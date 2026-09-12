@@ -43,6 +43,29 @@ const SESSION_DISABLE_ROUTE = "/api/mesh/voice/session/disable";
 /** Cap inbound memo audio well above any realistic tap-to-talk clip. */
 const MAX_MEMO_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Write privacy-safe ack telemetry. Request ids let operators correlate the
+ * route outcome without recording voice bodies or caller-supplied unknown ids.
+ */
+function logAckOutcome(
+  deps: VoiceApiDeps,
+  requestId: string,
+  outcome: string,
+  status: number,
+  announcementId?: string
+): void {
+  deps.log?.(
+    JSON.stringify({
+      level: status >= 500 ? "error" : status >= 400 ? "warn" : "info",
+      event: "voice_ack",
+      requestId,
+      outcome,
+      status,
+      ...(announcementId === undefined ? {} : { announcementId }),
+    })
+  );
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -332,26 +355,36 @@ export function handleVoiceApiRequest(
   // POST /api/mesh/voice/ack — {id} → playedAt set.
   if (req.method === "POST" && pathname === ACK_ROUTE) {
     void (async () => {
-      const body = (await readRawBody(req, 64 * 1024)).toString("utf-8");
-      let id: unknown;
+      const requestId = randomUUID();
       try {
-        id = (JSON.parse(body) as { id?: unknown }).id;
+        const body = (await readRawBody(req, 64 * 1024)).toString("utf-8");
+        let id: unknown;
+        try {
+          id = (JSON.parse(body) as { id?: unknown }).id;
+        } catch {
+          logAckOutcome(deps, requestId, "invalid_json", 400);
+          sendJson(res, 400, { error: "Invalid JSON body" });
+          return;
+        }
+        if (typeof id !== "string" || !id) {
+          logAckOutcome(deps, requestId, "missing_id", 400);
+          sendJson(res, 400, { error: "Missing id" });
+          return;
+        }
+        if (!service.ack(id)) {
+          // Do not log an unrecognised caller-supplied id: it need not be a
+          // server-generated announcement UUID.
+          logAckOutcome(deps, requestId, "unknown_announcement", 404);
+          sendJson(res, 404, { error: "unknown announcement id" });
+          return;
+        }
+        logAckOutcome(deps, requestId, "acknowledged", 200, id);
+        sendJson(res, 200, { ok: true });
       } catch {
-        sendJson(res, 400, { error: "Invalid JSON body" });
-        return;
+        logAckOutcome(deps, requestId, "body_read_failed", 500);
+        sendJson(res, 500, { error: "ack request failed" });
       }
-      if (typeof id !== "string" || !id) {
-        sendJson(res, 400, { error: "Missing id" });
-        return;
-      }
-      if (!service.ack(id)) {
-        sendJson(res, 404, { error: "unknown announcement id" });
-        return;
-      }
-      sendJson(res, 200, { ok: true });
-    })().catch((err) => {
-      sendJson(res, 500, { error: String(err) });
-    });
+    })();
     return true;
   }
 

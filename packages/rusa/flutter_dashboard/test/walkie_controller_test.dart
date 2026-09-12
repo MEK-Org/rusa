@@ -124,6 +124,53 @@ void main() {
         expect(api.disabledVoiceSessions, isEmpty);
       },
     );
+
+    test(
+      'reply-then-transfer recovers and acks each source backlog clip once in both directions',
+      () async {
+        api.backlogPages = [
+          const [],
+          [makeAnnouncement('handoff-a', actor: 'a')],
+          const [],
+          [makeAnnouncement('handoff-b', actor: 'b')],
+          const [],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'b'),
+        );
+        await pumpEventQueue();
+
+        expect(api.backlogActorIds, ['a', 'a', 'b']);
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/handoff-a']);
+        // A late non-backlog frame for the source remains stale after the handoff.
+        walkie.stream.framesCtrl.add(makeAnnouncement('stale-a', actor: 'a'));
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/handoff-a']);
+
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['handoff-a']);
+
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'a'),
+        );
+        await pumpEventQueue();
+
+        expect(api.backlogActorIds, ['a', 'a', 'b', 'b', 'a']);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/handoff-a',
+          '/api/mesh/voice/audio/handoff-b',
+        ]);
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(api.ackedIds, ['handoff-a', 'handoff-b']);
+        expect(controller.lastError.value, isNull);
+      },
+    );
   });
 
   group('playback queue', () {

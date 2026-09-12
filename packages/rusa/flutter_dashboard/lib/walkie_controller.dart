@@ -279,12 +279,21 @@ class WalkieController {
     }
   }
 
-  Future<void> _fetchBacklog() async {
+  /// Fetch one actor's unplayed announcements. A transfer deliberately fetches
+  /// the actor it just left as well as the recipient: the control may overtake
+  /// its source actor's final voice frame, but the backlog is an authoritative
+  /// snapshot of clips that remain unacknowledged. Direct late source frames
+  /// stay stale and are still rejected by [_enqueue].
+  Future<void> _fetchBacklog({
+    String? actorId,
+    bool handoffRecovery = false,
+  }) async {
+    final backlogActorId = actorId ?? this.actorId;
     try {
-      final items = await _deps.api.fetchVoiceBacklog(actorId);
+      final items = await _deps.api.fetchVoiceBacklog(backlogActorId);
       if (!_enabled.value) return;
       for (final frame in items) {
-        _enqueue(frame);
+        _enqueue(frame, backlogActorId: backlogActorId);
       }
     } on DashboardApiException catch (e) {
       if (e.status == 503) {
@@ -292,9 +301,15 @@ class WalkieController {
         await disable();
         return;
       }
-      _lastError.add('Backlog fetch failed: ${_apiErrorText(e)}');
+      final prefix = handoffRecovery
+          ? 'Handoff backlog fetch failed'
+          : 'Backlog fetch failed';
+      _lastError.add('$prefix: ${_apiErrorText(e)}');
     } catch (e) {
-      _lastError.add('Backlog fetch failed: $e');
+      final prefix = handoffRecovery
+          ? 'Handoff backlog fetch failed'
+          : 'Backlog fetch failed';
+      _lastError.add('$prefix: $e');
     }
   }
 
@@ -315,6 +330,7 @@ class WalkieController {
       return;
     }
 
+    final sourceActorId = actorId;
     _actorId = targetActorId;
     _connection.add(WalkieConnection.connecting);
     _teardownStream();
@@ -325,13 +341,20 @@ class WalkieController {
     _streamSubs.add(stream.controls.listen(_onControl));
     stream.connect([targetActorId], sessionId);
     onTransfer?.call(targetActorId);
-    unawaited(_fetchBacklog());
+    // The old stream cannot be trusted after its control frame. Recover its
+    // unacknowledged tail from the server snapshot instead of accepting stale
+    // SSE frames for the actor we just left.
+    unawaited(_fetchBacklog(actorId: sourceActorId, handoffRecovery: true));
+    unawaited(_fetchBacklog(actorId: targetActorId));
   }
 
   // ── Playback queue ──
 
-  void _enqueue(VoiceAnnouncement frame) {
-    if (frame.actorId != actorId) return; // stale frame across a reconnect
+  void _enqueue(VoiceAnnouncement frame, {String? backlogActorId}) {
+    // A fetched backlog is an authoritative response for [backlogActorId]; a
+    // live frame is valid only for the active actor, preserving stale-frame
+    // filtering after a reconnect or transfer.
+    if (frame.actorId != (backlogActorId ?? actorId)) return;
     if (!_seenIds.add(frame.id)) return; // already played or queued
     _queue.add(_QueueItem(frame));
     _queueDepth.add(_queue.length);

@@ -1743,6 +1743,16 @@ export class ActorMesh {
           `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
         );
       }
+      this.log(
+        JSON.stringify({
+          level: "warn",
+          event: "voice_session_transfer",
+          outcome: "handoff_not_recorded",
+          sessionId,
+          sourceActorId: fromActorId,
+          targetActorId: target.id,
+        })
+      );
       throw error;
     }
     // The responsive row is now durable; releasing the source through the
@@ -1761,9 +1771,26 @@ export class ActorMesh {
     // the browser changes selection/reconnects to it.
     try {
       transfer.notifySessionTransferred(sessionId, target.id);
-    } catch (error) {
       this.log(
-        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+        JSON.stringify({
+          level: "info",
+          event: "voice_session_transfer",
+          outcome: "control_dispatched",
+          sessionId,
+          sourceActorId: fromActorId,
+          targetActorId: target.id,
+        })
+      );
+    } catch {
+      this.log(
+        JSON.stringify({
+          level: "warn",
+          event: "voice_session_transfer",
+          outcome: "control_dispatch_failed",
+          sessionId,
+          sourceActorId: fromActorId,
+          targetActorId: target.id,
+        })
       );
     }
     return { sessionId, targetActorId: target.id };

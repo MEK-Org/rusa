@@ -791,6 +791,40 @@ describe("handleVoiceApiRequest", () => {
       ]);
     });
 
+    it("logs request-correlated ack outcomes without voice content", async () => {
+      const announcement = await seedAnnouncement("operator-private reply");
+      const logSpy = vi.fn();
+      deps.log = logSpy;
+
+      const acknowledged = call(deps, "POST", "/api/mesh/voice/ack", {
+        body: JSON.stringify({ id: announcement.id }),
+      });
+      await settled(acknowledged.res);
+      const unknown = call(deps, "POST", "/api/mesh/voice/ack", {
+        body: JSON.stringify({ id: "not-a-voice-id" }),
+      });
+      await settled(unknown.res);
+
+      const outcomes = logSpy.mock.calls.map(([message]) => JSON.parse(message as string));
+      expect(outcomes).toEqual([
+        expect.objectContaining({
+          event: "voice_ack",
+          outcome: "acknowledged",
+          status: 200,
+          announcementId: announcement.id,
+          requestId: expect.any(String),
+        }),
+        expect.objectContaining({
+          event: "voice_ack",
+          outcome: "unknown_announcement",
+          status: 404,
+          requestId: expect.any(String),
+        }),
+      ]);
+      expect(JSON.stringify(outcomes)).not.toContain("operator-private reply");
+      expect(JSON.stringify(outcomes)).not.toContain("not-a-voice-id");
+    });
+
     it("backlog is empty for an actor with no announcements", () => {
       const { res } = call(deps, "GET", `/api/mesh/actors/${UUID_B}/voice/backlog`);
       expect(res.statusCode).toBe(200);

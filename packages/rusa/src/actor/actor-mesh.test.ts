@@ -1612,7 +1612,7 @@ describe("ActorMesh", () => {
         sessionId: "walkie-session",
       },
     ];
-    const { mesh, fake, tick, registry } = setup({
+    const { mesh, fake, tick, registry, logs } = setup({
       inboxStore,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
@@ -1648,6 +1648,23 @@ describe("ActorMesh", () => {
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
     expect(controls).toEqual([["walkie-session", target]]);
+    const transferLog = logs
+      .map((message) => {
+        try {
+          return JSON.parse(message) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .find((entry) => entry?.event === "voice_session_transfer");
+    expect(transferLog).toMatchObject({
+      event: "voice_session_transfer",
+      outcome: "control_dispatched",
+      sessionId: "walkie-session",
+      sourceActorId: source,
+      targetActorId: target,
+    });
+    expect(JSON.stringify(transferLog)).not.toContain("take over the review");
     expect(registry.get(target)?.lastChatSessionId).toBeUndefined();
     expect(registry.get(target)?.humanUnlocked).toBeUndefined();
 

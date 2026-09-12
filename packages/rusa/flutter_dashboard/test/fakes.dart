@@ -370,6 +370,7 @@ class FakeApi extends DashboardApi {
   /// Backlog pages consumed in order; the last one repeats once exhausted.
   List<List<VoiceAnnouncement>> backlogPages = [const []];
   int backlogCalls = 0;
+  final backlogActorIds = <String>[];
   DashboardApiException? backlogError;
 
   final ackedIds = <String>[];
@@ -389,6 +390,7 @@ class FakeApi extends DashboardApi {
   @override
   Future<List<VoiceAnnouncement>> fetchVoiceBacklog(String actorId) async {
     backlogCalls++;
+    backlogActorIds.add(actorId);
     final err = backlogError;
     if (err != null) throw err;
     if (backlogPages.isEmpty) return const [];
