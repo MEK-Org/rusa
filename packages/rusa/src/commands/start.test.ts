@@ -32,7 +32,7 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
-import type { RunResult } from "../providers/types.js";
+import type { CodingProvider, RunResult } from "../providers/types.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
@@ -3902,6 +3902,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       { provider: "claude", model: "claude-sonnet-5", effort: "high" },
       { provider: "antigravity", model: "Gemini 4.1 Ultra", effort: "low" },
     ];
+    const fallbackOperatorPool: ProviderModelConfig[] = [
+      { provider: "claude", model: "claude-sonnet-5", effort: "low" },
+    ];
 
     const boot = async (): Promise<ActorMesh> => {
       let mesh: ActorMesh | undefined;
@@ -4069,6 +4072,160 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
       expect(liveRootPool(mesh)).toEqual(operatorPool);
       expect(modelSetEvents()).toHaveLength(1);
+    });
+
+    // `runWithFallback` is the production boundary that resolves a fallback,
+    // and `onRunStart` is the hook `Actor.invoke` fires with the entry it
+    // selected just before calling it. `requestRun` is mocked file-wide, so a
+    // run is driven the way the rest of this file drives one: through those
+    // hooks with a stubbed provider, classifying the primary as exhausted.
+    const rootFallbackRun = async (
+      mesh: ActorMesh,
+      selected: ProviderModelConfig,
+      recover: (fallback: CodingProvider) => RunResult = () => ({
+        success: true,
+        output: "fallback recovered",
+        exitCode: 0,
+      })
+    ): Promise<{ attempts: CodingProvider[]; result: RunResult }> => {
+      const root = mesh.get("root");
+      if (!root) throw new Error("root actor not ready");
+      const actor = root as unknown as {
+        opts: {
+          fallback?: { classify: (result: RunResult) => Promise<{ exhausted: boolean }> };
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: undefined,
+            selected: ProviderModelConfig
+          ) => void;
+          onRunEnd?: (result: RunResult) => Promise<void>;
+        };
+        runWithFallback: (
+          primary: CodingProvider,
+          runProvider: (provider: CodingProvider) => Promise<RunResult>
+        ) => Promise<RunResult>;
+      };
+      if (!actor.opts.fallback) throw new Error("root fallback not configured");
+      actor.opts.fallback.classify = vi.fn(async () => ({ exhausted: true }));
+      actor.opts.onRunStart?.(false, undefined, selected);
+      const primary: CodingProvider = {
+        name: selected.provider,
+        providerName: selected.provider,
+        model: selected.model,
+        effort: selected.effort,
+        run: async () => ({ success: true, output: "unused", exitCode: 0 }),
+      };
+      const attempts: CodingProvider[] = [];
+      const result = await actor.runWithFallback(primary, async (provider) => {
+        attempts.push(provider);
+        return provider === primary
+          ? { success: false, output: "quota exhausted", exitCode: 1 }
+          : recover(provider);
+      });
+      // Close the durable run the way `Actor.invoke` does, so the outcome is
+      // forwarded and the next run can start.
+      await actor.opts.onRunEnd?.(result);
+      return { attempts, result };
+    };
+    const runEndEvents = () =>
+      getRepositories().meshEvents.listEventsByActors(["root"], { kinds: ["run_end"], limit: 20 })
+        .events;
+
+    it("resolves a root fallback from the persisted entry that its Actor is running", async () => {
+      // Set a durable Claude/low primary, then edit the scalar file to a
+      // different Antigravity/high tuple before restart. The fallback model is
+      // deliberately named like the old file's model: the real Actor fallback
+      // boundary must not borrow that file provider or effort when it recovers
+      // from the durable primary.
+      const first = await boot();
+      first.setActorModel("root", fallbackOperatorPool, "root");
+      rootActorOpts(first).beforeRun?.({ mode: "yield-elicitation" });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const changedFileConfig = portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...changedFileConfig,
+          rootActor: {
+            ...changedFileConfig.rootActor,
+            fallbackModel: "Gemini 3.7 Flash",
+          },
+        }),
+        "utf8"
+      );
+
+      const mesh = await boot();
+      expect(liveRootPool(mesh)).toEqual(fallbackOperatorPool);
+      const persisted = fallbackOperatorPool[0] as ProviderModelConfig;
+
+      const recovered = await rootFallbackRun(mesh, persisted);
+      expect(recovered.attempts).toHaveLength(2);
+      expect(recovered.attempts[1]).toMatchObject({
+        providerName: "claude",
+        model: "Gemini 3.7 Flash",
+        effort: "low",
+      });
+      expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
+
+      // A fallback pin unavailable to the durable provider is a real failure,
+      // not permission to try the stale Antigravity/high file tuple instead.
+      // It is reported the way production forwards it to onRunEnd: as a failed
+      // result that leads with the exhaustion and keeps the resolver error as
+      // context, so the operator reads "wait for quota, and fix the pin" rather
+      // than a bare stack.
+      setProviderModelCatalog("claude", [
+        { identifier: "claude-sonnet-5", displayLabel: "claude-sonnet-5", passable: true },
+      ]);
+      const unresolvable = await rootFallbackRun(mesh, persisted);
+      expect(unresolvable.attempts).toHaveLength(1);
+      expect(unresolvable.result.success).toBe(false);
+      expect(unresolvable.result.output).toContain("primary claude-sonnet-5 exhausted");
+      expect(unresolvable.result.output).toMatch(
+        /model pin validation failed for provider "claude": rejected "Gemini 3.7 Flash"/
+      );
+      const ended = runEndEvents();
+      expect(ended).toHaveLength(2);
+      expect(ended[0]).toMatchObject({ success: false, body: unresolvable.result.output });
+    });
+
+    it("resolves a root fallback from the entry a later run launched on, not the boot-time pool", async () => {
+      // Root boots on the file tuple, then the operator moves its pool to
+      // Claude/low through set_actor_model while the service stays up. The
+      // next run launches on the new entry, and its fallback must follow that
+      // entry rather than the one frozen at boot. Freezing
+      // `rootBootModelConfig.modelConfig[0]` passes the restart case above and
+      // fails here.
+      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...config,
+          rootActor: { ...config.rootActor, fallbackModel: "Gemini 4.1 Ultra" },
+        }),
+        "utf8"
+      );
+      const mesh = await boot();
+      expect(liveRootPool(mesh)).toEqual([bootTuple]);
+
+      const booted = await rootFallbackRun(mesh, bootTuple);
+      expect(booted.attempts[1]).toMatchObject({
+        providerName: "antigravity",
+        model: "Gemini 4.1 Ultra",
+        effort: "high",
+      });
+
+      mesh.setActorModel("root", fallbackOperatorPool, "root");
+      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
+      expect(liveRootPool(mesh)).toEqual(fallbackOperatorPool);
+
+      const moved = await rootFallbackRun(mesh, fallbackOperatorPool[0] as ProviderModelConfig);
+      expect(moved.attempts).toHaveLength(2);
+      expect(moved.attempts[1]).toMatchObject({
+        providerName: "claude",
+        model: "Gemini 4.1 Ultra",
+        effort: "low",
+      });
     });
 
     it("seeds a root record with no persisted pool from the configured tuple without a model-set event", async () => {
