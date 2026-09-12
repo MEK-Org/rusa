@@ -184,8 +184,10 @@ class MeshHeader extends StatelessWidget {
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  // 70px: the pre-#423 56px row read cramped once the nav
+                  // buttons took typical padding at 16px — 25% taller.
                   SizedBox(
-                    height: 56,
+                    height: 70,
                     child: Row(
                       children: [
                         Expanded(
@@ -318,7 +320,7 @@ class _LeadingAction extends StatelessWidget {
       ),
       tooltip: back != null ? 'Back' : 'Navigation',
       padding: EdgeInsets.zero,
-      // The Material minimum touch target, which the 56px header row has room
+      // The Material minimum touch target, which the 70px header row has room
       // for — the same standard the phone actor list asks for with
       // `touchTargets: true`. Left at the default (standard) visual density,
       // since `VisualDensity.compact` would shave these constraints back to 40.
@@ -933,6 +935,13 @@ class _SchedulerWarningBadge extends StatelessWidget {
 /// A single header nav label: accent + bold when it's the active view, muted
 /// otherwise. A plain text button so it sits in the brand row without adding
 /// chrome to the locked V1.4.0 layout.
+///
+/// Sizing (issue #423): 16px labels — 25% up from the original 13px, which
+/// read small next to the rest of the chrome — on TextButton's typical
+/// padding (16px horizontal, 8px vertical). The inline nav rides a horizontal
+/// scroller, so the wider buttons never overflow the row; the compact variant
+/// keeps 12px horizontal padding so a ~390px window still shows the brand
+/// cluster comfortably.
 class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.destination,
@@ -945,9 +954,8 @@ class _NavItem extends StatelessWidget {
   final DashboardView selected;
   final ValueChanged<DashboardView> onSelect;
 
-  /// Tighter horizontal padding on phones  — the desktop padding left the
-  /// nav items too wide to fit alongside the brand + status on a ~390px phone,
-  /// overflowing the header row by a few pixels.
+  /// Tighter horizontal padding below 520px width — at the full 16px the nav
+  /// buttons crowd the brand + status cluster on a narrow desktop window.
   final bool compact;
 
   @override
@@ -962,13 +970,13 @@ class _NavItem extends StatelessWidget {
               ? MeshColors.accent
               : MeshColors.textSecondary,
           padding: EdgeInsets.symmetric(
-            horizontal: compact ? 6 : 10,
+            horizontal: compact ? 12 : 16,
             vertical: 8,
           ),
           minimumSize: Size.zero,
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           textStyle: TextStyle(
-            fontSize: 13,
+            fontSize: 16,
             fontWeight: active ? FontWeight.w700 : FontWeight.w500,
           ),
         ),

@@ -74,13 +74,13 @@ void main() {
       final svgRect = tester.getRect(svg);
       final textRect = tester.getRect(text);
 
-      // Overall desktop header height: 56px row + 1px bottom border = 57px.
-      expect(headerRect.height, 57.0);
+      // Overall desktop header height: 70px row + 1px bottom border = 71px.
+      expect(headerRect.height, 71.0);
 
-      // The 56px brand row containing the mark.
+      // The 70px brand row containing the mark.
       final brandRow = find.ancestor(of: mark, matching: find.byType(SizedBox)).first;
       final brandRowRect = tester.getRect(brandRow);
-      expect(brandRowRect.height, 56.0);
+      expect(brandRowRect.height, 70.0);
 
       // Artwork box constraint is 22px high and preserves 596:687 aspect ratio.
       expect(svgRect.height, 22.0);
@@ -98,12 +98,12 @@ void main() {
       expect(svgRect.left - markRect.left, 5.0);
       expect(markRect.right - svgRect.right, 5.0);
 
-      // Vertical centering within 56px brand row:
-      // (56 - 32) / 2 = 12px margin for BrandMark, 17px margin to artwork pixels.
-      expect(markRect.top - brandRowRect.top, 12.0);
-      expect(brandRowRect.bottom - markRect.bottom, 12.0);
-      expect(svgRect.top - brandRowRect.top, 17.0);
-      expect(brandRowRect.bottom - svgRect.bottom, 17.0);
+      // Vertical centering within 70px brand row:
+      // (70 - 32) / 2 = 19px margin for BrandMark, 24px margin to artwork pixels.
+      expect(markRect.top - brandRowRect.top, 19.0);
+      expect(brandRowRect.bottom - markRect.bottom, 19.0);
+      expect(svgRect.top - brandRowRect.top, 24.0);
+      expect(brandRowRect.bottom - svgRect.bottom, 24.0);
 
       // Left-margin from viewport edge (20px header padding + 5px crop padding).
       expect(markRect.left - headerRect.left, 20.0);
