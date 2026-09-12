@@ -348,12 +348,17 @@ export function referenceUrl(reference: Reference): string | null {
   let anchor = "";
   const commentIndex = segments.indexOf("comments");
   const reviewIndex = segments.indexOf("reviews");
-  if (commentIndex === segments.length - 2) {
+  // An absent collection is -1, and on a one-segment owner ref so is
+  // `length - 2` — the two would read as a comment anchor and truncate the
+  // array to length -1. Checking presence first keeps a short ref a short ref
+  // rather than a wrongly anchored one. The review branch cannot collide
+  // (`isPullRequest` needs three segments) but is guarded the same way.
+  if (commentIndex >= 0 && commentIndex === segments.length - 2) {
     anchor = isPullRequest
       ? `#discussion_r${segments[commentIndex + 1]}`
       : `#issuecomment-${segments[commentIndex + 1]}`;
     segments.length = commentIndex;
-  } else if (isPullRequest && reviewIndex === segments.length - 2) {
+  } else if (isPullRequest && reviewIndex >= 0 && reviewIndex === segments.length - 2) {
     anchor = `#pullrequestreview-${segments[reviewIndex + 1]}`;
     segments.length = reviewIndex;
   }
