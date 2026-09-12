@@ -128,6 +128,7 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
 export async function runActorMeshE2EUp(opts: {
   authEmulator?: string;
   authEmail?: string;
+  authEmails?: string[];
   root?: string;
   baseConfigHome?: string;
   rootDriver?: "provider" | "external";
@@ -145,7 +146,10 @@ export async function runActorMeshE2EUp(opts: {
   const controlPort = opts.rootControlPort ?? ROOT_CONTROL_PORT + offset;
   const gitRemotePort = GIT_REMOTE_PORT + offset;
   const dashboardAuth = opts.authEmulator
-    ? createE2EDashboardAuth(opts.authEmulator, opts.authEmail ?? "operator@example.com")
+    ? createE2EDashboardAuth(
+        opts.authEmulator,
+        opts.authEmails ?? opts.authEmail ?? "operator@example.com"
+      )
     : undefined;
   try {
     assertBwrapAvailable();

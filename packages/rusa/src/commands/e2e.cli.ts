@@ -35,6 +35,11 @@ program
   .option("--root-driver <driver>", "Root driver: provider or external", "provider")
   .option("--auth-emulator <host:port>", "Use a loopback Firebase Auth emulator (demo-rusa-auth)")
   .option("--auth-email <email>", "Sole emulator operator", "operator@example.com")
+  .option(
+    "--auth-emails <emails>",
+    "Comma-separated shared operators; overrides --auth-email",
+    (value) => value.split(",")
+  )
   .option("--port-offset <n>", "Offset the disposable instance's default ports", Number, 0)
   .option("--follower-bind <ip>", "Enable follower gateway on this Tailscale IPv4 address")
   .option("--follower-port <port>", "Follower gateway port", Number, 8190)
@@ -49,6 +54,7 @@ program
       rootDriver: string;
       authEmulator?: string;
       authEmail: string;
+      authEmails?: string[];
       portOffset: number;
       followerBind?: string;
       followerPort: number;
@@ -68,6 +74,7 @@ program
         rootDriver: opts.rootDriver,
         authEmulator: opts.authEmulator,
         authEmail: opts.authEmail,
+        authEmails: opts.authEmails,
         portOffset: opts.portOffset,
         followerGateway:
           opts.followerBind && opts.followerTokenFile
