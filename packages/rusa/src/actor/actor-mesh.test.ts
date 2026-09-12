@@ -8889,6 +8889,58 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(source, "complete")).toThrow(/did not own it when selected/);
   });
 
+  it("records a head unreadable at selection and fails closed on a handoff of it", () => {
+    // A concurrent write can leave a head briefly unreadable exactly when it is
+    // selected. Selection still admits it — every other exit is judged from the
+    // live row — but the run has no baseline to attribute a transfer to, and a
+    // later re-selection must not quietly supply one.
+    const unreadable = new Set<string>(["unreadable"]);
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => (unreadable.has(id) ? null : repo.get(id)),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    const source = worker(mesh, "source");
+    const recipient = worker(mesh, "recipient");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    repo.create({ id: "unreadable", title: "Unreadable at selection", ownerId: source });
+    selectHead(mesh, source, "unreadable");
+
+    // The row reads again and the same head is selected a second time inside
+    // this run: the null baseline stands, so the handoff still has nothing to
+    // be attributed to.
+    unreadable.delete("unreadable");
+    mesh.deliverReadyHeadAttention(source, { id: "unreadable", intent: "handle it" }, null);
+    const reselected = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === source &&
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === "unreadable"
+      )
+      .at(-1);
+    if (!reselected) throw new Error("expected a second ready-head entry");
+    mesh.selectInboxEntries(source, [reselected.id]);
+    repo.setCheckpoint("unreadable", "Standing recorded for the recipient.", source);
+    repo.reassign("unreadable", recipient, source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/could not be read when selected/);
+    mesh.abandonInboxRun(source);
+
+    // The same unreadable selection still leaves the other exits open.
+    unreadable.add("closed");
+    repo.create({ id: "closed", title: "Closed after an unreadable selection", ownerId: source });
+    selectHead(mesh, source, "closed");
+    unreadable.delete("closed");
+    repo.setTerminalStatus("closed", "done", null, null, source);
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
+  });
+
   it("rejects strict handoffs without the outgoing checkpoint or to a recipient nothing will wake", async () => {
     const { mesh, registry } = strictMesh();
     const source = worker(mesh, "source");
