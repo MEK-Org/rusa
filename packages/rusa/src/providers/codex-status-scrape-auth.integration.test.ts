@@ -80,9 +80,15 @@ set -u
 # Emit banner to satisfy TUI-ready poll
 printf 'OpenAI Codex\\n'
 
-# If replacement auth is configured, simulate credential refresh by writing to $CODEX_HOME/auth.json
+# Simulate Codex's current in-place credential write, or a future atomic replacement.
 if [ -n "\${REFRESH_PAYLOAD:-}" ] && [ -n "\${CODEX_HOME:-}" ]; then
-  printf "%s\\n" "$REFRESH_PAYLOAD" > "$CODEX_HOME/auth.json"
+  if [ "\${AUTH_WRITE_MODE:-in-place}" = "replace" ]; then
+    replacement=$(mktemp "$CODEX_HOME/auth.XXXXXX")
+    printf "%s\\n" "$REFRESH_PAYLOAD" > "$replacement"
+    mv "$replacement" "$CODEX_HOME/auth.json"
+  else
+    printf "%s\\n" "$REFRESH_PAYLOAD" > "$CODEX_HOME/auth.json"
+  fi
 fi
 
 case "\${SCENARIO:-normal}" in
@@ -139,6 +145,37 @@ esac
       else process.env.REFRESH_PAYLOAD = origEnv;
       if (origScenario === undefined) delete process.env.SCENARIO;
       else process.env.SCENARIO = origScenario;
+    }
+  }, 30_000);
+
+  it("rejects an atomic replacement of the required shared auth symlink", async () => {
+    const origPayload = process.env.REFRESH_PAYLOAD;
+    const origScenario = process.env.SCENARIO;
+    const origWriteMode = process.env.AUTH_WRITE_MODE;
+    try {
+      process.env.REFRESH_PAYLOAD = FIXTURE_REFRESHED_AUTH_SUCCESS;
+      process.env.SCENARIO = "normal";
+      process.env.AUTH_WRITE_MODE = "replace";
+
+      await expect(
+        scrapeCodexStatus({
+          actorDir,
+          codexConfigDir: hostCodexDir,
+          cliCommand: cliScriptPath,
+          timeoutMs: 15_000,
+        })
+      ).rejects.toThrow(/replaced the required shared auth symlink/);
+
+      // The host store must remain untouched rather than silently losing the replacement.
+      const hostAuthContent = readFileSync(join(hostCodexDir, "auth.json"), "utf8");
+      expect(JSON.parse(hostAuthContent)).toEqual(JSON.parse(FIXTURE_INITIAL_AUTH));
+    } finally {
+      if (origPayload === undefined) delete process.env.REFRESH_PAYLOAD;
+      else process.env.REFRESH_PAYLOAD = origPayload;
+      if (origScenario === undefined) delete process.env.SCENARIO;
+      else process.env.SCENARIO = origScenario;
+      if (origWriteMode === undefined) delete process.env.AUTH_WRITE_MODE;
+      else process.env.AUTH_WRITE_MODE = origWriteMode;
     }
   }, 30_000);
 

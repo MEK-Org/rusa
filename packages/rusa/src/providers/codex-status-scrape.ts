@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -197,7 +198,8 @@ function seedIsolatedCodexHome(actorDir: string, hostCodexDir: string): string {
     try {
       symlinkSync(resolve(hostAuth), join(codexHome, "auth.json"));
     } catch {
-      writeFileSync(join(codexHome, "auth.json"), readFileSync(hostAuth), { mode: 0o600 });
+      rmSync(codexHome, { recursive: true, force: true });
+      throw new Error("codex /status scrape could not create the required shared auth symlink");
     }
   }
   let baseConfig = "";
@@ -212,6 +214,21 @@ function seedIsolatedCodexHome(actorDir: string, hostCodexDir: string): string {
   const trust = `\n[projects.${JSON.stringify(actorDir)}]\ntrust_level = "trusted"\n`;
   writeFileSync(join(codexHome, "config.toml"), baseConfig + trust, { mode: 0o600 });
   return codexHome;
+}
+
+/**
+ * Codex currently truncates and rewrites `auth.json` in place, which follows the
+ * shared symlink. Detect a future atomic replacement rather than reporting a
+ * successful scrape while discarding its refreshed credentials at cleanup.
+ */
+function assertSharedAuthSymlink(codexHome: string, hostCodexDir: string): void {
+  if (!existsSync(join(hostCodexDir, "auth.json"))) return;
+  try {
+    if (lstatSync(join(codexHome, "auth.json")).isSymbolicLink()) return;
+  } catch {
+    // Fall through to the stable diagnostic below.
+  }
+  throw new Error("codex /status scrape replaced the required shared auth symlink");
 }
 
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
@@ -240,6 +257,16 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
   const cleanup = () => {
     killTmux();
+    try {
+      assertSharedAuthSymlink(codexHome, hostCodexDir);
+    } catch {
+      try {
+        rmSync(codexHome, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+      throw new Error("codex /status scrape replaced the required shared auth symlink");
+    }
     try {
       rmSync(codexHome, { recursive: true, force: true });
     } catch {
