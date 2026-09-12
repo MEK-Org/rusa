@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
-import { canManageObligation } from "../obligations/owner.js";
+import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   assertConcreteModelConfig,
@@ -8671,6 +8672,431 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
   });
 
+  /**
+   * The handoff surface a worker actually has (#420): its own obligations MCP
+   * with the production owner-or-ancestor policy over the mesh's real ancestry
+   * and the production owner resolver over the registry.
+   */
+  async function obligationsMcpFor(
+    mesh: ActorMesh,
+    registry: InMemoryActorRepository,
+    actorId: string
+  ): Promise<Client> {
+    const server = createObligationsMcpServer(repo, actorId, {
+      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+      canManage: (callerId, obligation) =>
+        canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "strict-handoff", version: "0.0.0" });
+    await client.connect(clientTransport);
+    return client;
+  }
+
+  async function callTool(client: Client, name: string, args: Record<string, unknown>) {
+    return (await client.callTool({ name, arguments: args })) as { isError?: boolean };
+  }
+
+  /** Route repository head transitions the way runStart's readyHeadSink does. */
+  function wireLiveReadyHeads(mesh: ActorMesh): void {
+    repo.setReadyHeadListener(({ ownerId, head, previousHeadId, sequence }) =>
+      mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null ? null : { id: head.id, intent: head.intent },
+        previousHeadId,
+        sequence
+      )
+    );
+  }
+
+  function headEntries(actorId: string, obligationId: string) {
+    return inboxStore.entries.filter(
+      (entry) =>
+        entry.actorId === actorId &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === obligationId
+    );
+  }
+
+  /** Select the latest head attention already delivered, without injecting any. */
+  function selectDeliveredHead(mesh: ActorMesh, actorId: string, obligationId: string): void {
+    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    const entry = headEntries(actorId, obligationId).at(-1);
+    if (!entry) throw new Error(`expected delivered ready-head attention for ${actorId}`);
+    mesh.selectInboxEntries(actorId, [entry.id]);
+  }
+
+  it("hands a strict head to a sibling over the real obligations MCP, delivers it live, and accepts the transfer back", async () => {
+    const { mesh, registry } = strictMesh();
+    wireLiveReadyHeads(mesh);
+    const reviewer = worker(mesh, "reviewer");
+    const implementer = worker(mesh, "implementer");
+    mesh.enrollActorInExperiment(reviewer, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    mesh.enrollActorInExperiment(implementer, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    const reviewerMcp = await obligationsMcpFor(mesh, registry, reviewer);
+    const implementerMcp = await obligationsMcpFor(mesh, registry, implementer);
+
+    // Attention arrives through the production listener, not an injection.
+    repo.create({ id: "review", title: "Review", ownerId: reviewer });
+    selectDeliveredHead(mesh, reviewer, "review");
+
+    // Checkpoint first, reassign second: the reviewer and implementer are
+    // siblings, so the owner-or-ancestor policy admits the reviewer's write
+    // only while it still owns the head.
+    expect(
+      (
+        await callTool(reviewerMcp, "set_checkpoint", {
+          id: "review",
+          checkpoint: "Findings recorded; implementer should correct the patch.",
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(
+      (await callTool(reviewerMcp, "reassign_obligation", { id: "review", owner_id: implementer }))
+        .isError
+    ).toBeFalsy();
+    expect(
+      (await callTool(reviewerMcp, "set_checkpoint", { id: "review", checkpoint: "too late" }))
+        .isError
+    ).toBe(true);
+
+    // The committed transition reached the recipient's durable inbox in this
+    // process, before the outgoing run ended and with no restart.
+    expect(headEntries(implementer, "review")).toHaveLength(1);
+
+    expect(() => mesh.declareYield(reviewer, "blocked")).not.toThrow();
+    mesh.finishInboxRun(reviewer);
+    expect(repo.get("review")).toMatchObject({
+      id: "review",
+      ownerId: implementer,
+      status: "ready",
+      checkpointBy: reviewer,
+    });
+    expect(repo.listDirectChildEdges("review")).toEqual([]);
+
+    // Correction and re-review: the same obligation travels back the same way,
+    // as a second, distinct wake for the reviewer.
+    expect(headEntries(reviewer, "review")).toHaveLength(1);
+    selectDeliveredHead(mesh, implementer, "review");
+    expect(
+      (
+        await callTool(implementerMcp, "set_checkpoint", {
+          id: "review",
+          checkpoint: "Corrections are ready; reviewer should re-review.",
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(
+      (await callTool(implementerMcp, "reassign_obligation", { id: "review", owner_id: reviewer }))
+        .isError
+    ).toBeFalsy();
+    expect(headEntries(reviewer, "review")).toHaveLength(2);
+    expect(() => mesh.declareYield(implementer, "complete")).not.toThrow();
+    expect(repo.get("review")).toMatchObject({
+      id: "review",
+      ownerId: reviewer,
+      status: "ready",
+      checkpointBy: implementer,
+    });
+    expect(repo.listDirectChildEdges("review")).toEqual([]);
+  });
+
+  it("recovers a handed-off head into the recipient's queue after the process is interrupted before delivery", () => {
+    const { mesh, registry } = strictMesh();
+    const reviewer = worker(mesh, "reviewer");
+    const implementer = worker(mesh, "implementer");
+    mesh.enrollActorInExperiment(reviewer, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "review", title: "Review", ownerId: reviewer });
+    selectHead(mesh, reviewer, "review");
+    repo.setCheckpoint("review", "Findings recorded; implementer should correct.", reviewer);
+    // No listener is wired: the row and head transition commit, and the
+    // process dies before anything reaches the recipient's inbox.
+    repo.reassign("review", implementer, reviewer);
+    expect(() => mesh.declareYield(reviewer, "blocked")).not.toThrow();
+    expect(headEntries(implementer, "review")).toHaveLength(0);
+
+    // Rebuild the mesh and recover the recipient's head from the durable
+    // transition, exactly as boot reconciliation does.
+    const resumed = setup({
+      actors: registry,
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    resumed.mesh.rehydrateAll();
+    resumed.mesh.reconcileReadyHeads(repo);
+    expect(headEntries(implementer, "review")).toHaveLength(1);
+    expect(repo.get("review")).toMatchObject({ ownerId: implementer, status: "ready" });
+  });
+
+  it("rejects a handoff carrying a checkpoint from an earlier run, or one this actor did not own at selection", async () => {
+    const { mesh, registry } = strictMesh();
+    wireLiveReadyHeads(mesh);
+    const source = worker(mesh, "source");
+    const recipient = worker(mesh, "recipient");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    const sourceMcp = await obligationsMcpFor(mesh, registry, source);
+
+    // Run 1: checkpoint, then leave legally on a new unmet prerequisite.
+    repo.create({ id: "stale", title: "Stale standing", ownerId: source });
+    selectDeliveredHead(mesh, source, "stale");
+    expect(
+      (
+        await callTool(sourceMcp, "set_checkpoint", {
+          id: "stale",
+          checkpoint: "Round one: waiting on the gate.",
+        })
+      ).isError
+    ).toBeFalsy();
+    repo.create({ id: "gate", title: "Gate", ownerId: recipient });
+    repo.addPrerequisite("stale", "gate", source);
+    expect(() => mesh.declareYield(source, "blocked")).not.toThrow();
+    mesh.finishInboxRun(source);
+
+    // The gate clears and the head comes back to the source. Run 2 hands it off
+    // without saying where round two stands: the standing it carries describes
+    // the previous run, so the transfer is not a checkpointed handoff.
+    repo.setTerminalStatus("gate", "done", null, null, recipient);
+    selectDeliveredHead(mesh, source, "stale");
+    expect(
+      (await callTool(sourceMcp, "reassign_obligation", { id: "stale", owner_id: recipient }))
+        .isError
+    ).toBeFalsy();
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/left over from before this run/);
+    mesh.abandonInboxRun(source);
+
+    // Attention was delivered while the source owned the head, but an ancestor
+    // moved it before the source selected. The source's own fresh checkpoint —
+    // written through the ancestor path here — is not a handoff it performed.
+    repo.create({ id: "moved", title: "Moved before selection", ownerId: source });
+    repo.reassign("moved", recipient, "root");
+    mesh.actorQueued(source, { responsive: false, mode: "ordinary" });
+    const stale = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === source &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "moved"
+    );
+    if (!stale) throw new Error("expected the pre-transfer attention");
+    mesh.selectInboxEntries(source, [stale.id]);
+    repo.setCheckpoint("moved", "I never owned this during the run.", source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/did not own it when selected/);
+  });
+
+  it("records a head unreadable at selection and fails closed on a handoff of it", () => {
+    // A concurrent write can leave a head briefly unreadable exactly when it is
+    // selected. Selection still admits it — every other exit is judged from the
+    // live row — but the run has no baseline to attribute a transfer to, and a
+    // later re-selection must not quietly supply one.
+    const unreadable = new Set<string>(["unreadable"]);
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => (unreadable.has(id) ? null : repo.get(id)),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    const source = worker(mesh, "source");
+    const recipient = worker(mesh, "recipient");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    repo.create({ id: "unreadable", title: "Unreadable at selection", ownerId: source });
+    selectHead(mesh, source, "unreadable");
+
+    // The row reads again and the same head is selected a second time inside
+    // this run: the null baseline stands, so the handoff still has nothing to
+    // be attributed to.
+    unreadable.delete("unreadable");
+    mesh.deliverReadyHeadAttention(source, { id: "unreadable", intent: "handle it" }, null);
+    const reselected = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === source &&
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === "unreadable"
+      )
+      .at(-1);
+    if (!reselected) throw new Error("expected a second ready-head entry");
+    mesh.selectInboxEntries(source, [reselected.id]);
+    repo.setCheckpoint("unreadable", "Standing recorded for the recipient.", source);
+    repo.reassign("unreadable", recipient, source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/could not be read when selected/);
+    mesh.abandonInboxRun(source);
+
+    // The same unreadable selection still leaves the other exits open.
+    unreadable.add("closed");
+    repo.create({ id: "closed", title: "Closed after an unreadable selection", ownerId: source });
+    selectHead(mesh, source, "closed");
+    unreadable.delete("closed");
+    repo.setTerminalStatus("closed", "done", null, null, source);
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
+  });
+
+  it("rejects strict handoffs without the outgoing checkpoint or to a recipient nothing will wake", async () => {
+    const { mesh, registry } = strictMesh();
+    const source = worker(mesh, "source");
+    const recipient = worker(mesh, "recipient");
+    const retired = worker(mesh, "retired recipient");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    const sourceMcp = await obligationsMcpFor(mesh, registry, source);
+    const handoff = async (id: string, ownerId: string) =>
+      callTool(sourceMcp, "reassign_obligation", { id, owner_id: ownerId });
+
+    // Missing checkpoint: a real ownership transfer alone remains insufficient.
+    repo.create({ id: "missing-checkpoint", title: "Missing checkpoint", ownerId: source });
+    selectHead(mesh, source, "missing-checkpoint");
+    expect((await handoff("missing-checkpoint", recipient)).isError).toBeFalsy();
+    expect(() => mesh.declareYield(source, "complete")).toThrow(
+      /without a checkpoint written by this actor/
+    );
+    mesh.abandonInboxRun(source);
+
+    // Self-reassignment is a no-op, even with a fresh checkpoint.
+    repo.create({ id: "self", title: "Self handoff", ownerId: source });
+    selectHead(mesh, source, "self");
+    repo.setCheckpoint("self", "I cannot hand this off to myself.", source);
+    expect((await handoff("self", source)).isError).toBeFalsy();
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/obligation is still ready/);
+    mesh.abandonInboxRun(source);
+
+    // The production owner resolver refuses a retired recipient, so the
+    // transfer fails and the source still owns the selected head.
+    mesh.retire(retired);
+    repo.create({ id: "failed", title: "Failed handoff", ownerId: source });
+    selectHead(mesh, source, "failed");
+    repo.setCheckpoint("failed", "Transfer attempt failed; source still owns it.", source);
+    expect((await handoff("failed", retired)).isError).toBe(true);
+    expect(repo.get("failed")?.ownerId).toBe(source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/obligation is still ready/);
+    mesh.abandonInboxRun(source);
+
+    // The operator is a legitimate owner but not an actor any inbox wakes, so
+    // handing the head to a human is a question for a person, not a handoff.
+    repo.create({ id: "to-human", title: "Human handoff", ownerId: source });
+    selectHead(mesh, source, "to-human");
+    repo.setCheckpoint("to-human", "Needs an operator decision.", source);
+    expect((await handoff("to-human", "human:operator")).isError).toBeFalsy();
+    expect(() => mesh.declareYield(source, "complete")).toThrow(
+      /not an active actor that can be woken/
+    );
+    mesh.abandonInboxRun(source);
+
+    // Nothing mints a system owner through the surface; the repository accepts
+    // this direct mutation and enforcement still fails closed on it.
+    repo.create({ id: "to-system", title: "System handoff", ownerId: source });
+    selectHead(mesh, source, "to-system");
+    repo.setCheckpoint("to-system", "Nobody will be woken for this.", source);
+    repo.reassign("to-system", "system:mesh", source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(
+      /not an active actor that can be woken/
+    );
+  });
+
+  it("rejects a handoff to an ancestor that is mid-retirement even though its record still reads active", () => {
+    // Retirement marks each actor retired only on the way back out of the
+    // subtree, so the parent still reads active while its child's onRetire
+    // fires. A handoff landing there during that window is accepted by the
+    // repository and destroyed with the parent.
+    let observed: string | null = null;
+    let parentStatusDuringTeardown: string | undefined;
+    const { mesh, registry } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+      onRetire: (record) => {
+        if (record.id !== child) return;
+        repo.reassign("to-retiring", parent, source);
+        parentStatusDuringTeardown = registry.get(parent)?.status;
+        try {
+          mesh.declareYield(source, "complete");
+          observed = "accepted";
+        } catch (err) {
+          observed = err instanceof Error ? err.message : String(err);
+        }
+      },
+    });
+    const source = worker(mesh, "source");
+    const parent = worker(mesh, "retiring parent");
+    const child = mesh.spawn({ charter: "retiring child", parentId: parent });
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "to-retiring", title: "Handoff into teardown", ownerId: source });
+    selectHead(mesh, source, "to-retiring");
+    repo.setCheckpoint("to-retiring", "Handing this to the parent.", source);
+
+    mesh.retire(parent);
+    expect(parentStatusDuringTeardown).toBe("active");
+    expect(observed).toMatch(/not an active actor that can be woken/);
+  });
+
+  it("resolves the root alias for both the recipient and the selection-time owner", async () => {
+    // Production keys root's record by a minted instance id while callers and
+    // repository rows may still say "root"; the predicate resolves the alias
+    // the same way reconciliation and ancestry do.
+    const rootId = "root-3f1a";
+    const { mesh, registry } = setup({
+      rootId,
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    const source = worker(mesh, "source");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    const sourceMcp = await obligationsMcpFor(mesh, registry, source);
+
+    // Over the MCP, root is addressed by its real id; the literal alias names
+    // no record and is refused by the production owner resolver.
+    repo.create({ id: "to-root", title: "Escalate to root", ownerId: source });
+    selectHead(mesh, source, "to-root");
+    repo.setCheckpoint("to-root", "Needs root's decision; standing recorded.", source);
+    expect(
+      (await callTool(sourceMcp, "reassign_obligation", { id: "to-root", owner_id: "root" }))
+        .isError
+    ).toBe(true);
+    expect(
+      (await callTool(sourceMcp, "reassign_obligation", { id: "to-root", owner_id: rootId }))
+        .isError
+    ).toBeFalsy();
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
+    mesh.finishInboxRun(source);
+
+    // A row that says "root" — written by a surface that still uses the legacy
+    // address — is the same active recipient, not an unknown actor.
+    repo.create({ id: "to-root-alias", title: "Escalate to root alias", ownerId: source });
+    selectHead(mesh, source, "to-root-alias");
+    repo.setCheckpoint("to-root-alias", "Standing recorded for root.", source);
+    repo.reassign("to-root-alias", "root", source);
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
+    mesh.finishInboxRun(source);
+
+    // Symmetrically, a head whose row names root by its alias was owned by
+    // root at selection, so root itself can hand it down.
+    mesh.enrollActorInExperiment(rootId, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "from-root", title: "Delegated by root", ownerId: "root" });
+    selectHead(mesh, rootId, "from-root");
+    repo.setCheckpoint("from-root", "Standing recorded; worker should take it.", rootId);
+    repo.reassign("from-root", source, "root");
+    expect(() => mesh.declareYield(rootId, "blocked")).not.toThrow();
+  });
+
   it("does not constrain runs selected from regular messages rather than head attention", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
@@ -8799,7 +9225,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child";
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
     expect(notice).toContain(exits);
     expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
 
