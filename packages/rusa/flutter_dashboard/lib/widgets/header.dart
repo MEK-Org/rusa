@@ -184,8 +184,9 @@ class MeshHeader extends StatelessWidget {
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  // 70px: #423 asked for ~25% over the original 56px.
                   SizedBox(
-                    height: 56,
+                    height: 70,
                     child: Row(
                       children: [
                         Expanded(
@@ -245,7 +246,6 @@ class MeshHeader extends StatelessWidget {
                                             destination: destination,
                                             selected: selected,
                                             onSelect: onSelect!,
-                                            compact: compact,
                                           ),
                                       ],
                                     ),
@@ -318,7 +318,7 @@ class _LeadingAction extends StatelessWidget {
       ),
       tooltip: back != null ? 'Back' : 'Navigation',
       padding: EdgeInsets.zero,
-      // The Material minimum touch target, which the 56px header row has room
+      // The Material minimum touch target, which the 70px header row has room
       // for — the same standard the phone actor list asks for with
       // `touchTargets: true`. Left at the default (standard) visual density,
       // since `VisualDensity.compact` would shave these constraints back to 40.
@@ -933,47 +933,39 @@ class _SchedulerWarningBadge extends StatelessWidget {
 /// A single header nav label: accent + bold when it's the active view, muted
 /// otherwise. A plain text button so it sits in the brand row without adding
 /// chrome to the locked V1.4.0 layout.
+///
+/// Sizing (issue #423): 16px labels, the nearest whole pixel to 25% over the
+/// original 13px, on TextButton's own padding and minimum size — the issue
+/// asked for "the typical amount of padding", and the earlier zero-minimum /
+/// shrink-wrap overrides were what made the buttons read constrained. The
+/// wordmark is also 16px; the brand stays distinct by its mark, letter-spacing
+/// and primary color rather than by size. The inline nav rides a horizontal
+/// scroller, and the app hands the header a drawer below [kNarrowBreakpoint],
+/// so no narrower padding variant is needed.
 class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.destination,
     required this.selected,
     required this.onSelect,
-    this.compact = false,
   });
 
   final DashboardDestination destination;
   final DashboardView selected;
   final ValueChanged<DashboardView> onSelect;
 
-  /// Tighter horizontal padding on phones  — the desktop padding left the
-  /// nav items too wide to fit alongside the brand + status on a ~390px phone,
-  /// overflowing the header row by a few pixels.
-  final bool compact;
-
   @override
   Widget build(BuildContext context) {
     final active = destination.isActive(selected);
-    return Padding(
-      padding: EdgeInsets.symmetric(horizontal: compact ? 0 : 2),
-      child: TextButton(
-        onPressed: () => onSelect(destination.targetFrom(selected)),
-        style: TextButton.styleFrom(
-          foregroundColor: active
-              ? MeshColors.accent
-              : MeshColors.textSecondary,
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 6 : 10,
-            vertical: 8,
-          ),
-          minimumSize: Size.zero,
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          textStyle: TextStyle(
-            fontSize: 13,
-            fontWeight: active ? FontWeight.w700 : FontWeight.w500,
-          ),
+    return TextButton(
+      onPressed: () => onSelect(destination.targetFrom(selected)),
+      style: TextButton.styleFrom(
+        foregroundColor: active ? MeshColors.accent : MeshColors.textSecondary,
+        textStyle: TextStyle(
+          fontSize: 16,
+          fontWeight: active ? FontWeight.w700 : FontWeight.w500,
         ),
-        child: Text(destination.label),
       ),
+      child: Text(destination.label),
     );
   }
 }
