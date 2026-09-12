@@ -918,15 +918,15 @@ void main() {
 
         // Check BLOCKED BY section
         expect(find.text('BLOCKED BY'), findsOneWidget);
-        expect(find.text('Prerequisite Non-GitHub Title'), findsWidgets);
-        expect(find.text('Prerequisite with GitHub Issue'), findsWidgets);
+        expect(find.text('Prerequisite Non-GitHub Title'), findsNWidgets(2));
+        expect(find.text('Prerequisite with GitHub Issue'), findsNWidgets(2));
         expect(find.text('github:MEK-Org/rusa/issues/101'), findsOneWidget);
 
         // Check BLOCKS section
         expect(find.text('BLOCKS'), findsOneWidget);
-        expect(find.text('Dependent with GitHub PR'), findsWidgets);
+        expect(find.text('Dependent with GitHub PR'), findsNWidgets(2));
         expect(find.text('github:MEK-Org/rusa/pulls/202'), findsOneWidget);
-        expect(find.text('Dependent Non-GitHub Title'), findsWidgets);
+        expect(find.text('Dependent Non-GitHub Title'), findsNWidgets(2));
 
         // Tapping a GitHub-backed obligation opens its detail view, whose
         // existing reference card owns the resolved external link.
@@ -959,19 +959,23 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [targetOb, item1, item2]
-          ..obligationDetails = {
-            'ob-target': ObligationDetailSnapshot(
-              obligation: targetOb,
-              parent: null,
-              children: [],
-              blockingChildren: [],
-              blockedBy: [item1],
-              blockedByTotal: 3,
-              blockedByHasMore: true,
-              blocks: [item2],
-              blocksTotal: 5,
-              blocksHasMore: true,
-            ),
+          ..obBlockedBy = {
+            'ob-target': [item1],
+          }
+          ..obBlockedByTotal = {
+            'ob-target': 3,
+          }
+          ..obBlockedByHasMore = {
+            'ob-target': true,
+          }
+          ..obBlocks = {
+            'ob-target': [item2],
+          }
+          ..obBlocksTotal = {
+            'ob-target': 5,
+          }
+          ..obBlocksHasMore = {
+            'ob-target': true,
           };
 
         final store = DashboardStore(api: api, stream: FakeStream());

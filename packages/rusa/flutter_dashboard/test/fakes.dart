@@ -534,7 +534,11 @@ class FakeApi extends DashboardApi {
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
   Map<String, ReferenceDto?> obExternalReferences = {};
   Map<String, List<ObligationDto>> obBlockedBy = {};
+  Map<String, int> obBlockedByTotal = {};
+  Map<String, bool> obBlockedByHasMore = {};
   Map<String, List<ObligationDto>> obBlocks = {};
+  Map<String, int> obBlocksTotal = {};
+  Map<String, bool> obBlocksHasMore = {};
 
   /// When set, computes the detail snapshot per call instead of the static
   /// [obligationDetails] map — needed to fake a paginated completions field
@@ -631,11 +635,11 @@ class FakeApi extends DashboardApi {
           )
           .toList(),
       blockedBy: blockedBy,
-      blockedByTotal: blockedBy.length,
-      blockedByHasMore: false,
+      blockedByTotal: obBlockedByTotal[id] ?? blockedBy.length,
+      blockedByHasMore: obBlockedByHasMore[id] ?? false,
       blocks: blocks,
-      blocksTotal: blocks.length,
-      blocksHasMore: false,
+      blocksTotal: obBlocksTotal[id] ?? blocks.length,
+      blocksHasMore: obBlocksHasMore[id] ?? false,
       externalReference: obExternalReferences[id],
     );
   }
