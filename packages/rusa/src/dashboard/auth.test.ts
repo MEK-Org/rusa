@@ -1,12 +1,21 @@
 // @vitest-environment node
 import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
-import { DashboardAuth, SESSION_COOKIE, SESSION_MS, STREAM_IDLE_MS } from "./auth.js";
+import {
+  createDashboardAuth,
+  DashboardAuth,
+  SESSION_COOKIE,
+  SESSION_MS,
+  STREAM_IDLE_MS,
+} from "./auth.js";
 
 const config = {
   email: "owner@example.com",
@@ -37,15 +46,26 @@ describe("single-operator dashboard authentication", () => {
   let token: DecodedIdToken;
   let serial: number;
   let revoked: boolean;
+  // Firebase unreachable: every network-backed call fails with the SDK's transport code.
+  let unreachable: boolean;
+  // ...and the SDK holds no cached signing certificates, so nothing verifies locally.
+  let offline: boolean;
+  const outage = () =>
+    Object.assign(new Error("connect ECONNREFUSED"), { code: "app/network-error" });
   const firebase = {
     verifyIdToken: vi.fn(async (value: string, _check: boolean) => {
+      if (unreachable) throw outage();
       if (value !== "id-token" || revoked)
         throw new Error("sensitive Firebase error /private/credential.json");
       return token;
     }),
     verifySessionCookie: vi.fn(async (value: string, check: boolean) => {
       const cookie = cookies.get(value);
-      if (!cookie || (check && revoked)) throw new Error("sensitive session error");
+      if (!cookie) throw new Error("sensitive session error");
+      // Signature verification survives an outage on cached certificates unless
+      // `offline` also denies it the public keys.
+      if (unreachable && (check || offline)) throw outage();
+      if (check && revoked) throw new Error("sensitive session error");
       return cookie;
     }),
     createSessionCookie: vi.fn(async (_value: string, options: { expiresIn: number }) => {
@@ -62,6 +82,8 @@ describe("single-operator dashboard authentication", () => {
     now = Date.now();
     serial = 0;
     revoked = false;
+    unreachable = false;
+    offline = false;
     token = claim();
     cookies.clear();
     vi.clearAllMocks();
@@ -204,7 +226,18 @@ describe("single-operator dashboard authentication", () => {
     });
     const shell = await fetch(`${origin}/actors/some-actor`);
     expect(shell.headers.get("cache-control")).toBe("no-store");
-    expect(await shell.text()).not.toContain(config.email);
+    const html = await shell.text();
+    expect(html).not.toContain(config.email);
+    // The login shell replaces Flutter's generated page, and bootDashboard() re-injects
+    // the loader by hand; both silently drift if the template ever needs more than that.
+    const template = readFileSync(
+      new URL("../../flutter_dashboard/web/index.html", import.meta.url),
+      "utf8"
+    );
+    expect(template.match(/<script[^>]*>/g)).toEqual(['<script src="flutter_bootstrap.js" async>']);
+    expect(template).toContain('<base href="$FLUTTER_BASE_HREF">');
+    expect(html).toContain('<base href="/">');
+    expect(html).toContain('<script src="/dashboard-auth.js" defer>');
   });
 
   it.each([
@@ -320,6 +353,40 @@ describe("single-operator dashboard authentication", () => {
     ).toBe(401);
   });
 
+  it("keeps a valid session through a Firebase outage, and rejects once revocation is visible", async () => {
+    const cookie = await login();
+    const session = () => fetch(`${origin}/api/auth/session`, { headers: { Cookie: cookie } });
+    expect((await session()).status).toBe(200);
+    unreachable = true;
+    now += 60_000;
+    firebase.verifySessionCookie.mockClear();
+    // The revocation attempt fails; signature/expiry/admission still pass locally.
+    expect((await session()).status).toBe(200);
+    expect(firebase.verifySessionCookie.mock.calls.map(([, check]) => check)).toEqual([
+      true,
+      false,
+    ]);
+    // The failed attempt counts for the window, so polling does not retry Firebase per request.
+    firebase.verifySessionCookie.mockClear();
+    expect((await session()).status).toBe(200);
+    expect(firebase.verifySessionCookie.mock.calls.map(([, check]) => check)).toEqual([false]);
+    // Outage-time login and renewal are unavailable, not denied: the browser keeps its session.
+    expect((await post("/api/auth/refresh", cookie)).status).toBe(503);
+    expect((await post("/api/auth/session")).status).toBe(503);
+    // With no cached certificates either, the answer is "unavailable", never "sign in again".
+    offline = true;
+    expect((await session()).status).toBe(503);
+    offline = false;
+    // Expiry is still enforced locally during the outage.
+    now += SESSION_MS;
+    expect((await session()).status).toBe(401);
+    now -= SESSION_MS;
+    unreachable = false;
+    revoked = true;
+    now += 60_000;
+    expect((await session()).status).toBe(401);
+  });
+
   it("clears the browser cookie on logout", async () => {
     const cookie = await login();
     const res = await post("/api/auth/logout", cookie);
@@ -361,6 +428,12 @@ describe("single-operator dashboard authentication", () => {
     const req = { headers: { cookie } } as IncomingMessage;
     const first = response();
     auth.guardStream(req, first);
+    // A transport failure during the periodic check leaves the stream open.
+    unreachable = true;
+    now += 60_000;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(first.end).not.toHaveBeenCalled();
+    unreachable = false;
     revoked = true;
     now += 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
@@ -371,6 +444,11 @@ describe("single-operator dashboard authentication", () => {
     now += STREAM_IDLE_MS;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(second.end).toHaveBeenCalledWith(expect.stringContaining("session_idle"));
+    // Shutdown closes streams without an auth frame so the browser reconnects on its own.
+    const third = response();
+    auth.guardStream(req, third);
+    await auth.close();
+    expect(third.end).toHaveBeenCalledWith(undefined);
   });
 
   it("preserves unauthenticated mode when auth is absent", async () => {
@@ -407,5 +485,35 @@ describe("single-operator dashboard authentication", () => {
     } finally {
       await started.close();
     }
+  });
+});
+
+describe("production boundary startup", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rusa-auth-"));
+  const keyPath = join(dir, "admin.json");
+  const withKey = (path = keyPath) => ({
+    ...config,
+    firebase: { ...config.firebase, serviceAccountKeyPath: path },
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("names each startup failure without ever serving it", () => {
+    // The e2e seam sets this for its own process; the production check must see it unset.
+    vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", undefined);
+    const missing = join(dir, "missing.json");
+    expect(() => createDashboardAuth(withKey(missing))).toThrow(`(ENOENT): ${missing}`);
+    writeFileSync(keyPath, "{not json");
+    expect(() => createDashboardAuth(withKey())).toThrow(`not valid JSON: ${keyPath}`);
+    writeFileSync(keyPath, JSON.stringify({ project_id: "other-project" }));
+    expect(() => createDashboardAuth(withKey())).toThrow(
+      `does not match auth.firebase.projectId (project): ${keyPath}`
+    );
+    writeFileSync(keyPath, JSON.stringify({ project_id: "project" }));
+    expect(() => createDashboardAuth(withKey())).toThrow(
+      /Could not initialize dashboard Firebase authentication: .*private_key/
+    );
   });
 });

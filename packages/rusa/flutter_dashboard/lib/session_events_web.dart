@@ -26,6 +26,17 @@ String? get csrfToken {
 
 /// Owns reconnects so an idle EventSource cannot silently reopen itself.
 /// Navigation renews the cookie before reconnecting either mesh or voice streams.
+///
+/// `session_idle` and `auth_required` are in-band frames on an open stream. The
+/// browser's own reconnect after a drop can instead be refused outright (a 401
+/// once the session is gone), which only surfaces as `error` with the source
+/// closed; that case is settled by asking `/api/auth/session` directly, so a
+/// dead stream never waits for the next poll to notice.
+///
+/// `data-rusa-session-idle` belongs to the login controller (auth-browser.ts):
+/// its inactivity timer sets it and a successful renewal clears it. A server
+/// `session_idle` frame only disconnects; it is the backstop for a throttled
+/// tab whose timer never fired, and the next renewal reconnects as usual.
 class SessionEventSource {
   SessionEventSource(this.url) {
     _active = ((web.Event _) => _connect()).toJS;
@@ -56,6 +67,28 @@ class SessionEventSource {
       ((web.Event _) {
         _disconnect();
         requireAuthentication();
+      }).toJS,
+    );
+    source.addEventListener(
+      'error',
+      ((web.Event _) {
+        // CONNECTING is a native retry in progress; CLOSED means the server refused
+        // the reconnect. Only a 401 turns that refusal into a login prompt.
+        if (!authenticationEnabled ||
+            _source != source ||
+            source.readyState != web.EventSource.CLOSED) {
+          return;
+        }
+        web.window
+            .fetch('/api/auth/session'.toJS, web.RequestInit(cache: 'no-store'))
+            .toDart
+            .then((response) {
+              if (response.status == 401) {
+                _disconnect();
+                requireAuthentication();
+              }
+            })
+            .catchError((Object _) {});
       }).toJS,
     );
     for (final entry in _listeners.entries) {

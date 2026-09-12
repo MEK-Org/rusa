@@ -18,6 +18,12 @@ auth:
 Enable Google in the Firebase project's Authentication sign-in providers and
 add the dashboard hostname to its authorized domains. Use a service account
 from that same project with permission to manage Firebase Authentication.
+Config already carries a second, unrelated Firebase credential:
+`understanding.glassGoals.firebaseServiceAccountKeyPath`, for the glass_goals
+knowledge-graph project's admin tooling. Set `auth.firebase.serviceAccountKeyPath`
+independently; startup rejects a key whose `project_id` is not
+`auth.firebase.projectId`, so the same file serves both fields only if both
+really are the same Firebase project. Neither field falls back to the other.
 The Web API key, project ID, and auth domain are public client configuration;
 the email policy and service-account file are never served to the browser.
 The Firebase SDK is bundled with the dashboard; no additional script CDN is
@@ -79,8 +85,20 @@ The avatar uses your Firebase profile photo, with a person-icon fallback.
 Logout clears the Rusa cookie and signs out
 Firebase across tabs on this browser. It does not revoke other devices' sessions.
 Use Firebase's user disablement or refresh-token revocation to end all sessions;
-requests and open streams observe revocation within 60 seconds. Signature and
-expiry checks still run on every request. Configuration changes apply at restart.
+requests and open streams observe revocation within 60 seconds. That window is a
+chosen default, not a measured need: it costs one Firebase lookup per open stream
+per minute and one per minute for polling. Signature and expiry checks still run
+on every request and never depend on the cache.
+
+Firebase being unreachable is not treated as a revocation. If a revocation lookup
+fails for a transport reason (network error, timeout, or a Firebase server error),
+the request or stream continues on the locally verified signature, expiry, and
+admission checks, and the lookup is retried at the next window; only an explicit
+rejection ends the session. Login and renewal during such an outage answer 503
+rather than 401, so the browser keeps its still-valid session and retries on the
+next navigation. A Rusa restart ends open streams without a login prompt; the
+browser reconnects on its own and the existing cookie is verified again.
+Configuration changes apply at restart.
 
 All dashboard data, mutations, avatars, quota/understanding views, voice, and SSE
 are behind the same gate. Public routes are the generic login shell and bundled

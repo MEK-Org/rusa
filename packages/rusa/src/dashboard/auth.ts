@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { cert, deleteApp, initializeApp } from "firebase-admin/app";
+import { cert, deleteApp, initializeApp, type ServiceAccount } from "firebase-admin/app";
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
@@ -11,6 +11,18 @@ export const SESSION_COOKIE = "__Host-rusa_session";
 export const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
 export const STREAM_IDLE_MS = 60 * 60 * 1000;
 const REVOCATION_MS = 60_000;
+/** Firebase unreachable or failing server-side. Every other failure is a rejection. */
+const TRANSIENT_CODES = new Set([
+  "app/network-error",
+  "app/network-timeout",
+  "auth/internal-error",
+]);
+const isTransient = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  typeof error.code === "string" &&
+  TRANSIENT_CODES.has(error.code);
 const authenticatedRequests = new WeakSet<IncomingMessage>();
 export const isAuthenticatedOperatorRequest = (req: IncomingMessage): boolean =>
   authenticatedRequests.has(req);
@@ -125,10 +137,19 @@ export class DashboardAuth {
     const checkRevoked =
       forceRevocation || checkedAt === undefined || this.now() - checkedAt >= REVOCATION_MS;
     // Signature/project/expiry verification is never cached by this layer.
-    const token = await this.firebase.verifySessionCookie(cookie, checkRevoked);
+    const token = await this.firebase.verifySessionCookie(cookie, checkRevoked).catch((error) => {
+      // Firebase being unreachable is not a revocation: signature, expiry, and admission
+      // still gate the request locally, and the revocation check resumes next window.
+      if (!checkRevoked || !isTransient(error)) throw error;
+      return this.firebase.verifySessionCookie(cookie, false);
+    });
     this.admitted(token);
     if (checkRevoked) {
-      if (this.revocations.size >= 256) this.revocations.clear();
+      // Renewal issues a fresh cookie on every navigation, so entries expire rather than
+      // accumulate; a failed attempt also counts, so an outage costs one call per window.
+      for (const [stale, at] of this.revocations) {
+        if (this.now() - at >= REVOCATION_MS) this.revocations.delete(stale);
+      }
       this.revocations.set(key, this.now());
     }
     return token;
@@ -149,8 +170,11 @@ export class DashboardAuth {
       res.setHeader("Cache-Control", "no-store");
       authenticatedRequests.add(req);
       return true;
-    } catch {
-      json(res, 401, { error: "Authentication required" });
+    } catch (error) {
+      // 401 is the browser's signal to sign in again, so an unreachable Firebase
+      // (when even the cached-certificate path cannot answer) must not send one.
+      if (isTransient(error)) json(res, 503, { error: "Authentication unavailable" });
+      else json(res, 401, { error: "Authentication required" });
       return false;
     }
   }
@@ -223,9 +247,12 @@ export class DashboardAuth {
       setCookie(res, cookie, SESSION_MS / 1000);
       this.csrf.issue(req, res, cookie, SESSION_MS / 1000);
       json(res, 200, { authenticated: true });
-    } catch {
+    } catch (error) {
       // Never forward SDK errors, tokens, emails, or credential paths to logs or responses.
-      json(res, 401, { error: "Authentication required" });
+      // An unreachable Firebase is reported as unavailable so the browser retries rather
+      // than discarding a still-valid session.
+      if (isTransient(error)) json(res, 503, { error: "Authentication unavailable" });
+      else json(res, 401, { error: "Authentication required" });
     }
     return true;
   }
@@ -260,15 +287,17 @@ export class DashboardAuth {
     });
   }
 
-  private endStream(res: ServerResponse, event: string): void {
+  private endStream(res: ServerResponse, event?: string): void {
     const stream = this.streams.get(res);
     if (stream) clearInterval(stream.timer);
     this.streams.delete(res);
-    if (!res.writableEnded) res.end(`event: ${event}\ndata: {}\n\n`);
+    if (!res.writableEnded) res.end(event ? `event: ${event}\ndata: {}\n\n` : undefined);
   }
 
   async close(): Promise<void> {
-    for (const res of this.streams.keys()) this.endStream(res, "auth_required");
+    // Shutdown is not an authentication event: a plain close lets the browser's native
+    // reconnect resume the still-valid session once the server is back.
+    for (const res of this.streams.keys()) this.endStream(res);
     this.revocations.clear();
     await this.dispose();
   }
@@ -279,17 +308,41 @@ export function createDashboardAuth(config: DashboardAuthConfig): DashboardAuth 
   // Auth emulators accept unsigned tokens. Never inherit this bypass in the production boundary.
   if (process.env.FIREBASE_AUTH_EMULATOR_HOST)
     throw new Error("Dashboard authentication cannot use the Firebase Auth emulator");
+  // Startup-only failures: each names its cause for the operator's terminal or journal.
+  // None of these run for a request, so nothing here can reach a client.
+  const { projectId, serviceAccountKeyPath } = config.firebase;
+  const fail = (message: string, cause?: unknown): Error =>
+    new Error(`${message}: ${serviceAccountKeyPath}`, { cause });
+  let raw: string;
   try {
-    const credential = JSON.parse(readFileSync(config.firebase.serviceAccountKeyPath, "utf8"));
-    if (credential.project_id !== config.firebase.projectId) throw new Error("project mismatch");
+    raw = readFileSync(serviceAccountKeyPath, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unreadable";
+    throw fail(`Could not read auth.firebase.serviceAccountKeyPath (${code})`, error);
+  }
+  let credential: unknown;
+  try {
+    credential = JSON.parse(raw);
+  } catch (error) {
+    throw fail("auth.firebase.serviceAccountKeyPath is not valid JSON", error);
+  }
+  if (
+    typeof credential !== "object" ||
+    credential === null ||
+    (credential as { project_id?: unknown }).project_id !== projectId
+  ) {
+    throw fail(`Service account project_id does not match auth.firebase.projectId (${projectId})`);
+  }
+  try {
     const app = initializeApp(
-      { projectId: config.firebase.projectId, credential: cert(credential) },
+      { projectId, credential: cert(credential as ServiceAccount) },
       `rusa-dashboard-${randomUUID()}`
     );
     return new DashboardAuth(config, getAuth(app), Date.now, () => deleteApp(app));
-  } catch {
-    throw new Error(
-      "Could not initialize dashboard Firebase authentication; check the configured project and service account"
-    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not initialize dashboard Firebase authentication: ${message}`, {
+      cause: error,
+    });
   }
 }
