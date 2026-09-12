@@ -1,12 +1,13 @@
 # Dashboard authentication
 
-Rusa optionally admits one Google account to the dashboard. That account acts
-as `human:operator`, with the same authority as the existing local operator.
+Rusa optionally admits configured Google accounts to the dashboard. Every admitted
+human has the same shared visibility and control as the existing local operator;
+actions retain `human:operator` attribution. This is not tenant isolation.
 Verified users are recorded in the existing principal repository, but no historical
 identities are migrated and the single root is unchanged. Omit `auth` to keep the
 existing unauthenticated local mode; it does not provision a local user principal.
 
-## Durable identity groundwork (not multi-user authorization)
+## Durable identities and shared access
 
 An admitted Firebase identity resolves to a stable Rusa user keyed by the Firebase
 project issuer plus subject. Firebase ID tokens and session cookies have different
@@ -15,8 +16,8 @@ transport issuers; after SDK project verification, both are keyed using the cano
 up by email. Email remains the admission policy and mutable metadata, not identity.
 
 The authenticated request carries a typed principal together with an explicit
-single-operator compatibility authority. Actions still use `human:operator`; this
-does not yet provide tenant isolation. No root association, implicit owner claim,
+shared-operator authority. Distinct users do not require distinct roots, and an
+existing root can be shared by all users. No root association, implicit owner claim,
 legacy alias, or historical rewrite is performed.
 
 A verified existing session can provision its user on its first request after the
@@ -41,6 +42,23 @@ auth:
     authDomain: example-project.firebaseapp.com
     serviceAccountKeyPath: /absolute/path/to/firebase-admin.json
 ```
+
+For multiple users, replace `email` with a non-empty `allowedEmails` list:
+
+```yaml
+  allowedEmails:
+    - owner@example.com
+    - colleague@example.com
+```
+
+Use exactly one of `email` or `allowedEmails`; duplicate addresses are rejected
+after trimming and case normalization. The legacy single-email configuration
+remains supported. All listed accounts have equal access to all dashboard data
+and existing operator actions, including instance-wide controls. There is no
+privileged first user, private root, or ownership-derived visibility filter.
+Unlisted accounts remain denied. Admission changes require a server restart.
+Root-count relaxation and event-source ownership are separate work; neither is
+required for multiple humans to share this installation.
 
 Enable Google in the Firebase project's Authentication sign-in providers and
 add the dashboard hostname to its authorized domains. Use a service account
@@ -87,7 +105,7 @@ It protects against cross-site request forgery, not same-origin script injection
 
 The login screen offers Google sign-in only. The server verifies Firebase ID
 tokens, verified email, Google as the sign-in provider, and the configured
-email before issuing a Firebase session cookie. There is no Rusa registration
+email allowlist before issuing a Firebase session cookie. There is no Rusa registration
 or invitation flow. Firebase may create its own provider account during Google
 sign-in; that does not grant access to Rusa.
 
@@ -179,6 +197,12 @@ In another terminal:
 ```sh
 pnpm e2e am-up --root-driver external --port-offset 100 --base-config-home /nonexistent-rusa-auth-e2e-config --auth-emulator 127.0.0.1:9099 --auth-email operator@example.com
 ```
+
+For shared access, replace `--auth-email operator@example.com` with
+`--auth-emails operator@example.com,colleague@example.com`. Both users can access
+the same mesh; test them in separate browser profiles or private contexts.
+Run the simultaneous-user browser test with
+`RUSA_SHARED_AUTH_EMULATOR_E2E=http://127.0.0.1:8183 pnpm --filter rusa exec vitest run src/e2e/auth-emulator.browser.test.ts`.
 
 Open <http://127.0.0.1:8183>, click **Sign in with Google**, then **Add new
 account** in the emulator popup. Enter `operator@example.com`; no password is

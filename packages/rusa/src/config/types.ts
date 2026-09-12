@@ -366,9 +366,7 @@ export interface VoiceConfig {
   voiceName?: string;
 }
 
-export interface DashboardAuthConfig {
-  /** The sole admitted Google account. Its Rusa identity remains human:operator. */
-  email: string;
+export type DashboardAuthConfig = {
   firebase: {
     projectId: string;
     apiKey: string;
@@ -376,10 +374,16 @@ export interface DashboardAuthConfig {
     /** Explicit Admin SDK credential file; never sent to the browser. */
     serviceAccountKeyPath: string;
   };
-}
+} & (
+  | { /** Backward-compatible single-email shorthand. */ email: string; allowedEmails?: never }
+  | {
+      /** All admitted humans share operator access; no privileged owner. */ allowedEmails: string[];
+      email?: never;
+    }
+);
 
 export interface RusaConfig {
-  /** Optional single-operator dashboard authentication. */
+  /** Optional Google authentication with shared human operator access. */
   auth?: DashboardAuthConfig;
   /** Optional named config profile. "quickstart" enables the local quick-start profile. */
   profile?: string;
