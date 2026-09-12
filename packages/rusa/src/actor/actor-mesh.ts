@@ -727,7 +727,7 @@ export interface ActorMeshOptions {
  * anyway. One wording means the instruction cannot drift from the rule.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child";
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or hand it off with your checkpoint to a distinct active actor";
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -750,6 +750,8 @@ const STRICT_HEAD_CLOSURE_EXITS =
  */
 interface HeadClosureRunState {
   headObligationIds: Set<string>;
+  /** Owner observed when this actor selected each strict head. */
+  selectedOwnerIds: Map<string, string>;
   preExistingChildIds: Map<string, Set<string>>;
   preExistingPrerequisiteIds: Map<string, Set<string>>;
 }
@@ -1366,12 +1368,17 @@ export class ActorMesh {
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
       const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
         headObligationIds: new Set<string>(),
+        selectedOwnerIds: new Map<string, string>(),
         preExistingChildIds: new Map<string, Set<string>>(),
         preExistingPrerequisiteIds: new Map<string, Set<string>>(),
       };
       this.headClosureRuns.set(actorId, run);
       for (const obligationId of headObligationIds) {
         run.headObligationIds.add(obligationId);
+        if (!run.selectedOwnerIds.has(obligationId)) {
+          const selected = closure.get(obligationId);
+          if (selected) run.selectedOwnerIds.set(obligationId, selected.ownerId);
+        }
         if (!run.preExistingChildIds.has(obligationId)) {
           run.preExistingChildIds.set(
             obligationId,
@@ -3012,6 +3019,16 @@ export class ActorMesh {
       const obligation = closure.get(obligationId);
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
 
+      if (
+        this.isCheckpointedStrictHandoff(
+          actorId,
+          obligation,
+          runState.selectedOwnerIds.get(obligationId)
+        )
+      ) {
+        continue;
+      }
+
       if (obligation.status === "ready") {
         this.rejectCleanYield(actorId, obligationId, obligation.title, "obligation is still ready");
       }
@@ -3044,6 +3061,28 @@ export class ActorMesh {
         );
       }
     }
+  }
+
+  /**
+   * A strict head may leave its current owner only after that owner has handed
+   * its still-ready work to a distinct active actor with a durable standing.
+   * The obligation row and ready-head transition are already committed by the
+   * repository; boot reconciliation can therefore restore recipient attention
+   * if delivery is interrupted between that commit and the wake.
+   */
+  private isCheckpointedStrictHandoff(
+    outgoingActorId: string,
+    obligation: Obligation,
+    selectedOwnerId: string | undefined
+  ): boolean {
+    if (selectedOwnerId !== outgoingActorId || obligation.status !== "ready") return false;
+    if (obligation.ownerId === outgoingActorId) return false;
+    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) return false;
+
+    // This is deliberately the durable actor record rather than `live`: an
+    // active recipient may be between process restart and rehydration, when
+    // the committed ready-head transition is exactly what restores its queue.
+    return this.actors.get(obligation.ownerId)?.status === "active";
   }
 
   private rejectCleanYield(

@@ -643,7 +643,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child"
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or hand it off with your checkpoint to a distinct active actor"
     );
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");

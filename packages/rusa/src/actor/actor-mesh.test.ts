@@ -8671,6 +8671,112 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
   });
 
+  it("accepts a checkpointed ready-head handoff, recovers it after interruption, and accepts transfer back", () => {
+    const { mesh, registry } = strictMesh();
+    const reviewer = worker(mesh, "reviewer");
+    const implementer = worker(mesh, "implementer");
+    mesh.enrollActorInExperiment(reviewer, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    mesh.enrollActorInExperiment(implementer, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "review", title: "Review", ownerId: reviewer });
+
+    selectHead(mesh, reviewer, "review");
+    repo.setCheckpoint(
+      "review",
+      "Findings recorded; implementer should correct the patch.",
+      reviewer
+    );
+    repo.reassign("review", implementer, reviewer);
+
+    expect(() => mesh.declareYield(reviewer, "blocked")).not.toThrow();
+    expect(repo.get("review")).toMatchObject({
+      id: "review",
+      ownerId: implementer,
+      status: "ready",
+      checkpointBy: reviewer,
+    });
+    expect(repo.listDirectChildEdges("review")).toEqual([]);
+
+    // The handoff committed before delivery. Rebuild the mesh and recover the
+    // recipient's ready head from the durable repository transition, exactly
+    // as boot reconciliation does after an interrupted process.
+    const resumed = setup({
+      actors: registry,
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    resumed.mesh.rehydrateAll();
+    resumed.mesh.reconcileReadyHeads(repo);
+    const recipientEntry = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === implementer &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "review"
+    );
+    expect(recipientEntry).toBeDefined();
+    if (!recipientEntry) throw new Error("expected recovered handoff attention");
+
+    resumed.mesh.actorQueued(implementer, { responsive: false, mode: "ordinary" });
+    resumed.mesh.selectInboxEntries(implementer, [recipientEntry.id]);
+    repo.setCheckpoint("review", "Corrections are ready; reviewer should re-review.", implementer);
+    repo.reassign("review", reviewer, implementer);
+
+    expect(() => resumed.mesh.declareYield(implementer, "complete")).not.toThrow();
+    expect(repo.get("review")).toMatchObject({
+      id: "review",
+      ownerId: reviewer,
+      status: "ready",
+      checkpointBy: implementer,
+    });
+    expect(repo.listDirectChildEdges("review")).toEqual([]);
+  });
+
+  it("rejects strict handoffs without the outgoing checkpoint or an eligible distinct recipient", () => {
+    const { mesh, registry } = strictMesh();
+    const source = worker(mesh, "source");
+    const recipient = worker(mesh, "recipient");
+    const inactive = worker(mesh, "inactive recipient");
+    mesh.enrollActorInExperiment(source, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    // Missing checkpoint: a real ownership transfer alone remains insufficient.
+    repo.create({ id: "missing-checkpoint", title: "Missing checkpoint", ownerId: source });
+    selectHead(mesh, source, "missing-checkpoint");
+    repo.reassign("missing-checkpoint", recipient, source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/not finished or decomposed/);
+    mesh.abandonInboxRun(source);
+
+    // Self-reassignment is a no-op, even when a checkpoint exists.
+    repo.create({ id: "self", title: "Self handoff", ownerId: source });
+    selectHead(mesh, source, "self");
+    repo.setCheckpoint("self", "I cannot hand this off to myself.", source);
+    repo.reassign("self", source, source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/not finished or decomposed/);
+    mesh.abandonInboxRun(source);
+
+    // A rejected repository mutation leaves the source owning the selected
+    // head, so it cannot manufacture a disposition.
+    repo.create({ id: "failed", title: "Failed handoff", ownerId: source });
+    selectHead(mesh, source, "failed");
+    repo.setCheckpoint("failed", "Transfer attempt failed; source still owns it.", source);
+    expect(() => repo.reassign("failed", "   ", source)).toThrow();
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/not finished or decomposed/);
+    mesh.abandonInboxRun(source);
+
+    // The repository accepts this direct test mutation, but a retired actor
+    // cannot receive runnable work; strict enforcement must reject it.
+    repo.create({ id: "inactive", title: "Inactive handoff", ownerId: source });
+    selectHead(mesh, source, "inactive");
+    repo.setCheckpoint("inactive", "Awaiting the recipient's next action.", source);
+    registry.patch(inactive, { status: "retired" });
+    repo.reassign("inactive", inactive, source);
+    expect(() => mesh.declareYield(source, "complete")).toThrow(/not finished or decomposed/);
+  });
+
   it("does not constrain runs selected from regular messages rather than head attention", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
@@ -8799,7 +8905,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child";
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or hand it off with your checkpoint to a distinct active actor";
     expect(notice).toContain(exits);
     expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
 
