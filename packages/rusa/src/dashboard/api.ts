@@ -1540,18 +1540,21 @@ export async function handleMeshApiRequest(
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
-    sendJson(
-      res,
-      200,
-      await resolveInboxPage(
-        deps.inbox.list(actorId, {
-          status: status as "unhandled" | "handled" | "all" | undefined,
-          limit: clampLimit(url),
-          cursor: url.searchParams.get("cursor") ?? undefined,
-        }),
-        deps
-      )
-    );
+    let page: InboxPage;
+    try {
+      page = deps.inbox.list(actorId, {
+        status: status as "unhandled" | "handled" | "all" | undefined,
+        limit: clampLimit(url),
+        cursor: url.searchParams.get("cursor") ?? undefined,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === "invalid inbox cursor") {
+        sendJson(res, 400, { error: err.message });
+        return true;
+      }
+      throw err;
+    }
+    sendJson(res, 200, await resolveInboxPage(page, deps));
     return true;
   }
 

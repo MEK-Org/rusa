@@ -1541,6 +1541,13 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("GET /api/mesh/inbox rejects an invalid cursor as client input", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/inbox?actor=root&cursor=not-a-cursor");
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "invalid inbox cursor" });
+  });
+
   it("GET /api/mesh/inbox resolves a GitHub-sourced entry's source into a linkable reference", async () => {
     // Shaped like `deriveGitHubInboxNotification`'s output for an
     // issue-comment webhook: no `messageId`, and `source` is the exact
