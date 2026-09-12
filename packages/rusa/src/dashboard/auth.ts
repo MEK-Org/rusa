@@ -5,6 +5,7 @@ import { cert, deleteApp, initializeApp } from "firebase-admin/app";
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
+import { DashboardCsrf } from "./csrf.js";
 
 export const SESSION_COOKIE = "__Host-rusa_session";
 export const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
@@ -82,6 +83,7 @@ async function readToken(req: IncomingMessage): Promise<string> {
 
 /** One operator, unchanged human:operator authority. No user rows or identity migration. */
 export class DashboardAuth {
+  private readonly csrf = new DashboardCsrf();
   private readonly revocations = new Map<string, number>();
   private readonly streams = new Map<
     ServerResponse,
@@ -137,7 +139,10 @@ export class DashboardAuth {
       const cookie = sessionCookie(req);
       if (!cookie) throw new Error("unauthorized");
       await this.verify(cookie);
-      if (!["GET", "HEAD", "OPTIONS"].includes(req.method ?? "") && !isSameOrigin(req)) {
+      if (
+        !["GET", "HEAD", "OPTIONS"].includes(req.method ?? "") &&
+        (!isSameOrigin(req) || !this.csrf.verify(req, cookie))
+      ) {
         json(res, 403, { error: "Forbidden" });
         return false;
       }
@@ -153,6 +158,21 @@ export class DashboardAuth {
   /** Auth routes are handled before all dashboard/data/voice dispatch. */
   async handle(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<boolean> {
     if (!pathname.startsWith("/api/auth/")) return false;
+    if (req.method === "GET" && pathname === "/api/auth/csrf") {
+      // Custom header prevents cross-origin form/navigation bootstrap; no CORS permission
+      // is granted to a foreign preflight. Bootstrap never extends the auth session.
+      if (
+        req.headers["x-rusa-csrf-bootstrap"] !== "1" ||
+        req.headers["sec-fetch-site"] === "cross-site" ||
+        (req.headers.origin !== undefined && !isSameOrigin(req))
+      ) {
+        json(res, 403, { error: "Forbidden" });
+      } else {
+        this.csrf.issue(req, res, sessionCookie(req) ?? "", SESSION_MS / 1000);
+        json(res, 200, { ok: true });
+      }
+      return true;
+    }
     if (req.method === "GET" && pathname === "/api/auth/config") {
       json(res, 200, this.clientConfig());
       return true;
@@ -161,7 +181,11 @@ export class DashboardAuth {
       if (await this.authorize(req, res)) json(res, 200, { authenticated: true });
       return true;
     }
-    if (req.method !== "POST" || !isSameOrigin(req)) {
+    if (
+      req.method !== "POST" ||
+      !isSameOrigin(req) ||
+      !this.csrf.verify(req, sessionCookie(req) ?? "")
+    ) {
       json(res, 403, { error: "Forbidden" });
       return true;
     }
@@ -171,6 +195,7 @@ export class DashboardAuth {
         if (stream.cookie === cookie) this.endStream(res, "auth_required");
       }
       setCookie(res, "", 0);
+      this.csrf.issue(req, res, "", SESSION_MS / 1000);
       json(res, 200, { ok: true });
       return true;
     }
@@ -196,6 +221,7 @@ export class DashboardAuth {
       }
       const cookie = await this.firebase.createSessionCookie(idToken, { expiresIn: SESSION_MS });
       setCookie(res, cookie, SESSION_MS / 1000);
+      this.csrf.issue(req, res, cookie, SESSION_MS / 1000);
       json(res, 200, { authenticated: true });
     } catch {
       // Never forward SDK errors, tokens, emails, or credential paths to logs or responses.

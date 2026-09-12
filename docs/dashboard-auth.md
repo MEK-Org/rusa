@@ -33,6 +33,25 @@ localhost is accepted for development where the browser supports Secure
 localhost cookies. Firebase Auth emulator configuration is rejected by the
 production authentication boundary.
 
+Authenticated-mode mutations also require a signed double-submit CSRF token.
+The browser calls `GET /api/auth/csrf` with `X-Rusa-CSRF-Bootstrap: 1`, then copies
+the readable `__Host-rusa_csrf` cookie into `X-Rusa-CSRF` on the mutation. The
+server requires an exact cookie/header match and validates an HMAC binding the
+token to the current session cookie (or the pre-login state). Missing, duplicate,
+mismatched, forged, or differently session-bound tokens are rejected with 403
+before the mutation runs. Origin checks and Strict cookies remain required.
+
+The CSRF cookie is Secure, host-only, SameSite=Strict, and intentionally not
+HttpOnly; the Firebase authentication cookie remains HttpOnly. Session creation,
+renewal, and logout replace the CSRF binding. The bootstrap reuses a valid token
+and never creates or renews an authentication session. Both browser clients
+bootstrap before mutations, so a server restart (which replaces the in-memory
+CSRF signing key) does not require a new login. No database/config secret is
+added; this is a single-server implementation, not a shared-key multi-replica setup.
+
+This follows the [signed double-submit cookie pattern](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#signed-double-submit-cookie-recommended).
+It protects against cross-site request forgery, not same-origin script injection.
+
 The login screen offers Google sign-in only. The server verifies Firebase ID
 tokens, verified email, Google as the sign-in provider, and the configured
 email before issuing a Firebase session cookie. There is no Rusa registration
@@ -66,6 +85,7 @@ expiry checks still run on every request. Configuration changes apply at restart
 All dashboard data, mutations, avatars, quota/understanding views, voice, and SSE
 are behind the same gate. Public routes are the generic login shell and bundled
 login script, health, client auth configuration, and login/session endpoints.
+The header-protected CSRF bootstrap is also public so login itself can be protected.
 GitHub webhook HMAC, host wake tokens, and actor MCP endpoints retain their
 separate machine authentication; Firebase does not authorize them.
 

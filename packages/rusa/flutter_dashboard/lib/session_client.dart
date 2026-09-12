@@ -9,6 +9,18 @@ class SessionClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (!['GET', 'HEAD', 'OPTIONS'].contains(request.method) &&
+        needsCsrf(request.url)) {
+      final bootstrap = await _inner.get(
+        request.url.resolve('/api/auth/csrf'),
+        headers: {'X-Rusa-CSRF-Bootstrap': '1'},
+      );
+      final token = csrfToken;
+      if (bootstrap.statusCode != 200 || token == null) {
+        throw http.ClientException('CSRF bootstrap unavailable', request.url);
+      }
+      request.headers['X-Rusa-CSRF'] = token;
+    }
     final response = await _inner.send(request);
     if (response.statusCode == 401) requireAuthentication();
     return response;

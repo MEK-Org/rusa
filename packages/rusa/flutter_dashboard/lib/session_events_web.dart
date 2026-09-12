@@ -10,6 +10,19 @@ bool get authenticationEnabled =>
     web.document.documentElement?.getAttribute('data-rusa-auth') == 'enabled';
 String? get profilePhotoUrl =>
     web.document.documentElement?.getAttribute('data-rusa-profile-photo');
+bool needsCsrf(Uri url) =>
+    authenticationEnabled &&
+    Uri.base.resolveUri(url).origin == web.window.location.origin;
+String? get csrfToken {
+  final cookies = web.document.cookie
+      .split(';')
+      .map((part) => part.trim())
+      .where((part) => part.startsWith('__Host-rusa_csrf='))
+      .toList();
+  return cookies.length == 1
+      ? cookies.single.substring('__Host-rusa_csrf='.length)
+      : null;
+}
 
 /// Owns reconnects so an idle EventSource cannot silently reopen itself.
 /// Navigation renews the cookie before reconnecting either mesh or voice streams.

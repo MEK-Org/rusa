@@ -34,18 +34,56 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
             (entry) => entry.name === "__Host-rusa_session"
           );
           expect(cookie).toMatchObject({ secure: true, httpOnly: true, sameSite: "Strict" });
+          const csrfCookie = (await context.cookies()).find(
+            (entry) => entry.name === "__Host-rusa_csrf"
+          );
+          expect(csrfCookie).toMatchObject({ secure: true, httpOnly: false, sameSite: "Strict" });
+          // Authenticated cross-site-style submissions cannot log the user out.
+          expect(
+            await page.evaluate(
+              async () => (await fetch("/api/auth/logout", { method: "POST" })).status
+            )
+          ).toBe(403);
+          expect(await status("/api/auth/session")).toBe(200);
           const refresh = page.waitForResponse(
             (response) =>
               response.url().endsWith("/api/auth/refresh") && response.request().method() === "POST"
           );
           await page.evaluate(() => window.dispatchEvent(new Event("rusa-navigation")));
-          expect((await refresh).status()).toBe(200);
+          const renewed = await refresh;
+          expect(renewed.status()).toBe(200);
+          expect(renewed.request().headers()["x-rusa-csrf"]).toBeTruthy();
           // Enable Flutter's accessibility tree to exercise the actual profile menu.
           await page.locator("flt-semantics-placeholder").evaluate((element) => {
             (element as HTMLElement).style.cssText =
               "position:fixed;left:0;top:0;width:20px;height:20px;z-index:9999";
           });
           await page.locator("flt-semantics-placeholder").click({ force: true });
+          // Exercise Flutter's mutation client without leaving fixture obligations behind.
+          await page.route("**/api/mesh/obligations", async (route) => {
+            if (route.request().method() === "POST") {
+              await route.fulfill({
+                status: 503,
+                contentType: "application/json",
+                body: '{"error":"test-only write interception"}',
+              });
+            } else await route.continue();
+          });
+          await page.getByRole("button", { name: "New Obligation", exact: true }).click();
+          await page.getByRole("textbox").first().click();
+          await page.keyboard.type("CSRF browser verification", { delay: 20 });
+          await page.keyboard.press("Tab");
+          const mutation = page.waitForRequest(
+            (request) =>
+              request.method() === "POST" && request.url().endsWith("/api/mesh/obligations")
+          );
+          await page.getByRole("button", { name: "Create", exact: true }).click();
+          const sent = await mutation;
+          expect(sent.headers()["x-rusa-csrf"]).toBe(
+            (await context.cookies()).find((entry) => entry.name === "__Host-rusa_csrf")?.value
+          );
+          expect(sent.headers()["x-rusa-csrf"]).toBeTruthy();
+          await page.getByRole("button", { name: "Cancel", exact: true }).click();
           await page.getByRole("button", { name: "Profile menu" }).click();
           await page.getByRole("menuitem", { name: "Log out", exact: true }).click();
           await page.getByRole("button", { name: "Sign in with Google", exact: true }).waitFor();

@@ -86,17 +86,23 @@ describe("single-operator dashboard authentication", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     vi.useRealTimers();
   });
-  const post = (path: string, cookie?: string, extra: Record<string, string> = {}) =>
-    fetch(origin + path, {
+  const post = async (path: string, cookie?: string, extra: Record<string, string> = {}) => {
+    const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
+      headers: { "X-Rusa-CSRF-Bootstrap": "1", ...(cookie ? { Cookie: cookie } : {}) },
+    });
+    const csrfCookie = bootstrap.headers.getSetCookie()[0].split(";")[0];
+    return fetch(origin + path, {
       method: "POST",
       headers: {
         Origin: origin,
         "Content-Type": "application/json",
-        ...(cookie ? { Cookie: cookie } : {}),
+        Cookie: [cookie, csrfCookie].filter(Boolean).join("; "),
+        "X-Rusa-CSRF": csrfCookie.slice(csrfCookie.indexOf("=") + 1),
         ...extra,
       },
       body: JSON.stringify({ idToken: "id-token" }),
     });
+  };
   async function login(): Promise<string> {
     const res = await post("/api/auth/session");
     expect(res.status).toBe(200);
@@ -104,6 +110,87 @@ describe("single-operator dashboard authentication", () => {
     if (!cookie) throw new Error("Expected a session cookie");
     return cookie.split(";")[0];
   }
+
+  it("requires a protected bootstrap, without authenticating or extending a session", async () => {
+    expect((await fetch(`${origin}/api/auth/csrf`)).status).toBe(403);
+    expect(
+      (
+        await fetch(`${origin}/api/auth/csrf`, {
+          headers: {
+            "X-Rusa-CSRF-Bootstrap": "1",
+            Origin: "https://evil.example",
+          },
+        })
+      ).status
+    ).toBe(403);
+    const response = await fetch(`${origin}/api/auth/csrf`, {
+      headers: { "X-Rusa-CSRF-Bootstrap": "1" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const cookie = response.headers.getSetCookie()[0];
+    expect(cookie).toMatch(/^__Host-rusa_csrf=[a-f0-9]{64}\.[a-f0-9]{64};/);
+    expect(cookie).toContain("Path=/; Secure; SameSite=Strict");
+    expect(cookie).not.toContain("HttpOnly");
+    expect(firebase.createSessionCookie).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "/api/auth/session",
+    "/api/auth/refresh",
+    "/api/auth/logout",
+    "/api/mesh/actors/actor/interrupt",
+  ])("rejects missing or forged double-submit tokens on %s", async (path) => {
+    const cookie = await login();
+    for (const csrf of ["", `${"a".repeat(64)}.${"b".repeat(64)}`]) {
+      const response = await fetch(origin + path, {
+        method: "POST",
+        headers: {
+          Origin: origin,
+          Cookie: `${cookie}; __Host-rusa_csrf=${csrf}`,
+          "X-Rusa-CSRF": csrf,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ idToken: "id-token" }),
+      });
+      expect(response.status).toBe(403);
+      expect(response.headers.get("set-cookie")).toBeNull();
+    }
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(firebase.createSessionCookie).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects mismatched, duplicate, and another session's CSRF cookie", async () => {
+    const first = await login();
+    const response = await fetch(`${origin}/api/auth/csrf`, {
+      headers: {
+        "X-Rusa-CSRF-Bootstrap": "1",
+        Cookie: first,
+      },
+    });
+    const csrfCookie = response.headers.getSetCookie()[0].split(";")[0];
+    const csrf = csrfCookie.split("=")[1];
+    const second = await login();
+    for (const [cookie, header] of [
+      [`${first}; ${csrfCookie}`, "mismatch"],
+      [`${first}; ${csrfCookie}; ${csrfCookie}`, csrf],
+      [`${second}; ${csrfCookie}`, csrf],
+      [csrfCookie, csrf],
+    ]) {
+      expect(
+        (
+          await fetch(`${origin}/api/auth/logout`, {
+            method: "POST",
+            headers: {
+              Origin: origin,
+              Cookie: cookie,
+              "X-Rusa-CSRF": header,
+            },
+          })
+        ).status
+      ).toBe(403);
+    }
+  });
 
   it("exposes only client-safe config and a generic login shell", async () => {
     const res = await fetch(`${origin}/api/auth/config`);
@@ -142,7 +229,7 @@ describe("single-operator dashboard authentication", () => {
   it("accepts the verified sole Google user and protects cookie attributes", async () => {
     const res = await post("/api/auth/session");
     expect(res.status).toBe(200);
-    expect(res.headers.get("set-cookie")).toBe(
+    expect(res.headers.getSetCookie()[0]).toBe(
       `${SESSION_COOKIE}=cookie-1; Max-Age=432000; Path=/; Secure; HttpOnly; SameSite=Strict`
     );
     const authorized = await fetch(`${origin}/api/dashboard/config`, {
@@ -242,9 +329,18 @@ describe("single-operator dashboard authentication", () => {
 
   it("binds authenticated actions to human:operator instead of a body-supplied identity", async () => {
     const cookie = await login();
+    const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
+      headers: { "X-Rusa-CSRF-Bootstrap": "1", Cookie: cookie },
+    });
+    const csrfCookie = bootstrap.headers.getSetCookie()[0].split(";")[0];
     const res = await fetch(`${origin}/api/mesh/actors/actor/interrupt`, {
       method: "POST",
-      headers: { Cookie: cookie, Origin: origin, "Content-Type": "application/json" },
+      headers: {
+        Cookie: `${cookie}; ${csrfCookie}`,
+        Origin: origin,
+        "Content-Type": "application/json",
+        "X-Rusa-CSRF": csrfCookie.split("=")[1],
+      },
       body: JSON.stringify({ by: "forged-actor" }),
     });
     expect(res.status).toBe(200);

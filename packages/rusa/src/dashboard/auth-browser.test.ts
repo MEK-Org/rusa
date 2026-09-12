@@ -47,12 +47,14 @@ describe("dashboard login and activity", () => {
     delete document.documentElement.dataset.rusaProfilePhoto;
     delete document.documentElement.dataset.rusaSessionIdle;
     sdk.auth.currentUser = sdk.user;
+    vi.spyOn(document, "cookie", "get").mockReturnValue("__Host-rusa_csrf=test-csrf");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
         requests.push(url);
         if (url.endsWith("/config"))
           return Response.json({ enabled, firebase: { projectId: "project" } });
+        if (url.endsWith("/csrf")) return Response.json({ ok: true });
         const status = url.endsWith("/refresh") ? refreshStatus : sessionStatus;
         return Response.json({}, { status });
       })
@@ -94,6 +96,14 @@ describe("dashboard login and activity", () => {
 
   it("renews on a visit, pauses after one idle hour, and resumes on navigation", async () => {
     await startDashboardAuth();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/auth/csrf",
+      expect.objectContaining({ headers: { "X-Rusa-CSRF-Bootstrap": "1" } })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/auth/refresh",
+      expect.objectContaining({ headers: expect.objectContaining({ "X-Rusa-CSRF": "test-csrf" }) })
+    );
     expect(document.documentElement.dataset.rusaProfilePhoto).toBe(sdk.user.photoURL);
     expect(bootstrap()).not.toBeNull();
     expect(requests.filter((url) => url.endsWith("/refresh"))).toHaveLength(1);

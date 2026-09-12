@@ -81,14 +81,28 @@ export async function startDashboardAuth(reload = () => window.location.reload()
   await setPersistence(auth, browserLocalPersistence);
   await auth.authStateReady();
 
-  const post = (path: string, idToken?: string) =>
-    fetch(`/api/auth/${path}`, {
+  const post = async (path: string, idToken?: string) => {
+    const bootstrap = await fetch("/api/auth/csrf", {
+      headers: { "X-Rusa-CSRF-Bootstrap": "1" },
+      cache: "no-store",
+    });
+    if (!bootstrap.ok) throw new Error("CSRF bootstrap unavailable");
+    const csrf = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .filter((part) => part.startsWith("__Host-rusa_csrf="));
+    if (csrf.length !== 1) throw new Error("CSRF cookie unavailable");
+    return fetch(`/api/auth/${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Rusa-CSRF": csrf[0].slice("__Host-rusa_csrf=".length),
+      },
       body: JSON.stringify(idToken ? { idToken } : {}),
       credentials: "same-origin",
       cache: "no-store",
     });
+  };
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
 
