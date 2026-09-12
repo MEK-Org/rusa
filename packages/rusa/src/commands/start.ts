@@ -90,7 +90,6 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import {
-  describePool,
   RootModelConfigStartupError,
   resolveRootBootModelConfig,
 } from "../actor/root-model-config.js";
@@ -198,6 +197,7 @@ import { createExhaustionClassifier } from "../providers/exhaustion-classifier.j
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import {
+  describeModelConfigPool,
   fillModelConfigFromCurrent,
   resolveModelClasses,
   validateModelConfigPool,
@@ -210,7 +210,6 @@ import {
   QUOTA_THROTTLE_PROVIDERS,
   type QuotaThrottleProvider,
   resolveProvider,
-  resolveRootProvider,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
@@ -1072,18 +1071,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // writes it, and wins over the scalar `rootActor` file tuple once it exists.
   // The file seeds only a record with no pool. Resolved before any server is
   // bound so an unrunnable persisted pool stops boot with nothing to unwind.
+  // The file tuple itself was validated by the config loader; what is checked
+  // here is the pool root will actually run on, instantiated entry by entry
+  // the way worker spawn preflights its own pool.
+  const rootBootstrapTuple: RawProviderModelConfig = {
+    provider: rootActor.provider,
+    model: rootActor.model,
+    ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+  };
   let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig>;
   try {
     rootBootModelConfig = resolveRootBootModelConfig({
       config,
       actors,
       rootId,
-      bootstrap: {
-        provider: rootActor.provider,
-        model: rootActor.model,
-        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
-      },
+      bootstrap: rootBootstrapTuple,
       portable: rootActor.context?.type === "portable",
+      preflight: (entry) => resolveProvider(config, entry.provider, entry.model, entry.effort),
     });
   } catch (err) {
     if (!(err instanceof RootModelConfigStartupError)) throw err;
@@ -1096,11 +1100,29 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     process.exit(1);
     return;
   }
+  const rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
   log.info("root_model_config_resolved", {
     rootId,
     source: rootBootModelConfig.source,
-    modelConfig: describePool(rootBootModelConfig.modelConfig),
+    modelConfig: rootModelConfigDescription,
   });
+  // Every boot before #333 wrote the file tuple onto the row, so an upgraded
+  // database already carries a pool and the file stops steering root from
+  // here on. Say so whenever the two differ: a healthy boot on a model the
+  // operator just edited away from would otherwise be the only signal.
+  const configuredRootDescription = describeModelConfigPool([rootBootstrapTuple]);
+  if (
+    rootBootModelConfig.source === "persisted" &&
+    rootModelConfigDescription !== configuredRootDescription
+  ) {
+    log.warn("root_model_config_file_ignored", {
+      rootId,
+      configured: configuredRootDescription,
+      persisted: rootModelConfigDescription,
+      action:
+        "root's model is durable on its actor record after bootstrap; change it with set_actor_model, or clear the root row's model_config in the actors table to seed it from rootActor again",
+    });
+  }
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
@@ -1192,15 +1214,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
-  // The scalar `rootActor` tuple must still resolve even when the persisted
-  // pool won above: it seeds a fresh record and remains the launch policy of
-  // the root-only `fallback` degrade path.
-  try {
-    resolveRootProvider(config);
-  } catch (err) {
-    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
-  }
   const fallbackModels = normalizeFallbackModel(config);
   const classifyExhaustion = createExhaustionClassifier(config.geminiApiKey);
   const repoRoot = (() => {
@@ -2054,12 +2067,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        const poolDesc = modelConfigPool
-          .map(
-            (c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`
-          )
-          .join(", ");
-        const errorMsg = `worker ${id} spawn failed: declared modelConfig [${poolDesc}] could not be resolved: ${reason}`;
+        const errorMsg = `worker ${id} spawn failed: declared modelConfig [${describeModelConfigPool(modelConfigPool)}] could not be resolved: ${reason}`;
         console.error(`[mesh] ${errorMsg}`);
 
         teardownActorMcp(id);
@@ -2848,8 +2856,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // ordered pool after a restart, or the configured tuple on first boot
       // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
       // so resolution reads the live entry rather than freezing the
-      // boot-time `resolveRootProvider` result. `fallback` below is its own,
-      // separate degrade path.
+      // boot-time pool. `fallback` below is its own, separate degrade path.
       modelConfig: [...rootBootModelConfig.modelConfig],
       resolveProvider: (selected) =>
         resolveProvider(config, selected.provider, selected.model, selected.effort),
@@ -3046,10 +3053,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     isRoot: true,
     // Persisted pool preserved verbatim (validated, same order), or the
     // configured tuple seeding a record that had none. Adoption merges onto
-    // the existing row, so `modelClass` is written explicitly: retained with a
-    // persisted pool, cleared when the file seeds a fresh one.
+    // the existing row, which is what keeps a persisted pool's `modelClass`.
     modelConfig: rootBootModelConfig.modelConfig,
-    modelClass: rootBootModelConfig.modelClass,
     context: rootActor.context,
     sessionId:
       rootActor.context?.type === "portable"
@@ -3099,7 +3104,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ? `portable/${rootContext.mode} (stateless)`
         : (actors.get(rootId)?.sessionId ?? "(new)");
     console.log(
-      `[root] model_config=${describePool(rootBootModelConfig.modelConfig)} (${rootBootModelConfig.source}) session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
+      `[root] model_config=${rootModelConfigDescription} (${rootBootModelConfig.source}) session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
     );
   }
 

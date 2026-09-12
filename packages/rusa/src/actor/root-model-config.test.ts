@@ -40,8 +40,9 @@ function repositoryWith(record?: ActorRecord): InMemoryActorRepository {
 }
 
 describe("resolveRootBootModelConfig", () => {
-  it("preserves a persisted ordered pool and its class provenance over the configured tuple", () => {
+  it("preserves a persisted ordered pool over the configured tuple, preflighting every entry in order", () => {
     const actors = repositoryWith(rootRecord({ modelConfig: pool, modelClass: "frontier" }));
+    const preflighted: ProviderModelConfig[] = [];
 
     const resolved = resolveRootBootModelConfig({
       config: bothProviders,
@@ -49,9 +50,13 @@ describe("resolveRootBootModelConfig", () => {
       rootId: "root",
       bootstrap,
       portable: true,
+      preflight: (entry) => preflighted.push(entry),
     });
 
-    expect(resolved).toEqual({ source: "persisted", modelConfig: pool, modelClass: "frontier" });
+    // Class provenance is not this decision's to make: it rides along on the
+    // record merge, so the resolved value carries only the pool.
+    expect(resolved).toEqual({ source: "persisted", modelConfig: pool });
+    expect(preflighted).toEqual(pool);
   });
 
   it("seeds from the configured tuple when the record has no persisted pool", () => {
@@ -123,6 +128,27 @@ describe("resolveRootBootModelConfig", () => {
         portable: false,
       })
     ).toThrow(RootModelConfigStartupError);
+  });
+
+  it("fails by name when a persisted entry validates but its provider cannot be instantiated", () => {
+    const actors = repositoryWith(rootRecord({ modelConfig: pool }));
+
+    const attempt = () =>
+      resolveRootBootModelConfig({
+        config: bothProviders,
+        actors,
+        rootId: "root",
+        bootstrap,
+        portable: true,
+        preflight: (entry) => {
+          if (entry.provider === "antigravity") throw new Error("no adapter for agy in this build");
+        },
+      });
+
+    expect(attempt).toThrow(RootModelConfigStartupError);
+    expect(attempt).toThrow(
+      /persisted model_config that is not valid under the current configuration: no adapter for agy in this build/
+    );
   });
 
   it("fails by name when the configured tuple cannot seed an empty record", () => {

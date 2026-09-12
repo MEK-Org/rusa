@@ -1,10 +1,20 @@
 import type { RusaConfig } from "../config/types.js";
 import {
+  describeModelConfigPool,
   type ProviderModelConfig,
   type RawProviderModelConfig,
   validateModelConfigPool,
 } from "../providers/model-config.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+
+/**
+ * The root's boot-time model-pool decision, kept apart from `start.ts` because
+ * it is a root-only carve-out: every other actor's pool is simply read from its
+ * record, and the day root stops being special (#333's stated direction) this
+ * module is deleted whole rather than untangled from the boot sequence. Being
+ * a pure function of config plus repository also lets the refusal branches be
+ * pinned without booting the service.
+ */
 
 /**
  * Startup refused to construct the root actor because the `model_config`
@@ -33,8 +43,6 @@ export interface RootBootModelConfig {
   source: "persisted" | "bootstrap";
   /** Validated, ordered pool the live root actor and its record both run on. */
   modelConfig: ProviderModelConfig[];
-  /** Class provenance retained from the persisted record; never set on bootstrap. */
-  modelClass?: string;
 }
 
 /**
@@ -47,7 +55,14 @@ export interface RootBootModelConfig {
  * validator every spawn and `set_actor_model` already passes through. The
  * scalar `rootActor` file fields only seed a record that carries no pool at
  * all: a fresh database, or a legacy document that predates the required
- * provider/model contract and is read back as unset.
+ * provider/model contract and is read back as unset. `modelClass` is not
+ * decided here: the repository only reads it off a document that also carries
+ * a non-empty pool, so a preserved pool keeps its class through the record
+ * merge and a seeded one never had a class to lose.
+ *
+ * `preflight` runs once per validated entry (the caller instantiates the
+ * provider, as worker spawn does for its pool) so an adapter the build lacks
+ * refuses boot here, by name, rather than on root's first run.
  *
  * A persisted pool that no longer validates (a provider removed from
  * `providers`, a model the catalog now rejects, a multi-entry pool on a root
@@ -61,46 +76,37 @@ export function resolveRootBootModelConfig(input: {
   rootId: string;
   bootstrap: RawProviderModelConfig;
   portable: boolean;
+  preflight?: (entry: ProviderModelConfig) => void;
 }): RootBootModelConfig {
-  const { config, rootId, portable } = input;
-  const existing = input.actors.get(rootId);
-  const persisted = existing?.modelConfig;
+  const { config, rootId, portable, preflight } = input;
+  const persisted = input.actors.get(rootId)?.modelConfig;
+  const resolve = (pool: readonly RawProviderModelConfig[]): ProviderModelConfig[] => {
+    const modelConfig = validateModelConfigPool(config, [...pool], { portable });
+    for (const entry of modelConfig) preflight?.(entry);
+    return modelConfig;
+  };
   if (persisted && persisted.length > 0) {
-    let modelConfig: ProviderModelConfig[];
     try {
-      modelConfig = validateModelConfigPool(config, persisted, { portable });
+      return { source: "persisted", modelConfig: resolve(persisted) };
     } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : String(cause);
       throw new RootModelConfigStartupError(
-        `root actor '${rootId}' has a persisted model_config that is not valid under the current configuration: ${reason} (persisted pool: ${describePool(persisted)})`,
+        `root actor '${rootId}' has a persisted model_config that is not valid under the current configuration: ${reasonOf(cause)} (persisted pool: ${describeModelConfigPool(persisted)})`,
         "restore the provider/model it names in config.yaml, or clear the root row's model_config in the actors table so the configured rootActor tuple seeds it again; startup never overwrites a persisted root pool from the file",
         { cause }
       );
     }
-    return {
-      source: "persisted",
-      modelConfig,
-      ...(existing?.modelClass === undefined ? {} : { modelClass: existing.modelClass }),
-    };
   }
   try {
-    return {
-      source: "bootstrap",
-      modelConfig: validateModelConfigPool(config, [input.bootstrap], { portable }),
-    };
+    return { source: "bootstrap", modelConfig: resolve([input.bootstrap]) };
   } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
     throw new RootModelConfigStartupError(
-      `root actor '${rootId}' has no persisted model_config and the configured rootActor tuple cannot seed it: ${reason} (configured: ${describePool([input.bootstrap])})`,
+      `root actor '${rootId}' has no persisted model_config and the configured rootActor tuple cannot seed it: ${reasonOf(cause)} (configured: ${describeModelConfigPool([input.bootstrap])})`,
       "set rootActor.provider/model/effort in config.yaml to a provider declared under `providers` and a model it accepts",
       { cause }
     );
   }
 }
 
-/** Human-readable pool summary, matching the mesh's model-set event wording. */
-export function describePool(pool: readonly RawProviderModelConfig[]): string {
-  return pool
-    .map((c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`)
-    .join(", ");
+function reasonOf(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }

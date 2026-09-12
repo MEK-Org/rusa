@@ -11,6 +11,7 @@ import {
 } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
+  describeModelConfigPool,
   isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
@@ -323,13 +324,6 @@ function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[
     }
     return { provider: entry.provider, model, effort: entry.effort };
   });
-}
-
-/** Human-readable pool summary for the spawn/model-set event log. */
-function describeModelConfigPool(pool: readonly ProviderModelConfig[]): string {
-  return pool
-    .map((c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`)
-    .join(", ");
 }
 
 function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): string {

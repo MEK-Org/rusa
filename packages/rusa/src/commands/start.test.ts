@@ -143,6 +143,27 @@ vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
   refreshConfiguredProviderModelCatalogs: modelScrapeMock.refreshConfiguredProviderModelCatalogs,
 }));
 
+// Structured records go to a synchronous fd-1 sink that bypasses
+// `process.stdout.write`; route every logger built during a test into this
+// capture so a boot record can be asserted the way an operator would read it.
+const logCapture = vi.hoisted(() => ({ lines: [] as string[] }));
+
+vi.mock("../observability/logger.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../observability/logger.js")>();
+  return {
+    ...actual,
+    createLogger: (options: Parameters<typeof actual.createLogger>[0] = {}) =>
+      actual.createLogger({
+        ...options,
+        destination: {
+          write: (line: string) => {
+            logCapture.lines.push(line);
+          },
+        },
+      }),
+  };
+});
+
 import {
   getShutdownExitCode,
   isLegacyWorktreeKey,
@@ -3909,6 +3930,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const rootActorOpts = (mesh: ActorMesh) =>
       (mesh.get("root") as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } })
         .opts;
+    const bootRecords = (msg: string): Record<string, unknown>[] =>
+      logCapture.lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((record) => record.msg === msg);
+    const readRootModelConfigRow = (): unknown => {
+      const db = new Database(join(homeDir, "data", "mesh.db"), { readonly: true });
+      try {
+        const row = db.prepare("SELECT model_config FROM actors WHERE id = ?").get("root") as {
+          model_config: string;
+        };
+        return JSON.parse(row.model_config);
+      } finally {
+        db.close();
+      }
+    };
 
     // Boot on the file tuple, move root to the operator pool through the same
     // set/apply path production uses, and stop — the database now carries the
@@ -3927,6 +3963,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     beforeEach(() => {
       clearProviderModelCatalog("antigravity");
       clearProviderModelCatalog("claude");
+      logCapture.lines.length = 0;
       writeFileSync(
         join(homeDir, "config.yaml"),
         toYaml(portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" })),
@@ -3936,6 +3973,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     it("preserves the persisted ordered pool across a restart on the record and the live root", async () => {
       await persistOperatorPool();
+      logCapture.lines.length = 0;
 
       const mesh = await boot();
 
@@ -3943,6 +3981,79 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(liveRootPool(mesh)).toEqual(operatorPool);
       // The restart preserved the value; it did not "set" anything.
       expect(modelSetEvents()).toHaveLength(1);
+      expect(bootRecords("root_model_config_resolved")).toMatchObject([
+        {
+          level: "info",
+          source: "persisted",
+          modelConfig: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
+        },
+      ]);
+      // The file still names the bootstrap tuple, so the operator is told it
+      // no longer steers root — with both values and what to do instead.
+      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
+        {
+          level: "warn",
+          configured: "antigravity:Gemini 3.7 Flash @ high",
+          persisted: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
+          action: expect.stringMatching(/set_actor_model/),
+        },
+      ]);
+    });
+
+    it("keeps an upgraded database on the tuple its last boot wrote, not the tuple the file now says", async () => {
+      // Before #333 every boot wrote the file tuple onto the root row, so a
+      // database upgraded across this change already carries one — this is
+      // the common case, not the operator-pool one: boot once on the old
+      // file, edit the file, boot again.
+      const first = await boot();
+      expect(first.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml(portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "low" })),
+        "utf8"
+      );
+      logCapture.lines.length = 0;
+
+      const restarted = await boot();
+
+      expect(restarted.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      expect(liveRootPool(restarted)).toEqual([bootTuple]);
+      expect(modelSetEvents()).toHaveLength(0);
+      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
+        {
+          level: "warn",
+          configured: "antigravity:Gemini 4.1 Ultra @ low",
+          persisted: "antigravity:Gemini 3.7 Flash @ high",
+        },
+      ]);
+    });
+
+    it("keeps the persisted pool's class provenance through a restart", async () => {
+      await persistOperatorPool();
+      // A class-bearing (v3) document only ever carries a non-empty pool, so
+      // the merge onto the existing row is what keeps the class: startup
+      // decides the pool and leaves the class alone.
+      const db = new Database(join(homeDir, "data", "mesh.db"));
+      try {
+        db.prepare("UPDATE actors SET model_config = ? WHERE id = ?").run(
+          JSON.stringify({ schemaVersion: 3, entries: operatorPool, modelClass: "frontier" }),
+          "root"
+        );
+      } finally {
+        db.close();
+      }
+
+      const mesh = await boot();
+
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(mesh.actors.get("root")?.modelClass).toBe("frontier");
+      expect(readRootModelConfigRow()).toEqual({
+        schemaVersion: 3,
+        entries: operatorPool,
+        modelClass: "frontier",
+      });
     });
 
     it("does not replace a persisted pool with a changed scalar rootActor tuple", async () => {
@@ -3968,6 +4079,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(mesh.actors.get("root")?.modelConfig).toEqual([bootTuple]);
       expect(liveRootPool(mesh)).toEqual([bootTuple]);
       expect(modelSetEvents()).toHaveLength(0);
+      expect(bootRecords("root_model_config_resolved")).toMatchObject([{ source: "bootstrap" }]);
+      expect(bootRecords("root_model_config_file_ignored")).toEqual([]);
     });
 
     it("seeds a fresh database with a minted root from the configured tuple", async () => {
@@ -4012,19 +4125,60 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(ready).toBe(false);
       expect(process.exit).toHaveBeenCalledWith(1);
-      // The refusal is a structured `root_model_config_invalid` record, not prose.
+      // The refusal is a structured `root_model_config_invalid` record carrying
+      // the reason and an action, not prose.
       expect(consoleError).not.toHaveBeenCalled();
       consoleError.mockRestore();
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          level: "error",
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(/provider "claude" is not configured/),
+          action: expect.stringMatching(/clear the root row's model_config/),
+        },
+      ]);
       // Nothing rewrote the persisted pool on the way out.
-      const db = new Database(join(homeDir, "data", "mesh.db"), { readonly: true });
-      try {
-        const row = db.prepare("SELECT model_config FROM actors WHERE id = ?").get("root") as {
-          model_config: string;
-        };
-        expect(JSON.parse(row.model_config)).toEqual({ schemaVersion: 2, entries: operatorPool });
-      } finally {
-        db.close();
-      }
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 2, entries: operatorPool });
+    });
+
+    it("refuses to boot when a persisted entry validates but its provider has no adapter", async () => {
+      // The boot-time instantiation check follows the pool root actually runs
+      // on, not the file tuple: an effort-free claude entry passes validation
+      // under an unknown cliCommand and fails only when instantiated.
+      const mesh = await boot();
+      mesh.setActorModel("root", [{ provider: "claude", model: "claude-sonnet-5" }], "root");
+      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...config,
+          providers: { ...config.providers, claude: { cliCommand: "nonsense" } },
+        }),
+        "utf8"
+      );
+      logCapture.lines.length = 0;
+      let ready = false;
+
+      await runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      });
+
+      expect(ready).toBe(false);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(/No implementation for CLI command "nonsense"/),
+        },
+      ]);
     });
 
     it("refuses to boot on a corrupt persisted model_config document", async () => {
@@ -4040,9 +4194,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
       let ready = false;
 
-      // The repository already refuses a malformed document fail-closed; what
-      // matters here is that boot propagates that refusal instead of quietly
-      // running the root on the file tuple.
+      // The repository already refuses a malformed document fail-closed, from
+      // the `actors.list()` that resolves the root id — before the pool is
+      // decided, and for any actor's row, not only root's. What matters here
+      // is that boot propagates that refusal instead of quietly running the
+      // root on the file tuple.
       await expect(
         runStart({
           e2e: {
