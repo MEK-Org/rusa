@@ -1,7 +1,11 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -9323,5 +9327,148 @@ describe("strict obligation handling experiment (#382)", () => {
     // An unenrolled actor on the same partial port is untouched.
     expect(() => selectHead(mesh, unenrolled, "partial-control-head")).not.toThrow();
     expect(() => mesh.declareYield(unenrolled, "complete")).not.toThrow();
+  });
+});
+
+describe("accountRun token accounting (#443)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "rusa-account-run-test-"));
+    initDb(tempDir);
+  });
+
+  afterEach(() => {
+    closeDb();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("records token accounting for root using its concrete run id and preserving fields", () => {
+    const rootId = "root-custom-id";
+    const runId = "root-run-id";
+    const { mesh } = setup({ rootId });
+
+    mesh.accountRun(
+      rootId,
+      {
+        success: true,
+        output: "test output",
+        exitCode: 0,
+        tokenUsage: {
+          provider: "claude",
+          model: "claude-sonnet-4-6",
+          scrapedAt: "2026-09-12T12:00:00.000Z",
+          uncachedInput: 200,
+          cacheRead: 80,
+          output: 40,
+          reasoning: null,
+          response: null,
+        },
+      },
+      runId
+    );
+
+    const records = getDb()
+      .prepare("SELECT * FROM run_token_records WHERE run_id = ?")
+      .all(runId) as Array<Record<string, unknown>>;
+
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      run_id: runId,
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+      scraped_at: "2026-09-12T12:00:00.000Z",
+      uncached_input: 200,
+      cache_read: 80,
+      output: 40,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("preserves honest absence when provider supplies no usage or null counts", () => {
+    const { mesh } = setup();
+
+    // 1. result with no tokenUsage does not write a record
+    mesh.accountRun("root", {
+      success: true,
+      output: "no tokens",
+      exitCode: 0,
+    });
+
+    let records = getDb().prepare("SELECT * FROM run_token_records").all();
+    expect(records).toHaveLength(0);
+
+    // 2. unattributed tokenUsage preserves nulls without synthesizing zeroes
+    const runId = "root-codex-run";
+    mesh.accountRun(
+      "root",
+      {
+        success: true,
+        output: "unattributed tokens",
+        exitCode: 0,
+        tokenUsage: {
+          provider: "codex",
+          model: "gpt-5.6-sol",
+          scrapedAt: "2026-09-12T12:05:00.000Z",
+          uncachedInput: null,
+          cacheRead: null,
+          output: null,
+          reasoning: null,
+          response: null,
+        },
+      },
+      runId
+    );
+
+    records = getDb().prepare("SELECT * FROM run_token_records WHERE run_id = ?").all(runId);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      run_id: runId,
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      uncached_input: null,
+      cache_read: null,
+      output: null,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("records token accounting for worker actors", () => {
+    const { mesh } = setup();
+    const workerId = mesh.spawn({ charter: "subactor", parentId: "root" });
+    const runId = "worker-run-id";
+
+    mesh.accountRun(
+      workerId,
+      {
+        success: true,
+        output: "worker done",
+        exitCode: 0,
+        tokenUsage: {
+          provider: "claude",
+          model: "claude-haiku-4-5",
+          scrapedAt: "2026-09-12T12:10:00.000Z",
+          uncachedInput: 50,
+          cacheRead: 10,
+          output: 5,
+          reasoning: null,
+          response: null,
+        },
+      },
+      runId
+    );
+
+    const records = getDb().prepare("SELECT * FROM run_token_records WHERE run_id = ?").all(runId);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      run_id: runId,
+      provider: "claude",
+      model: "claude-haiku-4-5",
+      uncached_input: 50,
+      cache_read: 10,
+      output: 5,
+    });
   });
 });
