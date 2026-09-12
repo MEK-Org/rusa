@@ -59,6 +59,15 @@ Minimal example:
     secret: GENERATED_SECRET
     externalUrl: https://example.ngrok-free.app/webhook
 
+  # Optional single-user Google login. Omit auth for unauthenticated local mode.
+  # auth:
+  #   email: owner@example.com
+  #   firebase:
+  #     projectId: example-project
+  #     apiKey: YOUR_FIREBASE_WEB_API_KEY
+  #     authDomain: example-project.firebaseapp.com
+  #     serviceAccountKeyPath: /absolute/path/to/firebase-admin.json
+
   dashboard:
     port: 8080
     quotaProviders:

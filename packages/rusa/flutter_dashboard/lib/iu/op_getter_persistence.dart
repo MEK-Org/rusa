@@ -5,6 +5,7 @@ import 'dart:developer' as developer;
 // Op is re-exported by goals_core/sync.dart, so we don't take a direct goals_types dep.
 import 'package:goals_core/sync.dart' show LoadOpsResp, Op, PersistenceService;
 import 'package:http/http.dart' as http;
+import '../session_client.dart';
 
 /// A **read-only** [PersistenceService] for the IU calibration view (ISSUE_NUM 2b).
 ///
@@ -19,7 +20,7 @@ import 'package:http/http.dart' as http;
 /// bodies via `loadString`, not inline). It NEVER writes: [save] throws.
 class OpGetterPersistenceService implements PersistenceService {
   OpGetterPersistenceService({this.baseUrl = '', http.Client? client})
-    : _client = client ?? http.Client();
+    : _client = SessionClient(client);
 
   /// Origin for the endpoint; '' = same-origin (the dashboard serves both).
   final String baseUrl;

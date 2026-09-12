@@ -59,6 +59,7 @@ ${"━".repeat(26)}
   // viewer can surface the halt state even though no mesh runs in this process.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
   const dashboardServer = await startDashboardServer({
+    auth: config.auth,
     port: dashboardPort,
     bindHost: dashboardBindHost,
     logger: log,

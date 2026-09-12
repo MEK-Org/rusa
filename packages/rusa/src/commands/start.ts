@@ -118,6 +118,7 @@ import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
 import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
+import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
@@ -515,6 +516,8 @@ export interface RunStartE2EHandles {
  * The issue-client edge is swapped via the existing `setIssueClient` global.
  */
 export interface RunStartE2EHooks {
+  /** Emulator boundary supplied only by the disposable e2e launcher. */
+  dashboardAuth?: DashboardAuth;
   /** Experimental execution seam; production always constructs a local Actor. */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
@@ -3348,6 +3351,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     noDashboardServer,
   })
     ? await startDashboardServer({
+        auth: config.auth,
+        e2eAuth: opts?.e2e?.dashboardAuth,
         port: dashboardPort,
         bindHost: dashboardBindHost,
         logger: log,

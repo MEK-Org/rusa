@@ -15,6 +15,7 @@ import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { getRepositories } from "../db/index.js";
+import { createE2EDashboardAuth } from "../e2e/auth-emulator.js";
 import { FakeIssueClient } from "../e2e/fake-issue-client.js";
 import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "../e2e/git-remote-server.js";
 import { LocalTracker } from "../e2e/local-tracker.js";
@@ -125,6 +126,8 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
  * Teardown + root removal is via `e2e am-down --root <root>`.
  */
 export async function runActorMeshE2EUp(opts: {
+  authEmulator?: string;
+  authEmail?: string;
   root?: string;
   baseConfigHome?: string;
   rootDriver?: "provider" | "external";
@@ -141,6 +144,9 @@ export async function runActorMeshE2EUp(opts: {
   const chatPort = CHAT_CONTROL_PORT + offset;
   const controlPort = opts.rootControlPort ?? ROOT_CONTROL_PORT + offset;
   const gitRemotePort = GIT_REMOTE_PORT + offset;
+  const dashboardAuth = opts.authEmulator
+    ? createE2EDashboardAuth(opts.authEmulator, opts.authEmail ?? "operator@example.com")
+    : undefined;
   try {
     assertBwrapAvailable();
   } catch (err) {
@@ -306,6 +312,7 @@ export async function runActorMeshE2EUp(opts: {
       rootDriver: opts.rootDriver,
       createWorkerActor: followerHub ? instanceWorkerFactory(config, followerHub) : undefined,
       dashboard: true,
+      dashboardAuth,
       quotaApi: createDashboardE2EQuotaApi(),
       onReady: (handles) => {
         emitGitHubEvent = handles.emitGitHubEvent;
