@@ -183,6 +183,84 @@ describe("EventManager", () => {
       expect(entries[0].payload.merged).toBe(true);
     });
 
+    it("routes a native merged PR closure to its exact owner, then its repository owner", () => {
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const exactOwner = "pr-owner";
+      const repositoryOwner = "repo-owner";
+      const liveActors = new Set([exactOwner, repositoryOwner]);
+      owners.subscribe({
+        resource: "github:MEK-Org/glass_goals_devkit/pulls/5",
+        actorId: exactOwner,
+        subscribedBy: "root",
+        subscribedAt: "2026-09-12T12:00:00Z",
+      });
+      owners.subscribe({
+        resource: "github:MEK-Org/glass_goals_devkit",
+        actorId: repositoryOwner,
+        subscribedBy: "root",
+        subscribedAt: "2026-09-12T12:00:00Z",
+      });
+      const inbox = new FakeInboxStore();
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({
+          owners,
+          subscriptions,
+          isLive: (actorId) => liveActors.has(actorId),
+        }),
+      });
+
+      // GitHub puts the PR number at the webhook payload's top level. The
+      // embedded pull_request object deliberately has no duplicate number.
+      const delivery = em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request",
+          payload: {
+            action: "closed",
+            number: 5,
+            repository: { full_name: "MEK-Org/glass_goals_devkit" },
+            pull_request: { merged: true },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual([exactOwner]);
+      expect(delivery.entries).toEqual([
+        expect.objectContaining({
+          actorId: exactOwner,
+          source: "github:MEK-Org/glass_goals_devkit/pulls/5",
+          payload: { type: "pull_request.closed", merged: true },
+        }),
+      ]);
+
+      // PR #6 has no exact owner, so the merged closure is allowed to reach
+      // the live repository owner instead.
+      const fallback = em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request",
+          payload: {
+            action: "closed",
+            number: 6,
+            repository: { full_name: "MEK-Org/glass_goals_devkit" },
+            pull_request: { merged: true },
+          },
+        },
+      });
+
+      expect(fallback.ownerIds).toEqual([repositoryOwner]);
+      expect(fallback.entries).toEqual([
+        expect.objectContaining({
+          actorId: repositoryOwner,
+          source: "github:MEK-Org/glass_goals_devkit/pulls/6",
+          payload: { type: "pull_request.closed", merged: true },
+        }),
+      ]);
+      expect(inbox.entries).toHaveLength(2);
+    });
+
     it("drops a green GitHub check suite inside the normalizer before routing", async () => {
       const inbox = new FakeInboxStore();
       let resolved = false;
