@@ -182,7 +182,23 @@ describe("obligation history payload validation", () => {
     ).toThrow(ObligationValidationError);
   });
 
-  it("rejects malformed externalRef strings that violate canonical grammar or target rules", () => {
+  it("accepts externalRef values the reference grammar admits but the live identity policy refuses", () => {
+    // History records what the claim *was*; a ref the policy later narrows out
+    // of live rows still has to read back from `before`.
+    expect(
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{"externalRef":"github:MEK-Org/rusa/issues/1/comments/2"},"after":{"externalRef":null}}'
+      ).before.externalRef
+    ).toBe("github:MEK-Org/rusa/issues/1/comments/2");
+
+    expect(
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{},"after":{"externalRef":"gchat:spaces/AAAA/messages/BBBB"}}'
+      ).after.externalRef
+    ).toBe("gchat:spaces/AAAA/messages/BBBB");
+  });
+
+  it("rejects externalRef strings that violate the canonical reference grammar", () => {
     expect(() =>
       parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"externalRef":""}}')
     ).toThrow(ObligationValidationError);
@@ -203,13 +219,7 @@ describe("obligation history payload validation", () => {
 
     expect(() =>
       parseHistoryPayload(
-        '{"schemaVersion":1,"before":{},"after":{"externalRef":"gchat:spaces/AAAA/messages/BBBB"}}'
-      )
-    ).toThrow(ObligationValidationError);
-
-    expect(() =>
-      parseHistoryPayload(
-        '{"schemaVersion":1,"before":{},"after":{"externalRef":"github:MEK-Org/rusa/issues/1/comments/2"}}'
+        '{"schemaVersion":1,"before":{},"after":{"externalRef":"github:MEK-Org//rusa"}}'
       )
     ).toThrow(ObligationValidationError);
 
