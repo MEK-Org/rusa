@@ -17,11 +17,12 @@ Widget _header({
   required DashboardStore store,
   required ValueChanged<DashboardView> onSelect,
   required double width,
+  VisualDensity visualDensity = VisualDensity.compact,
 }) => MaterialApp(
   // Desktop web's default density. The test platform would resolve to
   // standard density, which hides how the old zero-minimum / shrink-wrap
   // overrides collapsed the buttons' vertical padding to nothing on desktop.
-  theme: buildMeshTheme().copyWith(visualDensity: VisualDensity.compact),
+  theme: buildMeshTheme().copyWith(visualDensity: visualDensity),
   home: Scaffold(
     body: SizedBox(
       width: width,
@@ -114,6 +115,32 @@ void main() {
     await tester.tap(find.text('Work'));
     await tester.pump();
     expect(selected, [DashboardView.work]);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('standard density centers 48px nav targets in the 70px brand row',
+      (tester) async {
+    final store = await _store(tester);
+    await _surface(tester, 1100);
+    await tester.pumpWidget(
+      _header(
+        store: store,
+        onSelect: (_) {},
+        width: 1100,
+        visualDensity: VisualDensity.standard,
+      ),
+    );
+    await tester.pump();
+
+    // Material's standard text-button target is 48px: it fits with 11px on
+    // each side in the 70px brand row, so its surface and ink remain centered.
+    for (final destination in kDashboardDestinations) {
+      final button = tester.getRect(_button(destination.label));
+      expect(button.height, 48);
+      expect(button.top, 11);
+      expect(button.bottom, 59);
+      expect(button.center.dy, 35);
+    }
     expect(tester.takeException(), isNull);
   });
 
