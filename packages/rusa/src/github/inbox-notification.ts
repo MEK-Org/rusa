@@ -64,14 +64,8 @@ export function deriveGitHubInboxNotification(
   } else {
     const pullRequest = payload.pull_request as { number?: unknown } | undefined;
     const issue = payload.issue as { number?: unknown; pull_request?: unknown } | undefined;
+    const number = integerId(pullRequest?.number) ?? integerId(issue?.number);
     const isPullRequest = pullRequest != null || issue?.pull_request != null;
-    // GitHub's pull_request webhook puts its required PR number at the payload
-    // top level. Keep the nested form for the other GitHub event shapes that
-    // carry a pull_request object of their own.
-    const number =
-      integerId(pullRequest?.number) ??
-      integerId(issue?.number) ??
-      (event === "pull_request" ? integerId(payload.number) : undefined);
     const rawRef = typeof payload.ref === "string" ? payload.ref : undefined;
     const refType = payload.ref_type;
     const ref =

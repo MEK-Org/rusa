@@ -153,6 +153,15 @@ export interface EventSourceRecipients {
    */
   ownerIds: readonly string[];
   subscriberIds: readonly string[];
+  /**
+   * The ownership ladder's own account of how {@link ownerIds} was reached,
+   * carried so a drop can say *which* rung answered and why it yielded nobody
+   * (#428: the drop line alone cannot tell a non-live owner from an
+   * authoritative claim held by a non-runnable principal). Absent only from
+   * resolvers that do not walk the ladder, e.g. test doubles; a landed
+   * directive carries none because no ladder was consulted.
+   */
+  ownership?: EventSourceOwnershipDiagnostic;
 }
 
 export interface AuthorSuppressionInput {
@@ -211,6 +220,23 @@ export function applyAuthorSuppression(input: AuthorSuppressionInput): string[] 
     deliverable.push(dest);
   }
   return deliverable;
+}
+
+/**
+ * Renders the ladder's answer for the uncovered-drop journal line without the
+ * principal. The three fields are what discriminate the drop causes #428 left
+ * open: `governingSource=none` means no rung claimed the resource (an owner
+ * that is not live reads the same as no owner at all, so the walk continued
+ * past it); `governingSource=obligation … isLive=false` means an authoritative
+ * claim stopped the walk at that rung and its holder cannot run. The holder's
+ * identity is deliberately omitted — it may be a human principal, and the
+ * obligation itself is the place to look it up.
+ */
+export function describeUncoveredOwnership(
+  ownership: EventSourceOwnershipDiagnostic | undefined
+): string {
+  if (!ownership) return "governingSource=unknown";
+  return `governingSource=${ownership.governingSource ?? "none"} resourceLevel=${ownership.resourceLevel ?? "none"} isLive=${ownership.isLive}`;
 }
 
 export interface ResolveRecipientsOptions {
@@ -325,11 +351,16 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
     const summary = opts.eventSummary ?? key;
     let directed = false;
     let ownerIds: string[] = [];
+    let ownership: EventSourceOwnershipDiagnostic | undefined;
 
     if (opts.directedTarget) {
       const governing = this.obligationOwnerFor(key);
       if (governing) {
-        ownerIds = this.options.ports.isLive(governing) ? [governing] : [];
+        // The exact claim is already in hand; the ladder returns on its first
+        // rung with the same live-or-nobody answer and the diagnostic to match.
+        const resolution = this.resolveOwner(key, { exactObligationOwner: governing });
+        ownerIds = resolution.ownerIds;
+        ownership = resolution.diagnostic;
       } else {
         const target = this.options.ports.resolveActor?.(opts.directedTarget);
         if (target && this.options.ports.isLive(target.id)) {
@@ -342,18 +373,22 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
           this.options.log?.(
             `mesh:deliver target not live: ${opts.directedTarget} — directive ignored`
           );
-          ownerIds = this.resolveOwner(key, {
+          const resolution = this.resolveOwner(key, {
             eventPayload: opts.eventPayload,
             enforceBubblingPolicy: true,
             exactObligationOwner: null,
-          }).ownerIds;
+          });
+          ownerIds = resolution.ownerIds;
+          ownership = resolution.diagnostic;
         }
       }
     } else {
-      ownerIds = this.resolveOwner(key, {
+      const resolution = this.resolveOwner(key, {
         eventPayload: opts.eventPayload,
         enforceBubblingPolicy: true,
-      }).ownerIds;
+      });
+      ownerIds = resolution.ownerIds;
+      ownership = resolution.diagnostic;
     }
 
     // Direct subscribers are added to whatever ownership resolved to — the two
@@ -385,7 +420,7 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
       }
     }
 
-    return { directed, ownerIds, subscriberIds };
+    return { directed, ownerIds, subscriberIds, ownership };
   }
 
   resolveOwner(
@@ -686,6 +721,7 @@ export class EventManager {
       // slice, events under it would hit this drop when the delegate dies —
       // still visible here, but the invariant is what keeps that from happening.
       this.log?.(`event not covered by any subscription — dropped (${summary})`);
+      this.log?.(`uncovered drop ownership: ${describeUncoveredOwnership(recipients.ownership)}`);
       return { entries: [], ownerIds: [] };
     }
 
