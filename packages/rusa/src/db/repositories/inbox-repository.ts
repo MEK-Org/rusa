@@ -42,19 +42,37 @@ function decodeCursor(cursor: string): CursorValue {
   }
 }
 
+// SQLite's JSON functions throw for malformed text. Always substitute a benign
+// object before extracting scheduling priority so one historic/damaged row
+// cannot prevent inbox queries or the mesh-wide pending-work scan.
+const validJsonPriority =
+  "json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.priority')";
+
+function unavailablePayload(reason: "malformed JSON" | "invalid shape"): InboxPayload {
+  return {
+    type: "inbox.unavailable",
+    unavailable: `stored inbox payload has ${reason}`,
+  };
+}
+
 function toEntry(row: InboxRow): InboxEntry {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload_json);
+  } catch {
+    parsed = unavailablePayload("malformed JSON");
+  }
   let payload: InboxPayload;
   try {
-    payload = JSON.parse(row.payload_json) as InboxPayload;
-    validateInboxPayload(payload);
+    validateInboxPayload(parsed);
+    payload = parsed;
   } catch {
     // Writes reject invalid payloads, but an older or damaged durable row must
     // not make every page containing it unavailable. Keep its id, ownership,
-    // status, and position so the operator can see and clear the honest marker.
-    payload = {
-      type: "inbox.unavailable",
-      unavailable: "stored inbox payload could not be read",
-    };
+    // status, and position so the operator can see and clear the marker. The
+    // marker identifies the failure class but deliberately never exposes the
+    // persisted payload or parser/validation error.
+    payload = unavailablePayload("invalid shape");
   }
   return {
     id: row.id,
@@ -131,7 +149,7 @@ export class InboxRepository implements InboxStore {
       params.push(options.source);
     }
     if (options.responsiveOnly) {
-      where.push("json_extract(payload_json, '$.priority') = 'responsive'");
+      where.push(`${validJsonPriority} = 'responsive'`);
     }
     if (options.cursor) {
       const cursor = decodeCursor(options.cursor);
@@ -165,7 +183,7 @@ export class InboxRepository implements InboxStore {
 
   countUnhandled(actorId: string, options: { responsiveOnly?: boolean } = {}): number {
     const responsiveWhere = options.responsiveOnly
-      ? " AND json_extract(payload_json, '$.priority') = 'responsive'"
+      ? ` AND ${validJsonPriority} = 'responsive'`
       : "";
     const row = this.db
       .prepare(
@@ -256,7 +274,7 @@ export class InboxRepository implements InboxStore {
       .prepare(
         `SELECT actor_id AS actorId,
                 CASE WHEN MAX(
-                  CASE WHEN json_extract(payload_json, '$.priority') = 'responsive'
+                  CASE WHEN ${validJsonPriority} = 'responsive'
                        THEN 1 ELSE 0 END
                 ) = 1 THEN 'responsive' ELSE 'normal' END AS priority
          FROM actor_inbox_entries

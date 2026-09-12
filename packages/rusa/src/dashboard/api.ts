@@ -1524,7 +1524,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/inbox?actor=<id>&status=unhandled|handled|all
+  // GET /api/mesh/inbox?actor=<id>&status=unhandled|handled|all&cursor=<cursor>
   if (pathname === "/api/mesh/inbox") {
     if (!deps.inbox) {
       sendJson(res, 503, { error: "inbox data unavailable" });
@@ -1547,6 +1547,7 @@ export async function handleMeshApiRequest(
         deps.inbox.list(actorId, {
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),
+          cursor: url.searchParams.get("cursor") ?? undefined,
         }),
         deps
       )

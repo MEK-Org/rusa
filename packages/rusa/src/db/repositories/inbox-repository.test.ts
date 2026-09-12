@@ -167,6 +167,52 @@ describe("InboxRepository", () => {
     expect(store.actorsWithUnhandled()).toContainEqual({ actorId: "a", priority: "normal" });
   });
 
+  it("keeps corrupt payloads query-safe and distinguishes parse from shape failures", () => {
+    store.append([
+      {
+        id: "responsive",
+        actorId: "a",
+        source: "chat",
+        payload: { type: "message.created", priority: "responsive" },
+      },
+    ]);
+    const insertCorrupt = db.prepare(
+      `INSERT INTO actor_inbox_entries
+        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+       VALUES (?, ?, 'legacy', ?, NULL, NULL, ?)`
+    );
+    insertCorrupt.run("malformed", "a", "2026-07-13T13:00:00.000Z", "{not valid JSON");
+    insertCorrupt.run("invalid-shape", "a", "2026-07-13T14:00:00.000Z", '{"type":false}');
+    insertCorrupt.run("only-malformed", "b", "2026-07-13T15:00:00.000Z", "{not valid JSON");
+
+    const entries = new Map(
+      store.list("a", { status: "all" }).entries.map((entry) => [entry.id, entry])
+    );
+    expect(entries.get("malformed")?.payload).toEqual({
+      type: "inbox.unavailable",
+      unavailable: "stored inbox payload has malformed JSON",
+    });
+    expect(entries.get("invalid-shape")?.payload).toEqual({
+      type: "inbox.unavailable",
+      unavailable: "stored inbox payload has invalid shape",
+    });
+    expect(JSON.stringify([...entries.values()])).not.toContain("{not valid JSON");
+
+    // These all used json_extract before the malformed row was guarded.
+    expect(store.list("a", { responsiveOnly: true }).entries.map((entry) => entry.id)).toEqual([
+      "responsive",
+    ]);
+    expect(store.countUnhandled("a", { responsiveOnly: true })).toBe(1);
+    expect(store.actorsWithUnhandled()).toEqual([
+      { actorId: "a", priority: "responsive" },
+      { actorId: "b", priority: "normal" },
+    ]);
+    expect(store.actorsWithUnseen()).toEqual([
+      { actorId: "a", priority: "responsive" },
+      { actorId: "b", priority: "normal" },
+    ]);
+  });
+
   it("handled_at changes only through actor mark_handled", async () => {
     vi.useFakeTimers();
     store.append([

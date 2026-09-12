@@ -1465,7 +1465,7 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/inbox keeps the root page readable when one stored payload is corrupt", async () => {
+  it("keeps a root inbox readable, pageable, and clearable when one stored payload is malformed", async () => {
     // This uses the same persisted-store read and HTTP handler as the dashboard,
     // but seeds the legacy/corrupt row directly because current writes reject it.
     // A broken row must remain visible and occupy its normal page position rather
@@ -1494,19 +1494,50 @@ describe("handleMeshApiRequest", () => {
     const first = await call(deps, "GET", "/api/mesh/inbox?actor=root&status=unhandled&limit=1");
 
     expect(first.res.statusCode).toBe(200);
-    expect(JSON.parse(first.res.body)).toMatchObject({
+    const firstBody = JSON.parse(first.res.body);
+    expect(firstBody).toMatchObject({
       entries: [
         {
           id: "corrupt-root-entry",
           actorId: "root",
           payload: {
             type: "inbox.unavailable",
-            unavailable: "stored inbox payload could not be read",
+            unavailable: "stored inbox payload has malformed JSON",
           },
         },
       ],
       unhandledCount: 2,
       nextCursor: expect.any(String),
+    });
+
+    const second = await call(
+      deps,
+      "GET",
+      `/api/mesh/inbox?actor=root&status=unhandled&limit=1&cursor=${encodeURIComponent(firstBody.nextCursor)}`
+    );
+    expect(second.res.statusCode).toBe(200);
+    expect(JSON.parse(second.res.body)).toMatchObject({
+      entries: [{ id: "valid-root-entry", payload: { type: "mesh.message", fromId: "worker" } }],
+      unhandledCount: 2,
+      nextCursor: null,
+    });
+
+    const cleared = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors/root/inbox/handled",
+      JSON.stringify({ entryId: "corrupt-root-entry", reason: "malformed legacy row" })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+    expect(cleared.res.statusCode).toBe(200);
+    expect(JSON.parse(cleared.res.body)).toMatchObject({ ok: true, alreadyHandled: false });
+
+    const afterClear = await call(deps, "GET", "/api/mesh/inbox?actor=root&status=unhandled");
+    expect(afterClear.res.statusCode).toBe(200);
+    expect(JSON.parse(afterClear.res.body)).toMatchObject({
+      entries: [{ id: "valid-root-entry" }],
+      unhandledCount: 1,
     });
   });
 
