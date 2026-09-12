@@ -1012,8 +1012,11 @@ export class QuotaService {
   /**
    * Codex has no quiet quota API — its remaining-quota numbers live only in the
    * interactive `/status` TUI. Rent a host-side PTY (tmux), scrape the panel, and
-   * parse it deterministically . Read-only `/status` never mutates auth
-   * (never `/usage`, which consumes a reset), so this is auth-safe by construction.
+   * parse it deterministically. Read-only `/status` does not consume usage resets
+   * (unlike `/usage`). While `/status` is read-only, CLI startup and authenticated
+   * requests can trigger standard credential refreshes; the probe links the shared
+   * host auth store so refreshes survive probe teardown while config/session state
+   * remains isolated.
    * The get_quota TTL cache gates how often this runs (never probe-on-read).
    */
   private async probeCodexQuota(actorDir: string): Promise<ProviderQuotaSnapshot> {

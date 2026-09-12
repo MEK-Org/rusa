@@ -12,9 +12,11 @@ const spawnMock = vi.fn();
 const spawnSyncMock = vi.fn();
 const mkdtempSyncMock = vi.fn();
 const existsSyncMock = vi.fn();
+const lstatSyncMock = vi.fn();
 const writeFileSyncMock = vi.fn();
 const rmSyncMock = vi.fn();
 const mkdirSyncMock = vi.fn();
+const symlinkSyncMock = vi.fn();
 
 vi.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => spawnMock(...args),
@@ -28,16 +30,20 @@ vi.mock("node:child_process", () => ({
 vi.mock("node:fs", () => ({
   mkdtempSync: (...args: unknown[]) => mkdtempSyncMock(...args),
   existsSync: (...args: unknown[]) => existsSyncMock(...args),
+  lstatSync: (...args: unknown[]) => lstatSyncMock(...args),
   writeFileSync: (...args: unknown[]) => writeFileSyncMock(...args),
   rmSync: (...args: unknown[]) => rmSyncMock(...args),
   mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
+  symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
   readFileSync: vi.fn().mockReturnValue(""),
   default: {
     mkdtempSync: (...args: unknown[]) => mkdtempSyncMock(...args),
     existsSync: (...args: unknown[]) => existsSyncMock(...args),
+    lstatSync: (...args: unknown[]) => lstatSyncMock(...args),
     writeFileSync: (...args: unknown[]) => writeFileSyncMock(...args),
     rmSync: (...args: unknown[]) => rmSyncMock(...args),
     mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
+    symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
     readFileSync: vi.fn().mockReturnValue(""),
   },
 }));
@@ -53,6 +59,7 @@ describe("codex-status-scrape", () => {
     vi.clearAllMocks();
     mkdtempSyncMock.mockReturnValue("/tmp/test-codex-home");
     existsSyncMock.mockReturnValue(false);
+    lstatSyncMock.mockReturnValue({ isSymbolicLink: () => true });
   });
 
   describe("buildTmuxScript", () => {
@@ -288,6 +295,33 @@ describe("codex-status-scrape", () => {
       });
 
       expect(output).toBe("rendered 5h limit: 99% left\n");
+    });
+
+    it("symlinks the host auth.json into the isolated codex home when it exists", async () => {
+      existsSyncMock.mockImplementation((p) => String(p).endsWith("auth.json"));
+
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        pid: 12345,
+      });
+
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      await scrapeCodexStatus({
+        actorDir: "/tmp/actor",
+        codexConfigDir: "/tmp/codex-config",
+      });
+
+      expect(symlinkSyncMock).toHaveBeenCalledWith(
+        expect.stringContaining("/tmp/codex-config/auth.json"),
+        "/tmp/test-codex-home/auth.json"
+      );
     });
   });
 });
