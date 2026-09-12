@@ -131,13 +131,20 @@ describe("reference grammar", () => {
     expect(asGitHubIssue(parseReference("github:o/r/issues/9007199254740992"))).toBeNull();
   });
 
-  it("projects back out to the provider's URL, wrinkles and all", () => {
-    // The one place GitHub's inconsistencies are reconstructed: singular
-    // `/pull/`, and a comment as an anchor on its parent.
+  it("projects an owner-only reference without throwing", () => {
+    // #424: with one segment, `indexOf("comments")` is -1 and so is
+    // `length - 2`, which read as "a comment anchor is present" and set the
+    // array length to -1. The owner/repo line is the control: at two segments
+    // `length - 2` is 0, so the collision never happened there.
     expect(referenceUrl(parseReference("github:MEK-Org"))).toBe("https://github.com/MEK-Org");
     expect(referenceUrl(parseReference("github:MEK-Org/rusa"))).toBe(
       "https://github.com/MEK-Org/rusa"
     );
+  });
+
+  it("projects back out to the provider's URL, wrinkles and all", () => {
+    // The one place GitHub's inconsistencies are reconstructed: singular
+    // `/pull/`, and a comment as an anchor on its parent.
     expect(referenceUrl(parseReference("github:MEK-Org/rusa/issues/33"))).toBe(
       "https://github.com/MEK-Org/rusa/issues/33"
     );
