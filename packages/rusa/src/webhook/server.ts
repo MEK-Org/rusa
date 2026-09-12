@@ -587,14 +587,19 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
-          log: (line) => log.debug("voice_route", { detail: line }),
+          logger: log.child({ component: "voice-route" }),
         }
       : null;
   // Reply-TTS hook: observe the mesh-event emitter for replies to
   // human:operator and push rendered audio on the `voice` channel.
   const detachVoiceOutbound =
     options.voice && options.mesh && sseHub
-      ? attachVoiceOutbound(options.mesh.emitter, options.voice.service, sseHub)
+      ? attachVoiceOutbound(
+          options.mesh.emitter,
+          options.voice.service,
+          sseHub,
+          log.child({ component: "voice-outbound" })
+        )
       : null;
   // The session registry lives in VoiceService while the targeted wire channel
   // lives in this hub. Join them only after both are constructed so a transfer

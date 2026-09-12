@@ -18,6 +18,7 @@ import { stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { SseHub } from "../dashboard/sse.js";
+import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toFrame, VOICE_MEMO_PREFIX, type VoiceService } from "./voice-service.js";
 
@@ -29,8 +30,8 @@ export interface VoiceApiDeps {
   mesh?: ActorMesh;
   /** Null when voice is unconfigured (no geminiApiKey) → routes 503. */
   service: VoiceService | null;
-  /** Optional logger for route events (silenced under tests when omitted). */
-  log?: (message: string) => void;
+  /** Optional structured logger for route events (silenced under tests when omitted). */
+  logger?: Logger;
 }
 
 const MEMO_ROUTE = /^\/api\/mesh\/actors\/([^/]+)\/voice-memo$/;
@@ -42,6 +43,38 @@ const SESSION_DISABLE_ROUTE = "/api/mesh/voice/session/disable";
 
 /** Cap inbound memo audio well above any realistic tap-to-talk clip. */
 const MAX_MEMO_BYTES = 25 * 1024 * 1024;
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Write privacy-safe ack telemetry. Request ids let operators correlate the
+ * route outcome without recording voice bodies or caller-supplied unknown ids.
+ */
+function logAckOutcome(
+  deps: VoiceApiDeps,
+  requestId: string,
+  outcome: string,
+  status: number,
+  opts: { announcementId?: string; idShape?: "uuid" | "other" } = {}
+): void {
+  const level = status >= 500 ? "error" : status >= 400 ? "warn" : "info";
+  deps.logger?.[level]("voice_ack", {
+    requestId,
+    outcome,
+    status,
+    ...(opts.announcementId === undefined ? {} : { announcementId: opts.announcementId }),
+    ...(opts.idShape === undefined ? {} : { idShape: opts.idShape }),
+  });
+}
+
+/** Every ack outcome returns the log correlation id without echoing its body. */
+function sendAckResult(
+  res: ServerResponse,
+  status: number,
+  requestId: string,
+  body: Record<string, unknown>
+): void {
+  sendJson(res, status, { ...body, requestId });
+}
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
@@ -278,16 +311,13 @@ export function handleVoiceApiRequest(
                   : now - announcement.streamRequestedAt;
               const latencySuspect =
                 latency === null || !Number.isFinite(latency) || latency < 0 || latency > 60_000;
-              deps.log?.(
-                JSON.stringify({
-                  level: latencySuspect ? "warn" : "info",
-                  msg: "First MP3 byte flushed to client",
-                  latencyMs: latency,
-                  latencySuspect,
-                  announcementId: announcement.id,
-                  mime: announcement.mime,
-                })
-              );
+              const level = latencySuspect ? "warn" : "info";
+              deps.logger?.[level]("voice_audio_first_byte", {
+                latencyMs: latency,
+                latencySuspect,
+                announcementId: announcement.id,
+                mime: announcement.mime,
+              });
             }
             res.write(chunk);
           },
@@ -332,26 +362,48 @@ export function handleVoiceApiRequest(
   // POST /api/mesh/voice/ack — {id} → playedAt set.
   if (req.method === "POST" && pathname === ACK_ROUTE) {
     void (async () => {
-      const body = (await readRawBody(req, 64 * 1024)).toString("utf-8");
+      const requestId = randomUUID();
+      let body: string;
+      try {
+        body = (await readRawBody(req, 64 * 1024)).toString("utf-8");
+      } catch {
+        logAckOutcome(deps, requestId, "body_read_failed", 500);
+        sendAckResult(res, 500, requestId, { error: "ack request failed" });
+        return;
+      }
       let id: unknown;
       try {
         id = (JSON.parse(body) as { id?: unknown }).id;
       } catch {
-        sendJson(res, 400, { error: "Invalid JSON body" });
+        logAckOutcome(deps, requestId, "invalid_json", 400);
+        sendAckResult(res, 400, requestId, { error: "Invalid JSON body" });
         return;
       }
       if (typeof id !== "string" || !id) {
-        sendJson(res, 400, { error: "Missing id" });
+        logAckOutcome(deps, requestId, "missing_id", 400);
+        sendAckResult(res, 400, requestId, { error: "Missing id" });
         return;
       }
-      if (!service.ack(id)) {
-        sendJson(res, 404, { error: "unknown announcement id" });
+      let acknowledged: boolean;
+      try {
+        acknowledged = service.ack(id);
+      } catch {
+        logAckOutcome(deps, requestId, "ack_route_failed", 500);
+        sendAckResult(res, 500, requestId, { error: "ack request failed" });
         return;
       }
-      sendJson(res, 200, { ok: true });
-    })().catch((err) => {
-      sendJson(res, 500, { error: String(err) });
-    });
+      if (!acknowledged) {
+        // Do not log the caller-supplied id. Its UUID/non-UUID shape is enough
+        // to distinguish a likely stale announcement from malformed input.
+        logAckOutcome(deps, requestId, "unknown_announcement", 404, {
+          idShape: UUID_SHAPE.test(id) ? "uuid" : "other",
+        });
+        sendAckResult(res, 404, requestId, { error: "unknown announcement id" });
+        return;
+      }
+      logAckOutcome(deps, requestId, "acknowledged", 200, { announcementId: id });
+      sendAckResult(res, 200, requestId, { ok: true });
+    })();
     return true;
   }
 

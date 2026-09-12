@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
 
@@ -124,6 +127,95 @@ void main() {
         expect(api.disabledVoiceSessions, isEmpty);
       },
     );
+
+    test(
+      'reply-then-transfer recovers and acks each source backlog clip once in both directions',
+      () async {
+        api.backlogPages = [
+          const [],
+          [makeAnnouncement('handoff-a', actor: 'a')],
+          const [],
+          [makeAnnouncement('handoff-b', actor: 'b')],
+          const [],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'b'),
+        );
+        await pumpEventQueue();
+
+        expect(api.backlogActorIds, ['a', 'a', 'b']);
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/handoff-a']);
+        // A late non-backlog frame for the source remains stale after the handoff.
+        walkie.stream.framesCtrl.add(makeAnnouncement('stale-a', actor: 'a'));
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/handoff-a']);
+
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['handoff-a']);
+
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'a'),
+        );
+        await pumpEventQueue();
+
+        expect(api.backlogActorIds, ['a', 'a', 'b', 'b', 'a']);
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/handoff-a',
+          '/api/mesh/voice/audio/handoff-b',
+        ]);
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(api.ackedIds, ['handoff-a', 'handoff-b']);
+        expect(controller.lastError.value, isNull);
+      },
+    );
+
+    test(
+      'handoff recovery keeps source audio ahead of target backlog and SSE',
+      () async {
+        await controller.enable();
+        await pumpEventQueue();
+
+        final sourceBacklog = Completer<List<VoiceAnnouncement>>();
+        final targetBacklog = Completer<List<VoiceAnnouncement>>();
+        api.backlogGates.addAll([sourceBacklog, targetBacklog]);
+
+        walkie.stream.controlsCtrl.add(
+          const VoiceSessionControl(targetActorId: 'b'),
+        );
+        await pumpEventQueue();
+        expect(api.backlogActorIds, ['a', 'a']);
+
+        // The new actor can speak as soon as its stream connects, but it must
+        // wait behind the source recovery that causally precedes the handoff.
+        walkie.stream.framesCtrl.add(makeAnnouncement('live-b', actor: 'b'));
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, isEmpty);
+
+        sourceBacklog.complete([makeAnnouncement('handoff-a', actor: 'a')]);
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, ['/api/mesh/voice/audio/handoff-a']);
+        expect(api.backlogActorIds, ['a', 'a', 'b']);
+
+        targetBacklog.complete([makeAnnouncement('backlog-b', actor: 'b')]);
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/handoff-a',
+          '/api/mesh/voice/audio/backlog-b',
+        ]);
+
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls.last, '/api/mesh/voice/audio/live-b');
+      },
+    );
   });
 
   group('playback queue', () {
@@ -235,6 +327,28 @@ void main() {
         await pumpEventQueue();
         expect(controller.lastError.value, contains('Playback failed'));
         expect(controller.nowPlaying.value?.id, 'm2');
+      },
+    );
+
+    test(
+      'a successful later ack clears only a stale ack-failed banner',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('m1'), makeAnnouncement('m2')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+
+        api.ackError = apiError(500, 'temporary outage');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(controller.lastError.value, contains('Ack failed'));
+
+        api.ackError = null;
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        expect(api.ackedIds, ['m2']);
+        expect(controller.lastError.value, isNull);
       },
     );
 

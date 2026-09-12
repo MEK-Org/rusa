@@ -9,6 +9,7 @@ import {
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   assertConcreteModelConfig,
   describeModelConfigPool,
@@ -711,6 +712,8 @@ export interface ActorMeshOptions {
   scheduledMessages?: ScheduledMessageScheduler;
   /** Atomic boundary for recording a scheduled message's chat/audit rows. */
   withTransaction?: (fn: () => void) => void;
+  /** Structured lifecycle records for the host-owned voice transfer boundary. */
+  voiceTransferLogger?: Logger;
   log?: (msg: string) => void;
 }
 
@@ -834,6 +837,7 @@ export class ActorMesh {
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
+  private readonly voiceTransferLog: Logger;
   private scheduledMessages?: ScheduledMessageScheduler;
   private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
@@ -933,6 +937,7 @@ export class ActorMesh {
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
     this.log = opts.log ?? (() => {});
+    this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
     this.eventManager = opts.eventManager;
@@ -1743,6 +1748,13 @@ export class ActorMesh {
           `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
         );
       }
+      this.voiceTransferLog.error("voice_session_transfer", {
+        outcome: "handoff_not_recorded",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+        err: error,
+      });
       throw error;
     }
     // The responsive row is now durable; releasing the source through the
@@ -1761,10 +1773,22 @@ export class ActorMesh {
     // the browser changes selection/reconnects to it.
     try {
       transfer.notifySessionTransferred(sessionId, target.id);
+      this.voiceTransferLog.info("voice_session_transfer", {
+        outcome: "control_scheduled",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+      });
     } catch (error) {
-      this.log(
-        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
-      );
+      // VoiceService records asynchronous leased-SSE dispatch failures itself;
+      // retain observability as well for a synchronous transfer-port failure.
+      this.voiceTransferLog.warn("voice_session_transfer", {
+        outcome: "control_dispatch_failed",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+        err: error,
+      });
     }
     return { sessionId, targetActorId: target.id };
   }

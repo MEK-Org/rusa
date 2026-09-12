@@ -50,7 +50,6 @@
     "src/understanding/seed.ts": 3,
     "src/update/orchestrator.ts": 1,
     "src/voice/audio.ts": 2,
-    "src/voice/wiring.ts": 1,
     "src/webhook/forwarder.ts": 1,
     "src/webhook/silence-detector.ts": 1
   }

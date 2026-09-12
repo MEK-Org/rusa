@@ -141,6 +141,8 @@ class WalkieController {
   String? _sessionId;
   final _streamSubs = <StreamSubscription<dynamic>>[];
   bool _draining = false;
+  Future<void>? _handoffRecovery;
+  String? _handoffTargetActorId;
   bool _droppedSinceConnect = false;
   Timer? _recordTicker;
   Timer? _deliveredReset;
@@ -279,12 +281,18 @@ class WalkieController {
     }
   }
 
-  Future<void> _fetchBacklog() async {
+  /// Fetch one actor's unplayed announcements. A transfer deliberately fetches
+  /// the actor it just left as well as the recipient: the control may overtake
+  /// its source actor's final voice frame, but the backlog is an authoritative
+  /// snapshot of clips that remain unacknowledged. Direct late source frames
+  /// stay stale and are still rejected by [_enqueue].
+  Future<void> _fetchBacklog({String? actorId}) async {
+    final backlogActorId = actorId ?? this.actorId;
     try {
-      final items = await _deps.api.fetchVoiceBacklog(actorId);
+      final items = await _deps.api.fetchVoiceBacklog(backlogActorId);
       if (!_enabled.value) return;
       for (final frame in items) {
-        _enqueue(frame);
+        _enqueue(frame, backlogActorId: backlogActorId);
       }
     } on DashboardApiException catch (e) {
       if (e.status == 503) {
@@ -300,7 +308,34 @@ class WalkieController {
 
   void _onFrame(VoiceAnnouncement frame) {
     if (!_enabled.value) return;
+    // Do not let a recipient frame overtake the source's recovered handoff
+    // backlog. The same guard remains narrowly scoped to this one transfer;
+    // it does not delay normal live playback or accept source SSE frames.
+    final recovery = _handoffRecovery;
+    if (recovery != null && frame.actorId == _handoffTargetActorId) {
+      unawaited(
+        recovery.then((_) {
+          if (_enabled.value && !_disposed && frame.actorId == actorId) {
+            _enqueue(frame);
+          }
+        }),
+      );
+      return;
+    }
     _enqueue(frame);
+  }
+
+  Future<void> _recoverHandoffBacklogs(
+    String sourceActorId,
+    String targetActorId,
+  ) async {
+    // Keep source audio ahead of recipient audio even when the two HTTP
+    // requests would otherwise resolve in the opposite order. There is no
+    // cursor for this snapshot: every unseen, unacknowledged source item is a
+    // prior delivery loss that must be recovered; [_seenIds] rejects repeats.
+    await _fetchBacklog(actorId: sourceActorId);
+    if (!_enabled.value || _disposed) return;
+    await _fetchBacklog(actorId: targetActorId);
   }
 
   /// Keep the same UUID and local walkie state while moving its SSE filter to
@@ -315,9 +350,25 @@ class WalkieController {
       return;
     }
 
+    final sourceActorId = actorId;
     _actorId = targetActorId;
     _connection.add(WalkieConnection.connecting);
     _teardownStream();
+    // The old stream cannot be trusted after its control frame. Recover its
+    // unacknowledged tail from the server snapshot before recipient audio, and
+    // establish that guard before connecting: a stream may synchronously
+    // deliver its first recipient frame from connect().
+    final recovery = _recoverHandoffBacklogs(sourceActorId, targetActorId);
+    _handoffRecovery = recovery;
+    _handoffTargetActorId = targetActorId;
+    unawaited(
+      recovery.whenComplete(() {
+        if (identical(_handoffRecovery, recovery)) {
+          _handoffRecovery = null;
+          _handoffTargetActorId = null;
+        }
+      }),
+    );
     final stream = _deps.createStream();
     _stream = stream;
     _streamSubs.add(stream.frames.listen(_onFrame));
@@ -325,13 +376,15 @@ class WalkieController {
     _streamSubs.add(stream.controls.listen(_onControl));
     stream.connect([targetActorId], sessionId);
     onTransfer?.call(targetActorId);
-    unawaited(_fetchBacklog());
   }
 
   // ── Playback queue ──
 
-  void _enqueue(VoiceAnnouncement frame) {
-    if (frame.actorId != actorId) return; // stale frame across a reconnect
+  void _enqueue(VoiceAnnouncement frame, {String? backlogActorId}) {
+    // A fetched backlog is an authoritative response for [backlogActorId]; a
+    // live frame is valid only for the active actor, preserving stale-frame
+    // filtering after a reconnect or transfer.
+    if (frame.actorId != (backlogActorId ?? actorId)) return;
     if (!_seenIds.add(frame.id)) return; // already played or queued
     _queue.add(_QueueItem(frame));
     _queueDepth.add(_queue.length);
@@ -365,6 +418,11 @@ class WalkieController {
         if (item.ackNeeded) {
           try {
             await _deps.api.ackVoiceAnnouncement(item.frame.id);
+            // A later successful acknowledgement makes a transient ack banner
+            // stale, but must not hide an unrelated playback or fetch error.
+            if (_lastError.value?.startsWith('Ack failed: ') ?? false) {
+              _lastError.add(null);
+            }
           } catch (e) {
             if (_disposed) return;
             _lastError.add('Ack failed: $e');

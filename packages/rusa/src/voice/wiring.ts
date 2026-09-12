@@ -7,6 +7,7 @@
 
 import type { VoiceConfig } from "../config/types.js";
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import { createGeminiSpeechClient } from "./gemini-speech.js";
 import { toFrame, type VoiceAnnouncementFrame, VoiceService } from "./voice-service.js";
 
@@ -22,6 +23,7 @@ export function createVoiceService(options: {
    */
   voiceNameFor?: (actorId: string) => string | undefined;
   onSessionEnded?: (actorId: string) => void;
+  logger?: Logger;
 }): VoiceService {
   return new VoiceService({
     home: options.home,
@@ -33,6 +35,7 @@ export function createVoiceService(options: {
     }),
     voiceNameFor: options.voiceNameFor,
     onSessionEnded: options.onSessionEnded,
+    logger: options.logger,
   });
 }
 
@@ -45,20 +48,14 @@ export function createVoiceService(options: {
 export function attachVoiceOutbound(
   emitter: MeshEventEmitter,
   service: VoiceService,
-  hub: { pushVoice(frame: VoiceAnnouncementFrame): void }
+  hub: { pushVoice(frame: VoiceAnnouncementFrame): void },
+  logger: Logger = nullLogger
 ): () => void {
   return emitter.onMeshEvent((event) => {
     void service
-      .handleMeshEvent(event)
-      .then((announcement) => {
-        if (announcement) hub.pushVoice(toFrame(announcement));
-      })
+      .handleMeshEvent(event, (announcement) => hub.pushVoice(toFrame(announcement)))
       .catch((err) => {
-        console.warn(
-          `[voice] reply TTS failed for ${event.actorId}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
+        logger.warn("voice_reply_tts_failed", { actorId: event.actorId, err });
       });
   });
 }
