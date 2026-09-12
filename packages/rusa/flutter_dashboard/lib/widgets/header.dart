@@ -184,8 +184,7 @@ class MeshHeader extends StatelessWidget {
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // 70px: the pre-#423 56px row read cramped once the nav
-                  // buttons took typical padding at 16px — 25% taller.
+                  // 70px: #423 asked for ~25% over the original 56px.
                   SizedBox(
                     height: 70,
                     child: Row(
@@ -247,7 +246,6 @@ class MeshHeader extends StatelessWidget {
                                             destination: destination,
                                             selected: selected,
                                             onSelect: onSelect!,
-                                            compact: compact,
                                           ),
                                       ],
                                     ),
@@ -936,52 +934,38 @@ class _SchedulerWarningBadge extends StatelessWidget {
 /// otherwise. A plain text button so it sits in the brand row without adding
 /// chrome to the locked V1.4.0 layout.
 ///
-/// Sizing (issue #423): 16px labels — 25% up from the original 13px, which
-/// read small next to the rest of the chrome — on TextButton's typical
-/// padding (16px horizontal, 8px vertical). The inline nav rides a horizontal
-/// scroller, so the wider buttons never overflow the row; the compact variant
-/// keeps 12px horizontal padding so a ~390px window still shows the brand
-/// cluster comfortably.
+/// Sizing (issue #423): 16px labels, the nearest whole pixel to 25% over the
+/// original 13px, on TextButton's own padding and minimum size — the issue
+/// asked for "the typical amount of padding", and the earlier zero-minimum /
+/// shrink-wrap overrides were what made the buttons read constrained. The
+/// wordmark is also 16px; the brand stays distinct by its mark, letter-spacing
+/// and primary color rather than by size. The inline nav rides a horizontal
+/// scroller, and the app hands the header a drawer below [kNarrowBreakpoint],
+/// so no narrower padding variant is needed.
 class _NavItem extends StatelessWidget {
   const _NavItem({
     required this.destination,
     required this.selected,
     required this.onSelect,
-    this.compact = false,
   });
 
   final DashboardDestination destination;
   final DashboardView selected;
   final ValueChanged<DashboardView> onSelect;
 
-  /// Tighter horizontal padding below 520px width — at the full 16px the nav
-  /// buttons crowd the brand + status cluster on a narrow desktop window.
-  final bool compact;
-
   @override
   Widget build(BuildContext context) {
     final active = destination.isActive(selected);
-    return Padding(
-      padding: EdgeInsets.symmetric(horizontal: compact ? 0 : 2),
-      child: TextButton(
-        onPressed: () => onSelect(destination.targetFrom(selected)),
-        style: TextButton.styleFrom(
-          foregroundColor: active
-              ? MeshColors.accent
-              : MeshColors.textSecondary,
-          padding: EdgeInsets.symmetric(
-            horizontal: compact ? 12 : 16,
-            vertical: 8,
-          ),
-          minimumSize: Size.zero,
-          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          textStyle: TextStyle(
-            fontSize: 16,
-            fontWeight: active ? FontWeight.w700 : FontWeight.w500,
-          ),
+    return TextButton(
+      onPressed: () => onSelect(destination.targetFrom(selected)),
+      style: TextButton.styleFrom(
+        foregroundColor: active ? MeshColors.accent : MeshColors.textSecondary,
+        textStyle: TextStyle(
+          fontSize: 16,
+          fontWeight: active ? FontWeight.w700 : FontWeight.w500,
         ),
-        child: Text(destination.label),
       ),
+      child: Text(destination.label),
     );
   }
 }
