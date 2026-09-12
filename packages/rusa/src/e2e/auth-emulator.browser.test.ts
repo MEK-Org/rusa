@@ -2,6 +2,64 @@
 import { chromium } from "@playwright/test";
 import { expect, it } from "vitest";
 
+// Requires --auth-emails operator@example.com,colleague@example.com.
+it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
+  "lets two Google users share one mesh without sharing browser sessions",
+  async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const pages = [];
+      for (const email of ["operator@example.com", "colleague@example.com"]) {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        await page.goto(process.env.RUSA_SHARED_AUTH_EMULATOR_E2E as string);
+        const popupPromise = page.waitForEvent("popup");
+        await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
+        const popup = await popupPromise;
+        await popup.getByText("Add new account", { exact: true }).click();
+        await popup.locator("#email-input").fill(email);
+        await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
+        await page.locator("flutter-view").waitFor({ timeout: 45_000 });
+        pages.push(page);
+      }
+      const snapshots = await Promise.all(
+        pages.map((page) =>
+          page.evaluate(async () => {
+            const response = await fetch("/api/mesh/threads");
+            return {
+              status: response.status,
+              ids: (await response.json()).threads
+                .map((thread: { id: string }) => thread.id)
+                .sort(),
+            };
+          })
+        )
+      );
+      expect(snapshots[0].status).toBe(200);
+      expect(snapshots[0].ids.length).toBeGreaterThan(0);
+      expect(snapshots[1]).toEqual(snapshots[0]);
+      // Exercise the actual profile dropdown for the first user only.
+      await pages[0].locator("flt-semantics-placeholder").evaluate((element) => {
+        (element as HTMLElement).style.cssText =
+          "position:fixed;left:0;top:0;width:20px;height:20px;z-index:9999";
+      });
+      await pages[0].locator("flt-semantics-placeholder").click({ force: true });
+      await pages[0].getByRole("button", { name: "Profile menu" }).click();
+      await pages[0].getByRole("menuitem", { name: "Log out", exact: true }).click();
+      await pages[0].getByRole("button", { name: "Sign in with Google", exact: true }).waitFor();
+      expect(await pages[0].evaluate(async () => (await fetch("/api/mesh/threads")).status)).toBe(
+        401
+      );
+      expect(await pages[1].evaluate(async () => (await fetch("/api/mesh/threads")).status)).toBe(
+        200
+      );
+    } finally {
+      await browser.close();
+    }
+  },
+  90_000
+);
+
 // Requires the real Firebase emulator and am-up --auth-emulator, with built assets.
 it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
   "authenticates through the emulator popup, renews, and logs out",

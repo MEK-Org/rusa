@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 
-describe("optional single-user auth config", () => {
+describe("optional shared-human auth config", () => {
   const valid = () => ({
     email: " Owner@Example.com ",
     firebase: {
@@ -16,6 +16,26 @@ describe("optional single-user auth config", () => {
     const config = valid();
     validateDashboardAuth(config);
     expect(config.email).toBe("owner@example.com");
+  });
+  it("normalizes an explicit shared allowlist", () => {
+    const config = {
+      firebase: valid().firebase,
+      allowedEmails: [" Owner@Example.com ", "OTHER@example.com"],
+    };
+    validateDashboardAuth(config);
+    expect(config.allowedEmails).toEqual(["owner@example.com", "other@example.com"]);
+  });
+  it.each([
+    [],
+    "owner@example.com",
+    null,
+    [null],
+    ["invalid"],
+    ["owner@example.com", " OWNER@example.com "],
+  ])("rejects invalid allowlists: %j", (allowedEmails) => {
+    expect(() => validateDashboardAuth({ firebase: valid().firebase, allowedEmails })).toThrow(
+      /auth/
+    );
   });
   it.each([
     null,

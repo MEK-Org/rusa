@@ -46,7 +46,8 @@ const claim = (extra: Partial<DecodedIdToken> = {}): DecodedIdToken => ({
   ...extra,
 });
 
-describe("single-operator dashboard authentication", () => {
+describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
+  let allowedEmails: string[];
   const cookies = new Map<string, DecodedIdToken>();
   let token: DecodedIdToken;
   let serial: number;
@@ -75,6 +76,7 @@ describe("single-operator dashboard authentication", () => {
       cookies.set(
         name,
         claim({
+          ...token,
           iss: "https://session.firebase.google.com/project",
           exp: (now + options.expiresIn) / 1000,
         })
@@ -99,8 +101,9 @@ describe("single-operator dashboard authentication", () => {
     db = new Database(":memory:");
     runMigrations(db);
     principals = new PrincipalRepository(db);
+    allowedEmails = [config.email];
     auth = new DashboardAuth(
-      config,
+      mode === "legacy" ? config : { firebase: config.firebase, allowedEmails },
       firebase,
       new DashboardIdentityResolver(() => principals),
       () => now
@@ -109,7 +112,19 @@ describe("single-operator dashboard authentication", () => {
       createDashboardRequestHandler(
         { port: 0, auth: config },
         {
-          actors: { get: () => ({ id: "actor", status: "active" }) },
+          actors: {
+            get: () => ({ id: "actor", status: "active" }),
+            list: () => [
+              {
+                id: "actor",
+                isRoot: true,
+                parentId: null,
+                status: "active",
+                charter: "Shared root",
+              },
+            ],
+          },
+          meshEvents: { latestActivityByActor: () => new Map() },
           mesh: { interrupt },
         } as unknown as DashboardDataDeps,
         null,
@@ -151,6 +166,82 @@ describe("single-operator dashboard authentication", () => {
     return cookie.split(";")[0];
   }
 
+  it.skipIf(mode !== "shared")(
+    "gives two distinct, rootless humans equal reads and mutations while denying outsiders",
+    async () => {
+      allowedEmails.push("colleague@example.com");
+      const first = await login();
+      token = claim({ uid: "colleague-id", sub: "colleague-id", email: "colleague@example.com" });
+      const second = await login();
+      const contexts = [];
+      for (const cookie of [first, second]) {
+        const res = await fetch(`${origin}/api/mesh/threads`, { headers: { Cookie: cookie } });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ threads: [{ id: "actor" }] });
+        expect((await post("/api/mesh/actors/actor/interrupt", cookie)).status).toBe(200);
+        const req = { method: "GET", headers: { cookie } } as IncomingMessage;
+        expect(await auth.authorize(req, { setHeader: vi.fn() } as unknown as ServerResponse)).toBe(
+          true
+        );
+        contexts.push(getDashboardRequestIdentity(req));
+      }
+      expect(interrupt).toHaveBeenCalledTimes(2);
+      expect(interrupt).toHaveBeenNthCalledWith(1, "actor", "human:operator");
+      expect(interrupt).toHaveBeenNthCalledWith(2, "actor", "human:operator");
+      expect(contexts[0]?.principal.id).not.toBe(contexts[1]?.principal.id);
+      for (const context of contexts) {
+        expect(context?.mode).toBe("shared-operator");
+        expect(context?.principal.rootActorId).toBeUndefined();
+      }
+      const publicConfig = await (await fetch(`${origin}/api/auth/config`)).text();
+      expect(publicConfig).not.toContain("allowedEmails");
+      expect(publicConfig).not.toContain("example.com");
+      token = claim({ uid: "outsider", sub: "outsider", email: "outsider@example.com" });
+      expect((await post("/api/auth/session")).status).toBe(401);
+      expect((await fetch(`${origin}/api/mesh/threads`)).status).toBe(401);
+
+      const firstPrincipal = contexts[0]?.principal;
+      if (!firstPrincipal) throw new Error("Expected first user's principal");
+      principals.setDisabled(firstPrincipal.id, new Date(now).toISOString());
+      expect(
+        (await fetch(`${origin}/api/mesh/threads`, { headers: { Cookie: first } })).status
+      ).toBe(401);
+      expect(
+        (await fetch(`${origin}/api/mesh/threads`, { headers: { Cookie: second } })).status
+      ).toBe(200);
+      expect((await post("/api/auth/logout", first)).status).toBe(200);
+      expect(
+        (await fetch(`${origin}/api/mesh/threads`, { headers: { Cookie: second } })).status
+      ).toBe(200);
+    }
+  );
+
+  it.skipIf(mode !== "shared")(
+    "rechecks each stream's own admission without disconnecting another user",
+    async () => {
+      allowedEmails.push("colleague@example.com");
+      const first = await login();
+      token = claim({ uid: "colleague-id", sub: "colleague-id", email: "colleague@example.com" });
+      const second = await login();
+      vi.useFakeTimers();
+      const streams = [first, second].map((cookie) => {
+        const res = new EventEmitter() as ServerResponse;
+        res.end = vi.fn(() => {
+          res.emit("close");
+          return res;
+        });
+        auth.guardStream({ headers: { cookie } } as IncomingMessage, res);
+        return res;
+      });
+      // Simulates the policy loaded on restart; each stream is revalidated independently.
+      allowedEmails.splice(0, 1);
+      now += 60_000;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(streams[0].end).toHaveBeenCalledWith(expect.stringContaining("auth_required"));
+      expect(streams[1].end).not.toHaveBeenCalled();
+    }
+  );
+
   it("binds a durable principal without changing operator authority or exposing the token", async () => {
     const cookie = await login();
     const req = { headers: { cookie }, method: "GET" } as IncomingMessage;
@@ -162,7 +253,7 @@ describe("single-operator dashboard authentication", () => {
     expect(await auth.authorize(req, res)).toBe(true);
     const context = getDashboardRequestIdentity(req);
     expect(context).toMatchObject({
-      mode: "single-operator",
+      mode: "shared-operator",
       attributionId: "human:operator",
       principal: { kind: "user", identity: { issuer: token.iss, subject: token.sub } },
     });

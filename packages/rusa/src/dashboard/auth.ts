@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { cert, deleteApp, initializeApp, type ServiceAccount } from "firebase-admin/app";
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
-import { validateDashboardAuth } from "../config/dashboard-auth.js";
+import { allowedDashboardEmails, validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
@@ -28,8 +28,8 @@ const isTransient = (error: unknown): boolean =>
   TRANSIENT_CODES.has(error.code);
 export interface DashboardRequestIdentity {
   readonly principal: Readonly<UserPrincipal>;
-  /** Explicit compatibility authority. This is not yet tenant-scoped authorization. */
-  readonly mode: "single-operator";
+  /** All admitted humans share operator access; identity does not imply a private root. */
+  readonly mode: "shared-operator";
   readonly attributionId: "human:operator";
 }
 const authenticatedRequests = new WeakMap<IncomingMessage, DashboardRequestIdentity>();
@@ -105,7 +105,7 @@ async function readToken(req: IncomingMessage): Promise<string> {
   return body.idToken;
 }
 
-/** One operator, durable verified identity, unchanged human:operator authority. */
+/** Durable verified human identities with shared human:operator authority. */
 export class DashboardAuth {
   private readonly csrf = new DashboardCsrf();
   private readonly revocations = new Map<string, number>();
@@ -135,7 +135,7 @@ export class DashboardAuth {
   private admitted(token: DecodedIdToken): void {
     if (
       token.email_verified !== true ||
-      token.email?.trim().toLowerCase() !== this.config.email ||
+      !allowedDashboardEmails(this.config).includes(token.email?.trim().toLowerCase() ?? "") ||
       token.firebase?.sign_in_provider !== "google.com" ||
       !token.uid ||
       token.exp * 1000 <= this.now()
@@ -202,7 +202,7 @@ export class DashboardAuth {
             ...principal,
             ...(principal.identity ? { identity: Object.freeze({ ...principal.identity }) } : {}),
           }),
-          mode: "single-operator",
+          mode: "shared-operator",
           attributionId: "human:operator",
         })
       );

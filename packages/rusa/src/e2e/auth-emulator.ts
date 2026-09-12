@@ -7,14 +7,14 @@ import { DashboardIdentityResolver } from "../dashboard/identity.js";
 import { getRepositories } from "../db/index.js";
 
 /** Explicit disposable-instance seam. Production auth still rejects emulator mode. */
-export function createE2EDashboardAuth(host: string, email: string): DashboardAuth {
+export function createE2EDashboardAuth(host: string, email: string | string[]): DashboardAuth {
   if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host)) {
     throw new Error("Auth emulator must be a loopback host:port");
   }
   const port = Number(host.split(":")[1]);
   if (port < 1 || port > 65535) throw new Error("Invalid auth emulator port");
   const config = {
-    email,
+    ...(Array.isArray(email) ? { allowedEmails: email } : { email }),
     firebase: {
       projectId: "demo-rusa-auth",
       apiKey: "e2e-key",
