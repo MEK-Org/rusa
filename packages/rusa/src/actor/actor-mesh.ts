@@ -4301,7 +4301,7 @@ export class ActorMesh {
   }
 
   /** Record per-run token usage for accounting. */
-  private accountRun(actorId: string, result: RunResult, runId?: string): void {
+  accountRun(actorId: string, result: RunResult, runId?: string): void {
     if (!result.tokenUsage) return;
     if (!runId) {
       throw new Error(`token accounting requires a runId for actor ${actorId}`);

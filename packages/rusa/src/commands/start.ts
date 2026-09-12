@@ -3013,6 +3013,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         activeRunSelections.delete(rootId);
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);
+        mesh.accountRun(rootId, result, runId);
         logRunEnd(runLogger(rootId, runId), result);
         mesh.recordEvent({
           kind: "run_end",

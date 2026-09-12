@@ -2492,6 +2492,162 @@ describe("runStart webhook event routing (Phase 4)", () => {
     compactSpy.mockRestore();
   });
 
+  it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: {
+          provider: "claude",
+          model: "claude-sonnet-4-6",
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const rootId = rootActor.id;
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: {
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: unknown,
+            selected: { provider: string; model?: string; effort?: string }
+          ) => void;
+          onRunEnd?: (result: RunResult) => Promise<void>;
+        };
+      }
+    ).opts;
+
+    // 1. Root run with reported Claude token usage
+    const claudeUsage = {
+      provider: "claude" as const,
+      model: "claude-sonnet-4-6",
+      scrapedAt: "2026-09-12T12:00:00.000Z",
+      uncachedInput: 150,
+      cacheRead: 50,
+      output: 30,
+      reasoning: null,
+      response: null,
+    };
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "claude root run done",
+      exitCode: 0,
+      tokenUsage: claudeUsage,
+    });
+
+    const rootTokenRecords = () =>
+      getDb()
+        .prepare(
+          `SELECT rtr.*, ar.id AS actor_run_id
+           FROM run_token_records rtr
+           JOIN actor_runs ar ON ar.id = rtr.run_id
+           WHERE ar.actor_id = ?
+           ORDER BY rtr.created_at ASC`
+        )
+        .all(rootId) as Array<{
+        run_id: string;
+        actor_run_id: string;
+        provider: string;
+        model: string | null;
+        uncached_input: number | null;
+        cache_read: number | null;
+        output: number | null;
+        reasoning: number | null;
+        response: number | null;
+      }>;
+
+    const claudeRecords = rootTokenRecords();
+
+    expect(claudeRecords).toHaveLength(1);
+    expect(claudeRecords[0].run_id).toBe(claudeRecords[0].actor_run_id);
+    expect(claudeRecords[0]).toMatchObject({
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+      uncached_input: 150,
+      cache_read: 50,
+      output: 30,
+      reasoning: null,
+      response: null,
+    });
+
+    // 2. Root run with Codex unattributed token usage (honest absence: nulls, not manufactured zeroes)
+    const codexUsage = {
+      provider: "codex" as const,
+      model: "gpt-5.6-sol",
+      scrapedAt: "2026-09-12T12:05:00.000Z",
+      uncachedInput: null,
+      cacheRead: null,
+      output: null,
+      reasoning: null,
+      response: null,
+    };
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "codex root run done",
+      exitCode: 0,
+      tokenUsage: codexUsage,
+    });
+
+    const allRecords = rootTokenRecords();
+
+    expect(allRecords).toHaveLength(2);
+    expect(new Set(allRecords.map((record) => record.run_id))).toHaveLength(2);
+    expect(allRecords.every((record) => record.run_id === record.actor_run_id)).toBe(true);
+    expect(allRecords.find((record) => record.provider === "codex")).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      uncached_input: null,
+      cache_read: null,
+      output: null,
+      reasoning: null,
+      response: null,
+    });
+
+    // 3. Root run without token usage (e.g. provider returns none / honest absence)
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "root run with no usage",
+      exitCode: 0,
+    });
+
+    const recordsAfterNoUsage = rootTokenRecords();
+    expect(recordsAfterNoUsage).toHaveLength(2);
+  });
+
   it("does not infer polling scope from git remote when github config has no scope", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
