@@ -369,6 +369,9 @@ class FakeApi extends DashboardApi {
 
   /// Backlog pages consumed in order; the last one repeats once exhausted.
   List<List<VoiceAnnouncement>> backlogPages = [const []];
+
+  /// Optional per-request gates for testing the ordering of concurrent fetches.
+  final backlogGates = <Completer<List<VoiceAnnouncement>>>[];
   int backlogCalls = 0;
   final backlogActorIds = <String>[];
   DashboardApiException? backlogError;
@@ -393,6 +396,7 @@ class FakeApi extends DashboardApi {
     backlogActorIds.add(actorId);
     final err = backlogError;
     if (err != null) throw err;
+    if (backlogGates.isNotEmpty) return backlogGates.removeAt(0).future;
     if (backlogPages.isEmpty) return const [];
     final i = backlogCalls - 1;
     return backlogPages[i < backlogPages.length ? i : backlogPages.length - 1];

@@ -1901,6 +1901,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       notifySessionTransferred: (sessionId, targetActorId) =>
         voiceService?.notifySessionTransferred(sessionId, targetActorId),
     },
+    voiceTransferLogger: log.child({ component: "voice-session" }),
     listVoiceSessionChat: (sessionId) =>
       getRepositories().meshChat.listForSession(sessionId, {
         limit: MAX_VOICE_TRANSFER_CONTEXT_MESSAGES,
@@ -3343,6 +3344,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
         },
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
+        logger: log.child({ component: "voice-session" }),
       })
     : null;
   const dashboardServer = shouldBindDashboardServer({

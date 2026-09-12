@@ -9,6 +9,7 @@ import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
+import type { Logger } from "../observability/logger.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   assertConcreteModelConfig,
@@ -59,6 +60,21 @@ import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provide
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
+
+function captureLogger(records: Array<Record<string, unknown>>): Logger {
+  let logger!: Logger;
+  const write = (level: string, event: string, fields: Record<string, unknown> = {}) => {
+    records.push({ level, event, ...fields });
+  };
+  logger = {
+    debug: (event, fields) => write("debug", event, fields),
+    info: (event, fields) => write("info", event, fields),
+    warn: (event, fields) => write("warn", event, fields),
+    error: (event, fields) => write("error", event, fields),
+    child: () => logger,
+  };
+  return logger;
+}
 
 function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
   const entries: InboxEntry[] = [];
@@ -206,6 +222,7 @@ function setup(
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
+    voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -271,6 +288,7 @@ function setup(
     onRevive: opts.onRevive,
     retireCleanups: opts.retireCleanups,
     providerGate: opts.providerGate,
+    voiceTransferLogger: opts.voiceTransferLogger,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -1612,9 +1630,11 @@ describe("ActorMesh", () => {
         sessionId: "walkie-session",
       },
     ];
-    const { mesh, fake, tick, registry, logs } = setup({
+    const transferLogs: Array<Record<string, unknown>> = [];
+    const { mesh, fake, tick, registry } = setup({
       inboxStore,
       isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceTransferLogger: captureLogger(transferLogs),
       voiceSessionTransfer: {
         activeSessionIdFor: (actorId) => {
           if (actorId !== holder) throw new Error("caller does not hold an active voice session");
@@ -1648,18 +1668,10 @@ describe("ActorMesh", () => {
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
     expect(controls).toEqual([["walkie-session", target]]);
-    const transferLog = logs
-      .map((message) => {
-        try {
-          return JSON.parse(message) as Record<string, unknown>;
-        } catch {
-          return null;
-        }
-      })
-      .find((entry) => entry?.event === "voice_session_transfer");
+    const transferLog = transferLogs.find((entry) => entry.event === "voice_session_transfer");
     expect(transferLog).toMatchObject({
       event: "voice_session_transfer",
-      outcome: "control_dispatched",
+      outcome: "control_scheduled",
       sessionId: "walkie-session",
       sourceActorId: source,
       targetActorId: target,
