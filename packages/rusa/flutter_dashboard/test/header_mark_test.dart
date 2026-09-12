@@ -26,6 +26,20 @@ Widget _header(DashboardStore store) => MaterialApp(
   ),
 );
 
+Widget _phoneHeader(DashboardStore store, double width) => MaterialApp(
+  home: Scaffold(
+    body: SizedBox(
+      width: width,
+      child: MeshHeader(
+        store: store,
+        selected: DashboardView.actors,
+        onSelect: (_) {},
+        onMenuTap: () {},
+      ),
+    ),
+  ),
+);
+
 Widget _drawer(DashboardStore store) => MaterialApp(
   home: Scaffold(
     body: SizedBox(
@@ -205,6 +219,50 @@ void main() {
     expect(find.byType(BrandMark), findsOneWidget);
     await tester.runAsync(store.dispose);
   });
+
+  testWidgets(
+    'phone header keeps its actual compact controls inside 320px and 360px',
+    (tester) async {
+      final api = FakeApi()
+        ..halted = true
+        ..schedulerWarning = ['`atq` cannot be queried']
+        ..threadsResult = [makeThread('root', created: 't0')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await tester.runAsync(store.init);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      for (final width in [320.0, 360.0]) {
+        await tester.binding.setSurfaceSize(Size(width, 800));
+        await tester.pumpWidget(_phoneHeader(store, width));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final headerRect = tester.getRect(find.byType(MeshHeader));
+        // Phone navigation deliberately replaces BrandMark with the menu; the
+        // mark remains in the drawer, leaving the real header one compact row.
+        expect(find.byType(BrandMark), findsNothing);
+        expect(find.byIcon(Icons.menu), findsOneWidget);
+        expect(find.text('RUSA'), findsOneWidget);
+        expect(find.byIcon(Icons.pause_circle_filled), findsOneWidget);
+        expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+        expect(find.text('Halted'), findsNothing);
+        expect(find.text('Scheduler'), findsNothing);
+
+        for (final finder in [
+          find.byIcon(Icons.menu),
+          find.text('RUSA'),
+          find.byIcon(Icons.pause_circle_filled),
+          find.byIcon(Icons.warning_amber_rounded),
+        ]) {
+          final rect = tester.getRect(finder);
+          expect(rect.left, greaterThanOrEqualTo(headerRect.left));
+          expect(rect.right, lessThanOrEqualTo(headerRect.right));
+        }
+        expect(tester.takeException(), isNull);
+      }
+
+      await tester.runAsync(store.dispose);
+    },
+  );
 
   testWidgets('phone shape swaps the mark for the menu but keeps the brand', (
     tester,

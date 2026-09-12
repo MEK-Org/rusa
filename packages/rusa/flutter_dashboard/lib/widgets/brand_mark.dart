@@ -10,7 +10,7 @@ class BrandMark extends StatelessWidget {
   const BrandMark({super.key});
 
   /// Fixed height constraint for the artwork box itself. Sized so the padded
-  /// widget sits comfortably centered in the 56px header row.
+  /// widget sits comfortably centered in the 70px header row.
   static const double _kArtworkHeight = 22;
 
   /// Surrounding space compensating for the artwork's tight crop.
