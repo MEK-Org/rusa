@@ -8,10 +8,10 @@ import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 
 import 'fakes.dart';
 
-// Issue #412: the dashboard's upper-left mark is the operator-supplied
-// antler/tree SVG, the routine status indicator is gone, and an active halt
-// still surfaces a visible badge. The SVG loads asynchronously, so each test
-// runs in a real async zone and pumps until the asset future completes.
+// Issue #429 replaces the dashboard's upper-left mark with the simplified
+// antler/tree SVG. The normal-hidden status and active-halt badge behavior
+// landed in #412 and remain covered here. The SVG loads asynchronously, so each
+// test runs in a real async zone and pumps until the asset future completes.
 
 Widget _header(DashboardStore store) => MaterialApp(
   home: Scaffold(
@@ -48,7 +48,7 @@ Future<void> _pumpUntilMarkLoads(WidgetTester tester) async {
 
 void main() {
   testWidgets(
-    'renders the antler/tree mark upper-left in desktop header with bounds and crop margins',
+    'renders the simplified antler/tree mark upper-left in desktop header with bounds and crop margins',
     (tester) async {
       final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -82,14 +82,14 @@ void main() {
       final brandRowRect = tester.getRect(brandRow);
       expect(brandRowRect.height, 70.0);
 
-      // Artwork box constraint is 22px high and preserves 596:687 aspect ratio.
+      // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(596 / 687, epsilon: 0.01));
+      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
 
       // BrandMark footprint: vertical footprint is 32px (22 + 2*5 padding),
-      // horizontal footprint is ~35.36px (22 * 687 / 596 + 2*5).
+      // horizontal footprint is ~37.47px (22 * 241 / 193 + 2*5).
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 687 / 596 + 10, epsilon: 0.1));
+      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
 
       // Visual breathing room / crop-compensation margins:
       // Artwork has 5px internal clearance from the BrandMark container on all sides.
@@ -121,7 +121,7 @@ void main() {
   );
 
   testWidgets(
-    'renders the antler/tree mark in phone drawer with proper bounds and spacing',
+    'renders the simplified antler/tree mark in phone drawer with proper bounds and spacing',
     (tester) async {
       final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -144,13 +144,13 @@ void main() {
       final svgRect = tester.getRect(svg);
       final textRect = tester.getRect(text);
 
-      // Artwork box constraint is 22px high and preserves 596:687 aspect ratio.
+      // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(596 / 687, epsilon: 0.01));
+      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
 
       // BrandMark footprint in drawer.
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 687 / 596 + 10, epsilon: 0.1));
+      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
 
       // In the drawer, outer padding is (15, 15, 20, 11) to compensate for 5px mark padding,
       // landing the artwork at exactly 20px from drawer top and left edges.
