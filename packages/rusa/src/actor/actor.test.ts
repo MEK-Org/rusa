@@ -4,7 +4,7 @@ import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
 import { formatSigtermResult } from "../providers/termination-attribution.js";
-import type { RunOptions, RunResult } from "../providers/types.js";
+import type { CodingProvider, RunOptions, RunResult } from "../providers/types.js";
 import {
   Actor,
   type ActorOptions,
@@ -1196,6 +1196,56 @@ describe("Actor", () => {
     expect(seen[0]?.output).toContain('invalid --model "claude-sonnet-5"');
     // ISSUE_NUM's scrub still holds: the primary is named as a condition, never pasted
     // raw, because provider output echoes the prompt and the prompt holds secrets.
+    expect(seen[0]?.output).not.toContain("RAW PRIMARY");
+    expect(seen[0]?.output).not.toContain("secret=");
+  });
+
+  // #433 — a fallback whose model cannot be resolved under the provider the
+  // primary ran on is a configuration failure, not permission to retry under
+  // another tuple. It is still reported exhaustion-first: without this wrap the
+  // resolver throw escapes to the terminal boundary as a bare stack and the
+  // reader's first hypothesis is again a bad model pin, not "wait for quota".
+  it("reports the primary's exhaustion when the fallback cannot be resolved", async () => {
+    const primary = new FakeProvider(
+      () => ({
+        success: false,
+        output: "RAW PRIMARY: usage credits depleted for prompt secret=abc",
+        exitCode: 7,
+        sessionId: "primary-session",
+      }),
+      "primary-model"
+    );
+    const resolveFallback = vi.fn((): CodingProvider => {
+      throw new Error(
+        'model pin validation failed for provider "claude": rejected "fallback-model"'
+      );
+    });
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        fallback: {
+          models: ["fallback-model", "never-reached"],
+          resolveProvider: resolveFallback,
+          classify: async (r: RunResult) => ({ exhausted: r.output.includes("RAW PRIMARY") }),
+        },
+        onRunEnd: (r) => {
+          seen.push(r);
+        },
+      },
+      primary
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(primary.calls).toHaveLength(1);
+    // Resolution failing is terminal for recovery, exactly like a fallback
+    // attempt that failed for a non-exhaustion reason: later entries are not
+    // tried under some other interpretation.
+    expect(resolveFallback).toHaveBeenCalledTimes(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ success: false, exitCode: 7, sessionId: "primary-session" });
+    expect(seen[0]?.output).toContain("primary-model exhausted");
+    expect(seen[0]?.output).toContain("recovery failed");
+    expect(seen[0]?.output).toContain('model pin validation failed for provider "claude"');
     expect(seen[0]?.output).not.toContain("RAW PRIMARY");
     expect(seen[0]?.output).not.toContain("secret=");
   });
