@@ -8,10 +8,10 @@ import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 
 import 'fakes.dart';
 
-// Issue #412: the dashboard's upper-left mark is the operator-supplied
-// antler/tree SVG, the routine status indicator is gone, and an active halt
-// still surfaces a visible badge. The SVG loads asynchronously, so each test
-// runs in a real async zone and pumps until the asset future completes.
+// Issue #429 replaces the dashboard's upper-left mark with the simplified
+// antler/tree SVG. The normal-hidden status and active-halt badge behavior
+// landed in #412 and remain covered here. The SVG loads asynchronously, so each
+// test runs in a real async zone and pumps until the asset future completes.
 
 Widget _header(DashboardStore store) => MaterialApp(
   home: Scaffold(
@@ -21,6 +21,20 @@ Widget _header(DashboardStore store) => MaterialApp(
         store: store,
         selected: DashboardView.actors,
         onSelect: (_) {},
+      ),
+    ),
+  ),
+);
+
+Widget _phoneHeader(DashboardStore store, double width) => MaterialApp(
+  home: Scaffold(
+    body: SizedBox(
+      width: width,
+      child: MeshHeader(
+        store: store,
+        selected: DashboardView.actors,
+        onSelect: (_) {},
+        onMenuTap: () {},
       ),
     ),
   ),
@@ -48,7 +62,7 @@ Future<void> _pumpUntilMarkLoads(WidgetTester tester) async {
 
 void main() {
   testWidgets(
-    'renders the antler/tree mark upper-left in desktop header with bounds and crop margins',
+    'renders the simplified antler/tree mark upper-left in desktop header with bounds and crop margins',
     (tester) async {
       final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -82,14 +96,14 @@ void main() {
       final brandRowRect = tester.getRect(brandRow);
       expect(brandRowRect.height, 70.0);
 
-      // Artwork box constraint is 22px high and preserves 596:687 aspect ratio.
+      // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(596 / 687, epsilon: 0.01));
+      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
 
       // BrandMark footprint: vertical footprint is 32px (22 + 2*5 padding),
-      // horizontal footprint is ~35.36px (22 * 687 / 596 + 2*5).
+      // horizontal footprint is ~37.47px (22 * 241 / 193 + 2*5).
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 687 / 596 + 10, epsilon: 0.1));
+      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
 
       // Visual breathing room / crop-compensation margins:
       // Artwork has 5px internal clearance from the BrandMark container on all sides.
@@ -121,7 +135,7 @@ void main() {
   );
 
   testWidgets(
-    'renders the antler/tree mark in phone drawer with proper bounds and spacing',
+    'renders the simplified antler/tree mark in phone drawer with proper bounds and spacing',
     (tester) async {
       final api = FakeApi()..threadsResult = [makeThread('root', created: 't0')];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -144,13 +158,13 @@ void main() {
       final svgRect = tester.getRect(svg);
       final textRect = tester.getRect(text);
 
-      // Artwork box constraint is 22px high and preserves 596:687 aspect ratio.
+      // Artwork box constraint is 22px high and preserves 193:241 aspect ratio.
       expect(svgRect.height, 22.0);
-      expect(svgRect.height / svgRect.width, moreOrLessEquals(596 / 687, epsilon: 0.01));
+      expect(svgRect.height / svgRect.width, moreOrLessEquals(193 / 241, epsilon: 0.01));
 
       // BrandMark footprint in drawer.
       expect(markRect.height, 32.0);
-      expect(markRect.width, moreOrLessEquals(22 * 687 / 596 + 10, epsilon: 0.1));
+      expect(markRect.width, moreOrLessEquals(22 * 241 / 193 + 10, epsilon: 0.1));
 
       // In the drawer, outer padding is (15, 15, 20, 11) to compensate for 5px mark padding,
       // landing the artwork at exactly 20px from drawer top and left edges.
@@ -205,6 +219,50 @@ void main() {
     expect(find.byType(BrandMark), findsOneWidget);
     await tester.runAsync(store.dispose);
   });
+
+  testWidgets(
+    'phone header keeps its actual compact controls inside 320px and 360px',
+    (tester) async {
+      final api = FakeApi()
+        ..halted = true
+        ..schedulerWarning = ['`atq` cannot be queried']
+        ..threadsResult = [makeThread('root', created: 't0')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await tester.runAsync(store.init);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      for (final width in [320.0, 360.0]) {
+        await tester.binding.setSurfaceSize(Size(width, 800));
+        await tester.pumpWidget(_phoneHeader(store, width));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final headerRect = tester.getRect(find.byType(MeshHeader));
+        // Phone navigation deliberately replaces BrandMark with the menu; the
+        // mark remains in the drawer, leaving the real header one compact row.
+        expect(find.byType(BrandMark), findsNothing);
+        expect(find.byIcon(Icons.menu), findsOneWidget);
+        expect(find.text('RUSA'), findsOneWidget);
+        expect(find.byIcon(Icons.pause_circle_filled), findsOneWidget);
+        expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+        expect(find.text('Halted'), findsNothing);
+        expect(find.text('Scheduler'), findsNothing);
+
+        for (final finder in [
+          find.byIcon(Icons.menu),
+          find.text('RUSA'),
+          find.byIcon(Icons.pause_circle_filled),
+          find.byIcon(Icons.warning_amber_rounded),
+        ]) {
+          final rect = tester.getRect(finder);
+          expect(rect.left, greaterThanOrEqualTo(headerRect.left));
+          expect(rect.right, lessThanOrEqualTo(headerRect.right));
+        }
+        expect(tester.takeException(), isNull);
+      }
+
+      await tester.runAsync(store.dispose);
+    },
+  );
 
   testWidgets('phone shape swaps the mark for the menu but keeps the brand', (
     tester,
