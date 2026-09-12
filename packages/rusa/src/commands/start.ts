@@ -2888,11 +2888,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       fallback: fallbackModels
         ? {
             models: fallbackModels,
-            // Keep the long-standing fallback launch policy. Attribution below
-            // reads the provider instance this resolves, so it cannot relabel a
-            // fallback with the primary request.
+            // `runWithFallback` only calls this after `onRunStart` captures the
+            // entry that actually launched. Resolve the fallback under that
+            // provider and effort, rather than the scalar file tuple which may
+            // no longer be root's durable pool after a restart. An unsupported
+            // fallback model then throws explicitly instead of silently moving
+            // recovery onto the stale file provider.
             resolveProvider: (model) =>
-              resolveProvider(config, rootActor.provider, model, rootActor.effort),
+              resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
             classify: classifyExhaustion,
           }
         : undefined,

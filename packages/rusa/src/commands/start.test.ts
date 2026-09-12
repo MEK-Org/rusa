@@ -32,7 +32,7 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
-import type { RunResult } from "../providers/types.js";
+import type { CodingProvider, RunResult } from "../providers/types.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
@@ -3902,6 +3902,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       { provider: "claude", model: "claude-sonnet-5", effort: "high" },
       { provider: "antigravity", model: "Gemini 4.1 Ultra", effort: "low" },
     ];
+    const fallbackOperatorPool: ProviderModelConfig[] = [
+      { provider: "claude", model: "claude-sonnet-5", effort: "low" },
+    ];
 
     const boot = async (): Promise<ActorMesh> => {
       let mesh: ActorMesh | undefined;
@@ -4069,6 +4072,85 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
       expect(liveRootPool(mesh)).toEqual(operatorPool);
       expect(modelSetEvents()).toHaveLength(1);
+    });
+
+    it("resolves a root fallback from the persisted entry that its Actor is running", async () => {
+      // Set a durable Claude/low primary, then edit the scalar file to a
+      // different Antigravity/high tuple before restart. The fallback model is
+      // deliberately named like the old file's model: the real Actor fallback
+      // boundary must not borrow that file provider or effort when it recovers
+      // from the durable primary.
+      const first = await boot();
+      first.setActorModel("root", fallbackOperatorPool, "root");
+      rootActorOpts(first).beforeRun?.({ mode: "yield-elicitation" });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const changedFileConfig = portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...changedFileConfig,
+          rootActor: {
+            ...changedFileConfig.rootActor,
+            fallbackModel: "Gemini 3.7 Flash",
+          },
+        }),
+        "utf8"
+      );
+
+      const mesh = await boot();
+      const root = mesh.get("root");
+      if (!root) throw new Error("root actor not ready");
+      expect(liveRootPool(mesh)).toEqual(fallbackOperatorPool);
+      const actor = root as unknown as {
+        opts: {
+          fallback?: {
+            classify: (result: RunResult) => Promise<{ exhausted: boolean }>;
+          };
+        };
+        runWithFallback: (
+          primary: CodingProvider,
+          runProvider: (provider: CodingProvider) => Promise<RunResult>
+        ) => Promise<RunResult>;
+      };
+      const opts = actor.opts;
+      if (!opts.fallback) throw new Error("root fallback not configured");
+      opts.fallback.classify = vi.fn(async () => ({ exhausted: true }));
+      const primary: CodingProvider = {
+        name: "claude",
+        providerName: "claude",
+        model: "claude-sonnet-5",
+        effort: "low",
+        run: async () => ({ success: true, output: "unused", exitCode: 0 }),
+      };
+      const attempts: CodingProvider[] = [];
+
+      await actor.runWithFallback(primary, async (provider) => {
+        attempts.push(provider);
+        return provider === primary
+          ? { success: false, output: "quota exhausted", exitCode: 1 }
+          : { success: true, output: "fallback recovered", exitCode: 0 };
+      });
+
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]).toMatchObject({
+        providerName: "claude",
+        model: "Gemini 3.7 Flash",
+        effort: "low",
+      });
+
+      // A fallback pin unavailable to the durable provider is a real failure,
+      // not permission to try the stale Antigravity/high file tuple instead.
+      setProviderModelCatalog("claude", [
+        { identifier: "claude-sonnet-5", displayLabel: "claude-sonnet-5", passable: true },
+      ]);
+      await expect(
+        actor.runWithFallback(primary, async () => ({
+          success: false,
+          output: "quota exhausted",
+          exitCode: 1,
+        }))
+      ).rejects.toThrow(/model pin validation failed for provider "claude"/);
     });
 
     it("seeds a root record with no persisted pool from the configured tuple without a model-set event", async () => {
