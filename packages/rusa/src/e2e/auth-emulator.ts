@@ -3,6 +3,8 @@ import { deleteApp, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import { DashboardAuth } from "../dashboard/auth.js";
+import { DashboardIdentityResolver } from "../dashboard/identity.js";
+import { getRepositories } from "../db/index.js";
 
 /** Explicit disposable-instance seam. Production auth still rejects emulator mode. */
 export function createE2EDashboardAuth(host: string, email: string): DashboardAuth {
@@ -23,5 +25,12 @@ export function createE2EDashboardAuth(host: string, email: string): DashboardAu
   validateDashboardAuth(config);
   process.env.FIREBASE_AUTH_EMULATOR_HOST = host;
   const app = initializeApp({ projectId: config.firebase.projectId }, `rusa-e2e-${randomUUID()}`);
-  return new DashboardAuth(config, getAuth(app), Date.now, () => deleteApp(app), `http://${host}`);
+  return new DashboardAuth(
+    config,
+    getAuth(app),
+    new DashboardIdentityResolver(() => getRepositories().principals),
+    Date.now,
+    () => deleteApp(app),
+    `http://${host}`
+  );
 }

@@ -5,17 +5,22 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
   createDashboardAuth,
   DashboardAuth,
+  getDashboardRequestIdentity,
   SESSION_COOKIE,
   SESSION_MS,
   STREAM_IDLE_MS,
 } from "./auth.js";
+import { DashboardIdentityResolver } from "./identity.js";
 
 const config = {
   email: "owner@example.com",
@@ -31,7 +36,7 @@ const claim = (extra: Partial<DecodedIdToken> = {}): DecodedIdToken => ({
   uid: "owner-id",
   sub: "owner-id",
   aud: "project",
-  iss: "issuer",
+  iss: "https://securetoken.google.com/project",
   iat: now / 1000,
   exp: (now + SESSION_MS) / 1000,
   auth_time: Math.floor(now / 1000),
@@ -67,11 +72,19 @@ describe("single-operator dashboard authentication", () => {
     }),
     createSessionCookie: vi.fn(async (_value: string, options: { expiresIn: number }) => {
       const name = `cookie-${++serial}`;
-      cookies.set(name, claim({ exp: (now + options.expiresIn) / 1000 }));
+      cookies.set(
+        name,
+        claim({
+          iss: "https://session.firebase.google.com/project",
+          exp: (now + options.expiresIn) / 1000,
+        })
+      );
       return name;
     }),
   };
   let auth: DashboardAuth;
+  let db: Database.Database;
+  let principals: PrincipalRepository;
   let server: ReturnType<typeof createServer>;
   let origin: string;
   const interrupt = vi.fn(() => ({ interrupted: true, status: "interrupted" }));
@@ -83,7 +96,15 @@ describe("single-operator dashboard authentication", () => {
     token = claim();
     cookies.clear();
     vi.clearAllMocks();
-    auth = new DashboardAuth(config, firebase, () => now);
+    db = new Database(":memory:");
+    runMigrations(db);
+    principals = new PrincipalRepository(db);
+    auth = new DashboardAuth(
+      config,
+      firebase,
+      new DashboardIdentityResolver(() => principals),
+      () => now
+    );
     server = createServer(
       createDashboardRequestHandler(
         { port: 0, auth: config },
@@ -102,6 +123,7 @@ describe("single-operator dashboard authentication", () => {
     await auth.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    db.close();
     vi.useRealTimers();
   });
   const post = async (path: string, cookie?: string, extra: Record<string, string> = {}) => {
@@ -128,6 +150,59 @@ describe("single-operator dashboard authentication", () => {
     if (!cookie) throw new Error("Expected a session cookie");
     return cookie.split(";")[0];
   }
+
+  it("binds a durable principal without changing operator authority or exposing the token", async () => {
+    const cookie = await login();
+    const req = { headers: { cookie }, method: "GET" } as IncomingMessage;
+    const res = {
+      setHeader: vi.fn(),
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    } as unknown as ServerResponse;
+    expect(await auth.authorize(req, res)).toBe(true);
+    const context = getDashboardRequestIdentity(req);
+    expect(context).toMatchObject({
+      mode: "single-operator",
+      attributionId: "human:operator",
+      principal: { kind: "user", identity: { issuer: token.iss, subject: token.sub } },
+    });
+    expect(context?.principal.rootActorId).toBeUndefined();
+    expect(Object.isFrozen(context)).toBe(true);
+    expect(JSON.stringify(context)).not.toContain("cookie-1");
+    expect(JSON.stringify(context)).not.toContain("id-token");
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    expect(user?.id).toBe(context?.principal.id);
+    expect(user?.lastAuthenticatedAt).toBe(new Date(now).toISOString());
+    if (!user) throw new Error("Expected durable user");
+    principals.setDisabled(user.id, new Date(now).toISOString());
+    expect(await auth.authorize(req, res)).toBe(false);
+    expect(getDashboardRequestIdentity(req)).toBeUndefined();
+    expect((await post("/api/auth/session", cookie)).status).toBe(401);
+    expect((await post("/api/auth/refresh", cookie)).status).toBe(401);
+    expect(principals.getUser(user.id)?.identity).toEqual(user.identity);
+  });
+
+  it("resolves existing cookies across resolver restarts without claiming roots or changing history", async () => {
+    const cookie = await login();
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    const restarted = new DashboardAuth(
+      config,
+      firebase,
+      new DashboardIdentityResolver(() => new PrincipalRepository(db)),
+      () => now
+    );
+    const req = { headers: { cookie }, method: "GET" } as IncomingMessage;
+    const res = {
+      setHeader: vi.fn(),
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    } as unknown as ServerResponse;
+    now += 60000;
+    expect(await restarted.authorize(req, res)).toBe(true);
+    expect(getDashboardRequestIdentity(req)?.principal.id).toBe(user?.id);
+    expect(principals.getUser(user?.id ?? "")?.lastAuthenticatedAt).toBe(user?.lastAuthenticatedAt);
+    await restarted.close();
+  });
 
   it("requires a protected bootstrap, without authenticating or extending a session", async () => {
     expect((await fetch(`${origin}/api/auth/csrf`)).status).toBe(403);
@@ -366,6 +441,12 @@ describe("single-operator dashboard authentication", () => {
     firebase.verifySessionCookie.mockClear();
     expect((await session()).status).toBe(200);
     expect(firebase.verifySessionCookie.mock.calls.map(([, check]) => check)).toEqual([false]);
+    // The outage fallback must still consult the local principal, not just Firebase claims.
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    if (!user) throw new Error("Expected durable user");
+    principals.setDisabled(user.id, new Date(now).toISOString());
+    expect((await session()).status).toBe(401);
+    principals.setDisabled(user.id, null);
     // Outage-time login and renewal are unavailable, not denied: the browser keeps its session.
     expect((await post("/api/auth/refresh", cookie)).status).toBe(503);
     expect((await post("/api/auth/session")).status).toBe(503);
@@ -384,6 +465,19 @@ describe("single-operator dashboard authentication", () => {
     const res = await post("/api/auth/logout", cookie);
     expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
+  });
+
+  it.each([
+    "auth/argument-error",
+    "auth/quota-exceeded",
+  ])("preserves fail-closed handling for SDK rejection %s", async (code) => {
+    const cookie = await login();
+    firebase.verifySessionCookie.mockRejectedValueOnce(
+      Object.assign(new Error("SDK rejection"), { code })
+    );
+    expect(
+      (await fetch(`${origin}/api/auth/session`, { headers: { Cookie: cookie } })).status
+    ).toBe(401);
   });
 
   it("binds authenticated actions to human:operator instead of a body-supplied identity", async () => {
@@ -431,6 +525,17 @@ describe("single-operator dashboard authentication", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(first.end).toHaveBeenCalledWith(expect.stringContaining("auth_required"));
     revoked = false;
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    if (!user) throw new Error("Expected durable user");
+    const locallyDisabled = response();
+    auth.guardStream(req, locallyDisabled);
+    unreachable = true;
+    principals.setDisabled(user.id, new Date(now).toISOString());
+    now += 60_000;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(locallyDisabled.end).toHaveBeenCalledWith(expect.stringContaining("auth_required"));
+    unreachable = false;
+    principals.setDisabled(user.id, null);
     const second = response();
     auth.guardStream(req, second);
     now += STREAM_IDLE_MS;
@@ -481,6 +586,8 @@ describe("single-operator dashboard authentication", () => {
 });
 
 describe("production boundary startup", () => {
+  const db = new Database(":memory:");
+  const principals = new PrincipalRepository(db);
   const dir = mkdtempSync(join(tmpdir(), "rusa-auth-"));
   const keyPath = join(dir, "admin.json");
   const withKey = (path = keyPath) => ({
@@ -488,6 +595,7 @@ describe("production boundary startup", () => {
     firebase: { ...config.firebase, serviceAccountKeyPath: path },
   });
   afterEach(() => {
+    db.close();
     vi.unstubAllEnvs();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -496,15 +604,15 @@ describe("production boundary startup", () => {
     // The e2e seam sets this for its own process; the production check must see it unset.
     vi.stubEnv("FIREBASE_AUTH_EMULATOR_HOST", undefined);
     const missing = join(dir, "missing.json");
-    expect(() => createDashboardAuth(withKey(missing))).toThrow(`(ENOENT): ${missing}`);
+    expect(() => createDashboardAuth(withKey(missing), principals)).toThrow(`(ENOENT): ${missing}`);
     writeFileSync(keyPath, "{not json");
-    expect(() => createDashboardAuth(withKey())).toThrow(`not valid JSON: ${keyPath}`);
+    expect(() => createDashboardAuth(withKey(), principals)).toThrow(`not valid JSON: ${keyPath}`);
     writeFileSync(keyPath, JSON.stringify({ project_id: "other-project" }));
-    expect(() => createDashboardAuth(withKey())).toThrow(
+    expect(() => createDashboardAuth(withKey(), principals)).toThrow(
       `does not match auth.firebase.projectId (project): ${keyPath}`
     );
     writeFileSync(keyPath, JSON.stringify({ project_id: "project" }));
-    expect(() => createDashboardAuth(withKey())).toThrow(
+    expect(() => createDashboardAuth(withKey(), principals)).toThrow(
       /Could not initialize dashboard Firebase authentication: .*private_key/
     );
   });

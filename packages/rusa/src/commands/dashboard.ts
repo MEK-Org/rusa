@@ -60,6 +60,7 @@ ${"━".repeat(26)}
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
   const dashboardServer = await startDashboardServer({
     auth: config.auth,
+    principals: getRepositories().principals,
     port: dashboardPort,
     bindHost: dashboardBindHost,
     logger: log,
