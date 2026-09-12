@@ -172,7 +172,7 @@ export class DashboardAuth {
       return true;
     } catch (error) {
       // 401 is the browser's signal to sign in again, so an unreachable Firebase
-      // (when even the cached-certificate path cannot answer) must not send one.
+      // must not send one.
       if (isTransient(error)) json(res, 503, { error: "Authentication unavailable" });
       else json(res, 401, { error: "Authentication required" });
       return false;

@@ -48,8 +48,6 @@ describe("single-operator dashboard authentication", () => {
   let revoked: boolean;
   // Firebase unreachable: every network-backed call fails with the SDK's transport code.
   let unreachable: boolean;
-  // ...and the SDK holds no cached signing certificates, so nothing verifies locally.
-  let offline: boolean;
   const outage = () =>
     Object.assign(new Error("connect ECONNREFUSED"), { code: "app/network-error" });
   const firebase = {
@@ -62,9 +60,8 @@ describe("single-operator dashboard authentication", () => {
     verifySessionCookie: vi.fn(async (value: string, check: boolean) => {
       const cookie = cookies.get(value);
       if (!cookie) throw new Error("sensitive session error");
-      // Signature verification survives an outage on cached certificates unless
-      // `offline` also denies it the public keys.
-      if (unreachable && (check || offline)) throw outage();
+      // Signature verification survives an outage on cached certificates.
+      if (unreachable && check) throw outage();
       if (check && revoked) throw new Error("sensitive session error");
       return cookie;
     }),
@@ -83,7 +80,6 @@ describe("single-operator dashboard authentication", () => {
     serial = 0;
     revoked = false;
     unreachable = false;
-    offline = false;
     token = claim();
     cookies.clear();
     vi.clearAllMocks();
@@ -373,10 +369,6 @@ describe("single-operator dashboard authentication", () => {
     // Outage-time login and renewal are unavailable, not denied: the browser keeps its session.
     expect((await post("/api/auth/refresh", cookie)).status).toBe(503);
     expect((await post("/api/auth/session")).status).toBe(503);
-    // With no cached certificates either, the answer is "unavailable", never "sign in again".
-    offline = true;
-    expect((await session()).status).toBe(503);
-    offline = false;
     // Expiry is still enforced locally during the outage.
     now += SESSION_MS;
     expect((await session()).status).toBe(401);

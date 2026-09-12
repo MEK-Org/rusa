@@ -94,11 +94,14 @@ Firebase being unreachable is not treated as a revocation. If a revocation looku
 fails for a transport reason (network error, timeout, or a Firebase server error),
 the request or stream continues on the locally verified signature, expiry, and
 admission checks, and the lookup is retried at the next window; only an explicit
-rejection ends the session. Login and renewal during such an outage answer 503
-rather than 401, so the browser keeps its still-valid session and retries on the
-next navigation. A Rusa restart ends open streams without a login prompt; the
-browser reconnects on its own and the existing cookie is verified again.
-Configuration changes apply at restart.
+rejection ends the session. While Google's signing certificates remain cached in
+the process, login and renewal during an outage answer 503 rather than 401, so the
+browser keeps its still-valid session and retries on the next navigation; once
+certificates cannot be fetched (such as on a cold start or after certificate cache
+expiry during an extended outage), verification fails closed with 401. A Rusa
+restart ends open streams without a login prompt; the browser reconnects on its
+own and the existing cookie is verified again. Configuration changes apply at
+restart.
 
 All dashboard data, mutations, avatars, quota/understanding views, voice, and SSE
 are behind the same gate. Public routes are the generic login shell and bundled
