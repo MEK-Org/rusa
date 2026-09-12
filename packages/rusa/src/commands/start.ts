@@ -2427,7 +2427,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               body: result.output,
               payload: runEndPayload({ ...result, runId }),
             });
-            ctx.onRunEnd(result);
+            ctx.onRunEnd(result, runId);
             const compacted = await compactPortableActorAfterRun(id);
             if (compacted) {
               mesh.recordEvent({

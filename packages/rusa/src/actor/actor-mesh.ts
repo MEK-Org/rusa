@@ -460,7 +460,7 @@ export interface ActorFactoryContext {
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (token usage) + completion-review hook. */
-  onRunEnd: (result: RunResult) => void;
+  onRunEnd: (result: RunResult, runId?: string) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
   /**
@@ -4284,9 +4284,9 @@ export class ActorMesh {
       onQueued: (context) => {
         this.actorQueued(record.id, context);
       },
-      onRunEnd: (result) => {
+      onRunEnd: (result, runId) => {
         this.finishInboxRun(record.id);
-        this.accountRun(record.id, result);
+        this.accountRun(record.id, result, runId);
         // Safety net: the start/cancel hooks are the primary clearing
         // points, but a selection must never survive past its run ending.
         this.clearSelection(record.id);
@@ -4301,33 +4301,35 @@ export class ActorMesh {
   }
 
   /** Record per-run token usage for accounting. */
-  private accountRun(id: string, result: RunResult): void {
-    if (result.tokenUsage) {
-      const usage = result.tokenUsage;
-      try {
-        getDb()
-          .prepare(
-            `INSERT INTO run_token_records
-              (id, run_id, provider, model, scraped_at, uncached_input, cache_read, output, reasoning, response)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
-            randomUUID(),
-            id,
-            usage.provider,
-            usage.model,
-            usage.scrapedAt,
-            usage.uncachedInput,
-            usage.cacheRead,
-            usage.output,
-            usage.reasoning,
-            usage.response
-          );
-      } catch (err) {
-        this.log(
-          `token accounting write failed for ${id}: ${err instanceof Error ? err.message : String(err)}`
+  private accountRun(actorId: string, result: RunResult, runId?: string): void {
+    if (!result.tokenUsage) return;
+    if (!runId) {
+      throw new Error(`token accounting requires a runId for actor ${actorId}`);
+    }
+    const usage = result.tokenUsage;
+    try {
+      getDb()
+        .prepare(
+          `INSERT INTO run_token_records
+            (id, run_id, provider, model, scraped_at, uncached_input, cache_read, output, reasoning, response)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          randomUUID(),
+          runId,
+          usage.provider,
+          usage.model,
+          usage.scrapedAt,
+          usage.uncachedInput,
+          usage.cacheRead,
+          usage.output,
+          usage.reasoning,
+          usage.response
         );
-      }
+    } catch (err) {
+      this.log(
+        `token accounting write failed for ${runId}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
 

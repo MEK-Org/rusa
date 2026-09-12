@@ -5116,4 +5116,100 @@ describe("runStart webhook event routing (Phase 4)", () => {
       `from worker\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
     );
   });
+
+  it("records token usage linked to actor_runs.id through the real worker onRunEnd factory wiring", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh not ready");
+
+    const workerId = mesh.spawn({
+      charter: "worker token accounting wiring test",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const worker = mesh.get(workerId) as Actor | undefined;
+    if (!worker) throw new Error("worker not found");
+
+    type WorkerOpts = {
+      opts: {
+        onRunStart?: (
+          responsive: boolean,
+          injectRecord: undefined,
+          selected: { provider: string; model: string; effort: string }
+        ) => void;
+        onRunEnd?: (result: RunResult) => void | Promise<void>;
+      };
+    };
+    const workerOpts = (worker as unknown as WorkerOpts).opts;
+
+    // Start a run for the worker
+    workerOpts.onRunStart?.(false, undefined, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
+    // End run with token usage
+    const result: RunResult = {
+      success: true,
+      output: "worker run completed",
+      exitCode: 0,
+      tokenUsage: {
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        scrapedAt: new Date().toISOString(),
+        uncachedInput: 250,
+        cacheRead: 50,
+        output: 75,
+        reasoning: null,
+        response: null,
+      },
+    };
+    await workerOpts.onRunEnd?.(result);
+
+    // Assert that the run_end event was recorded and carried the runId
+    const db = getDb();
+    const eventRow = db
+      .prepare(
+        "SELECT payload FROM mesh_events WHERE kind = 'run_end' AND actor_id = ? ORDER BY id DESC LIMIT 1"
+      )
+      .get(workerId) as { payload: string } | undefined;
+    expect(eventRow).toBeDefined();
+    if (!eventRow) throw new Error("eventRow not found");
+    const payload = JSON.parse(eventRow.payload) as { runId?: string };
+    expect(payload.runId).toBeDefined();
+
+    // Assert that run_token_records has a row matching this exact runId
+    const tokenRecord = db
+      .prepare("SELECT * FROM run_token_records WHERE run_id = ?")
+      .get(payload.runId) as { id: string; run_id: string; uncached_input: number } | undefined;
+    expect(tokenRecord).toBeDefined();
+    expect(tokenRecord?.run_id).toBe(payload.runId);
+    expect(tokenRecord?.uncached_input).toBe(250);
+
+    // Verify foreign join: token record joins cleanly to actor_runs.id
+    const joined = db
+      .prepare(
+        `SELECT rtr.id, rtr.run_id, ar.id as run_fk, ar.actor_id
+         FROM run_token_records rtr
+         JOIN actor_runs ar ON rtr.run_id = ar.id
+         WHERE ar.id = ?`
+      )
+      .get(payload.runId) as { run_id: string; run_fk: string; actor_id: string } | undefined;
+    expect(joined).toBeDefined();
+    expect(joined?.run_id).toBe(payload.runId);
+    expect(joined?.actor_id).toBe(workerId);
+  });
 });
