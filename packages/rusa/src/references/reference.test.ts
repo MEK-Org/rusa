@@ -134,6 +134,10 @@ describe("reference grammar", () => {
   it("projects back out to the provider's URL, wrinkles and all", () => {
     // The one place GitHub's inconsistencies are reconstructed: singular
     // `/pull/`, and a comment as an anchor on its parent.
+    expect(referenceUrl(parseReference("github:MEK-Org"))).toBe("https://github.com/MEK-Org");
+    expect(referenceUrl(parseReference("github:MEK-Org/rusa"))).toBe(
+      "https://github.com/MEK-Org/rusa"
+    );
     expect(referenceUrl(parseReference("github:MEK-Org/rusa/issues/33"))).toBe(
       "https://github.com/MEK-Org/rusa/issues/33"
     );

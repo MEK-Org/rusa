@@ -348,12 +348,12 @@ export function referenceUrl(reference: Reference): string | null {
   let anchor = "";
   const commentIndex = segments.indexOf("comments");
   const reviewIndex = segments.indexOf("reviews");
-  if (commentIndex === segments.length - 2) {
+  if (commentIndex >= 0 && commentIndex === segments.length - 2) {
     anchor = isPullRequest
       ? `#discussion_r${segments[commentIndex + 1]}`
       : `#issuecomment-${segments[commentIndex + 1]}`;
     segments.length = commentIndex;
-  } else if (isPullRequest && reviewIndex === segments.length - 2) {
+  } else if (isPullRequest && reviewIndex >= 0 && reviewIndex === segments.length - 2) {
     anchor = `#pullrequestreview-${segments[reviewIndex + 1]}`;
     segments.length = reviewIndex;
   }
