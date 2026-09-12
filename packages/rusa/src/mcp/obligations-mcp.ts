@@ -580,7 +580,7 @@ export function createObligationsMcpServer(
     {
       title: "Reassign a live obligation",
       description:
-        "Change a ready or waiting obligation's owner while preserving its identity, tree position, priority, external reference, and state.",
+        "Change a ready or waiting obligation's owner while preserving its identity, tree position, priority, external reference, and state. To hand off a head you are working, write your own current checkpoint with set_checkpoint first and reassign second: once the owner is outside your subtree you can no longer write its checkpoint, and a strict head run only counts the handoff when the checkpoint it carries is yours from this run.",
       inputSchema: {
         id: z.string().trim().min(1),
         owner_id: z.string().trim().min(1),

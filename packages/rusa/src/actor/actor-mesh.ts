@@ -727,7 +727,7 @@ export interface ActorMeshOptions {
  * anyway. One wording means the instruction cannot drift from the rule.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or hand it off with your checkpoint to a distinct active actor";
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -750,10 +750,31 @@ const STRICT_HEAD_CLOSURE_EXITS =
  */
 interface HeadClosureRunState {
   headObligationIds: Set<string>;
-  /** Owner observed when this actor selected each strict head. */
-  selectedOwnerIds: Map<string, string>;
+  /**
+   * Each strict head as it stood when this actor first selected it in this
+   * run, or null when the closure could not read it then. Handoff evidence is
+   * scoped to the run against this snapshot, exactly as the child and
+   * prerequisite exits are scoped against the pre-existing id sets below: the
+   * run must have started with this actor owning the head, and the checkpoint
+   * it hands off with must be a rewrite made during the run rather than a
+   * standing left over from an earlier one.
+   *
+   * The first observation is the one kept. Re-selecting the same head later in
+   * the run must not refresh the baseline, or a mid-run rewrite followed by a
+   * re-selection would read as "unchanged" and a mid-run transfer as "never
+   * owned".
+   */
+  selectedHeads: Map<string, SelectedHeadSnapshot | null>;
   preExistingChildIds: Map<string, Set<string>>;
   preExistingPrerequisiteIds: Map<string, Set<string>>;
+}
+
+/** The fields of a selected strict head that a handoff is judged against. */
+interface SelectedHeadSnapshot {
+  ownerId: string;
+  checkpoint: string | null;
+  checkpointAt: string | null;
+  checkpointBy: string | null;
 }
 
 export class ActorMesh {
@@ -1368,16 +1389,30 @@ export class ActorMesh {
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
       const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
         headObligationIds: new Set<string>(),
-        selectedOwnerIds: new Map<string, string>(),
+        selectedHeads: new Map<string, SelectedHeadSnapshot | null>(),
         preExistingChildIds: new Map<string, Set<string>>(),
         preExistingPrerequisiteIds: new Map<string, Set<string>>(),
       };
       this.headClosureRuns.set(actorId, run);
       for (const obligationId of headObligationIds) {
         run.headObligationIds.add(obligationId);
-        if (!run.selectedOwnerIds.has(obligationId)) {
+        if (!run.selectedHeads.has(obligationId)) {
+          // An unreadable head is recorded as such rather than left absent, so
+          // a later re-selection cannot quietly supply a baseline the run did
+          // not start with. Enforcement then fails closed on a handoff of it;
+          // every other exit is judged from the live row as before.
           const selected = closure.get(obligationId);
-          if (selected) run.selectedOwnerIds.set(obligationId, selected.ownerId);
+          run.selectedHeads.set(
+            obligationId,
+            selected
+              ? {
+                  ownerId: selected.ownerId,
+                  checkpoint: selected.checkpoint,
+                  checkpointAt: selected.checkpointAt,
+                  checkpointBy: selected.checkpointBy,
+                }
+              : null
+          );
         }
         if (!run.preExistingChildIds.has(obligationId)) {
           run.preExistingChildIds.set(
@@ -3019,18 +3054,14 @@ export class ActorMesh {
       const obligation = closure.get(obligationId);
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
 
-      if (
-        this.isCheckpointedStrictHandoff(
+      if (obligation.status === "ready") {
+        const shortfall = this.strictHandoffShortfall(
           actorId,
           obligation,
-          runState.selectedOwnerIds.get(obligationId)
-        )
-      ) {
-        continue;
-      }
-
-      if (obligation.status === "ready") {
-        this.rejectCleanYield(actorId, obligationId, obligation.title, "obligation is still ready");
+          runState.selectedHeads.get(obligationId) ?? null
+        );
+        if (shortfall === null) continue;
+        this.rejectCleanYield(actorId, obligationId, obligation.title, shortfall);
       }
 
       const preExistingChildren =
@@ -3064,25 +3095,77 @@ export class ActorMesh {
   }
 
   /**
-   * A strict head may leave its current owner only after that owner has handed
-   * its still-ready work to a distinct active actor with a durable standing.
-   * The obligation row and ready-head transition are already committed by the
-   * repository; boot reconciliation can therefore restore recipient attention
-   * if delivery is interrupted between that commit and the wake.
+   * Why a still-ready strict head does not count as handed off by this run, or
+   * null when it does (#420).
+   *
+   * A handoff is the outgoing owner's own act: the run started with this actor
+   * owning the head, the head now belongs to a distinct actor that can be
+   * woken, and the checkpoint it carries was written by this actor during the
+   * run. The selection-time owner is load-bearing rather than a restatement of
+   * `actorId`: head attention is delivered to the owner, but ownership can move
+   * between delivery and selection (an ancestor reassigns it elsewhere), and
+   * without the snapshot such a run could yield cleanly on a transfer it never
+   * performed. The checkpoint is compared against the same snapshot so a
+   * standing left from an earlier run cannot stand in for this one.
+   *
+   * The obligation row and the ready-head transition are already committed by
+   * the repository before this runs, which is what makes the disposition
+   * durable: the live listener delivers the recipient's attention in-process,
+   * and boot reconciliation restores it if the process is interrupted between
+   * that commit and the wake.
    */
-  private isCheckpointedStrictHandoff(
+  private strictHandoffShortfall(
     outgoingActorId: string,
     obligation: Obligation,
-    selectedOwnerId: string | undefined
-  ): boolean {
-    if (selectedOwnerId !== outgoingActorId || obligation.status !== "ready") return false;
-    if (obligation.ownerId === outgoingActorId) return false;
-    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) return false;
+    selected: SelectedHeadSnapshot | null
+  ): string | null {
+    const recipientId = this.resolveThreadId(obligation.ownerId);
+    if (recipientId === outgoingActorId) return "obligation is still ready";
+    const moved = `obligation is still ready and moved to ${obligation.ownerId}`;
+    if (!selected) {
+      return `${moved}, but it could not be read when selected, so the transfer cannot be attributed to this run`;
+    }
+    if (this.resolveThreadId(selected.ownerId) !== outgoingActorId) {
+      return `${moved}, but this actor did not own it when selected, so the transfer is not this run's handoff`;
+    }
+    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
+      return `${moved} without a checkpoint written by this actor`;
+    }
+    if (
+      obligation.checkpoint === selected.checkpoint &&
+      obligation.checkpointAt === selected.checkpointAt &&
+      obligation.checkpointBy === selected.checkpointBy
+    ) {
+      return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
+    }
+    if (!this.isWakeableRecipient(obligation.ownerId)) {
+      return `${moved}, which is not an active actor that can be woken`;
+    }
+    return null;
+  }
 
-    // This is deliberately the durable actor record rather than `live`: an
-    // active recipient may be between process restart and rehydration, when
-    // the committed ready-head transition is exactly what restores its queue.
-    return this.actors.get(obligation.ownerId)?.status === "active";
+  /**
+   * Whether a handoff recipient will ever be woken for the work: an actor in
+   * the tree — not a human or system principal, which no inbox serves — whose
+   * durable record is active and which is not mid-retirement. The durable
+   * record is used rather than `live` on purpose: an active recipient may be
+   * between process restart and rehydration, when the committed ready-head
+   * transition is exactly what restores its queue. Retirement is the one
+   * non-restart state that record cannot show (see {@link isActiveActor}).
+   */
+  private isWakeableRecipient(ownerId: string): boolean {
+    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    return this.isActiveActor(this.resolveThreadId(ownerId));
+  }
+
+  /**
+   * Active by durable record and not currently being torn down. Retiring a
+   * subtree recurses into children first and only marks each actor retired on
+   * the way back out, so an ancestor unwinding its own retire still reads as
+   * active right up until it's torn down.
+   */
+  private isActiveActor(id: string): boolean {
+    return this.actors.get(id)?.status === "active" && !this.retiring.has(id);
   }
 
   private rejectCleanYield(
@@ -4258,25 +4341,21 @@ export class ActorMesh {
    * Who should hear that a scheduled message will never arrive: the sender if
    * it's genuinely live, else its nearest live ancestor.
    *
-   * "Live" is narrower than `status === "active"`. Retiring a subtree recurses
-   * into children first and only marks each actor retired on the way back out,
-   * so an ancestor unwinding its own retire still reads as active right up until
-   * it's torn down. Notifying it would post into an actor that is about to be
-   * closed — the notification is accepted
-   * and then destroyed, which looks identical to delivering it.
+   * "Live" here is {@link isActiveActor}, narrower than `status === "active"`:
+   * notifying an ancestor unwinding its own retire would post into an actor
+   * that is about to be closed — the notification is accepted and then
+   * destroyed, which looks identical to delivering it.
    *
    * The walk can't stop at the first parent for the same reason: when a whole
    * subtree goes down, that parent is usually mid-retire too.
    */
   private resolveDropNotifyTarget(fromId: string): string | null {
-    const isLive = (id: string): boolean =>
-      this.actors.get(id)?.status === "active" && !this.retiring.has(id);
-    if (isLive(fromId)) return fromId;
+    if (this.isActiveActor(fromId)) return fromId;
 
     const seen = new Set<string>([fromId]);
     let next = this.actors.get(fromId)?.parentId;
     while (next && !seen.has(next)) {
-      if (isLive(next)) return next;
+      if (this.isActiveActor(next)) return next;
       seen.add(next);
       next = this.actors.get(next)?.parentId;
     }

@@ -643,7 +643,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or hand it off with your checkpoint to a distinct active actor"
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
     );
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");
@@ -672,6 +672,71 @@ describe("runStart webhook event routing (Phase 4)", () => {
       status: "complete",
     });
     expect(accepted.isError).toBeFalsy();
+
+    // Handing the head to a sibling is a legal exit too (#420), through the
+    // worker's own obligations MCP under the production owner-or-ancestor
+    // policy: checkpoint first, reassign second. The committed transition
+    // reaches the recipient's durable inbox through runStart's ready-head
+    // sink in this process — no restart, no injection. A fresh enrolled
+    // worker, because a clean yield fences every tool of the one above.
+    const handoffSource = spawnWorker("live handoff source");
+    const recipient = spawnWorker("live handoff recipient");
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: handoffSource,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    const handoffHeadId = getRepositories().obligations.create({
+      title: "live handoff head",
+      ownerId: handoffSource,
+    }).id;
+    const handoffRun = await selectHeadOverMcp(handoffSource);
+    expect(handoffRun.obligationId).toBe(handoffHeadId);
+    const obligationsUrl = urlOf(actorOf(handoffSource), "obligations");
+    expect(
+      (
+        await call(obligationsUrl, "set_checkpoint", {
+          id: handoffHeadId,
+          checkpoint: "Findings recorded; recipient should take the next action.",
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(
+      (
+        await call(obligationsUrl, "reassign_obligation", {
+          id: handoffHeadId,
+          owner_id: recipient,
+        })
+      ).isError
+    ).toBeFalsy();
+    // Ownership has left the worker's subtree, so its checkpoint write is now
+    // refused: the order above is the only one that works.
+    expect(
+      (await call(obligationsUrl, "set_checkpoint", { id: handoffHeadId, checkpoint: "late" }))
+        .isError
+    ).toBe(true);
+    const recipientInbox = payloadOf(
+      await call(urlOf(actorOf(recipient), "inbox"), "list", { status: "unhandled" })
+    ) as { entries: Array<{ payload: { type: string; obligationId?: string } }> };
+    expect(
+      recipientInbox.entries.some(
+        (entry) =>
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === handoffHeadId
+      )
+    ).toBe(true);
+    const handedOff = await call(urlOf(actorOf(handoffSource), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(handedOff.isError).toBeFalsy();
+    expect(getRepositories().obligations.require(handoffHeadId)).toMatchObject({
+      ownerId: recipient,
+      status: "ready",
+      checkpointBy: handoffSource,
+    });
 
     // The unenrolled control keeps the existing behavior on the same wiring.
     const controlYield = await call(urlOf(actorOf(control), "mesh"), "yield_run", {
