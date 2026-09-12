@@ -4,7 +4,12 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
+import {
+  type InboxPage,
+  type InboxPayload,
+  type InboxStore,
+  InvalidInboxCursorError,
+} from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -1548,7 +1553,7 @@ export async function handleMeshApiRequest(
         cursor: url.searchParams.get("cursor") ?? undefined,
       });
     } catch (err) {
-      if (err instanceof Error && err.message === "invalid inbox cursor") {
+      if (err instanceof InvalidInboxCursorError) {
         sendJson(res, 400, { error: err.message });
         return true;
       }

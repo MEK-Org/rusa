@@ -1548,6 +1548,16 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res.body)).toEqual({ error: "invalid inbox cursor" });
   });
 
+  it("GET /api/mesh/inbox does not recast an unrelated matching error as client input", async () => {
+    vi.spyOn(inbox, "list").mockImplementation(() => {
+      throw new Error("invalid inbox cursor");
+    });
+
+    await expect(
+      call(deps, "GET", "/api/mesh/inbox?actor=root&cursor=not-a-cursor")
+    ).rejects.toThrow("invalid inbox cursor");
+  });
+
   it("GET /api/mesh/inbox resolves a GitHub-sourced entry's source into a linkable reference", async () => {
     // Shaped like `deriveGitHubInboxNotification`'s output for an
     // issue-comment webhook: no `messageId`, and `source` is the exact
