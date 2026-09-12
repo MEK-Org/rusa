@@ -160,6 +160,7 @@ export interface DashboardServerOptions {
   /** Pre-built emulator boundary from the disposable e2e launcher; `auth` config still
    * goes through `createDashboardAuth`, which rejects emulator mode. */
   e2eAuth?: DashboardAuth;
+  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   port: number;
   bindHost?: string;
   serveUi?: boolean;
@@ -542,7 +543,13 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   close: () => Promise<void>;
 }> {
   const { port } = options;
-  const auth = options.e2eAuth ?? (options.auth ? createDashboardAuth(options.auth) : null);
+  if (options.auth && !options.e2eAuth && !options.principals)
+    throw new Error("Authenticated dashboard requires a principal repository");
+  const auth =
+    options.e2eAuth ??
+    (options.auth && options.principals
+      ? createDashboardAuth(options.auth, options.principals)
+      : null);
   const bindHost = options.bindHost ?? "127.0.0.1";
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API

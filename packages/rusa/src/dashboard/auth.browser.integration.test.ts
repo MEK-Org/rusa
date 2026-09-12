@@ -5,6 +5,7 @@ import { chromium } from "@playwright/test";
 import { expect, it } from "vitest";
 import { createDashboardRequestHandler } from "../webhook/server.js";
 import { DashboardAuth } from "./auth.js";
+import { DashboardIdentityResolver } from "./identity.js";
 
 // Requires a built dashboard and Playwright Chromium; no Firebase project/network login.
 it.skipIf(process.env.RUSA_AUTH_BROWSER_SMOKE !== "1")(
@@ -23,11 +24,17 @@ it.skipIf(process.env.RUSA_AUTH_BROWSER_SMOKE !== "1")(
     const denied = async (): Promise<never> => {
       throw new Error("unauthenticated fixture");
     };
-    const auth = new DashboardAuth(config, {
-      verifyIdToken: denied,
-      verifySessionCookie: denied,
-      createSessionCookie: denied,
-    });
+    const auth = new DashboardAuth(
+      config,
+      {
+        verifyIdToken: denied,
+        verifySessionCookie: denied,
+        createSessionCookie: denied,
+      },
+      new DashboardIdentityResolver(() => {
+        throw new Error("Anonymous smoke must not access identity storage");
+      })
+    );
     const servers = [
       createServer(createDashboardRequestHandler({ port: 0, auth: config }, null, null, auth)),
       createServer(createDashboardRequestHandler({ port: 0 })),

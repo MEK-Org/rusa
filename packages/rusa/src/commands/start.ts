@@ -3352,6 +3352,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   })
     ? await startDashboardServer({
         auth: config.auth,
+        principals: getRepositories().principals,
         e2eAuth: opts?.e2e?.dashboardAuth,
         port: dashboardPort,
         bindHost: dashboardBindHost,

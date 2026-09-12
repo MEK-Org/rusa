@@ -2,8 +2,35 @@
 
 Rusa optionally admits one Google account to the dashboard. That account acts
 as `human:operator`, with the same authority as the existing local operator.
-This slice creates no users, migrates no historical identities, and retains one
-root actor. Omit `auth` to keep the existing unauthenticated local mode.
+Verified users are recorded in the existing principal repository, but no historical
+identities are migrated and the single root is unchanged. Omit `auth` to keep the
+existing unauthenticated local mode; it does not provision a local user principal.
+
+## Durable identity groundwork (not multi-user authorization)
+
+An admitted Firebase identity resolves to a stable Rusa user keyed by the Firebase
+project issuer plus subject. Firebase ID tokens and session cookies have different
+transport issuers; after SDK project verification, both are keyed using the canonical
+`https://securetoken.google.com/<projectId>` issuer. A returning user is never looked
+up by email. Email remains the admission policy and mutable metadata, not identity.
+
+The authenticated request carries a typed principal together with an explicit
+single-operator compatibility authority. Actions still use `human:operator`; this
+does not yet provide tenant isolation. No root association, implicit owner claim,
+legacy alias, or historical rewrite is performed.
+
+A verified existing session can provision its user on its first request after the
+upgrade, without another login. Subsequent polling only reads identity unless email
+metadata changed; login/renewal records the authentication timestamp. Database
+disablement is checked on every request and each stream revalidation (within 60
+seconds), independently of the Firebase revocation cache. Disabling a user preserves
+their record and history; it cannot be bypassed by retaining an old session.
+
+If an email is already held by another identity or an unbound pre-provisioned user,
+access fails closed. It does not implicitly bind by email or reinterpret that record
+as the configured owner. Existing pre-provisioned identities require explicit verified
+binding by the operator before use. Email reuse, Firebase project replacement, and
+identity reassignment require an explicit future cutover workflow, not deleting history.
 
 ```yaml
 auth:
