@@ -59,6 +59,14 @@ export interface InboxActorWork {
   priority: "normal" | "responsive";
 }
 
+/** A caller supplied an opaque inbox-page cursor that cannot be decoded. */
+export class InvalidInboxCursorError extends Error {
+  constructor() {
+    super("invalid inbox cursor");
+    this.name = "InvalidInboxCursorError";
+  }
+}
+
 /** Persistence seam. Only markSeen is allowed to write seenAt. */
 export interface InboxStore {
   /** Append new entries, returning only rows inserted by this call. Duplicate ids are no-ops. */

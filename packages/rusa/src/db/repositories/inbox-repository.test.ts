@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
 import { ActorMesh } from "../../actor/actor-mesh.js";
+import { InvalidInboxCursorError } from "../../actor/inbox-store.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
@@ -77,6 +78,12 @@ describe("InboxRepository", () => {
     expect(second.entries.map((entry) => entry.id)).toEqual(["a"]);
     expect(second.nextCursor).toBeNull();
     expect(store.read("actor-a", "foreign")).toBeNull();
+  });
+
+  it("raises a typed domain error for an invalid cursor", () => {
+    expect(() => store.list("actor-a", { cursor: "not-a-cursor" })).toThrow(
+      InvalidInboxCursorError
+    );
   });
 
   it("rolls back an append batch when any payload is invalid", () => {
@@ -165,6 +172,69 @@ describe("InboxRepository", () => {
 
     store.markHandled("a", ["a-responsive"]);
     expect(store.actorsWithUnhandled()).toContainEqual({ actorId: "a", priority: "normal" });
+  });
+
+  it("keeps corrupt payloads query-safe and distinguishes parse from shape failures", () => {
+    store.append([
+      {
+        id: "responsive",
+        actorId: "a",
+        source: "chat",
+        payload: { type: "message.created", priority: "responsive" },
+      },
+    ]);
+    const insertCorrupt = db.prepare(
+      `INSERT INTO actor_inbox_entries
+        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+       VALUES (?, ?, 'legacy', ?, NULL, NULL, ?)`
+    );
+    insertCorrupt.run("malformed", "a", "2026-07-13T13:00:00.000Z", "{not valid JSON");
+    // This valid JSON has a responsive priority, but it fails the same payload
+    // validation as toEntry and must therefore recover without that priority.
+    insertCorrupt.run(
+      "invalid-shape",
+      "a",
+      "2026-07-13T14:00:00.000Z",
+      '{"type":false,"priority":"responsive"}'
+    );
+    insertCorrupt.run("only-malformed", "b", "2026-07-13T15:00:00.000Z", "{not valid JSON");
+    insertCorrupt.run(
+      "only-invalid-shape",
+      "c",
+      "2026-07-13T16:00:00.000Z",
+      '{"type":false,"priority":"responsive"}'
+    );
+
+    const entries = new Map(
+      store.list("a", { status: "all" }).entries.map((entry) => [entry.id, entry])
+    );
+    expect(entries.get("malformed")?.payload).toEqual({
+      type: "inbox.unavailable",
+      unavailable: "stored inbox payload has malformed JSON",
+    });
+    expect(entries.get("invalid-shape")?.payload).toEqual({
+      type: "inbox.unavailable",
+      unavailable: "stored inbox payload has invalid shape",
+    });
+    expect(JSON.stringify([...entries.values()])).not.toContain("{not valid JSON");
+
+    // These all used json_extract before the malformed row was guarded.
+    expect(store.list("a", { responsiveOnly: true }).entries.map((entry) => entry.id)).toEqual([
+      "responsive",
+    ]);
+    expect(store.countUnhandled("a", { responsiveOnly: true })).toBe(1);
+    expect(store.list("c", { responsiveOnly: true }).entries).toEqual([]);
+    expect(store.countUnhandled("c", { responsiveOnly: true })).toBe(0);
+    expect(store.actorsWithUnhandled()).toEqual([
+      { actorId: "a", priority: "responsive" },
+      { actorId: "b", priority: "normal" },
+      { actorId: "c", priority: "normal" },
+    ]);
+    expect(store.actorsWithUnseen()).toEqual([
+      { actorId: "a", priority: "responsive" },
+      { actorId: "b", priority: "normal" },
+      { actorId: "c", priority: "normal" },
+    ]);
   });
 
   it("handled_at changes only through actor mark_handled", async () => {

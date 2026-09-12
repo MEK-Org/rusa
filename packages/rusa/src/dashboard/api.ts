@@ -4,7 +4,12 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
+import {
+  type InboxPage,
+  type InboxPayload,
+  type InboxStore,
+  InvalidInboxCursorError,
+} from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -1524,7 +1529,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/inbox?actor=<id>&status=unhandled|handled|all
+  // GET /api/mesh/inbox?actor=<id>&status=unhandled|handled|all&cursor=<cursor>
   if (pathname === "/api/mesh/inbox") {
     if (!deps.inbox) {
       sendJson(res, 503, { error: "inbox data unavailable" });
@@ -1540,17 +1545,21 @@ export async function handleMeshApiRequest(
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
-    sendJson(
-      res,
-      200,
-      await resolveInboxPage(
-        deps.inbox.list(actorId, {
-          status: status as "unhandled" | "handled" | "all" | undefined,
-          limit: clampLimit(url),
-        }),
-        deps
-      )
-    );
+    let page: InboxPage;
+    try {
+      page = deps.inbox.list(actorId, {
+        status: status as "unhandled" | "handled" | "all" | undefined,
+        limit: clampLimit(url),
+        cursor: url.searchParams.get("cursor") ?? undefined,
+      });
+    } catch (err) {
+      if (err instanceof InvalidInboxCursorError) {
+        sendJson(res, 400, { error: err.message });
+        return true;
+      }
+      throw err;
+    }
+    sendJson(res, 200, await resolveInboxPage(page, deps));
     return true;
   }
 

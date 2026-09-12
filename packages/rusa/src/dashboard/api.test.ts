@@ -1465,6 +1465,99 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("keeps a root inbox readable, pageable, and clearable when one stored payload is malformed", async () => {
+    // This uses the same persisted-store read and HTTP handler as the dashboard,
+    // but seeds the legacy/corrupt row directly because current writes reject it.
+    // A broken row must remain visible and occupy its normal page position rather
+    // than making the root actor's whole inbox unavailable.
+    inbox.append([
+      {
+        id: "valid-root-entry",
+        actorId: "root",
+        source: "mesh:worker",
+        deliveredAt: new Date("2026-06-21T00:00:00.000Z"),
+        payload: { type: "mesh.message", fromId: "worker" },
+      },
+    ]);
+    db.prepare(
+      `INSERT INTO actor_inbox_entries
+        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+       VALUES (?, ?, ?, ?, NULL, NULL, ?)`
+    ).run(
+      "corrupt-root-entry",
+      "root",
+      "mesh:legacy",
+      "2026-06-22T00:00:00.000Z",
+      "{not valid JSON"
+    );
+
+    const first = await call(deps, "GET", "/api/mesh/inbox?actor=root&status=unhandled&limit=1");
+
+    expect(first.res.statusCode).toBe(200);
+    const firstBody = JSON.parse(first.res.body);
+    expect(firstBody).toMatchObject({
+      entries: [
+        {
+          id: "corrupt-root-entry",
+          actorId: "root",
+          payload: {
+            type: "inbox.unavailable",
+            unavailable: "stored inbox payload has malformed JSON",
+          },
+        },
+      ],
+      unhandledCount: 2,
+      nextCursor: expect.any(String),
+    });
+
+    const second = await call(
+      deps,
+      "GET",
+      `/api/mesh/inbox?actor=root&status=unhandled&limit=1&cursor=${encodeURIComponent(firstBody.nextCursor)}`
+    );
+    expect(second.res.statusCode).toBe(200);
+    expect(JSON.parse(second.res.body)).toMatchObject({
+      entries: [{ id: "valid-root-entry", payload: { type: "mesh.message", fromId: "worker" } }],
+      unhandledCount: 2,
+      nextCursor: null,
+    });
+
+    const cleared = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors/root/inbox/handled",
+      JSON.stringify({ entryId: "corrupt-root-entry", reason: "malformed legacy row" })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+    expect(cleared.res.statusCode).toBe(200);
+    expect(JSON.parse(cleared.res.body)).toMatchObject({ ok: true, alreadyHandled: false });
+
+    const afterClear = await call(deps, "GET", "/api/mesh/inbox?actor=root&status=unhandled");
+    expect(afterClear.res.statusCode).toBe(200);
+    expect(JSON.parse(afterClear.res.body)).toMatchObject({
+      entries: [{ id: "valid-root-entry" }],
+      unhandledCount: 1,
+    });
+  });
+
+  it("GET /api/mesh/inbox rejects an invalid cursor as client input", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/inbox?actor=root&cursor=not-a-cursor");
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "invalid inbox cursor" });
+  });
+
+  it("GET /api/mesh/inbox does not recast an unrelated matching error as client input", async () => {
+    vi.spyOn(inbox, "list").mockImplementation(() => {
+      throw new Error("invalid inbox cursor");
+    });
+
+    await expect(
+      call(deps, "GET", "/api/mesh/inbox?actor=root&cursor=not-a-cursor")
+    ).rejects.toThrow("invalid inbox cursor");
+  });
+
   it("GET /api/mesh/inbox resolves a GitHub-sourced entry's source into a linkable reference", async () => {
     // Shaped like `deriveGitHubInboxNotification`'s output for an
     // issue-comment webhook: no `messageId`, and `source` is the exact
