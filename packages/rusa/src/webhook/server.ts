@@ -157,6 +157,9 @@ export interface DashboardMeshRefs {
 
 export interface DashboardServerOptions {
   auth?: DashboardAuthConfig;
+  /** Pre-built emulator boundary from the disposable e2e launcher; `auth` config still
+   * goes through `createDashboardAuth`, which rejects emulator mode. */
+  e2eAuth?: DashboardAuth;
   port: number;
   bindHost?: string;
   serveUi?: boolean;
@@ -535,14 +538,11 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
 /**
  * Start the dashboard HTTP server on the given port.
  */
-export async function startDashboardServer(
-  options: DashboardServerOptions,
-  authForE2E?: DashboardAuth
-): Promise<{
+export async function startDashboardServer(options: DashboardServerOptions): Promise<{
   close: () => Promise<void>;
 }> {
   const { port } = options;
-  const auth = authForE2E ?? (options.auth ? createDashboardAuth(options.auth) : null);
+  const auth = options.e2eAuth ?? (options.auth ? createDashboardAuth(options.auth) : null);
   const bindHost = options.bindHost ?? "127.0.0.1";
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API

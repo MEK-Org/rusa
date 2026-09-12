@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDashboardRequestHandler } from "../webhook/server.js";
+import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import { DashboardAuth, SESSION_COOKIE, SESSION_MS, STREAM_IDLE_MS } from "./auth.js";
 
@@ -385,5 +385,27 @@ describe("single-operator dashboard authentication", () => {
       await new Promise<void>((resolve) => local.close(() => resolve()));
     }
     expect(() => createDashboardRequestHandler({ port: 0, auth: config })).toThrow(/initialized/);
+  });
+
+  it("guards a started server with a pre-built boundary instead of production credentials", async () => {
+    // The disposable e2e launcher hands over an emulator boundary; nothing here reads
+    // the (nonexistent) service account, so the boundary must be the injected one.
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const started = await startDashboardServer({ port, e2eAuth: auth });
+    try {
+      const base = `http://127.0.0.1:${port}`;
+      expect((await fetch(`${base}/api/mesh/threads`)).status).toBe(401);
+      expect(await (await fetch(`${base}/api/auth/config`)).json()).toEqual(auth.clientConfig());
+      // Same boundary instance as the fixture server, so its session is honored here too.
+      const cookie = await login();
+      expect(
+        (await fetch(`${base}/api/auth/session`, { headers: { Cookie: cookie } })).status
+      ).toBe(200);
+    } finally {
+      await started.close();
+    }
   });
 });

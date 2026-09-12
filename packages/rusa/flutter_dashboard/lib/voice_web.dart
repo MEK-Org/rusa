@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'session_events_web.dart';
 import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
@@ -8,6 +7,7 @@ import 'package:web/web.dart' as web;
 
 import 'api.dart';
 import 'models.dart';
+import 'session_events_web.dart';
 import 'voice_platform.dart';
 
 /// Browser implementations of the `voice_platform.dart` seams :

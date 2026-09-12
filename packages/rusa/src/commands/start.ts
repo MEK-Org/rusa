@@ -118,6 +118,7 @@ import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
 import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
+import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
@@ -516,7 +517,7 @@ export interface RunStartE2EHandles {
  */
 export interface RunStartE2EHooks {
   /** Emulator boundary supplied only by the disposable e2e launcher. */
-  dashboardAuth?: import("../dashboard/auth.js").DashboardAuth;
+  dashboardAuth?: DashboardAuth;
   /** Experimental execution seam; production always constructs a local Actor. */
   createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
@@ -3349,114 +3350,111 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     e2eDashboard: opts?.e2e?.dashboard === true,
     noDashboardServer,
   })
-    ? await startDashboardServer(
-        {
-          auth: config.auth,
-          port: dashboardPort,
-          bindHost: dashboardBindHost,
-          logger: log,
-          // Bind the live mesh so the dashboard Data API + SSE serve real data.
-          mesh: {
-            mesh,
-            actors,
-            meshEvents: getRepositories().meshEvents,
-            meshChat: getRepositories().meshChat,
-            obligations: getRepositories().obligations,
-            inbox: getRepositories().inbox,
-            referenceCache: new ReferenceCacheService({
-              repo: getRepositories().referenceCache,
-              logger: log.child({ component: "reference-cache" }),
-            }),
-            chatClient: chatClient ?? undefined,
-            issueClient: issueClient,
-            emitter: meshEmitter,
-            // Read-only exposures: the emergency-brake state and a snapshot of
-            // which actors are executing a run right now — for the header HALTED
-            // indicator and per-thread run-state dots. No new mesh behavior.
-            isHalted: () => haltSwitch.hasActiveHalt(),
-            // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
-            // cron.allow-cron.deny preflights so a missing one-shot facility or an
-            // unusable crontab is dashboard/health-visible, not just a startup
-            // console.warn. Merged into one projection since either issue set
-            // means "some recurrence path is degraded" from an operator's view.
-            schedulerHealth: () => ({
-              ok: atPreflight.ok && cronPreflight.ok,
-              issues: [...cronPreflight.issues, ...atPreflight.issues],
-            }),
-            runningThreadIds: () => mesh.runningThreadIds(),
-            queuedThreadIds: () => mesh.queuedThreadIds(),
-            providerQueueSnapshots: () =>
-              [...providerPacers.values()].flatMap((pacer) =>
-                pacer.getQueueSnapshot().map((entry) => ({
-                  threadId: entry.threadId,
-                  position: entry.position,
-                  estimatedStartAt:
-                    entry.estimatedStartAt === null
-                      ? null
-                      : new Date(entry.estimatedStartAt).toISOString(),
-                  pacingIntervalMs: entry.pacingIntervalMs,
-                }))
-              ),
-            // Current work is the durable inbox focus for this actor's active
-            // run. It deliberately reads through the run ledger: a completed
-            // focus is history, not the next queued run's selected work.
-            selectedObligationForActor: (actorId) => {
-              const runId = runAccounting.activeRunId(actorId);
-              if (!runId) return null;
-              const obligationId =
-                getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
-              return obligationId ? getRepositories().obligations.get(obligationId) : null;
-            },
-            rootControl,
-            // The configured root identity  — display handle + avatar
-            // override — so the dashboard shows this instance's own identity
-            // instead of the default root-actor.
-            rootIdentity: { id: rootId, handle: rootHandle, avatarPath: rootActor.avatar },
-            // On-demand avatar generation  reuses the same key the
-            // walkie-talkie transcription/TTS calls above already gate on.
-            geminiApiKey,
-            getFollowers: () => (followerHub ? followerHub.list() : []),
+    ? await startDashboardServer({
+        auth: config.auth,
+        e2eAuth: opts?.e2e?.dashboardAuth,
+        port: dashboardPort,
+        bindHost: dashboardBindHost,
+        logger: log,
+        // Bind the live mesh so the dashboard Data API + SSE serve real data.
+        mesh: {
+          mesh,
+          actors,
+          meshEvents: getRepositories().meshEvents,
+          meshChat: getRepositories().meshChat,
+          obligations: getRepositories().obligations,
+          inbox: getRepositories().inbox,
+          referenceCache: new ReferenceCacheService({
+            repo: getRepositories().referenceCache,
+            logger: log.child({ component: "reference-cache" }),
+          }),
+          chatClient: chatClient ?? undefined,
+          issueClient: issueClient,
+          emitter: meshEmitter,
+          // Read-only exposures: the emergency-brake state and a snapshot of
+          // which actors are executing a run right now — for the header HALTED
+          // indicator and per-thread run-state dots. No new mesh behavior.
+          isHalted: () => haltSwitch.hasActiveHalt(),
+          // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
+          // cron.allow-cron.deny preflights so a missing one-shot facility or an
+          // unusable crontab is dashboard/health-visible, not just a startup
+          // console.warn. Merged into one projection since either issue set
+          // means "some recurrence path is degraded" from an operator's view.
+          schedulerHealth: () => ({
+            ok: atPreflight.ok && cronPreflight.ok,
+            issues: [...cronPreflight.issues, ...atPreflight.issues],
+          }),
+          runningThreadIds: () => mesh.runningThreadIds(),
+          queuedThreadIds: () => mesh.queuedThreadIds(),
+          providerQueueSnapshots: () =>
+            [...providerPacers.values()].flatMap((pacer) =>
+              pacer.getQueueSnapshot().map((entry) => ({
+                threadId: entry.threadId,
+                position: entry.position,
+                estimatedStartAt:
+                  entry.estimatedStartAt === null
+                    ? null
+                    : new Date(entry.estimatedStartAt).toISOString(),
+                pacingIntervalMs: entry.pacingIntervalMs,
+              }))
+            ),
+          // Current work is the durable inbox focus for this actor's active
+          // run. It deliberately reads through the run ledger: a completed
+          // focus is history, not the next queued run's selected work.
+          selectedObligationForActor: (actorId) => {
+            const runId = runAccounting.activeRunId(actorId);
+            if (!runId) return null;
+            const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
+            return obligationId ? getRepositories().obligations.get(obligationId) : null;
           },
-          // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
-          // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
-          // NOT a live Firestore query — this reader is built without a remote op sink, so
-          // it stays purely local even though the write client now syncs live. The
-          // canonical rootNodeId is surfaced so the view anchors to that root (renders its
-          // children as the top level, hides the root) — same root the read MCP anchors on.
-          understandingOps: {
-            ...createUnderstandingOpsReader(mcHome),
-            // Resolve externalized node bodies (glass_goals `v001_strings`) so the view renders
-            // content, not just structure — read-only, same trust as the baseline pull.
-            ...createUnderstandingStringsResolver(config),
-            rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
-          },
-          // Cached per-provider quota snapshot : reads the same shared
-          // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
-          // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
-          // the request path (issue #10). It serves the latest known reading
-          // immediately (stale-while-revalidate) and kicks any refresh in the
-          // background; a cold cache falls back to the durable quota DB below via
-          // `listHistory`.
-          quotaApi: opts?.e2e?.quotaApi ?? {
-            getQuota: async (provider) => quotaService.getQuotaCached(provider),
-            providers: quotaProviders,
-            getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
-            listHistory: sharedQuotaStore
-              ? (provider, sinceIso) => sharedQuotaStore.listHistorySince(provider, sinceIso)
-              : undefined,
-          },
-          // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
-          // for the reports tab. The standalone `dashboard` command wires this
-          // too (dashboard.ts) — without it the real prod/start server 404s the
-          // route. `mcHome` is already in scope (it feeds understandingOps above).
-          iuReportsApi: { mcHome },
-          dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
-          // Walkie-talkie voice routes + reply-TTS hook ; undefined when
-          // no geminiApiKey is configured (routes then 503).
-          voice: voiceService ? { service: voiceService } : undefined,
+          rootControl,
+          // The configured root identity  — display handle + avatar
+          // override — so the dashboard shows this instance's own identity
+          // instead of the default root-actor.
+          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: rootActor.avatar },
+          // On-demand avatar generation  reuses the same key the
+          // walkie-talkie transcription/TTS calls above already gate on.
+          geminiApiKey,
+          getFollowers: () => (followerHub ? followerHub.list() : []),
         },
-        opts?.e2e?.dashboardAuth
-      )
+        // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
+        // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
+        // NOT a live Firestore query — this reader is built without a remote op sink, so
+        // it stays purely local even though the write client now syncs live. The
+        // canonical rootNodeId is surfaced so the view anchors to that root (renders its
+        // children as the top level, hides the root) — same root the read MCP anchors on.
+        understandingOps: {
+          ...createUnderstandingOpsReader(mcHome),
+          // Resolve externalized node bodies (glass_goals `v001_strings`) so the view renders
+          // content, not just structure — read-only, same trust as the baseline pull.
+          ...createUnderstandingStringsResolver(config),
+          rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
+        },
+        // Cached per-provider quota snapshot : reads the same shared
+        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
+        // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
+        // the request path (issue #10). It serves the latest known reading
+        // immediately (stale-while-revalidate) and kicks any refresh in the
+        // background; a cold cache falls back to the durable quota DB below via
+        // `listHistory`.
+        quotaApi: opts?.e2e?.quotaApi ?? {
+          getQuota: async (provider) => quotaService.getQuotaCached(provider),
+          providers: quotaProviders,
+          getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
+          listHistory: sharedQuotaStore
+            ? (provider, sinceIso) => sharedQuotaStore.listHistorySince(provider, sinceIso)
+            : undefined,
+        },
+        // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
+        // for the reports tab. The standalone `dashboard` command wires this
+        // too (dashboard.ts) — without it the real prod/start server 404s the
+        // route. `mcHome` is already in scope (it feeds understandingOps above).
+        iuReportsApi: { mcHome },
+        dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
+        // Walkie-talkie voice routes + reply-TTS hook ; undefined when
+        // no geminiApiKey is configured (routes then 503).
+        voice: voiceService ? { service: voiceService } : undefined,
+      })
     : null;
   if (dashboardServer) console.log(`[dashboard] http://${dashboardBindHost}:${dashboardPort}`);
 
