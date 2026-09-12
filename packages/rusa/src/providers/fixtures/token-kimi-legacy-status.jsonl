@@ -1,0 +1,1 @@
+{"type":"StatusUpdate","timestamp":"2026-09-12T10:00:01.000Z","payload":{"token_usage":{"input_other":12,"input_cache_creation":3,"input_cache_read":8,"output":6}}}

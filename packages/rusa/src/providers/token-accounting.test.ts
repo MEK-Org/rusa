@@ -50,6 +50,48 @@ describe("provider token normalizers", () => {
     });
   });
 
+  it("attributes Kimi Code usage.record entries for kimi-for-coding", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-success.jsonl"), "2026-09-12T10:00:00Z")
+    ).toEqual({
+      uncachedInput: 25,
+      cacheRead: 12,
+      output: 11,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("preserves absent Kimi Code usage fields instead of making them zero", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-partial.jsonl"), "2026-09-12T10:00:00Z")
+    ).toEqual({
+      uncachedInput: 12,
+      cacheRead: null,
+      output: 6,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("ignores malformed Kimi Code usage records", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-malformed.jsonl"), "2026-09-12T10:00:00Z")
+    ).toBeNull();
+  });
+
+  it("accepts the direct legacy Kimi StatusUpdate usage shape", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-legacy-status.jsonl"), "2026-09-12T10:00:00Z")
+    ).toEqual({
+      uncachedInput: 15,
+      cacheRead: 8,
+      output: 6,
+      reasoning: null,
+      response: null,
+    });
+  });
+
   it("decodes agy fields and checks output = reasoning + response", () => {
     const rows = JSON.parse(fixture("token-agy.json")) as Array<{
       uncachedInput: number;

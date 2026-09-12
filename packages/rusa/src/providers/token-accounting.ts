@@ -88,6 +88,7 @@ function rowTimestamp(row: Record<string, unknown>): number | null {
   const candidates = [
     row.timestamp,
     row.ts,
+    row.time,
     (row.message as Record<string, unknown> | undefined)?.timestamp,
   ];
   for (const value of candidates) {
@@ -136,7 +137,13 @@ export function extractCodexTokenUsage(jsonl: string, runStartedAt: string): Tot
 
 export function extractKimiTokenUsage(jsonl: string, runStartedAt: string): Totals | null {
   const start = Date.parse(runStartedAt);
-  const totals = emptyTotals();
+  const totals: Totals = {
+    uncachedInput: null,
+    cacheRead: null,
+    output: null,
+    reasoning: null,
+    response: null,
+  };
   let found = false;
   for (const line of jsonl.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -144,24 +151,60 @@ export function extractKimiTokenUsage(jsonl: string, runStartedAt: string): Tota
       const row = JSON.parse(line) as Record<string, unknown>;
       const timestamp = rowTimestamp(row);
       if (timestamp === null || timestamp < start) continue;
-      const message = row.message as Record<string, unknown> | undefined;
-      const payload = message?.payload as Record<string, unknown> | undefined;
-      const usage = payload?.token_usage as Record<string, unknown> | undefined;
+      const message = asRecord(row.message);
+      const payload = asRecord(message?.payload) ?? asRecord(row.payload);
+      const usage =
+        row.type === "usage.record" ? asRecord(row.usage) : asRecord(payload?.token_usage);
       if (!usage) continue;
-      const other = nonNegativeInteger(usage.input_other);
-      const creation = nonNegativeInteger(usage.input_cache_creation);
-      if (
-        other !== null &&
-        creation !== null &&
-        add(totals, other + creation, usage.input_cache_read, usage.output)
-      ) {
-        found = true;
-      }
+      const other = kimiUsageNumber(usage, "inputOther", "input_other");
+      const creation = kimiUsageNumber(usage, "inputCacheCreation", "input_cache_creation");
+      const uncached = other === null && creation === null ? null : (other ?? 0) + (creation ?? 0);
+      const cacheRead = kimiUsageNumber(usage, "inputCacheRead", "input_cache_read");
+      const output = nonNegativeInteger(usage.output);
+      found = addPartial(totals, uncached, cacheRead, output) || found;
     } catch {
       // Ignore malformed/partial records.
     }
   }
   return found ? totals : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** Return the value emitted by this Kimi wire format without inventing a zero for an omission. */
+function kimiUsageNumber(
+  usage: Record<string, unknown>,
+  camelCase: string,
+  snakeCase: string
+): number | null {
+  return nonNegativeInteger(usage[camelCase] === undefined ? usage[snakeCase] : usage[camelCase]);
+}
+
+/** Sum only the Kimi usage dimensions the provider actually emitted. */
+function addPartial(
+  totals: Totals,
+  uncached: number | null,
+  cached: number | null,
+  output: number | null
+): boolean {
+  let found = false;
+  if (uncached !== null) {
+    totals.uncachedInput = (totals.uncachedInput ?? 0) + uncached;
+    found = true;
+  }
+  if (cached !== null) {
+    totals.cacheRead = (totals.cacheRead ?? 0) + cached;
+    found = true;
+  }
+  if (output !== null) {
+    totals.output = (totals.output ?? 0) + output;
+    found = true;
+  }
+  return found;
 }
 
 function findFile(root: string, predicate: (path: string) => boolean): string | undefined {
