@@ -2138,6 +2138,8 @@ export class ObligationRepository {
 
     // Validated, not cast: the table constrains its scalars only to non-empty,
     // so this is where a row proves it is the entry the caller is typed to get.
+    // Fail-closed for the whole call, like every other reader here: one row
+    // that cannot be read makes the trail throw rather than silently shorten.
     return rows.map(parseHistoryRow);
   }
 

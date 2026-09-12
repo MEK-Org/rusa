@@ -371,13 +371,55 @@ export interface ObligationHistoryEntry {
  */
 export const OBLIGATION_HISTORY_SCHEMA_VERSION = 1;
 
+/**
+ * Lift a throwing domain validator into a zod check, so a history field is held
+ * to the same spelling of the rule its live column is read under. If that rule
+ * ever grows, history follows without a second copy to keep in step.
+ */
+function validatedBy(validate: (value: string) => unknown) {
+  return z.string().superRefine((value, ctx) => {
+    try {
+      validate(value);
+    } catch (err) {
+      ctx.addIssue({
+        code: "custom",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
+/**
+ * A `parentId` is an obligation id, not an {@link EntityId}: it is only required
+ * to be non-empty (see {@link prerequisiteEdgeKey}). The live column is a
+ * foreign key, so this can only ever reject a hand-edited payload.
+ */
+const historyObligationIdSchema = z
+  .string()
+  .refine((value) => value.trim().length > 0, "obligation id is required");
+
+/**
+ * Tracked-field values as they were, validated at the read boundary (#185).
+ *
+ * `ownerId` is read under the same {@link validateEntityId} as the live row.
+ * `externalRef` is held to the reference *grammar* only, deliberately short of
+ * {@link parseExternalRef}'s identity policy: that policy governs what a live
+ * claim may be, while history records what the claim *was*. Correcting a live
+ * ref after the policy narrows appends the refused value here as `before`, and
+ * an append-only log cannot be fixed up afterwards, so policy is not a
+ * trip-wire for reading it.
+ *
+ * Validation is fail-closed for the whole `listHistory` call, the same as every
+ * other repository reader (`rows.map(toObligation)`): an audit trail that
+ * silently drops the rows it cannot read is worse than one that refuses.
+ */
 export const obligationHistoryStateSchema = z
   .object({
-    ownerId: z.string().optional(),
-    parentId: z.string().nullable().optional(),
+    ownerId: validatedBy(validateEntityId).optional(),
+    parentId: historyObligationIdSchema.nullable().optional(),
     priority: z.number().nullable().optional(),
     status: z.enum(OBLIGATION_STATUSES).optional(),
-    externalRef: z.string().nullable().optional(),
+    externalRef: validatedBy(parseObligationReference).nullable().optional(),
   })
   .strict();
 

@@ -643,5 +643,71 @@ describe("Obligation mutation history", () => {
 
       expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
     });
+
+    it("throws on malformed ownerId in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"ownerId":"   "}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("throws on malformed parentId in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reparent', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"parentId":""}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("throws on malformed externalRef in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'external_ref', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"externalRef":"not-a-ref"}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("reads back a frozen externalRef the live identity policy would refuse", () => {
+      // A comment is never a valid live external_ref, but if the policy that
+      // decides so had narrowed after the claim was made, correcting the live
+      // row is exactly what freezes the refused value into `before`. The
+      // append-only trail must still answer "what was it?" afterwards.
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'external_ref', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{"externalRef":"github:MEK-Org/rusa/issues/1/comments/2"},"after":{"externalRef":null}}')`
+      ).run(ob.id);
+
+      const [entry] = repository.listHistory(ob.id);
+      expect(entry?.before.externalRef).toBe("github:MEK-Org/rusa/issues/1/comments/2");
+      expect(entry?.after.externalRef).toBeNull();
+    });
+
+    it("fails the whole listHistory call when one row among valid ones is malformed", () => {
+      // Pinned as a decision, not an emergent property of `rows.map`: the trail
+      // is fail-closed like every other repository reader, so a caller never
+      // receives a silently shortened history.
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+      repository.reassign(ob.id, "actor-b", "actor-a");
+      expect(repository.listHistory(ob.id)).toHaveLength(1);
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"ownerId":""}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
   });
 });
