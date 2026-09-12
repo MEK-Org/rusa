@@ -43,8 +43,19 @@ function decodeCursor(cursor: string): CursorValue {
 }
 
 function toEntry(row: InboxRow): InboxEntry {
-  const payload = JSON.parse(row.payload_json) as InboxPayload;
-  validateInboxPayload(payload);
+  let payload: InboxPayload;
+  try {
+    payload = JSON.parse(row.payload_json) as InboxPayload;
+    validateInboxPayload(payload);
+  } catch {
+    // Writes reject invalid payloads, but an older or damaged durable row must
+    // not make every page containing it unavailable. Keep its id, ownership,
+    // status, and position so the operator can see and clear the honest marker.
+    payload = {
+      type: "inbox.unavailable",
+      unavailable: "stored inbox payload could not be read",
+    };
+  }
   return {
     id: row.id,
     actorId: row.actor_id,
