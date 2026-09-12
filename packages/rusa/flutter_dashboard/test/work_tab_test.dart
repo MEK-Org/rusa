@@ -850,7 +850,7 @@ void main() {
   );
 
   testWidgets(
-    'renders both dependency directions (BLOCKED BY and BLOCKS) with human-readable titles and navigable links',
+    'renders both dependency directions with titles and navigable GitHub-backed rows',
     (tester) async {
       await tester.runAsync(() async {
         await tester.binding.setSurfaceSize(const Size(1200, 1600));
@@ -884,7 +884,6 @@ void main() {
           title: 'Dependent Non-GitHub Title',
         );
 
-        final openedLinks = <String>[];
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [
@@ -907,11 +906,7 @@ void main() {
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
-              body: WorkTab(
-                store: store,
-                onSelectView: (_) {},
-                openLink: openedLinks.add,
-              ),
+              body: WorkTab(store: store, onSelectView: (_) {}),
             ),
           ),
         );
@@ -933,22 +928,13 @@ void main() {
         expect(find.text('github:MEK-Org/rusa/pulls/202'), findsOneWidget);
         expect(find.text('Dependent Non-GitHub Title'), findsWidgets);
 
-        // Tapping the external reference link opens the derived GitHub URL
-        await tester.tap(find.text('github:MEK-Org/rusa/issues/101'));
-        expect(openedLinks, ['https://github.com/MEK-Org/rusa/issues/101']);
-
-        await tester.tap(find.text('github:MEK-Org/rusa/pulls/202'));
-        expect(openedLinks, [
-          'https://github.com/MEK-Org/rusa/issues/101',
-          'https://github.com/MEK-Org/rusa/pull/202',
-        ]);
-
-        // Tapping an obligation row focuses it
-        await tester.tap(find.text('Prerequisite Non-GitHub Title').last);
+        // Tapping a GitHub-backed obligation opens its detail view, whose
+        // existing reference card owns the resolved external link.
+        await tester.tap(find.text('Prerequisite with GitHub Issue').last);
         for (int i = 0; i < 5; i++) {
           await tester.pump(const Duration(milliseconds: 10));
         }
-        expect(store.focusedObligationId.value, 'prereq-non-gh');
+        expect(store.focusedObligationId.value, 'prereq-gh');
 
         await store.dispose();
       });
@@ -956,7 +942,7 @@ void main() {
   );
 
   testWidgets(
-    'supports pagination load more buttons for BLOCKED BY and BLOCKS',
+    'shows bounded dependency page remainder without paging state',
     (tester) async {
       await tester.runAsync(() async {
         await tester.binding.setSurfaceSize(const Size(1200, 1600));
@@ -1004,8 +990,8 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('Load more (2 remaining)'), findsOneWidget);
-        expect(find.text('Load more (4 remaining)'), findsOneWidget);
+        expect(find.text('and 2 more'), findsOneWidget);
+        expect(find.text('and 4 more'), findsOneWidget);
 
         await store.dispose();
       });

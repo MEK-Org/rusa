@@ -598,8 +598,6 @@ class FakeApi extends DashboardApi {
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
-    int? blockedByOffset,
-    int? blocksOffset,
     int? limit,
   }) async {
     final byOffset = obligationDetailByOffset;

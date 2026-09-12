@@ -2424,7 +2424,7 @@ describe("handleMeshApiRequest", () => {
         const { res: limitRes } = await call(
           deps,
           "GET",
-          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=0&unblocks_offset=0"
+          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=0&blocks_offset=0"
         );
         expect(limitRes.statusCode).toBe(200);
         const limitData = JSON.parse(limitRes.body);

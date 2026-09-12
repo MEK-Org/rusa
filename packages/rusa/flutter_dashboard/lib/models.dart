@@ -1629,36 +1629,12 @@ class ObligationDetailSnapshot {
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
   ) {
-    final blockedByRaw = j['blockedBy'];
-    final blockedByList = (blockedByRaw is List)
-        ? blockedByRaw
-              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-              .toList()
-        : (blockedByRaw is Map<String, dynamic> &&
-              blockedByRaw['items'] is List)
-        ? (blockedByRaw['items'] as List<dynamic>)
-              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-              .toList()
-        : const <ObligationDto>[];
-    final blockedByTotal = j['blockedByTotal'] as int? ??
-        (blockedByRaw is Map ? blockedByRaw['total'] as int? ?? 0 : blockedByList.length);
-    final blockedByHasMore = j['blockedByHasMore'] as bool? ??
-        (blockedByRaw is Map ? (blockedByRaw['truncated'] as bool? ?? false) : false);
-
-    final blocksRaw = j['blocks'] ?? j['unblocks'];
-    final blocksList = (blocksRaw is List)
-        ? blocksRaw
-              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-              .toList()
-        : (blocksRaw is Map<String, dynamic> && blocksRaw['items'] is List)
-        ? (blocksRaw['items'] as List<dynamic>)
-              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-              .toList()
-        : const <ObligationDto>[];
-    final blocksTotal = j['blocksTotal'] as int? ??
-        (blocksRaw is Map ? blocksRaw['total'] as int? ?? 0 : blocksList.length);
-    final blocksHasMore = j['blocksHasMore'] as bool? ??
-        (blocksRaw is Map ? (blocksRaw['truncated'] as bool? ?? false) : false);
+    final blockedBy = (j['blockedBy'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList();
+    final blocks = (j['blocks'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList();
 
     return ObligationDetailSnapshot(
       obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
@@ -1685,12 +1661,12 @@ class ObligationDetailSnapshot {
                 .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
                 .toList()
           : const <ObligationDto>[],
-      blockedBy: blockedByList,
-      blockedByTotal: blockedByTotal,
-      blockedByHasMore: blockedByHasMore,
-      blocks: blocksList,
-      blocksTotal: blocksTotal,
-      blocksHasMore: blocksHasMore,
+      blockedBy: blockedBy,
+      blockedByTotal: j['blockedByTotal'] as int? ?? blockedBy.length,
+      blockedByHasMore: j['blockedByHasMore'] as bool? ?? false,
+      blocks: blocks,
+      blocksTotal: j['blocksTotal'] as int? ?? blocks.length,
+      blocksHasMore: j['blocksHasMore'] as bool? ?? false,
       artifacts: (j['artifacts'] is List)
           ? (j['artifacts'] as List<dynamic>)
                 .map(

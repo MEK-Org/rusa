@@ -1658,11 +1658,10 @@ export async function handleMeshApiRequest(
       return true;
     }
     const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
-    const offset = parsePositiveInt(url, "offset") ?? parsePositiveInt(url, "children_offset") ?? 0;
+    const offset = parsePositiveInt(url, "offset") ?? 0;
     const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
     const blockedByOffset = parsePositiveInt(url, "blocked_by_offset") ?? 0;
-    const blocksOffset =
-      parsePositiveInt(url, "blocks_offset") ?? parsePositiveInt(url, "unblocks_offset") ?? 0;
+    const blocksOffset = parsePositiveInt(url, "blocks_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,

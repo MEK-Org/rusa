@@ -26,22 +26,3 @@ String formatReturnsIn(String iso) {
   if (minutes > 0) return 'in ${minutes}m';
   return 'in <1m';
 }
-
-/// Derive a browsable web URL for an external reference if supported (e.g. GitHub).
-String? externalRefUrl(String? ref) {
-  if (ref == null) return null;
-  final trimmed = ref.trim();
-  if (trimmed.isEmpty) return null;
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
-  }
-  if (trimmed.startsWith('github:')) {
-    final path = trimmed.substring(7);
-    final segments = path.split('/');
-    if (segments.length >= 3 && segments[2] == 'pulls') {
-      segments[2] = 'pull';
-    }
-    return 'https://github.com/${segments.join('/')}';
-  }
-  return null;
-}

@@ -19,7 +19,6 @@ class ObligationRow extends StatelessWidget {
     this.onMoveDown,
     this.onMutated,
     this.onSelectView,
-    this.openLink,
     this.showOwner = false,
     this.showActions = true,
     this.showReorder = false,
@@ -33,7 +32,6 @@ class ObligationRow extends StatelessWidget {
   final VoidCallback? onMoveDown;
   final VoidCallback? onMutated;
   final void Function(DashboardView)? onSelectView;
-  final void Function(String url)? openLink;
   final bool showOwner;
   final bool showActions;
   final bool showReorder;
@@ -213,42 +211,23 @@ class ObligationRow extends StatelessWidget {
             ],
             if (obligation.externalRef != null && obligation.externalRef!.trim().isNotEmpty) ...[
               const SizedBox(height: 8),
-              Builder(
-                builder: (context) {
-                  final refUrl = externalRefUrl(obligation.externalRef);
-                  return Row(
-                    children: [
-                      const Text(
-                        'Reference: ',
-                        style: TextStyle(color: MeshColors.textSecondary, fontSize: 11.5),
+              Row(
+                children: [
+                  const Text(
+                    'Reference: ',
+                    style: TextStyle(color: MeshColors.textSecondary, fontSize: 11.5),
+                  ),
+                  Expanded(
+                    child: Text(
+                      obligation.externalRef!,
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11.5,
+                        fontFamily: kMonoFontFamily,
                       ),
-                      Expanded(
-                        child: InkWell(
-                          onTap: (openLink != null && refUrl != null)
-                              ? () => openLink!(refUrl)
-                              : null,
-                          child: Text(
-                            obligation.externalRef!,
-                            style: const TextStyle(
-                              color: MeshColors.accent,
-                              fontSize: 11.5,
-                              fontFamily: kMonoFontFamily,
-                            ),
-                          ),
-                        ),
-                      ),
-                      if (openLink != null && refUrl != null)
-                        IconButton(
-                          icon: const Icon(Icons.open_in_new, size: 14),
-                          color: MeshColors.textSecondary,
-                          tooltip: 'Open in external system',
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-                          onPressed: () => openLink!(refUrl),
-                        ),
-                    ],
-                  );
-                },
+                    ),
+                  ),
+                ],
               ),
             ],
             if (obligation.isScheduled && obligation.nextReadyAt != null) ...[
