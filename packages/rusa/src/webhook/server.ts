@@ -33,6 +33,7 @@ import {
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
@@ -155,12 +156,14 @@ export interface DashboardMeshRefs {
   getFollowers?: DashboardDataDeps["getFollowers"];
 }
 
-export interface DashboardServerOptions {
+export interface DashboardServerBaseOptions {
+  /** Single-operator authentication policy. The request handler only needs to know
+   * whether it is on; `startDashboardServer` additionally requires the storage the
+   * identities resolve through — see {@link DashboardAuthOptions}. */
   auth?: DashboardAuthConfig;
   /** Pre-built emulator boundary from the disposable e2e launcher; `auth` config still
    * goes through `createDashboardAuth`, which rejects emulator mode. */
   e2eAuth?: DashboardAuth;
-  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   port: number;
   bindHost?: string;
   serveUi?: boolean;
@@ -194,6 +197,14 @@ export interface DashboardServerOptions {
   /** Application logger for request diagnostics. Absent → nothing is logged. */
   logger?: Logger;
 }
+
+/** Configured `auth` and the principal repository its identities resolve through arrive
+ * together or not at all, so an authenticated dashboard cannot be started without storage. */
+export type DashboardAuthOptions =
+  | { auth?: DashboardAuthConfig; principals: PrincipalRepository }
+  | { auth?: undefined; principals?: undefined };
+
+export type DashboardServerOptions = DashboardServerBaseOptions & DashboardAuthOptions;
 
 /**
  * Validate the X-Hub-Signature-256 header against the payload.
@@ -251,7 +262,7 @@ export function parseJsonObjectBody(body: string): JsonObjectParseResult {
  * `rusa report`, not here.
  */
 export function createDashboardRequestHandler(
-  options: DashboardServerOptions,
+  options: DashboardServerBaseOptions,
   dataDeps: DashboardDataDeps | null = null,
   voiceDeps: VoiceApiDeps | null = null,
   auth: DashboardAuth | null = null
@@ -543,15 +554,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   close: () => Promise<void>;
 }> {
   const { port } = options;
-  if (options.auth && !options.e2eAuth && !options.principals)
-    throw new Error("Authenticated dashboard requires a principal repository");
-  const auth =
-    options.e2eAuth ??
-    (options.auth && options.principals
-      ? createDashboardAuth(options.auth, options.principals)
-      : null);
   const bindHost = options.bindHost ?? "127.0.0.1";
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
+  const auth =
+    options.e2eAuth ??
+    (options.auth ? createDashboardAuth(options.auth, options.principals, log) : null);
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.

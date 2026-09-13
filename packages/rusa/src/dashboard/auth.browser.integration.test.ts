@@ -33,7 +33,7 @@ it.skipIf(process.env.RUSA_AUTH_BROWSER_SMOKE !== "1")(
       },
       new DashboardIdentityResolver(() => {
         throw new Error("Anonymous smoke must not access identity storage");
-      })
+      }, config.firebase.projectId)
     );
     const servers = [
       createServer(createDashboardRequestHandler({ port: 0, auth: config }, null, null, auth)),

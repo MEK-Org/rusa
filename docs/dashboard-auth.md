@@ -14,10 +14,10 @@ transport issuers; after SDK project verification, both are keyed using the cano
 `https://securetoken.google.com/<projectId>` issuer. A returning user is never looked
 up by email. Email remains the admission policy and mutable metadata, not identity.
 
-The authenticated request carries a typed principal together with an explicit
-single-operator compatibility authority. Actions still use `human:operator`; this
-does not yet provide tenant isolation. No root association, implicit owner claim,
-legacy alias, or historical rewrite is performed.
+An authorized request carries the resolved user principal. Actions still use
+`human:operator` authority, and no route reads the principal yet; this is identity,
+not tenant isolation. No root association, implicit owner claim, legacy alias, or
+historical rewrite is performed.
 
 A verified existing session can provision its user on its first request after the
 upgrade, without another login. Subsequent polling only reads identity unless email
@@ -28,9 +28,11 @@ their record and history; it cannot be bypassed by retaining an old session.
 
 If an email is already held by another identity or an unbound pre-provisioned user,
 access fails closed. It does not implicitly bind by email or reinterpret that record
-as the configured owner. Existing pre-provisioned identities require explicit verified
-binding by the operator before use. Email reuse, Firebase project replacement, and
-identity reassignment require an explicit future cutover workflow, not deleting history.
+as the configured owner. The browser sees the ordinary 401, so the server also logs
+`dashboard_identity_email_conflict` naming the id of the row that holds the address —
+without the address itself — to distinguish this from a credential failure. Email
+reuse, Firebase project replacement, and identity reassignment require an explicit
+future cutover workflow, not deleting history.
 
 ```yaml
 auth:

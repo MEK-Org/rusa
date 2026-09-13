@@ -28,7 +28,7 @@ export function createE2EDashboardAuth(host: string, email: string): DashboardAu
   return new DashboardAuth(
     config,
     getAuth(app),
-    new DashboardIdentityResolver(() => getRepositories().principals),
+    new DashboardIdentityResolver(() => getRepositories().principals, config.firebase.projectId),
     Date.now,
     () => deleteApp(app),
     `http://${host}`

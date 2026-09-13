@@ -1,16 +1,18 @@
 import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { nullLogger } from "../observability/logger.js";
 import { DashboardIdentityResolver } from "./identity.js";
 
 let db: Database.Database;
 let repo: PrincipalRepository;
 let resolver: DashboardIdentityResolver;
+const ISSUER = "https://securetoken.google.com/project";
 const token = (extra: Partial<DecodedIdToken> = {}) =>
   ({
-    iss: "https://securetoken.google.com/project",
+    iss: ISSUER,
     sub: "uid",
     uid: "uid",
     email: "OWNER@example.com",
@@ -20,7 +22,7 @@ beforeEach(() => {
   db = new Database(":memory:");
   runMigrations(db);
   repo = new PrincipalRepository(db);
-  resolver = new DashboardIdentityResolver(() => repo);
+  resolver = new DashboardIdentityResolver(() => repo, "project");
 });
 afterEach(() => db.close());
 
@@ -44,18 +46,51 @@ it("never claims another identity or a pending owner by matching email", () => {
   expect(repo.getUser(pending.id)?.identity).toBeUndefined();
   repo.bindExternalIdentity(
     pending.id,
-    { issuer: token().iss, subject: "different" },
+    { issuer: ISSUER, subject: "different" },
     new Date().toISOString()
   );
   expect(() => resolver.resolve(token())).toThrow();
   expect(repo.getUser(pending.id)?.identity?.subject).toBe("different");
 });
 
-it("treats issuer and subject together as the key, not email or uid alone", () => {
+it("keys on the canonical project issuer and subject, whatever the token's transport issuer", () => {
   const first = resolver.resolve(token());
-  expect(() => resolver.resolve(token({ iss: "different-project" }))).toThrow();
-  expect(() => resolver.resolve(token({ uid: "other", sub: "other" }))).toThrow();
-  expect(repo.getUser(first.id)?.identity).toEqual({ issuer: token().iss, subject: "uid" });
+  expect(repo.getUser(first.id)?.identity).toEqual({ issuer: ISSUER, subject: "uid" });
+  // A session cookie carries a different transport issuer for the same verified person.
+  expect(resolver.resolve(token({ iss: "https://session.firebase.google.com/project" })).id).toBe(
+    first.id
+  );
+  // A different subject is a different person, even from the same project.
+  const second = resolver.resolve(token({ uid: "other", sub: "other", email: "other@x.test" }));
+  expect(second.id).not.toBe(first.id);
+});
+
+it("names the colliding row when a verified email is already held by another user", () => {
+  const warn = vi.fn();
+  const logged = new DashboardIdentityResolver(() => repo, "project", {
+    ...nullLogger,
+    warn,
+  });
+  const pending = repo.createUser({
+    email: "owner@example.com",
+    createdAt: new Date().toISOString(),
+  });
+  expect(() => logged.resolve(token())).toThrow(/already registered/);
+  expect(warn).toHaveBeenCalledWith("dashboard_identity_email_conflict", {
+    holderId: pending.id,
+    holderBound: false,
+  });
+  // The same collision on a returning user's email change is reported the same way.
+  const returning = logged.resolve(token({ email: "other@example.com" }));
+  warn.mockClear();
+  expect(() => logged.resolve(token())).toThrow(/already registered/);
+  expect(warn).toHaveBeenCalledWith("dashboard_identity_email_conflict", {
+    holderId: pending.id,
+    holderBound: false,
+  });
+  expect(repo.getUser(returning.id)?.email).toBe("other@example.com");
+  // The address itself never reaches the record.
+  expect(JSON.stringify(warn.mock.calls)).not.toContain("owner@example.com");
 });
 
 it("checks disablement on every resolution and never updates disabled users", () => {
@@ -70,7 +105,6 @@ it("checks disablement on every resolution and never updates disabled users", ()
 it.each([
   { uid: "mismatch" },
   { sub: "" },
-  { iss: "" },
   { email: undefined },
 ])("refuses incomplete verified identity %j", (extra) => {
   expect(() => resolver.resolve(token(extra))).toThrow();

@@ -6,6 +6,7 @@ import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
 import { DashboardIdentityResolver } from "./identity.js";
@@ -26,16 +27,11 @@ const isTransient = (error: unknown): boolean =>
   "code" in error &&
   typeof error.code === "string" &&
   TRANSIENT_CODES.has(error.code);
-export interface DashboardRequestIdentity {
-  readonly principal: Readonly<UserPrincipal>;
-  /** Explicit compatibility authority. This is not yet tenant-scoped authorization. */
-  readonly mode: "single-operator";
-  readonly attributionId: "human:operator";
-}
-const authenticatedRequests = new WeakMap<IncomingMessage, DashboardRequestIdentity>();
-export const getDashboardRequestIdentity = (
-  req: IncomingMessage
-): DashboardRequestIdentity | undefined => authenticatedRequests.get(req);
+const authenticatedRequests = new WeakMap<IncomingMessage, UserPrincipal>();
+/** The durable identity behind an authorized request. Actions still carry
+ * `human:operator` authority; this is identity, not yet tenant-scoped authorization. */
+export const getDashboardRequestPrincipal = (req: IncomingMessage): UserPrincipal | undefined =>
+  authenticatedRequests.get(req);
 export const isAuthenticatedOperatorRequest = (req: IncomingMessage): boolean =>
   authenticatedRequests.has(req);
 
@@ -144,15 +140,6 @@ export class DashboardAuth {
     }
   }
 
-  private resolvePrincipal(token: DecodedIdToken): UserPrincipal {
-    // Firebase ID tokens and session cookies use different transport issuers.
-    // The SDK verified the configured project; key both by its canonical ID-token issuer.
-    return this.identities.resolve({
-      ...token,
-      iss: `https://securetoken.google.com/${this.config.firebase.projectId}`,
-    });
-  }
-
   private async verify(
     cookie: string,
     forceRevocation = false
@@ -169,7 +156,7 @@ export class DashboardAuth {
       return this.firebase.verifySessionCookie(cookie, false);
     });
     this.admitted(token);
-    const principal = this.resolvePrincipal(token);
+    const principal = this.identities.resolve(token);
     if (checkRevoked) {
       // Renewal issues a fresh cookie on every navigation, so entries expire rather than
       // accumulate; a failed attempt also counts, so an outage costs one call per window.
@@ -182,7 +169,6 @@ export class DashboardAuth {
   }
 
   async authorize(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-    authenticatedRequests.delete(req);
     try {
       const cookie = sessionCookie(req);
       if (!cookie) throw new Error("unauthorized");
@@ -195,17 +181,7 @@ export class DashboardAuth {
         return false;
       }
       res.setHeader("Cache-Control", "no-store");
-      authenticatedRequests.set(
-        req,
-        Object.freeze({
-          principal: Object.freeze({
-            ...principal,
-            ...(principal.identity ? { identity: Object.freeze({ ...principal.identity }) } : {}),
-          }),
-          mode: "single-operator",
-          attributionId: "human:operator",
-        })
-      );
+      authenticatedRequests.set(req, principal);
       return true;
     } catch (error) {
       // 401 is the browser's signal to sign in again, so an unreachable Firebase
@@ -280,7 +256,7 @@ export class DashboardAuth {
       ) {
         throw new Error("unauthorized");
       }
-      const principal = this.resolvePrincipal(token);
+      const principal = this.identities.resolve(token);
       const cookie = await this.firebase.createSessionCookie(idToken, { expiresIn: SESSION_MS });
       this.identities.recordAuthentication(principal, new Date(this.now()).toISOString());
       setCookie(res, cookie, SESSION_MS / 1000);
@@ -344,7 +320,8 @@ export class DashboardAuth {
 
 export function createDashboardAuth(
   config: DashboardAuthConfig,
-  principals: PrincipalRepository
+  principals: PrincipalRepository,
+  logger: Logger = nullLogger
 ): DashboardAuth {
   validateDashboardAuth(config);
   // Auth emulators accept unsigned tokens. Never inherit this bypass in the production boundary.
@@ -383,7 +360,7 @@ export function createDashboardAuth(
     return new DashboardAuth(
       config,
       getAuth(app),
-      new DashboardIdentityResolver(() => principals),
+      new DashboardIdentityResolver(() => principals, projectId, logger),
       Date.now,
       () => deleteApp(app)
     );

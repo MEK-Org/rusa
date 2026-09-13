@@ -15,7 +15,7 @@ import type { DashboardDataDeps } from "./api.js";
 import {
   createDashboardAuth,
   DashboardAuth,
-  getDashboardRequestIdentity,
+  getDashboardRequestPrincipal,
   SESSION_COOKIE,
   SESSION_MS,
   STREAM_IDLE_MS,
@@ -102,7 +102,7 @@ describe("single-operator dashboard authentication", () => {
     auth = new DashboardAuth(
       config,
       firebase,
-      new DashboardIdentityResolver(() => principals),
+      new DashboardIdentityResolver(() => principals, config.firebase.projectId),
       () => now
     );
     server = createServer(
@@ -151,32 +151,36 @@ describe("single-operator dashboard authentication", () => {
     return cookie.split(";")[0];
   }
 
-  it("binds a durable principal without changing operator authority or exposing the token", async () => {
-    const cookie = await login();
-    const req = { headers: { cookie }, method: "GET" } as IncomingMessage;
-    const res = {
+  const authRequest = (cookie: string) =>
+    ({ headers: { cookie }, method: "GET" }) as IncomingMessage;
+  const authResponse = () =>
+    ({
       setHeader: vi.fn(),
       writeHead: vi.fn(),
       end: vi.fn(),
-    } as unknown as ServerResponse;
-    expect(await auth.authorize(req, res)).toBe(true);
-    const context = getDashboardRequestIdentity(req);
-    expect(context).toMatchObject({
-      mode: "single-operator",
-      attributionId: "human:operator",
-      principal: { kind: "user", identity: { issuer: token.iss, subject: token.sub } },
+    }) as unknown as ServerResponse;
+
+  it("binds a durable principal without changing operator authority or exposing the token", async () => {
+    const cookie = await login();
+    const req = authRequest(cookie);
+    expect(await auth.authorize(req, authResponse())).toBe(true);
+    const principal = getDashboardRequestPrincipal(req);
+    expect(principal).toMatchObject({
+      kind: "user",
+      identity: { issuer: token.iss, subject: token.sub },
     });
-    expect(context?.principal.rootActorId).toBeUndefined();
-    expect(Object.isFrozen(context)).toBe(true);
-    expect(JSON.stringify(context)).not.toContain("cookie-1");
-    expect(JSON.stringify(context)).not.toContain("id-token");
+    expect(principal?.rootActorId).toBeUndefined();
+    expect(JSON.stringify(principal)).not.toContain("cookie-1");
+    expect(JSON.stringify(principal)).not.toContain("id-token");
     const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
-    expect(user?.id).toBe(context?.principal.id);
+    expect(user?.id).toBe(principal?.id);
     expect(user?.lastAuthenticatedAt).toBe(new Date(now).toISOString());
     if (!user) throw new Error("Expected durable user");
+    // A disabled user's next request is refused and carries no identity.
     principals.setDisabled(user.id, new Date(now).toISOString());
-    expect(await auth.authorize(req, res)).toBe(false);
-    expect(getDashboardRequestIdentity(req)).toBeUndefined();
+    const refused = authRequest(cookie);
+    expect(await auth.authorize(refused, authResponse())).toBe(false);
+    expect(getDashboardRequestPrincipal(refused)).toBeUndefined();
     expect((await post("/api/auth/session", cookie)).status).toBe(401);
     expect((await post("/api/auth/refresh", cookie)).status).toBe(401);
     expect(principals.getUser(user.id)?.identity).toEqual(user.identity);
@@ -188,18 +192,13 @@ describe("single-operator dashboard authentication", () => {
     const restarted = new DashboardAuth(
       config,
       firebase,
-      new DashboardIdentityResolver(() => new PrincipalRepository(db)),
+      new DashboardIdentityResolver(() => new PrincipalRepository(db), config.firebase.projectId),
       () => now
     );
-    const req = { headers: { cookie }, method: "GET" } as IncomingMessage;
-    const res = {
-      setHeader: vi.fn(),
-      writeHead: vi.fn(),
-      end: vi.fn(),
-    } as unknown as ServerResponse;
+    const req = authRequest(cookie);
     now += 60000;
-    expect(await restarted.authorize(req, res)).toBe(true);
-    expect(getDashboardRequestIdentity(req)?.principal.id).toBe(user?.id);
+    expect(await restarted.authorize(req, authResponse())).toBe(true);
+    expect(getDashboardRequestPrincipal(req)?.id).toBe(user?.id);
     expect(principals.getUser(user?.id ?? "")?.lastAuthenticatedAt).toBe(user?.lastAuthenticatedAt);
     await restarted.close();
   });
