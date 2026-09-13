@@ -8,7 +8,6 @@ import {
   type InboxPage,
   type InboxPayload,
   type InboxStore,
-  InvalidInboxCursorError,
   type MarkHandledResult,
   validateInboxPayload,
 } from "../../actor/inbox-store.js";
@@ -39,48 +38,13 @@ function decodeCursor(cursor: string): CursorValue {
     if (typeof parsed.deliveredAt !== "string" || typeof parsed.id !== "string") throw new Error();
     return parsed;
   } catch {
-    throw new InvalidInboxCursorError();
+    throw new Error("invalid inbox cursor");
   }
-}
-
-// SQLite's JSON functions throw for malformed text. A recovered entry has no
-// priority unless it passes the same shape checks as toEntry, so keep SQL-side
-// scheduling in step with that visible recovery value.
-const recoveredPriority = `CASE WHEN json_valid(payload_json) THEN
-  CASE WHEN json_type(payload_json) = 'object'
-         AND json_type(payload_json, '$.type') = 'text'
-         AND (json_type(payload_json, '$.priority') IS NULL
-              OR json_extract(payload_json, '$.priority') = 'responsive')
-       THEN json_extract(payload_json, '$.priority')
-       ELSE NULL END
-  ELSE NULL END`;
-
-function unavailablePayload(reason: "malformed JSON" | "invalid shape"): InboxPayload {
-  return {
-    type: "inbox.unavailable",
-    unavailable: `stored inbox payload has ${reason}`,
-  };
 }
 
 function toEntry(row: InboxRow): InboxEntry {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(row.payload_json);
-  } catch {
-    parsed = unavailablePayload("malformed JSON");
-  }
-  let payload: InboxPayload;
-  try {
-    validateInboxPayload(parsed);
-    payload = parsed;
-  } catch {
-    // Writes reject invalid payloads, but an older or damaged durable row must
-    // not make every page containing it unavailable. Keep its id, ownership,
-    // status, and position so the operator can see and clear the marker. The
-    // marker identifies the failure class but deliberately never exposes the
-    // persisted payload or parser/validation error.
-    payload = unavailablePayload("invalid shape");
-  }
+  const payload = JSON.parse(row.payload_json) as InboxPayload;
+  validateInboxPayload(payload);
   return {
     id: row.id,
     actorId: row.actor_id,
@@ -156,7 +120,7 @@ export class InboxRepository implements InboxStore {
       params.push(options.source);
     }
     if (options.responsiveOnly) {
-      where.push(`${recoveredPriority} = 'responsive'`);
+      where.push("json_extract(payload_json, '$.priority') = 'responsive'");
     }
     if (options.cursor) {
       const cursor = decodeCursor(options.cursor);
@@ -190,7 +154,7 @@ export class InboxRepository implements InboxStore {
 
   countUnhandled(actorId: string, options: { responsiveOnly?: boolean } = {}): number {
     const responsiveWhere = options.responsiveOnly
-      ? ` AND ${recoveredPriority} = 'responsive'`
+      ? " AND json_extract(payload_json, '$.priority') = 'responsive'"
       : "";
     const row = this.db
       .prepare(
@@ -281,7 +245,7 @@ export class InboxRepository implements InboxStore {
       .prepare(
         `SELECT actor_id AS actorId,
                 CASE WHEN MAX(
-                  CASE WHEN ${recoveredPriority} = 'responsive'
+                  CASE WHEN json_extract(payload_json, '$.priority') = 'responsive'
                        THEN 1 ELSE 0 END
                 ) = 1 THEN 'responsive' ELSE 'normal' END AS priority
          FROM actor_inbox_entries
