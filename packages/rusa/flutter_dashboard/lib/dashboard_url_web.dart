@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 
 import 'widgets/header.dart';
+import 'session_events_stub.dart'
+    if (dart.library.js_interop) 'session_events_web.dart';
 
 /// The view the current address names, or null when the path names none —
 /// the bare `/` landing, where the caller picks the default that suits the
@@ -45,6 +47,9 @@ void writeDashboardViewToUrl(
     path: newPath,
     queryParameters: queryParams.isEmpty ? null : queryParams,
   );
+  if (url.path != Uri.base.path || url.query != Uri.base.query) {
+    notifyNavigation();
+  }
   // Let Flutter update its own browser-history entry. Calling the DOM History
   // API directly replaces the engine's serialized state and breaks teardown.
   // This is deliberately fire-and-forget: a view selection must not wait for

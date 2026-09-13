@@ -37,3 +37,5 @@ runs/
 quickstart-output*.txt
 quickstart-server*.log
 quickstart.pid
+firebase-debug.log
+ui-debug.log

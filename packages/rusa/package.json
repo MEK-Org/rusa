@@ -18,6 +18,7 @@
     "build:dashboard-ui": "node scripts/build-dashboard-ui.mjs",
     "analyze:dashboard-ui": "node scripts/flutter-run.mjs analyze",
     "backfill:codex-quota": "tsup --silent && node scripts/backfill-codex-quota-parses.mjs",
+    "backfill:token-records": "tsup --config tsup.maintenance.config.ts --silent && node scripts/backfill-run-token-records.mjs",
     "test:dashboard-ui": "node scripts/flutter-run.mjs test",
     "e2e": "node scripts/e2e.mjs",
     "eval:quota": "tsup --silent && node scripts/eval-quota-extraction.mjs",

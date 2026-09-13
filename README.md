@@ -20,6 +20,8 @@ The full rationale and target shape live in
 
 For a guide to running and configuring a local Docker quickstart container, see the [Quick Start Guide](docs/quickstart.md).
 
+For optional single-user Google login through Firebase, see [Dashboard authentication](docs/dashboard-auth.md).
+
 ---
 
 ## Core Architecture

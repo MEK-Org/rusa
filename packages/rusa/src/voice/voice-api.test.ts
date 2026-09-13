@@ -11,6 +11,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "./voice-api.js";
@@ -164,25 +165,32 @@ function makeStreamingService(home: string, startNow: number) {
   };
 }
 
-function findLatencyLog(calls: unknown[]): {
+type LogRecord = {
   level: string;
-  latencyMs: number | null;
+  event: string;
+  latencyMs?: number | null;
   latencySuspect?: boolean;
-} | null {
-  for (const call of calls) {
-    const args = call as string[];
-    const text = args[0];
-    if (typeof text !== "string") continue;
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed.msg === "First MP3 byte flushed to client") {
-        return parsed;
-      }
-    } catch {
-      // ignore non-JSON
-    }
-  }
-  return null;
+  [field: string]: unknown;
+};
+
+function captureLogger(): { logger: Logger; records: LogRecord[] } {
+  const records: LogRecord[] = [];
+  let logger!: Logger;
+  const write = (level: string, event: string, fields: Record<string, unknown> = {}) => {
+    records.push({ level, event, ...fields });
+  };
+  logger = {
+    debug: (event, fields) => write("debug", event, fields),
+    info: (event, fields) => write("info", event, fields),
+    warn: (event, fields) => write("warn", event, fields),
+    error: (event, fields) => write("error", event, fields),
+    child: () => logger,
+  };
+  return { logger, records };
+}
+
+function findLatencyLog(records: LogRecord[]): LogRecord | null {
+  return records.find((record) => record.event === "voice_audio_first_byte") ?? null;
 }
 
 describe("handleVoiceApiRequest", () => {
@@ -585,12 +593,12 @@ describe("handleVoiceApiRequest", () => {
       const announcement = await announcementPromise;
       expect(announcement).not.toBeNull();
 
-      const logSpy = vi.fn();
-      deps.log = logSpy;
+      const capture = captureLogger();
+      deps.logger = capture.logger;
       const { res } = call(deps, "GET", `/api/mesh/voice/audio/${announcement?.id}`);
 
       await vi.waitFor(() => expect(res.writes.length).toBeGreaterThan(0));
-      expect(findLatencyLog(logSpy.mock.calls)).not.toBeNull();
+      expect(findLatencyLog(capture.records)).not.toBeNull();
       expect(res.writes[0].toString()).toContain("chunk1-mp3");
       expect(res.ended).toBe(false);
 
@@ -611,12 +619,12 @@ describe("handleVoiceApiRequest", () => {
       // Simulate time passing between the stream request and the first chunk flush.
       advance(5_678);
 
-      const logSpy = vi.fn();
-      deps.log = logSpy;
+      const capture = captureLogger();
+      deps.logger = capture.logger;
       const { res } = call(deps, "GET", `/api/mesh/voice/audio/${announcement?.id}`);
       await vi.waitFor(() => expect(res.writes.length).toBeGreaterThan(0));
 
-      const log = findLatencyLog(logSpy.mock.calls);
+      const log = findLatencyLog(capture.records);
       expect(log).not.toBeNull();
       expect(log?.latencyMs).toBe(5_678);
       expect(log?.level).toBe("info");
@@ -634,12 +642,12 @@ describe("handleVoiceApiRequest", () => {
 
       advance(5_000);
 
-      const logSpy = vi.fn();
-      deps.log = logSpy;
+      const capture = captureLogger();
+      deps.logger = capture.logger;
       const { res } = call(deps, "GET", `/api/mesh/voice/audio/${announcement?.id}`);
       await vi.waitFor(() => expect(res.writes.length).toBeGreaterThan(0));
 
-      const log = findLatencyLog(logSpy.mock.calls);
+      const log = findLatencyLog(capture.records);
       expect(log).not.toBeNull();
       expect(log?.latencyMs).toBeNull();
       expect(log?.level).toBe("warn");
@@ -656,12 +664,12 @@ describe("handleVoiceApiRequest", () => {
 
       advance(70_000);
 
-      const logSpy = vi.fn();
-      deps.log = logSpy;
+      const capture = captureLogger();
+      deps.logger = capture.logger;
       const { res } = call(deps, "GET", `/api/mesh/voice/audio/${announcement?.id}`);
       await vi.waitFor(() => expect(res.writes.length).toBeGreaterThan(0));
 
-      const log = findLatencyLog(logSpy.mock.calls);
+      const log = findLatencyLog(capture.records);
       expect(log).not.toBeNull();
       expect(log?.latencyMs).toBe(70_000);
       expect(log?.level).toBe("warn");
@@ -676,8 +684,8 @@ describe("handleVoiceApiRequest", () => {
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "re-fetch test" }));
       expect(announcement).not.toBeNull();
 
-      const logSpy = vi.fn();
-      deps.log = logSpy;
+      const capture = captureLogger();
+      deps.logger = capture.logger;
 
       // First fetch flushes at +5s.
       advance(5_000);
@@ -689,26 +697,17 @@ describe("handleVoiceApiRequest", () => {
       const second = call(deps, "GET", `/api/mesh/voice/audio/${announcement?.id}`);
       await vi.waitFor(() => expect(second.res.writes.length).toBeGreaterThan(0));
 
-      const logs = logSpy.mock.calls
-        .map((call) => {
-          try {
-            const parsed = JSON.parse((call as string[])[0]);
-            return parsed.msg === "First MP3 byte flushed to client" ? parsed : null;
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
+      const logs = capture.records.filter((record) => record.event === "voice_audio_first_byte");
 
       expect(logs).toHaveLength(2);
       expect(logs[0].latencyMs).toBe(5_000);
       expect(logs[1].latencyMs).toBe(7_000);
     });
 
-    it("does not write to console.log when deps.log is omitted", async () => {
+    it("does not write to console.log when deps.logger is omitted", async () => {
       const { service: testService, advance } = makeStreamingService(home, 1_000);
       deps.service = testService;
-      delete deps.log;
+      delete deps.logger;
       testService.presenceConnect([UUID_A]);
 
       const announcement = await testService.handleMeshEvent(replyEvent({ body: "silent test" }));
@@ -789,6 +788,43 @@ describe("handleVoiceApiRequest", () => {
       expect(JSON.parse(res.body).announcements.map((a: { id: string }) => a.id)).toEqual([
         second.id,
       ]);
+    });
+
+    it("logs request-correlated ack outcomes without voice content", async () => {
+      const announcement = await seedAnnouncement("operator-private reply");
+      const capture = captureLogger();
+      deps.logger = capture.logger;
+
+      const acknowledged = call(deps, "POST", "/api/mesh/voice/ack", {
+        body: JSON.stringify({ id: announcement.id }),
+      });
+      await settled(acknowledged.res);
+      const unknown = call(deps, "POST", "/api/mesh/voice/ack", {
+        body: JSON.stringify({ id: "not-a-voice-id" }),
+      });
+      await settled(unknown.res);
+
+      const outcomes = capture.records.filter((record) => record.event === "voice_ack");
+      expect(outcomes).toEqual([
+        expect.objectContaining({
+          event: "voice_ack",
+          outcome: "acknowledged",
+          status: 200,
+          announcementId: announcement.id,
+          requestId: expect.any(String),
+        }),
+        expect.objectContaining({
+          event: "voice_ack",
+          outcome: "unknown_announcement",
+          status: 404,
+          requestId: expect.any(String),
+          idShape: "other",
+        }),
+      ]);
+      expect(JSON.parse(acknowledged.res.body).requestId).toBe(outcomes[0].requestId);
+      expect(JSON.parse(unknown.res.body).requestId).toBe(outcomes[1].requestId);
+      expect(JSON.stringify(outcomes)).not.toContain("operator-private reply");
+      expect(JSON.stringify(outcomes)).not.toContain("not-a-voice-id");
     });
 
     it("backlog is empty for an actor with no announcements", () => {

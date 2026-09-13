@@ -20,6 +20,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   type EncodedAudio,
   encodePcmAudio,
@@ -152,6 +153,8 @@ export interface VoiceServiceOptions {
   sessionLeaseMs?: number;
   /** Called once when an explicit session ends or expires. */
   onSessionEnded?: (actorId: string) => void;
+  /** Structured records for the actual leased-SSE transfer control dispatch. */
+  logger?: Logger;
 }
 
 interface VoiceSession {
@@ -181,6 +184,7 @@ export class VoiceService {
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
   private readonly voiceNameFor: ((actorId: string) => string | undefined) | undefined;
+  private readonly log: Logger;
 
   /** Live `voice` SSE subscription count per actor. */
   private readonly liveSubscriptions = new Map<string, number>();
@@ -192,6 +196,10 @@ export class VoiceService {
   private onSessionTransferred?: (sessionId: string, targetActorId: string) => void;
   /** Insertion-ordered announcement ring, oldest first, bounded. */
   private readonly announcements: VoiceAnnouncement[] = [];
+  /** Source reply renders that began before their actor handed off the session. */
+  private readonly pendingOutboundRenders = new Map<string, Set<Promise<void>>>();
+  /** The source-render barrier captured atomically with a session rebind. */
+  private readonly pendingTransferControls = new Map<string, Promise<void>>();
 
   constructor(options: VoiceServiceOptions) {
     this.home = options.home;
@@ -209,6 +217,7 @@ export class VoiceService {
     }
     this.voiceNameFor = options.voiceNameFor;
     this.onSessionEnded = options.onSessionEnded;
+    this.log = options.logger ?? nullLogger;
   }
 
   // ── Explicit leased walkie sessions ────────────────────────────────────
@@ -331,6 +340,18 @@ export class VoiceService {
 
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error("active voice session disappeared before transfer");
+    // A reply's mesh event starts TTS asynchronously. Capture every render
+    // already underway before moving the session, so its voice frame reaches
+    // the old SSE filter before the control changes that filter to the target.
+    const pending = this.pendingOutboundRenders.get(fromActorId);
+    if (pending && pending.size > 0) {
+      this.pendingTransferControls.set(
+        sessionId,
+        Promise.all([...pending]).then(() => undefined)
+      );
+    } else {
+      this.pendingTransferControls.delete(sessionId);
+    }
     session.actorId = targetActorId;
     return sessionId;
   }
@@ -341,12 +362,36 @@ export class VoiceService {
     if (!session || session.actorId !== targetActorId) {
       throw new Error("voice session cannot be restored after transfer");
     }
+    this.pendingTransferControls.delete(sessionId);
     session.actorId = fromActorId;
   }
 
-  /** Deliver a post-rebind dashboard control frame when a voice UI is bound. */
+  /**
+   * Deliver a post-rebind dashboard control frame when a voice UI is bound.
+   * A control following an in-flight source reply waits only for that reply's
+   * render registration; the durable rebind and recipient handoff have already
+   * completed, so this never rolls a transfer back or drops its lease.
+   */
   notifySessionTransferred(sessionId: string, targetActorId: string): void {
-    this.onSessionTransferred?.(sessionId, targetActorId);
+    const barrier = this.pendingTransferControls.get(sessionId);
+    this.pendingTransferControls.delete(sessionId);
+    const dispatch = () => {
+      try {
+        this.onSessionTransferred?.(sessionId, targetActorId);
+        this.log.info("voice_session_control_dispatched", { sessionId, targetActorId });
+      } catch (err) {
+        this.log.warn("voice_session_control_dispatch_failed", {
+          sessionId,
+          targetActorId,
+          err,
+        });
+      }
+    };
+    if (!barrier) {
+      dispatch();
+      return;
+    }
+    void barrier.then(dispatch);
   }
 
   /** Wire or clear the live dashboard notifier after its SSE hub is constructed. */
@@ -436,7 +481,10 @@ export class VoiceService {
    * announcement, and return it (the caller pushes the SSE frame). Returns null
    * for every event this hook doesn't own.
    */
-  async handleMeshEvent(event: MeshEvent): Promise<VoiceAnnouncement | null> {
+  async handleMeshEvent(
+    event: MeshEvent,
+    onAnnouncement?: (announcement: VoiceAnnouncement) => void
+  ): Promise<VoiceAnnouncement | null> {
     if (event.kind !== "message_sent") return null;
 
     let senderId: string | null = null;
@@ -460,37 +508,69 @@ export class VoiceService {
     const text = speakableText(event.body);
     if (!text) return null;
 
-    // Per-actor voice selection happens here, once per reply, before synthesis
-    // — an actor whose voice the operator just changed speaks with the new one
-    // on the very next reply. No persisted setting → undefined → the speech
-    // client's instance-wide default, which is the pre-existing behavior.
-    const voiceName = this.voiceNameFor?.(senderId);
+    // The emitter invokes this method synchronously up to its first await.
+    // Register the marker before starting synthesis so a transfer called in the
+    // same actor turn captures this render in its ordering barrier.
+    const finishRender = this.beginOutboundRender(senderId);
 
-    const streamRequestedAt = this.now();
-    const streamInfo = await this.speech.streamSynthesize(text, voiceName);
-    const dir = join(this.home, "voice", "outbox");
-    await mkdir(dir, { recursive: true });
-    const id = randomUUID();
-    const encoded = await this.encodeStream(
-      streamInfo.pcmStream,
-      streamInfo.sampleRate,
-      join(dir, `${streamRequestedAt}-${id}`)
-    );
+    try {
+      // Per-actor voice selection happens here, once per reply, before synthesis
+      // — an actor whose voice the operator just changed speaks with the new one
+      // on the very next reply. No persisted setting → undefined → the speech
+      // client's instance-wide default, which is the pre-existing behavior.
+      const voiceName = this.voiceNameFor?.(senderId);
 
-    const announcement: VoiceAnnouncement = {
-      id,
-      actorId: senderId,
-      text,
-      audioPath: encoded.path,
-      mime: encoded.mime,
-      createdAt: new Date(this.now()).toISOString(),
-      playedAt: null,
-      subscribeStream: encoded.subscribe,
-      streamRequestedAt,
+      const streamRequestedAt = this.now();
+      const streamInfo = await this.speech.streamSynthesize(text, voiceName);
+      const dir = join(this.home, "voice", "outbox");
+      await mkdir(dir, { recursive: true });
+      const id = randomUUID();
+      const encoded = await this.encodeStream(
+        streamInfo.pcmStream,
+        streamInfo.sampleRate,
+        join(dir, `${streamRequestedAt}-${id}`)
+      );
+
+      const announcement: VoiceAnnouncement = {
+        id,
+        actorId: senderId,
+        text,
+        audioPath: encoded.path,
+        mime: encoded.mime,
+        createdAt: new Date(this.now()).toISOString(),
+        playedAt: null,
+        subscribeStream: encoded.subscribe,
+        streamRequestedAt,
+      };
+      this.announcements.push(announcement);
+      while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
+      // The outbound bridge writes the source frame synchronously here. Only
+      // then may the transfer barrier release its control frame, preserving
+      // the source-frame → control order on the leased SSE connection.
+      onAnnouncement?.(announcement);
+      return announcement;
+    } finally {
+      finishRender();
+    }
+  }
+
+  /** Mark a source render so a same-turn transfer can order its control after it. */
+  private beginOutboundRender(actorId: string): () => void {
+    let resolve!: () => void;
+    const done = new Promise<void>((complete) => {
+      resolve = complete;
+    });
+    let renders = this.pendingOutboundRenders.get(actorId);
+    if (!renders) {
+      renders = new Set();
+      this.pendingOutboundRenders.set(actorId, renders);
+    }
+    renders.add(done);
+    return () => {
+      renders?.delete(done);
+      if (renders?.size === 0) this.pendingOutboundRenders.delete(actorId);
+      resolve();
     };
-    this.announcements.push(announcement);
-    while (this.announcements.length > this.maxAnnouncements) this.announcements.shift();
-    return announcement;
   }
 
   // ── Registry reads ──────────────────────────────────────────────────────

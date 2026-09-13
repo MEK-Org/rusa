@@ -32,7 +32,7 @@ import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
-import type { RunResult } from "../providers/types.js";
+import type { CodingProvider, RunResult } from "../providers/types.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
@@ -142,6 +142,27 @@ vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../providers/model-scrape.js")>()),
   refreshConfiguredProviderModelCatalogs: modelScrapeMock.refreshConfiguredProviderModelCatalogs,
 }));
+
+// Structured records go to a synchronous fd-1 sink that bypasses
+// `process.stdout.write`; route every logger built during a test into this
+// capture so a boot record can be asserted the way an operator would read it.
+const logCapture = vi.hoisted(() => ({ lines: [] as string[] }));
+
+vi.mock("../observability/logger.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../observability/logger.js")>();
+  return {
+    ...actual,
+    createLogger: (options: Parameters<typeof actual.createLogger>[0] = {}) =>
+      actual.createLogger({
+        ...options,
+        destination: {
+          write: (line: string) => {
+            logCapture.lines.push(line);
+          },
+        },
+      }),
+  };
+});
 
 import {
   getShutdownExitCode,
@@ -2471,6 +2492,162 @@ describe("runStart webhook event routing (Phase 4)", () => {
     compactSpy.mockRestore();
   });
 
+  it("persists token accounting records for ended root runs with reported token usage (#443)", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: {
+          provider: "claude",
+          model: "claude-sonnet-4-6",
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const rootId = rootActor.id;
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: {
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: unknown,
+            selected: { provider: string; model?: string; effort?: string }
+          ) => void;
+          onRunEnd?: (result: RunResult) => Promise<void>;
+        };
+      }
+    ).opts;
+
+    // 1. Root run with reported Claude token usage
+    const claudeUsage = {
+      provider: "claude" as const,
+      model: "claude-sonnet-4-6",
+      scrapedAt: "2026-09-12T12:00:00.000Z",
+      uncachedInput: 150,
+      cacheRead: 50,
+      output: 30,
+      reasoning: null,
+      response: null,
+    };
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "claude root run done",
+      exitCode: 0,
+      tokenUsage: claudeUsage,
+    });
+
+    const rootTokenRecords = () =>
+      getDb()
+        .prepare(
+          `SELECT rtr.*, ar.id AS actor_run_id
+           FROM run_token_records rtr
+           JOIN actor_runs ar ON ar.id = rtr.run_id
+           WHERE ar.actor_id = ?
+           ORDER BY rtr.created_at ASC`
+        )
+        .all(rootId) as Array<{
+        run_id: string;
+        actor_run_id: string;
+        provider: string;
+        model: string | null;
+        uncached_input: number | null;
+        cache_read: number | null;
+        output: number | null;
+        reasoning: number | null;
+        response: number | null;
+      }>;
+
+    const claudeRecords = rootTokenRecords();
+
+    expect(claudeRecords).toHaveLength(1);
+    expect(claudeRecords[0].run_id).toBe(claudeRecords[0].actor_run_id);
+    expect(claudeRecords[0]).toMatchObject({
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+      uncached_input: 150,
+      cache_read: 50,
+      output: 30,
+      reasoning: null,
+      response: null,
+    });
+
+    // 2. Root run with Codex unattributed token usage (honest absence: nulls, not manufactured zeroes)
+    const codexUsage = {
+      provider: "codex" as const,
+      model: "gpt-5.6-sol",
+      scrapedAt: "2026-09-12T12:05:00.000Z",
+      uncachedInput: null,
+      cacheRead: null,
+      output: null,
+      reasoning: null,
+      response: null,
+    };
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "codex root run done",
+      exitCode: 0,
+      tokenUsage: codexUsage,
+    });
+
+    const allRecords = rootTokenRecords();
+
+    expect(allRecords).toHaveLength(2);
+    expect(new Set(allRecords.map((record) => record.run_id))).toHaveLength(2);
+    expect(allRecords.every((record) => record.run_id === record.actor_run_id)).toBe(true);
+    expect(allRecords.find((record) => record.provider === "codex")).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      uncached_input: null,
+      cache_read: null,
+      output: null,
+      reasoning: null,
+      response: null,
+    });
+
+    // 3. Root run without token usage (e.g. provider returns none / honest absence)
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "claude",
+      model: "claude-sonnet-4-6",
+    });
+    await actorOpts.onRunEnd?.({
+      success: true,
+      output: "root run with no usage",
+      exitCode: 0,
+    });
+
+    const recordsAfterNoUsage = rootTokenRecords();
+    expect(recordsAfterNoUsage).toHaveLength(2);
+  });
+
   it("does not infer polling scope from git remote when github config has no scope", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
@@ -3861,6 +4038,494 @@ describe("runStart webhook event routing (Phase 4)", () => {
     halt.resume();
   });
 
+  describe("root model_config startup precedence (#333)", () => {
+    const portableRootConfig = (rootModel: { model: string; effort?: string }) => ({
+      github: { account: "mock-bot" },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "antigravity",
+        ...rootModel,
+        context: { type: "portable", mode: "tail" },
+      },
+      geminiApiKey: "fake-gemini-key",
+    });
+    const bootTuple = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+    // Multi-entry, cross-provider, ordered — every field the restart must keep.
+    const operatorPool: ProviderModelConfig[] = [
+      { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+      { provider: "antigravity", model: "Gemini 4.1 Ultra", effort: "low" },
+    ];
+    const fallbackOperatorPool: ProviderModelConfig[] = [
+      { provider: "claude", model: "claude-sonnet-5", effort: "low" },
+    ];
+
+    const boot = async (): Promise<ActorMesh> => {
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+      return mesh;
+    };
+    const liveRootPool = (mesh: ActorMesh): ProviderModelConfig[] | undefined =>
+      (mesh.get("root") as unknown as { opts: { modelConfig: ProviderModelConfig[] } } | undefined)
+        ?.opts.modelConfig;
+    const modelSetEvents = () =>
+      getRepositories().meshEvents.listEventsByActors(["root"], {
+        kinds: ["actor_model_set"],
+        limit: 20,
+      }).events;
+    const rootActorOpts = (mesh: ActorMesh) =>
+      (mesh.get("root") as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } })
+        .opts;
+    const bootRecords = (msg: string): Record<string, unknown>[] =>
+      logCapture.lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((record) => record.msg === msg);
+    const readRootModelConfigRow = (): unknown => {
+      const db = new Database(join(homeDir, "data", "mesh.db"), { readonly: true });
+      try {
+        const row = db.prepare("SELECT model_config FROM actors WHERE id = ?").get("root") as {
+          model_config: string;
+        };
+        return JSON.parse(row.model_config);
+      } finally {
+        db.close();
+      }
+    };
+
+    // Boot on the file tuple, move root to the operator pool through the same
+    // set/apply path production uses, and stop — the database now carries the
+    // pool and the service is down, exactly the state a restart starts from.
+    const persistOperatorPool = async (): Promise<void> => {
+      const mesh = await boot();
+      expect(mesh.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      mesh.setActorModel("root", operatorPool, "root");
+      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(modelSetEvents()).toHaveLength(1);
+      await shutdownFn?.();
+      shutdownFn = undefined;
+    };
+
+    beforeEach(() => {
+      clearProviderModelCatalog("antigravity");
+      clearProviderModelCatalog("claude");
+      logCapture.lines.length = 0;
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml(portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" })),
+        "utf8"
+      );
+    });
+
+    it("preserves the persisted ordered pool across a restart on the record and the live root", async () => {
+      await persistOperatorPool();
+      logCapture.lines.length = 0;
+
+      const mesh = await boot();
+
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      // The restart preserved the value; it did not "set" anything.
+      expect(modelSetEvents()).toHaveLength(1);
+      expect(bootRecords("root_model_config_resolved")).toMatchObject([
+        {
+          level: "info",
+          source: "persisted",
+          modelConfig: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
+        },
+      ]);
+      // The file still names the bootstrap tuple, so the operator is told it
+      // no longer steers root — with both values and what to do instead.
+      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
+        {
+          level: "warn",
+          configured: "antigravity:Gemini 3.7 Flash @ high",
+          persisted: "claude:claude-sonnet-5 @ high, antigravity:Gemini 4.1 Ultra @ low",
+          action: expect.stringMatching(/set_actor_model/),
+        },
+      ]);
+    });
+
+    it("keeps an upgraded database on the tuple its last boot wrote, not the tuple the file now says", async () => {
+      // Before #333 every boot wrote the file tuple onto the root row, so a
+      // database upgraded across this change already carries one — this is
+      // the common case, not the operator-pool one: boot once on the old
+      // file, edit the file, boot again.
+      const first = await boot();
+      expect(first.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml(portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "low" })),
+        "utf8"
+      );
+      logCapture.lines.length = 0;
+
+      const restarted = await boot();
+
+      expect(restarted.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      expect(liveRootPool(restarted)).toEqual([bootTuple]);
+      expect(modelSetEvents()).toHaveLength(0);
+      expect(bootRecords("root_model_config_file_ignored")).toMatchObject([
+        {
+          level: "warn",
+          configured: "antigravity:Gemini 4.1 Ultra @ low",
+          persisted: "antigravity:Gemini 3.7 Flash @ high",
+        },
+      ]);
+    });
+
+    it("keeps the persisted pool's class provenance through a restart", async () => {
+      await persistOperatorPool();
+      // A class-bearing (v3) document only ever carries a non-empty pool, so
+      // the merge onto the existing row is what keeps the class: startup
+      // decides the pool and leaves the class alone.
+      const db = new Database(join(homeDir, "data", "mesh.db"));
+      try {
+        db.prepare("UPDATE actors SET model_config = ? WHERE id = ?").run(
+          JSON.stringify({ schemaVersion: 3, entries: operatorPool, modelClass: "frontier" }),
+          "root"
+        );
+      } finally {
+        db.close();
+      }
+
+      const mesh = await boot();
+
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(mesh.actors.get("root")?.modelClass).toBe("frontier");
+      expect(readRootModelConfigRow()).toEqual({
+        schemaVersion: 3,
+        entries: operatorPool,
+        modelClass: "frontier",
+      });
+    });
+
+    it("does not replace a persisted pool with a changed scalar rootActor tuple", async () => {
+      await persistOperatorPool();
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml(portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "high" })),
+        "utf8"
+      );
+
+      const mesh = await boot();
+
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      expect(modelSetEvents()).toHaveLength(1);
+    });
+
+    // `runWithFallback` is the production boundary that resolves a fallback,
+    // and `onRunStart` is the hook `Actor.invoke` fires with the entry it
+    // selected just before calling it. `requestRun` is mocked file-wide, so a
+    // run is driven the way the rest of this file drives one: through those
+    // hooks with a stubbed provider, classifying the primary as exhausted.
+    const rootFallbackRun = async (
+      mesh: ActorMesh,
+      selected: ProviderModelConfig,
+      recover: (fallback: CodingProvider) => RunResult = () => ({
+        success: true,
+        output: "fallback recovered",
+        exitCode: 0,
+      })
+    ): Promise<{ attempts: CodingProvider[]; result: RunResult }> => {
+      const root = mesh.get("root");
+      if (!root) throw new Error("root actor not ready");
+      const actor = root as unknown as {
+        opts: {
+          fallback?: { classify: (result: RunResult) => Promise<{ exhausted: boolean }> };
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: undefined,
+            selected: ProviderModelConfig
+          ) => void;
+          onRunEnd?: (result: RunResult) => Promise<void>;
+        };
+        runWithFallback: (
+          primary: CodingProvider,
+          runProvider: (provider: CodingProvider) => Promise<RunResult>
+        ) => Promise<RunResult>;
+      };
+      if (!actor.opts.fallback) throw new Error("root fallback not configured");
+      actor.opts.fallback.classify = vi.fn(async () => ({ exhausted: true }));
+      actor.opts.onRunStart?.(false, undefined, selected);
+      const primary: CodingProvider = {
+        name: selected.provider,
+        providerName: selected.provider,
+        model: selected.model,
+        effort: selected.effort,
+        run: async () => ({ success: true, output: "unused", exitCode: 0 }),
+      };
+      const attempts: CodingProvider[] = [];
+      const result = await actor.runWithFallback(primary, async (provider) => {
+        attempts.push(provider);
+        return provider === primary
+          ? { success: false, output: "quota exhausted", exitCode: 1 }
+          : recover(provider);
+      });
+      // Close the durable run the way `Actor.invoke` does, so the outcome is
+      // forwarded and the next run can start.
+      await actor.opts.onRunEnd?.(result);
+      return { attempts, result };
+    };
+    const runEndEvents = () =>
+      getRepositories().meshEvents.listEventsByActors(["root"], { kinds: ["run_end"], limit: 20 })
+        .events;
+
+    it("resolves a root fallback from the persisted entry that its Actor is running", async () => {
+      // Set a durable Claude/low primary, then edit the scalar file to a
+      // different Antigravity/high tuple before restart. The fallback model is
+      // deliberately named like the old file's model: the real Actor fallback
+      // boundary must not borrow that file provider or effort when it recovers
+      // from the durable primary.
+      const first = await boot();
+      first.setActorModel("root", fallbackOperatorPool, "root");
+      rootActorOpts(first).beforeRun?.({ mode: "yield-elicitation" });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const changedFileConfig = portableRootConfig({ model: "Gemini 4.1 Ultra", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...changedFileConfig,
+          rootActor: {
+            ...changedFileConfig.rootActor,
+            fallbackModel: "Gemini 3.7 Flash",
+          },
+        }),
+        "utf8"
+      );
+
+      const mesh = await boot();
+      expect(liveRootPool(mesh)).toEqual(fallbackOperatorPool);
+      const persisted = fallbackOperatorPool[0] as ProviderModelConfig;
+
+      const recovered = await rootFallbackRun(mesh, persisted);
+      expect(recovered.attempts).toHaveLength(2);
+      expect(recovered.attempts[1]).toMatchObject({
+        providerName: "claude",
+        model: "Gemini 3.7 Flash",
+        effort: "low",
+      });
+      expect(recovered.result).toMatchObject({ success: true, output: "fallback recovered" });
+
+      // A fallback pin unavailable to the durable provider is a real failure,
+      // not permission to try the stale Antigravity/high file tuple instead.
+      // It is reported the way production forwards it to onRunEnd: as a failed
+      // result that leads with the exhaustion and keeps the resolver error as
+      // context, so the operator reads "wait for quota, and fix the pin" rather
+      // than a bare stack.
+      setProviderModelCatalog("claude", [
+        { identifier: "claude-sonnet-5", displayLabel: "claude-sonnet-5", passable: true },
+      ]);
+      const unresolvable = await rootFallbackRun(mesh, persisted);
+      expect(unresolvable.attempts).toHaveLength(1);
+      expect(unresolvable.result.success).toBe(false);
+      expect(unresolvable.result.output).toContain("primary claude-sonnet-5 exhausted");
+      expect(unresolvable.result.output).toMatch(
+        /model pin validation failed for provider "claude": rejected "Gemini 3.7 Flash"/
+      );
+      const ended = runEndEvents();
+      expect(ended).toHaveLength(2);
+      expect(ended[0]).toMatchObject({ success: false, body: unresolvable.result.output });
+    });
+
+    it("resolves a root fallback from the entry a later run launched on, not the boot-time pool", async () => {
+      // Root boots on the file tuple, then the operator moves its pool to
+      // Claude/low through set_actor_model while the service stays up. The
+      // next run launches on the new entry, and its fallback must follow that
+      // entry rather than the one frozen at boot. Freezing
+      // `rootBootModelConfig.modelConfig[0]` passes the restart case above and
+      // fails here.
+      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...config,
+          rootActor: { ...config.rootActor, fallbackModel: "Gemini 4.1 Ultra" },
+        }),
+        "utf8"
+      );
+      const mesh = await boot();
+      expect(liveRootPool(mesh)).toEqual([bootTuple]);
+
+      const booted = await rootFallbackRun(mesh, bootTuple);
+      expect(booted.attempts[1]).toMatchObject({
+        providerName: "antigravity",
+        model: "Gemini 4.1 Ultra",
+        effort: "high",
+      });
+
+      mesh.setActorModel("root", fallbackOperatorPool, "root");
+      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
+      expect(liveRootPool(mesh)).toEqual(fallbackOperatorPool);
+
+      const moved = await rootFallbackRun(mesh, fallbackOperatorPool[0] as ProviderModelConfig);
+      expect(moved.attempts).toHaveLength(2);
+      expect(moved.attempts[1]).toMatchObject({
+        providerName: "claude",
+        model: "Gemini 4.1 Ultra",
+        effort: "low",
+      });
+    });
+
+    it("seeds a root record with no persisted pool from the configured tuple without a model-set event", async () => {
+      // The legacy root thread from beforeEach carries no model fields: the
+      // upgrade path lands a record with no pool, the same as a fresh install.
+      const mesh = await boot();
+
+      expect(mesh.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      expect(liveRootPool(mesh)).toEqual([bootTuple]);
+      expect(modelSetEvents()).toHaveLength(0);
+      expect(bootRecords("root_model_config_resolved")).toMatchObject([{ source: "bootstrap" }]);
+      expect(bootRecords("root_model_config_file_ignored")).toEqual([]);
+    });
+
+    it("seeds a fresh database with a minted root from the configured tuple", async () => {
+      rmSync(join(homeDir, "threads.json"));
+
+      const mesh = await boot();
+
+      const roots = mesh.actors.list().filter((record) => record.parentId === null);
+      expect(roots).toHaveLength(1);
+      expect(roots[0]?.modelConfig).toEqual([bootTuple]);
+      expect(liveRootPool(mesh)).toEqual([bootTuple]);
+      expect(
+        getRepositories().meshEvents.listEventsByActors([roots[0]?.id ?? ""], {
+          kinds: ["actor_model_set"],
+          limit: 20,
+        }).events
+      ).toHaveLength(0);
+    });
+
+    it("refuses to boot on a persisted pool that no longer validates, leaving the row untouched", async () => {
+      await persistOperatorPool();
+      // The operator pool leads with claude; drop claude from `providers` so
+      // the persisted value can no longer be run. Falling back to the file
+      // would boot successfully — and that is the outcome that must not happen.
+      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({ ...config, providers: { antigravity: config.providers.antigravity } }),
+        "utf8"
+      );
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      let ready = false;
+
+      await runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      });
+
+      expect(ready).toBe(false);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      // The refusal is a structured `root_model_config_invalid` record carrying
+      // the reason and an action, not prose.
+      expect(consoleError).not.toHaveBeenCalled();
+      consoleError.mockRestore();
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          level: "error",
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(/provider "claude" is not configured/),
+          action: expect.stringMatching(/clear the root row's model_config/),
+        },
+      ]);
+      // Nothing rewrote the persisted pool on the way out.
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 2, entries: operatorPool });
+    });
+
+    it("refuses to boot when a persisted entry validates but its provider has no adapter", async () => {
+      // The boot-time instantiation check follows the pool root actually runs
+      // on, not the file tuple: an effort-free claude entry passes validation
+      // under an unknown cliCommand and fails only when instantiated.
+      const mesh = await boot();
+      mesh.setActorModel("root", [{ provider: "claude", model: "claude-sonnet-5" }], "root");
+      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          ...config,
+          providers: { ...config.providers, claude: { cliCommand: "nonsense" } },
+        }),
+        "utf8"
+      );
+      logCapture.lines.length = 0;
+      let ready = false;
+
+      await runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      });
+
+      expect(ready).toBe(false);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(/No implementation for CLI command "nonsense"/),
+        },
+      ]);
+    });
+
+    it("refuses to boot on a corrupt persisted model_config document", async () => {
+      await persistOperatorPool();
+      const db = new Database(join(homeDir, "data", "mesh.db"));
+      try {
+        db.prepare("UPDATE actors SET model_config = ? WHERE id = ?").run(
+          JSON.stringify({ schemaVersion: 2, entries: [{ provider: "claude" }] }),
+          "root"
+        );
+      } finally {
+        db.close();
+      }
+      let ready = false;
+
+      // The repository already refuses a malformed document fail-closed, from
+      // the `actors.list()` that resolves the root id — before the pool is
+      // decided, and for any actor's row, not only root's. What matters here
+      // is that boot propagates that refusal instead of quietly running the
+      // root on the file tuple.
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
+          },
+        })
+      ).rejects.toThrow(/invalid model_config for actor 'root'/);
+      expect(ready).toBe(false);
+    });
+  });
+
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
@@ -4763,5 +5428,101 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent[1]?.text).toBe(
       `from worker\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
     );
+  });
+
+  it("records token usage linked to actor_runs.id through the real worker onRunEnd factory wiring", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh not ready");
+
+    const workerId = mesh.spawn({
+      charter: "worker token accounting wiring test",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const worker = mesh.get(workerId) as Actor | undefined;
+    if (!worker) throw new Error("worker not found");
+
+    type WorkerOpts = {
+      opts: {
+        onRunStart?: (
+          responsive: boolean,
+          injectRecord: undefined,
+          selected: { provider: string; model: string; effort: string }
+        ) => void;
+        onRunEnd?: (result: RunResult) => void | Promise<void>;
+      };
+    };
+    const workerOpts = (worker as unknown as WorkerOpts).opts;
+
+    // Start a run for the worker
+    workerOpts.onRunStart?.(false, undefined, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+
+    // End run with token usage
+    const result: RunResult = {
+      success: true,
+      output: "worker run completed",
+      exitCode: 0,
+      tokenUsage: {
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        scrapedAt: new Date().toISOString(),
+        uncachedInput: 250,
+        cacheRead: 50,
+        output: 75,
+        reasoning: null,
+        response: null,
+      },
+    };
+    await workerOpts.onRunEnd?.(result);
+
+    // Assert that the run_end event was recorded and carried the runId
+    const db = getDb();
+    const eventRow = db
+      .prepare(
+        "SELECT payload FROM mesh_events WHERE kind = 'run_end' AND actor_id = ? ORDER BY id DESC LIMIT 1"
+      )
+      .get(workerId) as { payload: string } | undefined;
+    expect(eventRow).toBeDefined();
+    if (!eventRow) throw new Error("eventRow not found");
+    const payload = JSON.parse(eventRow.payload) as { runId?: string };
+    expect(payload.runId).toBeDefined();
+
+    // Assert that run_token_records has a row matching this exact runId
+    const tokenRecord = db
+      .prepare("SELECT * FROM run_token_records WHERE run_id = ?")
+      .get(payload.runId) as { id: string; run_id: string; uncached_input: number } | undefined;
+    expect(tokenRecord).toBeDefined();
+    expect(tokenRecord?.run_id).toBe(payload.runId);
+    expect(tokenRecord?.uncached_input).toBe(250);
+
+    // Verify foreign join: token record joins cleanly to actor_runs.id
+    const joined = db
+      .prepare(
+        `SELECT rtr.id, rtr.run_id, ar.id as run_fk, ar.actor_id
+         FROM run_token_records rtr
+         JOIN actor_runs ar ON rtr.run_id = ar.id
+         WHERE ar.id = ?`
+      )
+      .get(payload.runId) as { run_id: string; run_fk: string; actor_id: string } | undefined;
+    expect(joined).toBeDefined();
+    expect(joined?.run_id).toBe(payload.runId);
+    expect(joined?.actor_id).toBe(workerId);
   });
 });

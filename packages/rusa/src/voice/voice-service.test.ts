@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import type { Logger } from "../observability/logger.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { VOICE_PRESENCE_GRACE_MS, VoiceService } from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
@@ -35,6 +36,7 @@ function makeService(
     sessionLeaseMs?: number;
     onSessionEnded?: (actorId: string) => void;
     voiceNameFor?: (actorId: string) => string | undefined;
+    logger?: Logger;
   } = {}
 ) {
   const home = mkdtempSync(join(tmpdir(), "voice-service-"));
@@ -46,6 +48,7 @@ function makeService(
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
     voiceNameFor: opts.voiceNameFor,
+    logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
       await writeFile(path, pcm);
@@ -186,6 +189,63 @@ describe("VoiceService leased sessions", () => {
     service.notifySessionTransferred("session-a", TARGET);
     expect(controls).toEqual([["session-a", TARGET]]);
     expect(() => service.transferActiveSession(ACTOR, TARGET)).toThrow("does not hold");
+  });
+
+  it("dispatches a transfer control after a same-turn source reply frame", async () => {
+    let resolveSynthesis!: (value: Awaited<ReturnType<SpeechClient["streamSynthesize"]>>) => void;
+    const pendingSynthesis = new Promise<Awaited<ReturnType<SpeechClient["streamSynthesize"]>>>(
+      (resolve) => {
+        resolveSynthesis = resolve;
+      }
+    );
+    const logs: Array<Record<string, unknown>> = [];
+    let logger!: Logger;
+    const write = (level: string, event: string, fields: Record<string, unknown> = {}) => {
+      logs.push({ level, event, ...fields });
+    };
+    logger = {
+      debug: (event, fields) => write("debug", event, fields),
+      info: (event, fields) => write("info", event, fields),
+      warn: (event, fields) => write("warn", event, fields),
+      error: (event, fields) => write("error", event, fields),
+      child: () => logger,
+    };
+    const { service } = makeService({
+      speech: fakeSpeech({ streamSynthesize: () => pendingSynthesis }),
+      logger,
+    });
+    const frames: string[] = [];
+    const controls: Array<[string, string]> = [];
+    service.setSessionTransferNotifier((sessionId, targetActorId) =>
+      controls.push([sessionId, targetActorId])
+    );
+    service.presenceConnect([ACTOR]);
+    service.openSession("session-a", ACTOR);
+
+    const reply = service.handleMeshEvent(replyEvent(), (announcement) =>
+      frames.push(announcement.id)
+    );
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
+    service.notifySessionTransferred("session-a", TARGET);
+    expect(controls).toEqual([]);
+
+    resolveSynthesis({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {
+        yield Buffer.from([1, 2, 3, 4]);
+      })(),
+    });
+    await reply;
+
+    expect(frames).toHaveLength(1);
+    await vi.waitFor(() => expect(controls).toEqual([["session-a", TARGET]]));
+    expect(logs).toContainEqual({
+      level: "info",
+      event: "voice_session_control_dispatched",
+      sessionId: "session-a",
+      targetActorId: TARGET,
+    });
+    expect(JSON.stringify(logs)).not.toContain("On it — ETA five minutes.");
   });
 });
 

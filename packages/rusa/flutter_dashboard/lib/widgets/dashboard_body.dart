@@ -29,9 +29,13 @@ class DashboardBody extends StatefulWidget {
     required this.store,
     this.understandingBuilder,
     this.reportsBuilder,
+    this.onLogout,
+    this.profilePhotoUrl,
   });
 
   final DashboardStore store;
+  final VoidCallback? onLogout;
+  final String? profilePhotoUrl;
 
   /// Builds the Integrated Understanding view shown when its nav item is active.
   /// Injected by the web entrypoint (main.dart) so THIS file stays free of the
@@ -184,6 +188,8 @@ class _DashboardBodyState extends State<DashboardBody> {
       child: Column(
         children: [
           MeshHeader(
+            onLogout: widget.onLogout,
+            profilePhotoUrl: widget.profilePhotoUrl,
             store: widget.store,
             selected: _view,
             onSelect: _selectView,

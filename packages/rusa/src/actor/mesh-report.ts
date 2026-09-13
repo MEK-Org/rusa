@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { type MeshEvent, MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { describeModelConfigEntry } from "../providers/model-config.js";
 import type { ActorRecord } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
 
@@ -272,12 +273,7 @@ function renderTopology(records: ActorRecord[], counts: Map<string, number>): st
   const renderNode = (r: ActorRecord): string => {
     const meta = [
       chip(r.status, statusChipClass(r.status)),
-      ...(r.modelConfig ?? []).map((c) =>
-        chip(
-          `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`,
-          "muted-chip"
-        )
-      ),
+      ...(r.modelConfig ?? []).map((c) => chip(describeModelConfigEntry(c), "muted-chip")),
       counts.has(r.id) ? chip(`${counts.get(r.id)} events`, "muted-chip") : "",
     ]
       .filter(Boolean)

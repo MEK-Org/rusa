@@ -9,8 +9,10 @@ import {
   type ObligationStatus,
   prerequisiteEdgeKey,
 } from "../obligations/obligation.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import {
   assertConcreteModelConfig,
+  describeModelConfigPool,
   isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
@@ -325,13 +327,6 @@ function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[
   });
 }
 
-/** Human-readable pool summary for the spawn/model-set event log. */
-function describeModelConfigPool(pool: readonly ProviderModelConfig[]): string {
-  return pool
-    .map((c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`)
-    .join(", ");
-}
-
 function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): string {
   const named = busy.map((r) => `${r.actorId} (${r.phase})`).join(", ");
   const self = busy.find((r) => r.actorId === target);
@@ -466,7 +461,7 @@ export interface ActorFactoryContext {
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (token usage) + completion-review hook. */
-  onRunEnd: (result: RunResult) => void;
+  onRunEnd: (result: RunResult, runId?: string) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
   /**
@@ -717,6 +712,8 @@ export interface ActorMeshOptions {
   scheduledMessages?: ScheduledMessageScheduler;
   /** Atomic boundary for recording a scheduled message's chat/audit rows. */
   withTransaction?: (fn: () => void) => void;
+  /** Structured lifecycle records for the host-owned voice transfer boundary. */
+  voiceTransferLogger?: Logger;
   log?: (msg: string) => void;
 }
 
@@ -840,6 +837,7 @@ export class ActorMesh {
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
+  private readonly voiceTransferLog: Logger;
   private scheduledMessages?: ScheduledMessageScheduler;
   private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
@@ -939,6 +937,7 @@ export class ActorMesh {
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
     this.log = opts.log ?? (() => {});
+    this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
     this.eventManager = opts.eventManager;
@@ -1749,6 +1748,13 @@ export class ActorMesh {
           `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
         );
       }
+      this.voiceTransferLog.error("voice_session_transfer", {
+        outcome: "handoff_not_recorded",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+        err: error,
+      });
       throw error;
     }
     // The responsive row is now durable; releasing the source through the
@@ -1767,10 +1773,22 @@ export class ActorMesh {
     // the browser changes selection/reconnects to it.
     try {
       transfer.notifySessionTransferred(sessionId, target.id);
+      this.voiceTransferLog.info("voice_session_transfer", {
+        outcome: "control_scheduled",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+      });
     } catch (error) {
-      this.log(
-        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
-      );
+      // VoiceService records asynchronous leased-SSE dispatch failures itself;
+      // retain observability as well for a synchronous transfer-port failure.
+      this.voiceTransferLog.warn("voice_session_transfer", {
+        outcome: "control_dispatch_failed",
+        sessionId,
+        sourceActorId: fromActorId,
+        targetActorId: target.id,
+        err: error,
+      });
     }
     return { sessionId, targetActorId: target.id };
   }
@@ -4290,9 +4308,9 @@ export class ActorMesh {
       onQueued: (context) => {
         this.actorQueued(record.id, context);
       },
-      onRunEnd: (result) => {
+      onRunEnd: (result, runId) => {
         this.finishInboxRun(record.id);
-        this.accountRun(record.id, result);
+        this.accountRun(record.id, result, runId);
         // Safety net: the start/cancel hooks are the primary clearing
         // points, but a selection must never survive past its run ending.
         this.clearSelection(record.id);
@@ -4307,33 +4325,35 @@ export class ActorMesh {
   }
 
   /** Record per-run token usage for accounting. */
-  private accountRun(id: string, result: RunResult): void {
-    if (result.tokenUsage) {
-      const usage = result.tokenUsage;
-      try {
-        getDb()
-          .prepare(
-            `INSERT INTO run_token_records
-              (id, run_id, provider, model, scraped_at, uncached_input, cache_read, output, reasoning, response)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
-            randomUUID(),
-            id,
-            usage.provider,
-            usage.model,
-            usage.scrapedAt,
-            usage.uncachedInput,
-            usage.cacheRead,
-            usage.output,
-            usage.reasoning,
-            usage.response
-          );
-      } catch (err) {
-        this.log(
-          `token accounting write failed for ${id}: ${err instanceof Error ? err.message : String(err)}`
+  accountRun(actorId: string, result: RunResult, runId?: string): void {
+    if (!result.tokenUsage) return;
+    if (!runId) {
+      throw new Error(`token accounting requires a runId for actor ${actorId}`);
+    }
+    const usage = result.tokenUsage;
+    try {
+      getDb()
+        .prepare(
+          `INSERT INTO run_token_records
+            (id, run_id, provider, model, scraped_at, uncached_input, cache_read, output, reasoning, response)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          randomUUID(),
+          runId,
+          usage.provider,
+          usage.model,
+          usage.scrapedAt,
+          usage.uncachedInput,
+          usage.cacheRead,
+          usage.output,
+          usage.reasoning,
+          usage.response
         );
-      }
+    } catch (err) {
+      this.log(
+        `token accounting write failed for ${runId}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
 

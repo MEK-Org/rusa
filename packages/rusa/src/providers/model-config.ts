@@ -25,6 +25,16 @@ export interface RawProviderModelConfig {
   effort?: string;
 }
 
+/** One entry as `provider:model @ effort`, the wording every pool summary shares. */
+export function describeModelConfigEntry(entry: RawProviderModelConfig): string {
+  return `${entry.provider}${entry.model ? `:${entry.model}` : ""}${entry.effort ? ` @ ${entry.effort}` : ""}`;
+}
+
+/** Human-readable ordered pool summary for events, refusals and boot lines. */
+export function describeModelConfigPool(pool: readonly RawProviderModelConfig[]): string {
+  return pool.map(describeModelConfigEntry).join(", ");
+}
+
 /**
  * A reference to a runtime-managed named model class. It is deliberately the
  * *whole* model_config value rather than an entry inside a pool: a class

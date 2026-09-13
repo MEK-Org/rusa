@@ -1069,7 +1069,29 @@ export class Actor {
 
     const primaryName = primary.model ?? primary.name;
     for (const model of fallback.models) {
-      const provider = fallback.resolveProvider(model);
+      let provider: CodingProvider;
+      try {
+        provider = fallback.resolveProvider(model);
+      } catch (err) {
+        // The fallback could not even be built — e.g. its model pin is not
+        // valid under the provider the primary actually ran on. That is a
+        // configuration failure, and it must stay one rather than be retried
+        // under some other tuple; but the run still failed because the primary
+        // was exhausted, so report it the same way as a fallback attempt that
+        // failed for a non-exhaustion reason below: exhaustion first, the
+        // resolver error as context. Letting it escape would reach the
+        // terminal boundary as a bare stack with no mention of the exhaustion.
+        return {
+          success: false,
+          output: formatFallbackRecoveryFailure({
+            primaryName,
+            fallbackModel: model,
+            fallbackOutput: err instanceof Error ? err.message : String(err),
+          }),
+          exitCode: result.exitCode || 1,
+          sessionId: result.sessionId,
+        };
+      }
       this.opts.log?.(
         `\n[Fallback] primary ${primaryName} exhausted; continuing on fallback ${model}\n`
       );

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "tsup";
 import { resolveFlutterCommand } from "./flutter-resolver.mjs";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
@@ -59,6 +60,20 @@ if (!existsSync(flutterBuildDir)) {
 rmSync(outputDir, { recursive: true, force: true });
 mkdirSync(outputDir, { recursive: true });
 cpSync(flutterBuildDir, outputDir, { recursive: true });
+
+// Bundle the Firebase login/session bootstrap locally alongside Flutter assets.
+await build({
+  config: false,
+  entry: { "dashboard-auth": resolve(packageRoot, "src/dashboard/auth-browser-entry.ts") },
+  format: ["iife"],
+  platform: "browser",
+  target: "es2022",
+  outDir: outputDir,
+  outExtension: () => ({ js: ".js" }),
+  clean: false,
+  noExternal: [/.*/],
+  minify: true,
+});
 
 const iconSourceDir = resolve(flutterAppDir, "web/icons", dashboardInstance.iconSet);
 const iconOutputDir = resolve(outputDir, "icons");

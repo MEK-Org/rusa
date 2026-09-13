@@ -8,6 +8,7 @@ import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.j
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
+import { validateDashboardAuth } from "./dashboard-auth.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
@@ -127,6 +128,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
 
   const parsed = applyProfile(rawParsed);
+  validateDashboardAuth(parsed.auth);
 
   // Basic validation & defaulting
   if (parsed.github && !parsed.github.account) {

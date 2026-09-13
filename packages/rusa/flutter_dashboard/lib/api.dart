@@ -3,13 +3,14 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'models.dart';
+import 'session_client.dart';
 
 /// REST client for the PR2 dashboard Data API. All paths are resolved against
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
 class DashboardApi {
   DashboardApi({http.Client? client, Uri? base})
-    : _client = client ?? http.Client(),
+    : _client = SessionClient(client),
       _base = base ?? Uri.base;
 
   final http.Client _client;

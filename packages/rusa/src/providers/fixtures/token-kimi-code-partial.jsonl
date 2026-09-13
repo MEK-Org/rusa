@@ -1,0 +1,2 @@
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputOther":1873,"output":214},"usageScope":"turn","time":1789207201000}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputCacheRead":10993,"output":97},"usageScope":"turn","time":1789207202000}
