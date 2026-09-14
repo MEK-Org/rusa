@@ -25,10 +25,11 @@ export interface TrackerMcpOptions {
   /** The exact normalized selection for the provider attempt currently writing. */
   getRunSelection?: () => RawProviderModelConfig | undefined;
   /**
-   * Invoked after `create_issue` / `create_pull_request` succeeds, with the
-   * created thread's exact event resource, so the mesh can mechanically
-   * subscribe the creating actor to it . Best-effort bookkeeping: a
-   * throwing callback never fails the tool call.
+   * Invoked after `create_issue` / `create_pull_request` succeeds and a new
+   * thread was created (POST), with the created thread's exact event resource,
+   * so the mesh can mechanically subscribe the creating actor to it. Updates
+   * to an existing resource (PATCH) do not invoke this callback. Best-effort
+   * bookkeeping: a throwing callback never fails the tool call.
    */
   onResourceCreated?: (resource: EventResource) => void;
   isFenced?: () => boolean;
@@ -160,7 +161,9 @@ export function createTrackerMcpServer(
           ),
         });
         options.onWrite?.();
-        notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
+        if (pr.wasCreated) {
+          notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
+        }
         return toolOk(pr.htmlUrl);
       } catch (err) {
         return toolError(err);

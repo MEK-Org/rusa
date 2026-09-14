@@ -91,6 +91,8 @@ describe("LocalTracker", () => {
       base: "staging",
       author: "bot",
     });
+    expect(first.wasCreated).toBe(true);
+    expect(second.wasCreated).toBe(false);
     expect(second.number).toBe(first.number);
     expect(tracker.listPrs()).toHaveLength(1);
     expect(tracker.getPr(first.number)?.title).toBe("Updated");
@@ -103,6 +105,7 @@ describe("LocalTracker", () => {
       body: "v3",
       author: "bot",
     });
+    expect(third.wasCreated).toBe(false);
     expect(third.number).toBe(first.number);
     expect(tracker.getPr(first.number)?.base).toBe("staging");
   });

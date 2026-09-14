@@ -557,7 +557,7 @@ export function isLegacyWorktreeKey(key: string): boolean {
 }
 
 export function mechanicallySubscribeCreatedResource(
-  mesh: Pick<ActorMesh, "subscribeEventSource">,
+  mesh: Pick<ActorMesh, "addEventSourceSubscriber">,
   configuredRoots: readonly EventResource[],
   resource: EventResource,
   actorId: string,
@@ -570,7 +570,7 @@ export function mechanicallySubscribeCreatedResource(
       );
       return;
     }
-    mesh.subscribeEventSource(resource, actorId, actorId);
+    mesh.addEventSourceSubscriber(resource, actorId, actorId);
   } catch (err) {
     log(
       `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: ${err instanceof Error ? err.message : String(err)}`
@@ -2169,11 +2169,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             instanceId: rootHandle,
             getRunSelection: () => activeRunSelections.get(id),
             isFenced,
-            // Mechanically hand the created issue/PR's exact event source to its
-            // creator : follow-up events route here, not the repo/org
-            // steward. subscribedBy === actorId is the mechanical-subscription
-            // audit marker. Best-effort: another actor may already hold the exact
-            // resource (update-existing-PR path) — log and continue.
+            // Mechanically add the creator as an exact-resource subscriber for
+            // the created issue/PR: follow-up events route here additively
+            // alongside any obligation-governed route. subscribedBy === actorId
+            // is the mechanical-subscription audit marker. Best-effort: log and
+            // continue on failure.
             onResourceCreated: (resource) => {
               mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, id);
             },
@@ -2698,8 +2698,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       instanceId: rootHandle,
       actorHandle: rootHandle,
       getRunSelection: () => activeRunSelections.get(rootId),
-      // Uniform rule : the root gets mechanical subscriptions for what
-      // it creates too, and can delegate them onward.
+      // Uniform rule : the root gets mechanical additive subscriptions for what
+      // it creates too.
       onResourceCreated: (resource) => {
         mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
       },

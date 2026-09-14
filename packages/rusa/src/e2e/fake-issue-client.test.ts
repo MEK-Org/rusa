@@ -29,6 +29,7 @@ describe("FakeIssueClient", () => {
     expect(pr).toEqual({
       number: 1,
       htmlUrl: "http://localhost:8084/rusa-e2e/scratch/pull/1",
+      wasCreated: true,
     });
   });
 
@@ -48,7 +49,10 @@ describe("FakeIssueClient", () => {
       body: "b2",
       reviewer: "human",
     });
-    expect(second).toEqual(first);
+    expect(first.wasCreated).toBe(true);
+    expect(second.wasCreated).toBe(false);
+    expect(second.number).toBe(first.number);
+    expect(second.htmlUrl).toBe(first.htmlUrl);
     const details = await client.getPullRequestDetails(REPO, 1);
     expect(details.title).toBe("v2");
     expect(details.state).toBe("open");
