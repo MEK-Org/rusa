@@ -28,7 +28,7 @@ function recordingIssueClient(
   let pullRequestReadCount = 0;
   const client: IssueClient = {
     createIssue: async () => ({ number: 1, htmlUrl: "" }),
-    createPullRequest: async () => ({ number: 1, htmlUrl: "" }),
+    createPullRequest: async () => ({ number: 1, htmlUrl: "", wasCreated: true }),
     getOpenPullRequestsByAuthor: async () => [],
     getOpenPullRequests: async () => [],
     listIssues: async () => [],

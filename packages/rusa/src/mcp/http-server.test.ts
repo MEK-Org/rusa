@@ -23,7 +23,11 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
   const labels: string[] = [];
   const client: IssueClient = {
     createIssue: async () => ({ number: 1, htmlUrl: "https://example.test/issues/1" }),
-    createPullRequest: async () => ({ number: 1, htmlUrl: "https://example.test/pr/1" }),
+    createPullRequest: async () => ({
+      number: 1,
+      htmlUrl: "https://example.test/pr/1",
+      wasCreated: true,
+    }),
     getOpenPullRequestsByAuthor: async () => [],
     getOpenPullRequests: async () => [],
     listIssues: async () => [],

@@ -59,6 +59,11 @@ export interface CreatedIssue {
 export interface CreatedPullRequest {
   number: number;
   htmlUrl: string;
+  /**
+   * Whether the pull request was newly created via POST (true) rather than
+   * updated in-place via PATCH during an upsert (false).
+   */
+  wasCreated: boolean;
 }
 
 export interface MergePullRequestOptions {
@@ -548,7 +553,7 @@ export class GitHubIssueClient implements IssueClient {
         body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      pr = existing;
+      pr = { number: existing.number, htmlUrl: existing.htmlUrl, wasCreated: false };
     } else {
       // Unlike `gh pr create`, the REST endpoint requires an explicit base.
       const base = opts.base ?? (await this.getDefaultBranch(opts.repo));
@@ -557,7 +562,7 @@ export class GitHubIssueClient implements IssueClient {
         `/repos/${opts.repo}/pulls`,
         { title: opts.title, body, head: opts.head, base }
       );
-      pr = { number: created.number, htmlUrl: created.html_url };
+      pr = { number: created.number, htmlUrl: created.html_url, wasCreated: true };
     }
 
     // Both creation and update are complete before this separate GitHub API
@@ -596,7 +601,7 @@ export class GitHubIssueClient implements IssueClient {
   private async findOpenPullRequestForHead(
     repo: string,
     head: string
-  ): Promise<CreatedPullRequest | null> {
+  ): Promise<{ number: number; htmlUrl: string } | null> {
     try {
       const owner = repo.split("/")[0];
       const prs = await this.api<Array<{ number: number; html_url: string }>>(
@@ -1377,7 +1382,7 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
     // for the URL and there is no real PR number to report (0 is the "no PR"
     // placeholder). In practice unreachable: the per-actor tracker tool
     // short-circuits the bridge before reaching the client.
-    return { number: 0, htmlUrl: formatGitBridgePullRequestResult(deliverable) };
+    return { number: 0, htmlUrl: formatGitBridgePullRequestResult(deliverable), wasCreated: false };
   }
 
   createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {

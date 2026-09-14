@@ -179,6 +179,7 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
   reactionsAdded: { repo: string; subject: number; reaction: string }[] = [];
   commentReactionsAdded: { repo: string; commentId: number; reaction: string; scope?: string }[] =
     [];
+  createdPRs = new Set<string>();
 
   async addReaction(repo: string, subject: number, reaction: string): Promise<void> {
     this.reactionsAdded.push({ repo, subject, reaction });
@@ -199,6 +200,35 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
 
   async listUpdatedIssueComments(): Promise<[]> {
     return [];
+  }
+
+  async createIssue(opts: {
+    repo: string;
+    title: string;
+    body: string;
+  }): Promise<{ number: number; htmlUrl: string }> {
+    return {
+      number: 456,
+      htmlUrl: `https://example.test/${opts.repo}/issues/456`,
+    };
+  }
+
+  async createPullRequest(opts: {
+    repo: string;
+    head: string;
+    title: string;
+    body: string;
+  }): Promise<{ number: number; htmlUrl: string; wasCreated: boolean }> {
+    const key = `${opts.repo}:${opts.head}`;
+    if (this.createdPRs.has(key)) {
+      return {
+        number: 789,
+        htmlUrl: `https://example.test/${opts.repo}/pull/789`,
+        wasCreated: false,
+      };
+    }
+    this.createdPRs.add(key);
+    return { number: 789, htmlUrl: `https://example.test/${opts.repo}/pull/789`, wasCreated: true };
   }
 }
 
@@ -254,9 +284,9 @@ describe("start command tests", () => {
   });
 
   it("mechanically subscribes only created resources anchored in root config", () => {
-    const subscribeEventSource = vi.fn();
+    const addEventSourceSubscriber = vi.fn();
     const log = vi.fn();
-    const mesh = { subscribeEventSource };
+    const mesh = { addEventSourceSubscriber };
     const configuredRoots = ["github:configured-org"];
 
     for (const actorId of ["root", "worker"]) {
@@ -276,7 +306,7 @@ describe("start command tests", () => {
       );
     }
 
-    expect(subscribeEventSource.mock.calls).toEqual([
+    expect(addEventSourceSubscriber.mock.calls).toEqual([
       ["github:configured-org/repo/issues/72", "root", "root"],
       ["github:configured-org/repo/issues/72", "worker", "worker"],
     ]);
@@ -1843,6 +1873,301 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // A retry cannot re-claim seen work and does not duplicate the reaction.
     mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
+  });
+
+  it("delivers exact-resource issue and PR follow-up events to mechanically subscribed creator with no-obligation fan-out and under human:operator obligation", async () => {
+    let emitGitHubEvent:
+      | ((event: string, payload: Record<string, unknown>, deliveryId?: string) => Promise<void>)
+      | undefined;
+    let mesh: ActorMesh | undefined;
+
+    const issueClient = new MockIssueClient();
+    setIssueClient(issueClient as unknown as IssueClient);
+
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: {
+          account: "mock-bot",
+          orgs: [{ org: "dummy-org" }],
+        },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            emitGitHubEvent = handles.emitGitHubEvent;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+
+    expect(mesh).toBeDefined();
+    expect(emitGitHubEvent).toBeDefined();
+    if (!mesh || !emitGitHubEvent) {
+      throw new Error("Mesh or emitGitHubEvent not ready");
+    }
+
+    const workerId = mesh.spawn({
+      charter: "feature author",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
+    });
+
+    // Retrieve the live Actor and connect to its real factory-wired tracker MCP server
+    const worker = mesh.get(workerId);
+    if (!worker) throw new Error("worker not ready");
+    type LiveActorOptions = {
+      mcpServers: Array<{ name: string; url: string }>;
+    };
+    const workerOptions = (worker as unknown as { opts: LiveActorOptions }).opts;
+    const trackerUrl = workerOptions.mcpServers.find((server) => server.name === "tracker")?.url;
+    if (!trackerUrl) throw new Error("worker tracker MCP server missing");
+
+    const trackerClient = new Client({ name: "test-tracker-client", version: "0.0.0" });
+    await trackerClient.connect(new StreamableHTTPClientTransport(new URL(trackerUrl)));
+
+    // 1. Creator creates an issue and a PR via the factory-wired tracker MCP
+    await trackerClient.callTool({
+      name: "create_issue",
+      arguments: { repo: "dummy-org/dummy-repo", title: "Bug report", body: "Issue body" },
+    });
+
+    await trackerClient.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "dummy-org/dummy-repo",
+        head: "feature-branch",
+        title: "Feature PR",
+        body: "PR body",
+      },
+    });
+
+    await trackerClient.close();
+
+    const issueRef = "github:dummy-org/dummy-repo/issues/456";
+    const prRef = "github:dummy-org/dummy-repo/pulls/789";
+
+    // 2. Verify subscription storage: additive subscriber store holds the creator,
+    //    while delegation ownership store holds NO active claims for these resources.
+    expect(getRepositories().eventSourceSubscriptions.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resource: issueRef,
+          actorId: workerId,
+          subscribedBy: workerId,
+        }),
+        expect.objectContaining({
+          resource: prRef,
+          actorId: workerId,
+          subscribedBy: workerId,
+        }),
+      ])
+    );
+    expect(getRepositories().eventSourceOwners.activeForResource(issueRef)).toEqual([]);
+    expect(getRepositories().eventSourceOwners.activeForResource(prRef)).toEqual([]);
+
+    const liveMesh = mesh;
+
+    // 3. Prove that a later existing-PR PATCH updater is NOT subscribed
+    const updaterId = liveMesh.spawn({
+      charter: "feature updater",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
+    });
+
+    // Creator holds only an additive subscription, not ownership, so it has no authority to delegate
+    expect(liveMesh.resolveEffectiveRoute(issueRef).principal).toBe("root");
+    expect(liveMesh.resolveEffectiveRoute(prRef).principal).toBe("root");
+    expect(() => liveMesh.delegateEventSource(issueRef, updaterId, workerId)).toThrow(
+      /cannot delegate .* caller is not the current effective owner/
+    );
+    expect(() => liveMesh.delegateEventSource(prRef, updaterId, workerId)).toThrow(
+      /cannot delegate .* caller is not the current effective owner/
+    );
+
+    const updater = liveMesh.get(updaterId);
+    if (!updater) throw new Error("updater not ready");
+    const updaterOptions = (updater as unknown as { opts: LiveActorOptions }).opts;
+    const updaterTrackerUrl = updaterOptions.mcpServers.find(
+      (server) => server.name === "tracker"
+    )?.url;
+    if (!updaterTrackerUrl) throw new Error("updater tracker MCP server missing");
+
+    const updaterTrackerClient = new Client({ name: "test-updater-client", version: "0.0.0" });
+    await updaterTrackerClient.connect(
+      new StreamableHTTPClientTransport(new URL(updaterTrackerUrl))
+    );
+
+    await updaterTrackerClient.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "dummy-org/dummy-repo",
+        head: "feature-branch",
+        title: "Feature PR updated",
+        body: "PR update body",
+      },
+    });
+
+    await updaterTrackerClient.close();
+
+    // Confirm updater holds no subscriptions
+    expect(
+      getRepositories()
+        .eventSourceSubscriptions.subscribersOf(issueRef)
+        .map((s) => s.actorId)
+    ).toEqual([workerId]);
+    expect(
+      getRepositories()
+        .eventSourceSubscriptions.subscribersOf(prRef)
+        .map((s) => s.actorId)
+    ).toEqual([workerId]);
+    expect(
+      getRepositories()
+        .eventSourceSubscriptions.list()
+        .filter((s) => s.actorId === updaterId)
+    ).toEqual([]);
+
+    // 4. Prove intended no-obligation additive fan-out:
+    //    Without an obligation, effective route projects to the ancestor configured-root owner ("root").
+    const issueRouteBefore = mesh.resolveEffectiveRoute(issueRef);
+    expect(issueRouteBefore.governingSource).toBe("subscription");
+    expect(issueRouteBefore.principal).toBe("root");
+    expect(issueRouteBefore.isLive).toBe(true);
+
+    const prRouteBefore = mesh.resolveEffectiveRoute(prRef);
+    expect(prRouteBefore.governingSource).toBe("subscription");
+    expect(prRouteBefore.principal).toBe("root");
+    expect(prRouteBefore.isLive).toBe(true);
+
+    // Bubble-eligible follow-up events fan out to BOTH the exact creator subscriber
+    // and the ancestor configured-root owner ("root").
+    await emitGitHubEvent(
+      "issue_comment",
+      {
+        action: "created",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        issue: { number: 456 },
+        comment: { id: 101 },
+        sender: { login: "someone-else" },
+      },
+      "delivery-fanout-issue-comment-456"
+    );
+
+    await emitGitHubEvent(
+      "pull_request_review",
+      {
+        action: "submitted",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 789 },
+        review: { id: 201 },
+        sender: { login: "reviewer" },
+      },
+      "delivery-fanout-pr-review-789"
+    );
+
+    const workerFanoutEntries = getRepositories().inbox.list(workerId).entries;
+    expect(workerFanoutEntries).toHaveLength(2);
+    expect(workerFanoutEntries.map((e) => e.source).sort()).toEqual([issueRef, prRef]);
+    expect(workerFanoutEntries.map((e) => (e.payload as { type: string }).type).sort()).toEqual([
+      "issue_comment.created",
+      "pull_request_review.submitted",
+    ]);
+
+    const rootFanoutEntries = getRepositories().inbox.list("root").entries;
+    expect(rootFanoutEntries).toHaveLength(2);
+    expect(rootFanoutEntries.map((e) => e.source).sort()).toEqual([issueRef, prRef]);
+    expect(rootFanoutEntries.map((e) => (e.payload as { type: string }).type).sort()).toEqual([
+      "issue_comment.created",
+      "pull_request_review.submitted",
+    ]);
+
+    // Clear / mark handled to avoid event/entry interference with subsequent checks
+    getRepositories().inbox.markHandled(
+      workerId,
+      workerFanoutEntries.map((e) => e.id)
+    );
+    getRepositories().inbox.markHandled(
+      "root",
+      rootFanoutEntries.map((e) => e.id)
+    );
+    expect(getRepositories().inbox.list(workerId).entries).toHaveLength(0);
+    expect(getRepositories().inbox.list("root").entries).toHaveLength(0);
+    expect(getRepositories().inbox.list(updaterId).entries).toHaveLength(0);
+
+    // 5. Human-obligation coexistence proof:
+    //    Both resources receive a human:operator-owned decision obligation.
+    getRepositories().obligations.create({
+      title: "Human issue triage decision",
+      intent: "Human operator must review and triage",
+      ownerId: "human:operator",
+      externalRef: issueRef,
+    });
+    getRepositories().obligations.create({
+      title: "Human PR merge decision",
+      intent: "Human operator must approve merge",
+      ownerId: "human:operator",
+      externalRef: prRef,
+    });
+
+    // Verify route projection: human:operator obligation governs authority
+    const issueRouteAfter = mesh.resolveEffectiveRoute(issueRef);
+    expect(issueRouteAfter.governingSource).toBe("obligation");
+    expect(issueRouteAfter.principal).toBe("human:operator");
+    expect(issueRouteAfter.isLive).toBe(false);
+
+    const prRouteAfter = mesh.resolveEffectiveRoute(prRef);
+    expect(prRouteAfter.governingSource).toBe("obligation");
+    expect(prRouteAfter.principal).toBe("human:operator");
+    expect(prRouteAfter.isLive).toBe(false);
+
+    // Emit subsequent follow-up events under the human obligation
+    await emitGitHubEvent(
+      "issue_comment",
+      {
+        action: "created",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        issue: { number: 456 },
+        comment: { id: 102 },
+        sender: { login: "someone-else" },
+      },
+      "delivery-coexistence-issue-comment-456"
+    );
+
+    await emitGitHubEvent(
+      "pull_request_review",
+      {
+        action: "submitted",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        pull_request: { number: 789 },
+        review: { id: 202 },
+        sender: { login: "reviewer" },
+      },
+      "delivery-coexistence-pr-review-789"
+    );
+
+    // Creator receives both exact-resource events in its inbox alongside the human obligation,
+    // while root receives 0 new events because the human obligation halts bubbling to the ancestor.
+    const workerCoexistenceEntries = getRepositories().inbox.list(workerId).entries;
+    expect(workerCoexistenceEntries).toHaveLength(2);
+    expect(workerCoexistenceEntries.map((e) => e.source).sort()).toEqual([issueRef, prRef]);
+    expect(
+      workerCoexistenceEntries.map((e) => (e.payload as { type: string }).type).sort()
+    ).toEqual(["issue_comment.created", "pull_request_review.submitted"]);
+
+    expect(getRepositories().inbox.list("root").entries).toHaveLength(0);
+    expect(getRepositories().inbox.list(updaterId).entries).toHaveLength(0);
   });
 
   it("suppresses webhook events from github.orgs excludedRepos before inbox delivery", async () => {
