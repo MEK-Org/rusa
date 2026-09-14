@@ -3,8 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { loadConfig, resolveHome } from "../config/index.js";
+import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
+import { createQuotaService } from "../mcp/quota-mcp.js";
 import { createLogger } from "../observability/logger.js";
-import { providerThrottleKey } from "../providers/registry.js";
+import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
+import { QuotaCollectionLoop } from "../quota/coordinator-collection.js";
 import {
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
@@ -31,6 +35,28 @@ export function defaultQuotaCoordinatorSocketPath(): string {
   return join(tmpdir(), "rusa-quota", "coordinator.sock");
 }
 
+/**
+ * The coordinator is a separate process, so restore the last durable runtime
+ * model catalog before it asks the quota parser to classify model windows.
+ * This is intentionally a read-only best-effort input: an absent local catalog
+ * database simply leaves the catalog empty, which suppresses model-specific windows
+ * while preserving provider-wide readings.
+ */
+export function loadCoordinatorModelCatalogs(mcHome: string): void {
+  const catalogPath = join(mcHome, "data", "mesh.db");
+  if (existsSync(catalogPath)) {
+    const catalogDb = new Database(catalogPath, { readonly: true, fileMustExist: true });
+    try {
+      populateModelCatalogsFromDb(new ModelScrapeRepository(catalogDb));
+    } finally {
+      catalogDb.close();
+    }
+  }
+  // Kimi's runtime catalog is a local configuration file. Reading it here is
+  // also read-only and leaves no scrape/history row behind.
+  ingestKimiHostModels();
+}
+
 export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
   const log = createLogger({ context: { component: "quota-coordinator" } });
   const mcHome = opts.home ?? resolveHome();
@@ -55,6 +81,16 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
   const databasePath = resolveQuotaDatabasePath(configuredDb, mcHome);
 
   try {
+    try {
+      loadCoordinatorModelCatalogs(mcHome);
+    } catch (err) {
+      // No catalog is safer than a guessed catalog: parsing then retains only
+      // provider-wide windows. Keep service startup available when an old or
+      // unavailable local model-history DB cannot be read.
+      log.warn("Unable to load durable model catalog; model quota windows will be suppressed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     // Check schema version on a bare readonly connection before constructing SharedQuotaStore
     // so rollback attempts never execute WAL conversions or ALTER/CREATE statements
     if (existsSync(databasePath)) {
@@ -83,8 +119,13 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     const providerKeys = Object.keys(config.providers ?? {});
     const configuredLanes = Array.from(
       new Set(providerKeys.map((name) => providerThrottleKey(name, config)))
+    ).filter((provider): provider is (typeof QUOTA_THROTTLE_PROVIDERS)[number] =>
+      (QUOTA_THROTTLE_PROVIDERS as readonly string[]).includes(provider)
     );
-    const configuredProviders = configuredLanes.length > 0 ? configuredLanes : undefined;
+    // Match the coordinator's established default when no provider aliases
+    // appear in config: its service and collector must own the same lanes.
+    const configuredProviders =
+      configuredLanes.length > 0 ? configuredLanes : QUOTA_THROTTLE_PROVIDERS;
 
     const service = new QuotaCoordinatorService({
       socketPath,
@@ -93,14 +134,33 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       maxIntervalSeconds,
       staleAfterMs,
     });
+    const quotaService = createQuotaService({
+      config,
+      workersDir: join(mcHome, "workers"),
+      scrapeStore: store,
+    });
+    const collection = new QuotaCollectionLoop({
+      store,
+      quotaService,
+      providers: configuredProviders,
+      tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
+      maxIntervalSeconds,
+      onError: (provider, error) =>
+        log.warn("Quota collection tick failed", {
+          provider,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    });
 
     log.info("Starting quota-coordinator service", { socketPath, databasePath });
 
     await service.start();
+    collection.start();
     log.info("Quota coordinator ready and listening for requests");
 
     const shutdown = async () => {
       log.info("Stopping quota-coordinator service...");
+      collection.stop();
       await service.stop();
       store.close();
       process.exit(0);

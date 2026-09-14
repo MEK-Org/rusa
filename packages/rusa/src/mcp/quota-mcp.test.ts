@@ -110,7 +110,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 55,
           resetAtIso: "2026-07-13T02:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
 
@@ -141,8 +141,8 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("preserve all printed decimal precision");
       expect(systemInstruction).toContain("For Claude:");
       expect(systemInstruction).toContain("session/week usage windows");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
-      expect(systemInstruction).toContain("Current week (Fable)");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
+      expect(systemInstruction).toContain("Current Week (Fable)");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Codex:");
       expect(systemInstruction).not.toContain("For agy:");
@@ -202,9 +202,9 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("gpt-reserve Weekly limit");
-      expect(systemInstruction).toContain("starts a model-specific subsection");
+      expect(systemInstruction).toContain("beneath a standalone '<model name> limit:' heading");
       expect(systemInstruction).toContain("use the latest such panel");
       expect(systemInstruction).toContain("resets 02:10 on 27 Aug");
       expect(systemInstruction).toContain("15:11 on 1 Sep");
@@ -314,7 +314,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 93,
           resetAtIso: "2026-07-14T12:34:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -398,14 +398,14 @@ describe("quota MCP server", () => {
           kind: "five_hour",
           percentLeft: 90,
           resetAtIso: "2026-09-08T00:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
         {
           label: "Weekly",
           kind: "weekly",
           percentLeft: 58,
           resetAtIso: "2026-09-14T00:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -666,10 +666,103 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 100,
             resetAtIso: undefined,
-            scope: "provider",
+            scope: expect.objectContaining({ provider: expect.any(String) }),
           },
         ]);
       }
+    });
+
+    it("keeps a configured named-model window beside provider evidence with canonical IDs", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "Current Week (Fable)",
+                kind: "weekly",
+                usedPercent: 30,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: ["FABLE", "claude-fable", "unknown-model"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+        { identifier: "claude-sonnet", displayLabel: "Sonnet", passable: true },
+      ]);
+
+      expect(parsed.limits?.map((limit) => limit.scope)).toEqual([
+        { provider: "claude" },
+        { provider: "claude", models: ["claude-fable"] },
+      ]);
+    });
+
+    it("drops unconfigured reserve/model labels and retains provider-wide evidence", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 42,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "gpt-reserve Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: ["gpt-reserve"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("Codex quota", "test-key", Date.now(), []);
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({ label: "Weekly limit", scope: { provider: "codex" } }),
+      ]);
+    });
+
+    it("drops an explicitly empty model scope instead of relabelling it provider-wide", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 42,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "Unnamed reserve",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: [],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("Codex quota", "test-key", Date.now(), []);
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({ label: "Weekly limit", scope: { provider: "codex" } }),
+      ]);
     });
 
     it("resolves LLM-extracted ISO durations for relative reset dialects", async () => {
@@ -715,7 +808,7 @@ describe("quota MCP server", () => {
               kind: "weekly",
               percentLeft: 93,
               resetAtIso: expected,
-              scope: "provider",
+              scope: { provider: "codex" },
             },
           ]);
         }
@@ -755,7 +848,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 0,
             resetAtIso: new Date(generatedAt.getTime() + (70 * 60 + 13) * 60_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "agy" },
           },
         ]);
 
@@ -792,12 +885,14 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("For agy:");
       expect(systemInstruction).toContain("reports quota REMAINING");
       expect(systemInstruction).toContain("Use the more precise printed percentage");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
-      expect(systemInstruction).toContain("Ignore every other named model or model-group section");
+      expect(systemInstruction).toContain(
+        "Every other named model or model-group section is model-specific"
+      );
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -826,11 +921,13 @@ describe("quota MCP server", () => {
 
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toEqual([
-        expect.objectContaining({ label: "Weekly Limit", scope: "provider" }),
+        expect.objectContaining({ label: "Weekly Limit", scope: { provider: "agy" } }),
       ]);
 
       const systemInstruction = lastSystemInstruction();
-      expect(systemInstruction).toContain("Omit every other section (e.g. CLAUDE AND GPT MODELS)");
+      expect(systemInstruction).toContain(
+        "Every other named model or model-group section is model-specific"
+      );
     });
 
     it("scopes the Kimi LLM prompt to Kimi /usage and remaining-percent semantics", async () => {
@@ -842,12 +939,14 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("For Kimi:");
       expect(systemInstruction).toContain("interactive /usage panel");
       expect(systemInstruction).toContain("either 'N% used' or 'N% left/remaining'");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
-      expect(systemInstruction).toContain("Ignore every named-model or model-group limit");
+      expect(systemInstruction).toContain(
+        "Every named-model or model-group limit is model-specific"
+      );
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -923,14 +1022,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 72,
             resetAtIso: new Date(generatedAt.getTime() + (3 * 60 + 10) * 60_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "kimi" },
           },
           {
             label: "Weekly",
             kind: "weekly",
             percentLeft: 50,
             resetAtIso: new Date(generatedAt.getTime() + (2 * 24 + 22) * 3_600_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "kimi" },
           },
         ]);
       } finally {
@@ -979,7 +1078,7 @@ describe("quota MCP server", () => {
       const parsed = await parseAgyQuota("GEMINI MODELS Weekly 3% remaining", "test-key");
       const weekly = parsed.limits?.[0];
       expect(weekly?.percentLeft).toBe(3);
-      expect(weekly?.scope).toBe("provider");
+      expect(weekly?.scope).toEqual({ provider: "agy" });
     });
 
     it("fail-loud gate: fails loud with unknown status and error message when window has percentLeft < 100 and no reset ISO ", async () => {
@@ -1027,7 +1126,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 60,
           resetAtIso: "2026-08-27T10:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
     });
@@ -1070,7 +1169,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 100,
           resetAtIso: undefined,
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -1117,7 +1216,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 90,
           resetAtIso: "2026-07-14T12:34:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
@@ -1214,7 +1313,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 58,
           resetAtIso: "2026-09-07T18:08:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -1270,7 +1369,7 @@ describe("quota MCP server", () => {
       });
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
-      expect(parsed.limits?.map((l) => l.scope)).toEqual(["provider"]);
+      expect(parsed.limits?.map((l) => l.scope)).toEqual([{ provider: "codex" }]);
 
       // `parseCodexQuota` answers a partial snapshot; the service names the
       // provider it probed, exactly as the cache hands it to the endpoint.
@@ -1315,7 +1414,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 97,
           resetAtIso: "2026-07-13T09:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
     });
@@ -1923,7 +2022,7 @@ describe("quota MCP server", () => {
             kind: "session",
             percentLeft: 23,
             resetAtIso: "2026-07-13T02:59:00.000Z",
-            scope: "provider",
+            scope: { provider: "claude" },
           },
         ]);
       });
@@ -1981,7 +2080,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 60,
             resetAtIso: "2026-08-27T10:00:00.000Z",
-            scope: "provider",
+            scope: { provider: "claude" },
           },
         ]);
         expect(parsed.explanations).toEqual([]);
@@ -2081,7 +2180,7 @@ describe("quota MCP server", () => {
               kind: "weekly",
               percentLeft: 60,
               resetAtIso: "2030-01-01T00:00:00.000Z",
-              scope: "provider",
+              scope: { provider: "codex" },
             },
           ],
         });
@@ -2225,14 +2324,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 99,
             resetAtIso: "2026-07-14T23:32:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
           {
             label: "Weekly limit",
             kind: "weekly",
             percentLeft: 58,
             resetAtIso: "2026-07-14T12:34:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
         ]);
       });
@@ -2468,7 +2567,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 0,
             resetAtIso: "2026-07-07T12:25:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
         ]);
       });
@@ -2708,7 +2807,7 @@ describe("quota MCP server", () => {
           label: "Session",
           kind: "session",
           percentLeft: 88,
-          scope: "provider",
+          scope: { provider: "claude" },
         });
         expect(parsed.limits?.[0].resetAtIso).toBeDefined();
         expect(parsed.limits?.[1]).toMatchObject({
@@ -2716,7 +2815,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 55,
           resetAtIso: "2026-07-13T02:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         });
       });
     });

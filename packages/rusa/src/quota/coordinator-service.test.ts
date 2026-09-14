@@ -625,13 +625,39 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
         provider: "claude",
         status: "available",
         scrapedAt: new Date(nowMs).toISOString(),
-        limits: [{ kind: "session", label: "Session", percentLeft: 75 }],
+        limits: [
+          {
+            kind: "session",
+            label: "Session",
+            percentLeft: 75,
+            scope: { provider: "claude" },
+          },
+          {
+            kind: "weekly",
+            label: "Current Week (Fable)",
+            percentLeft: 80,
+            scope: { provider: "claude", models: ["claude-fable"] },
+          },
+        ],
       },
       {
         provider: "claude",
         status: "available",
         scrapedAt: new Date(nowMs).toISOString(),
-        limits: [{ kind: "session", label: "Session", percentLeft: 75 }],
+        limits: [
+          {
+            kind: "session",
+            label: "Session",
+            percentLeft: 75,
+            scope: { provider: "claude" },
+          },
+          {
+            kind: "weekly",
+            label: "Current Week (Fable)",
+            percentLeft: 80,
+            scope: { provider: "claude", models: ["claude-fable"] },
+          },
+        ],
       }
     );
 
@@ -640,6 +666,10 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(warmRes.json.status).toBe("available");
     expect(warmRes.json.provider).toBe("claude");
     expect(warmRes.json.limits[0].percentLeft).toBe(75);
+    expect(warmRes.json.limits[1].scope).toEqual({
+      provider: "claude",
+      models: ["claude-fable"],
+    });
   });
 
   // §5.5: GET /v1/history
