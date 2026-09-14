@@ -53,7 +53,18 @@ describe("dashboard E2E hydration", () => {
       }
       const body = raw ? JSON.parse(raw) : undefined;
       rootPosts.push({ path, body });
-      if (path === "/actors") return json(res, { id: `actor-${++actors}` }, 201);
+      if (path === "/actors") {
+        const provider = typeof body?.provider === "string" ? body.provider : "";
+        const model = typeof body?.model === "string" ? body.model.trim() : "";
+        if (!model) {
+          return json(
+            res,
+            { error: `modelConfig entry for provider "${provider}" is missing a model` },
+            400
+          );
+        }
+        return json(res, { id: `actor-${++actors}` }, 201);
+      }
       return json(res, { ok: true });
     });
     const chat = await listen((_req, res, raw) => {
