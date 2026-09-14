@@ -79,6 +79,14 @@ describe("dashboard E2E hydration", () => {
       return JSON.parse(charter.split("FAKE_PROVIDER_OUTPUT: ")[1]);
     });
     expect(spawns).toHaveLength(6);
+    // Every synthetic spawn must declare the explicit fake model the disposable
+    // instance requires (#456); the real root-control path has refused omitted
+    // models since #169, so a missing model here is a real hydration failure.
+    for (const call of spawns) {
+      const body = call.body as { provider?: unknown; model?: unknown };
+      expect(body.provider).toBe("fake");
+      expect(body.model).toBe("fake-model");
+    }
     expect(rootPosts.some((call) => call.path.endsWith("/messages"))).toBe(true);
     expect(rootPosts.some((call) => call.path.endsWith("/retire"))).toBe(true);
     expect(
