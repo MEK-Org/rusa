@@ -490,6 +490,9 @@ async function parseQuotaWithLlm(
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
       config: {
+        // Quota parsing is extraction, not creative generation. A fixed
+        // temperature keeps a repeated scrape from changing its window set.
+        temperature: 0,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,

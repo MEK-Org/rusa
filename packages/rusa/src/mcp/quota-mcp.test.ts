@@ -119,12 +119,14 @@ describe("quota MCP server", () => {
         model: string;
         contents: string;
         config: {
+          temperature: number;
           responseSchema: {
             properties: Record<string, unknown>;
           };
         };
       };
       expect(lastCallArgs.model).toBe("gemini-3.5-flash-lite");
+      expect(lastCallArgs.config.temperature).toBe(0);
       expect(lastCallArgs.contents).toContain("Claude output here");
       expect(lastCallArgs.config.responseSchema.properties.windows).toBeDefined();
     });
