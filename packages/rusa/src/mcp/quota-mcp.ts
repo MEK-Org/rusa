@@ -25,7 +25,11 @@ import {
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
-import { isModelScopedWindow, isProviderScopedWindow } from "../quota/window-scope.js";
+import {
+  hasSameQuotaWindowScope,
+  isModelScopedWindow,
+  isProviderScopedWindow,
+} from "../quota/window-scope.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -803,7 +807,7 @@ export function inferQuotaState(
       if (limit.resetAtIso) continue;
       const prevMatch = prevState.limits.find(
         (p) =>
-          isModelScopedWindow(p) === isModelScopedWindow(limit) &&
+          hasSameQuotaWindowScope(p, limit) &&
           ((limit.kind !== undefined && p.kind === limit.kind) || p.label === limit.label) &&
           p.resetAtIso &&
           Date.parse(p.resetAtIso) > scrapedAtMs &&

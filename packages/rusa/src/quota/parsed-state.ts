@@ -21,6 +21,12 @@ export interface VersionedQuotaParsedState {
 
 const VALID_STATUSES = new Set(["available", "exhausted", "unknown", "unsupported"]);
 const VALID_KINDS = new Set(["session", "five_hour", "weekly", "other"]);
+const VALID_EXPLANATION_FIELDS = new Set(["resetAtIso"]);
+const VALID_INFERENCE_RULES = new Set([
+  "sibling_window_copy",
+  "assumed_window_starts_now",
+  "carried_forward_bad_read",
+]);
 
 function isValidScope(raw: unknown, provider: string): boolean {
   if (raw === undefined || raw === null) return true;
@@ -62,6 +68,20 @@ function isValidLimit(raw: unknown, provider: string): boolean {
   return isValidScope(limit.scope, provider);
 }
 
+function isValidExplanation(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const explanation = raw as Record<string, unknown>;
+  return (
+    typeof explanation.window === "string" &&
+    explanation.window.trim().length > 0 &&
+    typeof explanation.field === "string" &&
+    VALID_EXPLANATION_FIELDS.has(explanation.field) &&
+    typeof explanation.rule === "string" &&
+    VALID_INFERENCE_RULES.has(explanation.rule) &&
+    typeof explanation.detail === "string"
+  );
+}
+
 /**
  * Validate a decoded blob. Returns the snapshot only when the version is
  * exactly the one this build writes and every field that participates in a
@@ -92,7 +112,7 @@ export function validateParsedStateBlob(raw: unknown): ProviderQuotaSnapshot | n
   if (state.explanations !== undefined && state.explanations !== null) {
     if (!Array.isArray(state.explanations)) return null;
     for (const explanation of state.explanations) {
-      if (!explanation || typeof explanation !== "object") return null;
+      if (!isValidExplanation(explanation)) return null;
     }
   }
   // Parsed snapshots are the normalized projection, never a second copy of

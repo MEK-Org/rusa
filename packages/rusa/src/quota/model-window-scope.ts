@@ -53,20 +53,32 @@ export function resolveWindowModels(
   configured: readonly ConfiguredModelRef[]
 ): string[] {
   if (configured.length === 0) return [];
-  const byKey = new Map<string, string>();
+  // A raw parser label has meaning only when it identifies one configured
+  // model. Keep collisions as an explicit rejection rather than letting the
+  // last catalog row win: a shared display label must not make a model window
+  // apply to an arbitrary model.
+  const byKey = new Map<string, string | null>();
+  const addKey = (key: string, identifier: string) => {
+    const existing = byKey.get(key);
+    if (existing === undefined || existing === identifier) {
+      byKey.set(key, identifier);
+    } else {
+      byKey.set(key, null);
+    }
+  };
   for (const ref of configured) {
     const identifier = ref.identifier.trim();
     if (!identifier) continue;
-    byKey.set(identifier.toLowerCase(), identifier);
+    addKey(identifier.toLowerCase(), identifier);
     const label = ref.displayLabel?.trim();
-    if (label) byKey.set(label.toLowerCase(), identifier);
+    if (label) addKey(label.toLowerCase(), identifier);
   }
   const matched = new Set<string>();
   for (const raw of rawModels) {
     const key = raw.trim().toLowerCase();
     if (!key) continue;
     const identifier = byKey.get(key);
-    if (identifier) matched.add(identifier);
+    if (identifier !== undefined && identifier !== null) matched.add(identifier);
   }
   // Return the canonical set in catalog order. Apart from making snapshots
   // stable across equivalent LLM ordering, this means every persisted scope

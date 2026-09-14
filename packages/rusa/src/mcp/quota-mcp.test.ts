@@ -3063,6 +3063,51 @@ describe("quota MCP server", () => {
         ]);
       });
 
+      it("carried_forward_bad_read: Step 3 never crosses canonical model window scopes", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const fableResetIso = "2026-08-26T15:00:00.000Z";
+        const sparkResetIso = "2026-08-26T16:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Fable Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: fableResetIso,
+              scope: { provider: "claude", models: ["claude-fable"] },
+            },
+            {
+              label: "Spark Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: sparkResetIso,
+              scope: { provider: "claude", models: ["claude-spark"] },
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "Spark Weekly",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: { provider: "claude", models: ["claude-spark"] },
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        expect(inferred.limits?.[0].resetAtIso).toBe(sparkResetIso);
+      });
+
       it("invariant: empty explanations list => inferred_parsed_state equals parsed_state", () => {
         const rawState: ProviderQuotaSnapshot = {
           provider: "claude",

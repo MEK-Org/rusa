@@ -33,3 +33,43 @@ export function isModelScopedWindow(limit: Pick<QuotaLimit, "scope">): boolean {
 export function isProviderScopedWindow(limit: Pick<QuotaLimit, "scope">): boolean {
   return limit.scope !== "model" && !isModelScopedWindow(limit);
 }
+
+/**
+ * True only when two model-scoped windows carry the same canonical scope, or
+ * when both are provider-scoped. This is deliberately stricter than comparing
+ * model-vs-provider shape: inference must not borrow a reset from one named
+ * model allocation for another allocation with the same window kind.
+ */
+export function hasSameQuotaWindowScope(
+  left: Pick<QuotaLimit, "scope">,
+  right: Pick<QuotaLimit, "scope">
+): boolean {
+  const modelScope = (
+    limit: Pick<QuotaLimit, "scope">
+  ): { provider: string; models: string[] } | null => {
+    if (typeof limit.scope !== "object" || limit.scope === null) return null;
+    const { provider, models } = limit.scope;
+    if (
+      typeof provider !== "string" ||
+      !Array.isArray(models) ||
+      models.length === 0 ||
+      models.some((model) => typeof model !== "string")
+    ) {
+      return null;
+    }
+    return { provider, models };
+  };
+
+  const leftModelScope = modelScope(left);
+  const rightModelScope = modelScope(right);
+  if (leftModelScope || rightModelScope) {
+    return (
+      leftModelScope !== null &&
+      rightModelScope !== null &&
+      leftModelScope.provider === rightModelScope.provider &&
+      leftModelScope.models.length === rightModelScope.models.length &&
+      leftModelScope.models.every((model, index) => model === rightModelScope.models[index])
+    );
+  }
+  return isProviderScopedWindow(left) && isProviderScopedWindow(right);
+}

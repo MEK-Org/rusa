@@ -20,4 +20,16 @@ describe("catalog-aware model window scope", () => {
   it("does not manufacture a model scope when the configured catalog is empty", () => {
     expect(resolveWindowModels(["Fable"], [])).toEqual([]);
   });
+
+  it("rejects an ambiguous display label while retaining an unambiguous identifier", () => {
+    const duplicateLabels = [
+      { identifier: "claude-fable-a", displayLabel: "Fable" },
+      { identifier: "claude-fable-b", displayLabel: "Fable" },
+    ];
+
+    expect(resolveWindowModels(["Fable"], duplicateLabels)).toEqual([]);
+    expect(resolveWindowModels(["Fable", "claude-fable-a"], duplicateLabels)).toEqual([
+      "claude-fable-a",
+    ]);
+  });
 });

@@ -38,4 +38,31 @@ describe("versioned parsed quota state", () => {
       parseParsedState(JSON.stringify({ version: 1, snapshot: { ...snapshot, raw: "secret" } }))
     ).toBeNull();
   });
+
+  it("rejects malformed explanations before restart inference can trust them", () => {
+    const validExplanation = {
+      window: "Current Week",
+      field: "resetAtIso",
+      rule: "assumed_window_starts_now",
+      detail: "assumed from the scrape instant",
+    };
+    expect(
+      parseParsedState(
+        JSON.stringify({ version: 1, snapshot: { ...snapshot, explanations: [validExplanation] } })
+      )
+    ).toEqual({ ...snapshot, explanations: [validExplanation] });
+
+    for (const explanation of [
+      { ...validExplanation, window: "" },
+      { ...validExplanation, field: "percentLeft" },
+      { ...validExplanation, rule: "invented_rule" },
+      { ...validExplanation, detail: null },
+    ]) {
+      expect(
+        parseParsedState(
+          JSON.stringify({ version: 1, snapshot: { ...snapshot, explanations: [explanation] } })
+        )
+      ).toBeNull();
+    }
+  });
 });
