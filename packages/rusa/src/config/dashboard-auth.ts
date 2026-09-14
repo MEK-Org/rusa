@@ -1,3 +1,4 @@
+import { normalizeEmail } from "../db/repositories/principal-repository.js";
 import type { DashboardAuthConfig } from "./types.js";
 
 /** Reject malformed auth rather than silently starting an unprotected dashboard. */
@@ -13,14 +14,16 @@ export function validateDashboardAuth(
   if (Object.keys(value).some((key) => !["email", "allowedEmails", "firebase"].includes(key))) {
     throw new Error("config.yaml: unknown auth field");
   }
-  if ("email" in value === "allowedEmails" in value) {
+  const hasEmail = "email" in value;
+  const hasAllowlist = "allowedEmails" in value;
+  if (hasEmail === hasAllowlist) {
     throw new Error("config.yaml: auth requires exactly one of email or allowedEmails");
   }
   const normalize = (email: unknown): string => {
     if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
       throw new Error("config.yaml: auth admission entries must be email addresses");
     }
-    return email.trim().toLowerCase();
+    return normalizeEmail(email);
   };
   if ("email" in value) value.email = normalize(value.email);
   else {

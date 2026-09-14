@@ -174,6 +174,9 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       token = claim({ uid: "colleague-id", sub: "colleague-id", email: "colleague@example.com" });
       const second = await login();
       const requestPrincipals = [];
+      // Shared authority does not let one admitted identity renew another's session.
+      expect((await post("/api/auth/refresh", first)).status).toBe(401);
+      expect((await post("/api/auth/refresh", second)).status).toBe(200);
       for (const cookie of [first, second]) {
         const res = await fetch(`${origin}/api/mesh/threads`, { headers: { Cookie: cookie } });
         expect(res.status).toBe(200);

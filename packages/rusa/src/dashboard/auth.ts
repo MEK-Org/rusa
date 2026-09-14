@@ -5,7 +5,10 @@ import { cert, deleteApp, initializeApp, type ServiceAccount } from "firebase-ad
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
 import { allowedDashboardEmails, validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
-import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import {
+  normalizeEmail,
+  type PrincipalRepository,
+} from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
@@ -131,7 +134,7 @@ export class DashboardAuth {
   private admitted(token: DecodedIdToken): void {
     if (
       token.email_verified !== true ||
-      !allowedDashboardEmails(this.config).includes(token.email?.trim().toLowerCase() ?? "") ||
+      !allowedDashboardEmails(this.config).includes(normalizeEmail(token.email ?? "")) ||
       token.firebase?.sign_in_provider !== "google.com" ||
       !token.uid ||
       token.exp * 1000 <= this.now()
