@@ -101,7 +101,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     db = new Database(":memory:");
     runMigrations(db);
     principals = new PrincipalRepository(db);
-    allowedEmails = [config.email];
+    allowedEmails = mode === "legacy" ? [config.email] : [config.email, "colleague@example.com"];
     auth = new DashboardAuth(
       mode === "legacy" ? config : { firebase: config.firebase, allowedEmails },
       firebase,
@@ -169,7 +169,6 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   it.skipIf(mode !== "shared")(
     "gives two distinct, rootless humans equal reads and mutations while denying outsiders",
     async () => {
-      allowedEmails.push("colleague@example.com");
       const first = await login();
       token = claim({ uid: "colleague-id", sub: "colleague-id", email: "colleague@example.com" });
       const second = await login();
@@ -222,7 +221,6 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   it.skipIf(mode !== "shared")(
     "rechecks each stream's own admission without disconnecting another user",
     async () => {
-      allowedEmails.push("colleague@example.com");
       const first = await login();
       token = claim({ uid: "colleague-id", sub: "colleague-id", email: "colleague@example.com" });
       const second = await login();
@@ -236,8 +234,9 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         auth.guardStream({ headers: { cookie } } as IncomingMessage, res);
         return res;
       });
-      // Simulates the policy loaded on restart; each stream is revalidated independently.
-      allowedEmails.splice(0, 1);
+      const firstPrincipal = principals.findUserByEmail("owner@example.com");
+      if (!firstPrincipal) throw new Error("Expected first user's principal");
+      principals.setDisabled(firstPrincipal.id, new Date(now).toISOString());
       now += 60_000;
       await vi.advanceTimersByTimeAsync(60_000);
       expect(streams[0].end).toHaveBeenCalledWith(expect.stringContaining("auth_required"));

@@ -38,7 +38,11 @@ program
   .option(
     "--auth-emails <emails>",
     "Comma-separated shared operators; overrides --auth-email",
-    (value) => value.split(",")
+    (value) =>
+      value
+        .split(",")
+        .map((e) => e.trim())
+        .filter(Boolean)
   )
   .option("--port-offset <n>", "Offset the disposable instance's default ports", Number, 0)
   .option("--follower-bind <ip>", "Enable follower gateway on this Tailscale IPv4 address")

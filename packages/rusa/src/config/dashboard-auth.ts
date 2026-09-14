@@ -14,8 +14,8 @@ export function validateDashboardAuth(
   if (Object.keys(value).some((key) => !["email", "allowedEmails", "firebase"].includes(key))) {
     throw new Error("config.yaml: unknown auth field");
   }
-  const hasEmail = "email" in value;
-  const hasAllowlist = "allowedEmails" in value;
+  const hasEmail = value.email !== undefined;
+  const hasAllowlist = value.allowedEmails !== undefined;
   if (hasEmail === hasAllowlist) {
     throw new Error("config.yaml: auth requires exactly one of email or allowedEmails");
   }
@@ -25,7 +25,7 @@ export function validateDashboardAuth(
     }
     return normalizeEmail(email);
   };
-  if ("email" in value) value.email = normalize(value.email);
+  if (value.email !== undefined) value.email = normalize(value.email);
   else {
     if (!Array.isArray(value.allowedEmails) || value.allowedEmails.length === 0) {
       throw new Error("config.yaml: auth.allowedEmails must be a non-empty array");
@@ -49,8 +49,4 @@ export function validateDashboardAuth(
   if (!/^[a-zA-Z0-9.-]+(?::\d+)?$/.test(value.firebase.authDomain as string)) {
     throw new Error("config.yaml: auth.firebase.authDomain must be a hostname");
   }
-}
-
-export function allowedDashboardEmails(config: DashboardAuthConfig): readonly string[] {
-  return config.allowedEmails ?? (config.email ? [config.email] : []);
 }

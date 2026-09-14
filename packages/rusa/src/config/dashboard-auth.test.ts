@@ -25,6 +25,23 @@ describe("optional shared-human auth config", () => {
     validateDashboardAuth(config);
     expect(config.allowedEmails).toEqual(["owner@example.com", "other@example.com"]);
   });
+  it("accepts programmatic configurations with explicit undefined omitted keys", () => {
+    const configWithUndefinedEmail = {
+      firebase: valid().firebase,
+      email: undefined,
+      allowedEmails: [" Owner@Example.com "],
+    };
+    validateDashboardAuth(configWithUndefinedEmail);
+    expect(configWithUndefinedEmail.allowedEmails).toEqual(["owner@example.com"]);
+
+    const configWithUndefinedAllowlist = {
+      firebase: valid().firebase,
+      email: " Owner@Example.com ",
+      allowedEmails: undefined,
+    };
+    validateDashboardAuth(configWithUndefinedAllowlist);
+    expect(configWithUndefinedAllowlist.email).toBe("owner@example.com");
+  });
   it.each([
     [],
     "owner@example.com",
