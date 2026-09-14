@@ -154,40 +154,51 @@ describe("QuotaCollectionLoop", () => {
   it("dedupes concurrent ticks to one service-owned probe and one controller advance", async () => {
     const store = storeWithReading();
     try {
-      let resolveProbe: ((state: ProviderQuotaSnapshot) => void) | undefined;
-      const getQuota = vi.fn(
+      let resolveProbe:
+        | ((outcome: { state: ProviderQuotaSnapshot; didProbe: boolean }) => void)
+        | undefined;
+      const getQuotaProbeOutcome = vi.fn(
         () =>
-          new Promise<ProviderQuotaSnapshot>((resolve) => {
+          new Promise<{ state: ProviderQuotaSnapshot; didProbe: boolean }>((resolve) => {
             resolveProbe = resolve;
           })
       );
       const advance = vi.spyOn(store, "advancePendingController");
       const loop = new QuotaCollectionLoop({
         store,
-        quotaService: { getQuota, hydrate: vi.fn() } as unknown as QuotaService,
+        quotaService: { getQuotaProbeOutcome, hydrate: vi.fn() } as unknown as QuotaService,
         providers: ["claude"],
       });
 
       const first = loop.tick();
       const second = loop.tick();
-      expect(getQuota).toHaveBeenCalledTimes(1);
-      resolveProbe?.({ provider: "claude", status: "available" });
+      expect(getQuotaProbeOutcome).toHaveBeenCalledTimes(1);
+      resolveProbe?.({ state: { provider: "claude", status: "available" }, didProbe: true });
       await Promise.all([first, second]);
-      expect(getQuota).toHaveBeenCalledTimes(1);
+      expect(getQuotaProbeOutcome).toHaveBeenCalledTimes(1);
       expect(advance).toHaveBeenCalledTimes(1);
     } finally {
       store.close();
     }
   });
 
-  it("leaves the published interval unchanged and counts a failed probe", async () => {
+  it("leaves the published interval unchanged and counts a real failed probe, not a cached unknown", async () => {
     const store = storeWithReading();
     try {
       const before = store.getProviderThrottle("claude");
       const loop = new QuotaCollectionLoop({
         store,
         quotaService: {
-          getQuota: vi.fn().mockResolvedValue({ provider: "claude", status: "unknown" }),
+          getQuotaProbeOutcome: vi
+            .fn()
+            .mockResolvedValueOnce({
+              state: { provider: "claude", status: "unknown" },
+              didProbe: true,
+            })
+            .mockResolvedValue({
+              state: { provider: "claude", status: "unknown" },
+              didProbe: false,
+            }),
           hydrate: vi.fn(),
         } as unknown as QuotaService,
         providers: ["claude"],
@@ -200,6 +211,8 @@ describe("QuotaCollectionLoop", () => {
         failures: 1,
         lastOutcome: "failure",
       });
+      await loop.tick();
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 1, failures: 1 });
     } finally {
       store.close();
     }
@@ -297,12 +310,19 @@ describe("QuotaCollectionLoop", () => {
         count: 2,
       });
       expect(observationRows(store)).toHaveLength(1);
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 1, failures: 0 });
+      // The coordinator cadence can be shorter than a provider TTL. A cache
+      // hit returns the prior reading but must not inflate probe/failure stats.
+      await loop.tick();
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 1, failures: 0 });
       // Move beyond the probe TTL: the second concurrent tick pool must still
       // share one live probe rather than one probe per caller.
       nowMs += 2;
       await Promise.all([loop.tick(), loop.tick()]);
       expect(run).toHaveBeenCalledTimes(2);
       expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 2, failures: 0 });
     } finally {
       await coordinator.stop();
       store.close();
@@ -378,6 +398,7 @@ describe("QuotaCollectionLoop", () => {
   it("criteria 11 and 13: carried-forward state survives restart without rewriting the observation", async () => {
     const root = makeRoot();
     const store = new SharedQuotaStore(join(root, "quota.db"));
+    let firstStoreClosed = false;
     let nowMs = Date.parse("2040-01-01T00:00:00.000Z");
     const run = vi.fn().mockResolvedValue({
       success: true,
@@ -410,6 +431,7 @@ describe("QuotaCollectionLoop", () => {
     });
 
     let secondCoordinator: QuotaCoordinatorService | undefined;
+    let restartedStore: SharedQuotaStore | undefined;
     try {
       await Promise.all([firstLoop.tick(), firstLoop.tick()]);
       nowMs += 2;
@@ -426,15 +448,22 @@ describe("QuotaCollectionLoop", () => {
       const preRestartPublication = await request(firstSocketPath, "/v1/quota?provider=claude");
       await firstCoordinator.stop();
 
+      // A process restart must rebuild the SQLite connection as well as the
+      // service objects; otherwise same-connection caches can mask a missing
+      // durable-state hydration path.
+      store.close();
+      firstStoreClosed = true;
+      restartedStore = new SharedQuotaStore(join(root, "quota.db"));
+
       const secondService = configuredClaudeService({
         root,
-        store,
+        store: restartedStore,
         now: () => nowMs,
         run,
         ttlMs: 1,
       });
       const secondLoop = new QuotaCollectionLoop({
-        store,
+        store: restartedStore,
         quotaService: secondService,
         providers: ["claude"],
         maxIntervalSeconds: 3600,
@@ -443,7 +472,7 @@ describe("QuotaCollectionLoop", () => {
       const secondSocketPath = join(root, "coordinator-second.sock");
       secondCoordinator = new QuotaCoordinatorService({
         socketPath: secondSocketPath,
-        store,
+        store: restartedStore,
         configuredProviders: ["claude"],
         now: () => nowMs,
       });
@@ -454,27 +483,31 @@ describe("QuotaCollectionLoop", () => {
       );
       expect(firstPostRestartPublication).toEqual(preRestartPublication);
 
-      const observationBeforeSecondBadRead = observationRows(store);
+      const observationBeforeSecondBadRead = observationRows(restartedStore);
       const changesBeforeSecondBadRead = (
-        store.db.prepare("SELECT total_changes() AS changes").get() as { changes: number }
+        restartedStore.db.prepare("SELECT total_changes() AS changes").get() as { changes: number }
       ).changes;
       nowMs += 2;
       await Promise.all([secondLoop.tick(), secondLoop.tick()]);
       expect(run).toHaveBeenCalledTimes(3);
-      expect(observationRows(store)).toEqual(observationBeforeSecondBadRead);
+      expect(observationRows(restartedStore)).toEqual(observationBeforeSecondBadRead);
       // The only writes are the fresh raw scrape and its parsed-state update;
       // an observation upsert would add a third change and violate criterion 13.
       expect(
-        (store.db.prepare("SELECT total_changes() AS changes").get() as { changes: number })
-          .changes - changesBeforeSecondBadRead
+        (
+          restartedStore.db.prepare("SELECT total_changes() AS changes").get() as {
+            changes: number;
+          }
+        ).changes - changesBeforeSecondBadRead
       ).toBe(2);
-      expect(store.getLatestSnapshot("claude")?.explanations).toEqual([
+      expect(restartedStore.getLatestSnapshot("claude")?.explanations).toEqual([
         expect.objectContaining({ rule: "carried_forward_bad_read" }),
       ]);
     } finally {
       await secondCoordinator?.stop();
       await firstCoordinator.stop();
-      store.close();
+      restartedStore?.close();
+      if (!firstStoreClosed) store.close();
     }
   });
 });

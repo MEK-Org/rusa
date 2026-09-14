@@ -15,6 +15,9 @@ import {
 import { isProviderScopedWindow } from "./window-scope.js";
 
 export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError };
+// Maintenance scripts consume this bundled shared-store artifact, so expose
+// the one persistence decoder/writer rather than duplicating JSON handling.
+export { parseParsedState, serializeParsedState } from "./parsed-state.js";
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;

@@ -53,6 +53,40 @@ function recordObservation(
 }
 
 describe("SharedQuotaStore canonical observations", () => {
+  it("hydrates a validated legacy bare parsed_state without a schema migration", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-state-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const scrapedAt = "2030-01-01T00:00:00.000Z";
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" });
+      store.db.prepare("UPDATE quota_scrapes SET parsed_state = ? WHERE id = ?").run(
+        JSON.stringify({
+          provider: "claude",
+          status: "available",
+          scrapedAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 80,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: "provider",
+            },
+          ],
+        }),
+        id
+      );
+
+      expect(store.getLatestSnapshot("claude")).toMatchObject({
+        provider: "claude",
+        limits: [expect.objectContaining({ scope: { provider: "claude" } })],
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses the compact schema and prunes raw scrape payloads after 30 days", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-retention-"));
     roots.push(root);

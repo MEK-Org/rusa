@@ -5,13 +5,10 @@ import type { SharedQuotaStore } from "./shared-store.js";
 export const DEFAULT_COLLECTION_TICK_MS = 300_000; // quota.throttle.tickSeconds default (300s)
 
 /**
- * Per-provider collection stats. `attempts` counts collection ticks that
- * asked the probe layer for a provider (a cache hit inside the probe layer's
- * TTL floor still counts as an attempt, not a probe); `failures` counts ticks
- * that produced no usable provider-wide reading — the scrape-failure counter
- * design §6.2 and criterion 4 name. Exact probe/parse counts are asserted at
- * the probe/parse seams in tests, because slot dedupe would hide a second
- * probe behind an identical row.
+ * Per-provider collection stats. Both counters concern actual probes started
+ * by this loop: cache hits and joins on another in-flight probe do not move
+ * them. `failures` records a rejected probe or an unknown result from a real
+ * probe, never a cached unknown reading.
  */
 export interface QuotaCollectionStats {
   attempts: number;
@@ -133,19 +130,24 @@ export class QuotaCollectionLoop {
   private async doTick(): Promise<void> {
     for (const provider of this.options.providers) {
       const stat = this.stat(provider);
-      stat.attempts += 1;
       try {
-        const snapshot = await this.options.quotaService.getQuota(provider as QuotaLlmProvider);
-        if (snapshot.status === "unknown") {
+        const outcome = await this.options.quotaService.getQuotaProbeOutcome(
+          provider as QuotaLlmProvider
+        );
+        if (!outcome.didProbe) continue;
+        stat.attempts += 1;
+        if (outcome.error || outcome.state?.status === "unknown") {
           stat.failures += 1;
           stat.lastOutcome = "failure";
         } else {
           stat.lastOutcome = "ok";
-          stat.lastScrapedAt = snapshot.scrapedAt ?? stat.lastScrapedAt;
+          stat.lastScrapedAt = outcome.state?.scrapedAt ?? stat.lastScrapedAt;
         }
+        if (outcome.error) this.options.onError?.(provider, outcome.error);
       } catch (error) {
-        stat.failures += 1;
-        stat.lastOutcome = "failure";
+        // getQuotaProbeOutcome currently reports probe errors as data. Retain
+        // this guard for a programming failure without misreporting it as a
+        // scrape attempt whose start we cannot prove.
         this.options.onError?.(provider, error);
       }
     }

@@ -8,6 +8,7 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
+  calculateFreshness,
   DEFAULT_MAX_INTERVAL_SECONDS,
   ProtocolMismatchError,
   publishedThrottle,
@@ -347,6 +348,49 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.updatedAt).toBe(expected.updatedAt);
     expect(res.json.buckets).toEqual(expected.buckets);
     expect(res.json.freshness).toEqual(expected.freshness);
+  });
+
+  it("criteria 5 and 5a: the oldest bucket governs freshness even when a narrower bucket refreshes updatedAt", () => {
+    const nowMs = Date.parse("2040-01-01T02:00:00.000Z");
+    const status: PersistedQuotaProviderStatus = {
+      provider: "claude",
+      intervalSeconds: 300,
+      uncappedIntervalSeconds: 300,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      // The narrow session refresh is newest, but does not erase weekly age.
+      updatedAt: new Date(nowMs - 60_000).toISOString(),
+      buckets: [
+        {
+          key: "claude:weekly",
+          percentLeft: 40,
+          timeRemainingPct: 50,
+          error: 0,
+          derivative: 0,
+          requiredIntervalSeconds: 300,
+          resetAtIso: null,
+          observedAt: new Date(nowMs - 30 * 60_000).toISOString(),
+        },
+        {
+          key: "claude:session",
+          percentLeft: 80,
+          timeRemainingPct: 50,
+          error: 0,
+          derivative: 0,
+          requiredIntervalSeconds: 300,
+          resetAtIso: null,
+          observedAt: new Date(nowMs - 60_000).toISOString(),
+        },
+      ],
+    };
+
+    expect(calculateFreshness(status, { nowMs, staleAfterMs: 15 * 60_000 })).toMatchObject({
+      ageMs: 30 * 60_000,
+      buckets: { "claude:weekly": 30 * 60_000, "claude:session": 60_000 },
+      stale: true,
+    });
   });
 
   // Criterion 16: Collection form is byte-identical to single form without service block.

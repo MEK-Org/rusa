@@ -200,7 +200,7 @@ interface LlmQuotaWindow {
   resetAtIso?: string;
   resetInIso?: string;
   placeholder?: boolean;
-  scope?: "provider" | "model";
+  scope?: "provider";
   /**
    * For a model-specific window, the configured model IDs it applies to, chosen
    * only from the configured model list supplied in the instructions. Code at
@@ -211,6 +211,17 @@ interface LlmQuotaWindow {
 }
 
 export type QuotaLlmProvider = "claude" | "codex" | "agy" | "kimi";
+
+/**
+ * Collection-only probe outcome. `didProbe` is true only for the caller that
+ * started a real expired-cache probe, never for a cache hit or a caller that
+ * merely joined somebody else's in-flight work.
+ */
+export interface QuotaProbeOutcome {
+  state?: ProviderQuotaSnapshot;
+  didProbe: boolean;
+  error?: unknown;
+}
 
 /** The valid `QuotaWindowKind` values, for validating the LLM's `kind` output. */
 const QUOTA_WINDOW_KINDS: readonly QuotaWindowKind[] = ["session", "five_hour", "weekly", "other"];
@@ -528,12 +539,7 @@ async function parseQuotaWithLlm(
       if (w.placeholder !== undefined && w.placeholder !== false) {
         throw new Error(`Quota parse failed: window '${String(w.label)}' has invalid placeholder`);
       }
-      // Older parser fixtures used scope='model' without a canonical model
-      // list. Preserve the safety property for that legacy input: discard it,
-      // never silently turn it into provider evidence. New structured output
-      // expresses model scope with `models` and schema scope='provider'.
-      if (w.scope === "model" && (!w.models || w.models.length === 0)) continue;
-      if (w.scope !== undefined && w.scope !== "provider" && w.scope !== "model") {
+      if (w.scope !== undefined && w.scope !== "provider") {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid scope`);
       }
       if (typeof w.label !== "string" || !w.label.trim()) {
@@ -545,6 +551,15 @@ async function parseQuotaWithLlm(
       ) {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid models`);
       }
+      // Trust boundary for model-specific windows: the parser's raw labels are
+      // intersected with the canonical configured model IDs for this provider.
+      // Drop an empty/unrecognised allocation before provider-only reset
+      // validation: it carries no provider evidence and must not make an
+      // otherwise valid provider panel fail solely on its own missing reset.
+      const rawModels = w.models ?? [];
+      const hasExplicitModelScope = w.models !== undefined;
+      const canonicalModels = resolveWindowModels(rawModels, configuredModelRefs(configuredModels));
+      if (hasExplicitModelScope && canonicalModels.length === 0) continue;
       const usedPercent = w.usedPercent;
       if (
         typeof usedPercent !== "number" ||
@@ -576,19 +591,6 @@ async function parseQuotaWithLlm(
           `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
         );
       }
-
-      // Trust boundary for model-specific windows: the parser's raw labels are
-      // intersected with the canonical configured model IDs for this provider.
-      // A window whose list empties out — unknown, ambiguous, reserve, or
-      // special-allocation label with no configured match — is dropped, never
-      // relabelled provider-wide, so it cannot influence provider evidence.
-      const rawModels = w.models ?? [];
-      const hasExplicitModelScope = w.models !== undefined;
-      const canonicalModels = resolveWindowModels(rawModels, configuredModelRefs(configuredModels));
-      // An explicit `models` property denotes a model allocation even when the
-      // model omitted every value. Treat that as an untrusted empty model
-      // scope and drop it; only an omitted property is provider-wide.
-      if (hasExplicitModelScope && canonicalModels.length === 0) continue;
 
       limits.push({
         label: w.label,
@@ -756,6 +758,7 @@ export function inferQuotaState(
   // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso.
   if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
     const activeUnexpiredLimits = prevState.limits.filter((limit) => {
+      if (!isProviderScopedWindow(limit)) return false;
       if (!limit.resetAtIso) return false;
       const resetMs = Date.parse(limit.resetAtIso);
       if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
@@ -945,6 +948,7 @@ export class QuotaService {
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
+            isProviderScopedWindow(l) &&
             l.resetAtIso &&
             Date.parse(l.resetAtIso) > Date.parse(scrapedAt) &&
             !prevState.explanations?.some(
@@ -1000,34 +1004,55 @@ export class QuotaService {
    * the ONLY entry point that may trigger a probe — callers (the MCP tool, the
    * dashboard endpoint) never probe directly.
    */
-  async getQuota(provider: "claude" | "codex" | "agy" | "kimi"): Promise<ProviderQuotaSnapshot> {
+  async getQuotaProbeOutcome(
+    provider: "claude" | "codex" | "agy" | "kimi"
+  ): Promise<QuotaProbeOutcome> {
     if (!this.configuredProviders.has(provider)) {
       return {
-        provider,
-        status: "unsupported",
-        message: `${provider} is not configured on this instance`,
+        state: {
+          provider,
+          status: "unsupported",
+          message: `${provider} is not configured on this instance`,
+        },
+        didProbe: false,
       };
     }
     const now = (this.deps.now ?? Date.now)();
     const cached = this.cache.get(provider);
     const ttl = this.getTtlMs(provider);
     if (cached && now - cached.timestamp < ttl) {
-      return cached.state;
+      return { state: cached.state, didProbe: false };
     }
 
     let inFlight = this.inFlightProbes.get(provider);
+    let didProbe = false;
     if (!inFlight) {
+      didProbe = true;
       inFlight = this.executeProbe(provider).finally(() => {
         this.inFlightProbes.delete(provider);
       });
       this.inFlightProbes.set(provider, inFlight);
     }
 
-    const state = await inFlight;
+    let state: ProviderQuotaSnapshot;
+    try {
+      state = await inFlight;
+    } catch (error) {
+      return { didProbe, error };
+    }
     if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
       this.cache.set(provider, { state, timestamp: (this.deps.now ?? Date.now)() });
     }
-    return state;
+    return { state, didProbe };
+  }
+
+  async getQuota(provider: "claude" | "codex" | "agy" | "kimi"): Promise<ProviderQuotaSnapshot> {
+    const outcome = await this.getQuotaProbeOutcome(provider);
+    if (outcome.error) throw outcome.error;
+    // Every non-error outcome carries state; keep this guard for a future
+    // implementation change rather than returning an invented snapshot.
+    if (!outcome.state) throw new Error(`Quota probe for ${provider} returned no state`);
+    return outcome.state;
   }
 
   /**

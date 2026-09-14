@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { loadConfig, resolveHome } from "../config/index.js";
+import type { RusaConfig } from "../config/types.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { createQuotaService } from "../mcp/quota-mcp.js";
 import { createLogger } from "../observability/logger.js";
@@ -55,6 +56,28 @@ export function loadCoordinatorModelCatalogs(mcHome: string): void {
   // Kimi's runtime catalog is a local configuration file. Reading it here is
   // also read-only and leaves no scrape/history row behind.
   ingestKimiHostModels();
+}
+
+/**
+ * Keep the coordinator's established read contract separate from the new
+ * collector's capability boundary. A configured alias remains readable even
+ * when this process has no probe for it; only collection is limited to the
+ * supported throttle providers.
+ */
+export function coordinatorProviderLanes(config: RusaConfig): {
+  configuredProviders: readonly string[] | undefined;
+  collectionProviders: readonly (typeof QUOTA_THROTTLE_PROVIDERS)[number][];
+} {
+  const providerKeys = Object.keys(config.providers ?? {});
+  const configuredLanes = Array.from(
+    new Set(providerKeys.map((name) => providerThrottleKey(name, config)))
+  );
+  const configuredProviders = configuredLanes.length > 0 ? configuredLanes : undefined;
+  const collectionProviders = (configuredProviders ?? QUOTA_THROTTLE_PROVIDERS).filter(
+    (provider): provider is (typeof QUOTA_THROTTLE_PROVIDERS)[number] =>
+      (QUOTA_THROTTLE_PROVIDERS as readonly string[]).includes(provider)
+  );
+  return { configuredProviders, collectionProviders };
 }
 
 export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
@@ -110,17 +133,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
 
     const store = new SharedQuotaStore(databasePath);
 
-    // Collapse config aliases onto canonical provider throttle lanes
-    const providerKeys = Object.keys(config.providers ?? {});
-    const configuredLanes = Array.from(
-      new Set(providerKeys.map((name) => providerThrottleKey(name, config)))
-    ).filter((provider): provider is (typeof QUOTA_THROTTLE_PROVIDERS)[number] =>
-      (QUOTA_THROTTLE_PROVIDERS as readonly string[]).includes(provider)
-    );
-    // Match the coordinator's established default when no provider aliases
-    // appear in config: its service and collector must own the same lanes.
-    const configuredProviders =
-      configuredLanes.length > 0 ? configuredLanes : QUOTA_THROTTLE_PROVIDERS;
+    const { configuredProviders, collectionProviders } = coordinatorProviderLanes(config);
 
     const service = new QuotaCoordinatorService({
       socketPath,
@@ -137,7 +150,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     const collection = new QuotaCollectionLoop({
       store,
       quotaService,
-      providers: configuredProviders,
+      providers: collectionProviders,
       tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
       maxIntervalSeconds,
       onError: (provider, error) =>

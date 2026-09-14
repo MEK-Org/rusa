@@ -21,6 +21,34 @@ describe("versioned parsed quota state", () => {
     expect(parseParsedState(serializeParsedState(snapshot))).toEqual(snapshot);
   });
 
+  it("accepts a fully valid legacy bare snapshot, normalising provider scope and discarding old model strings", () => {
+    expect(
+      parseParsedState(
+        JSON.stringify({
+          ...snapshot,
+          limits: [
+            { ...snapshot.limits[0], scope: "provider" },
+            { ...snapshot.limits[0], label: "Legacy model", scope: "model" },
+          ],
+        })
+      )
+    ).toEqual({
+      ...snapshot,
+      limits: [{ ...snapshot.limits[0], scope: { provider: "claude" } }],
+    });
+  });
+
+  it("rejects malformed legacy snapshots instead of taking a permissive compatibility path", () => {
+    expect(
+      parseParsedState(
+        JSON.stringify({
+          ...snapshot,
+          limits: [{ ...snapshot.limits[0], percentLeft: 101, scope: "provider" }],
+        })
+      )
+    ).toBeNull();
+  });
+
   it("rejects unsupported versions, foreign-provider scopes, and raw panel text", () => {
     expect(parseParsedState(JSON.stringify({ version: 2, snapshot }))).toBeNull();
     expect(
