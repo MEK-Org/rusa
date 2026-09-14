@@ -18,8 +18,9 @@ function usage() {
     "    --labels /absolute/path/to/quota-labels.json \\",
     "    --report /absolute/path/to/quota-eval.md [--repeat 3]",
     "",
-    "The label file is a JSON array of {id, expected:{status, limits}} records.",
-    "Raw scrape text and source IDs are never written to the report.",
+    "The label file is a JSON array of {id, provider, configuredModels?, expected:{status, limits}} records.",
+    "configuredModels is the provider's canonical catalog ({identifier, displayLabel?, passable?}); it is supplied to the production parser for model-window classification.",
+    "The database is opened read-only. Raw scrape text and source IDs are never written to the report.",
   ].join("\n");
 }
 
@@ -64,11 +65,25 @@ function normalizedSnapshot(snapshot) {
           kind: limit.kind ?? null,
           percentLeft: limit.percentLeft,
           resetAtIso: normalizedReset(limit.resetAtIso),
-          scope: limit.scope ?? null,
+          scope: normalizedScope(limit.scope),
         }))
         .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right), "en-US"))
     : [];
   return { status: snapshot?.status ?? null, limits };
+}
+
+function normalizedScope(scope) {
+  if (scope === "provider" || scope === undefined || scope === null) {
+    return { provider: null, models: [] };
+  }
+  if (scope === "model") return { provider: null, models: ["<legacy-model-scope>"] };
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+  const models = Array.isArray(scope.models)
+    ? [...new Set(scope.models.filter((model) => typeof model === "string" && model.trim()))].sort(
+        (left, right) => left.localeCompare(right, "en-US")
+      )
+    : [];
+  return { provider: typeof scope.provider === "string" ? scope.provider : null, models };
 }
 
 function validateLabels(labels) {
@@ -92,10 +107,16 @@ function validateLabels(labels) {
     ) {
       throw new Error(`label ${index + 1} has an invalid provider or status`);
     }
-    for (const limit of expected.limits) {
-      if (limit.scope !== "provider") {
-        throw new Error(`label ${index + 1} contains a non-provider expected limit`);
+    if (label.configuredModels !== undefined && !Array.isArray(label.configuredModels)) {
+      throw new Error(`label ${index + 1} has invalid configuredModels`);
+    }
+    for (const model of label.configuredModels ?? []) {
+      if (!model || typeof model.identifier !== "string" || !model.identifier.trim()) {
+        throw new Error(`label ${index + 1} has an invalid configured model`);
       }
+    }
+    for (const limit of expected.limits) {
+      if (!limit.scope) throw new Error(`label ${index + 1} has an invalid expected scope`);
       if (!Number.isFinite(limit.percentLeft) || limit.percentLeft < 0 || limit.percentLeft > 100) {
         throw new Error(`label ${index + 1} contains an invalid expected percentage`);
       }
@@ -106,33 +127,50 @@ function validateLabels(labels) {
 async function evaluateRecord(record, parser, apiKey, repeat) {
   const attempts = [];
   for (let pass = 0; pass < repeat; pass += 1) {
-    const parsed = await parser(record.rawOutput, apiKey, Date.parse(record.scrapedAt));
+    const parsed = await parser(
+      record.rawOutput,
+      apiKey,
+      Date.parse(record.scrapedAt),
+      record.configuredModels ?? []
+    );
     attempts.push(normalizedSnapshot(parsed));
   }
   const expected = normalizedSnapshot(record.expected);
   const expectedJson = JSON.stringify(expected);
   const results = attempts.map((attempt) => JSON.stringify(attempt));
-  const providerOnly = attempts.every((attempt) =>
-    attempt.limits.every((limit) => limit.scope === "provider")
+  const catalogIds = new Set(
+    (record.configuredModels ?? [])
+      .filter((model) => model.passable !== false)
+      .map((model) => model.identifier)
+  );
+  const catalogScoped = attempts.every((attempt) =>
+    attempt.limits.every(
+      (limit) =>
+        limit.scope &&
+        limit.scope.provider === record.provider &&
+        limit.scope.models.every((model) => catalogIds.has(model))
+    )
   );
   return {
     provider: record.provider,
     idHash: shortHash(`${record.provider}\0${record.id}`),
     exact: results.every((result) => result === expectedJson),
     stable: results.every((result) => result === results[0]),
-    providerOnly,
+    catalogScoped,
   };
 }
 
 function renderReport(results, repeat) {
-  const passed = results.filter((result) => result.exact && result.stable && result.providerOnly);
+  const passed = results.filter((result) => result.exact && result.stable && result.catalogScoped);
   const providerRows = PROVIDERS.map((provider) => {
     const rows = results.filter((result) => result.provider === provider);
-    const ok = rows.filter((result) => result.exact && result.stable && result.providerOnly).length;
+    const ok = rows.filter(
+      (result) => result.exact && result.stable && result.catalogScoped
+    ).length;
     return `| ${provider} | ${rows.length} | ${ok} | ${rows.length - ok} |`;
   }).join("\n");
   const failures = results.filter(
-    (result) => !result.exact || !result.stable || !result.providerOnly
+    (result) => !result.exact || !result.stable || !result.catalogScoped
   );
   const failureLines = failures.length
     ? failures
@@ -140,7 +178,7 @@ function renderReport(results, repeat) {
           const reasons = [
             !result.exact && "expected-value mismatch",
             !result.stable && "inconsistent repeated output",
-            !result.providerOnly && "non-provider scope",
+            !result.catalogScoped && "scope escaped configured catalog",
           ].filter(Boolean);
           return `- \`${result.idHash}\` (${result.provider}): ${reasons.join(", ")}`;
         })
@@ -149,7 +187,7 @@ function renderReport(results, repeat) {
   return (
     "# Quota extraction evaluation\n\n" +
     `Each labeled historical scrape was parsed ${repeat} time(s) through the production model/fallback path. ` +
-    "The evaluator compares structured provider fields only and does not parse or match raw quota text.\n\n" +
+    "The evaluator compares structured fields only, validates model scopes against each record's configured catalog, and never writes raw quota text.\n\n" +
     `Result: **${passed.length === results.length ? "PASS" : "FAIL"}** (${passed.length}/${results.length} labeled scrapes passed).\n\n` +
     "| Provider | Labeled scrapes | Passed | Failed |\n" +
     "| --- | ---: | ---: | ---: |\n" +
@@ -196,9 +234,9 @@ async function main() {
     const report = renderReport(results, args.repeat);
     await writeFile(args.report, report);
     process.stdout.write(
-      `[quota-eval] wrote ${args.report}; ${results.filter((result) => result.exact && result.stable && result.providerOnly).length}/${results.length} passed\n`
+      `[quota-eval] wrote ${args.report}; ${results.filter((result) => result.exact && result.stable && result.catalogScoped).length}/${results.length} passed\n`
     );
-    if (results.some((result) => !result.exact || !result.stable || !result.providerOnly)) {
+    if (results.some((result) => !result.exact || !result.stable || !result.catalogScoped)) {
       process.exitCode = 2;
     }
   } finally {

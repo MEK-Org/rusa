@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { inferQuotaState, parseCodexQuota } from "../build/maintenance/mcp/quota-mcp.js";
+import { serializeParsedState } from "../build/maintenance/quota/shared-store.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -151,7 +152,14 @@ function validateState(state, rowHash) {
     throw new Error(`invalid status for row ${rowHash}`);
   }
   for (const limit of state.limits ?? []) {
-    if (limit.scope !== "provider") {
+    if (
+      limit.scope !== undefined &&
+      limit.scope !== "provider" &&
+      (typeof limit.scope !== "object" ||
+        limit.scope === null ||
+        limit.scope.provider !== "codex" ||
+        (Array.isArray(limit.scope.models) && limit.scope.models.length > 0))
+    ) {
       throw new Error(`non-provider limit survived for row ${rowHash}`);
     }
     if (!Number.isFinite(limit.percentLeft) || limit.percentLeft < 0 || limit.percentLeft > 100) {
@@ -233,9 +241,12 @@ async function main() {
     const inferred = inferQuotaState(rawStates[index], previous, row.scrapedAt);
     const { raw: _raw, ...stored } = inferred;
     validateState(stored, shortHash(row.id));
-    const serialized = JSON.stringify(stored);
+    const serialized = serializeParsedState(stored);
     const oldState = parsedJson(row.parsedState);
-    oldModelWindows += (oldState?.limits ?? []).filter((limit) => limit.scope === "model").length;
+    const oldSnapshot = oldState?.snapshot ?? oldState;
+    oldModelWindows += (oldSnapshot?.limits ?? []).filter(
+      (limit) => limit.scope === "model"
+    ).length;
     newProviderWindows += (stored.limits ?? []).length;
     statuses[stored.status] += 1;
     if (serialized !== row.parsedState) changed += 1;

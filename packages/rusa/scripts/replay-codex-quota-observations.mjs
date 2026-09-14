@@ -1,7 +1,7 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { SharedQuotaStore } from "../build/maintenance/quota/shared-store.js";
+import { parseParsedState, SharedQuotaStore } from "../build/maintenance/quota/shared-store.js";
 
 const OBSERVATION_COLUMNS = [
   "provider",
@@ -63,18 +63,21 @@ function parseArgs(argv) {
 
 function parseState(value, id) {
   if (!value) throw new Error(`Codex scrape ${id} has no parsed_state`);
-  let state;
-  try {
-    state = JSON.parse(value);
-  } catch {
-    throw new Error(`Codex scrape ${id} has malformed parsed_state`);
-  }
+  const state = parseParsedState(value);
+  if (!state) throw new Error(`Codex scrape ${id} has malformed parsed_state`);
   if (state.provider !== "codex") throw new Error(`Codex scrape ${id} has the wrong provider`);
   if (!["available", "exhausted", "unknown"].includes(state.status)) {
     throw new Error(`Codex scrape ${id} has an invalid status`);
   }
   for (const limit of state.limits ?? []) {
-    if (limit.scope !== "provider") {
+    if (
+      limit.scope !== undefined &&
+      limit.scope !== "provider" &&
+      (typeof limit.scope !== "object" ||
+        limit.scope === null ||
+        limit.scope.provider !== "codex" ||
+        (Array.isArray(limit.scope.models) && limit.scope.models.length > 0))
+    ) {
       throw new Error(`Codex scrape ${id} still contains a non-provider limit`);
     }
     if (!Number.isFinite(limit.percentLeft) || limit.percentLeft < 0 || limit.percentLeft > 100) {
