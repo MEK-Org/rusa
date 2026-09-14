@@ -32,4 +32,14 @@ describe("catalog-aware model window scope", () => {
       "claude-fable-a",
     ]);
   });
+
+  it("rejects a normalized identifier/display-label collision", () => {
+    const identifierLabelCollision = [
+      { identifier: "claude-fable", displayLabel: "Fable" },
+      { identifier: "claude-sonnet", displayLabel: "claude-fable" },
+    ];
+
+    expect(resolveWindowModels(["claude-fable"], identifierLabelCollision)).toEqual([]);
+    expect(resolveWindowModels(["Fable"], identifierLabelCollision)).toEqual(["claude-fable"]);
+  });
 });

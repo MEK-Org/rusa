@@ -802,7 +802,12 @@ export function inferQuotaState(
   // Step 3: Bad read partial-fallback (Rule: carried_forward_bad_read)
   // The current parse extracted windows, but some window missed resetAtIso
   // while the previous scrape had an unexpired valid non-assumed resetAtIso.
-  if (limits && limits.length > 0 && prevState?.limits) {
+  if (
+    limits &&
+    limits.length > 0 &&
+    prevState?.limits &&
+    prevState.provider === rawState.provider
+  ) {
     for (const limit of limits) {
       if (limit.resetAtIso) continue;
       const prevMatch = prevState.limits.find(

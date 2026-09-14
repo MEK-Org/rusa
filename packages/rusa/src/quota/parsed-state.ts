@@ -68,12 +68,13 @@ function isValidLimit(raw: unknown, provider: string): boolean {
   return isValidScope(limit.scope, provider);
 }
 
-function isValidExplanation(raw: unknown): boolean {
+function isValidExplanation(raw: unknown, limitLabels: ReadonlySet<string>): boolean {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
   const explanation = raw as Record<string, unknown>;
   return (
     typeof explanation.window === "string" &&
     explanation.window.trim().length > 0 &&
+    limitLabels.has(explanation.window) &&
     typeof explanation.field === "string" &&
     VALID_EXPLANATION_FIELDS.has(explanation.field) &&
     typeof explanation.rule === "string" &&
@@ -104,6 +105,9 @@ export function validateParsedStateBlob(raw: unknown): ProviderQuotaSnapshot | n
       if (!isValidLimit(limit, state.provider)) return null;
     }
   }
+  const limitLabels = new Set(
+    (state.limits ?? []).map((limit) => (limit as { label: string }).label)
+  );
   if (state.scrapedAt !== undefined && state.scrapedAt !== null) {
     if (typeof state.scrapedAt !== "string" || !Number.isFinite(Date.parse(state.scrapedAt))) {
       return null;
@@ -112,7 +116,7 @@ export function validateParsedStateBlob(raw: unknown): ProviderQuotaSnapshot | n
   if (state.explanations !== undefined && state.explanations !== null) {
     if (!Array.isArray(state.explanations)) return null;
     for (const explanation of state.explanations) {
-      if (!isValidExplanation(explanation)) return null;
+      if (!isValidExplanation(explanation, limitLabels)) return null;
     }
   }
   // Parsed snapshots are the normalized projection, never a second copy of

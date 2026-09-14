@@ -54,6 +54,7 @@ describe("versioned parsed quota state", () => {
 
     for (const explanation of [
       { ...validExplanation, window: "" },
+      { ...validExplanation, window: "Missing Window" },
       { ...validExplanation, field: "percentLeft" },
       { ...validExplanation, rule: "invented_rule" },
       { ...validExplanation, detail: null },

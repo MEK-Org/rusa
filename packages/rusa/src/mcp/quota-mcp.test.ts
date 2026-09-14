@@ -3108,6 +3108,37 @@ describe("quota MCP server", () => {
         expect(inferred.limits?.[0].resetAtIso).toBe(sparkResetIso);
       });
 
+      it("carried_forward_bad_read: Step 3 never crosses providers", () => {
+        const previousState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: "2026-08-26T15:00:00.000Z",
+              scope: { provider: "claude" },
+            },
+          ],
+        };
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: { provider: "codex" },
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, previousState, "2026-08-26T11:00:00.000Z");
+        expect(inferred.limits?.[0].resetAtIso).toBeUndefined();
+      });
+
       it("invariant: empty explanations list => inferred_parsed_state equals parsed_state", () => {
         const rawState: ProviderQuotaSnapshot = {
           provider: "claude",

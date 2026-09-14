@@ -35,16 +35,21 @@ export interface QuotaCollectionLoopOptions {
 }
 
 /**
- * The service-side collection loop (#354, design §12 item 2): one owner for
- * probing, parsing, inference, controller advancement, and pacing policy.
+ * The coordinator-side collection loop (#354, design §12 item 2): it owns
+ * probing, parsing, inference, controller advancement, and pacing policy
+ * inside the coordinator process.
+ *
+ * This is the approved temporary stage-1 collection path, not yet the pool's
+ * sole collector: the instance client-read migration removes the legacy tick
+ * in the later §12 item 3 / #355 rollout step.
  *
  * Every tick, per configured provider, the loop asks the single service-owned
  * `QuotaService` for the current state. The probe layer's TTL cache makes the
  * provider TTL a floor on probe cadence, and its in-flight dedupe collapses
- * concurrent ticks — pool-wide, exactly one probe and one parse per provider
- * per cadence no matter how many clients are connected (criterion 1). After
- * the probe batch the loop advances the pending controller observations, so
- * controller advancement lives in the service's tick rather than any client's.
+ * concurrent ticks — within this coordinator process, exactly one probe and
+ * one parse per provider per cadence no matter how many clients are connected
+ * (criterion 1). After the probe batch the loop advances its pending
+ * controller observations.
  *
  * Boot hydration seeds the single `prevState` per provider from the latest
  * persisted `quota_scrapes.parsed_state`, so a service restart continues an
@@ -114,9 +119,9 @@ export class QuotaCollectionLoop {
   }
 
   private runTick(): Promise<void> {
-    // One tick at a time, pool-wide: a tick that is still probing when the
-    // next cadence fires (or when a second client-driven tick arrives) joins
-    // the in-flight tick instead of queueing a second probe batch.
+    // One coordinator tick at a time: a tick that is still probing when the
+    // next cadence fires joins the in-flight tick instead of queueing a second
+    // probe batch.
     if (!this.tickInFlight) {
       this.tickInFlight = this.doTick().finally(() => {
         this.tickInFlight = null;
@@ -144,9 +149,9 @@ export class QuotaCollectionLoop {
         this.options.onError?.(provider, error);
       }
     }
-    // The service's tick is the single owner of controller advancement: every
-    // unprocessed observation is reasoned exactly once, here, not in any
-    // client's tick.
+    // This coordinator path owns its controller advancement. The later client
+    // migration removes the legacy instance tick before this becomes the
+    // pool-wide advancement path.
     this.options.store.advancePendingController({ maxIntervalSeconds: this.maxIntervalSeconds });
   }
 }

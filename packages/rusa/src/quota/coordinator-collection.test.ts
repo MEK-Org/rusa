@@ -205,7 +205,7 @@ describe("QuotaCollectionLoop", () => {
     }
   });
 
-  it("hydrates the sole probe prevState from the latest validated snapshot", () => {
+  it("hydrates the coordinator probe prevState from the latest validated snapshot", () => {
     const store = storeWithReading();
     try {
       const hydrate = vi.fn();
