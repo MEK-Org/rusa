@@ -9,7 +9,7 @@ describe("coordinatorProviderLanes", () => {
         claude: { cliCommand: "claude" },
         experimental: { cliCommand: "experimental" },
       },
-    } as RusaConfig;
+    } as unknown as RusaConfig;
 
     expect(coordinatorProviderLanes(config)).toEqual({
       configuredProviders: ["claude", "experimental"],
@@ -18,7 +18,7 @@ describe("coordinatorProviderLanes", () => {
   });
 
   it("keeps the established all-provider default when no provider is configured", () => {
-    expect(coordinatorProviderLanes({ providers: {} } as RusaConfig)).toEqual({
+    expect(coordinatorProviderLanes({ providers: {} } as unknown as RusaConfig)).toEqual({
       configuredProviders: undefined,
       collectionProviders: ["claude", "codex", "agy", "kimi"],
     });
