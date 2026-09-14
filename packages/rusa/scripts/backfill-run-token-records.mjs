@@ -7,7 +7,7 @@ import {
   applyTokenRecordsBackfill,
   backupDatabase,
   generateReport,
-} from "../dist/actor/backfill-run-token-records.js";
+} from "../build/maintenance/actor/backfill-run-token-records.js";
 
 export function usage() {
   return [
