@@ -109,11 +109,6 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       : DEFAULT_STALE_AFTER_MS;
 
     const store = new SharedQuotaStore(databasePath);
-    if (config.quota?.throttle) {
-      store.configureController({
-        maxIntervalSeconds,
-      });
-    }
 
     // Collapse config aliases onto canonical provider throttle lanes
     const providerKeys = Object.keys(config.providers ?? {});
