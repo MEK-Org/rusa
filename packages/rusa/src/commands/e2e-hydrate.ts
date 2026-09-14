@@ -72,6 +72,9 @@ export async function runE2EHydrate(opts: {
   // Helper to encode FAKE_PROVIDER_OUTPUT inside the charter
   const fakeProviderOutput = (output: unknown) =>
     `\nFAKE_PROVIDER_OUTPUT: ${JSON.stringify(output)}`;
+  // The disposable instance's fake provider requires an explicit model since
+  // #169; its external root runs model "fake-model" (#456).
+  const fakeModel = "fake-model";
   const yieldCall = (status: "complete" | "blocked", note: string) => ({
     id: `yield-${status}-${note}`,
     name: "mcp_mesh_yield_run",
@@ -96,6 +99,7 @@ export async function runE2EHydrate(opts: {
   const idleActor = (await post(rootPort, "/actors", {
     charter: `Be a helpful assistant.${completedOutput("Hello there!", "Initial task complete")}`,
     provider: "fake",
+    model: fakeModel,
     title: "Completed Task",
   })) as { id: string };
   console.log(`Spawned idle actor: ${idleActor.id}`);
@@ -117,6 +121,7 @@ export async function runE2EHydrate(opts: {
       ],
     })}`,
     provider: "fake",
+    model: fakeModel,
     title: "Blocked Task",
   })) as { id: string };
   console.log(`Spawned blocked actor: ${blockedActor.id}`);
@@ -126,6 +131,7 @@ export async function runE2EHydrate(opts: {
   const retiredActor = (await post(rootPort, "/actors", {
     charter: `Old task.${completedOutput("done", "Old task complete")}`,
     provider: "fake",
+    model: fakeModel,
     title: "Retired Task",
   })) as { id: string };
   console.log(`Spawned actor to retire: ${retiredActor.id}`);
@@ -141,6 +147,7 @@ export async function runE2EHydrate(opts: {
       output: "Something went wrong",
     })}`,
     provider: "fake",
+    model: fakeModel,
     title: "Failing Task",
   })) as { id: string };
   console.log(`Spawned errored actor: ${erroredActor.id}`);
@@ -153,6 +160,7 @@ export async function runE2EHydrate(opts: {
       "Large emoji response complete"
     )}`,
     provider: "fake",
+    model: fakeModel,
     title: "Emoji & Huge Message",
   })) as { id: string };
   console.log(`Spawned huge message actor: ${emojiActor.id}`);
@@ -165,6 +173,7 @@ export async function runE2EHydrate(opts: {
       "Long charter complete"
     )}`,
     provider: "fake",
+    model: fakeModel,
     title: "Long Charter",
   })) as { id: string };
   console.log(`Spawned long charter actor: ${longActor.id}`);
