@@ -709,6 +709,65 @@ describe("quota MCP server", () => {
       ]);
     });
 
+    it("passes an incomplete configured model window to inference without losing provider evidence", async () => {
+      const resetAtIso = "2026-08-27T10:00:00.000Z";
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso,
+              },
+              {
+                label: "Current Week (Fable)",
+                kind: "weekly",
+                usedPercent: 30,
+                models: ["Fable"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+      ]);
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({
+          label: "Current Week",
+          resetAtIso,
+          scope: { provider: "claude" },
+        }),
+        expect.objectContaining({
+          label: "Current Week (Fable)",
+          resetAtIso: undefined,
+          scope: { provider: "claude", models: ["claude-fable"] },
+        }),
+      ]);
+
+      if (parsed.status !== "available" || !parsed.limits) {
+        throw new Error("expected parsed provider and model windows");
+      }
+
+      const inferred = inferQuotaState({
+        provider: "claude",
+        scrapedAt: "2026-08-20T10:00:00.000Z",
+        status: parsed.status,
+        limits: parsed.limits,
+      });
+      expect(inferred.limits?.[1]?.resetAtIso).toBe(resetAtIso);
+      expect(inferred.explanations).toContainEqual({
+        window: "Current Week (Fable)",
+        field: "resetAtIso",
+        rule: "sibling_window_copy",
+        detail: "copied from the provider-scope weekly in the same scrape",
+      });
+    });
+
     it("drops unconfigured reserve/model labels and retains provider-wide evidence", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>

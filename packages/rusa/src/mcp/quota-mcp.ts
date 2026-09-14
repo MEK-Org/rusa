@@ -585,8 +585,10 @@ async function parseQuotaWithLlm(
       }
 
       // A partially consumed provider window needs a reset so downstream pacing
-      // does not act on an unbounded quota reading.
-      if (percentLeft < 100 && !resetAtIso) {
+      // does not act on an unbounded quota reading. A model-scoped row is
+      // preserved for inference instead: it can inherit a same-kind provider
+      // reset or a compatible prior model reset without altering provider status.
+      if (canonicalModels.length === 0 && percentLeft < 100 && !resetAtIso) {
         throw new Error(
           `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
         );
