@@ -861,6 +861,16 @@ export function inferQuotaState(
     }
   }
 
+  // A partially used model window may reach inference without a reset so it
+  // can use a sibling or compatible previous model row. If neither repair
+  // applies, it cannot safely become durable quota state; discard only that
+  // model row and preserve the independently valid provider evidence.
+  if (limits && limits.length > 0) {
+    limits = limits.filter(
+      (limit) => !(isModelScopedWindow(limit) && limit.percentLeft < 100 && !limit.resetAtIso)
+    );
+  }
+
   return {
     ...rawState,
     status,

@@ -768,6 +768,52 @@ describe("quota MCP server", () => {
       });
     });
 
+    it("discards an unresolved configured model window without losing provider evidence", async () => {
+      const resetAtIso = "2026-08-27T10:00:00.000Z";
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso,
+              },
+              {
+                label: "Session (Fable)",
+                kind: "session",
+                usedPercent: 30,
+                models: ["Fable"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+      ]);
+      if (parsed.status !== "available" || !parsed.limits) {
+        throw new Error("expected parsed provider and model windows");
+      }
+
+      const inferred = inferQuotaState({
+        provider: "claude",
+        scrapedAt: "2026-08-20T10:00:00.000Z",
+        status: parsed.status,
+        limits: parsed.limits,
+      });
+      expect(inferred).toMatchObject({ status: "available" });
+      expect(inferred.limits).toEqual([
+        expect.objectContaining({
+          label: "Current Week",
+          resetAtIso,
+          scope: { provider: "claude" },
+        }),
+      ]);
+    });
+
     it("drops unconfigured reserve/model labels and retains provider-wide evidence", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
