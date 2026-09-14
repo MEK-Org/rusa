@@ -24,7 +24,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     },
     createPullRequest: async (opts: CreatePROptions) => {
       calls.push({ method: "createPullRequest", args: [opts] });
-      return { number: 1, htmlUrl: "https://example.test/pr/1" };
+      return { number: 1, htmlUrl: "https://example.test/pr/1", wasCreated: true };
     },
     createPrReviewComment: async (opts: CreatePrReviewCommentOptions) => {
       calls.push({ method: "createPrReviewComment", args: [opts] });
@@ -895,6 +895,25 @@ describe("tracker MCP server", () => {
       arguments: { repo: "owner/repo", head: "feature", title: "T", body: "B" },
     });
     expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/pulls/1");
+  });
+
+  it("does not notify onResourceCreated when create_pull_request updates an existing PR via PATCH (wasCreated: false)", async () => {
+    const { client: backend } = recordingIssueClient();
+    backend.createPullRequest = async (_opts) => ({
+      number: 1,
+      htmlUrl: "https://example.test/pr/1",
+      wasCreated: false,
+    });
+    const onResourceCreated = vi.fn();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-res", backend, { onResourceCreated })
+    );
+
+    await client.callTool({
+      name: "create_pull_request",
+      arguments: { repo: "owner/repo", head: "feature", title: "T", body: "B" },
+    });
+    expect(onResourceCreated).not.toHaveBeenCalled();
   });
 
   it("does not fail create_issue if onResourceCreated throws", async () => {

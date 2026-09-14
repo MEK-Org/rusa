@@ -129,7 +129,10 @@ describe("GitHubIssueClient", () => {
       labels: ["bug", "triage"],
     });
 
-    expect(issue).toEqual({ number: 44, htmlUrl: `https://github.com/${REPO}/issues/44` });
+    expect(issue).toEqual({
+      number: 44,
+      htmlUrl: `https://github.com/${REPO}/issues/44`,
+    });
     expect(requests[0].body).toEqual({
       title: "New issue",
       body: "Issue body",
@@ -170,6 +173,7 @@ describe("GitHubIssueClient", () => {
     expect(pr).toEqual({
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
+      wasCreated: true,
     });
     const create = requests.find((r) => r.path === `/repos/${REPO}/pulls` && r.method === "POST");
     expect(create?.body).toEqual({
@@ -205,6 +209,7 @@ describe("GitHubIssueClient", () => {
     expect(pr).toEqual({
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
+      wasCreated: true,
     });
     expect(requests.some((r) => r.path.endsWith("/requested_reviewers"))).toBe(false);
   });
@@ -230,6 +235,7 @@ describe("GitHubIssueClient", () => {
     expect(pr).toEqual({
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
+      wasCreated: false,
     });
     expect(requests.some((r) => r.method === "POST" && r.path === `/repos/${REPO}/pulls`)).toBe(
       false
@@ -464,6 +470,7 @@ describe("GitHubIssueClient", () => {
     expect(pr).toEqual({
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
+      wasCreated: false,
     });
     const patch = requests.find((r) => r.method === "PATCH");
     expect(patch?.body).toEqual({ title: "Updated title", body: "Updated body." });
@@ -522,7 +529,7 @@ describe("GitHubIssueClient", () => {
       ...({} as IssueClient & GitHubPollingIssueClient),
       createPullRequest: async () => {
         delegateCalls.push("createPullRequest");
-        return { number: 1, htmlUrl: "https://github.example/pr/1" };
+        return { number: 1, htmlUrl: "https://github.example/pr/1", wasCreated: true };
       },
     };
     const requests = installFetch({});

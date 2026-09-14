@@ -2429,10 +2429,12 @@ export class ActorMesh {
       );
     }
 
-    // Mechanical creator subscriptions  make it common for the delegator
-    // to hold the exact active subscription it is handing off; release it first
-    // (mirroring reclaimEventSource) so the store's one-active-subscriber
-    // invariant admits the child.
+    // Additive creator subscriptions are delivery-only and do not confer
+    // ownership; only an independently effective ancestor owner may delegate
+    // when no exact ownership is held. If the delegator holds an exact active
+    // ownership claim it is handing off, release it first (mirroring
+    // reclaimEventSource) so the store's one-active-subscriber invariant
+    // admits the child.
     if (this.activeSubscriptionHeldBy(delegatedBy, resource)) {
       this.unsubscribeEventSource(resource, delegatedBy, this.now());
     }

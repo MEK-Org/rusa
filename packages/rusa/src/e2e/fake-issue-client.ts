@@ -75,7 +75,7 @@ export class FakeIssueClient implements IssueClient {
       ...(opts.base !== undefined ? { base: opts.base } : {}),
       author: this.botAccount,
     });
-    return { number: pr.number, htmlUrl: pr.htmlUrl };
+    return { number: pr.number, htmlUrl: pr.htmlUrl, wasCreated: pr.wasCreated };
   }
 
   async getOpenPullRequestsByAuthor(_repo: string, author: string): Promise<OpenPullRequest[]> {

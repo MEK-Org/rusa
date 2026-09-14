@@ -5,7 +5,11 @@ import { cert, deleteApp, initializeApp, type ServiceAccount } from "firebase-ad
 import { type DecodedIdToken, getAuth } from "firebase-admin/auth";
 import { validateDashboardAuth } from "../config/dashboard-auth.js";
 import type { DashboardAuthConfig } from "../config/types.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
+import { DashboardIdentityResolver } from "./identity.js";
 
 export const SESSION_COOKIE = "__Host-rusa_session";
 export const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
@@ -23,7 +27,11 @@ const isTransient = (error: unknown): boolean =>
   "code" in error &&
   typeof error.code === "string" &&
   TRANSIENT_CODES.has(error.code);
-const authenticatedRequests = new WeakSet<IncomingMessage>();
+const authenticatedRequests = new WeakMap<IncomingMessage, UserPrincipal>();
+/** The durable identity behind an authorized request. Actions still carry
+ * `human:operator` authority; this is identity, not yet tenant-scoped authorization. */
+export const getDashboardRequestPrincipal = (req: IncomingMessage): UserPrincipal | undefined =>
+  authenticatedRequests.get(req);
 export const isAuthenticatedOperatorRequest = (req: IncomingMessage): boolean =>
   authenticatedRequests.has(req);
 
@@ -93,7 +101,7 @@ async function readToken(req: IncomingMessage): Promise<string> {
   return body.idToken;
 }
 
-/** One operator, unchanged human:operator authority. No user rows or identity migration. */
+/** One operator, durable verified identity, unchanged human:operator authority. */
 export class DashboardAuth {
   private readonly csrf = new DashboardCsrf();
   private readonly revocations = new Map<string, number>();
@@ -105,6 +113,7 @@ export class DashboardAuth {
   constructor(
     readonly config: DashboardAuthConfig,
     private readonly firebase: FirebaseSessionAdapter,
+    private readonly identities: DashboardIdentityResolver,
     private readonly now = Date.now,
     private readonly dispose: () => Promise<void> = async () => {},
     private readonly emulatorUrl?: string
@@ -131,7 +140,10 @@ export class DashboardAuth {
     }
   }
 
-  private async verify(cookie: string, forceRevocation = false): Promise<DecodedIdToken> {
+  private async verify(
+    cookie: string,
+    forceRevocation = false
+  ): Promise<{ token: DecodedIdToken; principal: UserPrincipal }> {
     const key = createHash("sha256").update(cookie).digest("hex");
     const checkedAt = this.revocations.get(key);
     const checkRevoked =
@@ -144,6 +156,7 @@ export class DashboardAuth {
       return this.firebase.verifySessionCookie(cookie, false);
     });
     this.admitted(token);
+    const principal = this.identities.resolve(token);
     if (checkRevoked) {
       // Renewal issues a fresh cookie on every navigation, so entries expire rather than
       // accumulate; a failed attempt also counts, so an outage costs one call per window.
@@ -152,14 +165,14 @@ export class DashboardAuth {
       }
       this.revocations.set(key, this.now());
     }
-    return token;
+    return { token, principal };
   }
 
   async authorize(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     try {
       const cookie = sessionCookie(req);
       if (!cookie) throw new Error("unauthorized");
-      await this.verify(cookie);
+      const { principal } = await this.verify(cookie);
       if (
         !["GET", "HEAD", "OPTIONS"].includes(req.method ?? "") &&
         (!isSameOrigin(req) || !this.csrf.verify(req, cookie))
@@ -168,7 +181,7 @@ export class DashboardAuth {
         return false;
       }
       res.setHeader("Cache-Control", "no-store");
-      authenticatedRequests.add(req);
+      authenticatedRequests.set(req, principal);
       return true;
     } catch (error) {
       // 401 is the browser's signal to sign in again, so an unreachable Firebase
@@ -236,14 +249,16 @@ export class DashboardAuth {
       this.admitted(token);
       if (
         previous
-          ? previous.uid !== token.uid
+          ? previous.token.uid !== token.uid
           : !Number.isFinite(token.auth_time) ||
             this.now() / 1000 - token.auth_time > 300 ||
             token.auth_time > this.now() / 1000
       ) {
         throw new Error("unauthorized");
       }
+      const principal = this.identities.resolve(token);
       const cookie = await this.firebase.createSessionCookie(idToken, { expiresIn: SESSION_MS });
+      this.identities.recordAuthentication(principal, new Date(this.now()).toISOString());
       setCookie(res, cookie, SESSION_MS / 1000);
       this.csrf.issue(req, res, cookie, SESSION_MS / 1000);
       json(res, 200, { authenticated: true });
@@ -303,7 +318,11 @@ export class DashboardAuth {
   }
 }
 
-export function createDashboardAuth(config: DashboardAuthConfig): DashboardAuth {
+export function createDashboardAuth(
+  config: DashboardAuthConfig,
+  principals: PrincipalRepository,
+  logger: Logger = nullLogger
+): DashboardAuth {
   validateDashboardAuth(config);
   // Auth emulators accept unsigned tokens. Never inherit this bypass in the production boundary.
   if (process.env.FIREBASE_AUTH_EMULATOR_HOST)
@@ -338,7 +357,13 @@ export function createDashboardAuth(config: DashboardAuthConfig): DashboardAuth 
       { projectId, credential: cert(credential as ServiceAccount) },
       `rusa-dashboard-${randomUUID()}`
     );
-    return new DashboardAuth(config, getAuth(app), Date.now, () => deleteApp(app));
+    return new DashboardAuth(
+      config,
+      getAuth(app),
+      new DashboardIdentityResolver(() => principals, projectId, logger),
+      Date.now,
+      () => deleteApp(app)
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not initialize dashboard Firebase authentication: ${message}`, {

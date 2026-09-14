@@ -56,6 +56,7 @@ export interface TrackerPr {
   labels: string[];
   createdAt: string;
   updatedAt: string;
+  wasCreated: boolean;
 }
 
 /** The review verdicts Rusa reconciles on (lowercase, as in GitHub webhooks). */
@@ -291,7 +292,7 @@ export class LocalTracker {
         existing.base = opts.base;
       }
       existing.updatedAt = now;
-      return existing;
+      return { ...existing, wasCreated: false };
     }
     const number = this.nextNumber++;
     const pr: TrackerPr = {
@@ -306,6 +307,7 @@ export class LocalTracker {
       labels: [],
       createdAt: now,
       updatedAt: now,
+      wasCreated: true,
     };
     this.prs.set(number, pr);
     return pr;
