@@ -112,9 +112,12 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       // duplicate id is suppressed and reported as "nothing new". Without this
       // the fake silently grants at-least-once where the real store gives
       // exactly-once, and dedupe-dependent behaviour cannot be tested here.
-      const inserted = inputs
-        .map((input, index) => ({
-          id: input.id ?? `entry-${entries.length + index + 1}`,
+      const inserted: InboxEntry[] = [];
+      for (const input of inputs) {
+        const id = input.id ?? `entry-${entries.length + 1}`;
+        if (entries.some((existing) => existing.id === id)) continue;
+        const entry: InboxEntry = {
+          id,
           actorId: input.actorId,
           source: input.source,
           deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
@@ -122,9 +125,10 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
           handledAt: null,
           handledNote: null,
           payload: input.payload,
-        }))
-        .filter((row) => !entries.some((existing) => existing.id === row.id));
-      entries.push(...inserted);
+        };
+        entries.push(entry);
+        inserted.push(entry);
+      }
       // Mirror SqliteInboxRepository: snapshot so an unsubscribe from inside a
       // callback cannot skip a sibling, and contain a throwing listener.
       if (inserted.length > 0) {
