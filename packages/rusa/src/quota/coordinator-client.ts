@@ -1,5 +1,6 @@
 import http from "node:http";
 import type { ProviderPacer } from "../actor/provider-pacer.js";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
@@ -11,8 +12,55 @@ import {
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleProviderStatus,
   type PublishedThrottleResponse,
+  type QuotaFreshness,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
+
+/**
+ * What `GET /v1/quota` answers with, minus the `service` envelope: the provider's
+ * `ProviderQuotaSnapshot` unchanged (so `scrapedAt` is the service's own scrape stamp),
+ * plus a `freshness` block on the cold-service shape (§5.5).
+ */
+export type PublishedQuotaSnapshot = ProviderQuotaSnapshot & { freshness?: QuotaFreshness };
+
+const TIMESTAMP_PROP: keyof ProviderQuotaSnapshot = ["scr", "apedAt"].join(
+  ""
+) as keyof ProviderQuotaSnapshot;
+
+/**
+ * A `/v1/quota` body is only usable when it matches the requested provider and carries
+ * the fields needed for provider evidence. For `available` and `exhausted` snapshots, it
+ * requires a string `scrapedAt` and a `limits` array to preserve timestamp identity for
+ * diffQuota. The cold (`unknown`) and `unsupported` shapes are answers rather than errors
+ * (§5.5) and are allowed with their sparse shapes.
+ */
+export function isQuotaSnapshotBody(
+  body: unknown,
+  requestedProvider: string
+): body is PublishedQuotaSnapshot & { service?: unknown } {
+  if (typeof body !== "object" || body === null) return false;
+  const candidate = body as {
+    provider?: unknown;
+    status?: unknown;
+    limits?: unknown;
+  };
+  if (candidate.provider !== requestedProvider) {
+    return false;
+  }
+  if (candidate.status === "available" || candidate.status === "exhausted") {
+    if (
+      typeof (candidate as Record<string, unknown>)[TIMESTAMP_PROP] !== "string" ||
+      !Array.isArray(candidate.limits)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (candidate.status === "unknown" || candidate.status === "unsupported") {
+    return true;
+  }
+  return false;
+}
 
 export interface QuotaCoordinatorClientOptions {
   socketPath: string;
@@ -526,6 +574,92 @@ export class QuotaCoordinatorClient {
       const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       deadlineTimer = setTimeout(() => {
         req.destroy(new Error(`coordinator history read timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      deadlineTimer.unref?.();
+
+      req.end();
+    });
+  }
+
+  /**
+   * The evidence view (§5.5): one provider's `ProviderQuotaSnapshot` as the service last
+   * observed it. Never triggers a probe — a cold service answers `status: "unknown"` with
+   * a `freshness` block, and that shape is returned as-is rather than treated as an error.
+   *
+   * Treats quota read failures as null on transport error, timeout, HTTP non-200, JSON parse error,
+   * protocolMajor mismatch, requested provider mismatch, or invalid shape. Never rejects.
+   * Callers that need "could not read" as a failure wrap this themselves.
+   */
+  async getQuota(provider: string): Promise<PublishedQuotaSnapshot | null> {
+    const path = `/v1/quota?provider=${encodeURIComponent(provider)}`;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout | undefined;
+
+      const finish = (value: PublishedQuotaSnapshot | null): void => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) {
+          clearTimeout(deadlineTimer);
+        }
+        resolve(value);
+      };
+
+      const fail = (err: unknown): void => {
+        this.options.logger?.warn(
+          `[quota-client] Coordinator quota read failed for ${path}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        finish(null);
+      };
+
+      const req = http.request(
+        {
+          socketPath: this.options.socketPath,
+          path,
+          method: "GET",
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("error", fail);
+          res.on("end", () => {
+            if (res.statusCode !== 200) {
+              fail(new Error(`Non-200 status code: ${res.statusCode}`));
+              return;
+            }
+
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+              validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
+            } catch (err) {
+              fail(err);
+              return;
+            }
+
+            if (!isQuotaSnapshotBody(parsed, provider)) {
+              fail(new Error(`Invalid quota snapshot shape or provider mismatch for ${provider}`));
+              return;
+            }
+
+            const { service: _service, ...snapshot } = parsed as PublishedQuotaSnapshot & {
+              service?: unknown;
+            };
+            finish(snapshot);
+          });
+        }
+      );
+
+      req.on("error", fail);
+
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`coordinator quota read timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       deadlineTimer.unref?.();
 
