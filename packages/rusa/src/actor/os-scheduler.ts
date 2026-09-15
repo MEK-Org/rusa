@@ -25,6 +25,7 @@ const INSTANCE_TAG_VERSION = "v1";
 // no legacy line can ever parse as a scoped one.
 const LEGACY_WAKE_TAG_PREFIX = "# mc-wake:";
 const LEGACY_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation:";
+const LEGACY_MESSAGE_TAG_PREFIX = "# mc-message-delivery:";
 
 /**
  * The actor-facing recurring-wake slice of the host scheduler.
@@ -94,7 +95,8 @@ export interface OsSchedulerOptions {
   instanceId: string;
   /**
    * Receives one record per `at` write, removal and enqueue confirmation, and
-   * the boot audit of legacy wake blocks. Silent when omitted.
+   * the boot audit of legacy wake blocks and legacy message jobs. Silent when
+   * omitted.
    */
   log?: Logger;
   /** Clock for judging whether a missing `at` job could already have fired. */
@@ -107,6 +109,21 @@ export interface UnadoptedLegacyWakeBlock {
   /** The wake-port path the block's job line reads, when it has one. */
   portFile: string | null;
   cronExpr: string;
+}
+
+/**
+ * A pre-scoping `# mc-message-delivery:` job found in the shared `at` queue.
+ * No instance owns it after the upgrade: it still fires, but no instance
+ * lists or cancels it.
+ */
+export interface LegacyMessageDeliveryJob {
+  atJobId: string;
+  tag: string;
+  /** The message id the tag encodes, when it decodes cleanly. */
+  messageId: string | null;
+  /** From the job's payload, when it decodes cleanly. */
+  toId: string | null;
+  deliverAt: string | null;
 }
 
 export interface WakeEntry {
@@ -402,6 +419,41 @@ export class DefaultOsScheduler implements OsScheduler {
     return unadopted;
   }
 
+  /**
+   * Boot audit: name every pre-scoping `# mc-message-delivery:` job still in
+   * the shared `at` queue. Legacy message jobs are foreign to every instance
+   * by design — they cannot be attributed to a writer — so after the upgrade
+   * each still fires but none is listed by `list_pending_messages` or
+   * cancellable until it does. Recording them here, once per boot, is the
+   * only place an operator sees that gap. Nothing is written or removed.
+   */
+  reportLegacyMessageDeliveryJobs(): LegacyMessageDeliveryJob[] {
+    const legacy: LegacyMessageDeliveryJob[] = [];
+    for (const job of this.atIo.list()) {
+      const tag = job.script
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.startsWith(LEGACY_MESSAGE_TAG_PREFIX));
+      if (tag === undefined) continue;
+      let payload: ScheduledMessage | null = null;
+      try {
+        payload = decodeScheduledMessage(job.script);
+      } catch {
+        // A legacy job this scheduler cannot read is still a legacy job.
+      }
+      const record: LegacyMessageDeliveryJob = {
+        atJobId: job.id,
+        tag,
+        messageId: decodeTagComponent(tag.slice(LEGACY_MESSAGE_TAG_PREFIX.length)),
+        toId: payload?.toId ?? null,
+        deliverAt: payload?.deliverAt ?? null,
+      };
+      this.log.warn("legacy_message_delivery_job_not_adopted", { ...record });
+      legacy.push(record);
+    }
+    return legacy;
+  }
+
   /** Build the complete cron line for an actor wake. */
   buildWakeJobLine(
     actorId: string,
@@ -620,10 +672,16 @@ export class DefaultOsScheduler implements OsScheduler {
   }
 
   /** The one path from this class into `atrm`, recorded per job with the tag it was matched by. */
-  private removeAtIds(family: InstanceTagFamily, id: string, tag: string, ids: Iterable<string>) {
+  private removeAtIds(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    ids: Iterable<string>,
+    reason?: string
+  ) {
     for (const atJobId of ids) {
       this.atIo.remove(atJobId);
-      this.log.info("at_job_removed", { family, id, tag, atJobId });
+      this.log.info("at_job_removed", { family, id, tag, atJobId, ...(reason ? { reason } : {}) });
     }
   }
 
@@ -659,6 +717,17 @@ export class DefaultOsScheduler implements OsScheduler {
       return;
     }
     this.log.error("at_enqueue_unconfirmed", { ...fields, reason: "job missing from queue" });
+    // The caller is about to report this send as failed, so nothing may stay
+    // armed under the id `at` printed: were the re-read wrong and the job in
+    // fact spooled, it would deliver a message its sender was told never left
+    // (and will likely send again). `atrm` of an id that was never spooled is
+    // a no-op, and a failure here cannot make the outcome worse than the
+    // unconfirmed write already is, so it is recorded and the refusal stands.
+    try {
+      this.removeAtIds(family, id, tag, [atJobId], "unconfirmed enqueue");
+    } catch (err) {
+      this.log.warn("at_job_remove_failed", { ...fields, err });
+    }
     throw new AtEnqueueUnconfirmedError(tag, atJobId);
   }
 
@@ -716,6 +785,10 @@ export class DefaultOsScheduler implements OsScheduler {
       // and prior at jobs armed.  Once it succeeds, remove only the stale jobs
       // captured before installation (never the just-created replacement).
       const staleAtIds = this.staleAtIds(tag);
+      // No enqueue re-read here, by design: {@link confirmAtEnqueue} exists to
+      // gate a message id handed back to a sender, and an activation has no
+      // such caller — boot reconciliation re-derives every activation from
+      // the repository, so a lost job is re-armed rather than lost.
       const replacementId = this.scheduleAt("obligation-activation", id, tag, script, time.date);
       this.updateCron(tag, endTag, null);
       this.removeAtIds(
@@ -752,6 +825,16 @@ export class DefaultOsScheduler implements OsScheduler {
     return Array.from(entries.values());
   }
 
+  /**
+   * Queue one message. The write is only reported once a re-read of the queue
+   * shows it ({@link confirmAtEnqueue}); on refusal the id `at` printed is
+   * removed if it exists, so a refused send leaves nothing armed under a
+   * fresh id. Re-scheduling an id that is already queued (the legacy import
+   * does this; `ActorMesh.sendMessage` never does, every send is a fresh id)
+   * keeps the prior copy armed across the write and removes it only after
+   * the replacement is confirmed — so a refused re-schedule is not a lost
+   * message: the earlier schedule of that id stands and delivers once.
+   */
   scheduleMessageDelivery(message: ScheduledMessage): void {
     if (Buffer.byteLength(message.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES) {
       throw new Error("Scheduled message body exceeds the 128 KiB host-job limit");

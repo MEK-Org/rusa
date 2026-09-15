@@ -7205,8 +7205,8 @@ describe("ActorMesh", () => {
       ])("in boot order %s neither instance cancels the other's message or the legacy job", (_, order) => {
         const { at, jobs } = sharedAtQueue();
         const instances = {
-          prod: bootInstance("/home/sf/.rusa-prod", at),
-          staging: bootInstance("/home/sf/.rusa-staging", at),
+          prod: bootInstance("/srv/rusa/prod", at),
+          staging: bootInstance("/srv/rusa/staging", at),
         };
         const before = jobs.map((job) => ({ ...job }));
         expect(before.map((job) => job.id)).toEqual(["legacy", "100", "101"]);
@@ -7228,9 +7228,9 @@ describe("ActorMesh", () => {
         const lossy: AtIo = { ...at, schedule: () => "200" };
         const cron: CrontabIo = { read: () => "", write: () => undefined };
         const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), lossy, {
-          tokenFile: "/home/sf/.rusa-prod/wake-token",
-          portFile: "/home/sf/.rusa-prod/wake-port",
-          instanceId: "/home/sf/.rusa-prod",
+          tokenFile: "/srv/rusa/prod/wake-token",
+          portFile: "/srv/rusa/prod/wake-port",
+          instanceId: "/srv/rusa/prod",
         });
         const events: MeshEventInput[] = [];
         const chatRows = new Map<string, string>();
@@ -7265,8 +7265,8 @@ describe("ActorMesh", () => {
 
       it("still cancels its own job for a recipient it does not know, and only that one", () => {
         const { at, jobs } = sharedAtQueue();
-        const prod = bootInstance("/home/sf/.rusa-prod", at);
-        const staging = bootInstance("/home/sf/.rusa-staging", at);
+        const prod = bootInstance("/srv/rusa/prod", at);
+        const staging = bootInstance("/srv/rusa/staging", at);
         prod.scheduler.scheduleMessageDelivery({
           id: "prod-orphan",
           toId: "recipient-prod-never-knew",

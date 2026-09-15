@@ -878,10 +878,13 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
   });
 
   /**
-   * ActorMesh.reconcilePendingDeliveries at boot: every listed message whose
-   * recipient this instance does not know is cancelled. Before scoping, the
-   * listing spanned the whole per-user queue, so this cancelled every
-   * co-hosted instance's messages.
+   * The scheduler contract boot reconciliation relies on, restated here:
+   * every listed message whose recipient this instance does not know is
+   * cancelled. Before scoping, the listing spanned the whole per-user queue,
+   * so this cancelled every co-hosted instance's messages. This is a mirror,
+   * not the mesh code; the authoritative test of the real
+   * `ActorMesh.reconcilePendingDeliveries` over a shared queue in both boot
+   * orders is in `actor-mesh.test.ts` ("#466").
    */
   function bootReconcile(scheduler: DefaultOsScheduler, knownActors: string[]) {
     for (const pending of scheduler.listMessageDeliveries()) {
@@ -892,7 +895,7 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
   it("writes every tag family (cron block and at job) with this instance's identity through the one shared constructor", async () => {
     const { at, jobs } = sharedAtQueue();
     const cron = { data: "" };
-    const prod = instance("/home/sf/.rusa-prod", at, cron);
+    const prod = instance("/srv/rusa/prod", at, cron);
 
     await prod.schedule("act1", "0 3 * * *", "nightly");
     prod.scheduleObligationActivation("ob-cron", { kind: "cron", cronExpr: "0 4 * * *" });
@@ -904,16 +907,14 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       .map((line) => line.trim())
       .filter((line) => line.startsWith("# mc-"));
     expect(tagLines).toEqual([
-      "# mc-wake-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:YWN0MQ",
-      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItY3Jvbg",
-      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItY3Jvbg",
-      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItYXQ",
-      "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:bXNnLWE",
+      "# mc-wake-instance:v1:L3Nydi9ydXNhL3Byb2Q:YWN0MQ",
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhL3Byb2Q:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItYXQ",
+      "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3Byb2Q:bXNnLWE",
     ]);
     for (const line of tagLines) {
-      expect(line).toMatch(
-        /^# mc-[a-z-]+-instance(-end)?:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:[A-Za-z0-9_-]+$/
-      );
+      expect(line).toMatch(/^# mc-[a-z-]+-instance(-end)?:v1:L3Nydi9ydXNhL3Byb2Q:[A-Za-z0-9_-]+$/);
     }
   });
 
@@ -925,8 +926,8 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
 
     function seeded() {
       const { at, jobs } = sharedAtQueue([legacyJob]);
-      const prod = instance("/home/sf/.rusa-prod", at, { data: "" });
-      const staging = instance("/home/sf/.rusa-staging", at, { data: "" });
+      const prod = instance("/srv/rusa/prod", at, { data: "" });
+      const staging = instance("/srv/rusa/staging", at, { data: "" });
       prod.scheduleMessageDelivery(message("msg-a", "prod-only-actor"));
       staging.scheduleMessageDelivery(message("msg-b", "staging-only-actor"));
       return { jobs, prod, staging };
@@ -976,7 +977,7 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
       const stagingCopy = jobs.find((job) => job.id === "102");
       expect(stagingCopy?.script).toContain(
-        "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:bXNnLWE"
+        "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3N0YWdpbmc:bXNnLWE"
       );
 
       prod.cancelMessageDelivery("msg-a");
@@ -990,8 +991,8 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
   });
 
   describe("at queue diagnostics", () => {
-    const PROD = "/home/sf/.rusa-prod";
-    const MSG_TAG = "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:bXNnLWE";
+    const PROD = "/srv/rusa/prod";
+    const MSG_TAG = "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3Byb2Q:bXNnLWE";
 
     it("records every at write, confirmation and removal with the tag and this instance's id", () => {
       const { at } = sharedAtQueue();
@@ -1003,7 +1004,7 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       prod.cancelMessageDelivery("msg-a");
       prod.cancelObligationActivation("ob-at");
 
-      const OB_TAG = "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItYXQ";
+      const OB_TAG = "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItYXQ";
       expect(records()).toEqual([
         {
           component: "os-scheduler",
@@ -1097,6 +1098,58 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
           queueSize: 1,
           reason: "job missing from queue",
         },
+        // The id `at` printed is cleared whether or not it exists, so a
+        // refused send never leaves an armed job behind.
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "101",
+          reason: "unconfirmed enqueue",
+        },
+      ]);
+    });
+
+    it("removes the job when the re-read was wrong and `at` had spooled it: a refused send cannot deliver twice", () => {
+      const { at, jobs } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      // The job is spooled, but this one read of the queue does not show it.
+      const blind: AtIo = { ...at, list: () => at.list().filter((job) => job.id !== "100") };
+      const prod = instance(PROD, blind, { data: "" }, { log });
+
+      expect(() => prod.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(jobs).toEqual([]);
+      expect(records().map((record) => [record.msg, record.reason])).toEqual([
+        ["at_job_scheduled", undefined],
+        ["at_enqueue_unconfirmed", "job missing from queue"],
+        ["at_job_removed", "unconfirmed enqueue"],
+      ]);
+    });
+
+    it("still refuses when clearing the unconfirmed id fails, recording the failure", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const broken: AtIo = {
+        ...at,
+        schedule: () => "101",
+        remove: () => {
+          throw new Error("atrm: cannot talk to atd");
+        },
+      };
+      const prod = instance(PROD, broken, { data: "" }, { log });
+
+      expect(() => prod.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(records().map((record) => record.msg)).toEqual([
+        "at_job_scheduled",
+        "at_enqueue_unconfirmed",
+        "at_job_remove_failed",
       ]);
     });
 
@@ -1131,6 +1184,67 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       expect(records().filter((record) => record.reason === "job missing from queue")).toHaveLength(
         2
       );
+    });
+  });
+
+  describe("boot audit of legacy message jobs", () => {
+    const legacyJob = {
+      id: "legacy",
+      script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${encodeScheduledMessagePayload(message("legacy", "legacy-recipient"))}'\n`,
+    };
+    const unreadableLegacyJob = {
+      id: "legacy-unreadable",
+      script: "# mc-message-delivery:not*base64\ncurl /wake-message\n",
+    };
+
+    it("names every legacy job with its at id, tag and what the payload says, and neither lists nor removes it", () => {
+      const { at, jobs } = sharedAtQueue([legacyJob, unreadableLegacyJob]);
+      const { log, records } = recordingLogger();
+      const prod = instance("/srv/rusa/prod", at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      const before = jobs.map((job) => ({ ...job }));
+
+      const legacy = prod.reportLegacyMessageDeliveryJobs();
+
+      expect(legacy).toEqual([
+        {
+          atJobId: "legacy",
+          tag: "# mc-message-delivery:bGVnYWN5",
+          messageId: "legacy",
+          toId: "legacy-recipient",
+          deliverAt: "2026-09-16T12:00:00.000Z",
+        },
+        {
+          atJobId: "legacy-unreadable",
+          tag: "# mc-message-delivery:not*base64",
+          messageId: null,
+          toId: null,
+          deliverAt: null,
+        },
+      ]);
+      expect(
+        records().filter((record) => record.msg === "legacy_message_delivery_job_not_adopted")
+      ).toEqual(
+        legacy.map((job) => ({
+          component: "os-scheduler",
+          instanceId: "/srv/rusa/prod",
+          msg: "legacy_message_delivery_job_not_adopted",
+          ...job,
+        }))
+      );
+      expect(jobs).toEqual(before);
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "recipient")]);
+    });
+
+    it("reports nothing for an empty queue or one holding only scoped jobs", () => {
+      const { at } = sharedAtQueue();
+      const prod = instance("/srv/rusa/prod", at, { data: "" });
+      expect(prod.reportLegacyMessageDeliveryJobs()).toEqual([]);
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      instance("/srv/rusa/staging", at, { data: "" }).scheduleMessageDelivery(
+        message("msg-b", "recipient")
+      );
+      expect(prod.reportLegacyMessageDeliveryJobs()).toEqual([]);
     });
   });
 });

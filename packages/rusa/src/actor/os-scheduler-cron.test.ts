@@ -22,8 +22,8 @@ class FakeCrontab implements CrontabIo {
 }
 
 const OPTS = {
-  tokenFile: "/home/sf/.rusa/wake-token",
-  portFile: "/home/sf/.rusa/wake-port",
+  tokenFile: "/srv/rusa/a/wake-token",
+  portFile: "/srv/rusa/a/wake-port",
   instanceId: "test-instance",
 };
 const make = (content = "", log?: ReturnType<typeof recordingLogger>["log"]) => {
@@ -143,8 +143,8 @@ describe("DefaultOsScheduler actor wake job lines", () => {
     const { scheduler } = make();
     const line = scheduler.buildWakeJobLine("act1", "0 3 * * *", "nightly distill");
     expect(line.startsWith("0 3 * * * /usr/bin/curl -fsS")).toBe(true);
-    expect(line).toContain('-H "Authorization: Bearer $(cat /home/sf/.rusa/wake-token)"');
-    expect(line).toContain('"http://127.0.0.1:$(cat /home/sf/.rusa/wake-port)/wake"');
+    expect(line).toContain('-H "Authorization: Bearer $(cat /srv/rusa/a/wake-token)"');
+    expect(line).toContain('"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake"');
     expect(line).toContain("-d 'actorId=act1'");
     expect(line).toContain("-d 'reason=nightly distill'");
   });
@@ -249,19 +249,19 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
   // Written by a co-hosted instance ("other-instance") for the same actor id.
   const foreignBlock =
     "# mc-wake-instance:v1:b3RoZXItaW5zdGFuY2U:YWN0MQ\n" +
-    "0 5 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa-other/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa-other/wake-port)/wake\" -d 'actorId=act1' -d 'reason=foreign'\n";
+    "0 5 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/other/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/other/wake-port)/wake\" -d 'actorId=act1' -d 'reason=foreign'\n";
   // Pre-scoping blocks: one reads this instance's wake-port file, one reads another instance's.
   const ownLegacyBlock =
     "# mc-wake:act1\n" +
-    "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy own'\n";
+    "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy own'\n";
   const foreignLegacyBlock =
     "# mc-wake:act2\n" +
-    "0 4 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa-other/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa-other/wake-port)/wake\" -d 'actorId=act2' -d 'reason=legacy foreign'\n";
+    "0 4 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/other/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/other/wake-port)/wake\" -d 'actorId=act2' -d 'reason=legacy foreign'\n";
   // This instance's own home under a spelling the running process does not use:
   // the residual ownership cannot prove, so the block stays foreign.
   const respelledHomeLegacyBlock =
     "# mc-wake:act1\n" +
-    "0 2 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf//.rusa/wake-token)\" \"http://127.0.0.1:$(cat /home/sf//.rusa/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy respelled'\n";
+    "0 2 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa//a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa//a/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy respelled'\n";
   const userLine = "0 1 * * * /usr/bin/user-job\n";
 
   it("lists only this instance's blocks: scoped foreign and legacy foreign wakes are invisible", async () => {
@@ -342,8 +342,8 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
     const unadopted = scheduler.reportUnadoptedLegacyWakeBlocks();
 
     expect(unadopted).toEqual([
-      { actorId: "act2", portFile: "/home/sf/.rusa-other/wake-port", cronExpr: "0 4 * * *" },
-      { actorId: "act1", portFile: "/home/sf//.rusa/wake-port", cronExpr: "0 2 * * *" },
+      { actorId: "act2", portFile: "/srv/rusa/other/wake-port", cronExpr: "0 4 * * *" },
+      { actorId: "act1", portFile: "/srv/rusa//a/wake-port", cronExpr: "0 2 * * *" },
     ]);
     expect(records()).toEqual([
       {
@@ -352,7 +352,7 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
         msg: "legacy_wake_block_not_adopted",
         tag: "# mc-wake:act2",
         actorId: "act2",
-        portFile: "/home/sf/.rusa-other/wake-port",
+        portFile: "/srv/rusa/other/wake-port",
         cronExpr: "0 4 * * *",
       },
       {
@@ -361,7 +361,7 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
         msg: "legacy_wake_block_not_adopted",
         tag: "# mc-wake:act1",
         actorId: "act1",
-        portFile: "/home/sf//.rusa/wake-port",
+        portFile: "/srv/rusa//a/wake-port",
         cronExpr: "0 2 * * *",
       },
     ]);
