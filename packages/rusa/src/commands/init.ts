@@ -76,7 +76,6 @@ function buildDefaultConfig(existing?: RusaConfig | null): RusaConfig {
   const baseConfig: RusaConfig = {
     github: {
       ...(existing?.github?.account ? { account: existing.github.account } : {}),
-      pollIntervalSeconds: existing?.github?.pollIntervalSeconds ?? 300,
     },
     // No silent provider default — `validateConfig` fails if none are configured.
     providers: existing?.providers ?? {},
@@ -280,12 +279,6 @@ export async function runInit(opts?: InitOptions): Promise<void> {
   execSync(`git config --global user.email "${gitEmail}"`, { stdio: "pipe" });
   console.log(`  ✓ Git identity set: ${gitName} <${gitEmail}>`);
 
-  // 3. Polling interval
-  const pollInterval = await input({
-    message: "Polling fallback interval in seconds:",
-    default: String(existing?.github?.pollIntervalSeconds ?? 300),
-  });
-
   // 5. Detect CLI providers and configure API keys
   console.log("\nDetecting LLM providers...\n");
 
@@ -439,7 +432,6 @@ export async function runInit(opts?: InitOptions): Promise<void> {
   const config: RusaConfig = {
     github: {
       account: ghAccount,
-      pollIntervalSeconds: parseInt(pollInterval, 10) || 300,
     },
     providers,
     ...(geminiApiKey.trim() ? { geminiApiKey: geminiApiKey.trim() } : {}),

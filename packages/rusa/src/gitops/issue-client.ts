@@ -246,49 +246,6 @@ export interface PullRequestReviewDetails {
   author: string;
 }
 
-export interface PollIssueOrPullRequest {
-  number: number;
-  title: string;
-  body: string;
-  author: string;
-  state: string;
-  createdAt: string;
-  updatedAt: string;
-  isPullRequest: boolean;
-  /**
-   * Draft state of a polled pull request. GitHub's issues list carries `draft`
-   * on every PR-backed record, so this is a plain boolean: always false for an
-   * issue, and never "unknown" for a PR.
-   */
-  draft: boolean;
-}
-
-export interface PollIssueComment {
-  id: number;
-  issueNumber: number;
-  author: string;
-  body: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PollBranchHead {
-  sha: string;
-}
-
-export interface GitHubPollingIssueClient {
-  /** List repositories currently visible in an organization. */
-  listPollOrganizationRepositories(org: string): Promise<string[]>;
-  /** Read one branch head for deploy-push polling; null means the branch is absent. */
-  getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null>;
-  /** Fetch issues and PR-backed issues updated after a watermark for event polling. */
-  listUpdatedIssuesAndPullRequests(repo: string, since: string): Promise<PollIssueOrPullRequest[]>;
-  /** Fetch issue/PR conversation comments updated after a watermark for event polling. */
-  listUpdatedIssueComments(repo: string, since: string): Promise<PollIssueComment[]>;
-  /** Fetch the issue wrapper for a polled comment, including PR marker when present. */
-  getPollIssue(repo: string, issueNumber: number): Promise<PollIssueOrPullRequest>;
-}
-
 /**
  * The reaction emoji GitHub supports on an issue/PR. `eyes` is the 👀 ack the
  * root uses to signal "seen" (reply-on-origin) without shelling raw `gh`.
@@ -857,68 +814,6 @@ export class GitHubIssueClient implements IssueClient {
     }));
   }
 
-  async listUpdatedIssuesAndPullRequests(
-    repo: string,
-    since: string
-  ): Promise<PollIssueOrPullRequest[]> {
-    const params = new URLSearchParams({
-      state: "all",
-      since,
-      sort: "updated",
-      direction: "asc",
-      per_page: "100",
-    });
-    const issues = await this.apiPages<PollIssueResponse>(`/repos/${repo}/issues`, params);
-    return issues.map(mapPollIssue);
-  }
-
-  async listPollOrganizationRepositories(org: string): Promise<string[]> {
-    const repos = await this.apiPages<{ full_name: string }>(
-      `/orgs/${org}/repos`,
-      new URLSearchParams({ type: "all", per_page: "100" })
-    );
-    return repos.map((repo) => repo.full_name);
-  }
-
-  async getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null> {
-    try {
-      const response = await this.api<{ commit: { sha: string } }>(
-        "GET",
-        `/repos/${repo}/branches/${encodeURIComponent(branch)}`
-      );
-      return { sha: response.commit.sha };
-    } catch (err) {
-      if (err instanceof GitHubApiError && err.status === 404) return null;
-      throw err;
-    }
-  }
-
-  async listUpdatedIssueComments(repo: string, since: string): Promise<PollIssueComment[]> {
-    const params = new URLSearchParams({ since, per_page: "100" });
-    const comments = await this.apiPages<{
-      id: number;
-      body: string | null;
-      user: { login: string } | null;
-      created_at: string;
-      updated_at: string;
-      issue_url: string;
-    }>(`/repos/${repo}/issues/comments`, params);
-
-    return comments.map((comment) => ({
-      id: comment.id,
-      issueNumber: issueNumberFromUrl(comment.issue_url),
-      author: comment.user?.login ?? "",
-      body: comment.body ?? "",
-      createdAt: comment.created_at,
-      updatedAt: comment.updated_at,
-    }));
-  }
-
-  async getPollIssue(repo: string, issueNumber: number): Promise<PollIssueOrPullRequest> {
-    const issue = await this.api<PollIssueResponse>("GET", `/repos/${repo}/issues/${issueNumber}`);
-    return mapPollIssue(issue);
-  }
-
   async postComment(repo: string, issueNumber: number, body: string): Promise<void> {
     await this.api("POST", `/repos/${repo}/issues/${issueNumber}/comments`, { body });
   }
@@ -1432,9 +1327,9 @@ export class GitHubIssueClient implements IssueClient {
   }
 }
 
-export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClient {
+export class GitBridgeIssueClient implements IssueClient {
   constructor(
-    private readonly delegate: IssueClient & GitHubPollingIssueClient,
+    private readonly delegate: IssueClient,
     private readonly opts: { port: number }
   ) {}
 
@@ -1573,62 +1468,6 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
   removeSubIssue(repo: string, parentIssueNumber: number, childIssueNumber: number): Promise<void> {
     return this.delegate.removeSubIssue(repo, parentIssueNumber, childIssueNumber);
   }
-
-  listUpdatedIssuesAndPullRequests(repo: string, since: string): Promise<PollIssueOrPullRequest[]> {
-    return this.delegate.listUpdatedIssuesAndPullRequests(repo, since);
-  }
-
-  listPollOrganizationRepositories(org: string): Promise<string[]> {
-    return this.delegate.listPollOrganizationRepositories(org);
-  }
-
-  getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null> {
-    return this.delegate.getPollBranchHead(repo, branch);
-  }
-
-  listUpdatedIssueComments(repo: string, since: string): Promise<PollIssueComment[]> {
-    return this.delegate.listUpdatedIssueComments(repo, since);
-  }
-
-  getPollIssue(repo: string, issueNumber: number): Promise<PollIssueOrPullRequest> {
-    return this.delegate.getPollIssue(repo, issueNumber);
-  }
-}
-
-interface PollIssueResponse {
-  number: number;
-  title: string;
-  body: string | null;
-  user: { login: string } | null;
-  state: string;
-  created_at: string;
-  updated_at: string;
-  pull_request?: unknown;
-  draft?: boolean;
-}
-
-function mapPollIssue(issue: PollIssueResponse): PollIssueOrPullRequest {
-  const isPullRequest = issue.pull_request !== undefined;
-  return {
-    number: issue.number,
-    title: issue.title,
-    body: issue.body ?? "",
-    author: issue.user?.login ?? "",
-    state: issue.state,
-    createdAt: issue.created_at,
-    updatedAt: issue.updated_at,
-    isPullRequest,
-    draft: isPullRequest && issue.draft === true,
-  };
-}
-
-function issueNumberFromUrl(issueUrl: string): number {
-  const raw = issueUrl.split("/").pop();
-  const number = raw ? Number.parseInt(raw, 10) : NaN;
-  if (!Number.isFinite(number)) {
-    throw new Error(`Could not parse issue number from ${issueUrl}`);
-  }
-  return number;
 }
 
 /**

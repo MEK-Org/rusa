@@ -247,10 +247,9 @@ describe("authorStampBodyForWebhookPayload ", () => {
     ).toBeNull();
   });
 
-  it("fails open on a poller-synthesized edit, which carries no `changes` ", () => {
-    // github/poller.ts emits action "edited" for ANY updatedAt bump (a label, a close, a
-    // new comment) with no `changes` object and `sender` set to the artifact author. It
-    // cannot prove a body edit, so it must be delivered rather than suppressed.
+  it("fails open on an `edited` payload that carries no `changes` at all", () => {
+    // A replayed or hand-built "edited" delivery with no `changes` object cannot prove a
+    // body edit, so it must be delivered rather than suppressed for the stamped author.
     expect(authorStampBodyForWebhookPayload("issues", "edited", { issue: stamped })).toBeNull();
     expect(
       authorStampBodyForWebhookPayload("pull_request", "edited", { pull_request: stamped })
@@ -273,9 +272,9 @@ describe("authorStampBodyForWebhookPayload ", () => {
 
   it("does not suppress an author when ANOTHER actor acts on their fresh issue ", () => {
     // The end-to-end shape of the failure, at the predicate that matters. Actor A opens a
-    // freshly stamped issue; actor B labels it; the poller turns that into `issues.edited`
-    // carrying A's untouched body and a bot sender. Suppressing here would deafen A to an
-    // event B caused — root's bar is that no foreign edit is ever suppressed.
+    // freshly stamped issue; an `issues.edited` arrives with no `changes`, A's untouched
+    // body and a bot sender. Suppressing here would deafen A to an event someone else
+    // caused — root's bar is that no foreign edit is ever suppressed.
     const repo = "dummy-org/dummy-repo";
     const issueNumber = 4242;
     const stamp = stampAuthor("actor-a", repo, issueNumber, "instance-a");

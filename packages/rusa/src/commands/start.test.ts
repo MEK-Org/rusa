@@ -27,7 +27,7 @@ import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
-import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
+import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
@@ -81,20 +81,6 @@ vi.mock("./service-instance.js", async (importActual) => {
   return {
     ...actual,
     resolveRepoRoot: serviceInstanceMock.resolveRepoRoot,
-  };
-});
-
-const pollerMock = vi.hoisted(() => ({
-  startGitHubEventPoller: vi.fn(() => ({
-    close: vi.fn(),
-  })),
-}));
-
-vi.mock("../github/poller.js", async (importActual) => {
-  const actual = await importActual<typeof import("../github/poller.js")>();
-  return {
-    ...actual,
-    startGitHubEventPoller: pollerMock.startGitHubEventPoller,
   };
 });
 
@@ -175,7 +161,7 @@ import {
   warnMissingConfiguredEventSubscriptionsAtBoot,
 } from "./start.js";
 
-class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient> {
+class MockIssueClient implements Partial<IssueClient> {
   reactionsAdded: { repo: string; subject: number; reaction: string }[] = [];
   commentReactionsAdded: { repo: string; commentId: number; reaction: string; scope?: string }[] =
     [];
@@ -192,14 +178,6 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
     scope?: string
   ): Promise<void> {
     this.commentReactionsAdded.push({ repo, commentId, reaction, scope });
-  }
-
-  async listUpdatedIssuesAndPullRequests(): Promise<[]> {
-    return [];
-  }
-
-  async listUpdatedIssueComments(): Promise<[]> {
-    return [];
   }
 
   async createIssue(opts: {
@@ -389,11 +367,9 @@ describe("start command tests", () => {
     expect(warn.mock.calls[0]?.[0]).toContain("(+2 more)");
   });
 
-  it("binds the webhook server only in webhook ingestion mode outside e2e", () => {
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: undefined })).toBe(true);
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: "webhook" })).toBe(true);
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: "poll" })).toBe(false);
-    expect(shouldBindWebhookServer({ e2eMode: true, ingestionMode: "webhook" })).toBe(false);
+  it("binds the webhook server whenever the runner is not driving events in-process", () => {
+    expect(shouldBindWebhookServer({ e2eMode: false })).toBe(true);
+    expect(shouldBindWebhookServer({ e2eMode: true })).toBe(false);
   });
 
   it("binds the dashboard in e2e only when explicitly enabled", () => {
@@ -456,7 +432,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
     modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockClear();
-    pollerMock.startGitHubEventPoller.mockClear();
     for (const method of Object.values(e2eInstanceManagerMock)) method.mockClear();
     serviceInstanceMock.resolveRepoRoot.mockImplementation(
       serviceInstanceMock.actualResolveRepoRoot
@@ -2524,15 +2499,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
-  async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      if (predicate()) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    throw new Error(message);
-  }
-
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
     const config = {
@@ -2977,198 +2943,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const recordsAfterNoUsage = rootTokenRecords();
     expect(recordsAfterNoUsage).toHaveLength(2);
-  });
-
-  it("does not infer polling scope from git remote when github config has no scope", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify poller was NOT started
-      expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  });
-
-  it("uses github.repos if configured, starting the poller even if resolveRepoRoot throws", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    // Mock resolveRepoRoot to throw
-    serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
-      throw new Error("Quickstart container simulation: no git repository found");
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["custom-owner/custom-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify that startGitHubEventPoller was started with the custom repo
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["custom-owner/custom-repo"] })
-      );
-
-      // Verify that we logged the repoRoot resolve error, but NOT a repoName error
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Could not infer the git repository root")
-      );
-      expect(errorSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("Could not determine the repository name")
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
-  });
-
-  it("ignores git remote identity and polls only explicitly configured github.repos", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/primary-org/primary-repo.git");
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["extra-org/extra-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["extra-org/extra-repo"] })
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
-    }
-  });
-
-  it("does not start poller when poll mode has neither github.repos nor github.orgs", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    // Mock resolveRepoRoot to throw (no git)
-    serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
-      throw new Error("Quickstart container simulation: no git repository found");
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify that startGitHubEventPoller was NOT called
-      expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
-
-      expect(errorSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("Could not determine the primary repository")
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
   });
 
   it("syncs configured root event sources on boot", async () => {
