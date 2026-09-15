@@ -28,7 +28,7 @@ export interface VoiceApiDeps {
   sseHub: SseHub;
   /** The live ActorMesh instance (memo delivery). */
   mesh?: ActorMesh;
-  /** Null when voice is unconfigured (no geminiApiKey) → routes 503. */
+  /** Null when voice is unconfigured (no provider credentials configured) → routes 503. */
   service: VoiceService | null;
   /** Optional structured logger for route events (silenced under tests when omitted). */
   logger?: Logger;
@@ -145,7 +145,8 @@ export function handleVoiceApiRequest(
   const service = deps.service;
   if (!service) {
     sendJson(res, 503, {
-      error: "voice unavailable: geminiApiKey is not configured on this instance",
+      error:
+        "voice unavailable: configure geminiApiKey or elevenlabsApiKey for the selected transcription provider",
     });
     return true;
   }

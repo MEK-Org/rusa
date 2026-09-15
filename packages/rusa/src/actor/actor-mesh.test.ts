@@ -26,6 +26,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -194,6 +195,7 @@ function deferredProvider() {
 
 function setup(
   opts: {
+    supportedVoices?: VoiceDefinition[];
     maxConcurrent?: number;
     sharedProvider?: CodingProvider;
     onRetire?: (record: { id: string }) => void;
@@ -266,6 +268,7 @@ function setup(
     log: (m) => logs.push(m),
   });
   mesh = new ActorMesh({
+    supportedVoices: opts.supportedVoices,
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -474,6 +477,19 @@ describe("ActorMesh", () => {
     expect(canWrite(descendant)).toBe(false);
   });
 
+  it.each([
+    "google",
+    "elevenlabs",
+  ] as const)("assigns a configured %s voice through the shared pool", (provider) => {
+    const voiceConfig: VoiceDefinition["voiceConfig"] =
+      provider === "google"
+        ? { schemaVersion: 1, provider, config: { voiceName: "Puck" } }
+        : { schemaVersion: 1, provider, config: { voiceId: "G17SuINrv2H9FC6nvetn" } };
+    const { mesh, registry } = setup({ supportedVoices: [{ label: "Voice", voiceConfig }] });
+    const id = mesh.spawn({ charter: "Speak", parentId: "root" });
+    expect(registry.get(id)?.voiceConfig).toEqual(voiceConfig);
+  });
+
   it("randomizes a supported voice for every newly spawned actor", () => {
     const { mesh, registry } = setup();
     const voices = new Set<string>();
@@ -482,6 +498,7 @@ describe("ActorMesh", () => {
       const voiceConfig = registry.get(id)?.voiceConfig;
       expect(voiceConfig?.schemaVersion).toBe(1);
       expect(voiceConfig?.provider).toBe("google");
+      if (voiceConfig?.provider !== "google") throw new Error("expected Google spawn voice");
       expect(voiceConfig?.config.voiceName).toBeDefined();
       expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
       voices.add(voiceConfig?.config.voiceName ?? "");

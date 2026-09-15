@@ -27,8 +27,13 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
-import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
+import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
+import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
+import {
+  googleVoiceConfig,
+  type VoiceConfigDocument,
+  voiceConfigSchema,
+} from "../voice/voice-config.js";
 import { isAuthenticatedOperatorRequest } from "./auth.js";
 import type { SseHub } from "./sse.js";
 
@@ -112,6 +117,7 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  supportedVoices?: readonly SupportedVoice[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
@@ -229,7 +235,7 @@ interface ThreadDto {
    * The actor's persisted walkie-talkie voice, or null when it follows the
    * instance-wide default (every actor without a stored `voice_config`).
    */
-  voiceName: string | null;
+  voiceConfig: VoiceConfigDocument | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -1313,27 +1319,26 @@ export async function handleMeshApiRequest(
           if (voiceConfigResult !== null && !voiceConfigResult.success) {
             sendJson(res, 400, {
               error:
-                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } }, or null for the default",
+                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } } or { schemaVersion: 1, provider: 'elevenlabs', config: { voiceId } }, or null for the default",
             });
             return;
           }
-          const voiceName =
-            voiceConfigResult === null
-              ? undefined
-              : canonicalSupportedVoiceName(voiceConfigResult.data.config.voiceName);
-          if (voiceConfigResult !== null && !voiceName) {
-            sendJson(res, 400, {
-              error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
-            });
-            return;
+          let voiceConfig = voiceConfigResult === null ? undefined : voiceConfigResult.data;
+          if (voiceConfig?.provider === "google") {
+            const canonical = canonicalSupportedVoiceName(voiceConfig.config.voiceName);
+            if (!canonical) {
+              sendJson(res, 400, {
+                error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
+              });
+              return;
+            }
+            voiceConfig = googleVoiceConfig(canonical);
           }
-          actors.patch(actorId, {
-            voiceConfig: voiceName === undefined ? undefined : googleVoiceConfig(voiceName),
-          });
+          actors.patch(actorId, { voiceConfig });
           // The initiating dashboard applies this acknowledgement directly.
           // Other tabs follow their normal refresh lifecycle; one setting does
           // not warrant a dedicated SSE event and cache path.
-          sendJson(res, 200, { voiceName: voiceName ?? null });
+          sendJson(res, 200, { voiceConfig: voiceConfig ?? null });
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
@@ -1479,7 +1484,7 @@ export async function handleMeshApiRequest(
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
-        voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
+        voiceConfig: r.voiceConfig ?? null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
@@ -1488,7 +1493,7 @@ export async function handleMeshApiRequest(
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
-      supportedVoices: SUPPORTED_TTS_VOICES,
+      supportedVoices: deps.supportedVoices ?? buildSupportedVoiceCatalog(),
     });
     return true;
   }

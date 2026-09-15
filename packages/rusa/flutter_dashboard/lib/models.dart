@@ -116,7 +116,7 @@ class ThreadDto {
     this.pacingIntervalMs,
     this.ownerExpectsRetirement,
     this.selectedObligation,
-    this.voiceName,
+    this.voiceConfig,
   });
 
   final String id;
@@ -204,7 +204,7 @@ class ThreadDto {
   /// The actor's persisted walkie-talkie voice, or null when it follows the
   /// instance-wide default. Absent (null) is the state of every actor without
   /// a stored voice setting, including all actors on an older server.
-  final String? voiceName;
+  final VoiceConfigDto? voiceConfig;
 
   bool get isRetired => status == 'retired';
 
@@ -237,7 +237,7 @@ class ThreadDto {
     int? pacingIntervalMs,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
-    Object? voiceName = _keepThreadField,
+    Object? voiceConfig = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -284,9 +284,9 @@ class ThreadDto {
     selectedObligation: identical(selectedObligation, _keepThreadField)
         ? this.selectedObligation
         : selectedObligation as ObligationDto?,
-    voiceName: identical(voiceName, _keepThreadField)
-        ? this.voiceName
-        : voiceName as String?,
+    voiceConfig: identical(voiceConfig, _keepThreadField)
+        ? this.voiceConfig
+        : voiceConfig as VoiceConfigDto?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -336,8 +336,85 @@ class ThreadDto {
             (j['selectedObligation'] as Map).cast<String, dynamic>(),
           )
         : null,
-    voiceName: j['voiceName'] as String?,
+    voiceConfig: j['voiceConfig'] != null
+        ? VoiceConfigDto.fromJson(j['voiceConfig'] as Map<String, dynamic>)
+        : j['voiceName'] != null
+        ? VoiceConfigDto(provider: 'google', config: {'voiceName': j['voiceName']})
+        : null,
   );
+}
+
+/// Opaque provider-specific settings passed unchanged between the catalog and API.
+class VoiceConfigDto {
+  const VoiceConfigDto({
+    required this.provider,
+    required this.config,
+    this.schemaVersion = 1,
+  });
+  final String provider;
+  final Map<String, dynamic> config;
+  final int schemaVersion;
+
+  factory VoiceConfigDto.fromJson(Map<String, dynamic> json) => VoiceConfigDto(
+    provider: json['provider'] as String,
+    config: Map<String, dynamic>.from(json['config'] as Map),
+    schemaVersion: json['schemaVersion'] as int,
+  );
+  Map<String, dynamic> toJson() => {
+    'schemaVersion': schemaVersion,
+    'provider': provider,
+    'config': config,
+  };
+
+  // JSON object key order must not affect dropdown identity after a refresh.
+  static Object? _canonical(Object? value) {
+    if (value is Map<String, dynamic>) {
+      final keys = value.keys.toList()..sort();
+      return {for (final key in keys) key: _canonical(value[key])};
+    }
+    if (value is List) return value.map(_canonical).toList();
+    return value;
+  }
+
+  String get _key => jsonEncode(_canonical(toJson()));
+  @override
+  bool operator ==(Object other) =>
+      other is VoiceConfigDto && _key == other._key;
+  @override
+  int get hashCode => _key.hashCode;
+}
+
+class SupportedVoiceDto {
+  const SupportedVoiceDto({
+    required this.label,
+    required this.providerLabel,
+    required this.voiceConfig,
+  });
+  final String label;
+  final String providerLabel;
+  final VoiceConfigDto voiceConfig;
+  String get displayLabel => '$label ($providerLabel)';
+
+  factory SupportedVoiceDto.fromJson(dynamic json) {
+    // Older servers supplied only the prebuilt Gemini voice names.
+    if (json is String) {
+      return SupportedVoiceDto(
+        label: json,
+        providerLabel: 'Gemini',
+        voiceConfig: VoiceConfigDto(
+          provider: 'google',
+          config: {'voiceName': json},
+        ),
+      );
+    }
+    return SupportedVoiceDto(
+      label: json['label'] as String,
+      providerLabel: json['providerLabel'] as String,
+      voiceConfig: VoiceConfigDto.fromJson(
+        json['voiceConfig'] as Map<String, dynamic>,
+      ),
+    );
+  }
 }
 
 /// The `GET /api/mesh/threads` response: the thread list plus the top-level
@@ -356,10 +433,10 @@ class ThreadsSnapshot {
   final List<ThreadDto> threads;
   final RuntimeCursor? runtimeCursor;
 
-  /// The supported prebuilt Google TTS voices, as reported by the server — the
+  /// The supported voices across providers, as reported by the server — the
   /// source for every voice picker in the UI. Empty against an older server
   /// that predates the per-actor voice setting.
-  final List<String> supportedVoices;
+  final List<SupportedVoiceDto> supportedVoices;
 
   /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
   /// unavailable — null when it's fine or the server doesn't report it. A
@@ -378,10 +455,9 @@ class ThreadsSnapshot {
     schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
         ?.map((e) => e as String)
         .toList(),
-    supportedVoices: (j['supportedVoices'] as List<dynamic>?)
-            ?.map((e) => e as String)
-            .toList() ??
-        const [],
+    supportedVoices: (j['supportedVoices'] as List<dynamic>? ?? const [])
+        .map(SupportedVoiceDto.fromJson)
+        .toList(),
   );
 }
 

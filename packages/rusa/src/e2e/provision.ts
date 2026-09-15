@@ -76,6 +76,18 @@ export function buildE2EConfig(opts: {
       fake: { cliCommand: "fake" },
     },
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
+    ...(base?.voice?.supportedVoices || base?.voice?.transcriptionProvider
+      ? {
+          voice: {
+            ...(base.voice.transcriptionProvider
+              ? { transcriptionProvider: base.voice.transcriptionProvider }
+              : {}),
+            ...(base.voice.supportedVoices
+              ? { supportedVoices: structuredClone(base.voice.supportedVoices) }
+              : {}),
+          },
+        }
+      : {}),
     // Required by the schema; the e2e instance never starts a webhook server.
     webhook: { port: 0, secret: "" },
     dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
@@ -164,7 +176,7 @@ export function provisionE2EInstance(opts: {
     rootActor: opts.rootActor,
     chat: opts.chat,
   });
-  writeFileSync(join(home, "config.yaml"), toYaml(config), "utf8");
+  writeFileSync(join(home, "config.yaml"), toYaml(config), { encoding: "utf8", mode: 0o600 });
 
   return { root, home, remotePath, scratchPath, config, repo: E2E_REPO };
 }

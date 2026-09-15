@@ -88,6 +88,20 @@ describe("buildE2EConfig", () => {
         codex: { cliCommand: "codex" },
       },
       geminiApiKey: "base-key-123",
+      elevenlabsApiKey: "elevenlabs-test-key",
+      voice: {
+        transcriptionProvider: "elevenlabs",
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "YOUR_VOICE_ID" },
+            },
+          },
+        ],
+      },
     } as unknown as RusaConfig;
 
     const config = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: base });
@@ -95,6 +109,11 @@ describe("buildE2EConfig", () => {
     expect(Object.keys(config.providers)).toEqual(["claude", "codex", "fake"]);
     expect(config.providers.fake?.cliCommand).toBe("fake");
     expect(config.geminiApiKey).toBe("base-key-123");
+    expect(config.elevenlabsApiKey).toBeUndefined();
+    expect(config.voice).toEqual({
+      transcriptionProvider: "elevenlabs",
+      supportedVoices: base.voice?.supportedVoices,
+    });
   });
 });
 

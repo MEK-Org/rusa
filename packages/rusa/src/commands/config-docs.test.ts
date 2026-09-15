@@ -63,4 +63,15 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("Multi-instance staging recipe:");
     expect(CONFIG_DOCS).toContain("spaces/AAAA_STAGING");
   });
+
+  it("documents voice enablement and provider options", () => {
+    expect(CONFIG_DOCS).toContain("elevenlabsApiKey");
+    expect(CONFIG_DOCS).toContain("transcriptionProvider: google # or elevenlabs");
+    expect(CONFIG_DOCS).toContain(
+      "Enabled by geminiApiKey (for Google) or elevenlabsApiKey (for ElevenLabs)"
+    );
+    expect(CONFIG_DOCS).not.toContain(
+      "The feature is enabled by geminiApiKey; this section only tunes it."
+    );
+  });
 });
