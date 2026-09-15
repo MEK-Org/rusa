@@ -1195,6 +1195,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // actors. Built from a Database alone, the container cannot do this itself,
   // and without this line every owner check in the repository is inert.
   getRepositories().setActorExists((actorId) => actors.get(actorId)?.status === "active");
+  // Append notifications are advisory, so a listener that throws never fails
+  // the write; without this the failure would also leave no trace, and the
+  // only sign of a missed nudge would be the latency until durable recovery.
+  getRepositories().setInboxListenerErrorHandler((error) => {
+    log.warn("inbox_listener_failed", { err: error });
+  });
   const rootId = resolveRootActorId(actors);
   // The root's durable pool lives on its actor record, where `set_actor_model`
   // writes it, and wins over the scalar `rootActor` file tuple once it exists.
