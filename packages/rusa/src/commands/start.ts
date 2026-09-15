@@ -2230,11 +2230,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // worker set (ISSUE_NUM, phase 1a). A granted-but-not-mountable capability (none
         // registered) is skipped safely. Parameterized capabilities (e.g. chat-write:spaces/AAAA)
         // are aggregated by their base name and passed to the factory.
-        const capabilities = mesh.activeCapabilitiesFor(rec.id);
         workerMcp.push(
-          ...mountGrantedServers(id, capabilities, grantableServers, mcpHttp, {
-            isFenced: (actorId) => mesh.isYielded(actorId),
-          })
+          ...mountGrantedServers(
+            id,
+            mesh.activeCapabilitiesFor(rec.id),
+            grantableServers,
+            mcpHttp,
+            {
+              isFenced: (actorId) => mesh.isYielded(actorId),
+            }
+          )
         );
 
         // Each worker gets its own private working directory and nothing else: its
@@ -2464,30 +2469,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           );
         }
         const actor = constructActorFromInvocation({
-          record: rec,
-          capabilities,
-          workspace: {
-            cwd,
-            addDirs: actorOptions.addDirs,
-            sandbox: actorOptions.sandbox,
-            isE2eRoot: actorOptions.isE2eRoot,
-            prepareUnderstandingMount: actorOptions.prepareUnderstandingMount,
-          },
-          provider: {
-            modelConfig: actorOptions.modelConfig,
-            resolveProvider: actorOptions.resolveProvider,
-            fallback: actorOptions.fallback,
-          },
-          mcpServers: workerMcp,
-          session: {
-            load: actorOptions.loadSessionId,
-            save: actorOptions.saveSessionId,
-          },
-          prompt: actorOptions.buildPrompt,
           actorOptions,
-          driver: createWorkerActor
-            ? (_input, options) => createWorkerActor(ctx, options)
-            : undefined,
+          driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
         });
         liveWorkerMcp.set(id, workerMcp);
         return actor;
@@ -2859,23 +2842,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
 
-  const rootRecord: ActorRecord = {
-    id: rootId,
-    charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
-    parentId: null,
-    isRoot: true,
-    // Persisted pool preserved verbatim (validated, same order), or the
-    // configured tuple seeding a record that had none. Adoption merges onto
-    // the existing row, which is what keeps a persisted pool's `modelClass`.
-    modelConfig: rootBootModelConfig.modelConfig,
-    context: rootActor.context,
-    sessionId:
-      rootActor.context?.type === "portable"
-        ? undefined
-        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-    status: "active",
-    createdAt: actors.get(rootId)?.createdAt ?? new Date().toISOString(),
-  };
   const externalRoot =
     opts?.e2e?.rootDriver === "external"
       ? new ExternalRootDriver(rootId, undefined, (state) =>
@@ -2886,7 +2852,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // onRunStart, read back on that same run's onRunEnd (mirrors the worker
   // `lastSelected` pattern, since root's one entry can move too).
   let rootLastSelected: RawProviderModelConfig = rootBootModelConfig.modelConfig[0];
-  let root!: MeshActor;
+  let root: MeshActor;
   const rootActorOptions: ActorOptions = {
     id: rootId,
     cwd: rootAgentDir,
@@ -3089,29 +3055,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
   };
   root = constructActorFromInvocation({
-    record: rootRecord,
-    capabilities: mesh.activeCapabilitiesFor(rootId),
-    workspace: {
-      cwd: rootActorOptions.cwd,
-      addDirs: rootActorOptions.addDirs,
-      sandbox: rootActorOptions.sandbox,
-      isE2eRoot: rootActorOptions.isE2eRoot,
-      prepareUnderstandingMount: rootActorOptions.prepareUnderstandingMount,
-    },
-    provider: {
-      modelConfig: rootActorOptions.modelConfig,
-      resolveProvider: rootActorOptions.resolveProvider,
-      fallback: rootActorOptions.fallback,
-    },
-    mcpServers: rootMcp,
-    session: {
-      load: rootActorOptions.loadSessionId,
-      save: rootActorOptions.saveSessionId,
-    },
-    prompt: rootActorOptions.buildPrompt,
     actorOptions: rootActorOptions,
     driver: externalRoot ? () => externalRoot : undefined,
   });
+  const rootRecord: ActorRecord = {
+    id: rootId,
+    charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
+    parentId: null,
+    isRoot: true,
+    // Persisted pool preserved verbatim (validated, same order), or the
+    // configured tuple seeding a record that had none. Adoption merges onto
+    // the existing row, which is what keeps a persisted pool's `modelClass`.
+    modelConfig: rootBootModelConfig.modelConfig,
+    context: rootActor.context,
+    sessionId:
+      rootActor.context?.type === "portable"
+        ? undefined
+        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
+    status: "active",
+    createdAt: actors.get(rootId)?.createdAt ?? new Date().toISOString(),
+  };
   mesh.adopt(rootRecord, root);
   if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
   const scheduleHaltExpiry = (until?: string) => {
