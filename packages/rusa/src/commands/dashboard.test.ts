@@ -10,7 +10,7 @@ const openMock = vi.hoisted(() => {
 });
 
 const mockConfig = {
-  github: { account: "test-user", pollIntervalSeconds: 10 },
+  github: { account: "test-user" },
   webhook: { port: 9742, secret: "test-secret" },
   dashboard: { port: 8080 } as { port: number; tailscaleHostname?: string },
 };

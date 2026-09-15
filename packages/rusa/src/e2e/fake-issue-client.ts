@@ -14,8 +14,6 @@ import {
   type MergePullRequestOptions,
   type OpenIssue,
   type OpenPullRequest,
-  type PollIssueComment,
-  type PollIssueOrPullRequest,
   type PrReviewComment,
   type PullRequestChecksStatus,
   PullRequestChecksUnreadableError,
@@ -158,90 +156,6 @@ export class FakeIssueClient implements IssueClient {
       body: c.body,
       createdAt: c.createdAt,
     }));
-  }
-
-  async listUpdatedIssuesAndPullRequests(
-    _repo: string,
-    since: string
-  ): Promise<PollIssueOrPullRequest[]> {
-    return [
-      ...this.tracker.listIssues().map((issue) => ({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        author: issue.author,
-        state: issue.state,
-        createdAt: issue.createdAt,
-        updatedAt: issue.updatedAt,
-        isPullRequest: false,
-        draft: false,
-      })),
-      ...this.tracker.listPrs().map((pr) => ({
-        number: pr.number,
-        title: pr.title,
-        body: pr.body,
-        author: pr.author,
-        state: pr.state,
-        createdAt: pr.createdAt,
-        updatedAt: pr.updatedAt,
-        isPullRequest: true,
-        draft: pr.draft,
-      })),
-    ].filter((record) => record.updatedAt > since);
-  }
-
-  async listPollOrganizationRepositories(_org: string): Promise<string[]> {
-    return [];
-  }
-
-  async getPollBranchHead(_repo: string, _branch: string): Promise<null> {
-    return null;
-  }
-
-  async listUpdatedIssueComments(_repo: string, since: string): Promise<PollIssueComment[]> {
-    return this.tracker
-      .listIssues()
-      .flatMap((issue) =>
-        issue.comments.map((comment) => ({
-          id: comment.id,
-          issueNumber: issue.number,
-          author: comment.author,
-          body: comment.body,
-          createdAt: comment.createdAt,
-          updatedAt: comment.createdAt,
-        }))
-      )
-      .filter((comment) => comment.updatedAt > since);
-  }
-
-  async getPollIssue(_repo: string, issueNumber: number): Promise<PollIssueOrPullRequest> {
-    const issue = this.tracker.getIssue(issueNumber);
-    if (issue) {
-      return {
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        author: issue.author,
-        state: issue.state,
-        createdAt: issue.createdAt,
-        updatedAt: issue.updatedAt,
-        isPullRequest: false,
-        draft: false,
-      };
-    }
-    const pr = this.tracker.getPr(issueNumber);
-    if (!pr) throw new Error(`Issue #${issueNumber} not found in local tracker`);
-    return {
-      number: pr.number,
-      title: pr.title,
-      body: pr.body,
-      author: pr.author,
-      state: pr.state,
-      createdAt: pr.createdAt,
-      updatedAt: pr.updatedAt,
-      isPullRequest: true,
-      draft: pr.draft,
-    };
   }
 
   async postComment(_repo: string, issueNumber: number, body: string): Promise<void> {
