@@ -62,6 +62,7 @@ import type {
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import {
+  AtEnqueueUnconfirmedError,
   DefaultOsScheduler,
   type ScheduledMessage,
   type ScheduledMessageScheduler,
@@ -7219,6 +7220,47 @@ describe("ActorMesh", () => {
           ]);
           expect(inboxStore.entries).toEqual([]);
         }
+      });
+
+      it("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
+        const { at, jobs } = sharedAtQueue();
+        // `at` prints a job id, but the job never reaches the spool.
+        const lossy: AtIo = { ...at, schedule: () => "200" };
+        const cron: CrontabIo = { read: () => "", write: () => undefined };
+        const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), lossy, {
+          tokenFile: "/home/sf/.rusa-prod/wake-token",
+          portFile: "/home/sf/.rusa-prod/wake-port",
+          instanceId: "/home/sf/.rusa-prod",
+        });
+        const events: MeshEventInput[] = [];
+        const chatRows = new Map<string, string>();
+        const { mesh } = setup({
+          scheduledMessages: scheduler,
+          events: (event) => events.push(event),
+          recordChat: (row) => {
+            const id = row.id ?? "missing-id";
+            chatRows.set(id, row.body);
+            return id;
+          },
+        });
+        const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+        const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+        events.length = 0;
+
+        expect(() =>
+          mesh.sendMessage(
+            recipient,
+            "lost in the spool",
+            sender,
+            undefined,
+            "2026-09-16T12:00:00.000Z"
+          )
+        ).toThrow(AtEnqueueUnconfirmedError);
+
+        expect(jobs.map((job) => job.id)).toEqual(["legacy"]);
+        expect(events).toEqual([]);
+        expect(chatRows.size).toBe(0);
+        expect(scheduler.listMessageDeliveries()).toEqual([]);
       });
 
       it("still cancels its own job for a recipient it does not know, and only that one", () => {

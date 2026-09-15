@@ -1,3 +1,4 @@
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { AtIo } from "./at-queue.js";
 import { assertCronExprCanFire } from "./cron-expression.js";
 import type { CrontabMutator } from "./crontab.js";
@@ -91,6 +92,21 @@ export interface OsSchedulerOptions {
   curlPath?: string;
   /** Stable identity supplied by the composition root for activation ownership. */
   instanceId: string;
+  /**
+   * Receives one record per `at` write, removal and enqueue confirmation, and
+   * the boot audit of legacy wake blocks. Silent when omitted.
+   */
+  log?: Logger;
+  /** Clock for judging whether a missing `at` job could already have fired. */
+  now?: () => number;
+}
+
+/** A pre-scoping `# mc-wake:` block this instance found but cannot prove it owns. */
+export interface UnadoptedLegacyWakeBlock {
+  actorId: string;
+  /** The wake-port path the block's job line reads, when it has one. */
+  portFile: string | null;
+  cronExpr: string;
 }
 
 export interface WakeEntry {
@@ -213,6 +229,28 @@ export class TruncatedCronBlockError extends Error {
   }
 }
 
+/**
+ * `at` schedules to the minute: a job whose time is at most this far ahead may
+ * run — and leave the queue — before a re-read of `atq` can see it, so its
+ * absence proves nothing. Any job further out than this must still be queued.
+ */
+const AT_DUE_WINDOW_MS = 60_000;
+
+/**
+ * Thrown when `at` reported a job id for a message but a re-read of the queue
+ * shows no job under that id carrying the message's tag. The write is not
+ * trusted on `at`'s say-so: a message id must never be handed back for a
+ * delivery that is not actually queued.
+ */
+export class AtEnqueueUnconfirmedError extends Error {
+  constructor(tag: string, atJobId: string) {
+    super(
+      `at job ${atJobId} for "${tag}" is not in the queue after scheduling — enqueue unconfirmed`
+    );
+    this.name = "AtEnqueueUnconfirmedError";
+  }
+}
+
 const SCHEDULED_MESSAGE_SCHEMA_VERSION = 1 as const;
 const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 128 * 1024;
 
@@ -266,6 +304,8 @@ function decodeScheduledMessage(script: string): ScheduledMessage {
 
 export class DefaultOsScheduler implements OsScheduler {
   readonly instanceId: string;
+  private readonly log: Logger;
+  private readonly now: () => number;
 
   constructor(
     private readonly mutator: CrontabMutator,
@@ -274,6 +314,13 @@ export class DefaultOsScheduler implements OsScheduler {
   ) {
     if (!opts.instanceId.trim()) throw new Error("instanceId is required");
     this.instanceId = opts.instanceId;
+    // Every record names the instance, so a shared queue's history can be
+    // split by writer after the fact.
+    this.log = (opts.log ?? nullLogger).child({
+      component: "os-scheduler",
+      instanceId: opts.instanceId,
+    });
+    this.now = opts.now ?? Date.now;
   }
 
   /** The only way this scheduler produces a tag line: `family` + this instance + `id`. */
@@ -315,6 +362,35 @@ export class DefaultOsScheduler implements OsScheduler {
       return tagLine.trim().slice(LEGACY_WAKE_TAG_PREFIX.length);
     }
     return null;
+  }
+
+  /**
+   * Boot audit: name every legacy `# mc-wake:` block this instance declined to
+   * adopt. Such a block keeps firing with nothing able to cancel it — it reads
+   * another instance's wake-port file, or this instance's under a spelling of
+   * `RUSA_HOME` the running process does not use — so it is recorded here,
+   * once, where an operator can find the orphan instead of meeting it by its
+   * firing. Nothing is written.
+   */
+  reportUnadoptedLegacyWakeBlocks(): UnadoptedLegacyWakeBlock[] {
+    const current = this.mutator.read();
+    if (current === "") return [];
+    const lines = current.replace(/\n$/, "").split("\n");
+    const unadopted: UnadoptedLegacyWakeBlock[] = [];
+    for (let index = 0; index < lines.length; index++) {
+      const tagLine = lines[index].trim();
+      if (!tagLine.startsWith(LEGACY_WAKE_TAG_PREFIX)) continue;
+      const jobLine = lines[index + 1] ?? "";
+      if (this.ownsLegacyWakeBlock(tagLine, jobLine)) continue;
+      const block: UnadoptedLegacyWakeBlock = {
+        actorId: tagLine.slice(LEGACY_WAKE_TAG_PREFIX.length),
+        portFile: jobLine.match(/\$\(cat ([^)\s]+)\)\/wake"/)?.[1] ?? null,
+        cronExpr: jobLine.trim().split(/\s+/).slice(0, 5).join(" "),
+      };
+      this.log.warn("legacy_wake_block_not_adopted", { tag: tagLine, ...block });
+      unadopted.push(block);
+    }
+    return unadopted;
   }
 
   /** Build the complete cron line for an actor wake. */
@@ -497,15 +573,72 @@ export class DefaultOsScheduler implements OsScheduler {
     return null;
   }
 
+  /** Ids of the queued `at` jobs whose script carries exactly `tag`, from a fresh read of the queue. */
   private staleAtIds(tag: string): string[] {
-    return this.atIo
-      .list()
+    return this.atJobIdsFor(this.atIo.list(), tag);
+  }
+
+  private atJobIdsFor(jobs: { id: string; script: string }[], tag: string): string[] {
+    return jobs
       .filter((job) => job.script.split("\n").some((line) => line.trim() === tag))
       .map((job) => job.id);
   }
 
-  private removeAtIds(ids: Iterable<string>): void {
-    for (const id of ids) this.atIo.remove(id);
+  /**
+   * The one path from this class into `at`: the write is recorded with the tag
+   * it carries, so a shared queue's every mutation is attributable to its
+   * writer. Nothing here proves the job stayed queued — see
+   * {@link confirmAtEnqueue}.
+   */
+  private scheduleAt(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    script: string,
+    date: Date
+  ) {
+    const atJobId = this.atIo.schedule(script, date);
+    this.log.info("at_job_scheduled", { family, id, tag, atJobId, runAt: date.toISOString() });
+    return atJobId;
+  }
+
+  /** The one path from this class into `atrm`, recorded per job with the tag it was matched by. */
+  private removeAtIds(family: InstanceTagFamily, id: string, tag: string, ids: Iterable<string>) {
+    for (const atJobId of ids) {
+      this.atIo.remove(atJobId);
+      this.log.info("at_job_removed", { family, id, tag, atJobId });
+    }
+  }
+
+  /**
+   * Re-read the queue and require the job `at` just reported to be in it with
+   * `tag`. A job due within {@link AT_DUE_WINDOW_MS} may legitimately have run
+   * already, so its absence is recorded and tolerated; a job further out that
+   * is missing was never durably queued, and the caller must not report it as
+   * scheduled.
+   */
+  private confirmAtEnqueue(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    atJobId: string,
+    date: Date
+  ) {
+    const queue = this.atIo.list();
+    const fields = { family, id, tag, atJobId, queueSize: queue.length };
+    if (this.atJobIdsFor(queue, tag).includes(atJobId)) {
+      this.log.info("at_enqueue_confirmed", fields);
+      return;
+    }
+    if (date.getTime() - this.now() <= AT_DUE_WINDOW_MS) {
+      this.log.warn("at_enqueue_unconfirmed", {
+        ...fields,
+        reason: "job due; may already have run",
+      });
+      return;
+    }
+    this.log.error("at_enqueue_unconfirmed", { ...fields, reason: "job missing from queue" });
+    throw new AtEnqueueUnconfirmedError(tag, atJobId);
   }
 
   /** The tag/end-tag pair bounding one obligation's managed cron block, scoped to this instance. */
@@ -551,7 +684,7 @@ export class DefaultOsScheduler implements OsScheduler {
       // The replacement cron block is now durable.  If removing an old at job
       // fails, retain it for reconciliation rather than creating a scheduling
       // gap by removing it before the replacement was installed.
-      this.removeAtIds(staleAtIds);
+      this.removeAtIds("obligation-activation", id, tag, staleAtIds);
     } else {
       const script = `${tag}\n${curlLine}\n`;
       // Validate the existing block before submitting `at`: corruption must
@@ -562,16 +695,21 @@ export class DefaultOsScheduler implements OsScheduler {
       // and prior at jobs armed.  Once it succeeds, remove only the stale jobs
       // captured before installation (never the just-created replacement).
       const staleAtIds = this.staleAtIds(tag);
-      const replacementId = this.atIo.schedule(script, time.date);
+      const replacementId = this.scheduleAt("obligation-activation", id, tag, script, time.date);
       this.updateCron(tag, endTag, null);
-      this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
+      this.removeAtIds(
+        "obligation-activation",
+        id,
+        tag,
+        staleAtIds.filter((staleId) => staleId !== replacementId)
+      );
     }
   }
 
   cancelObligationActivation(id: string): void {
     const { tag, endTag } = this.activationTags(id);
     this.updateCron(tag, endTag, null);
-    this.removeAtIds(this.staleAtIds(tag));
+    this.removeAtIds("obligation-activation", id, tag, this.staleAtIds(tag));
   }
 
   listObligationActivations(): ObligationActivationRecord[] {
@@ -609,14 +747,24 @@ export class DefaultOsScheduler implements OsScheduler {
       { retryWhileServiceRestarts: true }
     );
     const script = `${tag}\n${curlLine}\n`;
+    const deliverAt = new Date(message.deliverAt);
     const staleAtIds = this.staleAtIds(tag);
-    const replacementId = this.atIo.schedule(script, new Date(message.deliverAt));
-    this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
+    const replacementId = this.scheduleAt("message-delivery", message.id, tag, script, deliverAt);
+    // `at` printing a job id is not proof the job is queued. The message id is
+    // only returned to the sender once a re-read of the queue shows the job; a
+    // stale copy stays armed until then, so an unconfirmed write leaves no gap.
+    this.confirmAtEnqueue("message-delivery", message.id, tag, replacementId, deliverAt);
+    this.removeAtIds(
+      "message-delivery",
+      message.id,
+      tag,
+      staleAtIds.filter((staleId) => staleId !== replacementId)
+    );
   }
 
   cancelMessageDelivery(id: string): void {
     const tag = this.messageTag(id);
-    this.removeAtIds(this.staleAtIds(tag));
+    this.removeAtIds("message-delivery", id, tag, this.staleAtIds(tag));
   }
 
   /**

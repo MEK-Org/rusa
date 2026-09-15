@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createLogger } from "../observability/logger.js";
 import {
   type AtIo,
   type AtProbe,
@@ -10,6 +11,7 @@ import {
 } from "./at-queue.js";
 import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
+  AtEnqueueUnconfirmedError,
   DefaultOsScheduler,
   decodeScheduledMessagePayload,
   encodeScheduledMessagePayload,
@@ -36,9 +38,15 @@ describe("DefaultOsScheduler", () => {
       },
     };
 
+    // A queue that holds what was scheduled: a message write is confirmed by
+    // re-reading the queue, so a fake that always lists nothing cannot accept one.
+    const jobs: { id: string; script: string }[] = [];
     at = {
-      schedule: vi.fn().mockReturnValue("123"),
-      list: vi.fn().mockReturnValue([]),
+      schedule: vi.fn((script: string) => {
+        jobs.push({ id: "123", script });
+        return "123";
+      }),
+      list: vi.fn(() => jobs.map((job) => ({ ...job }))),
       remove: vi.fn(),
     };
 
@@ -814,7 +822,38 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
     return { at, jobs };
   }
 
-  function instance(instanceId: string, at: AtIo, cron: { data: string }) {
+  /** Structured records as an operator's `jq` would see them, without level/time noise. */
+  function recordingLogger() {
+    const lines: string[] = [];
+    const log = createLogger({
+      format: "json",
+      destination: {
+        write: (chunk: string) => {
+          lines.push(chunk);
+        },
+      },
+    });
+    const records = () =>
+      lines
+        .join("")
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => {
+          const { level: _level, time: _time, ...record } = JSON.parse(line);
+          return record as Record<string, unknown>;
+        });
+    return { log, records };
+  }
+
+  /** The clock every message in these tests is scheduled against: well before `deliverAt`. */
+  const NOW = Date.parse("2026-09-15T12:00:00.000Z");
+
+  function instance(
+    instanceId: string,
+    at: AtIo,
+    cron: { data: string },
+    extra: { log?: ReturnType<typeof recordingLogger>["log"]; now?: () => number } = {}
+  ) {
     const io: CrontabIo = {
       read: () => cron.data,
       write: (data) => {
@@ -825,6 +864,8 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       tokenFile: `${instanceId}/wake-token`,
       portFile: `${instanceId}/wake-port`,
       instanceId,
+      now: () => NOW,
+      ...extra,
     });
   }
 
@@ -945,6 +986,138 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       // Re-scheduling replaces only this instance's stale copy of the id.
       staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
       expect(jobs.map((job) => job.id)).toEqual(["legacy", "101", "103"]);
+    });
+  });
+
+  describe("at queue diagnostics", () => {
+    const PROD = "/home/sf/.rusa-prod";
+    const MSG_TAG = "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:bXNnLWE";
+
+    it("records every at write, confirmation and removal with the tag and this instance's id", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      prod.scheduleObligationActivation("ob-at", { kind: "at", date: new Date("2026-09-16") });
+      prod.cancelMessageDelivery("msg-a");
+      prod.cancelObligationActivation("ob-at");
+
+      const OB_TAG = "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItYXQ";
+      expect(records()).toEqual([
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_scheduled",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+          runAt: "2026-09-16T12:00:00.000Z",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_enqueue_confirmed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+          queueSize: 1,
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_scheduled",
+          family: "obligation-activation",
+          id: "ob-at",
+          tag: OB_TAG,
+          atJobId: "101",
+          runAt: "2026-09-16T00:00:00.000Z",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "obligation-activation",
+          id: "ob-at",
+          tag: OB_TAG,
+          atJobId: "101",
+        },
+      ]);
+    });
+
+    it("attributes a boot-reconciliation cancel to the instance that performed it", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "gone"));
+
+      bootReconcile(prod, []);
+
+      expect(records().filter((record) => record.msg === "at_job_removed")).toEqual([
+        expect.objectContaining({ instanceId: PROD, tag: MSG_TAG, atJobId: "100" }),
+      ]);
+    });
+
+    it("refuses to report a message as scheduled when `at` returned an id the queue re-read does not show, keeping the prior copy armed", () => {
+      const { at, jobs } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      expect(jobs.map((job) => job.id)).toEqual(["100"]);
+
+      // `at` prints a job id, but the job never reaches the spool.
+      const lossy: AtIo = { ...at, schedule: () => "101" };
+      const retry = instance(PROD, lossy, { data: "" }, { log });
+
+      expect(() => retry.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(jobs.map((job) => job.id)).toEqual(["100"]);
+      expect(records().slice(2)).toEqual([
+        expect.objectContaining({ msg: "at_job_scheduled", tag: MSG_TAG, atJobId: "101" }),
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_enqueue_unconfirmed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "101",
+          queueSize: 1,
+          reason: "job missing from queue",
+        },
+      ]);
+    });
+
+    it("tolerates, but records, a missing job that was due within at's minute granularity", () => {
+      const { at } = sharedAtQueue();
+      const lossy: AtIo = { ...at, schedule: () => "100" };
+      const { log, records } = recordingLogger();
+      const dueNow = instance(PROD, lossy, { data: "" }, { log, now: () => NOW });
+      const soon = {
+        ...message("msg-a", "recipient"),
+        deliverAt: new Date(NOW + 60_000).toISOString(),
+      };
+
+      expect(() => dueNow.scheduleMessageDelivery(soon)).not.toThrow();
+      expect(records().map((record) => [record.msg, record.reason])).toEqual([
+        ["at_job_scheduled", undefined],
+        ["at_enqueue_unconfirmed", "job due; may already have run"],
+      ]);
+
+      const later = { ...soon, deliverAt: new Date(NOW + 60_001).toISOString() };
+      expect(() => dueNow.scheduleMessageDelivery(later)).toThrow(AtEnqueueUnconfirmedError);
     });
   });
 });
