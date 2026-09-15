@@ -9296,6 +9296,54 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
   });
 
+  it("rejects a standing head whose fresh checkpoint was written by another actor (#468)", () => {
+    const { mesh } = strictMesh();
+    const steward = worker(mesh, "repo steward");
+    const other = worker(mesh, "other actor");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    selectHead(mesh, steward, "repo-node");
+
+    repo.setCheckpoint("repo-node", "Another actor's verification.", other);
+    expect(() => mesh.declareYield(steward, "complete")).toThrow(
+      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
+    );
+  });
+
+  it("rejects a standing head unreadable at selection even after its owner writes a checkpoint (#468)", () => {
+    const unreadable = new Set<string>(["repo-node"]);
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => (unreadable.has(id) ? null : repo.get(id)),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    const steward = worker(mesh, "repo steward");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    selectHead(mesh, steward, "repo-node");
+
+    unreadable.delete("repo-node");
+    repo.setCheckpoint("repo-node", "Re-derived; no new work exists.", steward);
+    expect(() => mesh.declareYield(steward, "complete")).toThrow(
+      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
+    );
+  });
+
   it("keeps an issue-ref'd leaf strict even with a checkpoint rewritten during the run (#468)", () => {
     const events: MeshEventInput[] = [];
     const { mesh } = strictMesh((event) => events.push(event));

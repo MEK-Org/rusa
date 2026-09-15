@@ -3173,11 +3173,12 @@ export class ActorMesh {
    * Whether a still-ready head this actor still owns is a *standing* head it
    * verified during this run, making a no-change clean yield legal (#468).
    *
-   * A head is standing when it names an owner or repository — a ref whose path
-   * is one or two segments (`github:OWNER`, `github:OWNER/REPO`) — or when it
-   * has no ref and no parent: the never-finished nodes (repo stewardship,
+   * A head is standing when it names a GitHub owner or repository — a ref whose
+   * path is one or two segments (`github:OWNER`, `github:OWNER/REPO`) — or when
+   * it has no ref and no parent: the never-finished nodes (repo stewardship,
    * apexes) that re-ready whenever their last live child clears. Issue/PR-ref'd
-   * heads and ref-free leaves are not standing and keep every strict exit.
+   * heads, non-GitHub refs, and ref-free leaves are not standing and keep every
+   * strict exit.
    *
    * The evidence demanded of the run is the same attribution
    * {@link strictHandoffShortfall} already makes: the checkpoint on the row was
@@ -3192,7 +3193,7 @@ export class ActorMesh {
   ): boolean {
     const standing =
       obligation.externalRef !== null
-        ? obligation.externalRef.segments.length <= 2
+        ? obligation.externalRef.scheme === "github" && obligation.externalRef.segments.length <= 2
         : obligation.parentId === null;
     if (!standing) return false;
     if (this.resolveThreadId(obligation.ownerId) !== actorId) return false;

@@ -127,8 +127,8 @@ export type MeshEventKind =
   // actionable reason. The rejected yield itself is not recorded as yielded.
   | "run_yield_rejected"
   // The accepted no-change disposition a standing head earns (#468): an
-  // enrolled run whose still-ready standing head (owner/repository-level ref,
-  // or ref-free root) carried a checkpoint this actor rewrote during the run
+  // enrolled run whose still-ready standing head (GitHub owner/repository-level
+  // ref, or ref-free root) carried a checkpoint this actor rewrote during the run
   // yielded cleanly on the verification it recorded. `actorId` = the verifying
   // actor; `detail` = the obligation id and why it counts; payload =
   // { obligationId, title }. The sibling rejected-disposition kind is
