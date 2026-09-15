@@ -745,6 +745,105 @@ describe("EventManager", () => {
       expect(noBubbleResult.ownerIds).toEqual([]);
     });
 
+    it("holds a draft PR opening at its exact resource and bubbles once it is ready for review", () => {
+      const ownerStore = new InMemoryEventSourceOwnerStore();
+      const subStore = new InMemoryEventSourceSubscriptionStore();
+
+      ownerStore.subscribe({
+        resource: "github:MEK-Org/rusa",
+        actorId: "repo-owner",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-10T12:00:00Z",
+      });
+      // The creator holds the PR's own event source mechanically on creation.
+      subStore.subscribe({
+        resource: "github:MEK-Org/rusa/pulls/600",
+        actorId: "pr-creator",
+        subscribedBy: "pr-creator",
+        subscribedAt: "2026-09-10T12:00:00Z",
+      });
+
+      const resolver = createRoutingKernel({ owners: ownerStore, subscriptions: subStore });
+
+      // Draft opening: the repo owner is not asked to look yet.
+      const draftOpened = resolver.resolveRecipients("github:MEK-Org/rusa/pulls/600", {
+        eventPayload: { type: "pull_request.opened", draft: true },
+      });
+      expect(draftOpened.ownerIds).toEqual([]);
+      expect(draftOpened.subscriberIds).toEqual(["pr-creator"]);
+
+      // Becoming ready is the moment the ordinary opened path resumes.
+      const ready = resolver.resolveRecipients("github:MEK-Org/rusa/pulls/600", {
+        eventPayload: { type: "pull_request.ready_for_review" },
+      });
+      expect(ready.ownerIds).toEqual(["repo-owner"]);
+
+      // Converting back to draft is not a repo-owner event either.
+      const backToDraft = resolver.resolveRecipients("github:MEK-Org/rusa/pulls/600", {
+        eventPayload: { type: "pull_request.converted_to_draft" },
+      });
+      expect(backToDraft.ownerIds).toEqual([]);
+
+      // A ready opening (draft flag absent or false) still climbs as before.
+      for (const eventPayload of [
+        { type: "pull_request.opened" },
+        { type: "pull_request.opened", draft: false },
+      ]) {
+        const opened = resolver.resolveRecipients("github:MEK-Org/rusa/pulls/600", {
+          eventPayload,
+        });
+        expect(opened.ownerIds).toEqual(["repo-owner"]);
+      }
+    });
+
+    it("delivers a draft PR webhook to nobody but the PR's own subscribers", async () => {
+      const inbox = new FakeInboxStore();
+      const ownerStore = new InMemoryEventSourceOwnerStore();
+      const subStore = new InMemoryEventSourceSubscriptionStore();
+      ownerStore.subscribe({
+        resource: "github:MEK-Org/rusa",
+        actorId: "repo-owner",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-10T12:00:00Z",
+      });
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners: ownerStore, subscriptions: subStore }),
+      });
+
+      const opened = (draft: boolean, number: number): RawIntegrationEvent => ({
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "opened",
+            pull_request: { number, draft },
+          },
+        },
+      });
+
+      expect((await em.handleExternalEvent(opened(true, 601))).entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+
+      const ready = await em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "ready_for_review",
+            pull_request: { number: 601, draft: false },
+          },
+        },
+      });
+      expect(ready.entries.map((entry) => entry.actorId)).toEqual(["repo-owner"]);
+      expect(ready.entries[0].payload).toEqual({ type: "pull_request.ready_for_review" });
+
+      const readyOpened = await em.handleExternalEvent(opened(false, 602));
+      expect(readyOpened.entries.map((entry) => entry.actorId)).toEqual(["repo-owner"]);
+    });
+
     it("gives live obligation claims precedence over explicit subscriptions", () => {
       const ownerStore = new InMemoryEventSourceOwnerStore();
       const subStore = new InMemoryEventSourceSubscriptionStore();

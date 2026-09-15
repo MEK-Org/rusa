@@ -239,6 +239,17 @@ describe("GitHubEventPoller", () => {
         updatedAt: "2026-07-03T00:01:00.000Z",
         isPullRequest: true,
       },
+      {
+        number: 10,
+        title: "Polled draft",
+        body: "draft body",
+        author: "mock-bot",
+        state: "open",
+        createdAt: "2026-07-03T00:02:00.000Z",
+        updatedAt: "2026-07-03T00:02:00.000Z",
+        isPullRequest: true,
+        draft: true,
+      },
     ];
     const events: Array<[string, Record<string, unknown>]> = [];
 
@@ -252,7 +263,7 @@ describe("GitHubEventPoller", () => {
       },
     }).pollOnce();
 
-    expect(events).toHaveLength(1);
+    expect(events).toHaveLength(2);
     expect(events[0][0]).toBe("pull_request");
     expect(events[0][1]).toMatchObject({
       action: "edited",
@@ -262,6 +273,13 @@ describe("GitHubEventPoller", () => {
         body: "pr body\n<!-- mesh:deliver worker-2 -->",
         user: { login: "mock-bot" },
       },
+    });
+    // Draft state rides along so a polled draft opening is held exactly like
+    // the webhook form; a record without it stays shaped as before.
+    expect((events[0][1].pull_request as Record<string, unknown>).draft).toBeUndefined();
+    expect(events[1][1]).toMatchObject({
+      action: "opened",
+      pull_request: { number: 10, draft: true },
     });
   });
 

@@ -324,6 +324,7 @@ function pullRequestPayload(
       state: pullRequest.state,
       created_at: pullRequest.createdAt,
       updated_at: pullRequest.updatedAt,
+      ...(pullRequest.draft !== undefined ? { draft: pullRequest.draft } : {}),
     },
     sender: sender(pullRequest.author),
   };

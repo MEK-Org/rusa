@@ -52,6 +52,7 @@ export interface TrackerPr {
   headRef: string;
   base: string | null;
   state: "open" | "closed";
+  draft: boolean;
   author: string;
   labels: string[];
   createdAt: string;
@@ -279,6 +280,7 @@ export class LocalTracker {
     body: string;
     existingBody?: string;
     base?: string | null;
+    draft?: boolean;
     author: string;
   }): TrackerPr {
     const existing = [...this.prs.values()].find(
@@ -290,6 +292,9 @@ export class LocalTracker {
       existing.body = opts.existingBody ?? opts.body;
       if (opts.base !== undefined) {
         existing.base = opts.base;
+      }
+      if (opts.draft !== undefined) {
+        existing.draft = opts.draft;
       }
       existing.updatedAt = now;
       return { ...existing, wasCreated: false };
@@ -303,6 +308,7 @@ export class LocalTracker {
       headRef: opts.headRef,
       base: opts.base ?? null,
       state: "open",
+      draft: opts.draft ?? false,
       author: opts.author,
       labels: [],
       createdAt: now,
@@ -638,6 +644,7 @@ export class LocalTracker {
       html_url: pr.htmlUrl,
       head: { ref: pr.headRef },
       body: pr.body,
+      draft: pr.draft,
       user: { login: pr.author },
       labels: pr.labels.map((name) => ({ name })),
       updated_at: pr.updatedAt,

@@ -73,9 +73,10 @@ export class FakeIssueClient implements IssueClient {
       body: opts.body,
       existingBody: opts.existingBody,
       ...(opts.base !== undefined ? { base: opts.base } : {}),
+      ...(opts.draft !== undefined ? { draft: opts.draft } : {}),
       author: this.botAccount,
     });
-    return { number: pr.number, htmlUrl: pr.htmlUrl, wasCreated: pr.wasCreated };
+    return { number: pr.number, htmlUrl: pr.htmlUrl, wasCreated: pr.wasCreated, draft: pr.draft };
   }
 
   async getOpenPullRequestsByAuthor(_repo: string, author: string): Promise<OpenPullRequest[]> {

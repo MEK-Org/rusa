@@ -91,6 +91,12 @@ export function deriveGitHubInboxNotification(
     const merged = (payload.pull_request as { merged?: unknown } | undefined)?.merged;
     if (typeof merged === "boolean") inboxPayload.merged = merged;
   }
+  if (type === "pull_request.opened") {
+    // A draft opening is not yet a request for anyone's attention; the flag
+    // lets bubbling hold it at the exact resource until ready_for_review.
+    const draft = (payload.pull_request as { draft?: unknown } | undefined)?.draft;
+    if (typeof draft === "boolean") inboxPayload.draft = draft;
+  }
   const commentId = integerId((payload.comment as { id?: unknown } | undefined)?.id);
   if (commentId !== undefined) inboxPayload.commentId = commentId;
 
