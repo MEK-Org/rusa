@@ -887,15 +887,7 @@ export class ActorMesh {
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
-    this.principals =
-      opts.principals ??
-      ("principals" in opts.actors
-        ? (
-            opts.actors as {
-              principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
-            }
-          ).principals
-        : undefined);
+    this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
@@ -2908,6 +2900,7 @@ export class ActorMesh {
     this.actors.patch(toId, {
       humanUnlocked: true,
       lastChatSessionId: sessionId,
+      lastChatPrincipalId: fromId,
     });
     const target = this.live.get(toId);
     const messageId = this.recordMessageEmitted({

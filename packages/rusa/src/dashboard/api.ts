@@ -5,7 +5,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
-import type { RootControlService } from "../actor/root-control.js";
+import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
   generateAvatarForce,
@@ -513,13 +513,27 @@ function parseKinds(url: URL): string[] | undefined {
 
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
-  deps: DashboardDataDeps | null
-): string {
+  _deps?: DashboardDataDeps | null
+): RootControlPrincipal {
   const reqPrincipal = getDashboardRequestPrincipal(req);
-  if (reqPrincipal) return reqPrincipal.id;
-  const firstUser = deps?.principals?.findFirstUser();
-  if (firstUser) return firstUser.id;
+  if (reqPrincipal) return reqPrincipal.id as RootControlPrincipal;
   return HUMAN_OPERATOR;
+}
+
+export function resolveChatQueryActors(
+  actors: string[],
+  deps: DashboardDataDeps | null,
+  req: IncomingMessage
+): string[] {
+  const result = new Set(actors);
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) result.add(reqPrincipal.id);
+  if (result.has(HUMAN_OPERATOR) && deps?.principals) {
+    for (const u of deps.principals.listUsers()) {
+      result.add(u.id);
+    }
+  }
+  return [...result];
 }
 
 /**
@@ -577,7 +591,7 @@ export async function handleMeshApiRequest(
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
-              "human:operator"
+              resolveOperatorPrincipalId(req, deps)
             );
             sendJson(res, 201, { id });
           } catch (err) {
@@ -616,7 +630,11 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            rootControl.reparentChild(actorId, parentId.trim(), "human:operator");
+            rootControl.reparentChild(
+              actorId,
+              parentId.trim(),
+              resolveOperatorPrincipalId(req, deps)
+            );
             sendJson(res, 200, { ok: true });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -760,7 +778,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       try {
-        const result = deps.mesh.runNow(actorId, "human:operator");
+        const result = deps.mesh.runNow(actorId, resolveOperatorPrincipalId(req, deps));
         sendJson(res, 200, { ok: true, queued: result.queued });
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1498,12 +1516,15 @@ export async function handleMeshApiRequest(
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
+    const reqPrincipal = getDashboardRequestPrincipal(req);
+    const userPrincipalId = reqPrincipal?.id ?? deps.principals?.listUsers()[0]?.id ?? null;
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
       supportedVoices: SUPPORTED_TTS_VOICES,
+      userPrincipalId,
     });
     return true;
   }
@@ -1522,7 +1543,8 @@ export async function handleMeshApiRequest(
       sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
       return true;
     }
-    const actors = parseActors(url);
+    const rawActors = parseActors(url);
+    const actors = resolveChatQueryActors(rawActors, deps, req);
     const conversation = url.searchParams.get("conversation") === "true";
     const page = meshEvents.listEventsByActors(actors, {
       limit: clampLimit(url),
@@ -1536,7 +1558,8 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
   if (pathname === "/api/mesh/chat") {
-    const actors = parseActors(url);
+    const rawActors = parseActors(url);
+    const actors = resolveChatQueryActors(rawActors, deps, req);
     const page = deps.meshChat.listChatByActors(actors, {
       limit: clampLimit(url),
       before: parsePositiveInt(url, "before") ?? null,

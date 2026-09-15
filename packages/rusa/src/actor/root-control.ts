@@ -6,7 +6,20 @@ import {
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 
-export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller" | (string & {});
+/**
+ * UUID string format representing a durable user principal ID.
+ */
+export type UserPrincipalId = `${string}-${string}-${string}-${string}-${string}`;
+
+/**
+ * Principals authorized to execute root-level control actions.
+ * Constrained to well-known infrastructure literals or a verified user principal UUID.
+ */
+export type RootControlPrincipal =
+  | "root-llm"
+  | "human:operator"
+  | "e2e-controller"
+  | UserPrincipalId;
 
 export interface RootChildRequest {
   executionTarget?: string;

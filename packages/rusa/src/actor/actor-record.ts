@@ -52,6 +52,8 @@ export interface ActorRecord {
   humanUnlocked?: boolean;
   /** Derived from the latest durable operator chat, never stored on the actor row. */
   lastChatSessionId?: string;
+  /** Initiating human operator/user principal of the latest chat session, never stored on the actor row. */
+  lastChatPrincipalId?: string;
   createdAt: string;
   /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
   executionTarget?: string;

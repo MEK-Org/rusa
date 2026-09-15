@@ -22,6 +22,7 @@ type ActorRow = {
 
 type LastHumanMessage = {
   session_id: string | null;
+  sender_id?: string | null;
 };
 
 /**
@@ -352,25 +353,12 @@ type DesiredOverlayEntry = {
 export class SqliteActorRepository implements ActorRepository {
   private readonly db: Database.Database;
   private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
-  private _hasPrincipals?: boolean;
 
   constructor(
     db: Database.Database,
     private readonly principals: PrincipalRepository = new PrincipalRepository(db)
   ) {
     this.db = db;
-  }
-
-  private hasPrincipalsTable(): boolean {
-    if (this._hasPrincipals !== true) {
-      const row = this.db
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principals'")
-        .get();
-      if (row) {
-        this._hasPrincipals = true;
-      }
-    }
-    return this._hasPrincipals === true;
   }
 
   upsert(record: ActorRecord): void {
@@ -451,16 +439,19 @@ export class SqliteActorRepository implements ActorRepository {
     // actor when no recipient index existed. One ordered pass has the same
     // newest `(ts, id)` semantics and leaves the first row for each recipient
     // in the map, without a schema migration or an N+1 query.
-    const newestHumanSql = this.hasPrincipalsTable()
-      ? "SELECT recipient_id, session_id FROM mesh_chat WHERE sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user') ORDER BY recipient_id, ts DESC, id DESC"
-      : "SELECT recipient_id, session_id FROM mesh_chat WHERE sender_id = ? ORDER BY recipient_id, ts DESC, id DESC";
+    const newestHumanSql =
+      "SELECT recipient_id, session_id, sender_id FROM mesh_chat WHERE sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user') ORDER BY recipient_id, ts DESC, id DESC";
     const newestHumanRows = this.db.prepare(newestHumanSql).all(HUMAN_OPERATOR) as Array<{
       recipient_id: string;
       session_id: string | null;
+      sender_id: string | null;
     }>;
     for (const message of newestHumanRows) {
       if (!lastHumanMessageByRecipient.has(message.recipient_id)) {
-        lastHumanMessageByRecipient.set(message.recipient_id, { session_id: message.session_id });
+        lastHumanMessageByRecipient.set(message.recipient_id, {
+          session_id: message.session_id,
+          sender_id: message.sender_id,
+        });
       }
     }
     // `null` means this actor was resolved by the batch and has no matching
@@ -497,9 +488,8 @@ export class SqliteActorRepository implements ActorRepository {
     const handles = this.db
       .prepare("SELECT target_id, role FROM actor_handles WHERE actor_id = ? ORDER BY target_id")
       .all(row.id) as Array<{ target_id: string; role: string | null }>;
-    const singleHumanSql = this.hasPrincipalsTable()
-      ? "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND (sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user')) ORDER BY ts DESC, id DESC LIMIT 1"
-      : "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1";
+    const singleHumanSql =
+      "SELECT session_id, sender_id FROM mesh_chat WHERE recipient_id = ? AND (sender_id = ? OR sender_id IN (SELECT id FROM principals WHERE kind = 'user')) ORDER BY ts DESC, id DESC LIMIT 1";
     const lastHumanMessage =
       listedLastHumanMessage === undefined
         ? (this.db.prepare(singleHumanSql).get(row.id, HUMAN_OPERATOR) as
@@ -527,6 +517,7 @@ export class SqliteActorRepository implements ActorRepository {
         : {}),
       ...(lastHumanMessage ? { humanUnlocked: true } : {}),
       ...(lastHumanMessage?.session_id ? { lastChatSessionId: lastHumanMessage.session_id } : {}),
+      ...(lastHumanMessage?.sender_id ? { lastChatPrincipalId: lastHumanMessage.sender_id } : {}),
       ...this.desiredOverlay.get(row.id),
     };
   }

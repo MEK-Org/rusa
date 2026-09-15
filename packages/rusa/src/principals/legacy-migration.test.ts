@@ -672,6 +672,218 @@ describe("legacy-migration", () => {
       expect(report).toContain("APPLIED");
       expect(report).toContain("Authoritative References Inventory");
       expect(report).toContain("Untouched Reference Sites");
+      expect(report).toContain("Dynamic Schema Sweep");
+    });
+
+    it("creates a verified SQLite online backup under WAL mode and checks integrity", async () => {
+      const dbFile = join(tempDir, "wal-mesh.db");
+      const db = setupLegacyDatabase(dbFile);
+      db.pragma("journal_mode = WAL");
+
+      // Write uncheckpointed row into WAL
+      db.prepare(
+        `INSERT INTO obligations (id, owner_id, creator_id, title, created_at, updated_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "wal-ob-1",
+        HUMAN_OPERATOR,
+        HUMAN_OPERATOR,
+        "WAL obligation",
+        "2026-09-01T03:00:00.000Z",
+        "2026-09-01T03:00:00.000Z",
+        "ready"
+      );
+
+      const backupDir = join(tempDir, "wal-backups");
+      const backupPath = await backupDatabase(db, backupDir);
+
+      const backupDb = new Database(backupPath, { readonly: true });
+      const rows = backupDb
+        .prepare("SELECT * FROM obligations WHERE id = ?")
+        .all("wal-ob-1") as Array<unknown>;
+      expect(rows).toHaveLength(1);
+      const integrity = backupDb.pragma("integrity_check") as Array<{ integrity_check: string }>;
+      expect(integrity[0].integrity_check).toBe("ok");
+      backupDb.close();
+      db.close();
+    });
+
+    it("dynamically detects unclassified legacy references via schema sweep and rolls back atomically", () => {
+      const db = setupLegacyDatabase();
+      // Add an unclassified table containing human:operator
+      db.exec("CREATE TABLE unclassified_custom (id TEXT PRIMARY KEY, operator_ref TEXT)");
+      db.prepare("INSERT INTO unclassified_custom VALUES (?, ?)").run("custom-1", HUMAN_OPERATOR);
+
+      const inventory = inventoryLegacyReferences(db);
+      expect(inventory.totalDangling).toBe(1);
+      expect(inventory.dangling).toContainEqual({
+        table: "unclassified_custom",
+        column: "operator_ref",
+        count: 1,
+      });
+
+      // Applying migration fails and rolls back because dangling legacy references remain
+      expect(() =>
+        executeLegacyPrincipalMigration(db, {
+          email: "operator@example.com",
+          apply: true,
+        })
+      ).toThrow(/unclassified legacy references detected/);
+
+      // Verify rollback occurred cleanly
+      const postInventory = inventoryLegacyReferences(db);
+      expect(postInventory.totalAuthoritative).toBe(inventory.totalAuthoritative);
+      db.close();
+    });
+
+    it("verifies actor reply targets authenticated durable principal and avoids minting human:operator", async () => {
+      const db = setupLegacyDatabase();
+      const principalRepo = new PrincipalRepository(db);
+      const actorRepo = new SqliteActorRepository(db, principalRepo);
+      const chatRepo = new MeshChatRepository(db);
+
+      const migration = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: true,
+      });
+
+      const mesh = new ActorMesh({
+        actors: actorRepo,
+        principals: principalRepo,
+        recordChat: (c) => chatRepo.record(c),
+        rootId: ROOT_ID,
+        createActor: () => {
+          throw new Error("unsupported");
+        },
+      });
+      const worker = actorRepo.get(WORKER_ID);
+      if (!worker) throw new Error("worker record missing");
+      mesh.adopt(worker, createMockLiveActor(WORKER_ID));
+
+      // Authenticated message arrives with fromId = durable principal ID
+      mesh.sendHumanMessage(WORKER_ID, "Ping worker", "sess-123", {
+        fromId: migration.principalId,
+      });
+
+      // The updated actor record has lastChatPrincipalId set to the user principal
+      const updatedWorker = actorRepo.get(WORKER_ID);
+      expect(updatedWorker?.lastChatPrincipalId).toBe(migration.principalId);
+
+      // Actor replies back in conversation
+      mesh.recordMessageEmitted({
+        fromId: WORKER_ID,
+        toId: updatedWorker?.lastChatPrincipalId ?? HUMAN_OPERATOR,
+        body: "Acknowledged ping",
+        sessionId: "sess-123",
+        isDrop: false,
+      });
+
+      // Check the emitted chat row: recipient_id must be the durable principal, NOT human:operator
+      const chats = chatRepo.listForSession("sess-123", { limit: 10 });
+      expect(chats).toHaveLength(2);
+      const workerReply = chats.find((c) => c.senderId === WORKER_ID);
+      expect(workerReply).toBeDefined();
+      expect(workerReply?.recipientId).toBe(migration.principalId);
+
+      // Assert that 0 authoritative human:operator references exist anywhere
+      const sweep = inventoryLegacyReferences(db);
+      expect(sweep.totalAuthoritative).toBe(0);
+      expect(sweep.totalDangling).toBe(0);
+      db.close();
+    });
+
+    it("rehearses full dry-run, apply with WAL online backup, and idempotent rerun on representative database", async () => {
+      const dbFile = join(tempDir, "representative-mesh.db");
+      const db = setupLegacyDatabase(dbFile);
+      db.pragma("journal_mode = WAL");
+
+      // Seed representative data across all relevant tables
+      const obInsert = db.prepare(
+        `INSERT INTO obligations (id, owner_id, creator_id, title, intent, created_at, updated_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (let i = 10; i < 20; i++) {
+        obInsert.run(
+          `rep-ob-${i}`,
+          i % 2 === 0 ? HUMAN_OPERATOR : ROOT_ID,
+          HUMAN_OPERATOR,
+          `Representative task ${i}`,
+          `Intent for task ${i} with human:operator mention`,
+          "2026-09-02T00:00:00.000Z",
+          "2026-09-02T00:00:00.000Z",
+          "ready"
+        );
+      }
+
+      const histInsert = db.prepare(
+        `INSERT INTO obligation_history (id, obligation_id, timestamp, mutation_kind, acting_principal, payload)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      for (let i = 10; i < 25; i++) {
+        histInsert.run(
+          i,
+          `rep-ob-${10 + (i % 10)}`,
+          "2026-09-02T00:01:00.000Z",
+          "update",
+          HUMAN_OPERATOR,
+          JSON.stringify({ note: `updated by human:operator ${i}` })
+        );
+      }
+
+      const chatInsert = db.prepare(
+        `INSERT INTO mesh_chat (sender_id, recipient_id, body, session_id, ts)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      for (let i = 10; i < 25; i++) {
+        chatInsert.run(
+          i % 2 === 0 ? HUMAN_OPERATOR : WORKER_ID,
+          i % 2 === 0 ? WORKER_ID : HUMAN_OPERATOR,
+          `Message body ${i} referencing human:operator`,
+          `rep-session-${i % 3}`,
+          1700000000000 + i
+        );
+      }
+
+      // 1. Dry run
+      const dryRunResult = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: false,
+      });
+      expect(dryRunResult.applied).toBe(false);
+      expect(dryRunResult.preInventory.totalAuthoritative).toBeGreaterThan(0);
+      expect(dryRunResult.preInventory.totalUntouched).toBeGreaterThan(0);
+      expect(dryRunResult.preInventory.totalDangling).toBe(0);
+
+      // Verify no mutation occurred during dry run
+      const drySweep = inventoryLegacyReferences(db);
+      expect(drySweep.totalAuthoritative).toBe(dryRunResult.preInventory.totalAuthoritative);
+
+      // 2. Apply with backup
+      const backupDir = join(tempDir, "rep-backups");
+      const backupPath = await backupDatabase(db, backupDir);
+      expect(backupPath).toContain("mesh-backup-");
+
+      const applyResult = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: true,
+      });
+      expect(applyResult.applied).toBe(true);
+      expect(applyResult.rewritesApplied).toBe(dryRunResult.preInventory.totalAuthoritative);
+      expect(applyResult.postInventory?.totalAuthoritative).toBe(0);
+      expect(applyResult.postInventory?.totalDangling).toBe(0);
+
+      // 3. Idempotent rerun
+      const rerunResult = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: true,
+      });
+      expect(rerunResult.applied).toBe(true);
+      expect(rerunResult.principalReused).toBe(true);
+      expect(rerunResult.principalCreated).toBe(false);
+      expect(rerunResult.rewritesApplied).toBe(0);
+      expect(rerunResult.postInventory?.totalAuthoritative).toBe(0);
+
+      db.close();
     });
   });
 });

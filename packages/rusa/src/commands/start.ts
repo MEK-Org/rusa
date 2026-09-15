@@ -1788,6 +1788,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
     actors,
+    principals: getRepositories().principals,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
     // is wired. Unknown or disconnected targets fail closed.

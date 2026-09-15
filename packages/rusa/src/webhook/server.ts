@@ -15,7 +15,11 @@ import {
   getDashboardHtml,
   hasDashboardAsset,
 } from "../dashboard/assets.js";
-import { createDashboardAuth, type DashboardAuth } from "../dashboard/auth.js";
+import {
+  createDashboardAuth,
+  type DashboardAuth,
+  getDashboardRequestPrincipal,
+} from "../dashboard/auth.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
@@ -199,10 +203,11 @@ export interface DashboardServerBaseOptions {
   logger?: Logger;
 }
 
-/** Configured `auth` and the principal repository its identities resolve through arrive
- * together or not at all, so an authenticated dashboard cannot be started without storage. */
+/** When `auth` is configured, `principals` storage is required so authenticated
+ * identities can be resolved. Storage may also be provided without external `auth`
+ * (e.g. in local mode or during maintenance). */
 export type DashboardAuthOptions =
-  | { auth?: DashboardAuthConfig; principals: PrincipalRepository }
+  | { auth: DashboardAuthConfig; principals: PrincipalRepository }
   | { auth?: undefined; principals?: PrincipalRepository };
 
 export type DashboardServerOptions = DashboardServerBaseOptions & DashboardAuthOptions;
@@ -338,7 +343,13 @@ export function createDashboardRequestHandler(
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify({ quotaProviders: options.dashboardConfig?.quotaProviders ?? {} }));
+        const reqPrincipal = getDashboardRequestPrincipal(req);
+        res.end(
+          JSON.stringify({
+            quotaProviders: options.dashboardConfig?.quotaProviders ?? {},
+            ...(reqPrincipal ? { userPrincipalId: reqPrincipal.id } : {}),
+          })
+        );
         return;
       }
 

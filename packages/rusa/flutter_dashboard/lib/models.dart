@@ -1092,9 +1092,13 @@ class QuotaProviderConfigDto {
 }
 
 class DashboardConfigDto {
-  const DashboardConfigDto({required this.quotaProviders});
+  const DashboardConfigDto({
+    required this.quotaProviders,
+    this.userPrincipalId,
+  });
 
   final Map<String, QuotaProviderConfigDto> quotaProviders;
+  final String? userPrincipalId;
 
   factory DashboardConfigDto.fromJson(Map<String, dynamic> j) {
     final rawProviders =
@@ -1106,6 +1110,7 @@ class DashboardConfigDto {
           QuotaProviderConfigDto.fromJson(value as Map<String, dynamic>),
         ),
       ),
+      userPrincipalId: j['userPrincipalId'] as String?,
     );
   }
 }

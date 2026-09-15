@@ -1,6 +1,6 @@
-import { copyFile, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { normalizeEmail, PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 
@@ -46,11 +46,19 @@ export interface UntouchedCount {
   reason: string;
 }
 
+export interface DanglingReferenceCount {
+  table: string;
+  column: string;
+  count: number;
+}
+
 export interface LegacyReferenceInventory {
   authoritative: AuthoritativeCount[];
   totalAuthoritative: number;
   untouched: UntouchedCount[];
   totalUntouched: number;
+  dangling: DanglingReferenceCount[];
+  totalDangling: number;
 }
 
 export interface MigrationOptions {
@@ -86,8 +94,52 @@ function columnExists(db: Database.Database, tableName: string, columnName: stri
 }
 
 /**
+ * Dynamically sweep every user table and column in the SQLite schema for exact matches
+ * to `human:operator` that are outside the classified authoritative and untouched inventories.
+ */
+export function sweepSchemaForExactMatches(
+  db: Database.Database,
+  knownKeys: Set<string>
+): DanglingReferenceCount[] {
+  const tables = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_litestream_%'"
+    )
+    .all() as Array<{ name: string }>;
+  const dangling: DanglingReferenceCount[] = [];
+  for (const { name: tableName } of tables) {
+    let cols: Array<{ name: string; type: string }>;
+    try {
+      cols = db.prepare(`PRAGMA table_info("${tableName}")`).all() as Array<{
+        name: string;
+        type: string;
+      }>;
+    } catch {
+      continue;
+    }
+    for (const col of cols) {
+      const key = `${tableName}.${col.name}`;
+      if (knownKeys.has(key)) continue;
+      try {
+        const row = db
+          .prepare(`SELECT COUNT(*) AS count FROM "${tableName}" WHERE "${col.name}" = ?`)
+          .get(HUMAN_OPERATOR) as { count: number } | undefined;
+        const count = row ? Number(row.count) : 0;
+        if (count > 0) {
+          dangling.push({ table: tableName, column: col.name, count });
+        }
+      } catch {
+        // Skip non-queryable columns (e.g. virtual tables)
+      }
+    }
+  }
+  return dangling;
+}
+
+/**
  * Mechanically inventory every exact authoritative reference to `human:operator`
- * as well as untouched log, prose, and provenance reference sites across the database.
+ * as well as untouched log, prose, and provenance reference sites across the database,
+ * plus a dynamic sweep for any unclassified/dangling references.
  */
 export function inventoryLegacyReferences(db: Database.Database): LegacyReferenceInventory {
   const authoritative: AuthoritativeCount[] = [];
@@ -132,11 +184,19 @@ export function inventoryLegacyReferences(db: Database.Database): LegacyReferenc
     totalUntouched += count;
   }
 
+  const knownKeys = new Set<string>();
+  for (const item of AUTHORITATIVE_REFERENCES) knownKeys.add(`${item.table}.${item.column}`);
+  for (const item of UNTOUCHED_REFERENCES) knownKeys.add(`${item.table}.${item.column}`);
+  const dangling = sweepSchemaForExactMatches(db, knownKeys);
+  const totalDangling = dangling.reduce((acc, cur) => acc + cur.count, 0);
+
   return {
     authoritative,
     totalAuthoritative,
     untouched,
     totalUntouched,
+    dangling,
+    totalDangling,
   };
 }
 
@@ -252,14 +312,22 @@ export function executeLegacyPrincipalMigration(
         HUMAN_OPERATOR
       );
     }
+
+    // In-transaction postcondition: check that 0 authoritative or dangling references remain before commit
+    const inTxInventory = inventoryLegacyReferences(db);
+    if (inTxInventory.totalAuthoritative !== 0) {
+      throw new Error(
+        `Migration integrity check failed: ${inTxInventory.totalAuthoritative} authoritative references remain after apply`
+      );
+    }
+    if (inTxInventory.totalDangling !== 0) {
+      throw new Error(
+        `Migration integrity check failed: ${inTxInventory.totalDangling} unclassified legacy references detected: ${JSON.stringify(inTxInventory.dangling)}`
+      );
+    }
   })();
 
   const postInventory = inventoryLegacyReferences(db);
-  if (postInventory.totalAuthoritative !== 0) {
-    throw new Error(
-      `Migration integrity check failed: ${postInventory.totalAuthoritative} authoritative references remain after apply`
-    );
-  }
 
   return {
     email,
@@ -321,6 +389,19 @@ export function generateMigrationReport(result: MigrationResult, databasePath: s
   }
   lines.push("");
 
+  lines.push("## Dynamic Schema Sweep (Unclassified References)");
+  lines.push("");
+  if (result.preInventory.dangling.length === 0) {
+    lines.push("- Zero unclassified exact `human:operator` references found across all tables.");
+  } else {
+    lines.push("| Table | Column | References Found |");
+    lines.push("| :--- | :--- | :---: |");
+    for (const item of result.preInventory.dangling) {
+      lines.push(`| \`${item.table}\` | \`${item.column}\` | ${item.count} |`);
+    }
+  }
+  lines.push("");
+
   lines.push("## Verification Summary");
   lines.push("");
   if (result.applied) {
@@ -345,14 +426,43 @@ export function generateMigrationReport(result: MigrationResult, databasePath: s
 }
 
 /**
- * Create a backup of the SQLite database before applying migration changes.
+ * Create a verified online backup of the SQLite database before applying migration changes.
+ * Uses SQLite's online backup API so WAL pages are safely captured without corruption or staleness,
+ * verified via PRAGMA integrity_check on the resulting backup.
  */
-export async function backupDatabase(databasePath: string, backupDir?: string): Promise<string> {
-  const source = resolve(databasePath);
-  const targetDir = backupDir ? resolve(backupDir) : dirname(source);
+export async function backupDatabase(
+  dbOrPath: Database.Database | string,
+  backupDir?: string
+): Promise<string> {
+  const isDbInstance = typeof dbOrPath !== "string" && "name" in dbOrPath;
+  const sourcePath = isDbInstance ? resolve(dbOrPath.name) : resolve(dbOrPath as string);
+  const targetDir = backupDir ? resolve(backupDir) : dirname(sourcePath);
   await mkdir(targetDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPath = join(targetDir, `mesh-backup-${timestamp}.db`);
-  await copyFile(source, backupPath);
+
+  let dbToClose: Database.Database | null = null;
+  let db: Database.Database;
+  if (isDbInstance) {
+    db = dbOrPath as Database.Database;
+  } else {
+    dbToClose = new Database(sourcePath);
+    db = dbToClose;
+  }
+  try {
+    await db.backup(backupPath);
+  } finally {
+    if (dbToClose) dbToClose.close();
+  }
+
+  const verifyDb = new Database(backupPath, { readonly: true });
+  try {
+    const rows = verifyDb.pragma("integrity_check") as Array<{ integrity_check: string }>;
+    if (!rows || rows.length === 0 || rows[0].integrity_check !== "ok") {
+      throw new Error(`Backup integrity check failed for ${backupPath}: ${JSON.stringify(rows)}`);
+    }
+  } finally {
+    verifyDb.close();
+  }
   return backupPath;
 }

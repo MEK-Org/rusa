@@ -69,7 +69,7 @@ export async function run(argv = process.argv) {
   let result;
   try {
     if (args.apply && args.backupDir) {
-      const backupPath = await backupDatabase(args.database, args.backupDir);
+      const backupPath = await backupDatabase(db, args.backupDir);
       process.stdout.write(`[legacy-migration] Backup created at ${backupPath}\n`);
     }
 
