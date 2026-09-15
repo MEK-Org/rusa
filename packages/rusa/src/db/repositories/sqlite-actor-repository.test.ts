@@ -672,6 +672,25 @@ describe("SqliteActorRepository", () => {
     }
   });
 
+  it("round-trips ElevenLabs voice IDs and clears them", () => {
+    repository.upsert(root);
+    const voiceConfig = {
+      schemaVersion: 1 as const,
+      provider: "elevenlabs" as const,
+      config: { voiceId: "voice-123" },
+    };
+    repository.upsert({
+      ...root,
+      id: "eleven-worker",
+      isRoot: false,
+      parentId: "root",
+      voiceConfig,
+    });
+    expect(repository.get("eleven-worker")?.voiceConfig).toEqual(voiceConfig);
+    repository.patch("eleven-worker", { voiceConfig: undefined });
+    expect(repository.get("eleven-worker")?.voiceConfig).toBeUndefined();
+  });
+
   it("rejects complete invalid voice documents at upsert and patch boundaries", () => {
     repository.upsert(root);
     const worker: ActorRecord = {
@@ -715,7 +734,7 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":1,"provider":"google"}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":""}}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":"Puck","unknown":true}}',
-      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"}}',
+      '{"schemaVersion":1,"provider":"unknown","config":{"voiceId":"abc"}}',
     ]) {
       db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);

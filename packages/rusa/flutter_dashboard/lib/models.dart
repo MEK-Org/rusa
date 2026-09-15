@@ -117,6 +117,7 @@ class ThreadDto {
     this.ownerExpectsRetirement,
     this.selectedObligation,
     this.voiceName,
+    this.elevenlabsVoiceId,
   });
 
   final String id;
@@ -205,6 +206,7 @@ class ThreadDto {
   /// instance-wide default. Absent (null) is the state of every actor without
   /// a stored voice setting, including all actors on an older server.
   final String? voiceName;
+  final String? elevenlabsVoiceId;
 
   bool get isRetired => status == 'retired';
 
@@ -238,6 +240,7 @@ class ThreadDto {
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
     Object? voiceName = _keepThreadField,
+    Object? elevenlabsVoiceId = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -284,6 +287,9 @@ class ThreadDto {
     selectedObligation: identical(selectedObligation, _keepThreadField)
         ? this.selectedObligation
         : selectedObligation as ObligationDto?,
+    elevenlabsVoiceId: identical(elevenlabsVoiceId, _keepThreadField)
+        ? this.elevenlabsVoiceId
+        : elevenlabsVoiceId as String?,
     voiceName: identical(voiceName, _keepThreadField)
         ? this.voiceName
         : voiceName as String?,
@@ -337,7 +343,17 @@ class ThreadDto {
           )
         : null,
     voiceName: j['voiceName'] as String?,
+    elevenlabsVoiceId: j['voiceConfig']?['provider'] == 'elevenlabs'
+        ? j['voiceConfig']['config']['voiceId'] as String?
+        : null,
   );
+}
+
+/// A configured voice ID and its display label.
+class ElevenLabsVoice {
+  const ElevenLabsVoice({required this.voiceId, required this.label});
+  final String voiceId;
+  final String label;
 }
 
 /// The `GET /api/mesh/threads` response: the thread list plus the top-level
@@ -350,6 +366,7 @@ class ThreadsSnapshot {
     this.runtimeCursor,
     this.schedulerWarning,
     this.supportedVoices = const [],
+    this.elevenlabsVoices = const [],
   });
 
   final bool halted;
@@ -360,6 +377,7 @@ class ThreadsSnapshot {
   /// source for every voice picker in the UI. Empty against an older server
   /// that predates the per-actor voice setting.
   final List<String> supportedVoices;
+  final List<ElevenLabsVoice> elevenlabsVoices;
 
   /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
   /// unavailable — null when it's fine or the server doesn't report it. A
@@ -378,6 +396,16 @@ class ThreadsSnapshot {
     schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
         ?.map((e) => e as String)
         .toList(),
+    elevenlabsVoices: j['elevenlabsVoices'] != null
+        ? (j['elevenlabsVoices'] as List<dynamic>)
+              .map((v) => ElevenLabsVoice(
+                voiceId: v['voiceId'] as String,
+                label: v['label'] as String,
+              ))
+              .toList()
+        : (j['elevenlabsVoiceIds'] as List<dynamic>? ?? const [])
+              .map((id) => ElevenLabsVoice(voiceId: id as String, label: id))
+              .toList(),
     supportedVoices: (j['supportedVoices'] as List<dynamic>?)
             ?.map((e) => e as String)
             .toList() ??

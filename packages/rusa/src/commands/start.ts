@@ -1787,6 +1787,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
+    elevenlabsVoiceIds:
+      config.voice?.elevenlabsVoices?.map((voice) => voice.voiceId) ??
+      config.voice?.elevenlabsVoiceIds,
     actors,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
@@ -3328,14 +3331,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onEvent,
         })
       : null;
-  // Walkie-talkie mode, server half : gated on geminiApiKey (transcription
-  // and TTS are host-side Gemini calls — the key never reaches workers). When
-  // absent the voice routes 503 with a clear error and nothing else changes.
+  // Walkie-talkie routes require the selected transcription provider key.
+  // Speech provider keys stay on the host. Actor TTS is selected per reply.
   const geminiApiKey = config.geminiApiKey?.trim();
-  voiceService = geminiApiKey
+  voiceService = (
+    config.voice?.transcriptionProvider === "elevenlabs"
+      ? config.elevenlabsApiKey?.trim()
+      : geminiApiKey
+  )
     ? createVoiceService({
         home: mcHome,
-        apiKey: geminiApiKey,
+        apiKey: geminiApiKey ?? "",
+        elevenlabsApiKey: config.elevenlabsApiKey,
+        voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
         voice: config.voice,
         // Per-actor voice for reply TTS: the actor's persisted voice_config,
         // validated against the supported catalog, else the instance-wide
@@ -3422,6 +3430,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
+          elevenlabsVoices: config.voice?.elevenlabsVoices,
+          elevenlabsVoiceIds: config.voice?.elevenlabsVoiceIds,
           getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated

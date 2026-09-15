@@ -187,6 +187,7 @@ function deferredProvider() {
 
 function setup(
   opts: {
+    elevenlabsVoiceIds?: string[];
     maxConcurrent?: number;
     sharedProvider?: CodingProvider;
     onRetire?: (record: { id: string }) => void;
@@ -257,6 +258,7 @@ function setup(
     log: (m) => logs.push(m),
   });
   mesh = new ActorMesh({
+    elevenlabsVoiceIds: opts.elevenlabsVoiceIds,
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -465,6 +467,18 @@ describe("ActorMesh", () => {
     expect(canWrite(descendant)).toBe(false);
   });
 
+  it("assigns new actors a voice from the configured ElevenLabs pool", () => {
+    const ids = ["G17SuINrv2H9FC6nvetn", "SMRMz7WpPUV6i2myuniv"];
+    const { mesh, registry } = setup({ elevenlabsVoiceIds: ids });
+    for (let i = 0; i < 10; i++) {
+      const id = mesh.spawn({ charter: "Speak", parentId: "root" });
+      const voice = registry.get(id)?.voiceConfig;
+      expect(voice?.provider).toBe("elevenlabs");
+      if (voice?.provider !== "elevenlabs") throw new Error("expected ElevenLabs voice");
+      expect(ids).toContain(voice.config.voiceId);
+    }
+  });
+
   it("randomizes a supported voice for every newly spawned actor", () => {
     const { mesh, registry } = setup();
     const voices = new Set<string>();
@@ -473,6 +487,7 @@ describe("ActorMesh", () => {
       const voiceConfig = registry.get(id)?.voiceConfig;
       expect(voiceConfig?.schemaVersion).toBe(1);
       expect(voiceConfig?.provider).toBe("google");
+      if (voiceConfig?.provider !== "google") throw new Error("expected Google spawn voice");
       expect(voiceConfig?.config.voiceName).toBeDefined();
       expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
       voices.add(voiceConfig?.config.voiceName ?? "");

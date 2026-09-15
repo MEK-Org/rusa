@@ -352,13 +352,23 @@ export interface RootActorConfig {
   avatar?: string;
 }
 
-/**
- * Walkie-talkie voice settings . Entirely optional — the feature itself
- * is gated on `geminiApiKey` being present; these only override the model and
- * voice defaults. No secrets live here.
- */
+/** A configured ElevenLabs voice and its dashboard label. */
+export interface ElevenLabsVoice {
+  voiceId: string;
+  label: string;
+}
+
+/** Walkie-talkie provider and model settings. No secrets live here. */
 export interface VoiceConfig {
-  /** Audio-capable Gemini model for memo transcription. Default "gemini-2.5-flash". */
+  /** STT provider, independent of actor TTS. Default "google". */
+  transcriptionProvider?: "google" | "elevenlabs";
+  /** ElevenLabs TTS model. Default "eleven_multilingual_v2". */
+  elevenlabsTtsModel?: string;
+  /** Selectable ElevenLabs voices; new actors pick randomly from this pool when non-empty. */
+  elevenlabsVoiceIds?: string[];
+  /** Named voice pool. Preferred over the legacy elevenlabsVoiceIds field. */
+  elevenlabsVoices?: ElevenLabsVoice[];
+  /** Model for the selected STT provider. Defaults to gemini-2.5-flash or scribe_v2. */
   transcriptionModel?: string;
   /** Gemini TTS model for reply audio. Default "gemini-3.1-flash-tts-preview". */
   ttsModel?: string;
@@ -398,6 +408,8 @@ export interface RusaConfig {
    * doesn't need those (e.g. a staging deploy).
    */
   geminiApiKey?: string;
+  /** Host-only ElevenLabs key; secrets/elevenlabs-api-key takes precedence. */
+  elevenlabsApiKey?: string;
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
   webhook: WebhookConfig;
@@ -408,7 +420,7 @@ export interface RusaConfig {
   dashboard?: DashboardConfig;
   /** Shared provider-quota storage and identity. */
   quota?: QuotaConfig;
-  /** Walkie-talkie voice tuning ; the feature is gated on geminiApiKey. */
+  /** Walkie-talkie voice tuning; requires the selected transcription provider key. */
   voice?: VoiceConfig;
   smokeTest?: SmokeTestConfig;
   invocationDebug?: InvocationDebugConfig;

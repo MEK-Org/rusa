@@ -112,6 +112,8 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  elevenlabsVoiceIds?: readonly string[];
+  elevenlabsVoices?: readonly { voiceId: string; label: string }[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
@@ -1313,27 +1315,28 @@ export async function handleMeshApiRequest(
           if (voiceConfigResult !== null && !voiceConfigResult.success) {
             sendJson(res, 400, {
               error:
-                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } }, or null for the default",
+                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } } or { schemaVersion: 1, provider: 'elevenlabs', config: { voiceId } }, or null for the default",
             });
             return;
+          }
+          let voiceConfig = voiceConfigResult === null ? undefined : voiceConfigResult.data;
+          if (voiceConfig?.provider === "google") {
+            const canonical = canonicalSupportedVoiceName(voiceConfig.config.voiceName);
+            if (!canonical) {
+              sendJson(res, 400, {
+                error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
+              });
+              return;
+            }
+            voiceConfig = googleVoiceConfig(canonical);
           }
           const voiceName =
-            voiceConfigResult === null
-              ? undefined
-              : canonicalSupportedVoiceName(voiceConfigResult.data.config.voiceName);
-          if (voiceConfigResult !== null && !voiceName) {
-            sendJson(res, 400, {
-              error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
-            });
-            return;
-          }
-          actors.patch(actorId, {
-            voiceConfig: voiceName === undefined ? undefined : googleVoiceConfig(voiceName),
-          });
+            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
+          actors.patch(actorId, { voiceConfig });
           // The initiating dashboard applies this acknowledgement directly.
           // Other tabs follow their normal refresh lifecycle; one setting does
           // not warrant a dedicated SSE event and cache path.
-          sendJson(res, 200, { voiceName: voiceName ?? null });
+          sendJson(res, 200, { voiceName: voiceName ?? null, voiceConfig: voiceConfig ?? null });
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
@@ -1479,6 +1482,7 @@ export async function handleMeshApiRequest(
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
+        voiceConfig: r.voiceConfig ?? null,
         voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
       };
     });
@@ -1489,6 +1493,11 @@ export async function handleMeshApiRequest(
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
       supportedVoices: SUPPORTED_TTS_VOICES,
+      elevenlabsVoiceIds:
+        deps.elevenlabsVoices?.map((voice) => voice.voiceId) ?? deps.elevenlabsVoiceIds ?? [],
+      elevenlabsVoices:
+        deps.elevenlabsVoices ??
+        (deps.elevenlabsVoiceIds ?? []).map((voiceId) => ({ voiceId, label: voiceId })),
     });
     return true;
   }

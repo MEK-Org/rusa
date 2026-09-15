@@ -198,6 +198,20 @@ describe("handleMeshApiRequest", () => {
     };
   });
 
+  it("exposes voice labels without changing their IDs", async () => {
+    const voices = [{ voiceId: "SMRMz7WpPUV6i2myuniv", label: "Valentino" }];
+    const { res } = await call({ ...deps, elevenlabsVoices: voices }, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    expect(body.elevenlabsVoices).toEqual(voices);
+    expect(body.elevenlabsVoiceIds).toEqual([voices[0].voiceId]);
+  });
+
+  it("exposes the configured ElevenLabs voice pool in the snapshot", async () => {
+    const ids = ["G17SuINrv2H9FC6nvetn", "SMRMz7WpPUV6i2myuniv"];
+    const { res } = await call({ ...deps, elevenlabsVoiceIds: ids }, "GET", "/api/mesh/threads");
+    expect(JSON.parse(res.body).elevenlabsVoiceIds).toEqual(ids);
+  });
+
   it("ignores non-/api/mesh paths (returns false)", async () => {
     const { handled } = await call(deps, "GET", "/dashboard");
     expect(handled).toBe(false);
@@ -236,8 +250,27 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toEqual({ voiceName: "Puck" });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceName: "Puck" });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
+    });
+
+    it("PATCH persists an ElevenLabs actor voice", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      const voiceConfig = {
+        schemaVersion: 1,
+        provider: "elevenlabs",
+        config: { voiceId: "voice-123" },
+      };
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceConfig })
+      );
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual(voiceConfig);
+      expect(JSON.parse(res.body)).toEqual({ voiceName: null, voiceConfig });
     });
 
     it("PATCH canonicalizes a supported wire spelling for the dropdown", async () => {
@@ -249,7 +282,7 @@ describe("handleMeshApiRequest", () => {
         JSON.stringify({ voiceConfig: googleVoiceConfig(" puck ") })
       );
       await settled(res);
-      expect(JSON.parse(res.body)).toEqual({ voiceName: "Puck" });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceName: "Puck" });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
@@ -282,7 +315,7 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toEqual({ voiceName: null });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceName: null });
       expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
     });
 
@@ -305,7 +338,7 @@ describe("handleMeshApiRequest", () => {
           voiceConfig: { schemaVersion: 1, provider: "google", config: { voiceName: 42 } },
         }),
         JSON.stringify({
-          voiceConfig: { schemaVersion: 1, provider: "elevenlabs", config: { voiceId: "abc" } },
+          voiceConfig: { schemaVersion: 1, provider: "unknown", config: { voiceId: "abc" } },
         }),
         JSON.stringify({
           voiceConfig: {

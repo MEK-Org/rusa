@@ -134,6 +134,7 @@ export interface VoiceServiceOptions {
    * voice setting, and every pre-migration actor). Transcription never consults
    * this: it stays instance-wide.
    */
+  speechFor?: (actorId: string) => { speech: SpeechClient; voiceName?: string };
   voiceNameFor?: (actorId: string) => string | undefined;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
@@ -167,6 +168,7 @@ interface VoiceSession {
 }
 
 export class VoiceService {
+  private readonly speechFor: VoiceServiceOptions["speechFor"];
   private readonly home: string;
   private readonly speech: SpeechClient;
   private readonly now: () => number;
@@ -202,6 +204,7 @@ export class VoiceService {
   private readonly pendingTransferControls = new Map<string, Promise<void>>();
 
   constructor(options: VoiceServiceOptions) {
+    this.speechFor = options.speechFor;
     this.home = options.home;
     this.speech = options.speech;
     this.now = options.now ?? Date.now;
@@ -521,7 +524,11 @@ export class VoiceService {
       const voiceName = this.voiceNameFor?.(senderId);
 
       const streamRequestedAt = this.now();
-      const streamInfo = await this.speech.streamSynthesize(text, voiceName);
+      const selected = this.speechFor?.(senderId);
+      const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
+        text,
+        selected?.voiceName ?? voiceName
+      );
       const dir = join(this.home, "voice", "outbox");
       await mkdir(dir, { recursive: true });
       const id = randomUUID();

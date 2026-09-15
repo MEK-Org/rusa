@@ -191,6 +191,12 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     writeFileSync(join(dir, name), value, { mode: 0o600 });
   }
 
+  it("loads the ElevenLabs host secret ahead of the inline key", () => {
+    const home = writeConfig({ elevenlabsApiKey: "inline-key" });
+    writeSecret(home, "elevenlabs-api-key", "  file-key  ");
+    expect(loadConfig(home).elevenlabsApiKey).toBe("file-key");
+  });
+
   it("secrets/gemini-api-key wins over the inline geminiApiKey (trimmed) and warns about the duplicate", () => {
     const home = writeConfig({ geminiApiKey: "inline-key" });
     writeSecret(home, "gemini-api-key", "  file-key  \n");
@@ -840,7 +846,57 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   });
 });
 
-describe("loadConfig voice (ISSUE_NUM, optional)", () => {
+describe("loadConfig voice (optional)", () => {
+  it("loads named voices and preserves legacy ID-only pools", () => {
+    const voice = loadConfig(
+      writeConfig({ voice: { elevenlabsVoices: [{ voiceId: " id ", label: " Christopher " }] } })
+    ).voice;
+    expect(voice?.elevenlabsVoices).toEqual([{ voiceId: "id", label: "Christopher" }]);
+    expect(
+      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: ["old"] } })).voice?.elevenlabsVoices
+    ).toEqual([{ voiceId: "old", label: "old" }]);
+    for (const entries of [
+      null,
+      ["id"],
+      [{ voiceId: "id", label: " " }],
+      [{ voiceId: "", label: "name" }],
+      [
+        { voiceId: "id", label: "a" },
+        { voiceId: "id", label: "b" },
+      ],
+    ]) {
+      expect(() => loadConfig(writeConfig({ voice: { elevenlabsVoices: entries } }))).toThrow(
+        /elevenlabsVoices/
+      );
+    }
+  });
+
+  it("normalizes the ElevenLabs pool and rejects malformed lists", () => {
+    expect(
+      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: [" a ", "b", "a"] } })).voice
+        ?.elevenlabsVoiceIds
+    ).toEqual(["a", "b"]);
+    for (const value of ["a", [""], [42], null]) {
+      expect(() => loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: value } }))).toThrow(
+        /elevenlabsVoiceIds/
+      );
+    }
+    expect(
+      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: [] } })).voice?.elevenlabsVoiceIds
+    ).toEqual([]);
+  });
+
+  it("loads ElevenLabs transcription and rejects unknown providers", () => {
+    const config = loadConfig(
+      writeConfig({ elevenlabsApiKey: "key", voice: { transcriptionProvider: "elevenlabs" } })
+    );
+    expect(config.voice?.transcriptionProvider).toBe("elevenlabs");
+    expect(config.elevenlabsApiKey).toBe("key");
+    expect(() => loadConfig(writeConfig({ voice: { transcriptionProvider: "unknown" } }))).toThrow(
+      /transcriptionProvider/
+    );
+  });
+
   it("loads a config that omits the voice section", () => {
     expect(loadConfig(writeConfig()).voice).toBeUndefined();
   });

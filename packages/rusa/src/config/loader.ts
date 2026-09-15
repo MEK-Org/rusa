@@ -586,14 +586,73 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.gitBridgePort = 8085;
   }
 
-  // Walkie-talkie voice tuning  — optional, additive; the feature is
-  // gated on geminiApiKey elsewhere, so an unset section is always valid.
+  // Optional voice tuning; startup checks the selected transcription provider key.
+  if (
+    parsed.elevenlabsApiKey !== undefined &&
+    (typeof parsed.elevenlabsApiKey !== "string" || !parsed.elevenlabsApiKey.trim())
+  ) {
+    throw new Error("config.yaml: elevenlabsApiKey must be a non-empty string when set");
+  }
   const voice = parsed.voice;
   if (voice !== undefined) {
     if (typeof voice !== "object" || voice === null || Array.isArray(voice)) {
       throw new Error("config.yaml: voice must be a mapping when set");
     }
-    for (const key of ["transcriptionModel", "ttsModel", "voiceName"] as const) {
+    if (
+      voice.transcriptionProvider !== undefined &&
+      !["google", "elevenlabs"].includes(voice.transcriptionProvider)
+    ) {
+      throw new Error("config.yaml: voice.transcriptionProvider must be google or elevenlabs");
+    }
+    if (voice.elevenlabsVoiceIds !== undefined) {
+      if (
+        !Array.isArray(voice.elevenlabsVoiceIds) ||
+        voice.elevenlabsVoiceIds.some((id) => typeof id !== "string" || !id.trim())
+      )
+        throw new Error(
+          "config.yaml: voice.elevenlabsVoiceIds must be a list of non-empty strings"
+        );
+      voice.elevenlabsVoiceIds = [...new Set(voice.elevenlabsVoiceIds.map((id) => id.trim()))];
+    }
+    if (voice.elevenlabsVoices !== undefined) {
+      if (
+        !Array.isArray(voice.elevenlabsVoices) ||
+        voice.elevenlabsVoices.some(
+          (entry) =>
+            !entry ||
+            typeof entry !== "object" ||
+            Array.isArray(entry) ||
+            typeof entry.voiceId !== "string" ||
+            !entry.voiceId.trim() ||
+            typeof entry.label !== "string" ||
+            !entry.label.trim()
+        )
+      )
+        throw new Error(
+          "config.yaml: voice.elevenlabsVoices must be a list of { voiceId, label } with non-empty strings"
+        );
+      voice.elevenlabsVoices = voice.elevenlabsVoices.map((entry) => ({
+        voiceId: entry.voiceId.trim(),
+        label: entry.label.trim(),
+      }));
+      if (
+        new Set(voice.elevenlabsVoices.map((entry) => entry.voiceId)).size !==
+        voice.elevenlabsVoices.length
+      ) {
+        throw new Error("config.yaml: voice.elevenlabsVoices contains duplicate voice IDs");
+      }
+    } else if (voice.elevenlabsVoiceIds !== undefined) {
+      voice.elevenlabsVoices = voice.elevenlabsVoiceIds.map((voiceId) => ({
+        voiceId,
+        label: voiceId,
+      }));
+    }
+    for (const key of [
+      "transcriptionModel",
+      "ttsModel",
+      "voiceName",
+      "elevenlabsTtsModel",
+    ] as const) {
       const value = voice[key];
       if (value !== undefined) {
         if (typeof value !== "string" || !value.trim()) {
@@ -668,6 +727,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * migration nudge to remove the inline copy.
  */
 function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
+  parsed.elevenlabsApiKey = readHostSecret("elevenlabs-api-key", mcHome) ?? parsed.elevenlabsApiKey;
   const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
   if (fileGeminiKey) {
     if (parsed.geminiApiKey) {

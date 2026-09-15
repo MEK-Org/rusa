@@ -272,6 +272,7 @@ class DashboardStore {
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
+  final _elevenlabsVoices = BehaviorSubject<List<ElevenLabsVoice>>.seeded(const []);
   final _supportedVoices = BehaviorSubject<List<String>>.seeded(const []);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
@@ -341,6 +342,7 @@ class DashboardStore {
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
+  ValueStream<List<ElevenLabsVoice>> get elevenlabsVoices => _elevenlabsVoices.stream;
   ValueStream<List<String>> get supportedVoices => _supportedVoices.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
@@ -1123,15 +1125,26 @@ class DashboardStore {
   /// Set (or, with null, clear) the actor's persisted walkie-talkie voice.
   /// The next threads refresh reflects the change; synthesis picks it up on
   /// the actor's next spoken reply.
-  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+  Future<void> updateActorVoice(
+    String actorId,
+    String? voiceName, {
+    String? elevenlabsVoiceId,
+  }) async {
     try {
-      final updatedVoiceName = await _api.updateActorVoice(actorId, voiceName);
+      final updatedVoiceName = await _api.updateActorVoice(
+        actorId,
+        voiceName,
+        elevenlabsVoiceId: elevenlabsVoiceId,
+      );
       final current = _actorStates.value;
       final existing = current.actors[actorId];
       if (existing != null) {
         final updatedActors = Map<String, ActorViewState>.of(current.actors);
         updatedActors[actorId] = existing.copyWith(
-          thread: existing.thread.copyWith(voiceName: updatedVoiceName),
+          thread: existing.thread.copyWith(
+            voiceName: updatedVoiceName,
+            elevenlabsVoiceId: elevenlabsVoiceId,
+          ),
         );
         _actorStates.add(
           current.copyWith(
@@ -1398,6 +1411,7 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
+      _elevenlabsVoices.add(snap.elevenlabsVoices);
       _updateActorStatesFromThreads(snap.threads);
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree
@@ -1584,6 +1598,7 @@ class DashboardStore {
       _halted.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),
+      _elevenlabsVoices.close(),
       _showRetired.close(),
       _selection.close(),
       _primary.close(),

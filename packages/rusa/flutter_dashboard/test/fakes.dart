@@ -160,6 +160,7 @@ class FakeApi extends DashboardApi {
   FakeApi() : super();
   List<ThreadDto> threadsResult = [];
   List<String> supportedVoices = const [];
+  List<ElevenLabsVoice> elevenlabsVoices = const [];
   QuotaSnapshotDto? quotaResult;
   QuotaHistoryDto? quotaHistoryResult;
   Object? quotaError;
@@ -211,17 +212,22 @@ class FakeApi extends DashboardApi {
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
       supportedVoices: supportedVoices,
+      elevenlabsVoices: elevenlabsVoices,
     );
   }
 
   final actorVoiceUpdates = <({String actorId, String? voiceName})>[];
 
   @override
-  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
+  Future<String?> updateActorVoice(
+    String actorId,
+    String? voiceName, {
+    String? elevenlabsVoiceId,
+  }) async {
     actorVoiceUpdates.add((actorId: actorId, voiceName: voiceName));
     threadsResult = [
       for (final thread in threadsResult)
-        thread.id == actorId ? thread.copyWith(voiceName: voiceName) : thread,
+        thread.id == actorId ? thread.copyWith(voiceName: voiceName, elevenlabsVoiceId: elevenlabsVoiceId) : thread,
     ];
     return voiceName;
   }

@@ -80,10 +80,17 @@ Minimal example:
       agy:
         primaryWindow: weekly
 
-  # Walkie-talkie voice tuning . Optional; the feature itself is gated on
-  # geminiApiKey being set. Defaults shown.
+  # Optional walkie-talkie voice tuning.
+  # Configure the selected provider key. Google defaults shown.
   # voice:
-  #   transcriptionModel: gemini-2.5-flash
+  #   transcriptionProvider: google # or elevenlabs (defaults to scribe_v2)
+  #   transcriptionModel: gemini-2.5-flash # omit to use the provider default
+  #   elevenlabsTtsModel: eleven_multilingual_v2
+  #   elevenlabsVoices:
+  #     - voiceId: G17SuINrv2H9FC6nvetn
+  #       label: Christopher
+  #     - voiceId: SMRMz7WpPUV6i2myuniv
+  #       label: Valentino
   #   ttsModel: gemini-3.1-flash-tts-preview
   #   voiceName: Laomedeia
 

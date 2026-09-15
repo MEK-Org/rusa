@@ -145,7 +145,8 @@ export function handleVoiceApiRequest(
   const service = deps.service;
   if (!service) {
     sendJson(res, 503, {
-      error: "voice unavailable: geminiApiKey is not configured on this instance",
+      error:
+        "voice unavailable: configure geminiApiKey or elevenlabsApiKey for the selected transcription provider",
     });
     return true;
   }

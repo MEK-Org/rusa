@@ -858,7 +858,7 @@ class _InfoViewState extends State<_InfoView> {
 }
 
 /// The actor's walkie-talkie voice picker on the Info tab: a dropdown of the
-/// supported Google TTS voices plus an "Instance default" entry that clears
+/// Google voices and configured ElevenLabs IDs, plus an "Instance default" entry that clears
 /// the persisted setting. The catalog comes from the threads snapshot the
 /// store already polls, so the picker populates without an extra fetch.
 class _VoicePicker extends StatelessWidget {
@@ -870,13 +870,19 @@ class _VoicePicker extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final supported = store.supportedVoices.value;
-    if (supported.isEmpty) {
+    final elevenlabsVoices = {
+      if (actor.elevenlabsVoiceId != null)
+        actor.elevenlabsVoiceId!: actor.elevenlabsVoiceId!,
+      for (final voice in store.elevenlabsVoices.value)
+        voice.voiceId: voice.label,
+    };
+    if (supported.isEmpty && elevenlabsVoices.isEmpty) {
       return const SizedBox.shrink();
     }
     return Padding(
       padding: const EdgeInsets.only(top: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
             'Voice: ',
@@ -886,23 +892,76 @@ class _VoicePicker extends StatelessWidget {
               fontWeight: FontWeight.w600,
             ),
           ),
-          DropdownButton<String?>(
-            value: actor.voiceName,
-            underline: const SizedBox.shrink(),
-            style: kMonoStyle.copyWith(
-              color: MeshColors.textSecondary,
-              fontSize: 13,
-            ),
-            dropdownColor: MeshColors.bgTertiary,
-            items: [
-              const DropdownMenuItem<String?>(
-                value: null,
-                child: Text('Instance default'),
+          const SizedBox(height: 8),
+          InputDecorator(
+            key: const ValueKey('voice-selector-field'),
+            decoration: InputDecoration(
+              isDense: true,
+              filled: true,
+              fillColor: MeshColors.bgTertiary,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 12,
               ),
-              for (final voice in supported)
-                DropdownMenuItem<String?>(value: voice, child: Text(voice)),
-            ],
-            onChanged: (voice) => store.updateActorVoice(actor.id, voice),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: const BorderSide(color: MeshColors.border),
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: const BorderSide(color: MeshColors.border),
+              ),
+            ),
+            child: DropdownButton<String?>(
+              isExpanded: true,
+              isDense: true,
+              icon: const Icon(
+                Icons.keyboard_arrow_down,
+                color: MeshColors.textSecondary,
+              ),
+              value: actor.elevenlabsVoiceId != null
+                  ? 'elevenlabs:${actor.elevenlabsVoiceId}'
+                  : actor.voiceName,
+              underline: const SizedBox.shrink(),
+              style: kMonoStyle.copyWith(
+                color: MeshColors.textSecondary,
+                fontSize: 13,
+              ),
+              dropdownColor: MeshColors.bgTertiary,
+              items: [
+                const DropdownMenuItem<String?>(
+                  value: null,
+                  child: Text('Instance default (Gemini)'),
+                ),
+                for (final voice in elevenlabsVoices.entries)
+                  DropdownMenuItem<String?>(
+                    value: 'elevenlabs:${voice.key}',
+                    child: Text(
+                      '${voice.value} (Elevenlabs)',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                for (final voice in supported)
+                  DropdownMenuItem<String?>(
+                    value: voice,
+                    child: Text(
+                      '$voice (Gemini)',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+              onChanged: (voice) {
+                if (voice?.startsWith('elevenlabs:') == true) {
+                  store.updateActorVoice(
+                    actor.id,
+                    null,
+                    elevenlabsVoiceId: voice!.substring('elevenlabs:'.length),
+                  );
+                } else {
+                  store.updateActorVoice(actor.id, voice);
+                }
+              },
+            ),
           ),
         ],
       ),

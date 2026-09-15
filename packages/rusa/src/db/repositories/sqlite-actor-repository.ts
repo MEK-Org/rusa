@@ -295,6 +295,7 @@ function buildVoiceConfig(record: ActorRecord): string | null {
   if (!parsed.success) {
     throw new Error(`invalid voice_config for actor '${record.id}'`);
   }
+  if (parsed.data.provider === "elevenlabs") return JSON.stringify(parsed.data);
   const voiceName = canonicalSupportedVoiceName(parsed.data.config.voiceName);
   if (!voiceName) {
     throw new Error(
@@ -320,6 +321,7 @@ function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecor
   // Canonicalizing repairs case-only hand edits so the dropdown always receives
   // one of its exact option values. A retired vendor voice uses the instance
   // fallback without treating its otherwise valid document as malformed.
+  if (parsed.provider === "elevenlabs") return { voiceConfig: parsed };
   const voiceName = canonicalSupportedVoiceName(parsed.config.voiceName);
   if (!voiceName) return {};
   return { voiceConfig: googleVoiceConfig(voiceName) };

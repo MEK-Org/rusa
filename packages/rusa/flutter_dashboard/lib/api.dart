@@ -265,7 +265,11 @@ class DashboardApi {
   /// Google-provider voice document, or pass null to restore the instance-wide
   /// default. The server rejects shapes and voices outside that provider's
   /// supported catalog with a 400.
-  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
+  Future<String?> updateActorVoice(
+    String actorId,
+    String? voiceName, {
+    String? elevenlabsVoiceId,
+  }) async {
     final uri = _u('/api/mesh/actors/$actorId/voice');
     final res = await _client.patch(
       uri,
@@ -274,7 +278,13 @@ class DashboardApi {
         'Content-Type': 'application/json',
       },
       body: jsonEncode({
-        'voiceConfig': voiceName == null
+        'voiceConfig': elevenlabsVoiceId != null
+            ? {
+                'schemaVersion': 1,
+                'provider': 'elevenlabs',
+                'config': {'voiceId': elevenlabsVoiceId},
+              }
+            : voiceName == null
             ? null
             : {
                 'schemaVersion': 1,

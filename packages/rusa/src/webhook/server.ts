@@ -150,6 +150,8 @@ export interface DashboardMeshRefs {
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
+  elevenlabsVoiceIds?: DashboardDataDeps["elevenlabsVoiceIds"];
+  elevenlabsVoices?: DashboardDataDeps["elevenlabsVoices"];
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   issueClient?: DashboardDataDeps["issueClient"];
@@ -585,6 +587,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           selectedObligationForActor: options.mesh.selectedObligationForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
+          elevenlabsVoiceIds: options.mesh.elevenlabsVoiceIds,
+          elevenlabsVoices: options.mesh.elevenlabsVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           issueClient: options.mesh.issueClient,
