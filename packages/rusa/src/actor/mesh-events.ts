@@ -126,6 +126,14 @@ export type MeshEventKind =
   // closing the selected head obligation; payload identifies the obligation and
   // actionable reason. The rejected yield itself is not recorded as yielded.
   | "run_yield_rejected"
+  // The accepted no-change disposition a standing head earns (#468): an
+  // enrolled run whose still-ready standing head (GitHub owner/repository-level
+  // ref, or ref-free root) carried a checkpoint this actor rewrote during the run
+  // yielded cleanly on the verification it recorded. `actorId` = the verifying
+  // actor; `detail` = the obligation id and why it counts; payload =
+  // { obligationId, title }. The sibling rejected-disposition kind is
+  // `run_yield_rejected`; pilots count no-change exits from the pair.
+  | "standing_head_verified"
   | "continuation_capped"
   // Capability lifecycle (design ISSUE_NUM, phase 1a): the root granted/revoked an
   // extra MCP capability to an actor. `actorId` = the grantee actor, `payload` = { grantedBy },
