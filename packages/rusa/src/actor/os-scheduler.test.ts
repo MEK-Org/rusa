@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createLogger } from "../observability/logger.js";
 import {
   type AtIo,
   type AtProbe,
@@ -10,6 +11,7 @@ import {
 } from "./at-queue.js";
 import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
+  AtEnqueueUnconfirmedError,
   DefaultOsScheduler,
   decodeScheduledMessagePayload,
   encodeScheduledMessagePayload,
@@ -36,9 +38,15 @@ describe("DefaultOsScheduler", () => {
       },
     };
 
+    // A queue that holds what was scheduled: a message write is confirmed by
+    // re-reading the queue, so a fake that always lists nothing cannot accept one.
+    const jobs: { id: string; script: string }[] = [];
     at = {
-      schedule: vi.fn().mockReturnValue("123"),
-      list: vi.fn().mockReturnValue([]),
+      schedule: vi.fn((script: string) => {
+        jobs.push({ id: "123", script });
+        return "123";
+      }),
+      list: vi.fn(() => jobs.map((job) => ({ ...job }))),
       remove: vi.fn(),
     };
 
@@ -80,7 +88,7 @@ describe("DefaultOsScheduler", () => {
 
     const [script, date] = vi.mocked(at.schedule).mock.calls[0];
     expect(date).toEqual(new Date(message.deliverAt));
-    expect(script).toContain("# mc-message-delivery:");
+    expect(script).toContain("# mc-message-delivery-instance:v1:dGVzdC1pbnN0YW5jZQ:");
     expect(script).toContain("/wake-message");
     expect(script).toContain('while [ "$rusa_attempt" -lt 120 ]');
     expect(script).toContain("rusa_callback_port=$(cat /port");
@@ -108,7 +116,11 @@ describe("DefaultOsScheduler", () => {
 
   it("fails visibly when an owned host job has a missing or corrupt payload", () => {
     vi.mocked(at.list).mockReturnValue([
-      { id: "broken", script: "# mc-message-delivery:broken\ncurl /wake-message -d 'id=old'\n" },
+      {
+        id: "broken",
+        script:
+          "# mc-message-delivery-instance:v1:dGVzdC1pbnN0YW5jZQ:YnJva2Vu\ncurl /wake-message -d 'id=old'\n",
+      },
     ]);
     expect(() => scheduler.listMessageDeliveries()).toThrow(
       /Invalid scheduled-message host job broken/
@@ -355,7 +367,7 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     expect(cronData).toContain(
       "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
     );
-    expect(cronData).toContain("# mc-wake:actor-a");
+    expect(cronData).toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
     // Every foreign line — the unrelated backup job, the foreign mc-wake
     // block, and the heartbeat job — is preserved byte-for-byte.
     for (const line of foreignLines) {
@@ -369,10 +381,10 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     expect(cronData).not.toContain(
       "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
     );
-    expect(cronData).toContain("# mc-wake:actor-a");
+    expect(cronData).toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
 
     await scheduler.cancel("actor-a");
-    expect(cronData).not.toContain("# mc-wake:actor-a");
+    expect(cronData).not.toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
     for (const line of foreignLines) {
       expect(cronData).toContain(line);
     }
@@ -787,5 +799,452 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
     expect(at.remove).toHaveBeenCalledWith("at-staging");
     expect(at.remove).not.toHaveBeenCalledWith("at-prod");
     expect(at.remove).not.toHaveBeenCalledWith("at-legacy");
+  });
+});
+
+describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
+  /** One shared per-user `at` queue, as seen by every co-hosted instance. */
+  function sharedAtQueue(seed: { id: string; script: string }[] = []) {
+    const jobs = [...seed];
+    let next = 100;
+    const at: AtIo = {
+      schedule: (script) => {
+        const id = String(next++);
+        jobs.push({ id, script });
+        return id;
+      },
+      list: () => jobs.map((job) => ({ ...job })),
+      remove: (id) => {
+        const index = jobs.findIndex((job) => job.id === id);
+        if (index >= 0) jobs.splice(index, 1);
+      },
+    };
+    return { at, jobs };
+  }
+
+  /** Structured records as an operator's `jq` would see them, without level/time noise. */
+  function recordingLogger() {
+    const lines: string[] = [];
+    const log = createLogger({
+      format: "json",
+      destination: {
+        write: (chunk: string) => {
+          lines.push(chunk);
+        },
+      },
+    });
+    const records = () =>
+      lines
+        .join("")
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => {
+          const { level: _level, time: _time, ...record } = JSON.parse(line);
+          return record as Record<string, unknown>;
+        });
+    return { log, records };
+  }
+
+  /** The clock every message in these tests is scheduled against: well before `deliverAt`. */
+  const NOW = Date.parse("2026-09-15T12:00:00.000Z");
+
+  function instance(
+    instanceId: string,
+    at: AtIo,
+    cron: { data: string },
+    extra: { log?: ReturnType<typeof recordingLogger>["log"]; now?: () => number } = {}
+  ) {
+    const io: CrontabIo = {
+      read: () => cron.data,
+      write: (data) => {
+        cron.data = data;
+      },
+    };
+    return new DefaultOsScheduler(new CrontabMutator(io), at, {
+      tokenFile: `${instanceId}/wake-token`,
+      portFile: `${instanceId}/wake-port`,
+      instanceId,
+      now: () => NOW,
+      ...extra,
+    });
+  }
+
+  const message = (id: string, toId: string) => ({
+    id,
+    toId,
+    fromId: "sender",
+    body: `body of ${id}`,
+    deliverAt: "2026-09-16T12:00:00.000Z",
+  });
+
+  /**
+   * The scheduler contract boot reconciliation relies on, restated here:
+   * every listed message whose recipient this instance does not know is
+   * cancelled. Before scoping, the listing spanned the whole per-user queue,
+   * so this cancelled every co-hosted instance's messages. This is a mirror,
+   * not the mesh code; the authoritative test of the real
+   * `ActorMesh.reconcilePendingDeliveries` over a shared queue in both boot
+   * orders is in `actor-mesh.test.ts` ("#466").
+   */
+  function bootReconcile(scheduler: DefaultOsScheduler, knownActors: string[]) {
+    for (const pending of scheduler.listMessageDeliveries()) {
+      if (!knownActors.includes(pending.toId)) scheduler.cancelMessageDelivery(pending.id);
+    }
+  }
+
+  it("writes every tag family (cron block and at job) with this instance's identity through the one shared constructor", async () => {
+    const { at, jobs } = sharedAtQueue();
+    const cron = { data: "" };
+    const prod = instance("/srv/rusa/prod", at, cron);
+
+    await prod.schedule("act1", "0 3 * * *", "nightly");
+    prod.scheduleObligationActivation("ob-cron", { kind: "cron", cronExpr: "0 4 * * *" });
+    prod.scheduleObligationActivation("ob-at", { kind: "at", date: new Date("2026-09-16") });
+    prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+
+    const tagLines = [cron.data, ...jobs.map((job) => job.script)]
+      .flatMap((text) => text.split("\n"))
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("# mc-"));
+    expect(tagLines).toEqual([
+      "# mc-wake-instance:v1:L3Nydi9ydXNhL3Byb2Q:YWN0MQ",
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhL3Byb2Q:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItYXQ",
+      "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3Byb2Q:bXNnLWE",
+    ]);
+    for (const line of tagLines) {
+      expect(line).toMatch(/^# mc-[a-z-]+-instance(-end)?:v1:L3Nydi9ydXNhL3Byb2Q:[A-Za-z0-9_-]+$/);
+    }
+  });
+
+  describe("two co-hosted instances over one shared at queue", () => {
+    const legacyJob = {
+      id: "legacy",
+      script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${encodeScheduledMessagePayload(message("legacy", "legacy-recipient"))}'\n`,
+    };
+
+    function seeded() {
+      const { at, jobs } = sharedAtQueue([legacyJob]);
+      const prod = instance("/srv/rusa/prod", at, { data: "" });
+      const staging = instance("/srv/rusa/staging", at, { data: "" });
+      prod.scheduleMessageDelivery(message("msg-a", "prod-only-actor"));
+      staging.scheduleMessageDelivery(message("msg-b", "staging-only-actor"));
+      return { jobs, prod, staging };
+    }
+
+    it("each instance lists only its own messages; the legacy unscoped job is never listed", () => {
+      const { prod, staging } = seeded();
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "prod-only-actor")]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it.each([
+      ["prod then staging", ["prod", "staging"] as const],
+      ["staging then prod", ["staging", "prod"] as const],
+    ])("boot reconciliation in order %s leaves the other instance's and legacy jobs untouched", (_, order) => {
+      const { jobs, prod, staging } = seeded();
+      const before = jobs.map((job) => ({ ...job }));
+      const known = { prod: ["prod-only-actor"], staging: ["staging-only-actor"] };
+      const schedulers = { prod, staging };
+
+      for (const name of order) bootReconcile(schedulers[name], known[name]);
+
+      expect(jobs).toEqual(before);
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "prod-only-actor")]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it.each([
+      ["prod then staging", ["prod", "staging"] as const],
+      ["staging then prod", ["staging", "prod"] as const],
+    ])("in order %s an instance cancels only its own truly-inactive recipient's message", (_, order) => {
+      const { jobs, prod, staging } = seeded();
+      const schedulers = { prod, staging };
+
+      // Prod's recipient really is gone; staging's is still live.
+      for (const name of order) {
+        bootReconcile(schedulers[name], name === "prod" ? [] : ["staging-only-actor"]);
+      }
+
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101"]);
+      expect(prod.listMessageDeliveries()).toEqual([]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it("cancelMessageDelivery and stale cleanup never match a foreign or legacy job with the same message id", () => {
+      const { jobs, prod, staging } = seeded();
+      staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
+      const stagingCopy = jobs.find((job) => job.id === "102");
+      expect(stagingCopy?.script).toContain(
+        "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3N0YWdpbmc:bXNnLWE"
+      );
+
+      prod.cancelMessageDelivery("msg-a");
+      prod.cancelMessageDelivery("legacy");
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101", "102"]);
+
+      // Re-scheduling replaces only this instance's stale copy of the id.
+      staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101", "103"]);
+    });
+  });
+
+  describe("at queue diagnostics", () => {
+    const PROD = "/srv/rusa/prod";
+    const MSG_TAG = "# mc-message-delivery-instance:v1:L3Nydi9ydXNhL3Byb2Q:bXNnLWE";
+
+    it("records every at write, confirmation and removal with the tag and this instance's id", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      prod.scheduleObligationActivation("ob-at", { kind: "at", date: new Date("2026-09-16") });
+      prod.cancelMessageDelivery("msg-a");
+      prod.cancelObligationActivation("ob-at");
+
+      const OB_TAG = "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhL3Byb2Q:b2ItYXQ";
+      expect(records()).toEqual([
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_scheduled",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+          runAt: "2026-09-16T12:00:00.000Z",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_enqueue_confirmed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+          queueSize: 1,
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_scheduled",
+          family: "obligation-activation",
+          id: "ob-at",
+          tag: OB_TAG,
+          atJobId: "101",
+          runAt: "2026-09-16T00:00:00.000Z",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "100",
+        },
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "obligation-activation",
+          id: "ob-at",
+          tag: OB_TAG,
+          atJobId: "101",
+        },
+      ]);
+    });
+
+    it("attributes a boot-reconciliation cancel to the instance that performed it", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "gone"));
+
+      bootReconcile(prod, []);
+
+      expect(records().filter((record) => record.msg === "at_job_removed")).toEqual([
+        expect.objectContaining({ instanceId: PROD, tag: MSG_TAG, atJobId: "100" }),
+      ]);
+    });
+
+    it("refuses to report a message as scheduled when `at` returned an id the queue re-read does not show, keeping the prior copy armed", () => {
+      const { at, jobs } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const prod = instance(PROD, at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      expect(jobs.map((job) => job.id)).toEqual(["100"]);
+
+      // `at` prints a job id, but the job never reaches the spool.
+      const lossy: AtIo = { ...at, schedule: () => "101" };
+      const retry = instance(PROD, lossy, { data: "" }, { log });
+
+      expect(() => retry.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(jobs.map((job) => job.id)).toEqual(["100"]);
+      expect(records().slice(2)).toEqual([
+        expect.objectContaining({ msg: "at_job_scheduled", tag: MSG_TAG, atJobId: "101" }),
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_enqueue_unconfirmed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "101",
+          queueSize: 1,
+          reason: "job missing from queue",
+        },
+        // The id `at` printed is cleared whether or not it exists, so a
+        // refused send never leaves an armed job behind.
+        {
+          component: "os-scheduler",
+          instanceId: PROD,
+          msg: "at_job_removed",
+          family: "message-delivery",
+          id: "msg-a",
+          tag: MSG_TAG,
+          atJobId: "101",
+          reason: "unconfirmed enqueue",
+        },
+      ]);
+    });
+
+    it("removes the job when the re-read was wrong and `at` had spooled it: a refused send cannot deliver twice", () => {
+      const { at, jobs } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      // The job is spooled, but this one read of the queue does not show it.
+      const blind: AtIo = { ...at, list: () => at.list().filter((job) => job.id !== "100") };
+      const prod = instance(PROD, blind, { data: "" }, { log });
+
+      expect(() => prod.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(jobs).toEqual([]);
+      expect(records().map((record) => [record.msg, record.reason])).toEqual([
+        ["at_job_scheduled", undefined],
+        ["at_enqueue_unconfirmed", "job missing from queue"],
+        ["at_job_removed", "unconfirmed enqueue"],
+      ]);
+    });
+
+    it("still refuses when clearing the unconfirmed id fails, recording the failure", () => {
+      const { at } = sharedAtQueue();
+      const { log, records } = recordingLogger();
+      const broken: AtIo = {
+        ...at,
+        schedule: () => "101",
+        remove: () => {
+          throw new Error("atrm: cannot talk to atd");
+        },
+      };
+      const prod = instance(PROD, broken, { data: "" }, { log });
+
+      expect(() => prod.scheduleMessageDelivery(message("msg-a", "recipient"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(records().map((record) => record.msg)).toEqual([
+        "at_job_scheduled",
+        "at_enqueue_unconfirmed",
+        "at_job_remove_failed",
+      ]);
+    });
+
+    it("tolerates, but records, a missing job only when its `at` run minute has already begun", () => {
+      const { at } = sharedAtQueue();
+      const lossy: AtIo = { ...at, schedule: () => "100" };
+      const { log, records } = recordingLogger();
+      const due = (iso: string) => ({ ...message("msg-a", "recipient"), deliverAt: iso });
+
+      // `at` truncates a job's time to the minute, so a job for 12:00:30
+      // submitted at 12:00:10 runs at once and may be gone before the re-read.
+      const midMinute = instance(PROD, lossy, { data: "" }, { log, now: () => NOW + 10_000 });
+      expect(() =>
+        midMinute.scheduleMessageDelivery(due("2026-09-15T12:00:30.000Z"))
+      ).not.toThrow();
+      expect(records().map((record) => [record.msg, record.reason])).toEqual([
+        ["at_job_scheduled", undefined],
+        ["at_enqueue_unconfirmed", "job run minute has begun; may already have run"],
+      ]);
+
+      // Thirty seconds ahead but across the minute boundary: the run minute
+      // has not begun, so the job cannot have run and must still be queued.
+      const nearBoundary = instance(PROD, lossy, { data: "" }, { log, now: () => NOW + 59_000 });
+      expect(() => nearBoundary.scheduleMessageDelivery(due("2026-09-15T12:01:29.000Z"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      // A full minute ahead on the boundary is likewise still ahead.
+      const onMinute = instance(PROD, lossy, { data: "" }, { log, now: () => NOW });
+      expect(() => onMinute.scheduleMessageDelivery(due("2026-09-15T12:01:00.000Z"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(records().filter((record) => record.reason === "job missing from queue")).toHaveLength(
+        2
+      );
+    });
+  });
+
+  describe("boot audit of legacy message jobs", () => {
+    const legacyJob = {
+      id: "legacy",
+      script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${encodeScheduledMessagePayload(message("legacy", "legacy-recipient"))}'\n`,
+    };
+    const unreadableLegacyJob = {
+      id: "legacy-unreadable",
+      script: "# mc-message-delivery:not*base64\ncurl /wake-message\n",
+    };
+
+    it("names every legacy job with its at id, tag and what the payload says, and neither lists nor removes it", () => {
+      const { at, jobs } = sharedAtQueue([legacyJob, unreadableLegacyJob]);
+      const { log, records } = recordingLogger();
+      const prod = instance("/srv/rusa/prod", at, { data: "" }, { log });
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      const before = jobs.map((job) => ({ ...job }));
+
+      const legacy = prod.reportLegacyMessageDeliveryJobs();
+
+      expect(legacy).toEqual([
+        {
+          atJobId: "legacy",
+          tag: "# mc-message-delivery:bGVnYWN5",
+          messageId: "legacy",
+          toId: "legacy-recipient",
+          deliverAt: "2026-09-16T12:00:00.000Z",
+        },
+        {
+          atJobId: "legacy-unreadable",
+          tag: "# mc-message-delivery:not*base64",
+          messageId: null,
+          toId: null,
+          deliverAt: null,
+        },
+      ]);
+      expect(
+        records().filter((record) => record.msg === "legacy_message_delivery_job_not_adopted")
+      ).toEqual(
+        legacy.map((job) => ({
+          component: "os-scheduler",
+          instanceId: "/srv/rusa/prod",
+          msg: "legacy_message_delivery_job_not_adopted",
+          ...job,
+        }))
+      );
+      expect(jobs).toEqual(before);
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "recipient")]);
+    });
+
+    it("reports nothing for an empty queue or one holding only scoped jobs", () => {
+      const { at } = sharedAtQueue();
+      const prod = instance("/srv/rusa/prod", at, { data: "" });
+      expect(prod.reportLegacyMessageDeliveryJobs()).toEqual([]);
+      prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+      instance("/srv/rusa/staging", at, { data: "" }).scheduleMessageDelivery(
+        message("msg-b", "recipient")
+      );
+      expect(prod.reportLegacyMessageDeliveryJobs()).toEqual([]);
+    });
   });
 });

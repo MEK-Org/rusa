@@ -881,8 +881,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Database initialization above creates the home when needed; resolving
       // it here makes relative spellings and symlink aliases one owner.
       instanceId: realpathSync(mcHome),
+      log,
     }
   );
+  // A pre-scoping wake block this instance cannot prove it owns keeps firing
+  // with nothing able to cancel it, and a pre-scoping message job fires
+  // without any instance listing it; name each one now, at boot, rather than
+  // leaving it to be discovered by its firing.
+  try {
+    osScheduler.reportUnadoptedLegacyWakeBlocks();
+  } catch (err) {
+    log.warn("legacy_wake_audit_failed", { err });
+  }
+  try {
+    osScheduler.reportLegacyMessageDeliveryJobs();
+  } catch (err) {
+    log.warn("legacy_message_audit_failed", { err });
+  }
   const wakeToken = ensureWakeToken(mcHome);
 
   const legacyActorImport = importLegacyActorState({

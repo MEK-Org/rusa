@@ -37,7 +37,9 @@ import type {
 } from "./actor-mesh.js";
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
+import type { AtIo } from "./at-queue.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
   type EventResource,
   InMemoryEventSourceOwnerStore,
@@ -59,7 +61,12 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
-import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
+import {
+  AtEnqueueUnconfirmedError,
+  DefaultOsScheduler,
+  type ScheduledMessage,
+  type ScheduledMessageScheduler,
+} from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -221,7 +228,8 @@ function setup(
     obligations?: ActorMeshOptions["obligations"];
     configuredEventSources?: ActorMeshOptions["configuredEventSources"];
     providerGate?: ActorMeshOptions["providerGate"];
-    scheduledMessages?: FakeScheduledMessageScheduler;
+    /** Any scheduler; a test passing a real one must not use the fake-only helpers. */
+    scheduledMessages?: ScheduledMessageScheduler;
     actors?: InMemoryActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
@@ -234,7 +242,8 @@ function setup(
   const logs: string[] = [];
   let seq = 0;
   let chatSeq = 0;
-  const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
+  const scheduledMessages = (opts.scheduledMessages ??
+    new FakeScheduledMessageScheduler()) as FakeScheduledMessageScheduler;
   const inboxStore = opts.inboxStore ?? createMemoryInboxStore();
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
@@ -7125,6 +7134,160 @@ describe("ActorMesh", () => {
           }),
         })
       );
+    });
+
+    describe("boot reconciliation across co-hosted instances sharing one at queue (#466)", () => {
+      /** A per-user `at` queue every instance on the host reads and writes. */
+      function sharedAtQueue() {
+        const jobs: { id: string; script: string }[] = [
+          {
+            id: "legacy",
+            // Written before message tags carried an instance: foreign to everyone.
+            script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${Buffer.from(
+              JSON.stringify({
+                schemaVersion: 1,
+                id: "legacy",
+                toId: "nobody",
+                fromId: "nobody",
+                body: "legacy",
+                deliverAt: "2026-09-16T12:00:00.000Z",
+              })
+            ).toString("base64url")}'\n`,
+          },
+        ];
+        let next = 100;
+        const at: AtIo = {
+          schedule: (script) => {
+            const id = String(next++);
+            jobs.push({ id, script });
+            return id;
+          },
+          list: () => jobs.map((job) => ({ ...job })),
+          remove: (id) => {
+            const index = jobs.findIndex((job) => job.id === id);
+            if (index >= 0) jobs.splice(index, 1);
+          },
+        };
+        return { at, jobs };
+      }
+
+      /** One instance: its own actor repository, crontab and OsScheduler over the shared queue. */
+      function bootInstance(instanceId: string, at: AtIo) {
+        let cronData = "";
+        const cron: CrontabIo = {
+          read: () => cronData,
+          write: (data) => {
+            cronData = data;
+          },
+        };
+        const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
+          tokenFile: `${instanceId}/wake-token`,
+          portFile: `${instanceId}/wake-port`,
+          instanceId,
+        });
+        const inboxStore = createMemoryInboxStore();
+        const { mesh } = setup({ scheduledMessages: scheduler, inboxStore });
+        const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+        const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+        mesh.sendMessage(
+          recipient,
+          `scheduled on ${instanceId}`,
+          sender,
+          undefined,
+          "2026-09-16T12:00:00.000Z"
+        );
+        return { mesh, scheduler, inboxStore, recipient };
+      }
+
+      it.each([
+        ["prod then staging", ["prod", "staging"] as const],
+        ["staging then prod", ["staging", "prod"] as const],
+      ])("in boot order %s neither instance cancels the other's message or the legacy job", (_, order) => {
+        const { at, jobs } = sharedAtQueue();
+        const instances = {
+          prod: bootInstance("/srv/rusa/prod", at),
+          staging: bootInstance("/srv/rusa/staging", at),
+        };
+        const before = jobs.map((job) => ({ ...job }));
+        expect(before.map((job) => job.id)).toEqual(["legacy", "100", "101"]);
+
+        for (const name of order) instances[name].mesh.reconcilePendingDeliveries();
+
+        expect(jobs).toEqual(before);
+        for (const { scheduler, inboxStore, recipient } of Object.values(instances)) {
+          expect(scheduler.listMessageDeliveries()).toEqual([
+            expect.objectContaining({ toId: recipient }),
+          ]);
+          expect(inboxStore.entries).toEqual([]);
+        }
+      });
+
+      it("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
+        const { at, jobs } = sharedAtQueue();
+        // `at` prints a job id, but the job never reaches the spool.
+        const lossy: AtIo = { ...at, schedule: () => "200" };
+        const cron: CrontabIo = { read: () => "", write: () => undefined };
+        const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), lossy, {
+          tokenFile: "/srv/rusa/prod/wake-token",
+          portFile: "/srv/rusa/prod/wake-port",
+          instanceId: "/srv/rusa/prod",
+        });
+        const events: MeshEventInput[] = [];
+        const chatRows = new Map<string, string>();
+        const { mesh } = setup({
+          scheduledMessages: scheduler,
+          events: (event) => events.push(event),
+          recordChat: (row) => {
+            const id = row.id ?? "missing-id";
+            chatRows.set(id, row.body);
+            return id;
+          },
+        });
+        const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+        const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+        events.length = 0;
+
+        expect(() =>
+          mesh.sendMessage(
+            recipient,
+            "lost in the spool",
+            sender,
+            undefined,
+            "2026-09-16T12:00:00.000Z"
+          )
+        ).toThrow(AtEnqueueUnconfirmedError);
+
+        expect(jobs.map((job) => job.id)).toEqual(["legacy"]);
+        expect(events).toEqual([]);
+        expect(chatRows.size).toBe(0);
+        expect(scheduler.listMessageDeliveries()).toEqual([]);
+      });
+
+      it("still cancels its own job for a recipient it does not know, and only that one", () => {
+        const { at, jobs } = sharedAtQueue();
+        const prod = bootInstance("/srv/rusa/prod", at);
+        const staging = bootInstance("/srv/rusa/staging", at);
+        prod.scheduler.scheduleMessageDelivery({
+          id: "prod-orphan",
+          toId: "recipient-prod-never-knew",
+          fromId: "sender",
+          body: "drop",
+          deliverAt: "2026-09-16T12:00:00.000Z",
+        });
+
+        staging.mesh.reconcilePendingDeliveries();
+        prod.mesh.reconcilePendingDeliveries();
+
+        // Only prod's own orphan (job 102) is gone: the legacy job, prod's
+        // live message and staging's message all survive both reconciliations.
+        expect(jobs.map((job) => job.id)).toEqual(["legacy", "100", "101"]);
+        expect(prod.scheduler.listMessageDeliveries()).toEqual([
+          expect.objectContaining({ toId: prod.recipient }),
+        ]);
+        expect(staging.scheduler.listMessageDeliveries()).toEqual([
+          expect.objectContaining({ toId: staging.recipient }),
+        ]);
+      });
     });
 
     it("reconstructs acceptance history when a crash occurs after the at job is installed", () => {
