@@ -114,8 +114,8 @@ export class SqliteInboxRepository implements InboxRepository {
         payload: input.payload,
       };
     });
-    const insertedIds = this.db.transaction(() => {
-      const inserted = new Set<string>();
+    const inserted = this.db.transaction(() => {
+      const insertedRows: InboxEntry[] = [];
       for (const row of rows) {
         const result = insert.run(
           row.id,
@@ -124,13 +124,17 @@ export class SqliteInboxRepository implements InboxRepository {
           row.deliveredAt.toISOString(),
           JSON.stringify(row.payload)
         );
-        if (result.changes === 1) inserted.add(row.id);
+        if (result.changes === 1) {
+          insertedRows.push({
+            ...row,
+            seenAt: null,
+            handledAt: null,
+            handledNote: null,
+          });
+        }
       }
-      return inserted;
+      return insertedRows;
     })();
-    const inserted = rows
-      .filter((row) => insertedIds.has(row.id))
-      .map((row) => ({ ...row, seenAt: null, handledAt: null, handledNote: null }));
     // Notify only once the rows are durable: the transaction above has
     // committed, and nothing here is awaited, so the appending caller's own
     // wake still follows in the same turn.
@@ -283,14 +287,19 @@ export class SqliteInboxRepository implements InboxRepository {
   /**
    * Advisory delivery after commit. A listener that throws must neither undo
    * the durable write nor starve the listeners after it, so each failure is
-   * contained and reported through `onListenerError`.
+   * contained and reported through `onListenerError`. A failure in the error
+   * reporter itself is similarly contained.
    */
   private notifyItemsAppended(items: readonly InboxEntry[]): void {
     for (const listener of [...this.listeners]) {
       try {
         listener(items);
       } catch (error) {
-        this.onListenerError(error);
+        try {
+          this.onListenerError(error);
+        } catch {
+          // A throwing reporter must neither escape append nor starve later listeners.
+        }
       }
     }
   }
