@@ -1511,41 +1511,50 @@ class _DetailViewState extends State<_DetailView> {
       fontSize: 22,
       fontWeight: FontWeight.bold,
     );
+    final status = ObligationStatusChip(
+      obligation: o,
+      store: store,
+      bordered: true,
+    );
+    final titleAndStatus = Row(
+      children: [
+        Expanded(
+          child: SelectableText(
+            o.heading,
+            maxLines: 2,
+            style: titleStyle,
+          ),
+        ),
+        const SizedBox(width: 10),
+        status,
+      ],
+    );
+    if (o.isTerminal) {
+      return titleAndStatus;
+    }
     return LayoutBuilder(
       builder: (context, constraints) {
-        final titleWidth = (TextPainter(
+        // SelectableText's RenderEditable expands to a loose Wrap constraint,
+        // so measure its rendered text width to keep the controls adjacent.
+        final intrinsicTitleWidth = TextPainter.computeMaxIntrinsicWidth(
           text: TextSpan(text: o.heading, style: titleStyle),
           textDirection: Directionality.of(context),
           textScaler: MediaQuery.textScalerOf(context),
           maxLines: 2,
           textWidthBasis: TextWidthBasis.longestLine,
-        )..layout(maxWidth: constraints.maxWidth)).width;
+        );
+        final titleWidth = intrinsicTitleWidth > constraints.maxWidth
+            ? constraints.maxWidth
+            : intrinsicTitleWidth;
         final title = SizedBox(
           width: titleWidth,
           child: SelectableText(
             o.heading,
             key: const ValueKey('obligation-detail-title'),
             maxLines: 2,
+            textWidthBasis: TextWidthBasis.longestLine,
             style: titleStyle,
           ),
-        );
-        final status = ObligationStatusChip(
-          obligation: o,
-          store: store,
-          bordered: true,
-        );
-        if (o.isTerminal) {
-          return Wrap(
-            alignment: WrapAlignment.start,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            runSpacing: 4,
-            spacing: 10,
-            children: [title, status],
-          );
-        }
-        final actionRow = Row(
-          mainAxisSize: MainAxisSize.min,
-          children: actions,
         );
         return Wrap(
           alignment: WrapAlignment.start,
@@ -1554,10 +1563,13 @@ class _DetailViewState extends State<_DetailView> {
           spacing: 8,
           children: [
             title,
-            Row(
+            Wrap(
               key: const ValueKey('obligation-detail-actions'),
-              mainAxisSize: MainAxisSize.min,
-              children: [status, const SizedBox(width: 8), actionRow],
+              alignment: WrapAlignment.start,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              runSpacing: 4,
+              spacing: 8,
+              children: [status, ...actions],
             ),
           ],
         );

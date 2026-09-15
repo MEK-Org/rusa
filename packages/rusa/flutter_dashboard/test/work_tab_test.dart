@@ -169,13 +169,13 @@ void main() {
     'keeps detail actions at the title start when the header wraps (#476)',
     (tester) async {
       await tester.runAsync(() async {
-        await tester.binding.setSurfaceSize(const Size(1200, 800));
+        await tester.binding.setSurfaceSize(const Size(1600, 800));
         addTearDown(() => tester.binding.setSurfaceSize(null));
 
         final ob = makeObligation(
           'header-actions',
           ownerId: 'root',
-          title: 'Actions beside the title',
+          title: 'Actions beside the obligation title',
         );
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
@@ -200,27 +200,33 @@ void main() {
         final wideTitleRect = tester.getRect(title);
         final wideActionsRect = tester.getRect(actions);
 
-        // The controls follow the header's content instead of occupying the
-        // far edge of the wide detail pane.
-        expect(wideActionsRect.left, greaterThan(wideTitleRect.left));
-        expect(wideActionsRect.left, lessThan(900));
+        // The controls are adjacent to the title rather than at the far edge
+        // of the wide detail pane.
+        expect(wideActionsRect.left, closeTo(wideTitleRect.right + 8, 1));
 
-        await tester.binding.setSurfaceSize(const Size(500, 800));
+        await tester.binding.setSurfaceSize(const Size(400, 800));
         await tester.pump();
         await tester.pump();
 
         final narrowTitleRect = tester.getRect(title);
         final narrowActionsRect = tester.getRect(actions);
 
-        // The narrow header moves the action run onto the next line, but it
-        // stays start-aligned and every labelled control remains available.
-        expect(narrowTitleRect.height, greaterThan(30));
-        expect(narrowActionsRect.top, greaterThan(narrowTitleRect.top));
+        // A two-line title moves the controls to a start-aligned run. The
+        // controls themselves can wrap instead of overflowing the pane.
+        expect(narrowTitleRect.height, greaterThan(50));
+        expect(narrowActionsRect.top, greaterThan(narrowTitleRect.bottom));
         expect(narrowActionsRect.left, closeTo(narrowTitleRect.left, 0.1));
-        expect(find.byTooltip('Mark Done'), findsOneWidget);
-        expect(find.byTooltip('Cancel Obligation'), findsOneWidget);
-        expect(find.byTooltip('Reassign obligation'), findsOneWidget);
-        expect(find.byTooltip('Add child obligation'), findsOneWidget);
+        expect(narrowActionsRect.right, lessThanOrEqualTo(400));
+        for (final tooltip in [
+          'Mark Done',
+          'Cancel Obligation',
+          'Reassign obligation',
+          'Add child obligation',
+        ]) {
+          final control = find.byTooltip(tooltip);
+          expect(control, findsOneWidget);
+          expect(tester.getRect(control).right, lessThanOrEqualTo(400));
+        }
 
         await store.dispose();
       });
