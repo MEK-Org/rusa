@@ -323,6 +323,63 @@ describe("db-check", () => {
     expect(existsSync(join(home, "host-jobs.json"))).toBe(false);
   });
 
+  it("plans portable-context snapshots without importing or archiving them", () => {
+    writeFileSync(
+      join(home, "threads.json"),
+      JSON.stringify({
+        threads: [
+          {
+            id: "root",
+            charter: "root charter",
+            parentId: null,
+            status: "active",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      })
+    );
+    mkdirSync(join(home, "portable-context"), { recursive: true });
+    const snapshot = JSON.stringify({
+      schemaVersion: 3,
+      actorId: "root",
+      generation: 2,
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      lastFoldedSourceId: "chat-1",
+      compactor: null,
+      items: [],
+    });
+    writeFileSync(join(home, "portable-context", "root.json"), snapshot);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedPortableContextSnapshots).toBe(1);
+
+    // Plan mode never archives the source or writes durable snapshots.
+    expect(readFileSync(join(home, "portable-context", "root.json"), "utf8")).toBe(snapshot);
+    const db = new Database(join(home, "data", "mesh.db"));
+    expect(new Repositories(db).portableContext.find("root")).toBeUndefined();
+    db.close();
+  });
+
+  it("reports no planned snapshots on a fresh home and creates no portable-context directory", () => {
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedPortableContextSnapshots).toBe(0);
+    expect(existsSync(join(home, "portable-context"))).toBe(false);
+  });
+
+  it("exits non-zero when a legacy portable-context snapshot cannot be read", () => {
+    mkdirSync(join(home, "portable-context"), { recursive: true });
+    writeFileSync(join(home, "portable-context", "root.json"), "{ not json");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("cannot read"));
+    consoleError.mockRestore();
+  });
+
   it("exits non-zero when the legacy host-job file holds unresolved rows", () => {
     writeFileSync(
       join(home, "host-jobs.json"),
@@ -627,7 +684,7 @@ describe("db-check", () => {
     expect(consoleLog).toHaveBeenCalledWith(
       expect.stringContaining(
         "Legacy import plan: 0 actor(s), 0 scheduled message(s), 0 capability grant(s), " +
-          "0 event source ownership(s), 0 host job(s)"
+          "0 event source ownership(s), 0 host job(s), 0 portable-context snapshot(s)"
       )
     );
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");

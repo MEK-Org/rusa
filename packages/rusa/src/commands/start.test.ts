@@ -2780,10 +2780,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
 
     expect(compactSpy).toHaveBeenCalledOnce();
-    const state = JSON.parse(
-      readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
-    ) as { generation: number; lastFoldedSourceId: string | null };
+    // Read back through the durable store, not a file: the snapshot is a row in
+    // mesh.db, committed with the run that folded it.
+    const state = getRepositories().portableContext.load("root");
     expect(state.generation).toBe(1);
+    expect(existsSync(join(homeDir, "portable-context"))).toBe(false);
     expect(state.lastFoldedSourceId).toBeTruthy();
     const compacted = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["portable_context_compacted"],
@@ -2794,7 +2795,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // mesh_events is an analytics stream, so pruning it must not remove live
     // prompt state. Recent output comes from actor_runs, recent messages from
-    // mesh_chat, and compacted memory from the portable-context file.
+    // mesh_chat, and compacted memory from portable_context_snapshots.
     getDb().exec("DELETE FROM mesh_events");
     const built = actorOpts.buildPrompt();
     expect(built.prompt).toContain("root completed");
@@ -2815,9 +2816,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
     expect(compactSpy).toHaveBeenCalledTimes(2);
-    const advancedState = JSON.parse(
-      readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
-    ) as { generation: number; lastFoldedSourceId: string | null };
+    const advancedState = getRepositories().portableContext.load("root");
     expect(advancedState.generation).toBe(2);
     expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
     compactSpy.mockRestore();
@@ -5588,6 +5587,148 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(exitEvents[0]?.actor_id).toBe("root");
       expect(exitEvents[0]?.detail).toContain("job-root-afterboot");
       expect(exitEvents[0]?.detail).toContain("jobId=job-after-boot");
+    } finally {
+      probe.close();
+    }
+  });
+
+  // The arbiter for the portable-context cutover wiring (#473): the importer,
+  // repository and db-check tests all pass against a store nothing
+  // production-facing is holding, so this boots the real thing from a legacy
+  // directory and then drives the wired prompt assembler. A dropped import
+  // call, or a second store constructed for one of the two consumers, fails
+  // here.
+  it("imports portable context at boot and assembles prompts from the same database (#473)", async () => {
+    const legacyDir = join(homeDir, "portable-context");
+    mkdirSync(legacyDir, { recursive: true });
+    const legacyBytes = JSON.stringify(
+      {
+        schemaVersion: 3,
+        actorId: "root",
+        generation: 5,
+        updatedAt: "2026-07-01T00:00:00.000Z",
+        lastFoldedSourceId: "legacy-source-1",
+        compactor: { provider: "gemini", model: "gemini-3-flash" },
+        items: [
+          {
+            id: "mem-legacy",
+            kind: "decision",
+            priority: "must",
+            status: "active",
+            statement: "Memory folded before the cutover survives it.",
+            evidence: [
+              {
+                eventId: "chat-legacy",
+                sender: "operator",
+                ts: "2026-07-01T00:00:00.000Z",
+                quote: "Remember this from before.",
+              },
+            ],
+            updatedAt: "2026-07-01T00:00:00.000Z",
+          },
+        ],
+      },
+      null,
+      2
+    );
+    writeFileSync(join(legacyDir, "root.json"), legacyBytes, "utf8");
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+          context: { type: "portable", mode: "ledger" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+
+    // The legacy directory became state and was archived, not deleted.
+    expect(existsSync(legacyDir)).toBe(false);
+    const backups = readdirSync(homeDir).filter(
+      (name) => name.startsWith("portable-context.imported-") && name.endsWith(".bak")
+    );
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(homeDir, backups[0] ?? "", "root.json"), "utf8")).toBe(legacyBytes);
+
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const buildPrompt = (
+      rootActor as unknown as { opts: { buildPrompt: () => { prompt: string } } }
+    ).opts.buildPrompt;
+
+    // Memory the mesh never folded itself reaches the prompt.
+    expect(buildPrompt().prompt).toContain("Memory folded before the cutover survives it.");
+
+    // A connection of this test's own — what the mesh committed, not what it
+    // happens to be holding in memory.
+    const probe = new Database(join(homeDir, "data", "mesh.db"));
+    try {
+      expect(
+        probe
+          .prepare("SELECT actor_id, schema_version, generation FROM portable_context_snapshots")
+          .all()
+      ).toEqual([{ actor_id: "root", schema_version: 3, generation: 5 }]);
+
+      // A fold the booted mesh has never seen, committed after boot by another
+      // connection. A store that read the file once at startup cannot see this.
+      probe
+        .prepare(
+          `UPDATE portable_context_snapshots
+             SET generation = 6, snapshot = ?
+           WHERE actor_id = 'root'`
+        )
+        .run(
+          JSON.stringify({
+            schemaVersion: 3,
+            actorId: "root",
+            generation: 6,
+            updatedAt: "2026-07-02T00:00:00.000Z",
+            lastFoldedSourceId: "legacy-source-2",
+            compactor: { provider: "gemini", model: "gemini-3-flash" },
+            items: [
+              {
+                id: "mem-after-boot",
+                kind: "decision",
+                priority: "must",
+                status: "active",
+                statement: "A fold committed by another connection is read straight back.",
+                evidence: [
+                  {
+                    eventId: "chat-after-boot",
+                    sender: "operator",
+                    ts: "2026-07-02T00:00:00.000Z",
+                    quote: "Committed elsewhere.",
+                  },
+                ],
+                updatedAt: "2026-07-02T00:00:00.000Z",
+              },
+            ],
+          })
+        );
+
+      const rebuilt = buildPrompt().prompt;
+      expect(rebuilt).toContain("A fold committed by another connection is read straight back.");
+      expect(rebuilt).not.toContain("Memory folded before the cutover survives it.");
     } finally {
       probe.close();
     }

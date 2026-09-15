@@ -1,11 +1,4 @@
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -336,7 +329,6 @@ export async function runActorMeshE2EUp(opts: {
             followerHub,
             port: controlPort,
             handles,
-            home,
           });
         }
         printDriveHelp({
@@ -362,7 +354,6 @@ export function startRootControlServer(opts: {
   followerHub?: FollowerHub;
   port: number;
   handles: RunStartE2EHandles;
-  home?: string;
 }): Server {
   const send = (res: import("node:http").ServerResponse, code: number, body: unknown) => {
     res.writeHead(code, { "content-type": "application/json" });
@@ -409,16 +400,11 @@ export function startRootControlServer(opts: {
     }
     const contextMatch = url.pathname.match(/^\/actors\/([^/]+)\/context$/);
     if (req.method === "GET" && contextMatch) {
-      if (!opts.home) {
-        send(res, 409, { error: "portable context inspection is not configured" });
-        return;
-      }
       const id = decodeURIComponent(contextMatch[1]);
       if (!opts.handles.mesh.actors.get(id)) {
         send(res, 404, { error: "actor not found" });
         return;
       }
-      const path = join(opts.home, "portable-context", `${id}.json`);
       const events = getRepositories()
         .meshEvents.listEventsByActors([id], { limit: 20 })
         .events.filter(
@@ -429,8 +415,10 @@ export function startRootControlServer(opts: {
             event.kind === "portable_context_compacted"
         )
         .reverse();
+      // Straight from the durable snapshot, so an inspector reads exactly what
+      // the fold committed rather than a file this process may not have flushed.
       send(res, 200, {
-        state: existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null,
+        state: getRepositories().portableContext.find(id) ?? null,
         events,
       });
       return;
