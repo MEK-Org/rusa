@@ -242,6 +242,81 @@ void main() {
       });
     });
 
+    testWidgets(
+      'the overflow tracks run-state changes after the detail is open',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..runtimeCursor = const RuntimeCursor(
+              streamId: 'stream-a',
+              revision: 0,
+            )
+            ..threadsResult = [
+              makeThread(_actorId, created: 't0', runState: RunState.idle),
+            ];
+          final stream = FakeStream();
+          final store = DashboardStore(api: api, stream: stream);
+          await store.init();
+          await _pump(tester, store, size: const Size(390, 844));
+          await _goToActors(tester);
+          await _openActor(tester, store);
+
+          // Initial pump: idle actor → Run now only.
+          await _openOverflow(tester);
+          expect(find.text('Run now'), findsOneWidget);
+          expect(find.text('Interrupt'), findsNothing);
+          // Dismiss the menu by tapping the detail body beneath it.
+          await tester.tapAt(const Offset(195, 700));
+          await tester.pump(const Duration(milliseconds: 300));
+
+          // The authoritative stream transitions the actor to running — with no
+          // other interaction, the open overflow must follow.
+          stream.runtimeStatesCtrl.add(
+            const ActorRuntimeStateDelta(
+              streamId: 'stream-a',
+              revision: 1,
+              actorId: _actorId,
+              runState: RunState.running,
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.pump(const Duration(milliseconds: 50));
+
+          // Identity stays; the actions swap to the running set.
+          expect(
+            find.descendant(
+              of: find.byType(MeshHeader),
+              matching: find.text('$_actorId-handle'),
+            ),
+            findsOneWidget,
+          );
+          await _openOverflow(tester);
+          expect(find.text('Interrupt'), findsOneWidget);
+          expect(find.text('Run now'), findsNothing);
+          await tester.tapAt(const Offset(195, 700));
+          await tester.pump(const Duration(milliseconds: 300));
+
+          // And back to idle.
+          stream.runtimeStatesCtrl.add(
+            const ActorRuntimeStateDelta(
+              streamId: 'stream-a',
+              revision: 2,
+              actorId: _actorId,
+              runState: RunState.idle,
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 50));
+          await tester.pump(const Duration(milliseconds: 50));
+
+          await _openOverflow(tester);
+          expect(find.text('Run now'), findsOneWidget);
+          expect(find.text('Interrupt'), findsNothing);
+
+          await store.dispose();
+        });
+      },
+    );
+
     testWidgets('a retired actor offers no overflow actions', (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()

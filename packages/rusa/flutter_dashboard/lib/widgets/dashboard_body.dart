@@ -171,9 +171,7 @@ class _DashboardBodyState extends State<DashboardBody> {
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
                 onBack: inActorDetail ? widget.store.clearSelection : null,
-                detailActor: inActorDetail
-                    ? widget.store.actorStates.value.actors[snap.data!]?.thread
-                    : null,
+                detailActorId: inActorDetail ? snap.data : null,
               ),
             );
           },
@@ -188,26 +186,44 @@ class _DashboardBodyState extends State<DashboardBody> {
   Widget _chrome({
     VoidCallback? onMenuTap,
     VoidCallback? onBack,
-    ThreadDto? detailActor,
+    String? detailActorId,
   }) {
+    Widget header(ThreadDto? detail) {
+      return MeshHeader(
+        onLogout: widget.onLogout,
+        profilePhotoUrl: widget.profilePhotoUrl,
+        store: widget.store,
+        selected: _view,
+        onSelect: _selectView,
+        quotaProviders: _quotaProviders(
+          widget.store.dashboardConfig.valueOrNull,
+        ),
+        onMenuTap: onMenuTap,
+        onBack: onBack,
+        pageTitle: _pageTitleFor(_view),
+        detailActor: detail,
+      );
+    }
+
+    // Phone identity must track live run state: the overflow menu's actions
+    // are derived from the actor's dot state, so the header rebuilds off the
+    // actorStates stream — a one-time snapshot here would leave the actions
+    // stale until some unrelated rebuild. Desktop passes no id and keeps the
+    // header it has always built.
+    final phoneHeader = detailActorId == null
+        ? header(null)
+        : StreamBuilder<ActorStateSnapshot>(
+            stream: widget.store.actorStates,
+            initialData: widget.store.actorStates.value,
+            builder: (context, snap) =>
+                header(snap.data?.actors[detailActorId]?.thread),
+          );
+
     return ColoredBox(
       color: MeshColors.bgPrimary,
       child: Column(
         children: [
-          MeshHeader(
-            onLogout: widget.onLogout,
-            profilePhotoUrl: widget.profilePhotoUrl,
-            store: widget.store,
-            selected: _view,
-            onSelect: _selectView,
-            quotaProviders: _quotaProviders(
-              widget.store.dashboardConfig.valueOrNull,
-            ),
-            onMenuTap: onMenuTap,
-            onBack: onBack,
-            pageTitle: _pageTitleFor(_view),
-            detailActor: detailActor,
-          ),
+          phoneHeader,
           Expanded(
             child: _view == DashboardView.overview
                 ? OverviewTab(store: widget.store, onSelectView: _selectView)
