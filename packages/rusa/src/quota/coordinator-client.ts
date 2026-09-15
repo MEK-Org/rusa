@@ -1,5 +1,10 @@
 import http from "node:http";
 import {
+  nullQuotaMetrics,
+  QUOTA_CLIENT_METRICS,
+  type QuotaMetrics,
+} from "./coordinator-metrics.js";
+import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
@@ -14,13 +19,39 @@ export interface QuotaCoordinatorClientOptions {
   hardStaleAfterMs?: number;
   now?: () => number;
   logger?: { warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
+  /** Metric sink; defaults to the discarding one. */
+  metrics?: QuotaMetrics;
+  /**
+   * The `source` label the two client series carry — which reader this is.
+   * The series exist to be compared across many readers at once, so an
+   * unlabelled one is not useful; an unset source reports as `unknown` rather
+   * than silently merging distinct readers into one line.
+   */
+  source?: string;
 }
 
 export class QuotaCoordinatorClient {
   private lastAppliedIntervals: Map<string, number> = new Map();
   private lastSuccessfulReadMs: Map<string, number> = new Map();
+  private readonly metrics: QuotaMetrics;
+  private readonly source: string;
 
-  constructor(readonly options: QuotaCoordinatorClientOptions) {}
+  constructor(readonly options: QuotaCoordinatorClientOptions) {
+    this.metrics = options.metrics ?? nullQuotaMetrics;
+    this.source = options.source ?? "unknown";
+  }
+
+  /**
+   * Whether the last read reached the service. Reported as 0/1 rather than as
+   * an event, because the condition that matters is a client sitting
+   * disconnected across ticks — a gauge shows that as a flat line at zero,
+   * where a failure counter only shows it as an absence of increments.
+   */
+  private recordConnected(connected: boolean): void {
+    this.metrics.gauge(QUOTA_CLIENT_METRICS.serviceConnected, connected ? 1 : 0, {
+      source: this.source,
+    });
+  }
 
   getLastAppliedInterval(provider: string): number {
     // §5.7 Rule 0/Rule 2 read only the ceiling: a client that has never had a
@@ -73,6 +104,10 @@ export class QuotaCoordinatorClient {
       const nowMs = this.options.now ? this.options.now() : Date.now();
       this.lastAppliedIntervals.set(provider, interval);
       this.lastSuccessfulReadMs.set(provider, nowMs);
+      this.metrics.gauge(QUOTA_CLIENT_METRICS.appliedIntervalSeconds, interval, {
+        source: this.source,
+        provider,
+      });
       return true;
     }
 
@@ -99,6 +134,11 @@ export class QuotaCoordinatorClient {
             data += chunk;
           });
           res.on("end", () => {
+            // Reaching a response at all is the connection signal, whatever the
+            // service said: a 503 from a cold coordinator is a service that is
+            // up and answering, and reporting it as disconnected would fire the
+            // §9.5 alert on a healthy pool during startup.
+            this.recordConnected(true);
             if (res.statusCode === 200) {
               try {
                 const parsed = JSON.parse(data);
@@ -137,7 +177,10 @@ export class QuotaCoordinatorClient {
           });
         }
       );
-      req.on("error", reject);
+      req.on("error", (err) => {
+        this.recordConnected(false);
+        reject(err);
+      });
       req.end();
     });
   }

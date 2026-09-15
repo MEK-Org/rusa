@@ -1,4 +1,9 @@
 import type { QuotaLlmProvider, QuotaService } from "../mcp/quota-mcp.js";
+import {
+  nullQuotaMetrics,
+  QUOTA_SERVICE_METRICS,
+  type QuotaMetrics,
+} from "./coordinator-metrics.js";
 import { DEFAULT_MAX_INTERVAL_SECONDS } from "./coordinator-protocol.js";
 import type { SharedQuotaStore } from "./shared-store.js";
 
@@ -15,6 +20,16 @@ export interface QuotaCollectionStats {
   failures: number;
   lastOutcome: "ok" | "failure" | null;
   lastScrapedAt: string | null;
+  /**
+   * When the last probe was *started*, as distinct from `lastScrapedAt`, which
+   * only moves on a reading that survived parsing. The gap between the two is
+   * the entire signal for "the service is up and its probes are broken": a
+   * probe that fails before it can persist a scrape row leaves no trace in the
+   * database, so readiness has to read it from the loop.
+   */
+  lastAttemptAt: string | null;
+  /** The last probe failure message, retained until a probe succeeds. */
+  lastError: string | null;
 }
 
 export interface QuotaCollectionLoopOptions {
@@ -25,6 +40,8 @@ export interface QuotaCollectionLoopOptions {
   /** Service tick cadence. Defaults to 300s (quota.throttle.tickSeconds). */
   tickMs?: number;
   maxIntervalSeconds?: number;
+  /** Metric sink; defaults to the discarding one. */
+  metrics?: QuotaMetrics;
   /** Timer seams for tests. */
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
@@ -53,9 +70,16 @@ export interface QuotaCollectionLoopOptions {
  * in-flight `carried_forward_bad_read` chain instead of starting a fresh one
  * (design §6.3, criterion 13).
  */
+/** A probe failure as readiness reports it: a message, never a stack. */
+function describeProbeError(error: unknown): string {
+  if (error === undefined || error === null) return "probe returned an unknown reading";
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class QuotaCollectionLoop {
   private readonly tickMs: number;
   private readonly maxIntervalSeconds: number;
+  private readonly metrics: QuotaMetrics;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
   private timer: unknown = null;
@@ -65,6 +89,7 @@ export class QuotaCollectionLoop {
   constructor(readonly options: QuotaCollectionLoopOptions) {
     this.tickMs = options.tickMs ?? DEFAULT_COLLECTION_TICK_MS;
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
+    this.metrics = options.metrics ?? nullQuotaMetrics;
     this.setIntervalFn = options.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalFn =
       options.clearIntervalFn ??
@@ -74,7 +99,14 @@ export class QuotaCollectionLoop {
   private stat(provider: string): QuotaCollectionStats {
     let entry = this.stats.get(provider);
     if (!entry) {
-      entry = { attempts: 0, failures: 0, lastOutcome: null, lastScrapedAt: null };
+      entry = {
+        attempts: 0,
+        failures: 0,
+        lastOutcome: null,
+        lastScrapedAt: null,
+        lastAttemptAt: null,
+        lastError: null,
+      };
       this.stats.set(provider, entry);
     }
     return entry;
@@ -82,6 +114,17 @@ export class QuotaCollectionLoop {
 
   getStats(provider: string): Readonly<QuotaCollectionStats> {
     return { ...this.stat(provider) };
+  }
+
+  /**
+   * Every provider this loop collects, including ones that have not yet
+   * produced a stat entry, so a provider whose first probe has not returned is
+   * visible as "no attempt yet" rather than missing from readiness entirely.
+   */
+  getAllStats(): Record<string, Readonly<QuotaCollectionStats>> {
+    const all: Record<string, Readonly<QuotaCollectionStats>> = {};
+    for (const provider of this.options.providers) all[provider] = this.getStats(provider);
+    return all;
   }
 
   /**
@@ -130,24 +173,42 @@ export class QuotaCollectionLoop {
   private async doTick(): Promise<void> {
     for (const provider of this.options.providers) {
       const stat = this.stat(provider);
+      const startedMs = Date.now();
       try {
         const outcome = await this.options.quotaService.getQuotaProbeOutcome(
           provider as QuotaLlmProvider
         );
         if (!outcome.didProbe) continue;
         stat.attempts += 1;
+        stat.lastAttemptAt = new Date(startedMs).toISOString();
+        this.metrics.histogram(
+          QUOTA_SERVICE_METRICS.scrapeSeconds,
+          (Date.now() - startedMs) / 1000,
+          { provider }
+        );
         if (outcome.error || outcome.state?.status === "unknown") {
           stat.failures += 1;
           stat.lastOutcome = "failure";
+          stat.lastError = describeProbeError(outcome.error);
+          this.metrics.counter(QUOTA_SERVICE_METRICS.scrapesTotal, {
+            provider,
+            outcome: "failure",
+          });
         } else {
           stat.lastOutcome = "ok";
           stat.lastScrapedAt = outcome.state?.scrapedAt ?? stat.lastScrapedAt;
+          stat.lastError = null;
+          this.metrics.counter(QUOTA_SERVICE_METRICS.scrapesTotal, {
+            provider,
+            outcome: "success",
+          });
         }
         if (outcome.error) this.options.onError?.(provider, outcome.error);
       } catch (error) {
         // getQuotaProbeOutcome currently reports probe errors as data. Retain
         // this guard for a programming failure without misreporting it as a
         // scrape attempt whose start we cannot prove.
+        stat.lastError = describeProbeError(error);
         this.options.onError?.(provider, error);
       }
     }
