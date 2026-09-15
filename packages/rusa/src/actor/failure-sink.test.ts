@@ -587,6 +587,48 @@ describe("routeRunFailure", () => {
   });
 
   describe("isHumanOperatorCancelled helper ", () => {
+    it("recognizes a durable user principal id as a human cancellation only via principal storage", () => {
+      // After the #460 cutover the dashboard interrupts with the migrated user
+      // id, which carries no `human:` prefix; storage is what says it is a person.
+      const USER = "11111111-0000-4000-8000-000000000001";
+      const interrupted: RunResult = {
+        success: false,
+        exitCode: 143,
+        interrupted: true,
+        interruptSource: USER,
+        output: `[Task interrupted by ${USER}]`,
+      };
+      const principals = {
+        getUser: (id: string) => (id === USER ? { kind: "user", id } : undefined),
+      } as unknown as NonNullable<FailureSinkDeps["principals"]>;
+      expect(isHumanOperatorCancelled(interrupted, principals)).toBe(true);
+      expect(isHumanOperatorCancelled(interrupted)).toBe(false);
+      expect(
+        isHumanOperatorCancelled({ ...interrupted, interruptSource: "worker-abc" }, principals)
+      ).toBe(false);
+    });
+
+    it("suppresses the root error-chat notice for a durable-principal interrupt", async () => {
+      const USER = "11111111-0000-4000-8000-000000000001";
+      const { deps, toChat, logs } = makeDeps(
+        { root: { id: "root", parentId: null } },
+        {
+          principals: {
+            getUser: (id: string) => (id === USER ? { kind: "user", id } : undefined),
+          } as unknown as NonNullable<FailureSinkDeps["principals"]>,
+        }
+      );
+      await routeRunFailure(deps, "root", {
+        success: false,
+        exitCode: 143,
+        interrupted: true,
+        interruptSource: USER,
+        output: `[Task interrupted by ${USER}]`,
+      });
+      expect(toChat).toEqual([]);
+      expect(logs.some((l) => l.includes("interrupted by human operator"))).toBe(true);
+    });
+
     it("identifies various human operator interrupt patterns", () => {
       expect(
         isHumanOperatorCancelled({

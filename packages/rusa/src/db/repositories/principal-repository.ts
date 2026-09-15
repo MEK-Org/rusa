@@ -128,6 +128,22 @@ export class PrincipalRepository {
     return row ? this.getUser(row.principal_id) : undefined;
   }
 
+  /** First user row in storage, if any exists — for local-mode single-user fallback. */
+  findFirstUser(): UserPrincipal | undefined {
+    const row = this.db.prepare("SELECT * FROM users ORDER BY rowid ASC LIMIT 1").get() as
+      | UserRow
+      | undefined;
+    return row ? this.getUser(row.principal_id) : undefined;
+  }
+
+  /** List all user principals in storage. */
+  listUsers(): UserPrincipal[] {
+    const rows = this.db.prepare("SELECT * FROM users ORDER BY rowid ASC").all() as UserRow[];
+    return rows
+      .map((r) => this.getUser(r.principal_id))
+      .filter((u): u is UserPrincipal => u !== undefined);
+  }
+
   /**
    * Create a user and its principal in one transaction. The id is minted here
    * and returned; callers do not choose it.

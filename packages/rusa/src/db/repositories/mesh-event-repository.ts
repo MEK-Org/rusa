@@ -325,12 +325,11 @@ export class MeshEventRepository {
       WHERE e.actor_id IN (${actorPlaceholders})
     `;
 
-    if (opts.conversation && actorIds.length === 2) {
+    if (opts.conversation && actorIds.length >= 2) {
       sql += ` AND (
-        (c.sender_id = ? AND c.recipient_id = ?) OR
-        (c.sender_id = ? AND c.recipient_id = ?)
+        c.sender_id IN (${actorPlaceholders}) AND c.recipient_id IN (${actorPlaceholders}) AND c.sender_id != c.recipient_id
       )`;
-      params.push(actorIds[0], actorIds[1], actorIds[1], actorIds[0]);
+      params.push(...actorIds, ...actorIds);
     }
 
     if (opts.kinds && opts.kinds.length > 0) {

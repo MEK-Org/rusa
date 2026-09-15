@@ -447,15 +447,12 @@ class FakeApi extends DashboardApi {
     }
   }
 
-  final interruptCalls = <({String actorId, String by})>[];
+  final interruptCalls = <String>[];
   DashboardApiException? interruptError;
 
   @override
-  Future<void> interruptActor(
-    String actorId, {
-    String by = 'human:operator',
-  }) async {
-    interruptCalls.add((actorId: actorId, by: by));
+  Future<void> interruptActor(String actorId) async {
+    interruptCalls.add(actorId);
     final err = interruptError;
     if (err != null) throw err;
   }

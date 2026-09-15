@@ -972,8 +972,15 @@ class DashboardStore {
     _operatorChat.add(cur.copyWith(loading: true));
     try {
       final selectedId = actors.first;
+      final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
+      final chatActors = [
+        selectedId,
+        'human:operator',
+        if (userPrincipalId != null && userPrincipalId != 'human:operator')
+          userPrincipalId,
+      ];
       final page = await _api.fetchChat(
-        actors: [selectedId, 'human:operator'],
+        actors: chatActors,
         before: reset ? null : cur.cursor,
         limit: _kEventsPageSize,
       );
@@ -1230,8 +1237,13 @@ class DashboardStore {
 
         if (sel.length == 1) {
           final selectedId = sel.first;
-          if ((actorId == selectedId && recipientId == 'human:operator') ||
-              (actorId == 'human:operator' && recipientId == selectedId)) {
+          final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
+          final isHumanSender = actorId == 'human:operator' ||
+              (userPrincipalId != null && actorId == userPrincipalId);
+          final isHumanRecipient = recipientId == 'human:operator' ||
+              (userPrincipalId != null && recipientId == userPrincipalId);
+          if ((actorId == selectedId && isHumanRecipient) ||
+              (isHumanSender && recipientId == selectedId)) {
             if (_seenOperatorChatMessageIds.add(c.id)) {
               final cur = _operatorChat.value;
               _operatorChat.add(
