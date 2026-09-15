@@ -37,9 +37,28 @@ export interface PublishedThrottleResponse extends PublishedThrottleProviderStat
   service: QuotaCoordinatorServiceInfo;
 }
 
+/**
+ * A configured provider the coordinator has no stored throttle for yet. It is
+ * a valid application state, not a transport failure, so it is served with
+ * HTTP 200: the single-provider form is `{ service, error }` and the
+ * collection form carries the same object minus `service` (§5.5, criterion 16).
+ * `503` stays reserved for genuine infrastructure failure (`healthz`/`readyz`).
+ */
+export interface PublishedThrottleColdStatus {
+  error: QuotaCoordinatorError & { code: "not_ready"; retryable: true };
+}
+
+export interface PublishedThrottleColdResponse extends PublishedThrottleColdStatus {
+  service: QuotaCoordinatorServiceInfo;
+}
+
+export type PublishedThrottleLaneStatus =
+  | PublishedThrottleProviderStatus
+  | PublishedThrottleColdStatus;
+
 export interface PublishedThrottleCollectionResponse {
   service: QuotaCoordinatorServiceInfo;
-  providers: Record<string, PublishedThrottleProviderStatus>;
+  providers: Record<string, PublishedThrottleLaneStatus>;
 }
 
 export type QuotaCoordinatorErrorCode =

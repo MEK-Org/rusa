@@ -782,17 +782,20 @@ while `governingBucketKey` still names the weekly one — which is why both the
 key and the per-bucket map are on the wire and no separate governing-age field
 is.
 
-**Omitting `provider` returns only the configured providers with a stored
-throttle** — `stored(p)` non-null, §5.7. A stale or hard-stale lane still has
-a stored throttle and is still in the map, marked in `freshness`; a configured
-provider with no stored throttle is absent from the collection, and its
-individual lookup remains `503 not_ready`. A client treats an absent configured
-lane as it treats that envelope (§5.6): no successful read for the lane, so
-§5.7 rule 0 applies. Cold lanes are omitted rather than represented because a
-cold lane's single-provider response is the `not_ready` error envelope, not a
-throttle body, and criterion 16 requires every collection value to be
-byte-identical to a successful single-provider response — there is nothing for
-a cold value to be identical to. The collection is the call a client's tick
+**A configured provider with no stored throttle yet — `stored(p)` null, §5.7 —
+answers `200` with the `not_ready` envelope** (§5.6), not a `503`. Being cold is
+a valid application state the service handled correctly: there is simply
+nothing to say yet. `503` is reserved for genuine infrastructure failure
+(`healthz`/`readyz` below), and a client that had to read `503` as "nothing yet"
+could not tell that apart from the service actually being unavailable. This is
+the same rule `GET /v1/quota` already follows — the cold answer is a shape, not
+an error. A stale or hard-stale lane is not cold: it has a stored throttle and
+publishes the body above, marked in `freshness`.
+
+**Omitting `provider` returns every configured provider.** A cold lane is
+present, carrying the same `not_ready` envelope minus `service`, so the map
+always has one key per configured provider and a client never has to infer a
+lane's state from its absence. The collection is the call a client's tick
 actually makes, so the collection form is part of the contract rather than a
 convenience:
 
@@ -801,7 +804,8 @@ convenience:
   "service": { /* as above */ },
   "providers": {
     "claude": { /* every field above except "service" */ },
-    "codex":  { /* … */ }
+    "codex":  { /* … */ },
+    "kimi":   { "error": { "code": "not_ready", "message": "…", "retryable": true } }
   }
 }
 ```
@@ -917,10 +921,17 @@ own, since a frozen interval looks exactly like a stable one (§5.7).
 
 One error envelope: `{ "error": { "code": "...", "message": "...", "retryable": bool } }`.
 
-| Code | Meaning | Client action |
-| --- | --- | --- |
-| `not_ready` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
-| `provider_unknown` | Provider argument is blank or not configured on this service | Refuse; this is a configuration error, not a runtime one |
+| Code | HTTP | Meaning | Client action |
+| --- | --- | --- | --- |
+| `not_ready` | `200` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
+| `provider_unknown` | `404` | Provider argument is blank or not configured on this service | Refuse; this is a configuration error, not a runtime one |
+
+`not_ready` rides a `200` because the HTTP status answers a different question
+from the code: the status says whether the service could handle the request,
+the code says what it found. A cold lane is handled fine — there is nothing to
+report yet — and the envelope says so explicitly, so the client keeps its JSON
+contract and `503` keeps meaning what it means everywhere else, a service that
+cannot serve (§5.5).
 
 **Two application-state codes, and revision 8 deleted three.** Each deletion is
 a claim that the code could not fire, so each is worth its sentence:
@@ -1777,10 +1788,11 @@ right foundation for 1 and 8.
     `GET /v1/throttle` with no `provider`, and assert the response is a map keyed
     by provider whose every value is byte-identical to that provider's
     single-provider response with the `service` block removed. Assert also that
-    a configured provider with no stored throttle is absent from the map while
-    its single-provider request still returns `503 not_ready` (§5.5). This is
-    the shape every client's tick actually uses (§5.5), and without this
-    criterion it is the one part of the publication contract no criterion pins.
+    a configured provider with no stored throttle is present in the map, that
+    its single-provider request is `200` with the `not_ready` envelope, and that
+    the identity holds for it too (§5.5). This is the shape every client's tick
+    actually uses (§5.5), and without this criterion it is the one part of the
+    publication contract no criterion pins.
 
 ---
 

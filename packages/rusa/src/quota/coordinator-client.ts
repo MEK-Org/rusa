@@ -3,6 +3,7 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
+  type PublishedThrottleColdResponse,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
   validateProtocolMajor,
@@ -50,6 +51,8 @@ export class QuotaCoordinatorClient {
   /**
    * Apply a response from the quota coordinator, strictly enforcing client-side
    * protocolMajor compatibility on every response per §5.2 and Criterion 9.
+   * A 200 `not_ready` body carries no `intervalSeconds`, so it applies nothing
+   * and the client stays on §5.7 rule 0 / its last applied interval (§5.6).
    */
   applyResponse(provider: string, body: unknown): boolean {
     try {
@@ -81,7 +84,12 @@ export class QuotaCoordinatorClient {
 
   async getThrottle(
     provider?: string
-  ): Promise<PublishedThrottleResponse | PublishedThrottleCollectionResponse | null> {
+  ): Promise<
+    | PublishedThrottleResponse
+    | PublishedThrottleColdResponse
+    | PublishedThrottleCollectionResponse
+    | null
+  > {
     const path = provider
       ? `/v1/throttle?provider=${encodeURIComponent(provider)}`
       : "/v1/throttle";
@@ -124,6 +132,12 @@ export class QuotaCoordinatorClient {
                   typeof parsed.providers === "object"
                 ) {
                   for (const [p, pStatus] of Object.entries(parsed.providers)) {
+                    // A cold lane carries the not_ready envelope rather than a
+                    // throttle body (§5.5). There is nothing to apply, and the
+                    // client stays on §5.7 rule 0 / its last applied interval.
+                    if (pStatus && typeof pStatus === "object" && "error" in pStatus) {
+                      continue;
+                    }
                     this.applyResponse(p, pStatus);
                   }
                 }
