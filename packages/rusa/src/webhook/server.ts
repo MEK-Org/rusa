@@ -8,18 +8,18 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
-import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
+import {
+  type DashboardDataDeps,
+  handleMeshApiRequest,
+  viewingUserPrincipalId,
+} from "../dashboard/api.js";
 import {
   getDashboardAsset,
   getDashboardAssetDir,
   getDashboardHtml,
   hasDashboardAsset,
 } from "../dashboard/assets.js";
-import {
-  createDashboardAuth,
-  type DashboardAuth,
-  getDashboardRequestPrincipal,
-} from "../dashboard/auth.js";
+import { createDashboardAuth, type DashboardAuth } from "../dashboard/auth.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
@@ -343,11 +343,14 @@ export function createDashboardRequestHandler(
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        const reqPrincipal = getDashboardRequestPrincipal(req);
+        // The viewing user: the authenticated identity, else local mode's
+        // sole active durable user, so the client personalizes "my" surfaces
+        // (obligation queue, chat) without assuming the legacy alias (#460).
+        const userPrincipalId = viewingUserPrincipalId(req, dataDeps?.principals);
         res.end(
           JSON.stringify({
             quotaProviders: options.dashboardConfig?.quotaProviders ?? {},
-            ...(reqPrincipal ? { userPrincipalId: reqPrincipal.id } : {}),
+            ...(userPrincipalId ? { userPrincipalId } : {}),
           })
         );
         return;
@@ -614,6 +617,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
+          principals: options.mesh.principals ?? options.principals,
           logger: log.child({ component: "voice-route" }),
         }
       : null;

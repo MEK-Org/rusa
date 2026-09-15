@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -34,6 +35,11 @@ export interface FailureSinkDeps {
    * front to judge: wait, respawn on another provider/tier, or re-scope.
    */
   classify?: ExhaustionClassifier;
+  /**
+   * Durable principals, so an interrupt attributed to a user principal id is
+   * recognized as a human cancellation (#460) rather than a failure to report.
+   */
+  principals?: Pick<PrincipalRepository, "getUser">;
 }
 
 /**
@@ -240,11 +246,18 @@ function scrubJson(value: unknown): unknown {
  * Check if a run failure was caused by a human operator interrupt or cancellation .
  * Top-level error chat reporting suppresses notices for operator-initiated interrupts.
  */
-export function isHumanOperatorCancelled(result: RunResult): boolean {
+export function isHumanOperatorCancelled(
+  result: RunResult,
+  principals?: Pick<PrincipalRepository, "getUser">
+): boolean {
   if (result.interruptSource) {
     const by = result.interruptSource.toLowerCase();
     return (
-      by === "human:operator" || by === "operator" || by === "human" || by.startsWith("human:")
+      by === "human:operator" ||
+      by === "operator" ||
+      by === "human" ||
+      by.startsWith("human:") ||
+      principals?.getUser(result.interruptSource) !== undefined
     );
   }
   if (result.interrupted) {
@@ -298,7 +311,7 @@ function routeMechanicalFailureNotice(
   }
 
   if (actorId === deps.rootId) {
-    if (result && isHumanOperatorCancelled(result)) {
+    if (result && isHumanOperatorCancelled(result, deps.principals)) {
       deps.log(`suppressing error chat for root ${label} — interrupted by human operator`);
       return;
     }

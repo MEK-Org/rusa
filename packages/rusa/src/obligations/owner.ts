@@ -1,4 +1,6 @@
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { resolveLegacyOperatorAlias } from "../principals/operator-principal.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { Obligation } from "./obligation.js";
 
@@ -11,17 +13,21 @@ import type { Obligation } from "./obligation.js";
  * pressure only exists if every write boundary applies the same rule, so this
  * is the rule, in one place.
  *
- * Accepts a live actor or the single canonical operator id. Everything else is
- * refused: a retired actor, an id that names nothing, and any `system:*` id,
- * since nothing mints a system owner today and admitting one would create work
- * that appears in no queue and wakes nobody.
+ * Accepts a live actor, a durable user principal, or the legacy operator alias
+ * — which, once a sole active user exists, resolves to that user rather than
+ * minting a fresh `human:operator` row (#460). Everything else is refused: a
+ * retired actor, an id that names nothing, and any `system:*` id, since nothing
+ * mints a system owner today and admitting one would create work that appears
+ * in no queue and wakes nobody.
  */
 export function resolveObligationOwner(
   actors: Pick<ActorRepository, "get">,
   rawOwnerId: string,
-  principals?: Pick<import("../db/repositories/principal-repository.js").PrincipalRepository, "get">
+  principals?: Pick<PrincipalRepository, "get" | "listUsers">
 ): { ok: true; ownerId: string } | { ok: false; error: string } {
-  const ownerId = rawOwnerId.trim();
+  const alias = resolveLegacyOperatorAlias(rawOwnerId.trim(), principals);
+  if (!alias.ok) return alias;
+  const ownerId = alias.ownerId;
   if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
   if (principals) {
     const p = principals.get(ownerId);

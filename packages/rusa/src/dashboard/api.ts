@@ -25,12 +25,13 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
-import { getDashboardRequestPrincipal, isAuthenticatedOperatorRequest } from "./auth.js";
+import { getDashboardRequestPrincipal } from "./auth.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -511,13 +512,53 @@ function parseKinds(url: URL): string[] | undefined {
   return kinds.length > 0 ? kinds : undefined;
 }
 
+/**
+ * The durable principal a dashboard mutation is attributed to. An
+ * authenticated session carries its verified identity. In auth-disabled local
+ * mode the process boundary is the trust boundary, so the sole active durable
+ * user is the attribution — and only when exactly one exists. Zero or several
+ * active users is refused with the reason, never guessed at and never the
+ * legacy `human:operator` alias (#460).
+ */
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
-  _deps?: DashboardDataDeps | null
-): RootControlPrincipal {
+  deps?: Pick<DashboardDataDeps, "principals"> | null
+): { ok: true; principalId: RootControlPrincipal } | { ok: false; error: string } {
   const reqPrincipal = getDashboardRequestPrincipal(req);
-  if (reqPrincipal) return reqPrincipal.id as RootControlPrincipal;
-  return HUMAN_OPERATOR;
+  if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
+  const sole = resolveSoleActiveUser(deps?.principals);
+  if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
+  return { ok: false, error: sole.error };
+}
+
+/**
+ * Resolve the acting principal or answer the request with 403 and the reason.
+ * Returns null once the response has been sent so the caller can simply return.
+ */
+export function requireOperatorPrincipal(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps?: Pick<DashboardDataDeps, "principals"> | null
+): RootControlPrincipal | null {
+  const resolved = resolveOperatorPrincipalId(req, deps);
+  if (resolved.ok) return resolved.principalId;
+  sendJson(res, 403, { error: resolved.error });
+  return null;
+}
+
+/**
+ * The durable user a read surface should treat as "me": the authenticated
+ * identity, else local mode's sole active user, else null. Read paths never
+ * fail on this — they just cannot personalize.
+ */
+export function viewingUserPrincipalId(
+  req: IncomingMessage,
+  principals: DashboardDataDeps["principals"]
+): string | null {
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) return reqPrincipal.id;
+  const sole = resolveSoleActiveUser(principals);
+  return sole.ok ? sole.user.id : null;
 }
 
 export function resolveChatQueryActors(
@@ -571,6 +612,8 @@ export async function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
           try {
             // Portable context  is opt-in per actor: absent means native, so
             // an existing caller that never sends the field keeps the old record.
@@ -591,7 +634,7 @@ export async function handleMeshApiRequest(
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
-              resolveOperatorPrincipalId(req, deps)
+              principal
             );
             sendJson(res, 201, { id });
           } catch (err) {
@@ -629,12 +672,10 @@ export async function handleMeshApiRequest(
             sendJson(res, 400, { error: "parentId is required" });
             return;
           }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
           try {
-            rootControl.reparentChild(
-              actorId,
-              parentId.trim(),
-              resolveOperatorPrincipalId(req, deps)
-            );
+            rootControl.reparentChild(actorId, parentId.trim(), principal);
             sendJson(res, 200, { ok: true });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -689,7 +730,8 @@ export async function handleMeshApiRequest(
             return;
           }
 
-          const fromId = resolveOperatorPrincipalId(req, deps);
+          const fromId = requireOperatorPrincipal(req, res, deps);
+          if (!fromId) return;
           const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice, fromId });
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
@@ -724,24 +766,13 @@ export async function handleMeshApiRequest(
         sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
         return true;
       }
+      // The body is drained but never read: `by` is bound server-side from
+      // the acting principal, and a body value is neither an identity claim
+      // nor a fallback (#460).
       readBody(req)
-        .then((bodyStr) => {
-          let by = resolveOperatorPrincipalId(req, deps);
-          if (bodyStr.trim()) {
-            try {
-              const parsed = JSON.parse(bodyStr);
-              if (
-                !isAuthenticatedOperatorRequest(req) &&
-                parsed &&
-                typeof parsed.by === "string" &&
-                parsed.by.trim()
-              ) {
-                by = parsed.by.trim();
-              }
-            } catch {
-              // Ignore body parse errors, default to resolved operator principal
-            }
-          }
+        .then(() => {
+          const by = requireOperatorPrincipal(req, res, deps);
+          if (!by) return;
           try {
             const result = mesh.interrupt(actorId, by);
             sendJson(res, 200, {
@@ -777,8 +808,10 @@ export async function handleMeshApiRequest(
         sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
         return true;
       }
+      const principal = requireOperatorPrincipal(req, res, deps);
+      if (!principal) return true;
       try {
-        const result = deps.mesh.runNow(actorId, resolveOperatorPrincipalId(req, deps));
+        const result = deps.mesh.runNow(actorId, principal);
         sendJson(res, 200, { ok: true, queued: result.queued });
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1022,8 +1055,9 @@ export async function handleMeshApiRequest(
             return;
           }
 
+          const creatorId = requireOperatorPrincipal(req, res, deps);
+          if (!creatorId) return;
           try {
-            const creatorId = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.create({
               ownerId: owner.ownerId,
               parentId,
@@ -1083,8 +1117,9 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.setTerminalStatus(
               id,
               status,
@@ -1141,8 +1176,9 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             sendJson(res, 200, {
               ok: true,
               obligation: obligations.setExternalRef(id, externalRef, actingPrincipal),
@@ -1190,8 +1226,9 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.movePriorityInternal(
               id,
               previousId,
@@ -1239,8 +1276,9 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.reparent(id, parentId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
@@ -1288,8 +1326,9 @@ export async function handleMeshApiRequest(
             sendJson(res, 400, { error: owner.error });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
@@ -1516,8 +1555,7 @@ export async function handleMeshApiRequest(
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
-    const reqPrincipal = getDashboardRequestPrincipal(req);
-    const userPrincipalId = reqPrincipal?.id ?? deps.principals?.listUsers()[0]?.id ?? null;
+    const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
