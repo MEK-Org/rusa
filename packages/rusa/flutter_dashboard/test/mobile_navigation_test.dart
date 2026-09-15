@@ -136,10 +136,13 @@ void main() {
       final store = await _store();
       await _pump(tester, store, size: const Size(390, 844));
 
-      // The brand mark and the inline nav both give way to one leading action.
+      // The brand mark and the inline nav both give way to one leading
+      // action, and the header names the page instead of the product
+      // (issue #462): the phone title is the active view's label.
       expect(find.byIcon(Icons.menu), findsOneWidget);
       expect(find.byType(BrandMark), findsNothing);
-      expect(find.text('Overview'), findsNothing);
+      expect(find.text('RUSA'), findsNothing);
+      expect(find.text('Overview'), findsOneWidget);
       expect(find.text('IU'), findsNothing);
       expect(find.byType(MobileNavDrawer), findsNothing);
 
@@ -147,7 +150,13 @@ void main() {
 
       expect(find.byType(MobileNavDrawer), findsOneWidget);
       for (final label in ['Overview', 'Actors', 'Work', 'IU']) {
-        expect(find.text(label), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byType(MobileNavDrawer),
+            matching: find.text(label),
+          ),
+          findsOneWidget,
+        );
       }
       // The brand mark keeps its place in the drawer it made room for.
       expect(find.byType(BrandMark), findsOneWidget);

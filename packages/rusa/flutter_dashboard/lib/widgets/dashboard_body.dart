@@ -171,6 +171,9 @@ class _DashboardBodyState extends State<DashboardBody> {
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
                 onBack: inActorDetail ? widget.store.clearSelection : null,
+                detailActor: inActorDetail
+                    ? widget.store.actorStates.value.actors[snap.data!]?.thread
+                    : null,
               ),
             );
           },
@@ -182,7 +185,11 @@ class _DashboardBodyState extends State<DashboardBody> {
   /// The header + current view. Paints the dark base color directly (not just
   /// via the Scaffold) so the detail pane — which draws no background of its
   /// own — stays on-theme everywhere, including the headless screenshot capture.
-  Widget _chrome({VoidCallback? onMenuTap, VoidCallback? onBack}) {
+  Widget _chrome({
+    VoidCallback? onMenuTap,
+    VoidCallback? onBack,
+    ThreadDto? detailActor,
+  }) {
     return ColoredBox(
       color: MeshColors.bgPrimary,
       child: Column(
@@ -198,6 +205,8 @@ class _DashboardBodyState extends State<DashboardBody> {
             ),
             onMenuTap: onMenuTap,
             onBack: onBack,
+            pageTitle: _pageTitleFor(_view),
+            detailActor: detailActor,
           ),
           Expanded(
             child: _view == DashboardView.overview
@@ -218,6 +227,16 @@ class _DashboardBodyState extends State<DashboardBody> {
       ),
     );
   }
+}
+
+/// The phone app bar's page identity (issue #462): the active destination's
+/// label, so the phone header names the page instead of the product. Ignored
+/// by the desktop header shape, which keeps the brand row.
+String _pageTitleFor(DashboardView view) {
+  for (final destination in kDashboardDestinations) {
+    if (destination.isActive(view)) return destination.label;
+  }
+  return kDashboardDestinations.first.label;
 }
 
 /// Where a load lands: the view the address named, if it named one, and

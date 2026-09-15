@@ -82,7 +82,8 @@ class _DetailPanelState extends State<DetailPanel>
       builder: (_, _) {
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;
         final height = MediaQuery.of(context).size.height;
-        final isFullScreenWalkie = walkieActive && height < kShortViewportHeight;
+        final isFullScreenWalkie =
+            walkieActive && height < kShortViewportHeight;
 
         if (isFullScreenWalkie) {
           return ChatTab(
@@ -157,7 +158,11 @@ class _DetailPanelState extends State<DetailPanel>
                           parentHandle: parentHandle,
                           store: widget.store,
                         ),
-                        InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
+                        InboxTab(
+                          actorId: actor.id,
+                          store: widget.store,
+                          onSelectView: widget.onSelectView,
+                        ),
                       ]
                     : [
                         ChatTab(
@@ -171,7 +176,11 @@ class _DetailPanelState extends State<DetailPanel>
                           parentHandle: parentHandle,
                           store: widget.store,
                         ),
-                        InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
+                        InboxTab(
+                          actorId: actor.id,
+                          store: widget.store,
+                          onSelectView: widget.onSelectView,
+                        ),
                       ],
               ),
             ),
@@ -369,7 +378,10 @@ class _DetailPanelState extends State<DetailPanel>
                     ),
                   ),
                   _statusBadge(a),
-                  if (!a.isRetired) ..._quickActions(a),
+                  // On a phone the run-state actions live in the app bar's
+                  // overflow menu (issue #462), not inline here; the desktop
+                  // detail header keeps them inline as before.
+                  if (!a.isRetired && !widget.narrow) ..._quickActions(a),
                 ],
               ),
               const SizedBox(height: 4),
@@ -391,64 +403,35 @@ class _DetailPanelState extends State<DetailPanel>
     ),
   );
 
+  /// The desktop detail header's inline run-state actions — the same
+  /// [actorHeaderActions] list the phone app bar renders as an overflow menu,
+  /// so the two surfaces always offer the same actions for the same state.
   List<Widget> _quickActions(ThreadDto a) {
     final dot = widget.store.dotFor(a);
-    final isRunning = dot == DotState.active;
-    final isQueued = dot == DotState.queued;
-    final isIdle = dot == DotState.idle;
-
-    if (isQueued) {
-      return [
+    return [
+      for (final action in actorHeaderActions(
+        store: widget.store,
+        actor: a,
+      )) ...[
         IconButton(
-          icon: const Icon(Icons.fast_forward_rounded, size: 20),
-          color: MeshColors.accent,
-          hoverColor: MeshColors.accent.withValues(alpha: 0.15),
+          icon: Icon(action.icon, size: 20),
+          color: action.icon == Icons.stop_rounded
+              ? MeshColors.statusHalted
+              : dot == DotState.idle
+              ? MeshColors.textSecondary
+              : MeshColors.accent,
+          hoverColor: action.icon == Icons.stop_rounded
+              ? MeshColors.statusHalted.withValues(alpha: 0.15)
+              : MeshColors.accent.withValues(alpha: 0.15),
           splashRadius: 16,
-          tooltip: 'Run now',
+          tooltip: action.label,
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: () => widget.store.runNowActor(a.id),
+          onPressed: action.invoke,
         ),
         const SizedBox(width: 2),
-        IconButton(
-          icon: const Icon(Icons.stop_rounded, size: 20),
-          color: MeshColors.statusHalted,
-          hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-          splashRadius: 16,
-          tooltip: 'Cancel queued run',
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: () => widget.store.interruptActor(a.id),
-        ),
-      ];
-    } else if (isRunning) {
-      return [
-        IconButton(
-          icon: const Icon(Icons.stop_rounded, size: 20),
-          color: MeshColors.statusHalted,
-          hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-          splashRadius: 16,
-          tooltip: 'Interrupt',
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: () => widget.store.interruptActor(a.id),
-        ),
-      ];
-    } else if (isIdle) {
-      return [
-        IconButton(
-          icon: const Icon(Icons.fast_forward_rounded, size: 20),
-          color: MeshColors.textSecondary,
-          hoverColor: MeshColors.accent.withValues(alpha: 0.15),
-          splashRadius: 16,
-          tooltip: 'Run now',
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: () => widget.store.runNowActor(a.id),
-        ),
-      ];
-    }
-    return const [];
+      ],
+    ];
   }
 
   Widget _meta(String label, String value) => RichText(
@@ -473,14 +456,15 @@ class _DetailPanelState extends State<DetailPanel>
     final state = widget.store.actorStates.value.actors[a.id];
     final retired = a.isRetired;
     final runState = state?.runState ?? RunState.unknown;
-    
+
     String text;
     Color color;
 
     if (retired) {
       text = 'RETIRED';
       color = MeshColors.statusRetired;
-    } else if (runState == RunState.running || runState == RunState.windingDown) {
+    } else if (runState == RunState.running ||
+        runState == RunState.windingDown) {
       text = 'RUNNING';
       color = MeshColors.statusActive;
     } else if (runState == RunState.queued) {
@@ -682,7 +666,11 @@ class _InfoViewState extends State<_InfoView> {
       children: [
         TextSpan(
           text: '$label: ',
-          style: const TextStyle(color: MeshColors.textMuted, fontSize: 13, fontWeight: FontWeight.w600),
+          style: const TextStyle(
+            color: MeshColors.textMuted,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
         ),
         TextSpan(
           text: value,
@@ -806,7 +794,10 @@ class _InfoViewState extends State<_InfoView> {
               if (actor.waitingOn != null)
                 _meta('Waiting on', actor.waitingOn!),
               if (actor.ownerExpectsRetirement != null)
-                _meta('Retire expected', actor.ownerExpectsRetirement!.toString()),
+                _meta(
+                  'Retire expected',
+                  actor.ownerExpectsRetirement!.toString(),
+                ),
             ],
           ),
           _VoicePicker(actor: actor, store: widget.store),
