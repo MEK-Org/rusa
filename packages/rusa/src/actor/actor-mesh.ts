@@ -3179,6 +3179,8 @@ export class ActorMesh {
    * apexes) that re-ready whenever their last live child clears. Issue/PR-ref'd
    * heads, non-GitHub refs, and ref-free leaves are not standing and keep every
    * strict exit.
+   * The ref-free parentless classification is convention-backed, not
+   * schema-backed: the model has no persistent apex discriminator.
    *
    * The evidence demanded of the run is the same attribution
    * {@link strictHandoffShortfall} already makes: the checkpoint on the row was
