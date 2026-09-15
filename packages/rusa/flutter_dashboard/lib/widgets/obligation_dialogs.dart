@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models.dart';
+import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'obligation_status.dart';
@@ -16,7 +17,14 @@ Future<void> showCreateObligationDialog(
   final formKey = GlobalKey<FormState>();
   final titleCtrl = TextEditingController();
   final intentCtrl = TextEditingController();
-  final ownerIdCtrl = TextEditingController(text: (defaultOwnerId == 'human:operator' ? 'human operator' : defaultOwnerId) ?? '');
+  final viewerPrincipalId = store.dashboardConfig.value?.userPrincipalId;
+  // Either of the person's ids shows as the readable handle; the id the field
+  // resolves to on submit is the durable one whenever the server knows it.
+  final ownerIdCtrl = TextEditingController(
+    text: isViewerPrincipal(defaultOwnerId, viewerPrincipalId)
+        ? kOperatorDisplayHandle
+        : defaultOwnerId ?? '',
+  );
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
   final externalRefCtrl = TextEditingController();
   final priorityCtrl = TextEditingController();
@@ -196,8 +204,8 @@ Future<void> showCreateObligationDialog(
 
                         final typedText = ownerIdCtrl.text.trim();
                         String resolvedId;
-                        if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
-                          resolvedId = 'human:operator';
+                        if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                          resolvedId = viewerOwnerId(viewerPrincipalId);
                         } else {
                           final matches = store.actorStates.value.actors.values
                               .where((a) => a.handle == typedText || a.id == typedText)
@@ -403,6 +411,7 @@ Future<void> showReassignObligationDialog(
   VoidCallback? onReassigned,
 }) async {
   final formKey = GlobalKey<FormState>();
+  final viewerPrincipalId = store.dashboardConfig.value?.userPrincipalId;
   final ownerIdCtrl = TextEditingController(text: '');
   var isSubmitting = false;
 
@@ -457,8 +466,8 @@ Future<void> showReassignObligationDialog(
                     try {
                       final typedText = ownerIdCtrl.text.trim();
                       String resolvedId;
-                      if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
-                        resolvedId = 'human:operator';
+                      if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                        resolvedId = viewerOwnerId(viewerPrincipalId);
                       } else {
                         final matches = store.actorStates.value.actors.values
                             .where((a) => a.handle == typedText || a.id == typedText)

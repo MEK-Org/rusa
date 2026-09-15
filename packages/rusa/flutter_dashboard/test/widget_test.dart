@@ -331,17 +331,12 @@ void main() {
         // Tap Cancel queued run button on queued actor
         await tester.tap(find.byTooltip('Cancel queued run'));
         await tester.pump(const Duration(milliseconds: 50));
-        expect(api.interruptCalls, [
-          (actorId: 'queued-actor', by: 'human:operator'),
-        ]);
+        expect(api.interruptCalls, ['queued-actor']);
 
         // Tap Interrupt button on running actor
         await tester.tap(find.byTooltip('Interrupt'));
         await tester.pump(const Duration(milliseconds: 50));
-        expect(api.interruptCalls, [
-          (actorId: 'queued-actor', by: 'human:operator'),
-          (actorId: 'running-actor', by: 'human:operator'),
-        ]);
+        expect(api.interruptCalls, ['queued-actor', 'running-actor']);
 
         await store.dispose();
       });

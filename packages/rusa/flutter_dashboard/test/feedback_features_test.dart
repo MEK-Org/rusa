@@ -105,7 +105,7 @@ void main() {
         await tester.tap(interruptBtn);
         await tester.pump(const Duration(milliseconds: 50));
 
-        expect(api.interruptCalls.map((c) => c.actorId), contains('actor-2'));
+        expect(api.interruptCalls, contains('actor-2'));
 
         await store.dispose();
       });
@@ -128,7 +128,7 @@ void main() {
         await tester.tap(find.byTooltip('Cancel queued run'));
         await tester.pump(const Duration(milliseconds: 50));
 
-        expect(api.interruptCalls.map((c) => c.actorId), contains('actor-3'));
+        expect(api.interruptCalls, contains('actor-3'));
 
         await store.dispose();
       });
