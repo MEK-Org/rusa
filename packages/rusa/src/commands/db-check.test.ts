@@ -323,6 +323,34 @@ describe("db-check", () => {
     expect(existsSync(join(home, "host-jobs.json"))).toBe(false);
   });
 
+  it("plans a legacy GitHub poll state file without writing or archiving it", () => {
+    const pollState = JSON.stringify({
+      repos: {
+        "example-org/service-repo": {
+          issuesWatermark: "2026-07-03T00:10:00Z",
+          commentsWatermark: "2026-07-03T00:05:00Z",
+          seen: ["issues:1:2026-07-03T00:10:00Z", "issue_comment:20:2026-07-03T00:05:00Z"],
+          branchHeads: { master: "sha-before" },
+        },
+      },
+    });
+    writeFileSync(join(home, "github-poller-state.json"), pollState);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedGitHubPollRepos).toBe(1);
+    expect(readFileSync(join(home, "github-poller-state.json"), "utf8")).toBe(pollState);
+    expect(countRows("github_poll_repos")).toBe(0);
+    expectNothingArchived(["github-poller-state.json"]);
+  });
+
+  it("reports no planned GitHub poll repos on a fresh home and creates no state file", () => {
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedGitHubPollRepos).toBe(0);
+    expect(existsSync(join(home, "github-poller-state.json"))).toBe(false);
+  });
+
   it("exits non-zero when the legacy host-job file holds unresolved rows", () => {
     writeFileSync(
       join(home, "host-jobs.json"),
@@ -627,7 +655,7 @@ describe("db-check", () => {
     expect(consoleLog).toHaveBeenCalledWith(
       expect.stringContaining(
         "Legacy import plan: 0 actor(s), 0 scheduled message(s), 0 capability grant(s), " +
-          "0 event source ownership(s), 0 host job(s)"
+          "0 event source ownership(s), 0 host job(s), 0 GitHub poll repo(s)"
       )
     );
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");

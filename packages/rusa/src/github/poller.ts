@@ -1,11 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import type { GitHubOrgConfig } from "../config/types.js";
 import type {
   GitHubPollingIssueClient,
   PollIssueComment,
   PollIssueOrPullRequest,
 } from "../gitops/issue-client.js";
+import { GITHUB_POLL_EPOCH, type GitHubPollStateStore } from "./poll-state-store.js";
 
 type EmitGitHubEvent = (
   event: string,
@@ -24,34 +23,16 @@ export interface GitHubPollerOptions {
    * promise a number the config layer never had to supply .
    */
   intervalSeconds?: number;
-  home: string;
   issueClient: GitHubPollingIssueClient;
   onEvent: EmitGitHubEvent;
-  statePath?: string;
-}
-
-interface RepoPollState {
-  issuesWatermark?: string;
-  commentsWatermark?: string;
-  /** @deprecated kept only to migrate pre-stream-cursor state files. */
-  watermark?: string;
-  seen: string[];
-  branchHeads?: Record<string, string>;
   /**
-   * Open PRs last polled as drafts. The issues list reports state, not
-   * transitions, so this is what lets a later non-draft record surface as
-   * `ready_for_review` instead of a plain `edited` (which never climbs to the
-   * repo owner). Entries leave when the PR is ready or closed.
+   * Durable cursors, seen keys and branch heads in `mesh.db`. The poller
+   * writes through to it after every delivery rather than snapshotting at the
+   * end of a cycle; see {@link GitHubPollStateStore} for the ordering rule
+   * that makes a mid-cycle crash re-emit rather than skip.
    */
-  draftPullRequests?: number[];
+  state: GitHubPollStateStore;
 }
-
-interface PollerState {
-  repos: Record<string, RepoPollState>;
-}
-
-const DEFAULT_WATERMARK = "1970-01-01T00:00:00.000Z";
-const MAX_SEEN_PER_REPO = 1000;
 
 /**
  * Applied when the caller supplies no interval. The invariant "the poller always
@@ -64,13 +45,13 @@ const MAX_SEEN_PER_REPO = 1000;
 export const DEFAULT_POLL_INTERVAL_SECONDS = 300;
 
 export class GitHubEventPoller {
-  private readonly statePath: string;
+  private readonly state: GitHubPollStateStore;
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
   private closed = false;
 
   constructor(private readonly options: GitHubPollerOptions) {
-    this.statePath = options.statePath ?? join(options.home, "github-poller-state.json");
+    this.state = options.state;
   }
 
   start(): void {
@@ -93,16 +74,14 @@ export class GitHubEventPoller {
     if (this.closed || this.polling) return;
     this.polling = true;
     try {
-      const state = this.loadState();
       const repos = await this.resolveConfiguredRepos();
       const explicitRepos = new Set(this.options.repos.map((repo) => repo.toLowerCase()));
       for (const repo of repos) {
-        await this.pollRepo(repo, state);
+        await this.pollRepo(repo);
         if (explicitRepos.has(repo.toLowerCase())) {
-          await this.pollDeployBranch(repo, state);
+          await this.pollDeployBranch(repo);
         }
       }
-      this.saveState(state);
     } finally {
       this.polling = false;
     }
@@ -131,16 +110,16 @@ export class GitHubEventPoller {
     return [...repos.values()];
   }
 
-  private async pollDeployBranch(repo: string, state: PollerState): Promise<void> {
+  private async pollDeployBranch(repo: string): Promise<void> {
     const branch = this.options.deployBranch ?? "master";
     const head = await this.options.issueClient.getPollBranchHead(repo, branch);
     if (!head) return;
 
-    const repoState = state.repos[repo] ?? { seen: [] };
-    state.repos[repo] = repoState;
-    const previous = repoState.branchHeads?.[branch];
-    repoState.branchHeads = { ...repoState.branchHeads, [branch]: head.sha };
-    if (previous === undefined || previous === head.sha) return;
+    const previous = this.state.getBranchHead(repo, branch);
+    if (previous === undefined || previous === head.sha) {
+      this.state.recordBranchHead(repo, branch, head.sha);
+      return;
+    }
 
     // Deliberately omit `ref`: a webhook push with a ref is an exact
     // github_branch resource and cannot bubble. Polling is enabled only for
@@ -157,20 +136,16 @@ export class GitHubEventPoller {
       },
       eventDeliveryId(repo, `push:${branch}:${head.sha}`)
     );
+    // Persisted only once the push has been delivered, so a crash in between
+    // re-emits it next cycle under the same delivery id.
+    this.state.recordBranchHead(repo, branch, head.sha);
   }
 
-  private async pollRepo(repo: string, state: PollerState): Promise<void> {
-    if (!state.repos[repo]) {
-      state.repos[repo] = { watermark: DEFAULT_WATERMARK, seen: [] };
-    }
-    const repoState = state.repos[repo];
-    const seen = new Set(repoState.seen);
-    const issuesWatermark = repoState.issuesWatermark ?? repoState.watermark ?? DEFAULT_WATERMARK;
-    const commentsWatermark =
-      repoState.commentsWatermark ?? repoState.watermark ?? DEFAULT_WATERMARK;
-    let nextIssuesWatermark = issuesWatermark;
-    let nextCommentsWatermark = commentsWatermark;
-    const draftPullRequests = new Set(repoState.draftPullRequests ?? []);
+  private async pollRepo(repo: string): Promise<void> {
+    const { issuesWatermark, commentsWatermark } = this.state.getCursors(repo) ?? {
+      issuesWatermark: GITHUB_POLL_EPOCH,
+      commentsWatermark: GITHUB_POLL_EPOCH,
+    };
 
     const issueRecords = await this.options.issueClient.listUpdatedIssuesAndPullRequests(
       repo,
@@ -214,59 +189,32 @@ export class GitHubEventPoller {
           key: `pull_request:${pullRequest.number}:${pullRequest.updatedAt}`,
           updatedAt: pullRequest.updatedAt,
           stream: "issues" as const,
-          emit: async () => {
-            await this.options.onEvent(
+          emit: () =>
+            this.options.onEvent(
               "pull_request",
-              pullRequestPayload(repo, pullRequest, draftPullRequests.has(pullRequest.number)),
+              pullRequestPayload(repo, pullRequest),
               eventDeliveryId(repo, `pull_request:${pullRequest.number}:${pullRequest.updatedAt}`)
-            );
-            if (pullRequest.draft && pullRequest.state === "open") {
-              draftPullRequests.add(pullRequest.number);
-            } else {
-              draftPullRequests.delete(pullRequest.number);
-            }
-          },
+            ),
         })),
     ].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 
+    // Events are in ascending updatedAt order across both streams, so once an
+    // event is delivered its stream cursor can move to its timestamp: anything
+    // still undelivered in this batch is at or after it and a re-fetch from
+    // there returns it again. The seen key and the cursor commit together, and
+    // only after delivery resolved — a crash before that point re-emits the
+    // event next cycle under the same delivery id, which the durable inbox
+    // already dedups; a cursor committed before delivery would skip it.
     for (const event of events) {
-      if (seen.has(event.key)) continue;
+      if (this.state.hasSeen(repo, event.key)) continue;
       await event.emit();
-      seen.add(event.key);
-      if (event.stream === "issues" && event.updatedAt > nextIssuesWatermark) {
-        nextIssuesWatermark = event.updatedAt;
-      } else if (event.stream === "comments" && event.updatedAt > nextCommentsWatermark) {
-        nextCommentsWatermark = event.updatedAt;
-      }
+      this.state.recordEmitted(repo, {
+        key: event.key,
+        stream: event.stream,
+        updatedAt: event.updatedAt,
+      });
     }
-
-    repoState.issuesWatermark = nextIssuesWatermark;
-    repoState.commentsWatermark = nextCommentsWatermark;
-    delete repoState.watermark;
-    repoState.seen = Array.from(seen).slice(-MAX_SEEN_PER_REPO);
-    if (draftPullRequests.size > 0) {
-      repoState.draftPullRequests = [...draftPullRequests];
-    } else {
-      delete repoState.draftPullRequests;
-    }
-  }
-
-  private loadState(): PollerState {
-    if (!existsSync(this.statePath)) return { repos: {} };
-    try {
-      const parsed = JSON.parse(readFileSync(this.statePath, "utf-8")) as PollerState;
-      return { repos: parsed.repos ?? {} };
-    } catch (err) {
-      console.warn(
-        `[github-poller] failed to read state; starting fresh: ${err instanceof Error ? err.message : String(err)}`
-      );
-      return { repos: {} };
-    }
-  }
-
-  private saveState(state: PollerState): void {
-    mkdirSync(dirname(this.statePath), { recursive: true });
-    writeFileSync(this.statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+    this.state.pruneSeen(repo);
   }
 
   private logPollError(err: unknown): void {
@@ -330,11 +278,10 @@ function issueCommentPayload(
 
 function pullRequestPayload(
   repo: string,
-  pullRequest: PollIssueOrPullRequest,
-  wasDraft: boolean
+  pullRequest: PollIssueOrPullRequest
 ): Record<string, unknown> {
   return {
-    action: pullRequestAction(pullRequest, wasDraft),
+    action: pullRequest.createdAt === pullRequest.updatedAt ? "opened" : "edited",
     repository: repositoryPayload(repo),
     pull_request: {
       number: pullRequest.number,
@@ -344,22 +291,9 @@ function pullRequestPayload(
       state: pullRequest.state,
       created_at: pullRequest.createdAt,
       updated_at: pullRequest.updatedAt,
-      draft: pullRequest.draft,
     },
     sender: sender(pullRequest.author),
   };
-}
-
-/**
- * Polling sees states, webhooks see transitions. `opened` and `edited` come
- * from timestamps as before; `ready_for_review` is the one transition worth
- * reconstructing, because a draft opening is held at the PR and the owner
- * would otherwise never hear about it (issue #307).
- */
-function pullRequestAction(pullRequest: PollIssueOrPullRequest, wasDraft: boolean): string {
-  if (pullRequest.createdAt === pullRequest.updatedAt) return "opened";
-  if (wasDraft && !pullRequest.draft && pullRequest.state === "open") return "ready_for_review";
-  return "edited";
 }
 
 function webhookIssue(issue: PollIssueOrPullRequest): Record<string, unknown> {

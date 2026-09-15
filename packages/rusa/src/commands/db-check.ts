@@ -6,6 +6,7 @@ import { resolveHome } from "../config/index.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyCapabilityGrantImport } from "../db/legacy-capability-grant-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
+import { planLegacyGitHubPollStateImport } from "../db/legacy-github-poll-state-import.js";
 import { planLegacyHostJobImport } from "../db/legacy-host-job-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
 import { Repositories } from "../db/repositories/index.js";
@@ -18,6 +19,7 @@ export interface DbCheckResult {
   plannedCapabilityGrants: number;
   plannedEventSourceOwnerships: number;
   plannedHostJobs: number;
+  plannedGitHubPollRepos: number;
 }
 
 /**
@@ -132,6 +134,10 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       pendingActorIds: pendingActors.map((actor) => actor.id),
     });
 
+    // Poll state names repositories, not actors, so it has no pending-actor
+    // dependency; it is planned last only to keep the order boot applies.
+    const githubPollPlan = planLegacyGitHubPollStateImport({ mcHome: home, repositories });
+
     return {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
@@ -139,6 +145,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       plannedCapabilityGrants: grantPlan.plan.kind === "import" ? grantPlan.plan.grants.length : 0,
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
+      plannedGitHubPollRepos: githubPollPlan.plannedRepos,
     };
   } finally {
     db.close();
@@ -159,7 +166,8 @@ export function runDbCheck(opts: { home: string }): void {
         `${result.plannedScheduledMessages} scheduled message(s), ` +
         `${result.plannedCapabilityGrants} capability grant(s), ` +
         `${result.plannedEventSourceOwnerships} event source ownership(s), ` +
-        `${result.plannedHostJobs} host job(s)`
+        `${result.plannedHostJobs} host job(s), ` +
+        `${result.plannedGitHubPollRepos} GitHub poll repo(s)`
     );
     console.log("✓ db-check passed");
   } catch (err) {

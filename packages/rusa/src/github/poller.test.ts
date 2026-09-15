@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { DbGitHubPollStateStore } from "../db/repositories/github-poll-state-repository.js";
+import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import type {
   GitHubPollingIssueClient,
   IssueClient,
@@ -9,6 +10,7 @@ import type {
   PollIssueOrPullRequest,
 } from "../gitops/issue-client.js";
 import { GitBridgeIssueClient } from "../gitops/issue-client.js";
+import { EventManager, type EventRoutingKernel } from "../runtime/event-manager.js";
 import { parseDirectedDeliveryDirective } from "../webhook/directed-delivery.js";
 import { deriveGitHubInboxNotification } from "./inbox-notification.js";
 import { GitHubEventPoller } from "./poller.js";
@@ -54,15 +56,24 @@ class MockPollIssueClient implements Partial<GitHubPollingIssueClient> {
 }
 
 describe("GitHubEventPoller", () => {
-  let home = "";
+  // One migrated mesh.db per test. A "restart" below is a fresh poller over the
+  // same database, which is exactly what a process restart is to this state.
+  let db: Database.Database;
+  let state: DbGitHubPollStateStore;
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    state = new DbGitHubPollStateStore(db);
+  });
 
   afterEach(() => {
     vi.useRealTimers();
-    if (home) rmSync(home, { recursive: true, force: true });
+    db.close();
   });
 
   it("polls explicit repositories plus organization repositories and suppresses exclusions", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.orgRepos.set("dummy-org", [
       "dummy-org/included",
@@ -73,7 +84,7 @@ describe("GitHubEventPoller", () => {
     await new GitHubEventPoller({
       repos: ["dummy-org/duplicate", "other-org/explicit"],
       orgs: [{ org: "dummy-org", excludedRepos: ["dummy-org/excluded"] }],
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async () => undefined,
     }).pollOnce();
@@ -86,7 +97,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("emits a repo-scoped push when an explicit repository deploy branch advances", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     const branchKey = "example-org/service-repo@master";
     client.branchHeads.set(branchKey, "sha-before");
@@ -98,7 +108,7 @@ describe("GitHubEventPoller", () => {
     const poller = new GitHubEventPoller({
       repos: ["example-org/service-repo"],
       deployBranch: "master",
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async (event, payload, deliveryId) => {
         events.push({ event, payload, deliveryId });
@@ -131,7 +141,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("maps a polled mesh:deliver issue comment to webhook-shaped payload", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.comments = [
       {
@@ -159,7 +168,7 @@ describe("GitHubEventPoller", () => {
     await new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       intervalSeconds: 300,
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async (event, payload) => {
         events.push([event, payload]);
@@ -186,7 +195,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("maps PR comments with issue.pull_request so routing treats them as PR resources", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.comments = [
       {
@@ -214,7 +222,7 @@ describe("GitHubEventPoller", () => {
     await new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       intervalSeconds: 300,
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async (event, payload) => {
         events.push([event, payload]);
@@ -228,7 +236,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("maps PR-backed issue records to pull_request events", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.issues = [
       {
@@ -259,7 +266,7 @@ describe("GitHubEventPoller", () => {
     await new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       intervalSeconds: 300,
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async (event, payload) => {
         events.push([event, payload]);
@@ -344,7 +351,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("persists watermark and dedupes across restarts", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.issues = [
       {
@@ -364,7 +370,7 @@ describe("GitHubEventPoller", () => {
       new GitHubEventPoller({
         repos: ["dummy-org/dummy-repo"],
         intervalSeconds: 300,
-        home,
+        state,
         issueClient: client as GitHubPollingIssueClient,
         onEvent: async (event, payload) => {
           events.push([event, payload]);
@@ -383,13 +389,13 @@ describe("GitHubEventPoller", () => {
       "1970-01-01T00:00:00.000Z",
       "1970-01-01T00:00:00.000Z",
     ]);
-    expect(readFileSync(join(home, "github-poller-state.json"), "utf-8")).toContain(
-      '"issuesWatermark": "2026-07-03T00:01:00.000Z"'
-    );
+    expect(state.getCursors("dummy-org/dummy-repo")).toEqual({
+      issuesWatermark: "2026-07-03T00:01:00.000Z",
+      commentsWatermark: "1970-01-01T00:00:00.000Z",
+    });
   });
 
   it("tracks issue/PR and comment watermarks independently", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     client.issues = [
       {
@@ -420,7 +426,7 @@ describe("GitHubEventPoller", () => {
       new GitHubEventPoller({
         repos: ["dummy-org/dummy-repo"],
         intervalSeconds: 300,
-        home,
+        state,
         issueClient: client as GitHubPollingIssueClient,
         onEvent: async (event, payload) => {
           events.push([event, payload]);
@@ -443,12 +449,11 @@ describe("GitHubEventPoller", () => {
 
   it("polls on the configured interval", async () => {
     vi.useFakeTimers();
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     const poller = new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       intervalSeconds: 12,
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async () => {},
     });
@@ -465,14 +470,13 @@ describe("GitHubEventPoller", () => {
 
   it("falls back to a 300s interval when none is supplied, instead of a hot loop ", async () => {
     vi.useFakeTimers();
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     const poller = new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       // intervalSeconds deliberately absent — this is the config.yaml-omits-the-key
       // case. Before the fix it multiplied out to NaN, which setInterval coerces
       // to 0, so the assertions below would see hundreds of polls rather than one.
-      home,
+      state,
       issueClient: client as GitHubPollingIssueClient,
       onEvent: async () => {},
     });
@@ -488,8 +492,6 @@ describe("GitHubEventPoller", () => {
   });
 
   it("forwards poll methods through a GitBridgeIssueClient delegate ", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
-
     const delegate = new RecordingBridgeDelegate();
     delegate.comments = [
       {
@@ -519,7 +521,7 @@ describe("GitHubEventPoller", () => {
     await new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
       intervalSeconds: 300,
-      home,
+      state,
       issueClient: bridgeClient,
       onEvent: async (event, payload) => {
         events.push([event, payload]);
@@ -542,6 +544,139 @@ describe("GitHubEventPoller", () => {
     ]);
     expect(events).toHaveLength(1);
     expect(events[0][0]).toBe("issue_comment");
+  });
+
+  it("re-emits an event whose delivery crashed before its position was written", async () => {
+    // The write ordering under test: deliver, then record. A crash in between
+    // must re-emit under the same delivery id next cycle rather than skip the
+    // event, so the durable inbox — not the poller — is what makes it once-only.
+    const client = new MockPollIssueClient();
+    client.issues = [
+      {
+        number: 1,
+        title: "One",
+        body: "body",
+        author: "author",
+        state: "open",
+        createdAt: "2026-07-03T00:00:00.000Z",
+        updatedAt: "2026-07-03T00:01:00.000Z",
+        isPullRequest: false,
+      },
+    ];
+    const deliveries: Array<string | undefined> = [];
+    let crashNext = true;
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: ["dummy-org/dummy-repo"],
+        intervalSeconds: 300,
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (_event, _payload, deliveryId) => {
+          deliveries.push(deliveryId);
+          if (crashNext) {
+            crashNext = false;
+            throw new Error("delivery crashed after the event left the poller");
+          }
+        },
+      });
+
+    await expect(makePoller().pollOnce()).rejects.toThrow(/delivery crashed/);
+    // Nothing was recorded, so the next cycle still asks from the old position.
+    expect(state.getCursors("dummy-org/dummy-repo")).toBeUndefined();
+
+    await makePoller().pollOnce();
+    await makePoller().pollOnce();
+
+    expect(deliveries).toEqual([
+      "poll:dummy-org/dummy-repo:issues:1:2026-07-03T00:01:00.000Z",
+      "poll:dummy-org/dummy-repo:issues:1:2026-07-03T00:01:00.000Z",
+    ]);
+    expect(state.getCursors("dummy-org/dummy-repo")?.issuesWatermark).toBe(
+      "2026-07-03T00:01:00.000Z"
+    );
+  });
+
+  it("keeps a re-emitted delivery to a single durable inbox row", async () => {
+    // End to end over one mesh.db: the poller's re-emission after a crash and
+    // the inbox's idempotency key are the two halves of "no duplicate
+    // deliveries", so they are exercised together rather than each in isolation.
+    const client = new MockPollIssueClient();
+    client.issues = [
+      {
+        number: 1,
+        title: "One",
+        body: "body",
+        author: "author",
+        state: "open",
+        createdAt: "2026-07-03T00:00:00.000Z",
+        updatedAt: "2026-07-03T00:01:00.000Z",
+        isPullRequest: false,
+      },
+    ];
+    const inbox = new InboxRepository(db);
+    const resolver: EventRoutingKernel = {
+      resolveOwner: () => {
+        throw new Error("poller ingress must not resolve ownership");
+      },
+      resolveRecipients: () => ({ directed: false, ownerIds: ["actor-gh"], subscriberIds: [] }),
+    };
+    const eventManager = new EventManager({ inboxStore: inbox, resolver });
+    let crashNext = true;
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: ["dummy-org/dummy-repo"],
+        intervalSeconds: 300,
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (event, payload, deliveryId) => {
+          eventManager.handleExternalEvent({
+            sourceType: "github",
+            rawPayload: { event, payload },
+            idempotencyKey: `github:${deliveryId}`,
+          });
+          if (crashNext) {
+            crashNext = false;
+            throw new Error("crashed after the inbox row was appended");
+          }
+        },
+      });
+
+    await expect(makePoller().pollOnce()).rejects.toThrow(/crashed after/);
+    await makePoller().pollOnce();
+
+    expect(inbox.list("actor-gh").entries).toHaveLength(1);
+  });
+
+  it("delivers a deploy-branch push exactly once across a restart, from the durable head", async () => {
+    // Deleting the retired state file used to lose the previous head, and a
+    // head learned for the first time never emits — so the push that landed
+    // during the gap was dropped, not replayed. The head is durable now: a
+    // restart mid-gap still reports `before` as the last head this mesh saw.
+    const client = new MockPollIssueClient();
+    const branchKey = "example-org/service-repo@master";
+    client.branchHeads.set(branchKey, "sha-before");
+    const events: Array<{ payload: Record<string, unknown>; deliveryId?: string }> = [];
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: ["example-org/service-repo"],
+        deployBranch: "master",
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (_event, payload, deliveryId) => {
+          events.push({ payload, deliveryId });
+        },
+      });
+
+    await makePoller().pollOnce();
+    expect(state.getBranchHead("example-org/service-repo", "master")).toBe("sha-before");
+
+    client.branchHeads.set(branchKey, "sha-after");
+    await makePoller().pollOnce();
+    await makePoller().pollOnce();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].payload).toMatchObject({ before: "sha-before", after: "sha-after" });
+    expect(events[0].deliveryId).toBe("poll:example-org/service-repo:push:master:sha-after");
   });
 });
 

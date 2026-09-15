@@ -42,6 +42,7 @@ import { obligationCheckpoint } from "./0043_obligation_checkpoint.js";
 import { actorVoiceConfig } from "./0044_actor_voice_config.js";
 import { obligationHistory } from "./0045_obligation_history.js";
 import { actorExperiments } from "./0047_actor_experiments.js";
+import { githubPollState } from "./0048_github_poll_state.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -96,4 +97,5 @@ export const migrations: Migration[] = [
   actorVoiceConfig,
   obligationHistory,
   actorExperiments,
+  githubPollState,
 ];

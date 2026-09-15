@@ -128,6 +128,7 @@ import {
 } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
+import { importLegacyGitHubPollState } from "../db/legacy-github-poll-state-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import type {
   PrerequisiteAttention,
@@ -1507,6 +1508,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
   }
   const hostJobStore = getRepositories().hostJobs;
+  // GitHub poll cursors (#472): the poller's per-repo watermarks, seen keys
+  // and deploy-branch heads are durable in SQLite; `github-poller-state.json`
+  // is only a legacy source, imported once and then archived. Imported here
+  // regardless of ingestion mode so a file left behind by an earlier poll
+  // deployment is resolved before it can go stale.
+  const legacyGitHubPollImport = importLegacyGitHubPollState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyGitHubPollImport.importedRepos > 0) {
+    log.info("legacy_github_poll_state_imported", { repos: legacyGitHubPollImport.importedRepos });
+  } else if (legacyGitHubPollImport.backupFiles.length > 0) {
+    // Same stale-file rule as the host-job import above: a file present after
+    // the receipt committed is archived unread, and saying so is what stops an
+    // operator concluding a restored cursor file took effect.
+    log.warn("legacy_github_poll_state_archived_unread", {
+      backups: legacyGitHubPollImport.backupFiles,
+    });
+  }
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
@@ -3323,9 +3344,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           orgs: config.github.orgs ?? [],
           deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
           intervalSeconds: config.github.pollIntervalSeconds,
-          home: mcHome,
           issueClient,
           onEvent,
+          state: getRepositories().githubPollState,
         })
       : null;
   // Walkie-talkie mode, server half : gated on geminiApiKey (transcription
