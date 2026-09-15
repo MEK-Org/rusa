@@ -403,35 +403,64 @@ class _DetailPanelState extends State<DetailPanel>
     ),
   );
 
-  /// The desktop detail header's inline run-state actions — the same
-  /// [actorHeaderActions] list the phone app bar renders as an overflow menu,
-  /// so the two surfaces always offer the same actions for the same state.
   List<Widget> _quickActions(ThreadDto a) {
     final dot = widget.store.dotFor(a);
-    return [
-      for (final action in actorHeaderActions(
-        store: widget.store,
-        actor: a,
-      )) ...[
+    final isRunning = dot == DotState.active;
+    final isQueued = dot == DotState.queued;
+    final isIdle = dot == DotState.idle;
+
+    if (isQueued) {
+      return [
         IconButton(
-          icon: Icon(action.icon, size: 20),
-          color: action.icon == Icons.stop_rounded
-              ? MeshColors.statusHalted
-              : dot == DotState.idle
-              ? MeshColors.textSecondary
-              : MeshColors.accent,
-          hoverColor: action.icon == Icons.stop_rounded
-              ? MeshColors.statusHalted.withValues(alpha: 0.15)
-              : MeshColors.accent.withValues(alpha: 0.15),
+          icon: const Icon(Icons.fast_forward_rounded, size: 20),
+          color: MeshColors.accent,
+          hoverColor: MeshColors.accent.withValues(alpha: 0.15),
           splashRadius: 16,
-          tooltip: action.label,
+          tooltip: 'Run now',
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: action.invoke,
+          onPressed: () => widget.store.runNowActor(a.id),
         ),
         const SizedBox(width: 2),
-      ],
-    ];
+        IconButton(
+          icon: const Icon(Icons.stop_rounded, size: 20),
+          color: MeshColors.statusHalted,
+          hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+          splashRadius: 16,
+          tooltip: 'Cancel queued run',
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+          onPressed: () => widget.store.interruptActor(a.id),
+        ),
+      ];
+    } else if (isRunning) {
+      return [
+        IconButton(
+          icon: const Icon(Icons.stop_rounded, size: 20),
+          color: MeshColors.statusHalted,
+          hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+          splashRadius: 16,
+          tooltip: 'Interrupt',
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+          onPressed: () => widget.store.interruptActor(a.id),
+        ),
+      ];
+    } else if (isIdle) {
+      return [
+        IconButton(
+          icon: const Icon(Icons.fast_forward_rounded, size: 20),
+          color: MeshColors.textSecondary,
+          hoverColor: MeshColors.accent.withValues(alpha: 0.15),
+          splashRadius: 16,
+          tooltip: 'Run now',
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+          onPressed: () => widget.store.runNowActor(a.id),
+        ),
+      ];
+    }
+    return const [];
   }
 
   Widget _meta(String label, String value) => RichText(

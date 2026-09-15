@@ -168,6 +168,41 @@ void main() {
       });
     });
 
+    testWidgets(
+      'a very long actor handle bounds and ellipsizes without overflowing the header row',
+      (tester) async {
+        await tester.runAsync(() async {
+          const longId =
+              'worker-b4f33453-a67e-424f-90e7-a3edbe63f4f6-long-actor-name';
+          final api = FakeApi()
+            ..threadsResult = [
+              makeThread(longId, created: 't0', runState: RunState.idle),
+            ];
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+
+          await _pump(tester, store, size: const Size(390, 844));
+          await _goToActors(tester);
+          store.clickActor(longId);
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          expect(tester.takeException(), isNull);
+
+          final handleFinder = find.descendant(
+            of: find.byType(MeshHeader),
+            matching: find.text('$longId-handle'),
+          );
+          expect(handleFinder, findsOneWidget);
+          final textWidget = tester.widget<Text>(handleFinder);
+          expect(textWidget.overflow, TextOverflow.ellipsis);
+          expect(textWidget.maxLines, 1);
+
+          await store.dispose();
+        });
+      },
+    );
+
     testWidgets('run-state actions live in an accessible overflow menu', (
       tester,
     ) async {

@@ -230,15 +230,23 @@ class MeshHeader extends StatelessWidget {
                               // open actor — takes the wordmark's slot. The
                               // desktop shape keeps the brand untouched.
                               if (detail != null)
-                                _DetailIdentity(actor: detail, store: store)
+                                Flexible(
+                                  child: _DetailIdentity(
+                                    actor: detail,
+                                    store: store,
+                                  ),
+                                )
                               else if (drawerNav && pageTitle != null)
-                                Text(
-                                  pageTitle!,
-                                  maxLines: 1,
-                                  style: const TextStyle(
-                                    color: MeshColors.textPrimary,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 16,
+                                Flexible(
+                                  child: Text(
+                                    pageTitle!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: MeshColors.textPrimary,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 16,
+                                    ),
                                   ),
                                 )
                               else
@@ -503,25 +511,18 @@ class _ActorActionMenu extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<String>(
+    return PopupMenuButton<ActorHeaderAction>(
       tooltip: 'Actor actions',
       position: PopupMenuPosition.under,
       style: IconButton.styleFrom(
         foregroundColor: MeshColors.textSecondary,
         iconSize: 22,
       ),
-      onSelected: (label) {
-        for (final action in actions) {
-          if (action.label == label) {
-            action.invoke();
-            break;
-          }
-        }
-      },
+      onSelected: (action) => action.invoke(),
       itemBuilder: (_) => [
         for (final action in actions)
-          PopupMenuItem<String>(
-            value: action.label,
+          PopupMenuItem<ActorHeaderAction>(
+            value: action,
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [

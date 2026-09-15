@@ -252,7 +252,7 @@ String _pageTitleFor(DashboardView view) {
   for (final destination in kDashboardDestinations) {
     if (destination.isActive(view)) return destination.label;
   }
-  return kDashboardDestinations.first.label;
+  throw StateError('No dashboard destination configured for view: $view');
 }
 
 /// Where a load lands: the view the address named, if it named one, and
