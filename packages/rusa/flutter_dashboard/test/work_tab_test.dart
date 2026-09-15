@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
@@ -164,6 +166,147 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'keeps detail actions at the title start when the header wraps (#476)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(1600, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final ob = makeObligation(
+          'header-actions',
+          ownerId: 'root',
+          title: 'Actions beside the obligation title',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId(ob.id);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildMeshTheme(),
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        final title = find.byKey(const ValueKey('obligation-detail-title'));
+        final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final editableRender = tester.allRenderObjects
+            .whereType<RenderEditable>()
+            .where((render) => render.plainText == ob.heading)
+            .single;
+        final wideTitleRect = tester.getRect(title);
+        final wideActionsRect = tester.getRect(actions);
+
+        // The controls are adjacent to the title rather than at the far edge
+        // of the wide detail pane.
+        expect(wideActionsRect.left, closeTo(wideTitleRect.right + 8, 1));
+        expect(
+          editableRender
+              .getBoxesForSelection(
+                TextSelection(baseOffset: 0, extentOffset: ob.heading.length),
+              )
+              .map((box) => box.top)
+              .toSet(),
+          hasLength(1),
+          reason: 'short title unexpectedly wrapped',
+        );
+
+        await tester.binding.setSurfaceSize(const Size(400, 800));
+        await tester.pump();
+        await tester.pump();
+
+        final narrowTitleRect = tester.getRect(title);
+        final narrowActionsRect = tester.getRect(actions);
+
+        // A two-line title moves the controls to a start-aligned run. The
+        // controls themselves can wrap instead of overflowing the pane.
+        expect(narrowTitleRect.height, greaterThan(50));
+        expect(narrowActionsRect.top, greaterThan(narrowTitleRect.bottom));
+        expect(narrowActionsRect.left, closeTo(narrowTitleRect.left, 0.1));
+        expect(narrowActionsRect.right, lessThanOrEqualTo(400));
+        for (final tooltip in [
+          'Mark Done',
+          'Cancel Obligation',
+          'Reassign obligation',
+          'Add child obligation',
+        ]) {
+          final control = find.byTooltip(tooltip);
+          expect(control, findsOneWidget);
+          expect(tester.getRect(control).right, lessThanOrEqualTo(400));
+        }
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'keeps detail actions usable with large text on a narrow pane (#476)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(420, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final ob = makeObligation(
+          'large-text-header-actions',
+          ownerId: 'system:mesh',
+          title: 'Actions beside the obligation title',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId(ob.id);
+
+        await tester.pumpWidget(
+          MediaQuery(
+            data: MediaQueryData(textScaler: TextScaler.linear(2)),
+            child: MaterialApp(
+              home: Scaffold(
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        final title = find.byKey(const ValueKey('obligation-detail-title'));
+        final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final titleRect = tester.getRect(title);
+        final actionsRect = tester.getRect(actions);
+
+        expect(titleRect.height, greaterThan(70));
+        expect(actionsRect.top, greaterThan(titleRect.bottom));
+        expect(actionsRect.left, closeTo(titleRect.left, 0.1));
+        expect(actionsRect.right, lessThanOrEqualTo(420));
+        for (final tooltip in [
+          'Mark Done',
+          'Cancel Obligation',
+          'Reassign obligation',
+          'Add child obligation',
+        ]) {
+          final control = find.byTooltip(tooltip);
+          expect(control, findsOneWidget);
+          expect(tester.getRect(control).right, lessThanOrEqualTo(420));
+        }
+
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets(
     'excludes quiet terminal roots from the default load, fetches them on '

@@ -1506,49 +1506,56 @@ class _DetailViewState extends State<_DetailView> {
         ),
       ),
     ];
+    const titleStyle = TextStyle(
+      color: MeshColors.textPrimary,
+      fontSize: 22,
+      fontWeight: FontWeight.bold,
+    );
+    final status = ObligationStatusChip(
+      obligation: o,
+      store: store,
+      bordered: true,
+    );
     final titleAndStatus = Row(
       children: [
         Expanded(
           child: SelectableText(
             o.heading,
             maxLines: 2,
-            style: const TextStyle(
-              color: MeshColors.textPrimary,
-              fontSize: 22,
-              fontWeight: FontWeight.bold,
-            ),
+            style: titleStyle,
           ),
         ),
         const SizedBox(width: 10),
-        ObligationStatusChip(obligation: o, store: store, bordered: true),
+        status,
       ],
     );
-
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (o.isTerminal) return titleAndStatus;
-        final actionRow = Row(
-          mainAxisSize: MainAxisSize.min,
-          children: actions,
-        );
-        if (constraints.maxWidth < 560) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              titleAndStatus,
-              const SizedBox(height: 4),
-              Align(alignment: Alignment.centerRight, child: actionRow),
-            ],
-          );
-        }
-        return Row(
-          children: [
-            Expanded(child: titleAndStatus),
-            const SizedBox(width: 8),
-            actionRow,
-          ],
-        );
-      },
+    if (o.isTerminal) {
+      return titleAndStatus;
+    }
+    return Wrap(
+      alignment: WrapAlignment.start,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      runSpacing: 4,
+      spacing: 8,
+      children: [
+        IntrinsicWidth(
+          child: SelectableText(
+            o.heading,
+            key: const ValueKey('obligation-detail-title'),
+            maxLines: 2,
+            style: titleStyle,
+            textWidthBasis: TextWidthBasis.longestLine,
+          ),
+        ),
+        Wrap(
+          key: const ValueKey('obligation-detail-actions'),
+          alignment: WrapAlignment.start,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          runSpacing: 4,
+          spacing: 8,
+          children: [status, ...actions],
+        ),
+      ],
     );
   }
 }
