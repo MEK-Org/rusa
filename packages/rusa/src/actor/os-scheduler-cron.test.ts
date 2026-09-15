@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { createLogger } from "../observability/logger.js";
 import { cronExprEverFires, isValidCronExpr, nextCronOccurrence } from "./cron-expression.js";
 import { type CrontabIo, CrontabMutator, execCrontabIo, preflightCron } from "./crontab.js";
-import { DefaultOsScheduler, isValidActorId } from "./os-scheduler.js";
+import { DefaultOsScheduler, isValidActorId, TruncatedCronBlockError } from "./os-scheduler.js";
 import { writeWakePort } from "./wake-callback.js";
 
 /** In-memory crontab: serves a string, records each write. */
@@ -309,6 +309,26 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
     await scheduler.cancel("act1");
     expect(io.content).toBe(userLine + respelledHomeLegacyBlock);
     expect(io.writes.at(-1)).toBe(userLine + respelledHomeLegacyBlock);
+  });
+
+  it("fails closed without a write when an owned wake tag is not followed by its own job line", async () => {
+    // The job line was hand-removed; a positional delete would take the user's entry.
+    const orphanTag = "# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ\n";
+    const before = orphanTag + userLine + foreignBlock;
+    const { io, scheduler } = make(before);
+
+    await expect(scheduler.cancel("act1")).rejects.toThrow(TruncatedCronBlockError);
+    await expect(scheduler.schedule("act1", "0 3 * * *", "again")).rejects.toThrow(
+      TruncatedCronBlockError
+    );
+    expect(io.content).toBe(before);
+    expect(io.writes).toEqual([]);
+
+    // Other actors' blocks are still managed around the broken one.
+    await scheduler.schedule("act3", "0 6 * * *", "unaffected");
+    expect(io.content.startsWith(before)).toBe(true);
+    await scheduler.cancel("act3");
+    expect(io.content).toBe(before);
   });
 
   it("names at boot every legacy wake block it declined to adopt, and nothing it owns", () => {

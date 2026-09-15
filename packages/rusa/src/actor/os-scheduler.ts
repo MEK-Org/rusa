@@ -213,9 +213,10 @@ function parseWakePriority(job: string): "responsive" | undefined {
 }
 
 /**
- * Thrown when an owned recurrence/message cron block is found truncated or
- * unterminated — a start tag with no matching end marker before EOF or
- * another start tag. This can only mean the block was hand-edited or
+ * Thrown when an owned cron block is found truncated or unterminated — a
+ * start tag with no matching end marker before EOF or another start tag, or
+ * an owned wake tag not followed by this instance's own wake job line. This
+ * can only mean the block was hand-edited or
  * corrupted after this class wrote it: its exact boundary can no longer be
  * verified, so the mutation fails closed with no write rather than guessing
  * that an adjacent line belongs to (or doesn't belong to) the block.
@@ -230,11 +231,17 @@ export class TruncatedCronBlockError extends Error {
 }
 
 /**
- * `at` schedules to the minute: a job whose time is at most this far ahead may
- * run — and leave the queue — before a re-read of `atq` can see it, so its
- * absence proves nothing. Any job further out than this must still be queued.
+ * The instant `at` actually runs a job submitted for `date`. `at` keeps a
+ * job's run time in whole minutes (its spool filename encodes minutes since
+ * the epoch), so the seconds are truncated, not rounded: atd starts the job
+ * the moment that minute begins, or immediately when the minute is already
+ * past. A job whose run minute has begun may therefore have run — and left
+ * the queue — before a re-read of `atq` can see it; a job whose run minute
+ * has not begun cannot have, so it must still be queued.
  */
-const AT_DUE_WINDOW_MS = 60_000;
+function atRunInstant(date: Date): number {
+  return Math.floor(date.getTime() / 60_000) * 60_000;
+}
 
 /**
  * Thrown when `at` reported a job id for a message but a re-read of the queue
@@ -347,10 +354,12 @@ export class DefaultOsScheduler implements OsScheduler {
    * upgrade would strand each live wake as a duplicate of its replacement.
    */
   private ownsLegacyWakeBlock(tagLine: string, jobLine: string | undefined): boolean {
-    return (
-      tagLine.trim().startsWith(LEGACY_WAKE_TAG_PREFIX) &&
-      (jobLine ?? "").includes(`$(cat ${this.opts.portFile})`)
-    );
+    return tagLine.trim().startsWith(LEGACY_WAKE_TAG_PREFIX) && this.isOwnWakeJobLine(jobLine);
+  }
+
+  /** True only for a wake job line this instance wrote: it curls this instance's own wake port. */
+  private isOwnWakeJobLine(line: string | undefined): boolean {
+    return (line ?? "").includes(`$(cat ${this.opts.portFile})/wake"`);
   }
 
   /** The actor id of this instance's wake block starting at `lines[index]`, if any. */
@@ -412,15 +421,23 @@ export class DefaultOsScheduler implements OsScheduler {
     );
   }
 
-  /** Remove the actor's owned two-line wake block while preserving all other entries. */
+  /**
+   * Remove the actor's owned two-line wake block while preserving all other
+   * entries. A wake block has no end marker, so its second line is verified
+   * by content rather than by position: only this instance's own wake job
+   * line is ever consumed with the tag. An owned tag followed by anything
+   * else is a hand-edited block whose boundary cannot be verified, and the
+   * mutation fails closed with no write — exactly as {@link stripCronBlock}
+   * does — rather than deleting whichever line happens to come next.
+   */
   private stripWakeBlock(lines: string[], actorId: string): string[] {
     const kept: string[] = [];
     for (let index = 0; index < lines.length; index++) {
       if (this.ownedWakeActorId(lines, index) === actorId) {
-        const next = lines[index + 1];
-        if (next !== undefined && next.trim() !== "" && !next.trimStart().startsWith("#")) {
-          index++;
+        if (!this.isOwnWakeJobLine(lines[index + 1])) {
+          throw new TruncatedCronBlockError(lines[index].trim());
         }
+        index++;
         continue;
       }
       kept.push(lines[index]);
@@ -612,9 +629,10 @@ export class DefaultOsScheduler implements OsScheduler {
 
   /**
    * Re-read the queue and require the job `at` just reported to be in it with
-   * `tag`. A job due within {@link AT_DUE_WINDOW_MS} may legitimately have run
-   * already, so its absence is recorded and tolerated; a job further out that
-   * is missing was never durably queued, and the caller must not report it as
+   * `tag`. Only a job whose {@link atRunInstant run minute} had begun by the
+   * time the queue was read back may legitimately have run already, so its
+   * absence is recorded and tolerated; a missing job whose run minute is still
+   * ahead was never durably queued, and the caller must not report it as
    * scheduled.
    */
   private confirmAtEnqueue(
@@ -630,10 +648,13 @@ export class DefaultOsScheduler implements OsScheduler {
       this.log.info("at_enqueue_confirmed", fields);
       return;
     }
-    if (date.getTime() - this.now() <= AT_DUE_WINDOW_MS) {
+    // The clock is read after the re-read, so it bounds the latest instant the
+    // job could have run and left the queue unseen. `at`, atd and this process
+    // share the host clock, so no further allowance is applied.
+    if (atRunInstant(date) <= this.now()) {
       this.log.warn("at_enqueue_unconfirmed", {
         ...fields,
-        reason: "job due; may already have run",
+        reason: "job run minute has begun; may already have run",
       });
       return;
     }

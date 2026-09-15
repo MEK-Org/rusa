@@ -1100,24 +1100,37 @@ describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
       ]);
     });
 
-    it("tolerates, but records, a missing job that was due within at's minute granularity", () => {
+    it("tolerates, but records, a missing job only when its `at` run minute has already begun", () => {
       const { at } = sharedAtQueue();
       const lossy: AtIo = { ...at, schedule: () => "100" };
       const { log, records } = recordingLogger();
-      const dueNow = instance(PROD, lossy, { data: "" }, { log, now: () => NOW });
-      const soon = {
-        ...message("msg-a", "recipient"),
-        deliverAt: new Date(NOW + 60_000).toISOString(),
-      };
+      const due = (iso: string) => ({ ...message("msg-a", "recipient"), deliverAt: iso });
 
-      expect(() => dueNow.scheduleMessageDelivery(soon)).not.toThrow();
+      // `at` truncates a job's time to the minute, so a job for 12:00:30
+      // submitted at 12:00:10 runs at once and may be gone before the re-read.
+      const midMinute = instance(PROD, lossy, { data: "" }, { log, now: () => NOW + 10_000 });
+      expect(() =>
+        midMinute.scheduleMessageDelivery(due("2026-09-15T12:00:30.000Z"))
+      ).not.toThrow();
       expect(records().map((record) => [record.msg, record.reason])).toEqual([
         ["at_job_scheduled", undefined],
-        ["at_enqueue_unconfirmed", "job due; may already have run"],
+        ["at_enqueue_unconfirmed", "job run minute has begun; may already have run"],
       ]);
 
-      const later = { ...soon, deliverAt: new Date(NOW + 60_001).toISOString() };
-      expect(() => dueNow.scheduleMessageDelivery(later)).toThrow(AtEnqueueUnconfirmedError);
+      // Thirty seconds ahead but across the minute boundary: the run minute
+      // has not begun, so the job cannot have run and must still be queued.
+      const nearBoundary = instance(PROD, lossy, { data: "" }, { log, now: () => NOW + 59_000 });
+      expect(() => nearBoundary.scheduleMessageDelivery(due("2026-09-15T12:01:29.000Z"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      // A full minute ahead on the boundary is likewise still ahead.
+      const onMinute = instance(PROD, lossy, { data: "" }, { log, now: () => NOW });
+      expect(() => onMinute.scheduleMessageDelivery(due("2026-09-15T12:01:00.000Z"))).toThrow(
+        AtEnqueueUnconfirmedError
+      );
+      expect(records().filter((record) => record.reason === "job missing from queue")).toHaveLength(
+        2
+      );
     });
   });
 });
