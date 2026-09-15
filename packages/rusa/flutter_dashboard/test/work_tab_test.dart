@@ -166,6 +166,68 @@ void main() {
   });
 
   testWidgets(
+    'keeps detail actions at the title start when the header wraps (#476)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(1200, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final ob = makeObligation(
+          'header-actions',
+          ownerId: 'root',
+          title: 'Actions beside the title',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId(ob.id);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        final title = find.byKey(const ValueKey('obligation-detail-title'));
+        final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final wideTitleRect = tester.getRect(title);
+        final wideActionsRect = tester.getRect(actions);
+
+        // The controls follow the header's content instead of occupying the
+        // far edge of the wide detail pane.
+        expect(wideActionsRect.left, greaterThan(wideTitleRect.left));
+        expect(wideActionsRect.left, lessThan(900));
+
+        await tester.binding.setSurfaceSize(const Size(500, 800));
+        await tester.pump();
+        await tester.pump();
+
+        final narrowTitleRect = tester.getRect(title);
+        final narrowActionsRect = tester.getRect(actions);
+
+        // The narrow header moves the action run onto the next line, but it
+        // stays start-aligned and every labelled control remains available.
+        expect(narrowTitleRect.height, greaterThan(30));
+        expect(narrowActionsRect.top, greaterThan(narrowTitleRect.top));
+        expect(narrowActionsRect.left, closeTo(narrowTitleRect.left, 0.1));
+        expect(find.byTooltip('Mark Done'), findsOneWidget);
+        expect(find.byTooltip('Cancel Obligation'), findsOneWidget);
+        expect(find.byTooltip('Reassign obligation'), findsOneWidget);
+        expect(find.byTooltip('Add child obligation'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     'excludes quiet terminal roots from the default load, fetches them on '
     'Show Done (#241)',
     (tester) async {

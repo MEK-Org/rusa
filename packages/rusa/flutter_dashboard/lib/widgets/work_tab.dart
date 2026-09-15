@@ -1506,46 +1506,59 @@ class _DetailViewState extends State<_DetailView> {
         ),
       ),
     ];
-    final titleAndStatus = Row(
-      children: [
-        Expanded(
-          child: SelectableText(
-            o.heading,
-            maxLines: 2,
-            style: const TextStyle(
-              color: MeshColors.textPrimary,
-              fontSize: 22,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-        const SizedBox(width: 10),
-        ObligationStatusChip(obligation: o, store: store, bordered: true),
-      ],
+    const titleStyle = TextStyle(
+      color: MeshColors.textPrimary,
+      fontSize: 22,
+      fontWeight: FontWeight.bold,
     );
-
     return LayoutBuilder(
       builder: (context, constraints) {
-        if (o.isTerminal) return titleAndStatus;
+        final titleWidth = (TextPainter(
+          text: TextSpan(text: o.heading, style: titleStyle),
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+          maxLines: 2,
+          textWidthBasis: TextWidthBasis.longestLine,
+        )..layout(maxWidth: constraints.maxWidth)).width;
+        final title = SizedBox(
+          width: titleWidth,
+          child: SelectableText(
+            o.heading,
+            key: const ValueKey('obligation-detail-title'),
+            maxLines: 2,
+            style: titleStyle,
+          ),
+        );
+        final status = ObligationStatusChip(
+          obligation: o,
+          store: store,
+          bordered: true,
+        );
+        if (o.isTerminal) {
+          return Wrap(
+            alignment: WrapAlignment.start,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            runSpacing: 4,
+            spacing: 10,
+            children: [title, status],
+          );
+        }
         final actionRow = Row(
           mainAxisSize: MainAxisSize.min,
           children: actions,
         );
-        if (constraints.maxWidth < 560) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              titleAndStatus,
-              const SizedBox(height: 4),
-              Align(alignment: Alignment.centerRight, child: actionRow),
-            ],
-          );
-        }
-        return Row(
+        return Wrap(
+          alignment: WrapAlignment.start,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          runSpacing: 4,
+          spacing: 8,
           children: [
-            Expanded(child: titleAndStatus),
-            const SizedBox(width: 8),
-            actionRow,
+            title,
+            Row(
+              key: const ValueKey('obligation-detail-actions'),
+              mainAxisSize: MainAxisSize.min,
+              children: [status, const SizedBox(width: 8), actionRow],
+            ),
           ],
         );
       },
