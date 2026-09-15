@@ -694,22 +694,24 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * quickstart). Warns — without ever logging a value — when both are set, as a
  * migration nudge to remove the inline copy.
  */
+function warnDuplicateSecret(inlineName: string, secretFilename: string, term = "key"): void {
+  console.warn(
+    `[config] ${inlineName} is set inline in config.yaml AND ${SECRETS_DIRNAME}/${secretFilename} exists — the secrets file wins. Remove the inline ${term}.`
+  );
+}
+
 function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
   const fileElevenLabsKey = readHostSecret(ELEVENLABS_API_KEY_SECRET_FILENAME, mcHome);
   if (fileElevenLabsKey) {
     if (parsed.elevenlabsApiKey) {
-      console.warn(
-        `[config] elevenlabsApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${ELEVENLABS_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
-      );
+      warnDuplicateSecret("elevenlabsApiKey", ELEVENLABS_API_KEY_SECRET_FILENAME);
     }
     parsed.elevenlabsApiKey = fileElevenLabsKey;
   }
   const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
   if (fileGeminiKey) {
     if (parsed.geminiApiKey) {
-      console.warn(
-        `[config] geminiApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${GEMINI_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
-      );
+      warnDuplicateSecret("geminiApiKey", GEMINI_API_KEY_SECRET_FILENAME);
     }
     parsed.geminiApiKey = fileGeminiKey;
   }
@@ -717,9 +719,7 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
   const fileMistralKey = readHostSecret(MISTRAL_API_KEY_SECRET_FILENAME, mcHome);
   if (fileMistralKey) {
     if (parsed.mistralApiKey) {
-      console.warn(
-        `[config] mistralApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${MISTRAL_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
-      );
+      warnDuplicateSecret("mistralApiKey", MISTRAL_API_KEY_SECRET_FILENAME);
     }
     parsed.mistralApiKey = fileMistralKey;
   }
@@ -727,9 +727,7 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
   const fileWebhookSecret = readHostSecret(WEBHOOK_SECRET_FILENAME, mcHome);
   if (fileWebhookSecret && parsed.webhook) {
     if (parsed.webhook.secret) {
-      console.warn(
-        `[config] webhook.secret is set inline in config.yaml AND ${SECRETS_DIRNAME}/${WEBHOOK_SECRET_FILENAME} exists — the secrets file wins. Remove the inline value.`
-      );
+      warnDuplicateSecret("webhook.secret", WEBHOOK_SECRET_FILENAME, "value");
     }
     parsed.webhook.secret = fileWebhookSecret;
   }

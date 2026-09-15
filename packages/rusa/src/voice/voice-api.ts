@@ -28,7 +28,7 @@ export interface VoiceApiDeps {
   sseHub: SseHub;
   /** The live ActorMesh instance (memo delivery). */
   mesh?: ActorMesh;
-  /** Null when voice is unconfigured (no geminiApiKey) → routes 503. */
+  /** Null when voice is unconfigured (no provider credentials configured) → routes 503. */
   service: VoiceService | null;
   /** Optional structured logger for route events (silenced under tests when omitted). */
   logger?: Logger;

@@ -3466,7 +3466,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         iuReportsApi: { mcHome },
         dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
         // Walkie-talkie voice routes + reply-TTS hook ; undefined when
-        // no geminiApiKey is configured (routes then 503).
+        // voice credentials are unconfigured (routes then 503).
         voice: voiceService ? { service: voiceService } : undefined,
       })
     : null;
