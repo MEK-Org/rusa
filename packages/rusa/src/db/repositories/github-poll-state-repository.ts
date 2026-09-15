@@ -140,6 +140,10 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
     );
   }
 
+  /**
+   * Every repository with durable state, for import planning and inspection.
+   * Not part of {@link GitHubPollStateStore}: the poller never needs it.
+   */
   list(): GitHubPollRepoState[] {
     const repos = this.db
       .prepare(
@@ -174,6 +178,11 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
     }));
   }
 
+  /**
+   * Write a whole repository's state in one statement batch. Used by the
+   * one-shot legacy import, which runs it inside the import transaction; the
+   * poller itself never calls this, so it is not on the port either.
+   */
   importRepo(state: GitHubPollRepoState): void {
     this.db
       .prepare(

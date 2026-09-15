@@ -197,8 +197,9 @@ export function planLegacyGitHubPollStateImport(options: {
       const event = parseLegacySeenKey(key);
       if (!event) {
         throw new Error(
-          `Legacy GitHub poll state import: repository '${repo}' has seen key '${key}' ` +
-            "that is not <kind>:<id>:<updatedAt>; refusing to import a partial poll position"
+          `Legacy GitHub poll state import: ${filePath} has unresolved row(s); ` +
+            `refusing to import a partial poll position (repos.${repo}.seen: '${key}' ` +
+            "is not <kind>:<id>:<updatedAt> with a kind the poller emits)"
         );
       }
       seen.push(event);

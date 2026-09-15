@@ -3,7 +3,6 @@ import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
 import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
-import type { GitHubPollStateStore } from "../../github/poll-state-store.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
@@ -42,7 +41,7 @@ export class Repositories {
   readonly eventSourceOwners: DbEventSourceOwnerStore;
   readonly experimentEnrollments: ExperimentEnrollmentStore;
   readonly eventSourceSubscriptions: DbEventSourceSubscriptionStore;
-  readonly githubPollState: GitHubPollStateStore;
+  readonly githubPollState: DbGitHubPollStateStore;
   readonly hostJobs: HostJobStore;
   readonly legacyImportReceipts: LegacyImportReceiptRepository;
   readonly meshEvents: MeshEventRepository;

@@ -19,6 +19,13 @@ import type { Migration } from "./types.js";
  * poller only emits a push when it holds a previous head. That is why this
  * state is a durable authority and not a cache exception.
  *
+ * The branch-head loss is closed only by the previous head no longer going
+ * missing: the poller still records a first sighting without emitting, since
+ * a push notification needs a `before` and a first sighting has none. There
+ * is no bootstrap emission and no warning for a configured repository that
+ * has no head row yet; the first cycle after this migration records, and
+ * every later push is synthesized against a head that survives restarts.
+ *
  * ## Four tables, not one JSON column
  *
  * Follows `host_jobs` (0040) and `event_sources` (0038): ordinary scalar
@@ -93,10 +100,10 @@ export const githubPollState: Migration = {
         PRIMARY KEY (repo, event_key)
       );
 
-      -- Retention prunes each stream by (repo, stream, event_updated_at); the
-      -- primary key alone would make that a scan of every seen key in the repo.
-      CREATE INDEX github_poll_seen_events_by_stream_updated
-        ON github_poll_seen_events (repo, stream, event_updated_at);
+      -- No index beyond the primary key: retention prunes below each
+      -- stream's cursor every cycle, so a repo's rows are only the keys at
+      -- its cursors plus one unprocessed batch, and the (repo, ...) prefix
+      -- of the key already bounds every read and prune to that handful.
 
       CREATE TABLE github_poll_branch_heads (
         repo     TEXT NOT NULL REFERENCES github_poll_repos(repo) ON DELETE CASCADE,

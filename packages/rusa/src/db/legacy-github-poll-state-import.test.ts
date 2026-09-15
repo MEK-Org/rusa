@@ -192,7 +192,8 @@ describe("legacy GitHub poll state import", () => {
   it("refuses a seen key whose stream or timestamp cannot be recovered", () => {
     writeLegacy({ [REPO]: { ...legacyRepo, seen: ["issues:1"] } });
 
-    expect(() => runImport()).toThrow(/seen key 'issues:1'/);
+    // Every refusal names the file, so the operator knows which path to fix.
+    expect(() => runImport()).toThrow(new RegExp(`${filePath}.*seen: 'issues:1'`));
     expect(existsSync(filePath)).toBe(true);
     expect(repositories.githubPollState.list()).toEqual([]);
   });

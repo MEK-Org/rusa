@@ -21,7 +21,11 @@ export interface GitHubPollSeenEvent {
   pullRequest?: { number: number; draft: boolean };
 }
 
-/** Everything durable the poller knows about one repository. */
+/**
+ * Everything durable the poller knows about one repository — the unit the
+ * legacy import writes and `db-check` reads. The poller itself only ever
+ * touches the per-call surface of {@link GitHubPollStateStore}.
+ */
 export interface GitHubPollRepoState extends GitHubPollCursors {
   repo: string;
   seen: GitHubPollSeenEvent[];
@@ -56,6 +60,11 @@ export interface GitHubPollRepoState extends GitHubPollCursors {
  *   seen keys recorded above suppress re-delivering the part that got out.
  * - {@link recordBranchHead} follows the same after-delivery rule as
  *   {@link recordEmitted} for synthesized pushes.
+ *
+ * This is exactly the set of calls `poller.ts` makes. Whole-repository
+ * reads and writes (`list`, `importRepo`) belong to the SQLite
+ * implementation, where the one-shot legacy import uses them; a test double
+ * of the poller's port does not have to provide them.
  */
 export interface GitHubPollStateStore {
   /** The repository's cursors, or `undefined` if it has never been polled. */
@@ -89,14 +98,6 @@ export interface GitHubPollStateStore {
    * turns a not-draft record into `ready_for_review` rather than `edited`.
    */
   isDraftPullRequest(repo: string, pullNumber: number): boolean;
-  /** Every repository with durable state, for import planning and inspection. */
-  list(): GitHubPollRepoState[];
-  /**
-   * Write a whole repository's state in one statement batch. Used by the
-   * one-shot legacy import, which runs it inside the import transaction; the
-   * poller itself never calls this.
-   */
-  importRepo(state: GitHubPollRepoState): void;
 }
 
 /** The cursor every stream starts from before its first successful poll. */
