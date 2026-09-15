@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ActorOptions } from "../../actor/actor.js";
+import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { createRunAccounting } from "../../actor/run-accounting.js";
@@ -78,9 +79,28 @@ describe("remote actor run accounting", () => {
       executionTarget: "test-follower",
       record: { id: ACTOR_ID },
       getRecord: () => ({ id: ACTOR_ID }),
-      onRunEnd: (result: RunResult) => accounting.complete(ACTOR_ID, result),
+      lifecycle: createActorLifecycle([
+        {
+          onStart: (event) =>
+            accounting.begin(
+              ACTOR_ID,
+              event.runId,
+              createActorRunModelConfig({
+                provider: event.selected.provider,
+                model: event.selected.model ?? "",
+                ...(event.selected.effort === undefined ? {} : { effort: event.selected.effort }),
+              })
+            ),
+          onEnd: (event) => {
+            if (event.terminal.kind === "result") {
+              accounting.complete(ACTOR_ID, event.runId, event.terminal.result);
+            } else if (event.terminal.started) {
+              accounting.abandon(ACTOR_ID, event.runId, event.terminal.reason);
+            }
+          },
+        },
+      ]),
       onRuntimeStateChanged: () => {},
-      onQueued: () => {},
       admitRun: (context: { responsive: boolean; mode: string }) => {
         admits.push(context);
         return false;
@@ -93,20 +113,6 @@ describe("remote actor run accounting", () => {
 
     const actorOptions = {
       modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
-      onRunStart: (
-        _responsive: boolean,
-        _inject: unknown,
-        selected: { provider: string; model: string; effort?: string }
-      ) => {
-        accounting.begin(
-          ACTOR_ID,
-          createActorRunModelConfig({
-            provider: selected.provider,
-            model: selected.model,
-            ...(selected.effort === undefined ? {} : { effort: selected.effort }),
-          })
-        );
-      },
       log: (chunk: string) => {
         if (chunk.includes("run accounting failed")) accountingErrors.push(chunk);
       },
