@@ -24,6 +24,10 @@ class MockPollIssueClient implements Partial<GitHubPollingIssueClient> {
   polledRepos: string[] = [];
   orgRepos = new Map<string, string[]>();
   branchHeads = new Map<string, string>();
+  // GitHub's `since` is inclusive; the default here is strict so the older
+  // tests keep their exact call expectations. Turn it on to make the mock
+  // hand back the event sitting at the cursor, as the live endpoint would.
+  inclusiveSince = false;
 
   async listPollOrganizationRepositories(org: string): Promise<string[]> {
     return this.orgRepos.get(org) ?? [];
@@ -40,12 +44,16 @@ class MockPollIssueClient implements Partial<GitHubPollingIssueClient> {
   ): Promise<PollIssueOrPullRequest[]> {
     this.polledRepos.push(_repo);
     this.issueSinceCalls.push(since);
-    return this.issues.filter((issue) => issue.updatedAt > since);
+    return this.issues.filter((issue) => this.returnedBy(issue.updatedAt, since));
   }
 
   async listUpdatedIssueComments(_repo: string, since: string): Promise<PollIssueComment[]> {
     this.commentSinceCalls.push(since);
-    return this.comments.filter((comment) => comment.updatedAt > since);
+    return this.comments.filter((comment) => this.returnedBy(comment.updatedAt, since));
+  }
+
+  private returnedBy(updatedAt: string, since: string): boolean {
+    return this.inclusiveSince ? updatedAt >= since : updatedAt > since;
   }
 
   async getPollIssue(_repo: string, issueNumber: number): Promise<PollIssueOrPullRequest> {
@@ -707,6 +715,92 @@ describe("GitHubEventPoller", () => {
     await makePoller().pollOnce();
 
     expect(inbox.list("actor-gh").entries).toHaveLength(1);
+  });
+
+  it("retries only the failed later event after a restart, once the earlier one is committed", async () => {
+    // The same-stream sequence a live poller actually walks: cycle one
+    // delivers issue 1 and commits it, cursor and all. Issue 2 then arrives
+    // and its delivery crashes after the inbox row was appended. A fresh
+    // poller over the same mesh.db must not hand issue 1 out again, even
+    // though an inclusive `since` returns it, and must re-emit issue 2 under
+    // its original delivery id so the inbox row it left behind absorbs the
+    // repeat. The cursor stays at issue 1 until that retry succeeds.
+    const issue = (number: number, updatedAt: string) => ({
+      number,
+      title: `Issue ${number}`,
+      body: "body",
+      author: "author",
+      state: "open" as const,
+      createdAt: "2026-07-03T00:00:00.000Z",
+      updatedAt,
+      isPullRequest: false,
+    });
+    const repo = "dummy-org/dummy-repo";
+    const client = new MockPollIssueClient();
+    client.inclusiveSince = true;
+    client.issues = [issue(1, "2026-07-03T00:01:00.000Z")];
+
+    const inbox = new InboxRepository(db);
+    const resolver: EventRoutingKernel = {
+      resolveOwner: () => {
+        throw new Error("poller ingress must not resolve ownership");
+      },
+      resolveRecipients: () => ({ directed: false, ownerIds: ["actor-gh"], subscriberIds: [] }),
+    };
+    const eventManager = new EventManager({ inboxStore: inbox, resolver });
+    const deliveries: Array<string | undefined> = [];
+    let crashDeliveryOf: number | undefined;
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: [repo],
+        intervalSeconds: 300,
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (event, payload, deliveryId) => {
+          deliveries.push(deliveryId);
+          eventManager.handleExternalEvent({
+            sourceType: "github",
+            rawPayload: { event, payload },
+            idempotencyKey: `github:${deliveryId}`,
+          });
+          if ((payload.issue as { number: number }).number === crashDeliveryOf) {
+            crashDeliveryOf = undefined;
+            throw new Error("crashed after the inbox row was appended");
+          }
+        },
+      });
+    const issue1Id = `poll:${repo}:issues:1:2026-07-03T00:01:00.000Z`;
+    const issue2Id = `poll:${repo}:issues:2:2026-07-03T00:02:00.000Z`;
+
+    // Cycle one commits issue 1: seen key written, cursor at its timestamp.
+    await makePoller().pollOnce();
+    expect(deliveries).toEqual([issue1Id]);
+    expect(state.hasSeen(repo, "issues:1:2026-07-03T00:01:00.000Z")).toBe(true);
+    expect(state.getCursors(repo)?.issuesWatermark).toBe("2026-07-03T00:01:00.000Z");
+
+    // Cycle two: issue 2 lands, and its delivery crashes mid-flight.
+    client.issues.push(issue(2, "2026-07-03T00:02:00.000Z"));
+    crashDeliveryOf = 2;
+    await expect(makePoller().pollOnce()).rejects.toThrow(/crashed after/);
+    // Issue 1 came back from the inclusive fetch and was suppressed; issue 2
+    // went out once and was not recorded, and the cursor did not move.
+    expect(client.issueSinceCalls.at(-1)).toBe("2026-07-03T00:01:00.000Z");
+    expect(deliveries).toEqual([issue1Id, issue2Id]);
+    expect(state.hasSeen(repo, "issues:2:2026-07-03T00:02:00.000Z")).toBe(false);
+    expect(state.getCursors(repo)?.issuesWatermark).toBe("2026-07-03T00:01:00.000Z");
+
+    // Restart: a fresh poller over the same mesh.db retries issue 2 alone,
+    // under the same delivery id, and only then commits it.
+    await makePoller().pollOnce();
+    expect(deliveries).toEqual([issue1Id, issue2Id, issue2Id]);
+    expect(state.hasSeen(repo, "issues:2:2026-07-03T00:02:00.000Z")).toBe(true);
+    expect(state.getCursors(repo)?.issuesWatermark).toBe("2026-07-03T00:02:00.000Z");
+
+    // A further cycle re-fetches issue 2 at the inclusive cursor and delivers
+    // nothing; and the inbox holds one row per event, not one per attempt.
+    await makePoller().pollOnce();
+    expect(deliveries).toEqual([issue1Id, issue2Id, issue2Id]);
+    expect(inbox.list("actor-gh").entries).toHaveLength(2);
   });
 
   it("delivers a deploy-branch push exactly once across a restart, from the durable head", async () => {
