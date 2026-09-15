@@ -31,7 +31,10 @@ describe("DbGitHubPollStateStore", () => {
     expect(store.list()).toEqual([]);
   });
 
-  it("records an emitted event and advances only its own stream's cursor, atomically", () => {
+  it("records an emitted event without moving any cursor", () => {
+    // Recording a delivery and closing the window it came from are separate
+    // decisions: the poller records per event but only closes a window once
+    // the whole batch behind it has been processed.
     store.recordEmitted(REPO, {
       key: "issues:1:2026-07-03T00:10:00Z",
       stream: "issues",
@@ -40,34 +43,29 @@ describe("DbGitHubPollStateStore", () => {
 
     expect(store.hasSeen(REPO, "issues:1:2026-07-03T00:10:00Z")).toBe(true);
     expect(store.getCursors(REPO)).toEqual({
+      issuesWatermark: GITHUB_POLL_EPOCH,
+      commentsWatermark: GITHUB_POLL_EPOCH,
+    });
+  });
+
+  it("advances only the named stream's cursor, creating the repository row", () => {
+    store.advanceCursor(REPO, "issues", "2026-07-03T00:10:00Z");
+    expect(store.getCursors(REPO)).toEqual({
       issuesWatermark: "2026-07-03T00:10:00Z",
       commentsWatermark: GITHUB_POLL_EPOCH,
     });
 
-    store.recordEmitted(REPO, {
-      key: "issue_comment:20:2026-07-03T00:05:00Z",
-      stream: "comments",
-      updatedAt: "2026-07-03T00:05:00Z",
-    });
+    store.advanceCursor(REPO, "comments", "2026-07-03T00:05:00Z");
     expect(store.getCursors(REPO)).toEqual({
       issuesWatermark: "2026-07-03T00:10:00Z",
       commentsWatermark: "2026-07-03T00:05:00Z",
     });
   });
 
-  it("never rewinds a cursor when an older event is recorded after a newer one", () => {
-    store.recordEmitted(REPO, {
-      key: "issues:2:2026-07-03T00:10:00Z",
-      stream: "issues",
-      updatedAt: "2026-07-03T00:10:00Z",
-    });
-    store.recordEmitted(REPO, {
-      key: "issues:1:2026-07-03T00:01:00Z",
-      stream: "issues",
-      updatedAt: "2026-07-03T00:01:00Z",
-    });
+  it("never rewinds a cursor when an older advance arrives after a newer one", () => {
+    store.advanceCursor(REPO, "issues", "2026-07-03T00:10:00Z");
+    store.advanceCursor(REPO, "issues", "2026-07-03T00:01:00Z");
     expect(store.getCursors(REPO)?.issuesWatermark).toBe("2026-07-03T00:10:00Z");
-    expect(store.hasSeen(REPO, "issues:1:2026-07-03T00:01:00Z")).toBe(true);
   });
 
   it("is idempotent for a repeated key", () => {
@@ -113,6 +111,9 @@ describe("DbGitHubPollStateStore", () => {
       updatedAt: "2026-07-03T00:04:00Z",
     });
 
+    store.advanceCursor(REPO, "issues", "2026-07-03T00:10:00Z");
+    store.advanceCursor(REPO, "comments", "2026-07-03T00:05:00Z");
+
     store.pruneSeen(REPO);
 
     expect(store.list()[0]?.seen.map((event) => event.key)).toEqual([
@@ -135,6 +136,7 @@ describe("DbGitHubPollStateStore", () => {
         stream: "issues",
         updatedAt: "2026-07-03T00:10:00Z",
       });
+      store.advanceCursor(repo, "issues", "2026-07-03T00:10:00Z");
     }
 
     store.pruneSeen(REPO);
@@ -202,6 +204,7 @@ describe("DbGitHubPollStateStore", () => {
         stream: "issues",
         updatedAt: "2026-07-03T00:10:00Z",
       });
+      writer.advanceCursor(REPO, "issues", "2026-07-03T00:10:00Z");
       expect(reader.getCursors(REPO)?.issuesWatermark).toBe("2026-07-03T00:10:00Z");
       expect(reader.hasSeen(REPO, "issues:1:2026-07-03T00:10:00Z")).toBe(true);
     } finally {

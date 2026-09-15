@@ -30,11 +30,19 @@ export interface GitHubPollRepoState extends GitHubPollCursors {
  * per cycle, so the write contract is what makes a crash safe:
  *
  * - {@link recordEmitted} is called only *after* the event's delivery has
- *   resolved, and it moves the seen key and the stream cursor together. A
- *   crash between delivery and this call re-emits the event next cycle, and
- *   the durable inbox's per-(key, actor) row id absorbs the repeat. The other
- *   order — cursor first, delivery second — is the one that loses events.
- * - {@link recordBranchHead} follows the same rule for synthesized pushes.
+ *   resolved. A crash between delivery and this call re-emits the event next
+ *   cycle, and the durable inbox's per-(key, actor) row id absorbs the
+ *   repeat. The other order — record first, deliver second — loses events.
+ * - {@link advanceCursor} is called only once a stream's whole fetched batch
+ *   has been processed, never per event. A cursor that moved after each
+ *   delivery would be correct only if the delivery order were ascending *and*
+ *   `since` were inclusive; otherwise a crash part-way through a batch leaves
+ *   the cursor past an event that was never delivered, and the next fetch
+ *   cannot return it. Deferring the advance makes the no-missed-event property
+ *   independent of both: the next cycle re-fetches the whole batch, and the
+ *   seen keys recorded above suppress re-delivering the part that got out.
+ * - {@link recordBranchHead} follows the same after-delivery rule as
+ *   {@link recordEmitted} for synthesized pushes.
  */
 export interface GitHubPollStateStore {
   /** The repository's cursors, or `undefined` if it has never been polled. */
@@ -42,11 +50,16 @@ export interface GitHubPollStateStore {
   /** Whether `eventKey` has already been emitted for `repo`. */
   hasSeen(repo: string, eventKey: string): boolean;
   /**
-   * Record that `event` was delivered and advance its stream's cursor to at
-   * least `event.updatedAt`, atomically. Creates the repository row on first
-   * use with both cursors at the epoch.
+   * Record that `event` was delivered. Creates the repository row on first use
+   * with both cursors at the epoch. Idempotent for a repeated key.
    */
   recordEmitted(repo: string, event: GitHubPollSeenEvent): void;
+  /**
+   * Move `stream`'s cursor forward to `updatedAt`, creating the repository row
+   * on first use. Never rewinds: a value at or before the stored cursor is
+   * ignored, so an out-of-order call cannot re-open a window that has closed.
+   */
+  advanceCursor(repo: string, stream: GitHubPollStream, updatedAt: string): void;
   /**
    * Drop seen keys that neither stream's `since` can return again — those
    * strictly older than their own stream's cursor. GitHub's `since` is

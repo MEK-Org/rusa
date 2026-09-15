@@ -162,11 +162,7 @@ describe("legacy GitHub poll state import", () => {
     writeLegacy({ [REPO]: legacyRepo });
     runImport();
     // The poller has since advanced; a restored file must not rewind it.
-    repositories.githubPollState.recordEmitted(REPO, {
-      key: "issues:2:2026-08-01T00:00:00Z",
-      stream: "issues",
-      updatedAt: "2026-08-01T00:00:00Z",
-    });
+    repositories.githubPollState.advanceCursor(REPO, "issues", "2026-08-01T00:00:00Z");
     writeLegacy({ [REPO]: legacyRepo });
 
     const result = runImport();
@@ -205,11 +201,7 @@ describe("legacy GitHub poll state import", () => {
   });
 
   it("refuses to overwrite durable rows written without a receipt", () => {
-    repositories.githubPollState.recordEmitted(REPO, {
-      key: "issues:2:2026-08-01T00:00:00Z",
-      stream: "issues",
-      updatedAt: "2026-08-01T00:00:00Z",
-    });
+    repositories.githubPollState.advanceCursor(REPO, "issues", "2026-08-01T00:00:00Z");
     writeLegacy({ [REPO]: legacyRepo });
 
     expect(() => runImport()).toThrow(/without an import receipt/);

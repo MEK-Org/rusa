@@ -198,13 +198,10 @@ export class GitHubEventPoller {
         })),
     ].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 
-    // Events are in ascending updatedAt order across both streams, so once an
-    // event is delivered its stream cursor can move to its timestamp: anything
-    // still undelivered in this batch is at or after it and a re-fetch from
-    // there returns it again. The seen key and the cursor commit together, and
-    // only after delivery resolved — a crash before that point re-emits the
-    // event next cycle under the same delivery id, which the durable inbox
-    // already dedups; a cursor committed before delivery would skip it.
+    // Deliver oldest first, and record each event only after its delivery
+    // resolved: a crash before that point re-emits the event next cycle under
+    // the same delivery id, which the durable inbox already dedups, whereas
+    // recording first would drop it.
     for (const event of events) {
       if (this.state.hasSeen(repo, event.key)) continue;
       await event.emit();
@@ -214,6 +211,19 @@ export class GitHubEventPoller {
         updatedAt: event.updatedAt,
       });
     }
+
+    // Only now, with both batches fully processed, may the cursors move — to
+    // the newest timestamp each endpoint returned. Advancing per delivered
+    // event instead would be safe only while the delivery order is ascending
+    // and `since` is inclusive; a crash part-way through an unsorted or
+    // equal-timestamp batch would otherwise leave the cursor past an event
+    // that never went out, and no later fetch could return it. Deferring the
+    // advance costs one re-fetch of an interrupted batch, whose already
+    // delivered events the seen keys above suppress.
+    const latestIssue = latestUpdatedAt(issueRecords);
+    if (latestIssue) this.state.advanceCursor(repo, "issues", latestIssue);
+    const latestComment = latestUpdatedAt(comments);
+    if (latestComment) this.state.advanceCursor(repo, "comments", latestComment);
     this.state.pruneSeen(repo);
   }
 
@@ -222,6 +232,18 @@ export class GitHubEventPoller {
       `[github-poller] poll failed: ${err instanceof Error ? err.message : String(err)}`
     );
   }
+}
+
+/**
+ * The newest `updatedAt` in one endpoint's response, or `undefined` for an
+ * empty one — an empty batch teaches nothing, so its cursor stays put.
+ */
+function latestUpdatedAt(records: Array<{ updatedAt: string }>): string | undefined {
+  let latest: string | undefined;
+  for (const record of records) {
+    if (latest === undefined || record.updatedAt > latest) latest = record.updatedAt;
+  }
+  return latest;
 }
 
 function eventDeliveryId(repo: string, eventKey: string): string {

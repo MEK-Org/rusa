@@ -71,14 +71,22 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
            ON CONFLICT(repo, event_key) DO NOTHING`
         )
         .run(repo, event.key, event.stream, event.updatedAt);
-      const column = cursorColumn(event.stream);
+    })();
+  }
+
+  advanceCursor(repo: string, stream: GitHubPollStream, updatedAt: string): void {
+    this.db.transaction(() => {
+      this.ensureRepo(repo);
+      // The `<` guard is the no-rewind rule in the statement itself, so two
+      // writers cannot interleave a stale value over a newer one.
+      const column = cursorColumn(stream);
       this.db
         .prepare(
           `UPDATE github_poll_repos
            SET ${column} = ?, updated_at = ?
            WHERE repo = ? AND ${column} < ?`
         )
-        .run(event.updatedAt, this.now(), repo, event.updatedAt);
+        .run(updatedAt, this.now(), repo, updatedAt);
     })();
   }
 

@@ -596,6 +596,68 @@ describe("GitHubEventPoller", () => {
     );
   });
 
+  it("does not skip a batch-mate when a later delivery in the same batch crashes", async () => {
+    // The hazard a per-event cursor advance would create: the endpoint answers
+    // newest-first, and one of the events sharing the newest timestamp crashes
+    // while a sibling at that same timestamp has not gone out yet. A cursor
+    // moved after each delivery would sit at that timestamp with the sibling
+    // undelivered, and only an inclusive `since` could ever return it. The
+    // cursor moves once the batch is fully processed instead, so the next
+    // cycle re-fetches the whole window and the seen keys suppress the repeats.
+    const issue = (number: number, updatedAt: string) => ({
+      number,
+      title: `Issue ${number}`,
+      body: "body",
+      author: "author",
+      state: "open" as const,
+      createdAt: "2026-07-03T00:00:00.000Z",
+      updatedAt,
+      isPullRequest: false,
+    });
+    const client = new MockPollIssueClient();
+    client.issues = [
+      issue(3, "2026-07-03T00:10:00.000Z"),
+      issue(2, "2026-07-03T00:10:00.000Z"),
+      issue(1, "2026-07-03T00:01:00.000Z"),
+    ];
+    const delivered: number[] = [];
+    let crashAfter = 1;
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: ["dummy-org/dummy-repo"],
+        intervalSeconds: 300,
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (_event, payload) => {
+          if (crashAfter-- === 0) throw new Error("crashed part-way through the batch");
+          delivered.push((payload.issue as { number: number }).number);
+        },
+      });
+
+    await expect(makePoller().pollOnce()).rejects.toThrow(/part-way through the batch/);
+    // Oldest first, despite the newest-first response; and no window closed.
+    expect(delivered).toEqual([1]);
+    expect(state.getCursors("dummy-org/dummy-repo")).toEqual({
+      issuesWatermark: "1970-01-01T00:00:00.000Z",
+      commentsWatermark: "1970-01-01T00:00:00.000Z",
+    });
+
+    await makePoller().pollOnce();
+    await makePoller().pollOnce();
+
+    // Issue 3 crashed and issue 2 never got its turn; both are delivered on
+    // the retry, each exactly once, and issue 1 is not delivered twice.
+    expect(delivered).toEqual([1, 3, 2]);
+    expect(client.issueSinceCalls).toEqual([
+      "1970-01-01T00:00:00.000Z",
+      "1970-01-01T00:00:00.000Z",
+      "2026-07-03T00:10:00.000Z",
+    ]);
+    expect(state.getCursors("dummy-org/dummy-repo")?.issuesWatermark).toBe(
+      "2026-07-03T00:10:00.000Z"
+    );
+  });
+
   it("keeps a re-emitted delivery to a single durable inbox row", async () => {
     // End to end over one mesh.db: the poller's re-emission after a crash and
     // the inbox's idempotency key are the two halves of "no duplicate
