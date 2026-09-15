@@ -108,9 +108,7 @@ export interface QuotaCoordinatorConfig {
 /** Shared quota evidence, controller state, and launch pacing. */
 export interface QuotaConfig {
   /**
-   * SQLite database used for quota scrapes, canonical observations, and pacing state.
-   * Multiple rusa instances that share provider credentials should point at the same file.
-   * Required when quota.throttle is enabled.
+   * SQLite database used by the coordinator process; not read by instances.
    */
   databasePath?: string;
   /** Closed-loop launch pacing configuration. */

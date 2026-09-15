@@ -5,6 +5,7 @@ export const COORDINATOR_PROTOCOL_MINOR = 0;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
+export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;
@@ -59,6 +60,39 @@ export type PublishedThrottleLaneStatus =
 export interface PublishedThrottleCollectionResponse {
   service: QuotaCoordinatorServiceInfo;
   providers: Record<string, PublishedThrottleLaneStatus>;
+}
+
+export interface PublishedHistoryRecord {
+  scope: "provider" | "model";
+  kind: string;
+  label: string;
+  observedAt: string;
+  percentLeft: number;
+  resetAtIso: string | null;
+  controllerError: number | null;
+  intervalSeconds: number | null;
+}
+
+export interface PublishedHistoryResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  since: string;
+  records: PublishedHistoryRecord[];
+}
+
+export function isValidHistoryRecord(record: unknown): record is PublishedHistoryRecord {
+  if (typeof record !== "object" || record === null) return false;
+  const r = record as Record<string, unknown>;
+  return (
+    (r.scope === "provider" || r.scope === "model") &&
+    typeof r.kind === "string" &&
+    typeof r.label === "string" &&
+    typeof r.observedAt === "string" &&
+    typeof r.percentLeft === "number" &&
+    (r.resetAtIso === null || typeof r.resetAtIso === "string") &&
+    (r.controllerError === null || typeof r.controllerError === "number") &&
+    (r.intervalSeconds === null || typeof r.intervalSeconds === "number")
+  );
 }
 
 export type QuotaCoordinatorErrorCode =

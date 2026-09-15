@@ -1,10 +1,15 @@
 import http from "node:http";
+import type { ProviderPacer } from "../actor/provider-pacer.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
+  HISTORY_WINDOW_MS,
+  isValidHistoryRecord,
+  type PublishedHistoryRecord,
   type PublishedThrottleColdResponse,
   type PublishedThrottleCollectionResponse,
+  type PublishedThrottleProviderStatus,
   type PublishedThrottleResponse,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
@@ -100,9 +105,82 @@ function isValidCollectionThrottlePayload(body: unknown): boolean {
   return true;
 }
 
+/**
+ * Apply a published throttle status to a ProviderPacer: sets the pacer's interval
+ * in milliseconds and defers until exhaustedUntil when expired.
+ */
+export function applyThrottleStatusToPacer(
+  pacer: ProviderPacer,
+  status: PublishedThrottleProviderStatus | PublishedThrottleResponse
+): void {
+  pacer.setInterval(status.intervalSeconds * 1000);
+  if (status.expired && status.exhaustedUntil) {
+    const deferTargetMs = Date.parse(status.exhaustedUntil);
+    if (!Number.isNaN(deferTargetMs)) {
+      pacer.deferUntil(deferTargetMs);
+    }
+  }
+}
+
+/**
+ * Determine the initial pacer interval in seconds. When quota throttling is disabled,
+ * pacers remain unpaced (0). When throttling is enabled, pacers start with the
+ * client's last applied interval (which evaluates to maxIntervalSeconds at cold start per Rule 0),
+ * or maxIntervalSeconds when no client is present.
+ */
+export function initialPacerIntervalSeconds(
+  quotaThrottleEnabled: boolean,
+  client: Pick<QuotaCoordinatorClient, "getLastAppliedInterval"> | null | undefined,
+  provider: string,
+  maxIntervalSeconds?: number
+): number {
+  if (!quotaThrottleEnabled) {
+    return 0;
+  }
+  if (client) {
+    return client.getLastAppliedInterval(provider);
+  }
+  return maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
+}
+
+/**
+ * Reconcile each configured provider's ProviderPacer interval from the coordinator client's
+ * last applied interval (which preserves the last reasoned interval during an outage or cold lane,
+ * and widens past hardStaleAfterMs to maxIntervalSeconds per §5.7 Rule 2).
+ *
+ * Only calls setInterval when the target interval differs from the pacer's current interval.
+ * When setInterval is called, any retained published exhaustedUntil deferral is reapplied so
+ * that hard-stale widening or interval changes do not clobber an active exhaustion gate.
+ */
+export function reconcileProviderPacersFromClient(
+  pacerFor: (
+    provider: string
+  ) => Pick<ProviderPacer, "setInterval" | "interval"> & Partial<Pick<ProviderPacer, "deferUntil">>,
+  providers: readonly string[],
+  client: Pick<QuotaCoordinatorClient, "getLastAppliedInterval"> &
+    Partial<Pick<QuotaCoordinatorClient, "getLastPublishedStatus">>
+): void {
+  for (const provider of providers) {
+    const pacer = pacerFor(provider);
+    const targetIntervalMs = client.getLastAppliedInterval(provider) * 1000;
+    if (pacer.interval !== targetIntervalMs) {
+      pacer.setInterval(targetIntervalMs);
+      const status = client.getLastPublishedStatus?.(provider);
+      if (status?.expired && status.exhaustedUntil) {
+        const deferTargetMs = Date.parse(status.exhaustedUntil);
+        if (!Number.isNaN(deferTargetMs)) {
+          pacer.deferUntil?.(deferTargetMs);
+        }
+      }
+    }
+  }
+}
+
 export class QuotaCoordinatorClient {
   private lastAppliedIntervals: Map<string, number> = new Map();
   private lastSuccessfulReadMs: Map<string, number> = new Map();
+  private lastPublishedStatuses: Map<string, PublishedThrottleProviderStatus> = new Map();
+  private historyCache: Map<string, readonly PublishedHistoryRecord[]> = new Map();
   private serviceConnected = false;
   private nextReadAllowedAtMs = 0;
   private reconnectBackoffMs = RECONNECT_BACKOFF_MIN_MS;
@@ -143,6 +221,29 @@ export class QuotaCoordinatorClient {
     }
 
     return lastApplied;
+  }
+
+  /**
+   * Returns the most recently published throttle provider status received from
+   * a successful coordinator response, if any.
+   */
+  getLastPublishedStatus(provider: string): PublishedThrottleProviderStatus | undefined {
+    return this.lastPublishedStatuses.get(provider);
+  }
+
+  /**
+   * Return the cached history records for a provider, optionally filtered by sinceIso.
+   * Synchronous accessor matching the QuotaApiDeps listHistory signature.
+   */
+  getCachedHistory(provider: string, sinceIso?: string): readonly PublishedHistoryRecord[] {
+    const cached = this.historyCache.get(provider) ?? [];
+    if (!sinceIso) return cached;
+    const sinceMs = Date.parse(sinceIso);
+    if (Number.isNaN(sinceMs)) return cached;
+    return cached.filter((record) => {
+      const observedMs = Date.parse(record.observedAt);
+      return !Number.isNaN(observedMs) && observedMs >= sinceMs;
+    });
   }
 
   /**
@@ -329,6 +430,109 @@ export class QuotaCoordinatorClient {
     });
   }
 
+  /**
+   * Fetch published history for a provider from the coordinator service via GET /v1/history.
+   * Treats history failures as null without replacing the existing cache entry on transport,
+   * timeout, HTTP non-200, JSON parse, protocolMajor mismatch, identity mismatch, or invalid shape.
+   * [] is reserved for a valid empty response.
+   */
+  async getHistory(
+    provider: string,
+    since?: string
+  ): Promise<readonly PublishedHistoryRecord[] | null> {
+    const query = new URLSearchParams({ provider });
+    const effectiveSince = since ?? new Date(this.nowMs() - HISTORY_WINDOW_MS).toISOString();
+    query.set("since", effectiveSince);
+    const path = `/v1/history?${query.toString()}`;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout | undefined;
+
+      const finish = (value: readonly PublishedHistoryRecord[] | null): void => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) {
+          clearTimeout(deadlineTimer);
+        }
+        resolve(value);
+      };
+
+      const fail = (err: unknown): void => {
+        this.options.logger?.warn(
+          `[quota-client] Coordinator history read failed for ${path}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        finish(null);
+      };
+
+      const req = http.request(
+        {
+          socketPath: this.options.socketPath,
+          path,
+          method: "GET",
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("error", fail);
+          res.on("end", () => {
+            if (res.statusCode !== 200) {
+              fail(new Error(`Non-200 status code: ${res.statusCode}`));
+              return;
+            }
+
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+              validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
+            } catch (err) {
+              fail(err);
+              return;
+            }
+
+            if (
+              typeof parsed !== "object" ||
+              parsed === null ||
+              !("provider" in parsed) ||
+              (parsed as { provider: unknown }).provider !== provider ||
+              !("records" in parsed) ||
+              !Array.isArray((parsed as { records: unknown }).records)
+            ) {
+              fail(new Error("Invalid history response envelope or provider mismatch"));
+              return;
+            }
+
+            const records = (parsed as { records: unknown[] }).records;
+            for (const r of records) {
+              if (!isValidHistoryRecord(r)) {
+                fail(new Error("Invalid history record shape"));
+                return;
+              }
+            }
+
+            const validRecords = records as PublishedHistoryRecord[];
+            this.historyCache.set(provider, validRecords);
+            finish(validRecords);
+          });
+        }
+      );
+
+      req.on("error", fail);
+
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`coordinator history read timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      deadlineTimer.unref?.();
+
+      req.end();
+    });
+  }
+
   private nowMs(): number {
     return this.options.now ? this.options.now() : Date.now();
   }
@@ -343,6 +547,9 @@ export class QuotaCoordinatorClient {
       const interval = (body as { intervalSeconds: number }).intervalSeconds;
       this.lastAppliedIntervals.set(provider, interval);
       this.lastSuccessfulReadMs.set(provider, this.nowMs());
+      if ("buckets" in body && Array.isArray((body as { buckets: unknown }).buckets)) {
+        this.lastPublishedStatuses.set(provider, body as PublishedThrottleProviderStatus);
+      }
       return true;
     }
 
