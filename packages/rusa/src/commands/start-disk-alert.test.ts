@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
+import type { Logger } from "../observability/logger.js";
 import type { DurableEventDelivery } from "../runtime/event-manager.js";
 import { configuredRootEventSources, deliverHostAlarm, diskAlertUncovered } from "./start.js";
 
@@ -94,5 +95,55 @@ describe("deliverHostAlarm", () => {
       sendToErrorChat: null,
     });
     expect(outcome).toBe("dropped");
+  });
+
+  it("falls back to errorChat and logs when mesh delivery rejects", async () => {
+    const sent: string[] = [];
+    const logged: Array<{ event: string; fields?: unknown }> = [];
+    const mockLog = {
+      warn: (event: string, fields?: unknown) => logged.push({ event, fields }),
+    } as unknown as Logger;
+    const deliveryError = new Error("disk full: SQLITE_FULL");
+
+    const outcome = await deliverHostAlarm({
+      deliver: async () => {
+        throw deliveryError;
+      },
+      message: "disk is full",
+      sendToErrorChat: (text) => sent.push(text),
+      log: mockLog,
+    });
+    expect(outcome).toBe("errorChat");
+    expect(sent).toEqual(["disk is full"]);
+    expect(logged).toEqual([
+      {
+        event: "disk_alert_delivery_failed",
+        fields: { err: deliveryError },
+      },
+    ]);
+  });
+
+  it("reports a drop when mesh delivery rejects and there is no errorChat", async () => {
+    const logged: Array<{ event: string; fields?: unknown }> = [];
+    const mockLog = {
+      warn: (event: string, fields?: unknown) => logged.push({ event, fields }),
+    } as unknown as Logger;
+    const deliveryError = new Error("disk full: SQLITE_FULL");
+
+    const outcome = await deliverHostAlarm({
+      deliver: async () => {
+        throw deliveryError;
+      },
+      message: "disk is full",
+      sendToErrorChat: null,
+      log: mockLog,
+    });
+    expect(outcome).toBe("dropped");
+    expect(logged).toEqual([
+      {
+        event: "disk_alert_delivery_failed",
+        fields: { err: deliveryError },
+      },
+    ]);
   });
 });

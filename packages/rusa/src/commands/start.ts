@@ -434,16 +434,28 @@ export type HostAlarmOutcome = "delivered" | "errorChat" | "dropped";
 
 /**
  * Raise a host-level alarm through the mesh, falling back to a direct error-chat
- * send when the delivery lands in nobody's inbox. A full disk is precisely the
- * condition under which mesh routing may already be degraded, so the alarm keeps
- * the pre-mesh direct send as its floor rather than trusting routing (#481).
+ * send when the delivery lands in nobody's inbox or when mesh delivery rejects.
+ * A full disk is precisely the condition under which mesh routing and persistence
+ * may already be degraded, so the alarm keeps the pre-mesh direct send as its
+ * floor rather than trusting routing (#481).
  */
 export async function deliverHostAlarm(opts: {
   deliver: () => Promise<DurableEventDelivery>;
   message: string;
   sendToErrorChat: ((text: string) => void) | null;
+  log?: Logger;
 }): Promise<HostAlarmOutcome> {
-  const delivery = await opts.deliver();
+  let delivery: DurableEventDelivery;
+  try {
+    delivery = await opts.deliver();
+  } catch (error) {
+    opts.log?.warn("disk_alert_delivery_failed", {
+      err: error,
+    });
+    if (!opts.sendToErrorChat) return "dropped";
+    opts.sendToErrorChat(opts.message);
+    return "errorChat";
+  }
   if (delivery.entries.length > 0) return "delivered";
   if (!opts.sendToErrorChat) return "dropped";
   opts.sendToErrorChat(opts.message);
@@ -3851,6 +3863,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             }),
           message: event.message,
           sendToErrorChat,
+          log,
         });
         if (outcome !== "delivered") {
           log.warn("disk_alert_not_delivered_to_mesh", {
