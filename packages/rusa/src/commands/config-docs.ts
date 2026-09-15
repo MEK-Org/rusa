@@ -91,12 +91,12 @@ Minimal example:
   #       voiceConfig:
   #         schemaVersion: 1
   #         provider: elevenlabs
-  #         config: { voiceId: G17SuINrv2H9FC6nvetn }
+  #         config: { voiceId: YOUR_VOICE_ID_1 }
   #     - label: Valentino
   #       voiceConfig:
   #         schemaVersion: 1
   #         provider: elevenlabs
-  #         config: { voiceId: SMRMz7WpPUV6i2myuniv }
+  #         config: { voiceId: YOUR_VOICE_ID_2 }
   #   ttsModel: gemini-3.1-flash-tts-preview
   #   voiceName: Laomedeia
 
@@ -125,15 +125,16 @@ Top-level fields:
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
-  geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
+  geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill, Google speech); each skips gracefully when absent.
+  elevenlabsApiKey         Optional. Enables ElevenLabs walkie-talkie transcription and actor speech.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
   rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
                            root-actor.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
-  voice                    Optional. Walkie-talkie transcription/TTS model and voice overrides .
-                           The feature is enabled by geminiApiKey; this section only tunes it.
+  voice                    Optional. Walkie-talkie transcription and actor speech settings.
+                           Enabled by geminiApiKey (for Google) or elevenlabsApiKey (for ElevenLabs).
   invocationDebug          Optional. Full invocation artifact capture controls.
   observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).

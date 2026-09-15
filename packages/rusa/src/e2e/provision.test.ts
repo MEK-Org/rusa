@@ -97,7 +97,7 @@ describe("buildE2EConfig", () => {
             voiceConfig: {
               schemaVersion: 1,
               provider: "elevenlabs",
-              config: { voiceId: "G17SuINrv2H9FC6nvetn" },
+              config: { voiceId: "YOUR_VOICE_ID" },
             },
           },
         ],
@@ -109,9 +109,11 @@ describe("buildE2EConfig", () => {
     expect(Object.keys(config.providers)).toEqual(["claude", "codex", "fake"]);
     expect(config.providers.fake?.cliCommand).toBe("fake");
     expect(config.geminiApiKey).toBe("base-key-123");
-    expect(config.elevenlabsApiKey).toBe("elevenlabs-test-key");
-    expect(config.voice).toEqual(base.voice);
-    expect(config.voice).not.toBe(base.voice);
+    expect(config.elevenlabsApiKey).toBeUndefined();
+    expect(config.voice).toEqual({
+      transcriptionProvider: "elevenlabs",
+      supportedVoices: base.voice?.supportedVoices,
+    });
   });
 });
 

@@ -16,7 +16,7 @@ export interface SupportedVoice extends VoiceDefinition {
 
 const PROVIDER_LABELS: Record<VoiceConfigDocument["provider"], string> = {
   google: "Gemini",
-  elevenlabs: "Elevenlabs",
+  elevenlabs: "ElevenLabs",
 };
 
 /** Validate and canonicalize before duplicate detection or storing a configured pool. */
@@ -38,14 +38,24 @@ export function parseVoiceDefinitions(value: unknown): VoiceDefinition[] {
 
 /** Built-ins plus configured choices. A configured label overrides the built-in label. */
 export function buildSupportedVoiceCatalog(
-  configured: readonly VoiceDefinition[] = []
+  configured: readonly VoiceDefinition[] = [],
+  options?: {
+    availableProviders?: readonly VoiceConfigDocument["provider"][];
+  }
 ): SupportedVoice[] {
+  const available = options?.availableProviders ? new Set(options.availableProviders) : null;
   const entries = new Map<string, SupportedVoice>();
-  const builtins = SUPPORTED_TTS_VOICES.map((name) => ({
-    label: name,
-    voiceConfig: googleVoiceConfig(name),
-  }));
+  const builtins =
+    available === null || available.has("google")
+      ? SUPPORTED_TTS_VOICES.map((name) => ({
+          label: name,
+          voiceConfig: googleVoiceConfig(name),
+        }))
+      : [];
   for (const voice of [...builtins, ...configured]) {
+    if (available !== null && !available.has(voice.voiceConfig.provider)) {
+      continue;
+    }
     entries.set(JSON.stringify(voice.voiceConfig), {
       ...voice,
       providerLabel: PROVIDER_LABELS[voice.voiceConfig.provider],

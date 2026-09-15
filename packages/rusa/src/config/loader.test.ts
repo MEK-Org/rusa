@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { providerThrottleKey } from "../providers/registry.js";
 import { loadConfig } from "./loader.js";
+import { ELEVENLABS_API_KEY_SECRET_FILENAME } from "./secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
 function writeConfig(overrides: Record<string, unknown> = {}): string {
@@ -191,10 +192,21 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     writeFileSync(join(dir, name), value, { mode: 0o600 });
   }
 
-  it("loads the ElevenLabs host secret ahead of the inline key", () => {
+  it("loads the ElevenLabs host secret ahead of the inline key and warns about the duplicate", () => {
     const home = writeConfig({ elevenlabsApiKey: "inline-key" });
-    writeSecret(home, "elevenlabs-api-key", "  file-key  ");
-    expect(loadConfig(home).elevenlabsApiKey).toBe("file-key");
+    writeSecret(home, ELEVENLABS_API_KEY_SECRET_FILENAME, "  file-key  ");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const config = loadConfig(home);
+    expect(config.elevenlabsApiKey).toBe("file-key");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/elevenlabsApiKey.*secrets file wins/)
+    );
+    for (const call of warnSpy.mock.calls) {
+      expect(String(call[0])).not.toContain("file-key");
+      expect(String(call[0])).not.toContain("inline-key");
+    }
+    warnSpy.mockRestore();
   });
 
   it("secrets/gemini-api-key wins over the inline geminiApiKey (trimmed) and warns about the duplicate", () => {

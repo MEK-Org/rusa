@@ -11,6 +11,7 @@ import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js"
 import { parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 import {
+  ELEVENLABS_API_KEY_SECRET_FILENAME,
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
   readHostSecret,
@@ -694,7 +695,15 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * migration nudge to remove the inline copy.
  */
 function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
-  parsed.elevenlabsApiKey = readHostSecret("elevenlabs-api-key", mcHome) ?? parsed.elevenlabsApiKey;
+  const fileElevenLabsKey = readHostSecret(ELEVENLABS_API_KEY_SECRET_FILENAME, mcHome);
+  if (fileElevenLabsKey) {
+    if (parsed.elevenlabsApiKey) {
+      console.warn(
+        `[config] elevenlabsApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${ELEVENLABS_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
+      );
+    }
+    parsed.elevenlabsApiKey = fileElevenLabsKey;
+  }
   const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
   if (fileGeminiKey) {
     if (parsed.geminiApiKey) {

@@ -203,7 +203,7 @@ describe("handleMeshApiRequest", () => {
       { label: "Puck", providerLabel: "Gemini", voiceConfig: googleVoiceConfig("Puck") },
       {
         label: "Valentino",
-        providerLabel: "Elevenlabs",
+        providerLabel: "ElevenLabs",
         voiceConfig: {
           schemaVersion: 1 as const,
           provider: "elevenlabs" as const,

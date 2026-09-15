@@ -76,8 +76,18 @@ export function buildE2EConfig(opts: {
       fake: { cliCommand: "fake" },
     },
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
-    ...(base?.elevenlabsApiKey ? { elevenlabsApiKey: base.elevenlabsApiKey } : {}),
-    ...(base?.voice ? { voice: structuredClone(base.voice) } : {}),
+    ...(base?.voice?.supportedVoices || base?.voice?.transcriptionProvider
+      ? {
+          voice: {
+            ...(base.voice.transcriptionProvider
+              ? { transcriptionProvider: base.voice.transcriptionProvider }
+              : {}),
+            ...(base.voice.supportedVoices
+              ? { supportedVoices: structuredClone(base.voice.supportedVoices) }
+              : {}),
+          },
+        }
+      : {}),
     // Required by the schema; the e2e instance never starts a webhook server.
     webhook: { port: 0, secret: "" },
     dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },

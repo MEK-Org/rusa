@@ -57,8 +57,54 @@ describe("voice provider routing", () => {
     };
     await expect(service.handleMeshEvent(event)).rejects.toThrow("elevenlabs render");
     expect(clients.elevenlabs.streamSynthesize).toHaveBeenCalledWith("Hello", "my-voice");
-    config = { schemaVersion: 1, provider: "google", config: { voiceName: "Puck" } };
+    config = { schemaVersion: 1, provider: "google", config: { voiceName: "puck" } };
     await expect(service.handleMeshEvent(event)).rejects.toThrow("google render");
     expect(clients.google.streamSynthesize).toHaveBeenCalledWith("Hello", "Puck");
+  });
+
+  it("falls back default and Google voices to ElevenLabs pool when Google key is missing", async () => {
+    let config: VoiceConfigDocument | undefined = {
+      schemaVersion: 1,
+      provider: "google",
+      config: { voiceName: "Puck" },
+    };
+    const service = createVoiceService({
+      home: "/unused",
+      apiKey: "",
+      elevenlabsApiKey: "eleven-key",
+      voiceConfigFor: () => config,
+      voice: {
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "chris-voice-id" },
+            },
+          },
+        ],
+      },
+    });
+    service.presenceConnect(["actor"]);
+    clients.elevenlabs.streamSynthesize.mockRejectedValue(new Error("elevenlabs render"));
+    const event = {
+      id: "event",
+      ts: "now",
+      kind: "message_sent",
+      actorId: "actor",
+      detail: null,
+      body: "Hello",
+      payload: JSON.stringify({ to: "human:operator" }),
+      success: null,
+    };
+    // Legacy/pre-migration actor with Google voice falls back to ElevenLabs pool
+    await expect(service.handleMeshEvent(event)).rejects.toThrow("elevenlabs render");
+    expect(clients.elevenlabs.streamSynthesize).toHaveBeenCalledWith("Hello", "chris-voice-id");
+
+    // Unset actor voice (instance default) also falls back to ElevenLabs pool
+    config = undefined;
+    await expect(service.handleMeshEvent(event)).rejects.toThrow("elevenlabs render");
+    expect(clients.elevenlabs.streamSynthesize).toHaveBeenLastCalledWith("Hello", "chris-voice-id");
   });
 });

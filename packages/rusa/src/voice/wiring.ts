@@ -10,6 +10,7 @@ import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { createElevenLabsSpeechClient } from "./elevenlabs-speech.js";
 import { createGeminiSpeechClient } from "./gemini-speech.js";
+import { canonicalSupportedVoiceName } from "./tts-voices.js";
 import type { VoiceConfigDocument } from "./voice-config.js";
 import { toFrame, type VoiceAnnouncementFrame, VoiceService } from "./voice-service.js";
 
@@ -20,12 +21,6 @@ export function createVoiceService(options: {
   elevenlabsApiKey?: string;
   voiceConfigFor?: (actorId: string) => VoiceConfigDocument | undefined;
   voice?: VoiceConfig;
-  /**
-   * Per-actor voice lookup, consulted before each reply's synthesis. The
-   * caller resolves it against the actor repository; undefined keeps the
-   * instance-wide configured default.
-   */
-  voiceNameFor?: (actorId: string) => string | undefined;
   onSessionEnded?: (actorId: string) => void;
   logger?: Logger;
 }): VoiceService {
@@ -52,15 +47,43 @@ export function createVoiceService(options: {
     speech: { ...google, transcribe: transcription.transcribe },
     speechFor: (actorId) => {
       const config = options.voiceConfigFor?.(actorId);
-      if (config?.provider === "elevenlabs")
+      if (config?.provider === "elevenlabs") {
         return { speech: elevenlabs, voiceName: config.config.voiceId };
-      if (!options.apiKey.trim())
+      }
+      if (config?.provider === "google") {
+        if (options.apiKey.trim()) {
+          return {
+            speech: google,
+            voiceName: canonicalSupportedVoiceName(config.config.voiceName),
+          };
+        }
+        // Fall back to configured ElevenLabs voice pool if Google key is not configured
+        const fallback = options.voice?.supportedVoices?.find(
+          (v) => v.voiceConfig.provider === "elevenlabs"
+        );
+        if (fallback?.voiceConfig.provider === "elevenlabs" && options.elevenlabsApiKey?.trim()) {
+          return { speech: elevenlabs, voiceName: fallback.voiceConfig.config.voiceId };
+        }
         throw new Error(
           "Google TTS: geminiApiKey is not configured; select an ElevenLabs actor voice"
         );
-      return { speech: google, voiceName: config?.config.voiceName };
+      }
+      // Instance default (actor has no stored voiceConfig or null)
+      if (options.apiKey.trim()) {
+        return { speech: google, voiceName: options.voice?.voiceName };
+      }
+      if (options.elevenlabsApiKey?.trim()) {
+        const defaultVoice = options.voice?.supportedVoices?.find(
+          (v) => v.voiceConfig.provider === "elevenlabs"
+        );
+        if (defaultVoice?.voiceConfig.provider === "elevenlabs") {
+          return { speech: elevenlabs, voiceName: defaultVoice.voiceConfig.config.voiceId };
+        }
+      }
+      throw new Error(
+        "Google TTS: geminiApiKey is not configured; select an ElevenLabs actor voice"
+      );
     },
-    voiceNameFor: options.voiceNameFor,
     onSessionEnded: options.onSessionEnded,
     logger: options.logger,
   });

@@ -241,7 +241,6 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
-import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog } from "../voice/voice-catalog.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
@@ -3333,31 +3332,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Walkie-talkie routes require the selected transcription provider key.
   // Speech provider keys stay on the host. Actor TTS is selected per reply.
   const geminiApiKey = config.geminiApiKey?.trim();
-  voiceService = (
-    config.voice?.transcriptionProvider === "elevenlabs"
+  voiceService =
+    !e2eMode &&
+    (config.voice?.transcriptionProvider === "elevenlabs"
       ? config.elevenlabsApiKey?.trim()
-      : geminiApiKey
-  )
-    ? createVoiceService({
-        home: mcHome,
-        apiKey: geminiApiKey ?? "",
-        elevenlabsApiKey: config.elevenlabsApiKey,
-        voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
-        voice: config.voice,
-        // Per-actor voice for reply TTS: the actor's persisted voice_config,
-        // validated against the supported catalog, else the instance-wide
-        // default. Resolved fresh per reply so a dashboard edit takes effect
-        // on the actor's very next spoken reply.
-        voiceNameFor: (actorId) => {
-          const voiceConfig = actors.get(actorId)?.voiceConfig;
-          const voiceName =
-            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
-          return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
-        },
-        onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
-        logger: log.child({ component: "voice-session" }),
-      })
-    : null;
+      : geminiApiKey)
+      ? createVoiceService({
+          home: mcHome,
+          apiKey: geminiApiKey ?? "",
+          elevenlabsApiKey: config.elevenlabsApiKey,
+          voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
+          voice: config.voice,
+          onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
+          logger: log.child({ component: "voice-session" }),
+        })
+      : null;
   const dashboardServer = shouldBindDashboardServer({
     e2eMode,
     e2eDashboard: opts?.e2e?.dashboard === true,
@@ -3429,7 +3418,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
-          supportedVoices: buildSupportedVoiceCatalog(config.voice?.supportedVoices),
+          supportedVoices: buildSupportedVoiceCatalog(
+            config.voice?.supportedVoices,
+            e2eMode
+              ? undefined
+              : {
+                  availableProviders: [
+                    ...(geminiApiKey ? ["google" as const] : []),
+                    ...(config.elevenlabsApiKey?.trim() ? ["elevenlabs" as const] : []),
+                  ],
+                }
+          ),
           getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated

@@ -27,13 +27,13 @@ voice:
         schemaVersion: 1
         provider: elevenlabs
         config:
-          voiceId: G17SuINrv2H9FC6nvetn
+          voiceId: YOUR_VOICE_ID_1
     - label: Valentino
       voiceConfig:
         schemaVersion: 1
         provider: elevenlabs
         config:
-          voiceId: SMRMz7WpPUV6i2myuniv
+          voiceId: YOUR_VOICE_ID_2
     # The same pool can contain Gemini voices:
     # - label: Achernar
     #   voiceConfig:
@@ -43,22 +43,24 @@ voice:
     #       voiceName: Achernar
 ```
 
-These labels appear in the actor's **Info → Voice** dropdown. New actors randomly
-receive a voice from this pool. Existing actors retain their current settings;
-choosing another voice takes effect on the next reply. An omitted or empty pool
-keeps Google's existing random assignment. Google voices and **Instance default**
-remain available in the dropdown. Previously saved IDs remain displayed even if
-removed from the pool.
+These labels appear in the actor's **Info → Voice** dropdown. When configured, new
+actors randomly receive a voice from this pool, restricting spawn selection to the
+configured roster so that newly spawned actors only receive voices matching available
+credentials. Existing actors retain their current settings; choosing another voice
+takes effect on the next reply. An omitted or empty pool keeps Google's existing random
+assignment across built-in voices. In the dashboard dropdown, configured choices appear
+alongside built-in voices for available credentials (and **Instance default**).
+Previously saved IDs remain displayed even if removed from the pool.
 
 The dashboard snapshot has one `supportedVoices` catalog for all providers. Each
 entry contains `label`, `providerLabel`, and `voiceConfig`. Built-in Gemini voices
-are included automatically; a configured entry for the same document overrides
-its label. Actor selections and PATCH requests use that `voiceConfig` document
-unchanged, so labels are never used as provider voice IDs. Adding a provider
-requires its voice schema, display label, and speech adapter; the dashboard API,
-store, dropdown, and actor assignment do not need additional provider fields.
-The instance default is Google, so it still requires `geminiApiKey`; with only an
-ElevenLabs key, select an ElevenLabs voice for each actor you speak with.
+are included automatically when Google credentials are configured; a configured entry
+for the same document overrides its label. Actor selections and PATCH requests use
+that `voiceConfig` document unchanged, so labels are never used as provider voice IDs.
+Adding a provider requires its voice schema, display label, and speech adapter; the
+dashboard API, store, dropdown, and actor assignment do not need additional provider
+fields. The instance default is Google; on an ElevenLabs-only instance without
+`geminiApiKey`, reply synthesis falls back to the configured ElevenLabs voice pool.
 
 Optional TTS model override:
 
