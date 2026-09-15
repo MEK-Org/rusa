@@ -174,6 +174,7 @@ export class FakeIssueClient implements IssueClient {
         createdAt: issue.createdAt,
         updatedAt: issue.updatedAt,
         isPullRequest: false,
+        draft: false,
       })),
       ...this.tracker.listPrs().map((pr) => ({
         number: pr.number,
@@ -184,6 +185,7 @@ export class FakeIssueClient implements IssueClient {
         createdAt: pr.createdAt,
         updatedAt: pr.updatedAt,
         isPullRequest: true,
+        draft: pr.draft,
       })),
     ].filter((record) => record.updatedAt > since);
   }
@@ -224,6 +226,7 @@ export class FakeIssueClient implements IssueClient {
         createdAt: issue.createdAt,
         updatedAt: issue.updatedAt,
         isPullRequest: false,
+        draft: false,
       };
     }
     const pr = this.tracker.getPr(issueNumber);
@@ -237,6 +240,7 @@ export class FakeIssueClient implements IssueClient {
       createdAt: pr.createdAt,
       updatedAt: pr.updatedAt,
       isPullRequest: true,
+      draft: pr.draft,
     };
   }
 

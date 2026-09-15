@@ -152,6 +152,7 @@ describe("GitHubEventPoller", () => {
       createdAt: "2026-07-02T00:00:00.000Z",
       updatedAt: "2026-07-03T00:00:00.000Z",
       isPullRequest: false,
+      draft: false,
     });
     const events: Array<[string, Record<string, unknown>]> = [];
 
@@ -206,6 +207,7 @@ describe("GitHubEventPoller", () => {
       createdAt: "2026-07-02T00:00:00.000Z",
       updatedAt: "2026-07-03T00:00:00.000Z",
       isPullRequest: true,
+      draft: false,
     });
     const events: Array<[string, Record<string, unknown>]> = [];
 
@@ -238,6 +240,7 @@ describe("GitHubEventPoller", () => {
         createdAt: "2026-07-03T00:00:00.000Z",
         updatedAt: "2026-07-03T00:01:00.000Z",
         isPullRequest: true,
+        draft: false,
       },
       {
         number: 10,
@@ -275,12 +278,69 @@ describe("GitHubEventPoller", () => {
       },
     });
     // Draft state rides along so a polled draft opening is held exactly like
-    // the webhook form; a record without it stays shaped as before.
-    expect((events[0][1].pull_request as Record<string, unknown>).draft).toBeUndefined();
+    // the webhook form.
+    expect((events[0][1].pull_request as Record<string, unknown>).draft).toBe(false);
     expect(events[1][1]).toMatchObject({
       action: "opened",
       pull_request: { number: 10, draft: true },
     });
+  });
+
+  it("synthesizes ready_for_review when a polled draft PR later reports not-draft", async () => {
+    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
+    const client = new MockPollIssueClient();
+    const statePath = join(home, "poller-state.json");
+    const draftRecord: PollIssueOrPullRequest = {
+      number: 11,
+      title: "Draft then ready",
+      body: "body",
+      author: "mock-bot",
+      state: "open",
+      createdAt: "2026-07-03T00:00:00.000Z",
+      updatedAt: "2026-07-03T00:00:00.000Z",
+      isPullRequest: true,
+      draft: true,
+    };
+    client.issues = [draftRecord];
+    const events: Array<[string, Record<string, unknown>]> = [];
+    const poller = (): GitHubEventPoller =>
+      new GitHubEventPoller({
+        repos: ["dummy-org/dummy-repo"],
+        home,
+        statePath,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (event, payload) => {
+          events.push([event, payload]);
+        },
+      });
+
+    await poller().pollOnce();
+    // The draft opening is held at the PR: opened, carrying draft.
+    expect(events).toHaveLength(1);
+    expect(events[0][1]).toMatchObject({
+      action: "opened",
+      pull_request: { number: 11, draft: true },
+    });
+
+    // The next poll sees the same PR no longer a draft. Polling reports state,
+    // not transitions, so the remembered draft is what makes this the
+    // ready_for_review that climbs to the repo owner rather than a plain edit.
+    client.issues = [{ ...draftRecord, draft: false, updatedAt: "2026-07-03T00:05:00.000Z" }];
+    await poller().pollOnce();
+    expect(events).toHaveLength(2);
+    expect(events[1][1]).toMatchObject({
+      action: "ready_for_review",
+      pull_request: { number: 11, draft: false },
+    });
+    expect(deriveGitHubInboxNotification(events[1][0], events[1][1])?.payload).toEqual({
+      type: "pull_request.ready_for_review",
+    });
+
+    // Once ready, an ordinary later update is an edit again.
+    client.issues = [{ ...draftRecord, draft: false, updatedAt: "2026-07-03T00:09:00.000Z" }];
+    await poller().pollOnce();
+    expect(events).toHaveLength(3);
+    expect(events[2][1]).toMatchObject({ action: "edited" });
   });
 
   it("persists watermark and dedupes across restarts", async () => {
@@ -296,6 +356,7 @@ describe("GitHubEventPoller", () => {
         createdAt: "2026-07-03T00:00:00.000Z",
         updatedAt: "2026-07-03T00:01:00.000Z",
         isPullRequest: false,
+        draft: false,
       },
     ];
     const events: Array<[string, Record<string, unknown>]> = [];
@@ -340,6 +401,7 @@ describe("GitHubEventPoller", () => {
         createdAt: "2026-07-03T00:00:00.000Z",
         updatedAt: "2026-07-03T00:10:00.000Z",
         isPullRequest: false,
+        draft: false,
       },
     ];
     client.comments = [
@@ -448,6 +510,7 @@ describe("GitHubEventPoller", () => {
       createdAt: "2026-07-24T00:00:00.000Z",
       updatedAt: "2026-07-24T00:00:00.000Z",
       isPullRequest: false,
+      draft: false,
     });
 
     const bridgeClient = new GitBridgeIssueClient(delegate, { port: 9091 });

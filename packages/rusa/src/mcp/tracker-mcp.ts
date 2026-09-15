@@ -106,7 +106,7 @@ export function createTrackerMcpServer(
     {
       title: "Create or update a pull request",
       description:
-        "Create a PR for the given head branch, or update the existing PR if one already exists for that branch. Returns the PR URL, suffixed with ' (draft)' while the PR is a draft.",
+        "Create a PR for the given head branch, or update the existing PR if one already exists for that branch. Returns the PR URL, followed by a 'draft:' line whenever the PR is a draft after the call.",
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         head: z.string().describe("Feature branch name"),
@@ -170,9 +170,10 @@ export function createTrackerMcpServer(
         if (pr.wasCreated) {
           notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
         }
-        // A ready PR answers with the bare URL exactly as before; only a draft
-        // gains the suffix, so the state is visible without a new result shape.
-        return toolOk(pr.draft ? `${pr.htmlUrl} (draft)` : pr.htmlUrl);
+        // A ready PR answers with the bare URL exactly as before. A draft adds
+        // its state on a second line rather than a suffix, so the first line
+        // stays a whole URL that an actor can quote or paste unchanged.
+        return toolOk(pr.draft ? `${pr.htmlUrl}\ndraft: not yet ready for review` : pr.htmlUrl);
       } catch (err) {
         return toolError(err);
       }

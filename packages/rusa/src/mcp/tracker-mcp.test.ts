@@ -576,7 +576,8 @@ describe("tracker MCP server", () => {
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toBe("https://example.test/pr/1 (draft)");
+    // The URL owns its own line so a pasted result stays a usable link.
+    expect(textOf(res)).toBe("https://example.test/pr/1\ndraft: not yet ready for review");
     const opts = calls.find((call) => call.method === "createPullRequest")
       ?.args[0] as CreatePROptions;
     expect(opts.draft).toBe(true);

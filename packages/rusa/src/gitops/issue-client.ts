@@ -255,8 +255,12 @@ export interface PollIssueOrPullRequest {
   createdAt: string;
   updatedAt: string;
   isPullRequest: boolean;
-  /** Draft state of a polled pull request; absent for issues. */
-  draft?: boolean;
+  /**
+   * Draft state of a polled pull request. GitHub's issues list carries `draft`
+   * on every PR-backed record, so this is a plain boolean: always false for an
+   * issue, and never "unknown" for a PR.
+   */
+  draft: boolean;
 }
 
 export interface PollIssueComment {
@@ -558,19 +562,37 @@ export class GitHubIssueClient implements IssueClient {
     const body = existing ? (opts.existingBody ?? opts.body) : opts.body;
     let pr: CreatedPullRequest;
     if (existing) {
+      // Draft state is not a PATCH field: GitHub only flips it through two
+      // GraphQL mutations keyed by node id. Resolve everything the transition
+      // needs before the PATCH so a missing id fails with nothing applied.
+      const transitionTo =
+        opts.draft !== undefined && opts.draft !== existing.draft ? opts.draft : undefined;
+      const nodeId = existing.nodeId;
+      if (transitionTo !== undefined && !nodeId) {
+        throw new Error(
+          `pull request #${existing.number} has no node id; cannot change its draft state`
+        );
+      }
       // Update the existing PR's title, body, and base (if provided).
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
         title: opts.title,
         body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      // Draft state is not a PATCH field: GitHub only flips it through the two
-      // GraphQL mutations, so the transition runs after the body is final and
-      // the resulting ready_for_review event carries the updated PR.
+      // The transition runs after the body is final so the resulting
+      // ready_for_review event carries the updated PR. A failure here lands
+      // after the PATCH succeeded; the upsert is idempotent, so the caller can
+      // simply re-run it, and the error says so.
       let draft = existing.draft;
-      if (opts.draft !== undefined && opts.draft !== existing.draft) {
-        await this.setPullRequestDraft(existing.nodeId, opts.draft);
-        draft = opts.draft;
+      if (transitionTo !== undefined && nodeId) {
+        try {
+          await this.setPullRequestDraft(nodeId, transitionTo);
+        } catch (err) {
+          throw new Error(
+            `pull request #${existing.number} was updated but could not be ${transitionTo ? "converted to draft" : "marked ready for review"}: ${err instanceof Error ? err.message : String(err)}. Re-running the same call retries the transition.`
+          );
+        }
+        draft = transitionTo;
       }
       pr = { number: existing.number, htmlUrl: existing.htmlUrl, wasCreated: false, draft };
     } else {
@@ -591,7 +613,9 @@ export class GitHubIssueClient implements IssueClient {
         number: created.number,
         htmlUrl: created.html_url,
         wasCreated: true,
-        draft: created.draft === true,
+        // GitHub reports the state on the create response; only a response
+        // that omits it falls back to what was requested (ready by default).
+        draft: created.draft ?? opts.draft ?? false,
       };
     }
 
@@ -631,7 +655,7 @@ export class GitHubIssueClient implements IssueClient {
   private async findOpenPullRequestForHead(
     repo: string,
     head: string
-  ): Promise<{ number: number; htmlUrl: string; draft: boolean; nodeId: string } | null> {
+  ): Promise<{ number: number; htmlUrl: string; draft: boolean; nodeId?: string } | null> {
     try {
       const owner = repo.split("/")[0];
       const prs = await this.api<
@@ -642,12 +666,7 @@ export class GitHubIssueClient implements IssueClient {
       );
       const pr = prs[0];
       return pr
-        ? {
-            number: pr.number,
-            htmlUrl: pr.html_url,
-            draft: pr.draft === true,
-            nodeId: pr.node_id ?? "",
-          }
+        ? { number: pr.number, htmlUrl: pr.html_url, draft: pr.draft === true, nodeId: pr.node_id }
         : null;
     } catch {
       return null;
@@ -656,9 +675,6 @@ export class GitHubIssueClient implements IssueClient {
 
   /** Flip an open PR between draft and ready for review (GraphQL-only on GitHub). */
   private async setPullRequestDraft(pullRequestId: string, draft: boolean): Promise<void> {
-    if (!pullRequestId) {
-      throw new Error("pull request node id missing; cannot change draft state");
-    }
     const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
     await this.graphql(
       `mutation($pullRequestId: ID!) { ${mutation}(input: { pullRequestId: $pullRequestId }) { pullRequest { isDraft } } }`,
@@ -1602,7 +1618,7 @@ function mapPollIssue(issue: PollIssueResponse): PollIssueOrPullRequest {
     createdAt: issue.created_at,
     updatedAt: issue.updated_at,
     isPullRequest,
-    ...(isPullRequest && typeof issue.draft === "boolean" ? { draft: issue.draft } : {}),
+    draft: isPullRequest && issue.draft === true,
   };
 }
 

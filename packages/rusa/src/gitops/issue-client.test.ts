@@ -372,13 +372,34 @@ describe("GitHubIssueClient", () => {
       }
     });
 
-    it("surfaces a failed draft transition rather than reporting the requested state", async () => {
+    it("surfaces a failed draft transition, saying the body update already landed", async () => {
       installFetch({
         [HEAD_LOOKUP]: {
           json: [{ number: 12, html_url: PR_URL, draft: true, node_id: "PR_node12" }],
         },
         [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
         "POST /graphql": { json: { errors: [{ message: "not permitted" }] } },
+      });
+
+      // The PATCH has already succeeded by this point, so the error has to tell
+      // the caller that much and that re-running the idempotent upsert retries.
+      await expect(
+        new GitHubIssueClient().createPullRequest({
+          repo: REPO,
+          head: "mc/issue-9",
+          title: "Ready",
+          body: "Body.",
+          draft: false,
+        })
+      ).rejects.toThrow(
+        /#12 was updated but could not be marked ready for review.*not permitted.*Re-running/s
+      );
+    });
+
+    it("refuses a transition with no node id before touching the PR", async () => {
+      const requests = installFetch({
+        [HEAD_LOOKUP]: { json: [{ number: 12, html_url: PR_URL, draft: true }] },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
       });
 
       await expect(
@@ -389,7 +410,27 @@ describe("GitHubIssueClient", () => {
           body: "Body.",
           draft: false,
         })
-      ).rejects.toThrow("not permitted");
+      ).rejects.toThrow("no node id");
+      // Nothing was half-applied: the lookup is the only request made.
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([HEAD_LOOKUP]);
+    });
+
+    it("falls back to the requested draft state when the create response omits it", async () => {
+      installFetch({
+        [HEAD_LOOKUP]: { json: [] },
+        [`POST /repos/${REPO}/pulls`]: { status: 201, json: { number: 12, html_url: PR_URL } },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Design",
+        body: "Body.",
+        base: "staging",
+        draft: true,
+      });
+
+      expect(pr.draft).toBe(true);
     });
   });
 
