@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
@@ -186,6 +188,7 @@ void main() {
 
         await tester.pumpWidget(
           MaterialApp(
+            theme: buildMeshTheme(),
             home: Scaffold(
               body: WorkTab(store: store, onSelectView: (_) {}),
             ),
@@ -197,12 +200,26 @@ void main() {
 
         final title = find.byKey(const ValueKey('obligation-detail-title'));
         final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final editableRender = tester.allRenderObjects
+            .whereType<RenderEditable>()
+            .where((render) => render.plainText == ob.heading)
+            .single;
         final wideTitleRect = tester.getRect(title);
         final wideActionsRect = tester.getRect(actions);
 
         // The controls are adjacent to the title rather than at the far edge
         // of the wide detail pane.
         expect(wideActionsRect.left, closeTo(wideTitleRect.right + 8, 1));
+        expect(
+          editableRender
+              .getBoxesForSelection(
+                TextSelection(baseOffset: 0, extentOffset: ob.heading.length),
+              )
+              .map((box) => box.top)
+              .toSet(),
+          hasLength(1),
+          reason: 'short title unexpectedly wrapped',
+        );
 
         await tester.binding.setSurfaceSize(const Size(400, 800));
         await tester.pump();
