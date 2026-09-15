@@ -59,10 +59,41 @@ export interface InboxActorWork {
   priority: "normal" | "responsive";
 }
 
-/** Persistence seam. Only markSeen is allowed to write seenAt. */
-export interface InboxStore {
-  /** Append new entries, returning only rows inserted by this call. Duplicate ids are no-ops. */
+/** Listener for rows durably committed by {@link InboxRepository.append}. */
+export type InboxItemsAppendedListener = (items: readonly InboxEntry[]) => void;
+
+/**
+ * Persistence boundary for actor inbox items, alongside `ActorRepository`.
+ * Only markSeen is allowed to write seenAt.
+ *
+ * Invariants the runtime relies on:
+ * 1. Durable storage is the single source of truth about unhandled work.
+ * 2. `onItemsAppended` is an ADVISORY after-commit notification, never the
+ *    source of truth. Dropping one costs latency, not correctness.
+ * 3. Missed notifications (a crash, a restart, a listener registered late)
+ *    are reconciled against durable state via `actorsWithUnhandled()`.
+ */
+export interface InboxRepository {
+  /**
+   * Append new entries, returning only rows inserted by this call. Duplicate
+   * ids are no-ops. Must be called outside any enclosing transaction: the
+   * after-commit notification is only honest once the write is durable.
+   */
   append(entries: InboxAppendInput[]): InboxEntry[];
+  /**
+   * Subscribe to rows that have been durably committed by `append`. The
+   * listener receives only rows actually inserted, so redelivery of an already
+   * known id notifies nobody, and a failed or rolled-back append notifies
+   * nobody. Returns an unsubscribe function.
+   *
+   * Listeners run synchronously inside the appending caller's turn, after the
+   * commit and before that caller's own follow-up (typically the recipient
+   * wake), so the callback must be cheap and non-blocking: hand off async work
+   * without awaiting it. A thrown error is contained and journaled, never
+   * surfaced to the appender. Calling `append` from inside a listener is out of
+   * contract; it re-enters this notification path and is not guarded.
+   */
+  onItemsAppended(listener: InboxItemsAppendedListener): () => void;
   list(actorId: string, options?: InboxListOptions): InboxPage;
   read(actorId: string, entryId: string): InboxEntry | null;
   countUnhandled(actorId: string, options?: { responsiveOnly?: boolean }): number;

@@ -4,7 +4,6 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -27,6 +26,7 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import type { InboxPage, InboxPayload, InboxRepository } from "../repositories/inbox-repository.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
 import { isAuthenticatedOperatorRequest } from "./auth.js";
@@ -45,7 +45,7 @@ export interface DashboardDataDeps {
    * Durable actor inbox. Read-only to the dashboard apart from a single write:
    * the operator clearing an entry the actor should not have to answer (#66).
    */
-  inbox?: InboxStore;
+  inbox?: InboxRepository;
   sseHub: SseHub;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
