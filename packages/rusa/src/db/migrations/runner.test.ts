@@ -103,6 +103,7 @@ describe("Database Migration System", () => {
       "0044_actor_voice_config",
       "0045_obligation_history",
       "0047_actor_experiments",
+      "0048_portable_context_snapshots",
     ]);
 
     const meshEventsColumns = (

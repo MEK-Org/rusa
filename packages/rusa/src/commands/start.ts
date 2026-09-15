@@ -81,10 +81,7 @@ import {
   quarantineCountsByClass,
   resolvePortableContextCompactorModel,
 } from "../actor/portable-context-compactor.js";
-import {
-  FilePortableContextStore,
-  type PortableContextStore,
-} from "../actor/portable-context-state.js";
+import type { PortableContextStore } from "../actor/portable-context-state.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
@@ -129,6 +126,7 @@ import {
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
+import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -896,7 +894,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       impact: "too short to remove from log text; only credential-named fields are redacted",
     });
   }
-  const portableContextStore = new FilePortableContextStore(join(mcHome, "portable-context"));
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();
   const compactorFor = (context: PortableContextConfig): PortableContextCompactor | null => {
@@ -1623,6 +1620,32 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
   }
   const hostJobStore = getRepositories().hostJobs;
+  // Portable-context snapshots are authoritative memory: the ledger item
+  // ids, statuses, priorities, generation counter and `lastFoldedSourceId` in
+  // one were minted by a model fold and cannot be rebuilt from the messages and
+  // run outputs they were folded from. Durable in SQLite; `portable-context/`
+  // is only a legacy source, imported once and then archived.
+  const legacyPortableContextImport = importLegacyPortableContextState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyPortableContextImport.importedSnapshots > 0) {
+    log.info("legacy_portable_context_imported", {
+      snapshots: legacyPortableContextImport.importedSnapshots,
+    });
+  } else if (legacyPortableContextImport.backupFiles.length > 0) {
+    // A source directory still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the snapshots they put back took effect. `warn`, not
+    // `info`: nothing is broken, but memory someone placed there did not become
+    // state, and the backup path is where to find it.
+    log.warn("legacy_portable_context_archived_unread", {
+      backups: legacyPortableContextImport.backupFiles,
+    });
+  }
+  const portableContextStore: PortableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
