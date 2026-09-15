@@ -1,16 +1,31 @@
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { AtIo } from "./at-queue.js";
 import { assertCronExprCanFire } from "./cron-expression.js";
 import type { CrontabMutator } from "./crontab.js";
 
 const DEFAULT_CURL = "/usr/bin/curl";
-const WAKE_TAG_PREFIX = "# mc-wake:";
-// This distinct prefix is intentional: every old `mc-obligation-activation:`
-// tag, including one whose id contains a colon, remains legacy/foreign. A
-// version marker under the old prefix would still be ambiguous with a legal
-// legacy obligation id such as `v1:abc`.
-const SCOPED_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation-instance:v1:";
-const SCOPED_ACTIVATION_END_TAG_PREFIX = "# mc-obligation-activation-instance-end:v1:";
+
+/**
+ * Every tag family this scheduler writes into the crontab or an `at` job.
+ * The instance component is part of the tag's shape, never a per-family
+ * option: {@link instanceTag} is the only constructor, so a family cannot be
+ * written without the identity of the instance that owns it. Unscoped message
+ * tags once let every co-hosted instance sweep every other instance's pending
+ * messages at boot; a new family cannot repeat that by omission.
+ */
+type InstanceTagFamily = "wake" | "obligation-activation" | "message-delivery";
+/** A multi-line cron block is bounded by a start tag and its `-end` twin. */
+type InstanceTagBoundary = "start" | "end";
+const INSTANCE_TAG_VERSION = "v1";
+
+// Pre-scoping tags are legacy and foreign: `# mc-wake:<actorId>`,
+// `# mc-message-delivery:<base64url id>` and the two below. The `-instance`
+// suffix on the scoped prefixes is intentional: a version marker under an old
+// prefix would still be ambiguous with a legal legacy id such as `v1:abc`, so
+// no legacy line can ever parse as a scoped one.
+const LEGACY_WAKE_TAG_PREFIX = "# mc-wake:";
 const LEGACY_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation:";
+const LEGACY_MESSAGE_TAG_PREFIX = "# mc-message-delivery:";
 
 /**
  * The actor-facing recurring-wake slice of the host scheduler.
@@ -78,6 +93,37 @@ export interface OsSchedulerOptions {
   curlPath?: string;
   /** Stable identity supplied by the composition root for activation ownership. */
   instanceId: string;
+  /**
+   * Receives one record per `at` write, removal and enqueue confirmation, and
+   * the boot audit of legacy wake blocks and legacy message jobs. Silent when
+   * omitted.
+   */
+  log?: Logger;
+  /** Clock for judging whether a missing `at` job could already have fired. */
+  now?: () => number;
+}
+
+/** A pre-scoping `# mc-wake:` block this instance found but cannot prove it owns. */
+export interface UnadoptedLegacyWakeBlock {
+  actorId: string;
+  /** The wake-port path the block's job line reads, when it has one. */
+  portFile: string | null;
+  cronExpr: string;
+}
+
+/**
+ * A pre-scoping `# mc-message-delivery:` job found in the shared `at` queue.
+ * No instance owns it after the upgrade: it still fires, but no instance
+ * lists or cancels it.
+ */
+export interface LegacyMessageDeliveryJob {
+  atJobId: string;
+  tag: string;
+  /** The message id the tag encodes, when it decodes cleanly. */
+  messageId: string | null;
+  /** From the job's payload, when it decodes cleanly. */
+  toId: string | null;
+  deliverAt: string | null;
 }
 
 export interface WakeEntry {
@@ -93,38 +139,63 @@ export function isValidActorId(actorId: string): boolean {
 }
 
 /** Encode one tag component so arbitrary legal entity IDs cannot delimit a tag. */
-function encodeActivationTagComponent(value: string): string {
+function encodeTagComponent(value: string): string {
   return Buffer.from(value, "utf8").toString("base64url");
 }
 
 /** Decode only the canonical base64url values emitted by this scheduler. */
-function decodeActivationTagComponent(value: string): string | null {
+function decodeTagComponent(value: string): string | null {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   const decoded = Buffer.from(value, "base64url").toString("utf8");
-  return encodeActivationTagComponent(decoded) === value ? decoded : null;
+  return encodeTagComponent(decoded) === value ? decoded : null;
 }
 
-function scopedActivationTag(instanceId: string, id: string): string {
-  return `${SCOPED_ACTIVATION_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+function instanceTagPrefix(
+  family: InstanceTagFamily,
+  boundary: InstanceTagBoundary = "start"
+): string {
+  return `# mc-${family}-instance${boundary === "end" ? "-end" : ""}:${INSTANCE_TAG_VERSION}:`;
 }
 
-function scopedActivationEndTag(instanceId: string, id: string): string {
-  return `${SCOPED_ACTIVATION_END_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+/** One parsed instance-scoped tag line, from any instance. */
+interface InstanceTagRecord {
+  instanceId: string;
+  id: string;
+}
+
+/**
+ * The single constructor for every OS job tag:
+ * `# mc-<family>-instance[-end]:v1:<base64url instanceId>:<base64url id>`.
+ */
+function instanceTag(
+  family: InstanceTagFamily,
+  instanceId: string,
+  id: string,
+  boundary: InstanceTagBoundary = "start"
+): string {
+  return `${instanceTagPrefix(family, boundary)}${encodeTagComponent(instanceId)}:${encodeTagComponent(id)}`;
+}
+
+/** Parse a line in `family`'s scoped format; legacy and other families yield null. */
+function parseInstanceTag(family: InstanceTagFamily, line: string): InstanceTagRecord | null {
+  const prefix = instanceTagPrefix(family);
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(prefix)) return null;
+  const components = trimmed.slice(prefix.length).split(":");
+  if (components.length !== 2) return null;
+  const instanceId = decodeTagComponent(components[0]);
+  const id = decodeTagComponent(components[1]);
+  return instanceId && id ? { instanceId, id } : null;
 }
 
 function parseObligationActivationTag(line: string): ObligationActivationRecord | null {
-  const trimmed = line.trim();
-  if (trimmed.startsWith(SCOPED_ACTIVATION_TAG_PREFIX)) {
-    const components = trimmed.slice(SCOPED_ACTIVATION_TAG_PREFIX.length).split(":");
-    if (components.length !== 2) return null;
-    const instanceId = decodeActivationTagComponent(components[0]);
-    const id = decodeActivationTagComponent(components[1]);
-    return instanceId && id ? { instanceId, id } : null;
-  }
+  const scoped = parseInstanceTag("obligation-activation", line);
+  if (scoped) return scoped;
 
   // Tags written before scoped ownership are never adopted: a legacy id may
   // contain any delimiter, so it cannot be safely distinguished from a raw
   // instance/id format. Treat it as foreign and leave it untouched.
+  const trimmed = line.trim();
   if (trimmed.startsWith(LEGACY_ACTIVATION_TAG_PREFIX)) {
     const id = trimmed.slice(LEGACY_ACTIVATION_TAG_PREFIX.length).trim();
     return id ? { id } : null;
@@ -135,7 +206,7 @@ function parseObligationActivationTag(line: string): ObligationActivationRecord 
 function activationRecordKey(record: ObligationActivationRecord): string {
   // Length/encoding-safe key: entity IDs permit every delimiter, so raw
   // concatenation could collapse two distinct records during deduplication.
-  return `${record.instanceId === undefined ? "legacy" : "scoped"}:${encodeActivationTagComponent(record.instanceId ?? "")}:${encodeActivationTagComponent(record.id)}`;
+  return `${record.instanceId === undefined ? "legacy" : "scoped"}:${encodeTagComponent(record.instanceId ?? "")}:${encodeTagComponent(record.id)}`;
 }
 
 /** Single-quote a value for a cron command, then escape cron's `%` newline. */
@@ -143,6 +214,11 @@ function quoteForCron(value: string): string {
   const oneLine = value.replace(/[\r\n]+/g, " ");
   const singleQuoted = `'${oneLine.replace(/'/g, "'\\''")}'`;
   return singleQuoted.replace(/%/g, "\\%");
+}
+
+/** The `actorId` form argument of a wake job line, as {@link DefaultOsScheduler.buildWakeJobLine} writes it. */
+function wakeActorArg(actorId: string): string {
+  return `-d ${quoteForCron(`actorId=${actorId}`)}`;
 }
 
 function parseWakeReason(job: string): string {
@@ -159,9 +235,10 @@ function parseWakePriority(job: string): "responsive" | undefined {
 }
 
 /**
- * Thrown when an owned recurrence/message cron block is found truncated or
- * unterminated — a start tag with no matching end marker before EOF or
- * another start tag. This can only mean the block was hand-edited or
+ * Thrown when an owned cron block is found truncated or unterminated — a
+ * start tag with no matching end marker before EOF or another start tag, or
+ * an owned wake tag not followed by this instance's own wake job line. This
+ * can only mean the block was hand-edited or
  * corrupted after this class wrote it: its exact boundary can no longer be
  * verified, so the mutation fails closed with no write rather than guessing
  * that an adjacent line belongs to (or doesn't belong to) the block.
@@ -172,6 +249,34 @@ export class TruncatedCronBlockError extends Error {
       `crontab block "${tag}" has no matching end marker — truncated or hand-edited; refusing to mutate without a verified boundary`
     );
     this.name = "TruncatedCronBlockError";
+  }
+}
+
+/**
+ * The instant `at` actually runs a job submitted for `date`. `at` keeps a
+ * job's run time in whole minutes (its spool filename encodes minutes since
+ * the epoch), so the seconds are truncated, not rounded: atd starts the job
+ * the moment that minute begins, or immediately when the minute is already
+ * past. A job whose run minute has begun may therefore have run — and left
+ * the queue — before a re-read of `atq` can see it; a job whose run minute
+ * has not begun cannot have, so it must still be queued.
+ */
+function atRunInstant(date: Date): number {
+  return Math.floor(date.getTime() / 60_000) * 60_000;
+}
+
+/**
+ * Thrown when `at` reported a job id for a message but a re-read of the queue
+ * shows no job under that id carrying the message's tag. The write is not
+ * trusted on `at`'s say-so: a message id must never be handed back for a
+ * delivery that is not actually queued.
+ */
+export class AtEnqueueUnconfirmedError extends Error {
+  constructor(tag: string, atJobId: string) {
+    super(
+      `at job ${atJobId} for "${tag}" is not in the queue after scheduling — enqueue unconfirmed`
+    );
+    this.name = "AtEnqueueUnconfirmedError";
   }
 }
 
@@ -228,6 +333,8 @@ function decodeScheduledMessage(script: string): ScheduledMessage {
 
 export class DefaultOsScheduler implements OsScheduler {
   readonly instanceId: string;
+  private readonly log: Logger;
+  private readonly now: () => number;
 
   constructor(
     private readonly mutator: CrontabMutator,
@@ -236,6 +343,132 @@ export class DefaultOsScheduler implements OsScheduler {
   ) {
     if (!opts.instanceId.trim()) throw new Error("instanceId is required");
     this.instanceId = opts.instanceId;
+    // Every record names the instance, so a shared queue's history can be
+    // split by writer after the fact.
+    this.log = (opts.log ?? nullLogger).child({
+      component: "os-scheduler",
+      instanceId: opts.instanceId,
+    });
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** The only way this scheduler produces a tag line: `family` + this instance + `id`. */
+  private ownedTag(
+    family: InstanceTagFamily,
+    id: string,
+    boundary: InstanceTagBoundary = "start"
+  ): string {
+    return instanceTag(family, this.instanceId, id, boundary);
+  }
+
+  /** The id of an owned tag line, or null for foreign instances, legacy tags and other lines. */
+  private ownedId(family: InstanceTagFamily, line: string): string | null {
+    const record = parseInstanceTag(family, line);
+    return record?.instanceId === this.instanceId ? record.id : null;
+  }
+
+  /**
+   * A pre-scoping `# mc-wake:<actorId>` block belongs to this instance only
+   * when its job line reads this instance's own wake-port file — a path no
+   * co-hosted instance shares — so it can be listed, replaced and cancelled
+   * here without guessing. Every other legacy wake block is foreign. Legacy
+   * wake blocks recur forever and have no boot sweep, so without adoption an
+   * upgrade would strand each live wake as a duplicate of its replacement.
+   */
+  private ownsLegacyWakeBlock(tagLine: string, jobLine: string | undefined): boolean {
+    const trimmed = tagLine.trim();
+    return (
+      trimmed.startsWith(LEGACY_WAKE_TAG_PREFIX) &&
+      this.isOwnWakeJobLine(jobLine, trimmed.slice(LEGACY_WAKE_TAG_PREFIX.length))
+    );
+  }
+
+  /**
+   * True only for the wake job line this instance wrote for `actorId`: it
+   * curls this instance's own wake port *and* posts that actor id, exactly as
+   * {@link buildWakeJobLine} spells both. The port alone would also accept
+   * this instance's job line for a different actor, so a tag whose own job
+   * line is gone could claim the neighbouring actor's line as its second half.
+   */
+  private isOwnWakeJobLine(line: string | undefined, actorId: string): boolean {
+    // The closing quote of the actor argument delimits the id, so `act1`
+    // cannot match a line written for `act1:slot`.
+    return (line ?? "").includes(`$(cat ${this.opts.portFile})/wake" ${wakeActorArg(actorId)}`);
+  }
+
+  /** The actor id of this instance's wake block starting at `lines[index]`, if any. */
+  private ownedWakeActorId(lines: string[], index: number): string | null {
+    const tagLine = lines[index];
+    const scoped = this.ownedId("wake", tagLine);
+    if (scoped !== null) return scoped;
+    if (this.ownsLegacyWakeBlock(tagLine, lines[index + 1])) {
+      return tagLine.trim().slice(LEGACY_WAKE_TAG_PREFIX.length);
+    }
+    return null;
+  }
+
+  /**
+   * Boot audit: name every legacy `# mc-wake:` block this instance declined to
+   * adopt. Such a block keeps firing with nothing able to cancel it — it reads
+   * another instance's wake-port file, or this instance's under a spelling of
+   * `RUSA_HOME` the running process does not use — so it is recorded here,
+   * once, where an operator can find the orphan instead of meeting it by its
+   * firing. Nothing is written.
+   */
+  reportUnadoptedLegacyWakeBlocks(): UnadoptedLegacyWakeBlock[] {
+    const current = this.mutator.read();
+    if (current === "") return [];
+    const lines = current.replace(/\n$/, "").split("\n");
+    const unadopted: UnadoptedLegacyWakeBlock[] = [];
+    for (let index = 0; index < lines.length; index++) {
+      const tagLine = lines[index].trim();
+      if (!tagLine.startsWith(LEGACY_WAKE_TAG_PREFIX)) continue;
+      const jobLine = lines[index + 1] ?? "";
+      if (this.ownsLegacyWakeBlock(tagLine, jobLine)) continue;
+      const block: UnadoptedLegacyWakeBlock = {
+        actorId: tagLine.slice(LEGACY_WAKE_TAG_PREFIX.length),
+        portFile: jobLine.match(/\$\(cat ([^)\s]+)\)\/wake"/)?.[1] ?? null,
+        cronExpr: jobLine.trim().split(/\s+/).slice(0, 5).join(" "),
+      };
+      this.log.warn("legacy_wake_block_not_adopted", { tag: tagLine, ...block });
+      unadopted.push(block);
+    }
+    return unadopted;
+  }
+
+  /**
+   * Boot audit: name every pre-scoping `# mc-message-delivery:` job still in
+   * the shared `at` queue. Legacy message jobs are foreign to every instance
+   * by design — they cannot be attributed to a writer — so after the upgrade
+   * each still fires but none is listed by `list_pending_messages` or
+   * cancellable until it does. Recording them here, once per boot, is the
+   * only place an operator sees that gap. Nothing is written or removed.
+   */
+  reportLegacyMessageDeliveryJobs(): LegacyMessageDeliveryJob[] {
+    const legacy: LegacyMessageDeliveryJob[] = [];
+    for (const job of this.atIo.list()) {
+      const tag = job.script
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.startsWith(LEGACY_MESSAGE_TAG_PREFIX));
+      if (tag === undefined) continue;
+      let payload: ScheduledMessage | null = null;
+      try {
+        payload = decodeScheduledMessage(job.script);
+      } catch {
+        // A legacy job this scheduler cannot read is still a legacy job.
+      }
+      const record: LegacyMessageDeliveryJob = {
+        atJobId: job.id,
+        tag,
+        messageId: decodeTagComponent(tag.slice(LEGACY_MESSAGE_TAG_PREFIX.length)),
+        toId: payload?.toId ?? null,
+        deliverAt: payload?.deliverAt ?? null,
+      };
+      this.log.warn("legacy_message_delivery_job_not_adopted", { ...record });
+      legacy.push(record);
+    }
+    return legacy;
   }
 
   /** Build the complete cron line for an actor wake. */
@@ -253,20 +486,27 @@ export class DefaultOsScheduler implements OsScheduler {
     const priorityArg = responsive ? ` -d ${quoteForCron("priority=responsive")}` : "";
     return (
       `${cronExpr.trim()} ${curl} -fsS -H ${auth} ${url} ` +
-      `-d ${quoteForCron(`actorId=${actorId}`)} -d ${quoteForCron(`reason=${reason}`)}${priorityArg}`
+      `${wakeActorArg(actorId)} -d ${quoteForCron(`reason=${reason}`)}${priorityArg}`
     );
   }
 
-  /** Remove the actor's owned two-line wake block while preserving all other entries. */
+  /**
+   * Remove the actor's owned two-line wake block while preserving all other
+   * entries. A wake block has no end marker, so its second line is verified
+   * by content rather than by position: only this instance's own wake job
+   * line is ever consumed with the tag. An owned tag followed by anything
+   * else is a hand-edited block whose boundary cannot be verified, and the
+   * mutation fails closed with no write — exactly as {@link stripCronBlock}
+   * does — rather than deleting whichever line happens to come next.
+   */
   private stripWakeBlock(lines: string[], actorId: string): string[] {
-    const tag = WAKE_TAG_PREFIX + actorId;
     const kept: string[] = [];
     for (let index = 0; index < lines.length; index++) {
-      if (lines[index].trim() === tag) {
-        const next = lines[index + 1];
-        if (next !== undefined && next.trim() !== "" && !next.trimStart().startsWith("#")) {
-          index++;
+      if (this.ownedWakeActorId(lines, index) === actorId) {
+        if (!this.isOwnWakeJobLine(lines[index + 1], actorId)) {
+          throw new TruncatedCronBlockError(lines[index].trim());
         }
+        index++;
         continue;
       }
       kept.push(lines[index]);
@@ -285,7 +525,7 @@ export class DefaultOsScheduler implements OsScheduler {
     this.mutator.mutate((lines) => {
       const kept = this.stripWakeBlock(lines, actorId);
       kept.push(
-        WAKE_TAG_PREFIX + actorId,
+        this.ownedTag("wake", actorId),
         this.buildWakeJobLine(actorId, cronExpr, reason, priority)
       );
       return { lines: kept, result: undefined };
@@ -306,12 +546,12 @@ export class DefaultOsScheduler implements OsScheduler {
     const lines = current.replace(/\n$/, "").split("\n");
     const entries: WakeEntry[] = [];
     for (let index = 0; index < lines.length; index++) {
-      const trimmed = lines[index].trim();
-      if (!trimmed.startsWith(WAKE_TAG_PREFIX)) continue;
+      const actorId = this.ownedWakeActorId(lines, index);
+      if (actorId === null) continue;
       const job = lines[index + 1] ?? "";
       const priority = parseWakePriority(job);
       entries.push({
-        actorId: trimmed.slice(WAKE_TAG_PREFIX.length),
+        actorId,
         cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
         reason: parseWakeReason(job),
         ...(priority ? { priority } : {}),
@@ -419,22 +659,100 @@ export class DefaultOsScheduler implements OsScheduler {
     return null;
   }
 
+  /** Ids of the queued `at` jobs whose script carries exactly `tag`, from a fresh read of the queue. */
   private staleAtIds(tag: string): string[] {
-    return this.atIo
-      .list()
+    return this.atJobIdsFor(this.atIo.list(), tag);
+  }
+
+  private atJobIdsFor(jobs: { id: string; script: string }[], tag: string): string[] {
+    return jobs
       .filter((job) => job.script.split("\n").some((line) => line.trim() === tag))
       .map((job) => job.id);
   }
 
-  private removeAtIds(ids: Iterable<string>): void {
-    for (const id of ids) this.atIo.remove(id);
+  /**
+   * The one path from this class into `at`: the write is recorded with the tag
+   * it carries, so a shared queue's every mutation is attributable to its
+   * writer. Nothing here proves the job stayed queued — see
+   * {@link confirmAtEnqueue}.
+   */
+  private scheduleAt(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    script: string,
+    date: Date
+  ) {
+    const atJobId = this.atIo.schedule(script, date);
+    this.log.info("at_job_scheduled", { family, id, tag, atJobId, runAt: date.toISOString() });
+    return atJobId;
+  }
+
+  /** The one path from this class into `atrm`, recorded per job with the tag it was matched by. */
+  private removeAtIds(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    ids: Iterable<string>,
+    reason?: string
+  ) {
+    for (const atJobId of ids) {
+      this.atIo.remove(atJobId);
+      this.log.info("at_job_removed", { family, id, tag, atJobId, ...(reason ? { reason } : {}) });
+    }
+  }
+
+  /**
+   * Re-read the queue and require the job `at` just reported to be in it with
+   * `tag`. Only a job whose {@link atRunInstant run minute} had begun by the
+   * time the queue was read back may legitimately have run already, so its
+   * absence is recorded and tolerated; a missing job whose run minute is still
+   * ahead was never durably queued, and the caller must not report it as
+   * scheduled.
+   */
+  private confirmAtEnqueue(
+    family: InstanceTagFamily,
+    id: string,
+    tag: string,
+    atJobId: string,
+    date: Date
+  ) {
+    const queue = this.atIo.list();
+    const fields = { family, id, tag, atJobId, queueSize: queue.length };
+    if (this.atJobIdsFor(queue, tag).includes(atJobId)) {
+      this.log.info("at_enqueue_confirmed", fields);
+      return;
+    }
+    // The clock is read after the re-read, so it bounds the latest instant the
+    // job could have run and left the queue unseen. `at`, atd and this process
+    // share the host clock, so no further allowance is applied.
+    if (atRunInstant(date) <= this.now()) {
+      this.log.warn("at_enqueue_unconfirmed", {
+        ...fields,
+        reason: "job run minute has begun; may already have run",
+      });
+      return;
+    }
+    this.log.error("at_enqueue_unconfirmed", { ...fields, reason: "job missing from queue" });
+    // The caller is about to report this send as failed, so nothing may stay
+    // armed under the id `at` printed: were the re-read wrong and the job in
+    // fact spooled, it would deliver a message its sender was told never left
+    // (and will likely send again). `atrm` of an id that was never spooled is
+    // a no-op, and a failure here cannot make the outcome worse than the
+    // unconfirmed write already is, so it is recorded and the refusal stands.
+    try {
+      this.removeAtIds(family, id, tag, [atJobId], "unconfirmed enqueue");
+    } catch (err) {
+      this.log.warn("at_job_remove_failed", { ...fields, err });
+    }
+    throw new AtEnqueueUnconfirmedError(tag, atJobId);
   }
 
   /** The tag/end-tag pair bounding one obligation's managed cron block, scoped to this instance. */
   private activationTags(id: string): { tag: string; endTag: string } {
     return {
-      tag: scopedActivationTag(this.instanceId, id),
-      endTag: scopedActivationEndTag(this.instanceId, id),
+      tag: this.ownedTag("obligation-activation", id),
+      endTag: this.ownedTag("obligation-activation", id, "end"),
     };
   }
 
@@ -473,7 +791,7 @@ export class DefaultOsScheduler implements OsScheduler {
       // The replacement cron block is now durable.  If removing an old at job
       // fails, retain it for reconciliation rather than creating a scheduling
       // gap by removing it before the replacement was installed.
-      this.removeAtIds(staleAtIds);
+      this.removeAtIds("obligation-activation", id, tag, staleAtIds);
     } else {
       const script = `${tag}\n${curlLine}\n`;
       // Validate the existing block before submitting `at`: corruption must
@@ -484,16 +802,25 @@ export class DefaultOsScheduler implements OsScheduler {
       // and prior at jobs armed.  Once it succeeds, remove only the stale jobs
       // captured before installation (never the just-created replacement).
       const staleAtIds = this.staleAtIds(tag);
-      const replacementId = this.atIo.schedule(script, time.date);
+      // No enqueue re-read here, by design: {@link confirmAtEnqueue} exists to
+      // gate a message id handed back to a sender, and an activation has no
+      // such caller — boot reconciliation re-derives every activation from
+      // the repository, so a lost job is re-armed rather than lost.
+      const replacementId = this.scheduleAt("obligation-activation", id, tag, script, time.date);
       this.updateCron(tag, endTag, null);
-      this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
+      this.removeAtIds(
+        "obligation-activation",
+        id,
+        tag,
+        staleAtIds.filter((staleId) => staleId !== replacementId)
+      );
     }
   }
 
   cancelObligationActivation(id: string): void {
     const { tag, endTag } = this.activationTags(id);
     this.updateCron(tag, endTag, null);
-    this.removeAtIds(this.staleAtIds(tag));
+    this.removeAtIds("obligation-activation", id, tag, this.staleAtIds(tag));
   }
 
   listObligationActivations(): ObligationActivationRecord[] {
@@ -515,6 +842,16 @@ export class DefaultOsScheduler implements OsScheduler {
     return Array.from(entries.values());
   }
 
+  /**
+   * Queue one message. The write is only reported once a re-read of the queue
+   * shows it ({@link confirmAtEnqueue}); on refusal the id `at` printed is
+   * removed if it exists, so a refused send leaves nothing armed under a
+   * fresh id. Re-scheduling an id that is already queued (the legacy import
+   * does this; `ActorMesh.sendMessage` never does, every send is a fresh id)
+   * keeps the prior copy armed across the write and removes it only after
+   * the replacement is confirmed — so a refused re-schedule is not a lost
+   * message: the earlier schedule of that id stands and delivers once.
+   */
   scheduleMessageDelivery(message: ScheduledMessage): void {
     if (Buffer.byteLength(message.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES) {
       throw new Error("Scheduled message body exceeds the 128 KiB host-job limit");
@@ -531,24 +868,39 @@ export class DefaultOsScheduler implements OsScheduler {
       { retryWhileServiceRestarts: true }
     );
     const script = `${tag}\n${curlLine}\n`;
+    const deliverAt = new Date(message.deliverAt);
     const staleAtIds = this.staleAtIds(tag);
-    const replacementId = this.atIo.schedule(script, new Date(message.deliverAt));
-    this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
+    const replacementId = this.scheduleAt("message-delivery", message.id, tag, script, deliverAt);
+    // `at` printing a job id is not proof the job is queued. The message id is
+    // only returned to the sender once a re-read of the queue shows the job; a
+    // stale copy stays armed until then, so an unconfirmed write leaves no gap.
+    this.confirmAtEnqueue("message-delivery", message.id, tag, replacementId, deliverAt);
+    this.removeAtIds(
+      "message-delivery",
+      message.id,
+      tag,
+      staleAtIds.filter((staleId) => staleId !== replacementId)
+    );
   }
 
   cancelMessageDelivery(id: string): void {
     const tag = this.messageTag(id);
-    this.removeAtIds(this.staleAtIds(tag));
+    this.removeAtIds("message-delivery", id, tag, this.staleAtIds(tag));
   }
 
+  /**
+   * Only this instance's jobs: a co-hosted instance's messages and legacy
+   * unscoped `# mc-message-delivery:` jobs are foreign, never listed here, so
+   * boot reconciliation cannot cancel a recipient it merely does not know.
+   */
   listMessageDeliveries(): ScheduledMessage[] {
     const messages = new Map<string, ScheduledMessage>();
     for (const job of this.atIo.list()) {
       const tagLines = job.script
         .split("\n")
         .map((line) => line.trim())
-        .filter((line) => line.startsWith("# mc-message-delivery:"));
-      if (tagLines.length === 0) continue;
+        .filter((line) => line.startsWith(instanceTagPrefix("message-delivery")));
+      if (!tagLines.some((line) => this.ownedId("message-delivery", line) !== null)) continue;
       let message: ScheduledMessage;
       try {
         message = decodeScheduledMessage(job.script);
@@ -567,6 +919,6 @@ export class DefaultOsScheduler implements OsScheduler {
   }
 
   private messageTag(id: string): string {
-    return `# mc-message-delivery:${Buffer.from(id, "utf8").toString("base64url")}`;
+    return this.ownedTag("message-delivery", id);
   }
 }

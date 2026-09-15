@@ -44,20 +44,25 @@ export function deduplicatedInboxEntryId(dedupeKey: string, actorId: string): st
  * broader subscriber when no live exact subscriber exists.
  */
 export function mayBubbleToParent(
-  eventType: string | undefined,
-  eventMerged: boolean | undefined
+  eventPayload: { type?: string; merged?: unknown; draft?: unknown } | undefined
 ): boolean {
-  switch (eventType) {
+  switch (eventPayload?.type) {
     case "issues.opened":
     case "issue_comment.created":
-    case "pull_request.opened":
     case "pull_request_review.submitted":
     case "pull_request_review_comment.created":
     case "check_suite.completed":
     case "gchat.message":
       return true;
+    case "pull_request.opened":
+      // A draft PR is work in progress: it stays with its exact-resource
+      // subscribers (the creator) and reaches the repo owner only once
+      // `ready_for_review` fires, which is that PR's real "opened" moment.
+      return eventPayload?.draft !== true;
+    case "pull_request.ready_for_review":
+      return true;
     case "pull_request.closed":
-      return eventMerged === true;
+      return eventPayload?.merged === true;
     default:
       return false;
   }
@@ -490,10 +495,7 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
       }
 
       if (current === key && opts.enforceBubblingPolicy) {
-        const allowParent = mayBubbleToParent(
-          opts.eventPayload?.type,
-          opts.eventPayload?.merged === true
-        );
+        const allowParent = mayBubbleToParent(opts.eventPayload);
         if (!allowParent) {
           break;
         }

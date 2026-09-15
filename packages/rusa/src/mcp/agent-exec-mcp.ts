@@ -1222,7 +1222,7 @@ export function createAgentExecMcpServer(
     // ── Nightly wake schedule — ROOT-ONLY (ISSUE_NUM, phase 1c) ──
     // The mechanical nightly trigger backed by the familiar account's own crontab
     // (a cron job pings the loopback /wake endpoint). Root-only like grants; the
-    // crontab edits are surgical (one `# mc-wake:<id>` block) + validated.
+    // crontab edits are surgical (one instance-scoped `# mc-wake-instance:` block) + validated.
     if (wakeScheduler) {
       server.registerTool(
         "schedule_wake",

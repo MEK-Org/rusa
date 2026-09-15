@@ -37,6 +37,13 @@ interface RepoPollState {
   watermark?: string;
   seen: string[];
   branchHeads?: Record<string, string>;
+  /**
+   * Open PRs last polled as drafts. The issues list reports state, not
+   * transitions, so this is what lets a later non-draft record surface as
+   * `ready_for_review` instead of a plain `edited` (which never climbs to the
+   * repo owner). Entries leave when the PR is ready or closed.
+   */
+  draftPullRequests?: number[];
 }
 
 interface PollerState {
@@ -163,6 +170,7 @@ export class GitHubEventPoller {
       repoState.commentsWatermark ?? repoState.watermark ?? DEFAULT_WATERMARK;
     let nextIssuesWatermark = issuesWatermark;
     let nextCommentsWatermark = commentsWatermark;
+    const draftPullRequests = new Set(repoState.draftPullRequests ?? []);
 
     const issueRecords = await this.options.issueClient.listUpdatedIssuesAndPullRequests(
       repo,
@@ -206,12 +214,18 @@ export class GitHubEventPoller {
           key: `pull_request:${pullRequest.number}:${pullRequest.updatedAt}`,
           updatedAt: pullRequest.updatedAt,
           stream: "issues" as const,
-          emit: () =>
-            this.options.onEvent(
+          emit: async () => {
+            await this.options.onEvent(
               "pull_request",
-              pullRequestPayload(repo, pullRequest),
+              pullRequestPayload(repo, pullRequest, draftPullRequests.has(pullRequest.number)),
               eventDeliveryId(repo, `pull_request:${pullRequest.number}:${pullRequest.updatedAt}`)
-            ),
+            );
+            if (pullRequest.draft && pullRequest.state === "open") {
+              draftPullRequests.add(pullRequest.number);
+            } else {
+              draftPullRequests.delete(pullRequest.number);
+            }
+          },
         })),
     ].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 
@@ -230,6 +244,11 @@ export class GitHubEventPoller {
     repoState.commentsWatermark = nextCommentsWatermark;
     delete repoState.watermark;
     repoState.seen = Array.from(seen).slice(-MAX_SEEN_PER_REPO);
+    if (draftPullRequests.size > 0) {
+      repoState.draftPullRequests = [...draftPullRequests];
+    } else {
+      delete repoState.draftPullRequests;
+    }
   }
 
   private loadState(): PollerState {
@@ -311,10 +330,11 @@ function issueCommentPayload(
 
 function pullRequestPayload(
   repo: string,
-  pullRequest: PollIssueOrPullRequest
+  pullRequest: PollIssueOrPullRequest,
+  wasDraft: boolean
 ): Record<string, unknown> {
   return {
-    action: pullRequest.createdAt === pullRequest.updatedAt ? "opened" : "edited",
+    action: pullRequestAction(pullRequest, wasDraft),
     repository: repositoryPayload(repo),
     pull_request: {
       number: pullRequest.number,
@@ -324,9 +344,22 @@ function pullRequestPayload(
       state: pullRequest.state,
       created_at: pullRequest.createdAt,
       updated_at: pullRequest.updatedAt,
+      draft: pullRequest.draft,
     },
     sender: sender(pullRequest.author),
   };
+}
+
+/**
+ * Polling sees states, webhooks see transitions. `opened` and `edited` come
+ * from timestamps as before; `ready_for_review` is the one transition worth
+ * reconstructing, because a draft opening is held at the PR and the owner
+ * would otherwise never hear about it (issue #307).
+ */
+function pullRequestAction(pullRequest: PollIssueOrPullRequest, wasDraft: boolean): string {
+  if (pullRequest.createdAt === pullRequest.updatedAt) return "opened";
+  if (wasDraft && !pullRequest.draft && pullRequest.state === "open") return "ready_for_review";
+  return "edited";
 }
 
 function webhookIssue(issue: PollIssueOrPullRequest): Record<string, unknown> {

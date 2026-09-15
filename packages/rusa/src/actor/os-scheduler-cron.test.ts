@@ -2,9 +2,10 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createLogger } from "../observability/logger.js";
 import { cronExprEverFires, isValidCronExpr, nextCronOccurrence } from "./cron-expression.js";
 import { type CrontabIo, CrontabMutator, execCrontabIo, preflightCron } from "./crontab.js";
-import { DefaultOsScheduler, isValidActorId } from "./os-scheduler.js";
+import { DefaultOsScheduler, isValidActorId, TruncatedCronBlockError } from "./os-scheduler.js";
 import { writeWakePort } from "./wake-callback.js";
 
 /** In-memory crontab: serves a string, records each write. */
@@ -21,11 +22,11 @@ class FakeCrontab implements CrontabIo {
 }
 
 const OPTS = {
-  tokenFile: "/home/sf/.rusa/wake-token",
-  portFile: "/home/sf/.rusa/wake-port",
+  tokenFile: "/srv/rusa/a/wake-token",
+  portFile: "/srv/rusa/a/wake-port",
   instanceId: "test-instance",
 };
-const make = (content = "") => {
+const make = (content = "", log?: ReturnType<typeof recordingLogger>["log"]) => {
   const io = new FakeCrontab(content);
   const scheduler = new DefaultOsScheduler(
     new CrontabMutator(io),
@@ -34,10 +35,33 @@ const make = (content = "") => {
       list: () => [],
       remove: () => undefined,
     },
-    OPTS
+    { ...OPTS, ...(log ? { log } : {}) }
   );
   return { io, scheduler };
 };
+
+/** Structured records as an operator's `jq` would see them, without level/time noise. */
+function recordingLogger() {
+  const lines: string[] = [];
+  const log = createLogger({
+    format: "json",
+    destination: {
+      write: (chunk: string) => {
+        lines.push(chunk);
+      },
+    },
+  });
+  const records = () =>
+    lines
+      .join("")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const { level: _level, time: _time, ...record } = JSON.parse(line);
+        return record as Record<string, unknown>;
+      });
+  return { log, records };
+}
 
 describe("cron expression + actor-id validation", () => {
   it("accepts standard 5-field numeric/*,/- expressions", () => {
@@ -119,8 +143,8 @@ describe("DefaultOsScheduler actor wake job lines", () => {
     const { scheduler } = make();
     const line = scheduler.buildWakeJobLine("act1", "0 3 * * *", "nightly distill");
     expect(line.startsWith("0 3 * * * /usr/bin/curl -fsS")).toBe(true);
-    expect(line).toContain('-H "Authorization: Bearer $(cat /home/sf/.rusa/wake-token)"');
-    expect(line).toContain('"http://127.0.0.1:$(cat /home/sf/.rusa/wake-port)/wake"');
+    expect(line).toContain('-H "Authorization: Bearer $(cat /srv/rusa/a/wake-token)"');
+    expect(line).toContain('"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake"');
     expect(line).toContain("-d 'actorId=act1'");
     expect(line).toContain("-d 'reason=nightly distill'");
   });
@@ -147,7 +171,7 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
     const { io, scheduler } = make();
     await scheduler.schedule("act1", "0 3 * * *", "nightly");
     const lines = io.content.trimEnd().split("\n");
-    expect(lines[0]).toBe("# mc-wake:act1");
+    expect(lines[0]).toBe("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ");
     expect(lines[1].startsWith("0 3 * * * /usr/bin/curl")).toBe(true);
   });
 
@@ -158,7 +182,7 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
     await scheduler.schedule("act1", "30 4 * * *", "second"); // re-schedule same actor
     expect(io.content).toContain("# my own job");
     expect(io.content).toContain("/usr/bin/backup.sh");
-    expect(io.content.match(/# mc-wake:act1/g)).toHaveLength(1); // replaced, not duplicated
+    expect(io.content.match(/# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ$/gm)).toHaveLength(1); // replaced, not duplicated
     const entries = await scheduler.list();
     expect(entries).toEqual([{ actorId: "act1", cronExpr: "30 4 * * *", reason: "second" }]);
   });
@@ -218,6 +242,173 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
       scheduler.schedule("act2", "0 4 * * *", "two"),
     ]);
     expect((await scheduler.list()).map((e) => e.actorId).sort()).toEqual(["act1", "act2"]);
+  });
+});
+
+describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
+  // Written by a co-hosted instance ("other-instance") for the same actor id.
+  const foreignBlock =
+    "# mc-wake-instance:v1:b3RoZXItaW5zdGFuY2U:YWN0MQ\n" +
+    "0 5 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/other/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/other/wake-port)/wake\" -d 'actorId=act1' -d 'reason=foreign'\n";
+  // Pre-scoping blocks: one reads this instance's wake-port file, one reads another instance's.
+  const ownLegacyBlock =
+    "# mc-wake:act1\n" +
+    "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy own'\n";
+  const foreignLegacyBlock =
+    "# mc-wake:act2\n" +
+    "0 4 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/other/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/other/wake-port)/wake\" -d 'actorId=act2' -d 'reason=legacy foreign'\n";
+  // This instance's own home under a spelling the running process does not use:
+  // the residual ownership cannot prove, so the block stays foreign.
+  const respelledHomeLegacyBlock =
+    "# mc-wake:act1\n" +
+    "0 2 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa//a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa//a/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy respelled'\n";
+  const userLine = "0 1 * * * /usr/bin/user-job\n";
+
+  it("lists only this instance's blocks: scoped foreign and legacy foreign wakes are invisible", async () => {
+    const { scheduler } = make(userLine + foreignBlock + ownLegacyBlock + foreignLegacyBlock);
+    await scheduler.schedule("act3", "0 6 * * *", "own scoped");
+    expect(await scheduler.list()).toEqual([
+      { actorId: "act1", cronExpr: "0 3 * * *", reason: "legacy own" },
+      { actorId: "act3", cronExpr: "0 6 * * *", reason: "own scoped" },
+    ]);
+  });
+
+  it("schedule/cancel for a shared actor id leave the co-hosted instance's block byte-for-byte untouched", async () => {
+    const { io, scheduler } = make(userLine + foreignBlock + foreignLegacyBlock);
+    await scheduler.schedule("act1", "0 3 * * *", "own");
+    await scheduler.cancel("act2");
+    expect(io.content).toContain(foreignBlock);
+    expect(io.content).toContain(foreignLegacyBlock);
+    await scheduler.cancel("act1");
+    expect(io.content).toBe(userLine + foreignBlock + foreignLegacyBlock);
+  });
+
+  it("adopts a legacy block that reads this instance's own wake-port file: re-scheduling replaces it with the scoped block", async () => {
+    const { io, scheduler } = make(userLine + ownLegacyBlock + foreignLegacyBlock);
+    await scheduler.schedule("act1", "30 3 * * *", "migrated");
+    expect(io.content).not.toContain("# mc-wake:act1\n");
+    expect(io.content.match(/# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ$/gm)).toHaveLength(1);
+    expect(io.content).toContain(foreignLegacyBlock);
+    expect(await scheduler.list()).toEqual([
+      { actorId: "act1", cronExpr: "30 3 * * *", reason: "migrated" },
+    ]);
+    await scheduler.cancel("act1");
+    expect(io.content).toBe(userLine + foreignLegacyBlock);
+  });
+
+  it("leaves a legacy block under a different spelling of this instance's RUSA_HOME byte-identical through schedule and cancel of the same actor id", async () => {
+    const { io, scheduler } = make(userLine + respelledHomeLegacyBlock);
+    expect(await scheduler.list()).toEqual([]);
+
+    await scheduler.schedule("act1", "30 3 * * *", "scoped");
+    expect(io.content.startsWith(userLine + respelledHomeLegacyBlock)).toBe(true);
+    expect(await scheduler.list()).toEqual([
+      { actorId: "act1", cronExpr: "30 3 * * *", reason: "scoped" },
+    ]);
+
+    await scheduler.cancel("act1");
+    expect(io.content).toBe(userLine + respelledHomeLegacyBlock);
+    expect(io.writes.at(-1)).toBe(userLine + respelledHomeLegacyBlock);
+  });
+
+  it("fails closed without a write when an owned wake tag is not followed by its own job line", async () => {
+    // The job line was hand-removed; a positional delete would take the user's entry.
+    const orphanTag = "# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ\n";
+    const before = orphanTag + userLine + foreignBlock;
+    const { io, scheduler } = make(before);
+
+    await expect(scheduler.cancel("act1")).rejects.toThrow(TruncatedCronBlockError);
+    await expect(scheduler.schedule("act1", "0 3 * * *", "again")).rejects.toThrow(
+      TruncatedCronBlockError
+    );
+    expect(io.content).toBe(before);
+    expect(io.writes).toEqual([]);
+
+    // Other actors' blocks are still managed around the broken one.
+    await scheduler.schedule("act3", "0 6 * * *", "unaffected");
+    expect(io.content.startsWith(before)).toBe(true);
+    await scheduler.cancel("act3");
+    expect(io.content).toBe(before);
+  });
+
+  it("fails closed when an owned wake tag is followed by this instance's job line for a different actor", async () => {
+    // act1's job line was hand-removed, leaving its tag directly above act3's
+    // complete block. act3's line curls this instance's port, so a port-only
+    // ownership check would consume it as act1's second line.
+    const orphanTag = "# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ\n";
+    const { io, scheduler } = make(userLine);
+    await scheduler.schedule("act3", "0 6 * * *", "neighbour");
+    const act3Block = io.content.slice(userLine.length);
+    const before = userLine + orphanTag + act3Block.slice(act3Block.indexOf("\n") + 1);
+    io.content = before;
+    io.writes.length = 0;
+
+    await expect(scheduler.cancel("act1")).rejects.toThrow(TruncatedCronBlockError);
+    await expect(scheduler.schedule("act1", "0 3 * * *", "again")).rejects.toThrow(
+      TruncatedCronBlockError
+    );
+    expect(io.content).toBe(before);
+    expect(io.writes).toEqual([]);
+  });
+
+  it("does not adopt a legacy wake tag whose job line names a different actor, even on this instance's port", () => {
+    // `# mc-wake:act1` above the job line this instance wrote for act2.
+    const crossActorLegacyBlock =
+      "# mc-wake:act1\n" +
+      "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake\" -d 'actorId=act2' -d 'reason=cross'\n";
+    const { io, scheduler } = make(userLine + crossActorLegacyBlock);
+
+    expect(scheduler.reportUnadoptedLegacyWakeBlocks()).toEqual([
+      { actorId: "act1", portFile: "/srv/rusa/a/wake-port", cronExpr: "0 3 * * *" },
+    ]);
+    expect(io.writes).toEqual([]);
+  });
+
+  it("names at boot every legacy wake block it declined to adopt, and nothing it owns", () => {
+    const { log, records } = recordingLogger();
+    const { io, scheduler } = make(
+      userLine + foreignBlock + ownLegacyBlock + foreignLegacyBlock + respelledHomeLegacyBlock,
+      log
+    );
+    const before = io.content;
+
+    const unadopted = scheduler.reportUnadoptedLegacyWakeBlocks();
+
+    expect(unadopted).toEqual([
+      { actorId: "act2", portFile: "/srv/rusa/other/wake-port", cronExpr: "0 4 * * *" },
+      { actorId: "act1", portFile: "/srv/rusa//a/wake-port", cronExpr: "0 2 * * *" },
+    ]);
+    expect(records()).toEqual([
+      {
+        component: "os-scheduler",
+        instanceId: "test-instance",
+        msg: "legacy_wake_block_not_adopted",
+        tag: "# mc-wake:act2",
+        actorId: "act2",
+        portFile: "/srv/rusa/other/wake-port",
+        cronExpr: "0 4 * * *",
+      },
+      {
+        component: "os-scheduler",
+        instanceId: "test-instance",
+        msg: "legacy_wake_block_not_adopted",
+        tag: "# mc-wake:act1",
+        actorId: "act1",
+        portFile: "/srv/rusa//a/wake-port",
+        cronExpr: "0 2 * * *",
+      },
+    ]);
+    expect(io.content).toBe(before);
+    expect(io.writes).toEqual([]);
+  });
+
+  it("reports nothing for an empty crontab or one holding only owned blocks", async () => {
+    const { scheduler: empty } = make("");
+    expect(empty.reportUnadoptedLegacyWakeBlocks()).toEqual([]);
+
+    const { scheduler } = make(userLine + ownLegacyBlock);
+    await scheduler.schedule("act3", "0 6 * * *", "own scoped");
+    expect(scheduler.reportUnadoptedLegacyWakeBlocks()).toEqual([]);
   });
 });
 

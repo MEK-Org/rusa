@@ -37,7 +37,9 @@ import type {
 } from "./actor-mesh.js";
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
+import type { AtIo } from "./at-queue.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
   type EventResource,
   InMemoryEventSourceOwnerStore,
@@ -59,7 +61,12 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
-import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
+import {
+  AtEnqueueUnconfirmedError,
+  DefaultOsScheduler,
+  type ScheduledMessage,
+  type ScheduledMessageScheduler,
+} from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -221,7 +228,8 @@ function setup(
     obligations?: ActorMeshOptions["obligations"];
     configuredEventSources?: ActorMeshOptions["configuredEventSources"];
     providerGate?: ActorMeshOptions["providerGate"];
-    scheduledMessages?: FakeScheduledMessageScheduler;
+    /** Any scheduler; a test passing a real one must not use the fake-only helpers. */
+    scheduledMessages?: ScheduledMessageScheduler;
     actors?: InMemoryActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
@@ -234,7 +242,8 @@ function setup(
   const logs: string[] = [];
   let seq = 0;
   let chatSeq = 0;
-  const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
+  const scheduledMessages = (opts.scheduledMessages ??
+    new FakeScheduledMessageScheduler()) as FakeScheduledMessageScheduler;
   const inboxStore = opts.inboxStore ?? createMemoryInboxStore();
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
@@ -7127,6 +7136,160 @@ describe("ActorMesh", () => {
       );
     });
 
+    describe("boot reconciliation across co-hosted instances sharing one at queue (#466)", () => {
+      /** A per-user `at` queue every instance on the host reads and writes. */
+      function sharedAtQueue() {
+        const jobs: { id: string; script: string }[] = [
+          {
+            id: "legacy",
+            // Written before message tags carried an instance: foreign to everyone.
+            script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${Buffer.from(
+              JSON.stringify({
+                schemaVersion: 1,
+                id: "legacy",
+                toId: "nobody",
+                fromId: "nobody",
+                body: "legacy",
+                deliverAt: "2026-09-16T12:00:00.000Z",
+              })
+            ).toString("base64url")}'\n`,
+          },
+        ];
+        let next = 100;
+        const at: AtIo = {
+          schedule: (script) => {
+            const id = String(next++);
+            jobs.push({ id, script });
+            return id;
+          },
+          list: () => jobs.map((job) => ({ ...job })),
+          remove: (id) => {
+            const index = jobs.findIndex((job) => job.id === id);
+            if (index >= 0) jobs.splice(index, 1);
+          },
+        };
+        return { at, jobs };
+      }
+
+      /** One instance: its own actor repository, crontab and OsScheduler over the shared queue. */
+      function bootInstance(instanceId: string, at: AtIo) {
+        let cronData = "";
+        const cron: CrontabIo = {
+          read: () => cronData,
+          write: (data) => {
+            cronData = data;
+          },
+        };
+        const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
+          tokenFile: `${instanceId}/wake-token`,
+          portFile: `${instanceId}/wake-port`,
+          instanceId,
+        });
+        const inboxStore = createMemoryInboxStore();
+        const { mesh } = setup({ scheduledMessages: scheduler, inboxStore });
+        const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+        const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+        mesh.sendMessage(
+          recipient,
+          `scheduled on ${instanceId}`,
+          sender,
+          undefined,
+          "2026-09-16T12:00:00.000Z"
+        );
+        return { mesh, scheduler, inboxStore, recipient };
+      }
+
+      it.each([
+        ["prod then staging", ["prod", "staging"] as const],
+        ["staging then prod", ["staging", "prod"] as const],
+      ])("in boot order %s neither instance cancels the other's message or the legacy job", (_, order) => {
+        const { at, jobs } = sharedAtQueue();
+        const instances = {
+          prod: bootInstance("/srv/rusa/prod", at),
+          staging: bootInstance("/srv/rusa/staging", at),
+        };
+        const before = jobs.map((job) => ({ ...job }));
+        expect(before.map((job) => job.id)).toEqual(["legacy", "100", "101"]);
+
+        for (const name of order) instances[name].mesh.reconcilePendingDeliveries();
+
+        expect(jobs).toEqual(before);
+        for (const { scheduler, inboxStore, recipient } of Object.values(instances)) {
+          expect(scheduler.listMessageDeliveries()).toEqual([
+            expect.objectContaining({ toId: recipient }),
+          ]);
+          expect(inboxStore.entries).toEqual([]);
+        }
+      });
+
+      it("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
+        const { at, jobs } = sharedAtQueue();
+        // `at` prints a job id, but the job never reaches the spool.
+        const lossy: AtIo = { ...at, schedule: () => "200" };
+        const cron: CrontabIo = { read: () => "", write: () => undefined };
+        const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), lossy, {
+          tokenFile: "/srv/rusa/prod/wake-token",
+          portFile: "/srv/rusa/prod/wake-port",
+          instanceId: "/srv/rusa/prod",
+        });
+        const events: MeshEventInput[] = [];
+        const chatRows = new Map<string, string>();
+        const { mesh } = setup({
+          scheduledMessages: scheduler,
+          events: (event) => events.push(event),
+          recordChat: (row) => {
+            const id = row.id ?? "missing-id";
+            chatRows.set(id, row.body);
+            return id;
+          },
+        });
+        const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+        const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+        events.length = 0;
+
+        expect(() =>
+          mesh.sendMessage(
+            recipient,
+            "lost in the spool",
+            sender,
+            undefined,
+            "2026-09-16T12:00:00.000Z"
+          )
+        ).toThrow(AtEnqueueUnconfirmedError);
+
+        expect(jobs.map((job) => job.id)).toEqual(["legacy"]);
+        expect(events).toEqual([]);
+        expect(chatRows.size).toBe(0);
+        expect(scheduler.listMessageDeliveries()).toEqual([]);
+      });
+
+      it("still cancels its own job for a recipient it does not know, and only that one", () => {
+        const { at, jobs } = sharedAtQueue();
+        const prod = bootInstance("/srv/rusa/prod", at);
+        const staging = bootInstance("/srv/rusa/staging", at);
+        prod.scheduler.scheduleMessageDelivery({
+          id: "prod-orphan",
+          toId: "recipient-prod-never-knew",
+          fromId: "sender",
+          body: "drop",
+          deliverAt: "2026-09-16T12:00:00.000Z",
+        });
+
+        staging.mesh.reconcilePendingDeliveries();
+        prod.mesh.reconcilePendingDeliveries();
+
+        // Only prod's own orphan (job 102) is gone: the legacy job, prod's
+        // live message and staging's message all survive both reconciliations.
+        expect(jobs.map((job) => job.id)).toEqual(["legacy", "100", "101"]);
+        expect(prod.scheduler.listMessageDeliveries()).toEqual([
+          expect.objectContaining({ toId: prod.recipient }),
+        ]);
+        expect(staging.scheduler.listMessageDeliveries()).toEqual([
+          expect.objectContaining({ toId: staging.recipient }),
+        ]);
+      });
+    });
+
     it("reconstructs acceptance history when a crash occurs after the at job is installed", () => {
       const chatRows = new Map<string, string>();
       const events: MeshEventInput[] = [];
@@ -8993,8 +9156,15 @@ describe("strict obligation handling experiment (#382)", () => {
     );
     mesh.abandonInboxRun(source);
 
-    // Self-reassignment is a no-op, even with a fresh checkpoint.
-    repo.create({ id: "self", title: "Self handoff", ownerId: source });
+    // Self-reassignment is a no-op, even with a fresh checkpoint. The head is
+    // issue-ref'd, so it stays strict: the standing no-change exit (#468) does
+    // not apply to it.
+    repo.create({
+      id: "self",
+      title: "Self handoff",
+      ownerId: source,
+      externalRef: "github:MEK-Org/rusa/issues/1001",
+    });
     selectHead(mesh, source, "self");
     repo.setCheckpoint("self", "I cannot hand this off to myself.", source);
     expect((await handoff("self", source)).isError).toBeFalsy();
@@ -9004,7 +9174,12 @@ describe("strict obligation handling experiment (#382)", () => {
     // The production owner resolver refuses a retired recipient, so the
     // transfer fails and the source still owns the selected head.
     mesh.retire(retired);
-    repo.create({ id: "failed", title: "Failed handoff", ownerId: source });
+    repo.create({
+      id: "failed",
+      title: "Failed handoff",
+      ownerId: source,
+      externalRef: "github:MEK-Org/rusa/issues/1002",
+    });
     selectHead(mesh, source, "failed");
     repo.setCheckpoint("failed", "Transfer attempt failed; source still owns it.", source);
     expect((await handoff("failed", retired)).isError).toBe(true);
@@ -9184,6 +9359,244 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.finishInboxRun(subject);
   });
 
+  it("accepts a clean yield on a standing repository head whose checkpoint this run rewrote (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const steward = worker(mesh, "repo steward");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    selectHead(mesh, steward, "repo-node");
+
+    // The no-change run: exact-head workflows green, no open PRs, backlog
+    // parked. The only act is recording what the re-derivation found — a
+    // checkpoint rewrite against the row as selected.
+    repo.setCheckpoint(
+      "repo-node",
+      "Re-derived: master unchanged, exact-head workflows green, no open PRs, backlog parked.",
+      steward
+    );
+    expect(() => mesh.declareYield(steward, "complete")).not.toThrow();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "standing_head_verified",
+        actorId: steward,
+        payload: expect.stringContaining('"obligationId":"repo-node"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "run_yield_rejected" }));
+  });
+
+  it("classifies a ref-free parentless head as standing and accepts its fresh-checkpoint yield (#468)", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "apex-node", title: "Apex", ownerId: subject });
+    selectHead(mesh, subject, "apex-node");
+
+    repo.setCheckpoint("apex-node", "Children all closed; nothing new to raise.", subject);
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+  });
+
+  it("accepts a clean yield on a standing owner head whose checkpoint this run rewrote (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const steward = worker(mesh, "org steward");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "org-node",
+      title: "MEK-Org",
+      ownerId: steward,
+      externalRef: "github:MEK-Org",
+    });
+    selectHead(mesh, steward, "org-node");
+
+    repo.setCheckpoint(
+      "org-node",
+      "Re-derived the organization: no changes need a new obligation.",
+      steward
+    );
+    expect(() => mesh.declareYield(steward, "complete")).not.toThrow();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "standing_head_verified",
+        actorId: steward,
+        payload: expect.stringContaining('"obligationId":"org-node"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "run_yield_rejected" }));
+  });
+
+  it("rejects a standing repository head carrying a checkpoint written before the run (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const steward = worker(mesh, "repo steward");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    // Left by an earlier run; the snapshot at selection sees exactly this
+    // triple, so the standing it records cannot attribute an act to this one.
+    repo.setCheckpoint("repo-node", "Verified last week; nothing since.", steward);
+    selectHead(mesh, steward, "repo-node");
+
+    expect(() => mesh.declareYield(steward, "complete")).toThrow(
+      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_yield_rejected",
+        payload: expect.stringContaining('"obligationId":"repo-node"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
+  });
+
+  it("rejects a standing head whose fresh checkpoint was written by another actor (#468)", () => {
+    const { mesh } = strictMesh();
+    const steward = worker(mesh, "repo steward");
+    const other = worker(mesh, "other actor");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    selectHead(mesh, steward, "repo-node");
+
+    repo.setCheckpoint("repo-node", "Another actor's verification.", other);
+    expect(() => mesh.declareYield(steward, "complete")).toThrow(
+      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
+    );
+  });
+
+  it("rejects a standing head unreadable at selection even after its owner writes a checkpoint (#468)", () => {
+    const unreadable = new Set<string>(["repo-node"]);
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => (unreadable.has(id) ? null : repo.get(id)),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+    const steward = worker(mesh, "repo steward");
+    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "repo-node",
+      title: "glass_goals",
+      ownerId: steward,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    selectHead(mesh, steward, "repo-node");
+
+    unreadable.delete("repo-node");
+    repo.setCheckpoint("repo-node", "Re-derived; no new work exists.", steward);
+    expect(() => mesh.declareYield(steward, "complete")).toThrow(
+      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
+    );
+  });
+
+  it("keeps an issue-ref'd leaf strict even with a checkpoint rewritten during the run (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "issue-leaf",
+      title: "Fix the thing",
+      ownerId: subject,
+      externalRef: "github:MEK-Org/rusa/issues/468",
+    });
+    selectHead(mesh, subject, "issue-leaf");
+
+    repo.setCheckpoint("issue-leaf", "Investigated; the fix is not mine to make alone.", subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation issue-leaf \("Fix the thing"\) was not finished or decomposed/
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_yield_rejected",
+        payload: expect.stringContaining('"obligationId":"issue-leaf"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
+  });
+
+  it("keeps a ref-free leaf strict even with a checkpoint rewritten during the run (#468)", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "root-node", title: "rusa", ownerId: subject });
+    repo.create({
+      id: "leaf-node",
+      parentId: "root-node",
+      title: "Leaf task",
+      ownerId: subject,
+    });
+    selectHead(mesh, subject, "leaf-node");
+
+    repo.setCheckpoint("leaf-node", "Did what I could; still unresolved.", subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation leaf-node \("Leaf task"\) was not finished or decomposed/
+    );
+  });
+
+  it("does not record a standing acceptance when another selected head rejects the yield (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const subject = worker(mesh, "mixed heads");
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "standing-head",
+      title: "Repository stewardship",
+      ownerId: subject,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    repo.create({
+      id: "strict-leaf",
+      title: "Actionable leaf",
+      ownerId: subject,
+      externalRef: "github:MEK-Org/rusa/issues/468",
+    });
+    mesh.deliverReadyHeadAttention(subject, { id: "standing-head", intent: "verify" }, null);
+    mesh.deliverReadyHeadAttention(subject, { id: "strict-leaf", intent: "act" }, "standing-head");
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const entryIds = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === subject &&
+          entry.payload.type === "obligation.ready_head" &&
+          (entry.payload.obligationId === "standing-head" ||
+            entry.payload.obligationId === "strict-leaf")
+      )
+      .map((entry) => entry.id);
+    expect(entryIds).toHaveLength(2);
+    mesh.selectInboxEntries(subject, entryIds);
+
+    repo.setCheckpoint("standing-head", "No repository changes need a child.", subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation strict-leaf \("Actionable leaf"\) was not finished or decomposed/
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_yield_rejected",
+        payload: expect.stringContaining('"obligationId":"strict-leaf"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
+  });
+
   it("preserves failed-run handling without clean-yield rejection", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
@@ -9258,7 +9671,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor, or — for a standing (owner/repository-level or ref-free root) head — rewrite its checkpoint during the run to record the no-change verification you performed";
     expect(notice).toContain(exits);
     expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
 

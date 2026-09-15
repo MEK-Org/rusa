@@ -729,7 +729,7 @@ export interface ActorMeshOptions {
  * anyway. One wording means the instruction cannot drift from the rule.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor, or — for a standing (owner/repository-level or ref-free root) head — rewrite its checkpoint during the run to record the no-change verification you performed";
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -3067,6 +3067,7 @@ export class ActorMesh {
   private assertCleanYieldAllowed(actorId: string): void {
     const runState = this.headClosureRuns.get(actorId);
     if (!runState || runState.headObligationIds.size === 0) return;
+    const verifiedStandingHeads: Obligation[] = [];
     const closure = this.obligations;
     // Selection already refused to arm a run without these reads, so this is
     // the second half of the same fail-closed rule rather than a soft skip: an
@@ -3086,12 +3087,13 @@ export class ActorMesh {
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
 
       if (obligation.status === "ready") {
-        const shortfall = this.strictHandoffShortfall(
-          actorId,
-          obligation,
-          runState.selectedHeads.get(obligationId) ?? null
-        );
+        const selected = runState.selectedHeads.get(obligationId) ?? null;
+        const shortfall = this.strictHandoffShortfall(actorId, obligation, selected);
         if (shortfall === null) continue;
+        if (this.isStandingHeadVerifiedNoChange(actorId, obligation, selected)) {
+          verifiedStandingHeads.push(obligation);
+          continue;
+        }
         this.rejectCleanYield(actorId, obligationId, obligation.title, shortfall);
       }
 
@@ -3122,6 +3124,13 @@ export class ActorMesh {
           "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
         );
       }
+    }
+
+    // Do not durably name an accepted disposition until every selected head has
+    // passed. A later failure rejects the whole clean-yield attempt, so emitting
+    // during the loop would leave a false accepted disposition in its history.
+    for (const obligation of verifiedStandingHeads) {
+      this.recordStandingHeadVerified(actorId, obligation);
     }
   }
 
@@ -3162,17 +3171,83 @@ export class ActorMesh {
     if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
       return `${moved} without a checkpoint written by this actor`;
     }
-    if (
-      obligation.checkpoint === selected.checkpoint &&
-      obligation.checkpointAt === selected.checkpointAt &&
-      obligation.checkpointBy === selected.checkpointBy
-    ) {
+    if (!this.checkpointWasRewrittenSinceSelection(outgoingActorId, obligation, selected)) {
       return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
     }
     if (!this.isWakeableRecipient(obligation.ownerId)) {
       return `${moved}, which is not an active actor that can be woken`;
     }
     return null;
+  }
+
+  /**
+   * Whether a still-ready head this actor still owns is a *standing* head it
+   * verified during this run, making a no-change clean yield legal (#468).
+   *
+   * A head is standing when it names a GitHub owner or repository — a ref whose
+   * path is one or two segments (`github:OWNER`, `github:OWNER/REPO`) — or when
+   * it has no ref and no parent: the never-finished nodes (repo stewardship,
+   * apexes) that re-ready whenever their last live child clears. Issue/PR-ref'd
+   * heads, non-GitHub refs, and ref-free leaves are not standing and keep every
+   * strict exit.
+   * The ref-free parentless classification is convention-backed, not
+   * schema-backed: the model has no persistent apex discriminator.
+   *
+   * The evidence demanded of the run is the same attribution
+   * {@link strictHandoffShortfall} already makes: the checkpoint on the row was
+   * rewritten by this actor against the selection-time snapshot, so a standing
+   * left by an earlier run cannot stand in for this one. A null snapshot (the
+   * head was unreadable when selected) fails closed, as it does for a handoff.
+   */
+  private isStandingHeadVerifiedNoChange(
+    actorId: string,
+    obligation: Obligation,
+    selected: SelectedHeadSnapshot | null
+  ): boolean {
+    const standing =
+      obligation.externalRef !== null
+        ? obligation.externalRef.scheme === "github" && obligation.externalRef.segments.length <= 2
+        : obligation.parentId === null;
+    if (!standing) return false;
+    if (this.resolveThreadId(obligation.ownerId) !== actorId) return false;
+    if (!selected || this.resolveThreadId(selected.ownerId) !== actorId) return false;
+    if (!this.checkpointWasRewrittenSinceSelection(actorId, obligation, selected)) return false;
+    return true;
+  }
+
+  /**
+   * Record a verified standing-head disposition only once all selected heads
+   * have passed clean-yield enforcement. This remains a sibling of
+   * `run_yield_rejected`: pilots can count accepted and rejected no-change
+   * attempts without parsing an actor-authored yield note.
+   */
+  private recordStandingHeadVerified(actorId: string, obligation: Obligation): void {
+    this.recordEvent({
+      kind: "standing_head_verified",
+      actorId,
+      detail: `Standing head obligation ${obligation.id} verified for clean yield: checkpoint rewritten by this actor during this run`,
+      payload: JSON.stringify({ obligationId: obligation.id, title: obligation.title }),
+    });
+  }
+
+  /**
+   * The run-attribution check shared by strict handoffs and verified standing
+   * no-change yields. Selection snapshots the checkpoint's complete identity;
+   * a different complete identity on a checkpoint written by this actor is
+   * the durable proof it was rewritten after selection.
+   */
+  private checkpointWasRewrittenSinceSelection(
+    actorId: string,
+    obligation: Obligation,
+    selected: SelectedHeadSnapshot
+  ): boolean {
+    return (
+      Boolean(obligation.checkpoint) &&
+      obligation.checkpointBy === actorId &&
+      (obligation.checkpoint !== selected.checkpoint ||
+        obligation.checkpointAt !== selected.checkpointAt ||
+        obligation.checkpointBy !== selected.checkpointBy)
+    );
   }
 
   /**

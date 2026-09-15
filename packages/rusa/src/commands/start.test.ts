@@ -218,17 +218,23 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
     head: string;
     title: string;
     body: string;
-  }): Promise<{ number: number; htmlUrl: string; wasCreated: boolean }> {
+  }): Promise<{ number: number; htmlUrl: string; wasCreated: boolean; draft: boolean }> {
     const key = `${opts.repo}:${opts.head}`;
     if (this.createdPRs.has(key)) {
       return {
         number: 789,
         htmlUrl: `https://example.test/${opts.repo}/pull/789`,
         wasCreated: false,
+        draft: false,
       };
     }
     this.createdPRs.add(key);
-    return { number: 789, htmlUrl: `https://example.test/${opts.repo}/pull/789`, wasCreated: true };
+    return {
+      number: 789,
+      htmlUrl: `https://example.test/${opts.repo}/pull/789`,
+      wasCreated: true,
+      draft: false,
+    };
   }
 }
 
@@ -694,7 +700,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
     expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor, or — for a standing (owner/repository-level or ref-free root) head — rewrite its checkpoint during the run to record the no-change verification you performed"
     );
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");
