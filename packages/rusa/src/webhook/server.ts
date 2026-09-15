@@ -5,7 +5,6 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
 import {
@@ -41,6 +40,7 @@ import type { PrincipalRepository } from "../db/repositories/principal-repositor
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
 import type { VoiceService } from "../voice/voice-service.js";
@@ -134,7 +134,7 @@ export interface DashboardMeshRefs {
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
-  inbox?: InboxStore;
+  inbox?: InboxRepository;
   emitter: MeshEventEmitter;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;

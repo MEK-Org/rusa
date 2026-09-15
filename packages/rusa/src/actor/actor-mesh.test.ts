@@ -24,6 +24,15 @@ import {
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type {
+  InboxActorWork,
+  InboxEntry,
+  InboxItemsAppendedListener,
+  InboxListOptions,
+  InboxPage,
+  InboxPayload,
+  InboxRepository,
+} from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
   EventManager,
@@ -55,14 +64,6 @@ import {
 } from "./experiments.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
-import type {
-  InboxActorWork,
-  InboxEntry,
-  InboxListOptions,
-  InboxPage,
-  InboxPayload,
-  InboxStore,
-} from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import {
   AtEnqueueUnconfirmedError,
@@ -90,8 +91,9 @@ function captureLogger(records: Array<Record<string, unknown>>): Logger {
   return logger;
 }
 
-function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
+function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
   const entries: InboxEntry[] = [];
+  const listeners = new Set<InboxItemsAppendedListener>();
   const pendingActors = (predicate: (entry: InboxEntry) => boolean): InboxActorWork[] => {
     const priorities = new Map<string, InboxActorWork["priority"]>();
     for (const entry of entries.filter(predicate)) {
@@ -105,7 +107,7 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
   return {
     entries,
     append: (inputs) => {
-      // Mirrors InboxRepository: the insert is `ON CONFLICT(id) DO NOTHING` and
+      // Mirrors SqliteInboxRepository: the insert is `ON CONFLICT(id) DO NOTHING` and
       // the return is filtered to rows actually inserted, so a caller-supplied
       // duplicate id is suppressed and reported as "nothing new". Without this
       // the fake silently grants at-least-once where the real store gives
@@ -123,7 +125,14 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
         }))
         .filter((row) => !entries.some((existing) => existing.id === row.id));
       entries.push(...inserted);
+      if (inserted.length > 0) for (const listener of listeners) listener(inserted);
       return inserted;
+    },
+    onItemsAppended: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
     },
     list: (actorId: string, options: InboxListOptions = {}): InboxPage => {
       const status = options.status ?? "unhandled";
@@ -216,7 +225,7 @@ function setup(
     idgen?: () => string;
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
     recordRunYield?: ActorMeshOptions["recordRunYield"];
-    inboxStore?: InboxStore;
+    inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
@@ -876,7 +885,7 @@ describe("ActorMesh", () => {
       ],
       countUnhandled: (actorId: string) => (actorId === "t1" ? 1 : 0),
       markSeen: () => [],
-    } as unknown as InboxStore;
+    } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
       id: "t1",
@@ -1803,7 +1812,7 @@ describe("ActorMesh", () => {
   it("rolls a transferred lease back when the durable handoff write fails", () => {
     let holder = "";
     const backingStore = createMemoryInboxStore();
-    const failingInbox: InboxStore = {
+    const failingInbox: InboxRepository = {
       ...backingStore,
       append: () => {
         throw new Error("disk full");
@@ -5522,7 +5531,7 @@ describe("ActorMesh", () => {
 
       // Recipient liveness, the durable append, and the wake are one turn.
       // Suspend anywhere between them and a retirement lands after a recipient
-      // was resolved as live: the row is still written (InboxRepository.append
+      // was resolved as live: the row is still written (SqliteInboxRepository.append
       // validates only non-empty actor ids, and the inbox table has no actor
       // foreign key), leaving durable unhandled work nobody alive can take,
       // and the wake then fails. A microtask queued before the call is the
@@ -6000,7 +6009,7 @@ describe("ActorMesh", () => {
           }));
         },
         countUnhandled: () => appended.length,
-      } as unknown as InboxStore;
+      } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
         onInboxEntriesSeen: () => order.push("reaction"),
@@ -6087,7 +6096,7 @@ describe("ActorMesh", () => {
         append: () => {
           throw new Error("disk full");
         },
-      } as unknown as InboxStore;
+      } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
       const resource = "github:dummy-org/dummy-repo/issues/903" as const;
@@ -6123,7 +6132,7 @@ describe("ActorMesh", () => {
           }));
         },
         markSeen: () => [],
-      } as unknown as InboxStore;
+      } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -7402,7 +7411,7 @@ describe("ActorMesh", () => {
     it("makes callback retries idempotent without a local pending-message row", () => {
       const storedInbox = createMemoryInboxStore();
       let failAppend = true;
-      const inboxStore: InboxStore = {
+      const inboxStore: InboxRepository = {
         ...storedInbox,
         append: (inputs) => {
           if (failAppend) {

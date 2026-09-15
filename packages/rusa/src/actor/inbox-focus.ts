@@ -10,7 +10,7 @@ import {
   type ObligationArtifact,
 } from "../obligations/obligation.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
-import type { InboxEntry } from "./inbox-store.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 
 const CONTEXT_CHILD_LIMIT = 10;
 const CONTEXT_SIBLING_RADIUS = 2;

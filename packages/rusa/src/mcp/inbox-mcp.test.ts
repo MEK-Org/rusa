@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { actorInbox } from "../db/migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../db/migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../db/migrations/0015_actor_inbox_handled_note.js";
-import { InboxRepository } from "../db/repositories/inbox-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { createInboxMcpServer } from "./inbox-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -25,14 +25,14 @@ function dataOf(result: CallToolResult): unknown {
 }
 
 describe("inbox MCP server", () => {
-  let store: InboxRepository;
+  let store: SqliteInboxRepository;
 
   beforeEach(() => {
     const db = new Database(":memory:");
     actorInbox.up(db);
     actorInboxSeen.up(db);
     actorInboxHandledNote.up(db);
-    store = new InboxRepository(db, () => new Date("2026-07-13T12:00:00Z"));
+    store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00Z"));
     store.append([
       { id: "own", actorId: "actor-a", source: "chat", payload: { type: "message.created" } },
       { id: "foreign", actorId: "actor-b", source: "chat", payload: { type: "message.created" } },
