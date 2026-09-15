@@ -186,7 +186,13 @@ import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
-import { DiskUsageAlert } from "../observability/disk-alert.js";
+import {
+  DiskUsageAlert,
+  type DiskUsageAlertDeps,
+  describeDiskAlertConfig,
+  diskAlertActive,
+  resolveDiskAlertConfig,
+} from "../observability/disk-alert.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -217,7 +223,11 @@ import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
-import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import {
+  type DurableEventDelivery,
+  EventManager,
+  HierarchicalEventSourceResolver,
+} from "../runtime/event-manager.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -375,7 +385,7 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
   return [...providers];
 }
 
-function configuredRootEventSources(config: RusaConfig): EventResource[] {
+export function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
 
   for (const entry of config.github.orgs ?? []) {
@@ -393,14 +403,51 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
     configured.push("gchat:spaces");
   }
 
-  // Disk alerts are a host-owned event source, so configuring the producer is
-  // also the subscription declaration. Keeping that derivation here avoids a
-  // second config knob that can drift from observability.diskAlert.
-  if (config.observability?.diskAlert !== undefined) {
+  // Disk alerts are a host-owned event source, so whatever runs the producer is
+  // also the subscription declaration. Both sides read `diskAlertActive`, so a
+  // running sensor always has a receiver: an absent `observability` block used
+  // to leave the sensor emitting into a source nobody covered, and every alert
+  // it raised was dropped at the routing boundary (#481).
+  if (diskAlertActive(config)) {
     configured.push("system:events");
   }
 
   return configured;
+}
+
+/**
+ * A running disk sensor with no covering root source — the shape that silently
+ * threw away four hours of low-disk warning before a host filled up. Both sides
+ * now derive from one predicate, so this reads false by construction; it stays
+ * as the boot-time alarm that says so out loud if they ever drift again (#481).
+ */
+export function diskAlertUncovered(
+  config: RusaConfig,
+  configuredRoots: readonly EventResource[]
+): boolean {
+  if (!diskAlertActive(config)) return false;
+  return !configuredRoots.some((configured) => isSubResourceOf("system:events", configured));
+}
+
+/** What happened to a host-level alarm once it left the sensor. */
+export type HostAlarmOutcome = "delivered" | "errorChat" | "dropped";
+
+/**
+ * Raise a host-level alarm through the mesh, falling back to a direct error-chat
+ * send when the delivery lands in nobody's inbox. A full disk is precisely the
+ * condition under which mesh routing may already be degraded, so the alarm keeps
+ * the pre-mesh direct send as its floor rather than trusting routing (#481).
+ */
+export async function deliverHostAlarm(opts: {
+  deliver: () => Promise<DurableEventDelivery>;
+  message: string;
+  sendToErrorChat: ((text: string) => void) | null;
+}): Promise<HostAlarmOutcome> {
+  const delivery = await opts.deliver();
+  if (delivery.entries.length > 0) return "delivered";
+  if (!opts.sendToErrorChat) return "dropped";
+  opts.sendToErrorChat(opts.message);
+  return "errorChat";
 }
 
 /** Legacy cap value retained for event detail; Actor now allows one corrective yield run. */
@@ -526,6 +573,8 @@ export interface RunStartE2EHooks {
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
+  /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
+  diskAlertDeps?: DiskUsageAlertDeps;
   onReady?: (handles: RunStartE2EHandles) => void;
 }
 
@@ -3768,24 +3817,60 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
 
   const diskAlertConfig = config.observability?.diskAlert;
+  const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);
   let diskAlert: DiskUsageAlert | null = null;
-  if (diskAlertConfig?.enabled !== false) {
-    const activeDiskAlert = new DiskUsageAlert(diskAlertConfig, async (event) => {
-      await mesh.deliverExternalEvent({
-        sourceType: "timer",
-        rawResource: "system:events",
-        rawPayload: event,
-        priority: "responsive",
-        eventSummary: event.message,
-      });
+  if (diskAlertActive(config)) {
+    // The effective settings are stated at boot: an operator reading the journal
+    // should never have to infer which threshold the sensor is actually using.
+    log.info("disk_alert_active", {
+      volume: diskAlertSettings.volume,
+      thresholdPercent: diskAlertSettings.thresholdPercent,
+      thresholdBytes: diskAlertSettings.thresholdBytes,
+      intervalSeconds: diskAlertSettings.intervalSeconds,
+      cooldownSeconds: diskAlertSettings.cooldownSeconds,
+      summary: describeDiskAlertConfig(diskAlertSettings),
     });
+    if (diskAlertUncovered(config, configuredRoots)) {
+      log.warn("disk_alert_uncovered", {
+        detail:
+          "disk sensor is active but system:events is not a configured root source — host alarms will reach only errorChat",
+        errorChatConfigured: sendToErrorChat !== null,
+      });
+    }
+    const activeDiskAlert = new DiskUsageAlert(
+      diskAlertConfig,
+      async (event) => {
+        const outcome = await deliverHostAlarm({
+          deliver: () =>
+            mesh.deliverExternalEvent({
+              sourceType: "timer",
+              rawResource: "system:events",
+              rawPayload: event,
+              priority: "responsive",
+              eventSummary: event.message,
+            }),
+          message: event.message,
+          sendToErrorChat,
+        });
+        if (outcome !== "delivered") {
+          log.warn("disk_alert_not_delivered_to_mesh", {
+            fallback: outcome,
+            volume: event.volume,
+            freePercent: Number(event.freePercent.toFixed(1)),
+          });
+        }
+      },
+      undefined,
+      opts?.e2e?.diskAlertDeps
+    );
     diskAlert = activeDiskAlert;
-    // Reuse the 10-minute check interval for disk alerting or the configured one
     diskAlertCheck = setInterval(
       () => void activeDiskAlert.check(),
-      (diskAlertConfig?.intervalSeconds ?? 600) * 1000
+      diskAlertSettings.intervalSeconds * 1000
     );
     diskAlertCheck.unref?.();
+  } else {
+    log.info("disk_alert_disabled", { detail: "observability.diskAlert.enabled is false" });
   }
 
   // Probe model catalogs on startup and daily thereafter

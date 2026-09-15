@@ -30,6 +30,7 @@ import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/prot
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
+import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -2271,7 +2272,85 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent).toEqual([]);
   });
 
-  it("seeds root's system subscription from observability.diskAlert alone", async () => {
+  it("delivers the alert to root when config carries no observability block at all", async () => {
+    // The production shape behind the outage: no observability block, so the
+    // sensor ran on defaults and emitted into a source nobody covered. Root's
+    // subscription now follows the sensor's own predicate, so the alert lands.
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        chat: { errorChat: "spaces/operator-dm" },
+      }),
+      "utf8"
+    );
+
+    // 1 GiB free of 100 GiB — 1% free, under the 10%-free default.
+    const fakeStatfs = vi.fn().mockResolvedValue({
+      bavail: 1,
+      blocks: 100,
+      bsize: 1024 * 1024 * 1024,
+    });
+
+    let mesh: ActorMesh | undefined;
+    let emitSystemDiskCheck: (() => Promise<void>) | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          diskAlertDeps: {
+            statfs: fakeStatfs as unknown as DiskUsageAlertDeps["statfs"],
+            now: () => 1_000_000,
+          },
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            emitSystemDiskCheck = handles.emitSystemDiskCheck;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!emitSystemDiskCheck) throw new Error("disk check not ready");
+    expect(mesh?.listSubscriptions()).toContainEqual(
+      expect.objectContaining({
+        actorId: "root",
+        resource: "system:events",
+        subscribedBy: "root",
+      })
+    );
+
+    await emitSystemDiskCheck();
+
+    expect(fakeStatfs).toHaveBeenCalledWith("/");
+    expect(getRepositories().inbox.list("root").entries).toEqual([
+      expect.objectContaining({
+        actorId: "root",
+        source: "system:events",
+        payload: expect.objectContaining({
+          type: "system.disk",
+          priority: "responsive",
+          volume: "/",
+          thresholdPercent: 10,
+        }),
+      }),
+    ]);
+    expect(requestRunCalls).toContainEqual({
+      actorId: "root",
+      reason: JSON.stringify({ priority: "responsive" }),
+    });
+    // The mesh carried it, so the last-resort error-chat send stays unused.
+    expect(chatClient.sent).toEqual([]);
+  });
+
+  it("withholds root's system subscription only when the sensor is explicitly disabled", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -2284,11 +2363,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
 
     let mesh: ActorMesh | undefined;
+    let emitSystemDiskCheck: (() => Promise<void>) | undefined;
+    const fakeStatfs = vi.fn().mockResolvedValue({ bavail: 1, blocks: 100, bsize: 1024 });
     await new Promise<void>((resolve) => {
       runStart({
         e2e: {
+          diskAlertDeps: {
+            statfs: fakeStatfs as unknown as DiskUsageAlertDeps["statfs"],
+            now: () => 1_000_000,
+          },
           onReady: (handles) => {
             mesh = handles.mesh;
+            emitSystemDiskCheck = handles.emitSystemDiskCheck;
             shutdownFn = handles.shutdown;
             resolve();
           },
@@ -2296,13 +2382,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
 
-    expect(mesh?.listSubscriptions()).toContainEqual(
-      expect.objectContaining({
-        actorId: "root",
-        resource: "system:events",
-        subscribedBy: "root",
-      })
+    expect(mesh?.listSubscriptions()).not.toContainEqual(
+      expect.objectContaining({ actorId: "root", resource: "system:events" })
     );
+    // No sensor to trigger, so nothing reads the volume and nothing is delivered.
+    await emitSystemDiskCheck?.();
+    expect(fakeStatfs).not.toHaveBeenCalled();
+    expect(getRepositories().inbox.list("root").entries).toEqual([]);
   });
 
   it("adds mechanical eyes for ordinary comments on queued run", async () => {
