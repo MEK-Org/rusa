@@ -274,7 +274,7 @@ export interface ResolveRecipientsOptions {
  * same-turn invariant: recipient liveness, durable append, and the caller's
  * wake must not be separated by an await, or an actor can retire after being
  * selected as live and leave a durable unhandled row nobody is alive to take
- * (`SqliteInboxRepository.append` validates only non-empty ids, and the inbox table
+ * (`InboxRepository.append` validates only non-empty ids, and the inbox table
  * has no actor foreign key). Every read port behind this is a synchronous
  * in-memory or better-sqlite3 read, so a promise here would buy nothing and
  * cost the invariant.

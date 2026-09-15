@@ -258,6 +258,32 @@ describe("SqliteInboxRepository", () => {
       expect(listener).not.toHaveBeenCalled();
     });
 
+    it("deduplicates same-batch IDs so exactly the committed row is returned and emitted", () => {
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+
+      const inserted = store.append([
+        { id: "batch-dup", actorId: "actor-a", source: "chat", payload: { type: "first" } },
+        { id: "batch-dup", actorId: "actor-b", source: "webhook", payload: { type: "second" } },
+      ]);
+
+      expect(inserted).toHaveLength(1);
+      expect(inserted[0]).toMatchObject({
+        id: "batch-dup",
+        actorId: "actor-a",
+        source: "chat",
+        payload: { type: "first" },
+      });
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith(inserted);
+      expect(store.read("actor-a", "batch-dup")).toMatchObject({
+        id: "batch-dup",
+        actorId: "actor-a",
+        payload: { type: "first" },
+      });
+      expect(store.read("actor-b", "batch-dup")).toBeNull();
+    });
+
     it("emits nothing when validation rejects the batch before any write", () => {
       const listener = vi.fn();
       store.onItemsAppended(listener);
@@ -356,6 +382,26 @@ describe("SqliteInboxRepository", () => {
       expect(inserted.map((row) => row.id)).toEqual(["kept-by-container"]);
       expect(journaled).toHaveLength(1);
       expect((journaled[0] as Error).message).toBe("listener boom");
+    });
+
+    it("contains a throwing error reporter: write stands and later subscribers still run", () => {
+      store.setListenerErrorHandler(() => {
+        throw new Error("reporter exploded");
+      });
+      const after = vi.fn();
+      store.onItemsAppended(() => {
+        throw new Error("listener failed");
+      });
+      store.onItemsAppended(after);
+
+      let inserted: InboxEntry[] = [];
+      expect(() => {
+        inserted = store.append([entry("kept-despite-reporter-throw")]);
+      }).not.toThrow();
+
+      expect(inserted.map((row) => row.id)).toEqual(["kept-despite-reporter-throw"]);
+      expect(after).toHaveBeenCalledWith(inserted);
+      expect(store.read("actor-a", "kept-despite-reporter-throw")?.handledAt).toBeNull();
     });
 
     it("recovers through actorsWithUnhandled() when no notification was delivered", () => {
