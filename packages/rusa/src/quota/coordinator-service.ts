@@ -9,7 +9,8 @@ import {
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
-  type PublishedThrottleProviderStatus,
+  type PublishedThrottleColdStatus,
+  type PublishedThrottleLaneStatus,
   publishedThrottle,
   type QuotaCoordinatorError,
   type QuotaCoordinatorErrorResponse,
@@ -171,6 +172,19 @@ export class QuotaCoordinatorService {
     );
   }
 
+  // A configured-but-cold lane is an application state served with HTTP 200,
+  // not a 503 (§5.5, §5.6). Both throttle forms build the value here so the
+  // collection entry is byte-identical to the single response minus `service`.
+  private coldThrottle(provider: string): PublishedThrottleColdStatus {
+    return {
+      error: {
+        code: "not_ready",
+        message: `Coordinator is cold: no observations recorded for provider "${provider}" yet`,
+        retryable: true,
+      },
+    };
+  }
+
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     try {
       this.dispatchRequest(req, res);
@@ -232,10 +246,9 @@ export class QuotaCoordinatorService {
 
         const stored = this.options.store.getProviderThrottle(provider);
         if (!stored) {
-          this.sendError(res, 503, {
-            code: "not_ready",
-            message: `Coordinator is cold: no observations recorded for provider "${provider}" yet`,
-            retryable: true,
+          this.sendJson(res, 200, {
+            service: serviceInfo,
+            ...this.coldThrottle(provider),
           });
           return;
         }
@@ -254,18 +267,19 @@ export class QuotaCoordinatorService {
         return;
       }
 
-      // Collection form: /v1/throttle without ?provider=
-      const providersMap: Record<string, PublishedThrottleProviderStatus> = {};
+      // Collection form: /v1/throttle without ?provider= — every configured
+      // provider, cold lanes included (criterion 16).
+      const providersMap: Record<string, PublishedThrottleLaneStatus> = {};
       for (const p of this.configuredProviders) {
         const stored = this.options.store.getProviderThrottle(p);
-        if (stored) {
-          providersMap[p] = publishedThrottle(stored, {
-            maxIntervalSeconds: this.maxIntervalSeconds,
-            staleAfterMs: this.staleAfterMs,
-            hardStaleAfterMs: this.hardStaleAfterMs,
-            nowMs,
-          });
-        }
+        providersMap[p] = stored
+          ? publishedThrottle(stored, {
+              maxIntervalSeconds: this.maxIntervalSeconds,
+              staleAfterMs: this.staleAfterMs,
+              hardStaleAfterMs: this.hardStaleAfterMs,
+              nowMs,
+            })
+          : this.coldThrottle(p);
       }
 
       this.sendJson(res, 200, {

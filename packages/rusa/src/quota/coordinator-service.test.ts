@@ -438,24 +438,25 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
-      // Kimi is configured but cold. The collection must not invent a status
-      // for it, while its individual request remains a retryable not_ready.
+      // Kimi is configured but cold. It is still in the collection, carrying
+      // the same 200 not_ready body its individual request returns (§5.5).
       configuredProviders: ["claude", "codex", "kimi"],
       now: () => nowMs,
     });
     await service.start();
 
-    // Call collection form
+    // Call collection form: every configured provider, cold lanes included
     const collRes = await makeRequest(socketPath, "/v1/throttle");
     expect(collRes.status).toBe(200);
     expect(collRes.json.providers).toBeDefined();
-    expect(Object.keys(collRes.json.providers)).toEqual(["claude", "codex"]);
+    expect(Object.keys(collRes.json.providers)).toEqual(["claude", "codex", "kimi"]);
+    expect(collRes.json.providers.kimi.error.code).toBe("not_ready");
 
     const coldSingleRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
-    expect(coldSingleRes.status).toBe(503);
+    expect(coldSingleRes.status).toBe(200);
     expect(coldSingleRes.json.error.code).toBe("not_ready");
 
-    for (const p of ["claude", "codex"]) {
+    for (const p of ["claude", "codex", "kimi"]) {
       const singleRes = await makeRequest(socketPath, `/v1/throttle?provider=${p}`);
       expect(singleRes.status).toBe(200);
 
@@ -546,7 +547,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
   });
 
   // §5.6: The two semantic endpoint codes are provider_unknown and not_ready.
-  it("§5.6: returns provider_unknown (404) for unconfigured provider and not_ready (503) when cold", async () => {
+  // not_ready is an application state served with 200; 503 is reserved for
+  // genuine infrastructure failure.
+  it("§5.6: returns provider_unknown (404) for unconfigured provider and not_ready (200) when cold", async () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -561,9 +564,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(unknownRes.json.error.retryable).toBe(false);
     expect(unknownRes.json.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
 
-    // 2. Configured provider with no observations -> not_ready (503, retryable)
+    // 2. Configured provider with no observations -> not_ready (200, retryable)
     const coldRes = await makeRequest(socketPath, "/v1/throttle?provider=claude");
-    expect(coldRes.status).toBe(503);
+    expect(coldRes.status).toBe(200);
     expect(coldRes.json.error.code).toBe("not_ready");
     expect(coldRes.json.error.retryable).toBe(true);
     expect(coldRes.json.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
@@ -603,16 +606,16 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     await service.start();
 
     // Mixed-case alias on throttle: normalizes to the agy lane, which is
-    // configured but cold -> not_ready (503). A miss would be provider_unknown (404).
+    // configured but cold -> not_ready (200). A miss would be provider_unknown (404).
     for (const spelling of ["Antigravity", "ANTIGRAVITY", "antigravity"]) {
       const res = await makeRequest(socketPath, `/v1/throttle?provider=${spelling}`);
-      expect(res.status, `Expected 503 not_ready for ${spelling}`).toBe(503);
+      expect(res.status, `Expected 200 not_ready for ${spelling}`).toBe(200);
       expect(res.json.error.code).toBe("not_ready");
     }
 
     // Mixed-case plain provider also matches case-insensitively
     const claudeRes = await makeRequest(socketPath, "/v1/throttle?provider=CLAUDE");
-    expect(claudeRes.status).toBe(503);
+    expect(claudeRes.status).toBe(200);
     expect(claudeRes.json.error.code).toBe("not_ready");
 
     // quota: normalized alias resolves to the configured agy lane ("unknown",
