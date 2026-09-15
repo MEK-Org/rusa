@@ -208,8 +208,8 @@ class MeshHeader extends StatelessWidget {
               final twoTier = !drawerNav && constraints.maxWidth < 850;
               final detail = drawerNav ? detailActor : null;
               final detailActions = detail == null
-                  ? const <ActorHeaderAction>[]
-                  : actorHeaderActions(store: store, actor: detail);
+                  ? const <_ActorHeaderAction>[]
+                  : _actorHeaderActions(store: store, actor: detail);
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -402,13 +402,10 @@ class ProfileMenu extends StatelessWidget {
   }
 }
 
-/// One actor-detail action surfaced by the dashboard chrome (issue #462). The
-/// phone app bar's overflow menu renders these as labelled rows and the
-/// desktop detail header renders the same list as inline icon buttons — one
-/// list, so the two surfaces can never disagree about which actions an actor's
-/// run state offers.
-class ActorHeaderAction {
-  const ActorHeaderAction({
+/// One actor-detail action surfaced by the phone app bar's overflow menu
+/// (issue #462). Rendered as labelled rows in [_ActorActionMenu].
+class _ActorHeaderAction {
+  const _ActorHeaderAction({
     required this.label,
     required this.icon,
     required this.invoke,
@@ -419,22 +416,22 @@ class ActorHeaderAction {
   final VoidCallback invoke;
 }
 
-/// The actions an actor's current run state supports: queued actors can run
-/// now or drop their queued run; running ones can be interrupted; idle ones
+/// The phone actions an actor's current run state supports: queued actors can
+/// run now or drop their queued run; running ones can be interrupted; idle ones
 /// can be run. Retired actors offer nothing.
-List<ActorHeaderAction> actorHeaderActions({
+List<_ActorHeaderAction> _actorHeaderActions({
   required DashboardStore store,
   required ThreadDto actor,
 }) {
   switch (store.dotFor(actor)) {
     case DotState.queued:
       return [
-        ActorHeaderAction(
+        _ActorHeaderAction(
           label: 'Run now',
           icon: Icons.fast_forward_rounded,
           invoke: () => store.runNowActor(actor.id),
         ),
-        ActorHeaderAction(
+        _ActorHeaderAction(
           label: 'Cancel queued run',
           icon: Icons.stop_rounded,
           invoke: () => store.interruptActor(actor.id),
@@ -442,7 +439,7 @@ List<ActorHeaderAction> actorHeaderActions({
       ];
     case DotState.active:
       return [
-        ActorHeaderAction(
+        _ActorHeaderAction(
           label: 'Interrupt',
           icon: Icons.stop_rounded,
           invoke: () => store.interruptActor(actor.id),
@@ -450,7 +447,7 @@ List<ActorHeaderAction> actorHeaderActions({
       ];
     case DotState.idle:
       return [
-        ActorHeaderAction(
+        _ActorHeaderAction(
           label: 'Run now',
           icon: Icons.fast_forward_rounded,
           invoke: () => store.runNowActor(actor.id),
@@ -507,11 +504,11 @@ class _DetailIdentity extends StatelessWidget {
 class _ActorActionMenu extends StatelessWidget {
   const _ActorActionMenu({required this.actions});
 
-  final List<ActorHeaderAction> actions;
+  final List<_ActorHeaderAction> actions;
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<ActorHeaderAction>(
+    return PopupMenuButton<_ActorHeaderAction>(
       tooltip: 'Actor actions',
       position: PopupMenuPosition.under,
       style: IconButton.styleFrom(
@@ -521,7 +518,7 @@ class _ActorActionMenu extends StatelessWidget {
       onSelected: (action) => action.invoke(),
       itemBuilder: (_) => [
         for (final action in actions)
-          PopupMenuItem<ActorHeaderAction>(
+          PopupMenuItem<_ActorHeaderAction>(
             value: action,
             child: Row(
               mainAxisSize: MainAxisSize.min,
