@@ -242,6 +242,7 @@ import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
+import { buildSupportedVoiceCatalog } from "../voice/voice-catalog.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
@@ -1787,9 +1788,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
-    elevenlabsVoiceIds:
-      config.voice?.elevenlabsVoices?.map((voice) => voice.voiceId) ??
-      config.voice?.elevenlabsVoiceIds,
+    supportedVoices: config.voice?.supportedVoices,
     actors,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
@@ -3430,8 +3429,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
-          elevenlabsVoices: config.voice?.elevenlabsVoices,
-          elevenlabsVoiceIds: config.voice?.elevenlabsVoiceIds,
+          supportedVoices: buildSupportedVoiceCatalog(config.voice?.supportedVoices),
           getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated

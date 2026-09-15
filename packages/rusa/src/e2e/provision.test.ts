@@ -91,7 +91,16 @@ describe("buildE2EConfig", () => {
       elevenlabsApiKey: "elevenlabs-test-key",
       voice: {
         transcriptionProvider: "elevenlabs",
-        elevenlabsVoiceIds: ["G17SuINrv2H9FC6nvetn", "SMRMz7WpPUV6i2myuniv"],
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "G17SuINrv2H9FC6nvetn" },
+            },
+          },
+        ],
       },
     } as unknown as RusaConfig;
 

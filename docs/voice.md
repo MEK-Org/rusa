@@ -21,11 +21,26 @@ For actor TTS, configure the voice pool:
 
 ```yaml
 voice:
-  elevenlabsVoices:
-    - voiceId: G17SuINrv2H9FC6nvetn
-      label: Christopher
-    - voiceId: SMRMz7WpPUV6i2myuniv
-      label: Valentino
+  supportedVoices:
+    - label: Christopher
+      voiceConfig:
+        schemaVersion: 1
+        provider: elevenlabs
+        config:
+          voiceId: G17SuINrv2H9FC6nvetn
+    - label: Valentino
+      voiceConfig:
+        schemaVersion: 1
+        provider: elevenlabs
+        config:
+          voiceId: SMRMz7WpPUV6i2myuniv
+    # The same pool can contain Gemini voices:
+    # - label: Achernar
+    #   voiceConfig:
+    #     schemaVersion: 1
+    #     provider: google
+    #     config:
+    #       voiceName: Achernar
 ```
 
 These labels appear in the actor's **Info → Voice** dropdown. New actors randomly
@@ -33,8 +48,15 @@ receive a voice from this pool. Existing actors retain their current settings;
 choosing another voice takes effect on the next reply. An omitted or empty pool
 keeps Google's existing random assignment. Google voices and **Instance default**
 remain available in the dropdown. Previously saved IDs remain displayed even if
-removed from the pool. Legacy `elevenlabsVoiceIds` lists still work, using IDs as
-labels; when both fields exist, `elevenlabsVoices` takes precedence.
+removed from the pool.
+
+The dashboard snapshot has one `supportedVoices` catalog for all providers. Each
+entry contains `label`, `providerLabel`, and `voiceConfig`. Built-in Gemini voices
+are included automatically; a configured entry for the same document overrides
+its label. Actor selections and PATCH requests use that `voiceConfig` document
+unchanged, so labels are never used as provider voice IDs. Adding a provider
+requires its voice schema, display label, and speech adapter; the dashboard API,
+store, dropdown, and actor assignment do not need additional provider fields.
 The instance default is Google, so it still requires `geminiApiKey`; with only an
 ElevenLabs key, select an ElevenLabs voice for each actor you speak with.
 

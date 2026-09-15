@@ -86,11 +86,17 @@ Minimal example:
   #   transcriptionProvider: google # or elevenlabs (defaults to scribe_v2)
   #   transcriptionModel: gemini-2.5-flash # omit to use the provider default
   #   elevenlabsTtsModel: eleven_multilingual_v2
-  #   elevenlabsVoices:
-  #     - voiceId: G17SuINrv2H9FC6nvetn
-  #       label: Christopher
-  #     - voiceId: SMRMz7WpPUV6i2myuniv
-  #       label: Valentino
+  #   supportedVoices:
+  #     - label: Christopher
+  #       voiceConfig:
+  #         schemaVersion: 1
+  #         provider: elevenlabs
+  #         config: { voiceId: G17SuINrv2H9FC6nvetn }
+  #     - label: Valentino
+  #       voiceConfig:
+  #         schemaVersion: 1
+  #         provider: elevenlabs
+  #         config: { voiceId: SMRMz7WpPUV6i2myuniv }
   #   ttsModel: gemini-3.1-flash-tts-preview
   #   voiceName: Laomedeia
 

@@ -847,42 +847,37 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
 });
 
 describe("loadConfig voice (optional)", () => {
-  it("loads named voices and preserves legacy ID-only pools", () => {
+  it("loads a mixed provider catalog and canonicalizes its documents", () => {
+    const voiceConfig = { schemaVersion: 1, provider: "google", config: { voiceName: " puck " } };
+    const eleven = { schemaVersion: 1, provider: "elevenlabs", config: { voiceId: " id " } };
     const voice = loadConfig(
-      writeConfig({ voice: { elevenlabsVoices: [{ voiceId: " id ", label: " Christopher " }] } })
+      writeConfig({
+        voice: {
+          supportedVoices: [
+            { label: " Puck ", voiceConfig },
+            { label: "Christopher", voiceConfig: eleven },
+          ],
+        },
+      })
     ).voice;
-    expect(voice?.elevenlabsVoices).toEqual([{ voiceId: "id", label: "Christopher" }]);
-    expect(
-      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: ["old"] } })).voice?.elevenlabsVoices
-    ).toEqual([{ voiceId: "old", label: "old" }]);
+    expect(voice?.supportedVoices).toEqual([
+      { label: "Puck", voiceConfig: { ...voiceConfig, config: { voiceName: "Puck" } } },
+      { label: "Christopher", voiceConfig: { ...eleven, config: { voiceId: "id" } } },
+    ]);
+    const entry = { label: "Puck", voiceConfig };
     for (const entries of [
       null,
       ["id"],
-      [{ voiceId: "id", label: " " }],
-      [{ voiceId: "", label: "name" }],
-      [
-        { voiceId: "id", label: "a" },
-        { voiceId: "id", label: "b" },
-      ],
+      [{ ...entry, label: " " }],
+      [{ ...entry, voiceConfig: { ...voiceConfig, provider: "unknown" } }],
+      [entry, entry],
     ]) {
-      expect(() => loadConfig(writeConfig({ voice: { elevenlabsVoices: entries } }))).toThrow(
-        /elevenlabsVoices/
-      );
-    }
-  });
-
-  it("normalizes the ElevenLabs pool and rejects malformed lists", () => {
-    expect(
-      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: [" a ", "b", "a"] } })).voice
-        ?.elevenlabsVoiceIds
-    ).toEqual(["a", "b"]);
-    for (const value of ["a", [""], [42], null]) {
-      expect(() => loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: value } }))).toThrow(
-        /elevenlabsVoiceIds/
+      expect(() => loadConfig(writeConfig({ voice: { supportedVoices: entries } }))).toThrow(
+        /supportedVoices/
       );
     }
     expect(
-      loadConfig(writeConfig({ voice: { elevenlabsVoiceIds: [] } })).voice?.elevenlabsVoiceIds
+      loadConfig(writeConfig({ voice: { supportedVoices: [] } })).voice?.supportedVoices
     ).toEqual([]);
   });
 

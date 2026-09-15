@@ -8,6 +8,7 @@ import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.j
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
+import { parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
@@ -604,48 +605,14 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     ) {
       throw new Error("config.yaml: voice.transcriptionProvider must be google or elevenlabs");
     }
-    if (voice.elevenlabsVoiceIds !== undefined) {
-      if (
-        !Array.isArray(voice.elevenlabsVoiceIds) ||
-        voice.elevenlabsVoiceIds.some((id) => typeof id !== "string" || !id.trim())
-      )
+    if (voice.supportedVoices !== undefined) {
+      try {
+        voice.supportedVoices = parseVoiceDefinitions(voice.supportedVoices);
+      } catch (error) {
         throw new Error(
-          "config.yaml: voice.elevenlabsVoiceIds must be a list of non-empty strings"
+          `config.yaml: voice.supportedVoices: ${error instanceof Error ? error.message : String(error)}`
         );
-      voice.elevenlabsVoiceIds = [...new Set(voice.elevenlabsVoiceIds.map((id) => id.trim()))];
-    }
-    if (voice.elevenlabsVoices !== undefined) {
-      if (
-        !Array.isArray(voice.elevenlabsVoices) ||
-        voice.elevenlabsVoices.some(
-          (entry) =>
-            !entry ||
-            typeof entry !== "object" ||
-            Array.isArray(entry) ||
-            typeof entry.voiceId !== "string" ||
-            !entry.voiceId.trim() ||
-            typeof entry.label !== "string" ||
-            !entry.label.trim()
-        )
-      )
-        throw new Error(
-          "config.yaml: voice.elevenlabsVoices must be a list of { voiceId, label } with non-empty strings"
-        );
-      voice.elevenlabsVoices = voice.elevenlabsVoices.map((entry) => ({
-        voiceId: entry.voiceId.trim(),
-        label: entry.label.trim(),
-      }));
-      if (
-        new Set(voice.elevenlabsVoices.map((entry) => entry.voiceId)).size !==
-        voice.elevenlabsVoices.length
-      ) {
-        throw new Error("config.yaml: voice.elevenlabsVoices contains duplicate voice IDs");
       }
-    } else if (voice.elevenlabsVoiceIds !== undefined) {
-      voice.elevenlabsVoices = voice.elevenlabsVoiceIds.map((voiceId) => ({
-        voiceId,
-        label: voiceId,
-      }));
     }
     for (const key of [
       "transcriptionModel",

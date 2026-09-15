@@ -869,16 +869,24 @@ class _VoicePicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final supported = store.supportedVoices.value;
-    final elevenlabsVoices = {
-      if (actor.elevenlabsVoiceId != null)
-        actor.elevenlabsVoiceId!: actor.elevenlabsVoiceId!,
-      for (final voice in store.elevenlabsVoices.value)
-        voice.voiceId: voice.label,
+    final voices = {
+      for (final voice in store.supportedVoices.value) voice.voiceConfig: voice,
     };
-    if (supported.isEmpty && elevenlabsVoices.isEmpty) {
-      return const SizedBox.shrink();
+    final selected = actor.voiceConfig;
+    if (selected != null && !voices.containsKey(selected)) {
+      // Keep persisted selections usable even after removal from the catalog.
+      final sameProvider = voices.values.where(
+        (voice) => voice.voiceConfig.provider == selected.provider,
+      );
+      voices[selected] = SupportedVoiceDto(
+        label: selected.config.values.join(', '),
+        providerLabel: sameProvider.isEmpty
+            ? selected.provider
+            : sameProvider.first.providerLabel,
+        voiceConfig: selected,
+      );
     }
+    if (voices.isEmpty) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: 16),
       child: Column(
@@ -912,16 +920,14 @@ class _VoicePicker extends StatelessWidget {
                 borderSide: const BorderSide(color: MeshColors.border),
               ),
             ),
-            child: DropdownButton<String?>(
+            child: DropdownButton<VoiceConfigDto?>(
               isExpanded: true,
               isDense: true,
               icon: const Icon(
                 Icons.keyboard_arrow_down,
                 color: MeshColors.textSecondary,
               ),
-              value: actor.elevenlabsVoiceId != null
-                  ? 'elevenlabs:${actor.elevenlabsVoiceId}'
-                  : actor.voiceName,
+              value: selected,
               underline: const SizedBox.shrink(),
               style: kMonoStyle.copyWith(
                 color: MeshColors.textSecondary,
@@ -929,38 +935,20 @@ class _VoicePicker extends StatelessWidget {
               ),
               dropdownColor: MeshColors.bgTertiary,
               items: [
-                const DropdownMenuItem<String?>(
+                const DropdownMenuItem<VoiceConfigDto?>(
                   value: null,
                   child: Text('Instance default (Gemini)'),
                 ),
-                for (final voice in elevenlabsVoices.entries)
-                  DropdownMenuItem<String?>(
-                    value: 'elevenlabs:${voice.key}',
+                for (final voice in voices.values)
+                  DropdownMenuItem<VoiceConfigDto?>(
+                    value: voice.voiceConfig,
                     child: Text(
-                      '${voice.value} (Elevenlabs)',
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                for (final voice in supported)
-                  DropdownMenuItem<String?>(
-                    value: voice,
-                    child: Text(
-                      '$voice (Gemini)',
+                      voice.displayLabel,
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
               ],
-              onChanged: (voice) {
-                if (voice?.startsWith('elevenlabs:') == true) {
-                  store.updateActorVoice(
-                    actor.id,
-                    null,
-                    elevenlabsVoiceId: voice!.substring('elevenlabs:'.length),
-                  );
-                } else {
-                  store.updateActorVoice(actor.id, voice);
-                }
-              },
+              onChanged: (voice) => store.updateActorVoice(actor.id, voice),
             ),
           ),
         ],

@@ -30,6 +30,7 @@ import {
   type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
 import {
   MAX_VOICE_TRANSFER_NOTE_CHARS,
@@ -689,7 +690,7 @@ export interface ActorMeshOptions {
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
   /** Optional voice pool for newly spawned actors. */
-  elevenlabsVoiceIds?: readonly string[];
+  supportedVoices?: readonly VoiceDefinition[];
   /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
   isVoiceSessionActive?: (actorId: string) => boolean;
   /**
@@ -832,7 +833,7 @@ export class ActorMesh {
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxStore;
-  private readonly elevenlabsVoiceIds: readonly string[];
+  private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
   private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
@@ -897,7 +898,7 @@ export class ActorMesh {
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
-    this.elevenlabsVoiceIds = opts.elevenlabsVoiceIds ?? [];
+    this.supportedVoices = opts.supportedVoices ?? [];
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.voiceSessionTransfer = opts.voiceSessionTransfer;
     this.listVoiceSessionChat = opts.listVoiceSessionChat;
@@ -1902,17 +1903,11 @@ export class ActorMesh {
       // multi-actor chat is audible as different speakers; the operator can
       // re-pick it from the actor info panel at any time.
       voiceConfig:
-        this.elevenlabsVoiceIds.length > 0
-          ? {
-              schemaVersion: 1,
-              provider: "elevenlabs",
-              config: {
-                voiceId:
-                  this.elevenlabsVoiceIds[
-                    Math.floor(Math.random() * this.elevenlabsVoiceIds.length)
-                  ],
-              },
-            }
+        this.supportedVoices.length > 0
+          ? structuredClone(
+              this.supportedVoices[Math.floor(Math.random() * this.supportedVoices.length)]
+                .voiceConfig
+            )
           : googleVoiceConfig(randomSupportedVoiceName()),
       status: "active",
       createdAt: this.now(),

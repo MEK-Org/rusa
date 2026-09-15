@@ -3,6 +3,7 @@
  */
 
 import type { ContextConfig } from "../actor/actor-record.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
@@ -352,22 +353,14 @@ export interface RootActorConfig {
   avatar?: string;
 }
 
-/** A configured ElevenLabs voice and its dashboard label. */
-export interface ElevenLabsVoice {
-  voiceId: string;
-  label: string;
-}
-
 /** Walkie-talkie provider and model settings. No secrets live here. */
 export interface VoiceConfig {
   /** STT provider, independent of actor TTS. Default "google". */
   transcriptionProvider?: "google" | "elevenlabs";
   /** ElevenLabs TTS model. Default "eleven_multilingual_v2". */
   elevenlabsTtsModel?: string;
-  /** Selectable ElevenLabs voices; new actors pick randomly from this pool when non-empty. */
-  elevenlabsVoiceIds?: string[];
-  /** Named voice pool. Preferred over the legacy elevenlabsVoiceIds field. */
-  elevenlabsVoices?: ElevenLabsVoice[];
+  /** Named voice choices; new actors pick randomly from this pool when non-empty. */
+  supportedVoices?: VoiceDefinition[];
   /** Model for the selected STT provider. Defaults to gemini-2.5-flash or scribe_v2. */
   transcriptionModel?: string;
   /** Gemini TTS model for reply audio. Default "gemini-3.1-flash-tts-preview". */

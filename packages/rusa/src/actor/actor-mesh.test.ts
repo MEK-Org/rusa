@@ -26,6 +26,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -187,7 +188,7 @@ function deferredProvider() {
 
 function setup(
   opts: {
-    elevenlabsVoiceIds?: string[];
+    supportedVoices?: VoiceDefinition[];
     maxConcurrent?: number;
     sharedProvider?: CodingProvider;
     onRetire?: (record: { id: string }) => void;
@@ -258,7 +259,7 @@ function setup(
     log: (m) => logs.push(m),
   });
   mesh = new ActorMesh({
-    elevenlabsVoiceIds: opts.elevenlabsVoiceIds,
+    supportedVoices: opts.supportedVoices,
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -467,16 +468,17 @@ describe("ActorMesh", () => {
     expect(canWrite(descendant)).toBe(false);
   });
 
-  it("assigns new actors a voice from the configured ElevenLabs pool", () => {
-    const ids = ["G17SuINrv2H9FC6nvetn", "SMRMz7WpPUV6i2myuniv"];
-    const { mesh, registry } = setup({ elevenlabsVoiceIds: ids });
-    for (let i = 0; i < 10; i++) {
-      const id = mesh.spawn({ charter: "Speak", parentId: "root" });
-      const voice = registry.get(id)?.voiceConfig;
-      expect(voice?.provider).toBe("elevenlabs");
-      if (voice?.provider !== "elevenlabs") throw new Error("expected ElevenLabs voice");
-      expect(ids).toContain(voice.config.voiceId);
-    }
+  it.each([
+    "google",
+    "elevenlabs",
+  ] as const)("assigns a configured %s voice through the shared pool", (provider) => {
+    const voiceConfig: VoiceDefinition["voiceConfig"] =
+      provider === "google"
+        ? { schemaVersion: 1, provider, config: { voiceName: "Puck" } }
+        : { schemaVersion: 1, provider, config: { voiceId: "G17SuINrv2H9FC6nvetn" } };
+    const { mesh, registry } = setup({ supportedVoices: [{ label: "Voice", voiceConfig }] });
+    const id = mesh.spawn({ charter: "Speak", parentId: "root" });
+    expect(registry.get(id)?.voiceConfig).toEqual(voiceConfig);
   });
 
   it("randomizes a supported voice for every newly spawned actor", () => {

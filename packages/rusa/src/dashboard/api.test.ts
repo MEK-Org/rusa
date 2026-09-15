@@ -198,18 +198,25 @@ describe("handleMeshApiRequest", () => {
     };
   });
 
-  it("exposes voice labels without changing their IDs", async () => {
-    const voices = [{ voiceId: "SMRMz7WpPUV6i2myuniv", label: "Valentino" }];
-    const { res } = await call({ ...deps, elevenlabsVoices: voices }, "GET", "/api/mesh/threads");
+  it("exposes one provider-aware voice catalog", async () => {
+    const supportedVoices = [
+      { label: "Puck", providerLabel: "Gemini", voiceConfig: googleVoiceConfig("Puck") },
+      {
+        label: "Valentino",
+        providerLabel: "Elevenlabs",
+        voiceConfig: {
+          schemaVersion: 1 as const,
+          provider: "elevenlabs" as const,
+          config: { voiceId: "SMRMz7WpPUV6i2myuniv" },
+        },
+      },
+    ];
+    const { res } = await call({ ...deps, supportedVoices }, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
-    expect(body.elevenlabsVoices).toEqual(voices);
-    expect(body.elevenlabsVoiceIds).toEqual([voices[0].voiceId]);
-  });
-
-  it("exposes the configured ElevenLabs voice pool in the snapshot", async () => {
-    const ids = ["G17SuINrv2H9FC6nvetn", "SMRMz7WpPUV6i2myuniv"];
-    const { res } = await call({ ...deps, elevenlabsVoiceIds: ids }, "GET", "/api/mesh/threads");
-    expect(JSON.parse(res.body).elevenlabsVoiceIds).toEqual(ids);
+    expect(body.supportedVoices).toEqual(supportedVoices);
+    expect(Object.keys(body).filter((key) => key.toLowerCase().includes("voice"))).toEqual([
+      "supportedVoices",
+    ]);
   });
 
   it("ignores non-/api/mesh paths (returns false)", async () => {
@@ -250,7 +257,7 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toMatchObject({ voiceName: "Puck" });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceConfig: googleVoiceConfig("Puck") });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
@@ -270,7 +277,7 @@ describe("handleMeshApiRequest", () => {
       await settled(res);
       expect(res.statusCode).toBe(200);
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(voiceConfig);
-      expect(JSON.parse(res.body)).toEqual({ voiceName: null, voiceConfig });
+      expect(JSON.parse(res.body)).toEqual({ voiceConfig });
     });
 
     it("PATCH canonicalizes a supported wire spelling for the dropdown", async () => {
@@ -282,7 +289,7 @@ describe("handleMeshApiRequest", () => {
         JSON.stringify({ voiceConfig: googleVoiceConfig(" puck ") })
       );
       await settled(res);
-      expect(JSON.parse(res.body)).toMatchObject({ voiceName: "Puck" });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceConfig: googleVoiceConfig("Puck") });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
@@ -315,7 +322,7 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toMatchObject({ voiceName: null });
+      expect(JSON.parse(res.body)).toMatchObject({ voiceConfig: null });
       expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
     });
 
@@ -367,7 +374,7 @@ describe("handleMeshApiRequest", () => {
       expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
     });
 
-    it("threads list reports each actor's voiceName and the catalog top-level", async () => {
+    it("threads list reports each actor's voiceConfig and the catalog top-level", async () => {
       actors.upsert(rec(UUID_A, null, "active"));
       actors.upsert({
         ...rec(UUID_B, UUID_A, "active"),
@@ -376,12 +383,16 @@ describe("handleMeshApiRequest", () => {
       const { res } = await call(deps, "GET", "/api/mesh/threads");
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.supportedVoices).toContain("Puck");
-      const byId = new Map<string, { voiceName: string | null }>(
-        body.threads.map((t: { id: string; voiceName: string | null }) => [t.id, t])
+      expect(body.supportedVoices).toContainEqual({
+        label: "Puck",
+        providerLabel: "Gemini",
+        voiceConfig: googleVoiceConfig("Puck"),
+      });
+      const byId = new Map<string, { voiceConfig: unknown }>(
+        body.threads.map((t: { id: string; voiceConfig: unknown }) => [t.id, t])
       );
-      expect(byId.get(UUID_A)?.voiceName).toBeNull();
-      expect(byId.get(UUID_B)?.voiceName).toBe("Zephyr");
+      expect(byId.get(UUID_A)?.voiceConfig).toBeNull();
+      expect(byId.get(UUID_B)?.voiceConfig).toEqual(googleVoiceConfig("Zephyr"));
     });
   });
 
@@ -662,7 +673,13 @@ describe("handleMeshApiRequest", () => {
 
     it("leaves a small body alone even when the client would take brotli", async () => {
       actors.upsert(rec("root", null, "active"));
-      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "br");
+      const { res } = await call(
+        { ...deps, supportedVoices: [] },
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br"
+      );
       await settled(res);
 
       // Below the threshold a round trip through the threadpool buys nothing.
