@@ -7,6 +7,7 @@ import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyCapabilityGrantImport } from "../db/legacy-capability-grant-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
 import { planLegacyHostJobImport } from "../db/legacy-host-job-import.js";
+import { planLegacyPortableContextImport } from "../db/legacy-portable-context-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
 import { Repositories } from "../db/repositories/index.js";
 import { widenToWal } from "../db/wal.js";
@@ -18,6 +19,7 @@ export interface DbCheckResult {
   plannedCapabilityGrants: number;
   plannedEventSourceOwnerships: number;
   plannedHostJobs: number;
+  plannedPortableContextSnapshots: number;
 }
 
 /**
@@ -132,6 +134,14 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       pendingActorIds: pendingActors.map((actor) => actor.id),
     });
 
+    // Same pending-actor treatment again: a snapshot's owning actor may still
+    // be planned rather than committed on this un-mutated copy.
+    const portableContextPlan = planLegacyPortableContextImport({
+      mcHome: home,
+      repositories,
+      pendingActorIds: pendingActors.map((actor) => actor.id),
+    });
+
     return {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
@@ -139,6 +149,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       plannedCapabilityGrants: grantPlan.plan.kind === "import" ? grantPlan.plan.grants.length : 0,
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
+      plannedPortableContextSnapshots: portableContextPlan.plannedSnapshots,
     };
   } finally {
     db.close();
@@ -159,7 +170,8 @@ export function runDbCheck(opts: { home: string }): void {
         `${result.plannedScheduledMessages} scheduled message(s), ` +
         `${result.plannedCapabilityGrants} capability grant(s), ` +
         `${result.plannedEventSourceOwnerships} event source ownership(s), ` +
-        `${result.plannedHostJobs} host job(s)`
+        `${result.plannedHostJobs} host job(s), ` +
+        `${result.plannedPortableContextSnapshots} portable-context snapshot(s)`
     );
     console.log("✓ db-check passed");
   } catch (err) {
