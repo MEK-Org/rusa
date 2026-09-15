@@ -27,22 +27,24 @@ type BranchHeadRow = {
   head_sha: string;
 };
 
+type DraftRow = {
+  repo: string;
+  pull_number: number;
+};
+
 /**
- * SQLite implementation of {@link GitHubPollStateStore} over the three
+ * SQLite implementation of {@link GitHubPollStateStore} over the four
  * `github_poll_*` tables (0048_github_poll_state). Every call reads straight
  * from the database with no process-local snapshot, so the position a poll
  * cycle observes is the position the previous cycle committed, whether or
  * not the process restarted in between.
  *
  * Cursor comparisons are plain text comparisons, exactly as the retired file
- * store compared them: every value is a UTC ISO-8601 timestamp, for which
- * byte order is time order.
+ * store compared them: every value is GitHub's own `updated_at` text, one
+ * spelling per instant, for which byte order is time order.
  */
 export class DbGitHubPollStateStore implements GitHubPollStateStore {
-  constructor(
-    private readonly db: Database.Database,
-    private readonly now: () => string = () => new Date().toISOString()
-  ) {}
+  constructor(private readonly db: Database.Database) {}
 
   getCursors(repo: string): GitHubPollCursors | undefined {
     const row = this.db
@@ -71,6 +73,7 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
            ON CONFLICT(repo, event_key) DO NOTHING`
         )
         .run(repo, event.key, event.stream, event.updatedAt);
+      if (event.pullRequest) this.setDraft(repo, event.pullRequest);
     })();
   }
 
@@ -83,10 +86,10 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
       this.db
         .prepare(
           `UPDATE github_poll_repos
-           SET ${column} = ?, updated_at = ?
+           SET ${column} = ?
            WHERE repo = ? AND ${column} < ?`
         )
-        .run(updatedAt, this.now(), repo, updatedAt);
+        .run(updatedAt, repo, updatedAt);
     })();
   }
 
@@ -129,6 +132,14 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
     })();
   }
 
+  isDraftPullRequest(repo: string, pullNumber: number): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM github_poll_draft_pull_requests WHERE repo = ? AND pull_number = ?")
+        .get(repo, pullNumber) !== undefined
+    );
+  }
+
   list(): GitHubPollRepoState[] {
     const repos = this.db
       .prepare(
@@ -144,6 +155,11 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
     const heads = this.db
       .prepare("SELECT repo, branch, head_sha FROM github_poll_branch_heads ORDER BY repo, branch")
       .all() as BranchHeadRow[];
+    const drafts = this.db
+      .prepare(
+        "SELECT repo, pull_number FROM github_poll_draft_pull_requests ORDER BY repo, pull_number"
+      )
+      .all() as DraftRow[];
 
     return repos.map((row) => ({
       repo: row.repo,
@@ -154,20 +170,20 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
       branchHeads: Object.fromEntries(
         heads.filter((h) => h.repo === row.repo).map((h) => [h.branch, h.head_sha])
       ),
+      draftPullRequests: drafts.filter((d) => d.repo === row.repo).map((d) => d.pull_number),
     }));
   }
 
   importRepo(state: GitHubPollRepoState): void {
     this.db
       .prepare(
-        `INSERT INTO github_poll_repos (repo, issues_watermark, comments_watermark, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO github_poll_repos (repo, issues_watermark, comments_watermark)
+         VALUES (?, ?, ?)
          ON CONFLICT(repo) DO UPDATE SET
            issues_watermark = excluded.issues_watermark,
-           comments_watermark = excluded.comments_watermark,
-           updated_at = excluded.updated_at`
+           comments_watermark = excluded.comments_watermark`
       )
-      .run(state.repo, state.issuesWatermark, state.commentsWatermark, this.now());
+      .run(state.repo, state.issuesWatermark, state.commentsWatermark);
     const insertSeen = this.db.prepare(
       `INSERT INTO github_poll_seen_events (repo, event_key, stream, event_updated_at)
        VALUES (?, ?, ?, ?)
@@ -184,16 +200,35 @@ export class DbGitHubPollStateStore implements GitHubPollStateStore {
     for (const [branch, sha] of Object.entries(state.branchHeads)) {
       insertHead.run(state.repo, branch, sha);
     }
+    for (const pullNumber of state.draftPullRequests) {
+      this.setDraft(state.repo, { number: pullNumber, draft: true });
+    }
   }
 
   private ensureRepo(repo: string): void {
     this.db
       .prepare(
-        `INSERT INTO github_poll_repos (repo, issues_watermark, comments_watermark, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO github_poll_repos (repo, issues_watermark, comments_watermark)
+         VALUES (?, ?, ?)
          ON CONFLICT(repo) DO NOTHING`
       )
-      .run(repo, GITHUB_POLL_EPOCH, GITHUB_POLL_EPOCH, this.now());
+      .run(repo, GITHUB_POLL_EPOCH, GITHUB_POLL_EPOCH);
+  }
+
+  private setDraft(repo: string, pullRequest: { number: number; draft: boolean }): void {
+    if (pullRequest.draft) {
+      this.db
+        .prepare(
+          `INSERT INTO github_poll_draft_pull_requests (repo, pull_number)
+           VALUES (?, ?)
+           ON CONFLICT(repo, pull_number) DO NOTHING`
+        )
+        .run(repo, pullRequest.number);
+    } else {
+      this.db
+        .prepare("DELETE FROM github_poll_draft_pull_requests WHERE repo = ? AND pull_number = ?")
+        .run(repo, pullRequest.number);
+    }
   }
 }
 

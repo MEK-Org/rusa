@@ -4,7 +4,11 @@ import type {
   PollIssueComment,
   PollIssueOrPullRequest,
 } from "../gitops/issue-client.js";
-import { GITHUB_POLL_EPOCH, type GitHubPollStateStore } from "./poll-state-store.js";
+import {
+  GITHUB_POLL_EPOCH,
+  type GitHubPollSeenEvent,
+  type GitHubPollStateStore,
+} from "./poll-state-store.js";
 
 type EmitGitHubEvent = (
   event: string,
@@ -26,7 +30,7 @@ export interface GitHubPollerOptions {
   issueClient: GitHubPollingIssueClient;
   onEvent: EmitGitHubEvent;
   /**
-   * Durable cursors, seen keys and branch heads in `mesh.db`. The poller
+   * Durable cursors, seen keys, branch heads and draft set in `mesh.db`. The poller
    * writes through to it after every delivery rather than snapshotting at the
    * end of a cycle; see {@link GitHubPollStateStore} for the ordering rule
    * that makes a mid-cycle crash re-emit rather than skip.
@@ -156,7 +160,8 @@ export class GitHubEventPoller {
       commentsWatermark
     );
 
-    const events = [
+    // Each entry is the seen event the store will record plus how to emit it.
+    const events: Array<GitHubPollSeenEvent & { emit: () => Promise<void> }> = [
       ...comments.map((comment) => ({
         key: `issue_comment:${comment.id}:${comment.updatedAt}`,
         updatedAt: comment.updatedAt,
@@ -192,24 +197,32 @@ export class GitHubEventPoller {
           emit: () =>
             this.options.onEvent(
               "pull_request",
-              pullRequestPayload(repo, pullRequest),
+              pullRequestPayload(
+                repo,
+                pullRequest,
+                this.state.isDraftPullRequest(repo, pullRequest.number)
+              ),
               eventDeliveryId(repo, `pull_request:${pullRequest.number}:${pullRequest.updatedAt}`)
             ),
+          // The PR's standing once this event is out. Entries leave the draft
+          // set when the PR is ready or closed.
+          pullRequest: {
+            number: pullRequest.number,
+            draft: pullRequest.draft && pullRequest.state === "open",
+          },
         })),
     ].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 
     // Deliver oldest first, and record each event only after its delivery
     // resolved: a crash before that point re-emits the event next cycle under
     // the same delivery id, which the durable inbox already dedups, whereas
-    // recording first would drop it.
+    // recording first would drop it. A PR's draft standing rides on the same
+    // record, so it can never be committed without the key or vice versa.
     for (const event of events) {
       if (this.state.hasSeen(repo, event.key)) continue;
       await event.emit();
-      this.state.recordEmitted(repo, {
-        key: event.key,
-        stream: event.stream,
-        updatedAt: event.updatedAt,
-      });
+      const { emit: _emit, ...seen } = event;
+      this.state.recordEmitted(repo, seen);
     }
 
     // Only now, with both batches fully processed, may the cursors move — to
@@ -300,10 +313,11 @@ function issueCommentPayload(
 
 function pullRequestPayload(
   repo: string,
-  pullRequest: PollIssueOrPullRequest
+  pullRequest: PollIssueOrPullRequest,
+  wasDraft: boolean
 ): Record<string, unknown> {
   return {
-    action: pullRequest.createdAt === pullRequest.updatedAt ? "opened" : "edited",
+    action: pullRequestAction(pullRequest, wasDraft),
     repository: repositoryPayload(repo),
     pull_request: {
       number: pullRequest.number,
@@ -313,9 +327,23 @@ function pullRequestPayload(
       state: pullRequest.state,
       created_at: pullRequest.createdAt,
       updated_at: pullRequest.updatedAt,
+      draft: pullRequest.draft,
     },
     sender: sender(pullRequest.author),
   };
+}
+
+/**
+ * Polling sees states, webhooks see transitions. `opened` and `edited` come
+ * from timestamps as before; `ready_for_review` is the one transition worth
+ * reconstructing, because a draft opening is held at the PR and the owner
+ * would otherwise never hear about it (issue #307). `wasDraft` comes from the
+ * durable draft set, so the reconstruction survives a restart.
+ */
+function pullRequestAction(pullRequest: PollIssueOrPullRequest, wasDraft: boolean): string {
+  if (pullRequest.createdAt === pullRequest.updatedAt) return "opened";
+  if (wasDraft && !pullRequest.draft && pullRequest.state === "open") return "ready_for_review";
+  return "edited";
 }
 
 function webhookIssue(issue: PollIssueOrPullRequest): Record<string, unknown> {

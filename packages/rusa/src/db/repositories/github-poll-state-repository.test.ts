@@ -17,7 +17,7 @@ describe("DbGitHubPollStateStore", () => {
     db = new Database(":memory:");
     runMigrations(db);
     db.pragma("foreign_keys = ON");
-    store = new DbGitHubPollStateStore(db, () => "2026-09-15T00:00:00.000Z");
+    store = new DbGitHubPollStateStore(db);
   });
 
   afterEach(() => {
@@ -28,6 +28,7 @@ describe("DbGitHubPollStateStore", () => {
     expect(store.getCursors(REPO)).toBeUndefined();
     expect(store.hasSeen(REPO, "issues:1:2026-07-03T00:01:00Z")).toBe(false);
     expect(store.getBranchHead(REPO, "master")).toBeUndefined();
+    expect(store.isDraftPullRequest(REPO, 9)).toBe(false);
     expect(store.list()).toEqual([]);
   });
 
@@ -176,6 +177,7 @@ describe("DbGitHubPollStateStore", () => {
         },
       ],
       branchHeads: { master: "sha-before", release: "sha-release" },
+      draftPullRequests: [7, 9],
     };
 
     store.importRepo(state);
@@ -187,6 +189,43 @@ describe("DbGitHubPollStateStore", () => {
     });
     expect(store.hasSeen(REPO, "issues:1:2026-07-03T00:10:00Z")).toBe(true);
     expect(store.getBranchHead(REPO, "release")).toBe("sha-release");
+    expect(store.isDraftPullRequest(REPO, 9)).toBe(true);
+  });
+
+  it("moves a pull request's draft standing with the seen key that changed it", () => {
+    // One transaction per delivery: the next cycle skips a recorded key, so
+    // the draft change the event implied has to be committed with it.
+    store.recordEmitted(REPO, {
+      key: "pull_request:9:2026-07-03T00:01:00Z",
+      stream: "issues",
+      updatedAt: "2026-07-03T00:01:00Z",
+      pullRequest: { number: 9, draft: true },
+    });
+    expect(store.isDraftPullRequest(REPO, 9)).toBe(true);
+    expect(store.list()[0].draftPullRequests).toEqual([9]);
+
+    store.recordEmitted(REPO, {
+      key: "pull_request:9:2026-07-03T00:05:00Z",
+      stream: "issues",
+      updatedAt: "2026-07-03T00:05:00Z",
+      pullRequest: { number: 9, draft: false },
+    });
+    expect(store.isDraftPullRequest(REPO, 9)).toBe(false);
+    expect(store.list()[0].draftPullRequests).toEqual([]);
+
+    // Recording a non-PR event leaves the set alone.
+    store.recordEmitted(REPO, {
+      key: "pull_request:9:2026-07-03T00:06:00Z",
+      stream: "issues",
+      updatedAt: "2026-07-03T00:06:00Z",
+      pullRequest: { number: 9, draft: true },
+    });
+    store.recordEmitted(REPO, {
+      key: "issues:1:2026-07-03T00:07:00Z",
+      stream: "issues",
+      updatedAt: "2026-07-03T00:07:00Z",
+    });
+    expect(store.isDraftPullRequest(REPO, 9)).toBe(true);
   });
 
   it("is visible to a second connection without a process-local cache", () => {

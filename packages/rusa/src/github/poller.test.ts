@@ -302,9 +302,7 @@ describe("GitHubEventPoller", () => {
   });
 
   it("synthesizes ready_for_review when a polled draft PR later reports not-draft", async () => {
-    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
-    const statePath = join(home, "poller-state.json");
     const draftRecord: PollIssueOrPullRequest = {
       number: 11,
       title: "Draft then ready",
@@ -318,11 +316,13 @@ describe("GitHubEventPoller", () => {
     };
     client.issues = [draftRecord];
     const events: Array<[string, Record<string, unknown>]> = [];
+    // Every poll is a fresh poller over the same mesh.db: the draft set has
+    // to be durable, or a restart between the draft opening and the ready
+    // poll would report the transition as a plain edit.
     const poller = (): GitHubEventPoller =>
       new GitHubEventPoller({
         repos: ["dummy-org/dummy-repo"],
-        home,
-        statePath,
+        state,
         issueClient: client as GitHubPollingIssueClient,
         onEvent: async (event, payload) => {
           events.push([event, payload]);
@@ -336,6 +336,7 @@ describe("GitHubEventPoller", () => {
       action: "opened",
       pull_request: { number: 11, draft: true },
     });
+    expect(state.list()[0].draftPullRequests).toEqual([11]);
 
     // The next poll sees the same PR no longer a draft. Polling reports state,
     // not transitions, so the remembered draft is what makes this the
@@ -343,6 +344,7 @@ describe("GitHubEventPoller", () => {
     client.issues = [{ ...draftRecord, draft: false, updatedAt: "2026-07-03T00:05:00.000Z" }];
     await poller().pollOnce();
     expect(events).toHaveLength(2);
+    expect(state.list()[0].draftPullRequests).toEqual([]);
     expect(events[1][1]).toMatchObject({
       action: "ready_for_review",
       pull_request: { number: 11, draft: false },
@@ -569,6 +571,7 @@ describe("GitHubEventPoller", () => {
         createdAt: "2026-07-03T00:00:00.000Z",
         updatedAt: "2026-07-03T00:01:00.000Z",
         isPullRequest: false,
+        draft: false,
       },
     ];
     const deliveries: Array<string | undefined> = [];
@@ -621,6 +624,7 @@ describe("GitHubEventPoller", () => {
       createdAt: "2026-07-03T00:00:00.000Z",
       updatedAt,
       isPullRequest: false,
+      draft: false,
     });
     const client = new MockPollIssueClient();
     client.issues = [
@@ -681,6 +685,7 @@ describe("GitHubEventPoller", () => {
         createdAt: "2026-07-03T00:00:00.000Z",
         updatedAt: "2026-07-03T00:01:00.000Z",
         isPullRequest: false,
+        draft: false,
       },
     ];
     const inbox = new InboxRepository(db);
@@ -734,6 +739,7 @@ describe("GitHubEventPoller", () => {
       createdAt: "2026-07-03T00:00:00.000Z",
       updatedAt,
       isPullRequest: false,
+      draft: false,
     });
     const repo = "dummy-org/dummy-repo";
     const client = new MockPollIssueClient();
@@ -801,6 +807,72 @@ describe("GitHubEventPoller", () => {
     await makePoller().pollOnce();
     expect(deliveries).toEqual([issue1Id, issue2Id, issue2Id]);
     expect(inbox.list("actor-gh").entries).toHaveLength(2);
+  });
+
+  it("re-emits ready_for_review, not edited, when the ready delivery crashed before its record", async () => {
+    // The draft standing moves with the seen key, in one transaction, after
+    // delivery. If it moved before delivery — or separately — the retry after
+    // a crash would find the PR already not-draft and downgrade the
+    // transition to a plain edit that never reaches the repo owner.
+    const client = new MockPollIssueClient();
+    const draftRecord: PollIssueOrPullRequest = {
+      number: 11,
+      title: "Draft then ready",
+      body: "body",
+      author: "mock-bot",
+      state: "open",
+      createdAt: "2026-07-03T00:00:00.000Z",
+      updatedAt: "2026-07-03T00:00:00.000Z",
+      isPullRequest: true,
+      draft: true,
+    };
+    client.issues = [draftRecord];
+    const deliveries: Array<{ action: unknown; deliveryId?: string }> = [];
+    let crashNext = false;
+    const makePoller = () =>
+      new GitHubEventPoller({
+        repos: ["dummy-org/dummy-repo"],
+        state,
+        issueClient: client as GitHubPollingIssueClient,
+        onEvent: async (_event, payload, deliveryId) => {
+          deliveries.push({ action: payload.action, deliveryId });
+          if (crashNext) {
+            crashNext = false;
+            throw new Error("crashed after the ready event left the poller");
+          }
+        },
+      });
+
+    await makePoller().pollOnce();
+    expect(state.isDraftPullRequest("dummy-org/dummy-repo", 11)).toBe(true);
+
+    client.issues = [{ ...draftRecord, draft: false, updatedAt: "2026-07-03T00:05:00.000Z" }];
+    crashNext = true;
+    await expect(makePoller().pollOnce()).rejects.toThrow(/crashed after/);
+    // Nothing about that delivery was committed: still a draft, key unseen.
+    expect(state.isDraftPullRequest("dummy-org/dummy-repo", 11)).toBe(true);
+    expect(state.hasSeen("dummy-org/dummy-repo", "pull_request:11:2026-07-03T00:05:00.000Z")).toBe(
+      false
+    );
+
+    await makePoller().pollOnce();
+    await makePoller().pollOnce();
+
+    expect(deliveries).toEqual([
+      {
+        action: "opened",
+        deliveryId: "poll:dummy-org/dummy-repo:pull_request:11:2026-07-03T00:00:00.000Z",
+      },
+      {
+        action: "ready_for_review",
+        deliveryId: "poll:dummy-org/dummy-repo:pull_request:11:2026-07-03T00:05:00.000Z",
+      },
+      {
+        action: "ready_for_review",
+        deliveryId: "poll:dummy-org/dummy-repo:pull_request:11:2026-07-03T00:05:00.000Z",
+      },
+    ]);
+    expect(state.isDraftPullRequest("dummy-org/dummy-repo", 11)).toBe(false);
   });
 
   it("delivers a deploy-branch push exactly once across a restart, from the durable head", async () => {

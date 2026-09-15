@@ -331,6 +331,7 @@ describe("db-check", () => {
           commentsWatermark: "2026-07-03T00:05:00Z",
           seen: ["issues:1:2026-07-03T00:10:00Z", "issue_comment:20:2026-07-03T00:05:00Z"],
           branchHeads: { master: "sha-before" },
+          draftPullRequests: [9],
         },
       },
     });

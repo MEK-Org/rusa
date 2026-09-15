@@ -4,6 +4,8 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GITHUB_POLL_EPOCH } from "../github/poll-state-store.js";
+import { GitHubEventPoller } from "../github/poller.js";
+import type { GitHubPollingIssueClient } from "../gitops/issue-client.js";
 import {
   applyLegacyGitHubPollStateImport,
   GITHUB_POLL_STATE_FILENAME,
@@ -27,6 +29,7 @@ const legacyRepo = {
     "issue_comment:20:2026-07-03T00:05:00Z",
   ],
   branchHeads: { master: "sha-before" },
+  draftPullRequests: [9],
 };
 
 describe("parseLegacySeenKey", () => {
@@ -83,7 +86,7 @@ describe("legacy GitHub poll state import", () => {
     expect(existsSync(filePath)).toBe(false);
   });
 
-  it("imports cursors, seen keys and branch heads, then archives the source recoverably", () => {
+  it("imports cursors, seen keys, branch heads and drafts, then archives the source recoverably", () => {
     writeLegacy({ [REPO]: legacyRepo });
 
     const result = runImport();
@@ -112,6 +115,7 @@ describe("legacy GitHub poll state import", () => {
           },
         ],
         branchHeads: { master: "sha-before" },
+        draftPullRequests: [9],
       },
     ]);
     expect(repositories.legacyImportReceipts.has(GITHUB_POLL_STATE_IMPORT_SOURCE)).toBe(true);
@@ -191,6 +195,86 @@ describe("legacy GitHub poll state import", () => {
     expect(() => runImport()).toThrow(/seen key 'issues:1'/);
     expect(existsSync(filePath)).toBe(true);
     expect(repositories.githubPollState.list()).toEqual([]);
+  });
+
+  it("refuses a cursor that is not in the store's timestamp text form", () => {
+    // The store orders timestamps as text. A cursor that parses as a date but
+    // is spelled differently (here with a local offset) would sort by
+    // accident against GitHub's UTC text and could be sent as `since` forever.
+    for (const bad of ["not-a-date", "2026-07-03T02:10:00+02:00", "2026-07-03 00:10:00"]) {
+      writeLegacy({ [REPO]: { ...legacyRepo, commentsWatermark: bad } });
+
+      expect(() => runImport()).toThrow(/commentsWatermark: must be an ISO-8601 UTC timestamp/);
+      expect(existsSync(filePath)).toBe(true);
+      expect(repositories.githubPollState.list()).toEqual([]);
+    }
+  });
+
+  it("copies GitHub's timestamp text rather than reformatting it", () => {
+    // The runtime stores `updated_at` exactly as GitHub returns it, without
+    // fractional seconds; an import that respelled the same second as
+    // `.000Z` would sort before a runtime cursor at that second and let
+    // retention drop a key `since` can still return.
+    writeLegacy({ [REPO]: legacyRepo });
+    runImport();
+    const [imported] = repositories.githubPollState.list();
+    expect(imported.issuesWatermark).toBe("2026-07-03T00:10:00Z");
+    expect(imported.seen.map((event) => event.updatedAt)).toEqual([
+      "2026-07-03T00:01:00Z",
+      "2026-07-03T00:05:00Z",
+      "2026-07-03T00:10:00Z",
+    ]);
+  });
+
+  it("carries the imported draft set into the first poll after a restart", async () => {
+    // A PR the retired poller last saw as a draft, and a `since` that returns
+    // it again as not-draft: the first poll over the imported database must
+    // report ready_for_review, not a plain edit, or the transition that only
+    // the file remembered is lost in the cutover.
+    writeLegacy({ [REPO]: legacyRepo });
+    runImport();
+
+    const events: Array<Record<string, unknown>> = [];
+    const client = {
+      listPollOrganizationRepositories: async () => [],
+      getPollBranchHead: async () => null,
+      listUpdatedIssuesAndPullRequests: async (_repo: string, since: string) => {
+        expect(since).toBe("2026-07-03T00:10:00Z");
+        return [
+          {
+            number: 9,
+            title: "Draft then ready",
+            body: "body",
+            author: "author",
+            state: "open" as const,
+            createdAt: "2026-07-03T00:00:00Z",
+            updatedAt: "2026-07-03T00:12:00Z",
+            isPullRequest: true,
+            draft: false,
+          },
+        ];
+      },
+      listUpdatedIssueComments: async () => [],
+      getPollIssue: async () => {
+        throw new Error("unused");
+      },
+    } as unknown as GitHubPollingIssueClient;
+    await new GitHubEventPoller({
+      repos: [REPO],
+      state: repositories.githubPollState,
+      issueClient: client,
+      onEvent: async (_event, payload) => {
+        events.push(payload);
+      },
+    }).pollOnce();
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        action: "ready_for_review",
+        pull_request: expect.objectContaining({ number: 9, draft: false }),
+      }),
+    ]);
+    expect(repositories.githubPollState.list()[0].draftPullRequests).toEqual([]);
   });
 
   it("refuses an unparseable file rather than starting every cursor over", () => {

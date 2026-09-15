@@ -19,22 +19,50 @@ import type { Migration } from "./types.js";
  * poller only emits a push when it holds a previous head. That is why this
  * state is a durable authority and not a cache exception.
  *
- * ## Three tables, not one JSON column
+ * ## Four tables, not one JSON column
  *
  * Follows `host_jobs` (0040) and `event_sources` (0038): ordinary scalar
- * columns for every field the poller reads or advances. The retired file kept
- * the seen set as an array capped at its last 1000 entries; here it is
- * relational and keyed by the event's own `updated_at`, so retention is
- * decided by the cursor it protects (see the repository) rather than by a
- * count that was only ever a size bound.
+ * columns for every field the poller reads or advances, and nothing the
+ * poller does not read. The retired file kept the seen set as an array capped
+ * at its last 1000 entries; here it is relational and keyed by the event's
+ * own `updated_at`, so retention is decided by the cursor it protects (see
+ * the repository) rather than by a count that was only ever a size bound.
  *
  * ## `github_poll_repos.repo` is the natural key
  *
  * The poller addresses repositories by their configured `owner/name` string
  * and nothing else joins to them, so a surrogate id would only add a lookup.
- * The two child tables cascade with it: a cursor row that goes away takes its
- * seen keys and branch heads with it, because none of those mean anything
- * without the cursor they qualify.
+ * The three child tables cascade with it: a cursor row that goes away takes
+ * its seen keys, branch heads and draft set with it, because none of those
+ * mean anything without the cursor they qualify.
+ *
+ * ## Timestamps are GitHub's own text
+ *
+ * Every cursor and `event_updated_at` is the `updated_at` string GitHub
+ * returned (`YYYY-MM-DDTHH:MM:SSZ`), stored verbatim and compared as text.
+ * One spelling per instant is what makes byte order time order, which the
+ * no-rewind guard and retention both rely on; the legacy import therefore
+ * checks that shape and copies the text rather than reformatting it, since a
+ * `.000Z` spelling of the same second would sort *before* the runtime's.
+ *
+ * ## Branch heads as a map, not a column pair
+ *
+ * The poller watches one configured deploy branch per repository at a time,
+ * but the configured branch can change, and a head is only useful when it is
+ * the *previous* head of the branch now being watched: the first observation
+ * of a branch never emits. The retired file kept a branch→head map for that
+ * reason, so switching the deploy branch and back does not lose the push that
+ * landed in between; the table is that map, imported losslessly.
+ *
+ * ## Draft pull requests
+ *
+ * Polling reports states, not transitions. `ready_for_review` is the one
+ * transition the poller reconstructs (#307): a PR last polled as an open draft
+ * that now reports not-draft. The set of such PRs must survive a restart or
+ * the transition is reported as a plain `edited`, which never climbs to the
+ * repo owner. It moves in the same transaction as the seen key of the event
+ * that changed it, so a crash cannot leave the event recorded and the draft
+ * standing stale.
  *
  * ## Two cursors per repo, and a `stream` on every seen key
  *
@@ -54,8 +82,7 @@ export const githubPollState: Migration = {
       CREATE TABLE github_poll_repos (
         repo               TEXT PRIMARY KEY,
         issues_watermark   TEXT NOT NULL,
-        comments_watermark TEXT NOT NULL,
-        updated_at         TEXT NOT NULL
+        comments_watermark TEXT NOT NULL
       );
 
       CREATE TABLE github_poll_seen_events (
@@ -76,6 +103,12 @@ export const githubPollState: Migration = {
         branch   TEXT NOT NULL,
         head_sha TEXT NOT NULL,
         PRIMARY KEY (repo, branch)
+      );
+
+      CREATE TABLE github_poll_draft_pull_requests (
+        repo        TEXT NOT NULL REFERENCES github_poll_repos(repo) ON DELETE CASCADE,
+        pull_number INTEGER NOT NULL,
+        PRIMARY KEY (repo, pull_number)
       );
     `);
   },

@@ -12,6 +12,13 @@ export interface GitHubPollSeenEvent {
   key: string;
   stream: GitHubPollStream;
   updatedAt: string;
+  /**
+   * For a pull request event, the PR's draft standing once this event has
+   * been delivered. Carried on the seen event so the store can move the
+   * durable draft set in the same transaction as the key: the next cycle
+   * skips this key, so any draft change it implied has to land with it.
+   */
+  pullRequest?: { number: number; draft: boolean };
 }
 
 /** Everything durable the poller knows about one repository. */
@@ -19,12 +26,18 @@ export interface GitHubPollRepoState extends GitHubPollCursors {
   repo: string;
   seen: GitHubPollSeenEvent[];
   branchHeads: Record<string, string>;
+  /** Open PRs last polled as drafts; see {@link GitHubPollStateStore.isDraftPullRequest}. */
+  draftPullRequests: number[];
 }
 
 /**
  * Durable poll position for the GitHub event poller: per-repo stream cursors,
- * the seen keys those cursors can still re-fetch, and the last observed head
- * of each deploy branch. Replaces the retired `github-poller-state.json`.
+ * the seen keys those cursors can still re-fetch, the last observed head of
+ * each deploy branch, and the PRs last seen as drafts. Replaces the retired
+ * `github-poller-state.json`.
+ *
+ * Every timestamp is GitHub's own `updated_at` text, stored verbatim and
+ * compared as text; see the 0048 migration for why the spelling matters.
  *
  * The poller drives this store event by event rather than saving a snapshot
  * per cycle, so the write contract is what makes a crash safe:
@@ -70,6 +83,12 @@ export interface GitHubPollStateStore {
   getBranchHead(repo: string, branch: string): string | undefined;
   /** Record `sha` as the last observed head of `branch`. */
   recordBranchHead(repo: string, branch: string, sha: string): void;
+  /**
+   * Whether `pullNumber` was an open draft the last time the poller delivered
+   * an event for it. Polling reports states, not transitions; this is what
+   * turns a not-draft record into `ready_for_review` rather than `edited`.
+   */
+  isDraftPullRequest(repo: string, pullNumber: number): boolean;
   /** Every repository with durable state, for import planning and inspection. */
   list(): GitHubPollRepoState[];
   /**
