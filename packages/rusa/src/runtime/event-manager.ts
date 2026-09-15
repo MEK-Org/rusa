@@ -164,7 +164,7 @@ export interface EventSourceRecipients {
   ownership?: EventSourceOwnershipDiagnostic;
 }
 
-export interface AuthorSuppressionInput {
+interface AuthorSuppressionInput {
   /** The resolver's own answer, not a re-derivation. See {@link EventSourceRecipients.directed}. */
   directed: boolean;
   /** Candidate destinations in delivery order. */
@@ -195,12 +195,16 @@ export interface AuthorSuppressionInput {
  * the payload-less `ActorMesh.deliverEvent` — and a second copy of the rule is
  * how they silently drift into disagreeing about who gets woken. #393
  * collapsed that second path away, so the rule now has exactly one caller in
- * {@link EventManager.handleNormalizedEvent}; it stays a named
- * function because the rationale above is the reason anyone can read what the
- * filter means, and because the next delivery path to appear must call this
- * one rather than restate it.
+ * {@link EventManager.handleNormalizedEvent}. It stays a named function
+ * because the rationale above is the reason anyone can read what the filter
+ * means, and it is module-local for the same reason
+ * {@link EventManager.handleNormalizedEvent} is private: the export existed to
+ * serve `ActorMesh.deliverEvent` and had no other importer once that path
+ * went. A future delivery path in another module should re-export it here and
+ * call it rather than restate the rule — that is a one-word change, and until
+ * someone makes it the compiler says there is one caller.
  */
-export function applyAuthorSuppression(input: AuthorSuppressionInput): string[] {
+function applyAuthorSuppression(input: AuthorSuppressionInput): string[] {
   const { directed, destinations, stampedAuthor, instanceId, eventSummary, log } = input;
   if (directed || stampedAuthor == null || instanceId === undefined) {
     return [...destinations];

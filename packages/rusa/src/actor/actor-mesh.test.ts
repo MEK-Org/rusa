@@ -470,7 +470,15 @@ interface CanonicalEventOptions {
  * "responsive" to the timer normalizer, and these tests want ordinary work
  * unless they say otherwise. A `"normal"` raw priority leaves the prepared
  * payload untouched and wakes identically to an unset one
- * (`isResponsiveNudge` reads only `"responsive"`).
+ * (`isResponsiveNudge` reads only `"responsive"`). Making the field required
+ * would put that reasoning in front of whoever adds the next characterization
+ * instead of in this paragraph, at the cost of `priority: "normal"` on ~60
+ * call sites that do not care; the default is the trade, and this docblock is
+ * the part that has to carry it.
+ *
+ * That the normalizer's default lands in the persisted payload while the wake
+ * reads the raw priority is a real divergence, latent because the only
+ * production timer caller states its priority — #477.
  */
 const deliverCanonicalEvent = (
   mesh: ActorMesh,
@@ -6728,8 +6736,8 @@ describe("ActorMesh", () => {
 
     // One delivery path to characterize: the transitional second entry point
     // this suite used to run these three cases twice through is gone (#393),
-    // so production's own entry is what they fix.
-    const deliver = (mesh: ActorMesh) => mesh.deliverExternalEvent(responsiveIssueEvent);
+    // so production's own entry is what they fix — called directly below
+    // rather than through an alias, so each case names the door it enters.
 
     describe("responsive fan-out via deliverExternalEvent", () => {
       it("preempts only the owner's active run; the subscriber gets a durable responsive wake", async () => {
@@ -6741,7 +6749,7 @@ describe("ActorMesh", () => {
         await t.startRun(owner);
         await t.startRun(watcher);
 
-        await deliver(t.mesh);
+        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
@@ -6784,7 +6792,7 @@ describe("ActorMesh", () => {
         await t.startRun(watcherA);
         await t.startRun(watcherB);
 
-        await deliver(t.mesh);
+        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
 
         expect(t.signals.get(watcherA)?.aborted).toBe(false);
         expect(t.signals.get(watcherB)?.aborted).toBe(false);
@@ -6801,7 +6809,7 @@ describe("ActorMesh", () => {
         t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
         await t.startRun(owner);
 
-        await deliver(t.mesh);
+        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
         // Responsive admission bypasses the ordinary debounce window.
         await vi.advanceTimersByTimeAsync(0);
 

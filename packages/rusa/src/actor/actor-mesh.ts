@@ -2565,6 +2565,14 @@ export class ActorMesh {
    * owners-then-subscribers ordering now have one implementation, and the
    * characterization suite enters where production enters.
    *
+   * That collapse also dropped a capability rather than only a duplicate:
+   * `deliverEvent` without an `inboxPayload` could route, suppress, and wake
+   * with no inbox row behind the wake. Delivery now always leaves a durable
+   * row, and a notification without one is not expressible — which is the
+   * point, because a woken actor that restarts before it reads finds nothing
+   * to work from. Nothing replaces that shape: {@link deliverWake}, the other
+   * way to reach a live actor, records its own durable row too.
+   *
    * CRITICAL: the body runs to completion in one turn. No `await` may appear
    * between recipient resolution and the wake — the manager's
    * normalize/route/append is synchronous for exactly this reason, and this
