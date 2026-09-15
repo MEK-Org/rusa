@@ -21,7 +21,6 @@ import {
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
-  applyAuthorSuppression,
   type DurableEventDelivery,
   deduplicatedInboxEntryId,
   type EventManager,
@@ -476,18 +475,6 @@ export interface ActorFactoryContext {
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
-
-export interface EventDeliveryOptions {
-  directedTarget?: string | null;
-  stampedAuthor?: { actorId: string; instanceId: string } | null;
-  instanceId?: string;
-  /** When present, persist one notification per destination before waking it. */
-  inboxPayload?: InboxPayload;
-  /** Stable ingress id; combined with actor identity to make retries no-ops. */
-  inboxDedupeKey?: string;
-  inboxDeliveredAt?: Date;
-  inboxPriority?: "responsive" | "normal";
-}
 
 export interface RetireCleanup {
   name: string;
@@ -2327,8 +2314,8 @@ export class ActorMesh {
    * liveness check, and parent bubbling across delivery, delegation guards, and audit inspection.
    *
    * Note: Bubbling policy is enforced only when `opts.enforceBubblingPolicy` is true (for event
-   * delivery in {@link deliverEvent}); delegation guards and audit inspection walk ancestors
-   * unconditionally to determine governing authority.
+   * delivery in {@link deliverExternalEvent}); delegation guards and audit inspection walk
+   * ancestors unconditionally to determine governing authority.
    */
   private resolveRoutingDecision(
     resource: EventResource,
@@ -2499,7 +2486,7 @@ export class ActorMesh {
    * fall back to most-specific-live-subscriber-wins with parent bubbling.
    *
    * Note: This walk is unconditional for authority inspection. A reported
-   * ancestor-level route is only deliverable by {@link deliverEvent} for
+   * ancestor-level route is only deliverable by {@link deliverExternalEvent} for
    * bubble-eligible event classes; non-bubbling event classes are exact-only.
    * Direct subscriptions are delivery-only and never confer ownership.
    */
@@ -2568,108 +2555,23 @@ export class ActorMesh {
   }
 
   /**
-   * Resolve the active subscriber for a hierarchy-aware EventResource, checking liveness,
-   * and delivering to the governing live owner (live obligation claims taking precedence over
-   * stored subscriptions, with fallback to most-specific live subscriber). An allowlisted event may bubble
-   * up the ancestor chain past dead/absent exact subscribers; every other class is exact-only.
-   * An event no subscription covers is DROPPED (journal-visible):
-   * sources are config-declared , so an uncovered event is out-of-scope for this
-   * instance by definition — unconditional bubbling to root turned the repo-scoped staging
-   * instance back into an org-wide firehose . A covering org source is considered only
-   * for the event classes explicitly allowed by {@link mayBubbleToParent} .
-   * Follows the CRITICAL invariant of checking liveness and delivering synchronously.
-   * TRANSITIONAL: production ingress enters {@link deliverExternalEvent}. Since
-   * the GitHub, Chat, and timer callers moved there, this payload-bearing path
-   * has no in-repo caller outside tests; it remains only as the published
-   * embedder contract and as characterization coverage. #393 tracks collapsing
-   * it into the EventManager path so the most-tested entry point is again the
-   * production one.
-   */
-  async deliverEvent(
-    resource: EventResource,
-    eventSummary: string,
-    opts: EventDeliveryOptions = {}
-  ): Promise<void> {
-    // CRITICAL: no `await` may appear between recipient resolution and the
-    // notification below. EventManager's routing and append are synchronous for
-    // exactly this reason, and this method stays async only to preserve its
-    // public contract — as it did before the extraction. Yield anywhere in
-    // here and an actor can retire after being resolved as live, leaving a
-    // durable unhandled row with nobody alive to take it.
-    if (opts.inboxPayload) {
-      if (!this.eventManager) {
-        throw new Error("Inbox delivery requires a host-assembled EventManager");
-      }
-      const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-      const delivery = this.eventManager.handleNormalizedEvent({
-        resource: rawResource,
-        payload: {
-          ...opts.inboxPayload,
-          ...(opts.inboxPriority === "responsive" ? { priority: "responsive" } : {}),
-        },
-        deliveredAt: opts.inboxDeliveredAt,
-        dedupeKey: opts.inboxDedupeKey,
-        directedTarget: opts.directedTarget,
-        stampedAuthor: opts.stampedAuthor,
-        instanceId: opts.instanceId,
-        eventSummary,
-      });
-      this.notifyPersistedInboxEntries(delivery, opts.inboxPriority);
-      return;
-    }
-
-    const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-    const routing = this.routing;
-    if (!routing) {
-      throw new Error("Event routing requires a host-assembled EventManager");
-    }
-    const recipients = routing.resolveRecipients(rawResource, {
-      directedTarget: opts.directedTarget,
-      eventPayload: opts.inboxPayload,
-      eventSummary,
-    });
-    const destinations: string[] = [];
-    for (const id of recipients.ownerIds) {
-      if (!destinations.includes(id)) destinations.push(id);
-    }
-    for (const sub of recipients.subscriberIds) {
-      if (!destinations.includes(sub)) destinations.push(sub);
-    }
-
-    if (destinations.length === 0) {
-      // See the drop rationale in EventManager.handleExternalEvent: an
-      // uncovered event is out-of-scope for this instance by definition,
-      // because root retains a covering source for anything it delegates from.
-      this.log(`event not covered by any subscription — dropped (${eventSummary})`);
-      return;
-    }
-
-    const deliverable = applyAuthorSuppression({
-      directed: recipients.directed,
-      destinations,
-      stampedAuthor: opts.stampedAuthor,
-      instanceId: opts.instanceId,
-      eventSummary,
-      log: this.log,
-    });
-    if (deliverable.length === 0) return;
-
-    for (const dest of deliverable) {
-      const isOwner = recipients.ownerIds.includes(dest);
-      if (!this.notifyEventRecipient(dest, opts.inboxPriority, isOwner)) {
-        this.log(`Delivery target ${dest} is not live; cannot deliver event`);
-      }
-    }
-  }
-
-  /**
-   * The host's three external ingress paths enter here with an explicit raw
-   * source shape. EventManager owns normalize → route → append; Mesh owns the
+   * The one way an event enters the mesh. The host's three ingress paths —
+   * GitHub, Chat, and timer — arrive with an explicit raw source shape;
+   * EventManager owns normalize → route → append, and Mesh owns the
    * after-commit wake until #384 extracts that notification seam.
    *
-   * Like {@link deliverEvent}, the body runs to completion in one turn: the
-   * manager's normalize/route/append is synchronous, so nothing can retire
-   * between resolution, persistence, and the wake.
+   * #393 collapsed the transitional `deliverEvent` into this method: routing,
+   * source canonicalization, author suppression, durable append, and
+   * owners-then-subscribers ordering now have one implementation, and the
+   * characterization suite enters where production enters.
+   *
+   * CRITICAL: the body runs to completion in one turn. No `await` may appear
+   * between recipient resolution and the wake — the manager's
+   * normalize/route/append is synchronous for exactly this reason, and this
+   * method stays async only for its public contract. Yield anywhere in here
+   * and an actor can retire after being resolved as live, leaving a durable
+   * unhandled row with nobody alive to take it. `actor-mesh.test.ts` pins this
+   * with a retirement queued as a microtask before the call.
    */
   async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
     if (!this.eventManager) {

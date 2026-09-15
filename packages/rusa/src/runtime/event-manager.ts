@@ -191,10 +191,14 @@ export interface AuthorSuppressionInput {
  * `mesh:deliver` directive intentionally targets the actor even though the
  * underlying bot event would otherwise self-suppress.
  *
- * Single-sourced deliberately — the durable path in
- * {@link EventManager.handleExternalEvent} and the payload-less path in
- * `ActorMesh.deliverEvent` are the same rule, and a second copy is how the
- * two silently drift into disagreeing about who gets woken.
+ * Single-sourced deliberately. It once had two callers — the durable path and
+ * the payload-less `ActorMesh.deliverEvent` — and a second copy of the rule is
+ * how they silently drift into disagreeing about who gets woken. #393
+ * collapsed that second path away, so the rule now has exactly one caller in
+ * {@link EventManager.handleNormalizedEvent}; it stays a named
+ * function because the rationale above is the reason anyone can read what the
+ * filter means, and because the next delivery path to appear must call this
+ * one rather than restate it.
  */
 export function applyAuthorSuppression(input: AuthorSuppressionInput): string[] {
   const { directed, destinations, stampedAuthor, instanceId, eventSummary, log } = input;
@@ -682,15 +686,21 @@ export class EventManager {
   }
 
   /**
-   * Routes and durably appends an already-canonical payload. This preserves the
-   * legacy ActorMesh delivery contract without inventing a fourth ingress
-   * normalizer branch.
+   * Routes and durably appends an already-canonical payload — the second half
+   * of {@link handleExternalEvent}, kept named because normalize and
+   * route-plus-append are separate concerns worth reading separately.
+   *
+   * Private since #393: it was public only to serve `ActorMesh.deliverEvent`'s
+   * already-canonical delivery contract, and that path is gone. Every event now
+   * enters through {@link handleExternalEvent}, so a second entry point into
+   * routing cannot grow back without saying so here.
    */
-  handleNormalizedEvent(normalized: NormalizedIntegrationEvent): DurableEventDelivery {
+  private handleNormalizedEvent(normalized: NormalizedIntegrationEvent): DurableEventDelivery {
     // Normalize once at the durable boundary, before either side effect. The
-    // resolver and InboxStore must observe the same canonical key: otherwise a
-    // legacy-form ActorMesh delivery routes correctly but writes an inbox row
-    // `inbox.list({ source })` cannot find under its canonical source.
+    // resolver and InboxStore must observe the same canonical key: a caller
+    // that supplies `rawResource` in a legacy or non-canonical form routes
+    // correctly but would otherwise write an inbox row `inbox.list({ source })`
+    // cannot find under its canonical source.
     const resource = safeResourceKey(normalized.resource);
     const summary = normalized.eventSummary ?? resource;
     const recipients = this.routing.resolveRecipients(resource, {
