@@ -8,12 +8,13 @@ import type {
   InboxActorWork,
   InboxAppendInput,
   InboxEntry,
+  InboxItemsAppendedListener,
   InboxListOptions,
   InboxPage,
-  InboxStore,
+  InboxRepository,
   MarkHandledResult,
-} from "../actor/inbox-store.js";
-import { validateInboxPayload } from "../actor/inbox-store.js";
+} from "../repositories/inbox-repository.js";
+import { validateInboxPayload } from "../repositories/inbox-repository.js";
 import {
   deduplicatedInboxEntryId,
   EventManager,
@@ -22,9 +23,17 @@ import {
   type RawIntegrationEvent,
 } from "./event-manager.js";
 
-class FakeInboxStore implements InboxStore {
+class FakeInboxStore implements InboxRepository {
   readonly entries: InboxEntry[] = [];
   appendCalls: InboxAppendInput[][] = [];
+  private readonly listeners = new Set<InboxItemsAppendedListener>();
+
+  onItemsAppended(listener: InboxItemsAppendedListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   append(inputs: InboxAppendInput[]): InboxEntry[] {
     this.appendCalls.push(inputs);
@@ -46,6 +55,7 @@ class FakeInboxStore implements InboxStore {
       this.entries.push(entry);
       inserted.push(entry);
     }
+    if (inserted.length > 0) for (const listener of this.listeners) listener(inserted);
     return inserted;
   }
 

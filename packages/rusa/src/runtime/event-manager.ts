@@ -1,17 +1,17 @@
 import { createHash } from "node:crypto";
 import { type EventResource, resourceKey } from "../actor/event-subscriptions.js";
-import type {
-  InboxAppendInput,
-  InboxEntry,
-  InboxPayload,
-  InboxStore,
-} from "../actor/inbox-store.js";
 import {
   checkSuiteWakesAnyone,
   deriveGitHubInboxNotification,
 } from "../github/inbox-notification.js";
 import { isSystemActor } from "../mcp/stamp.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import type {
+  InboxAppendInput,
+  InboxEntry,
+  InboxPayload,
+  InboxRepository,
+} from "../repositories/inbox-repository.js";
 
 /**
  * Normalizes a resource to canonical reference form when valid, otherwise
@@ -255,7 +255,7 @@ export interface ResolveRecipientsOptions {
  * same-turn invariant: recipient liveness, durable append, and the caller's
  * wake must not be separated by an await, or an actor can retire after being
  * selected as live and leave a durable unhandled row nobody is alive to take
- * (`InboxRepository.append` validates only non-empty ids, and the inbox table
+ * (`SqliteInboxRepository.append` validates only non-empty ids, and the inbox table
  * has no actor foreign key). Every read port behind this is a synchronous
  * in-memory or better-sqlite3 read, so a promise here would buy nothing and
  * cost the invariant.
@@ -535,7 +535,7 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
 }
 
 export interface EventManagerOptions {
-  inboxStore: InboxStore;
+  inboxStore: InboxRepository;
   /**
    * The one routing kernel assembled by the host. EventManager re-exposes it as
    * {@link EventManager.routing} so a mesh cannot be handed a second, competing
@@ -553,14 +553,14 @@ export interface EventManagerOptions {
  *    into canonical inbox payload shapes while preserving public payloads.
  * 2. Apply event-source ownership and subscription rules to determine which
  *    actor(s) should receive an inbox item.
- * 3. Append deduplicated inbox items into the authoritative InboxStore.
+ * 3. Append deduplicated inbox items into the authoritative InboxRepository.
  *
  * Strict invariant:
  * EventManager NEVER directly invokes actors, schedules wakes, or owns run state.
  * It ends its responsibility at durable inbox delivery.
  */
 export class EventManager {
-  private readonly inboxStore: InboxStore;
+  private readonly inboxStore: InboxRepository;
   /**
    * The host-assembled ownership ladder, readable by collaborators that need
    * routing authority (ActorMesh's delegation guards and audit inspection).
@@ -690,7 +690,7 @@ export class EventManager {
    */
   handleNormalizedEvent(normalized: NormalizedIntegrationEvent): DurableEventDelivery {
     // Normalize once at the durable boundary, before either side effect. The
-    // resolver and InboxStore must observe the same canonical key: otherwise a
+    // resolver and InboxRepository must observe the same canonical key: otherwise a
     // legacy-form ActorMesh delivery routes correctly but writes an inbox row
     // `inbox.list({ source })` cannot find under its canonical source.
     const resource = safeResourceKey(normalized.resource);

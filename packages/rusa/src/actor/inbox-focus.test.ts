@@ -4,18 +4,18 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
-import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { resourceKey } from "./event-subscriptions.js";
 import { InboxFocusResolver } from "./inbox-focus.js";
-import type { InboxEntry } from "./inbox-store.js";
 
 describe("InboxFocusResolver", () => {
   let db: Database.Database;
   let runs: ActorRunRepository;
-  let inbox: InboxRepository;
+  let inbox: SqliteInboxRepository;
   let focus: InboxFocusRepository;
   let obligations: ObligationRepository;
   let chat: MeshChatRepository;
@@ -26,7 +26,7 @@ describe("InboxFocusResolver", () => {
     db.pragma("foreign_keys = ON");
     runMigrations(db);
     runs = new ActorRunRepository(db);
-    inbox = new InboxRepository(db);
+    inbox = new SqliteInboxRepository(db);
     focus = new InboxFocusRepository(db);
     let now = Date.parse("2026-09-01T12:00:00.000Z");
     obligations = new ObligationRepository(

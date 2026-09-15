@@ -4,13 +4,13 @@ import { runMigrations } from "../migrations/runner.js";
 import { createActorRunModelConfig } from "./actor-run-model-config.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
-import { InboxRepository } from "./inbox-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
+import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
 describe("InboxFocusRepository", () => {
   let db: Database.Database;
   let runs: ActorRunRepository;
-  let inbox: InboxRepository;
+  let inbox: SqliteInboxRepository;
   let obligations: ObligationRepository;
   let focus: InboxFocusRepository;
 
@@ -19,7 +19,7 @@ describe("InboxFocusRepository", () => {
     db.pragma("foreign_keys = ON");
     runMigrations(db);
     runs = new ActorRunRepository(db);
-    inbox = new InboxRepository(db);
+    inbox = new SqliteInboxRepository(db);
     obligations = new ObligationRepository(db, (id) => id === "actor-a");
     focus = new InboxFocusRepository(db, () => new Date("2026-09-01T12:00:00.000Z"));
     inbox.append([

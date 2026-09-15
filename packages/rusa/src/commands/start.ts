@@ -56,7 +56,6 @@ import {
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
-import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import {
   type MeshEventSink,
   type RunAbandonedPayload,
@@ -223,6 +222,7 @@ import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
   EventManager,
@@ -554,7 +554,7 @@ export interface RunStartE2EHandles {
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
-  inboxStore: InboxStore;
+  inboxStore: InboxRepository;
   /** Inject a GitHub-shaped event into the root (the webhook `onEvent` sink). */
   emitGitHubEvent: (
     event: string,
