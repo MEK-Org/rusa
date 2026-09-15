@@ -18,10 +18,15 @@ import type { Obligation } from "./obligation.js";
  */
 export function resolveObligationOwner(
   actors: Pick<ActorRepository, "get">,
-  rawOwnerId: string
+  rawOwnerId: string,
+  principals?: Pick<import("../db/repositories/principal-repository.js").PrincipalRepository, "get">
 ): { ok: true; ownerId: string } | { ok: false; error: string } {
   const ownerId = rawOwnerId.trim();
   if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
+  if (principals) {
+    const p = principals.get(ownerId);
+    if (p && p.kind === "user") return { ok: true, ownerId };
+  }
   const record = actors.get(ownerId);
   if (!record) return { ok: false, error: `unknown obligation owner: ${ownerId}` };
   if (record.status !== "active") {

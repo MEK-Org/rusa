@@ -256,9 +256,37 @@ describe("SqliteActorRepository", () => {
       prepare.mock.calls.filter(
         ([sql]) =>
           typeof sql === "string" &&
-          sql.includes("WHERE sender_id = ? ORDER BY recipient_id, ts DESC, id DESC")
+          sql.includes("ORDER BY recipient_id, ts DESC, id DESC")
       )
     ).toHaveLength(1);
+  });
+
+  it("derives humanUnlocked and lastChatSessionId from user principal mesh_chat rows", () => {
+    repository.upsert(root);
+    const principalRepo = new PrincipalRepository(db);
+    const userPrincipal = principalRepo.createUser({
+      email: "user@example.com",
+      createdAt: "2026-09-03T13:00:00.000Z",
+      identity: {
+        issuer: "https://accounts.google.com",
+        subject: "sub-1",
+      },
+    });
+
+    db.prepare(
+      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run("msg-user", "2026-09-03T13:20:00.000Z", userPrincipal.id, "root", "hello from user", "user-session-1");
+
+    expect(repository.get("root")).toMatchObject({
+      humanUnlocked: true,
+      lastChatSessionId: "user-session-1",
+    });
+
+    const byId = new Map(repository.list().map((r) => [r.id, r]));
+    expect(byId.get("root")).toMatchObject({
+      humanUnlocked: true,
+      lastChatSessionId: "user-session-1",
+    });
   });
 
   it("persists normalized records across a file-backed database reopen", () => {

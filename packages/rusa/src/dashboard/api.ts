@@ -20,6 +20,7 @@ import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
@@ -29,12 +30,13 @@ import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
-import { isAuthenticatedOperatorRequest } from "./auth.js";
+import { getDashboardRequestPrincipal, isAuthenticatedOperatorRequest } from "./auth.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
   actors: ActorRepository;
+  principals?: PrincipalRepository;
   /** Application logger for route diagnostics. Absent → nothing is logged. */
   logger?: Logger;
   meshEvents: MeshEventRepository;
@@ -509,6 +511,17 @@ function parseKinds(url: URL): string[] | undefined {
   return kinds.length > 0 ? kinds : undefined;
 }
 
+export function resolveOperatorPrincipalId(
+  req: IncomingMessage,
+  deps: DashboardDataDeps | null
+): string {
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) return reqPrincipal.id;
+  const firstUser = deps?.principals?.findFirstUser();
+  if (firstUser) return firstUser.id;
+  return HUMAN_OPERATOR;
+}
+
 /**
  * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
  * (responded or took over the socket for SSE), false to let the caller fall
@@ -658,7 +671,8 @@ export async function handleMeshApiRequest(
             return;
           }
 
-          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice });
+          const fromId = resolveOperatorPrincipalId(req, deps);
+          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice, fromId });
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {
@@ -694,7 +708,7 @@ export async function handleMeshApiRequest(
       }
       readBody(req)
         .then((bodyStr) => {
-          let by = "human:operator";
+          let by = resolveOperatorPrincipalId(req, deps);
           if (bodyStr.trim()) {
             try {
               const parsed = JSON.parse(bodyStr);
@@ -707,7 +721,7 @@ export async function handleMeshApiRequest(
                 by = parsed.by.trim();
               }
             } catch {
-              // Ignore body parse errors, default to human:operator
+              // Ignore body parse errors, default to resolved operator principal
             }
           }
           try {
@@ -984,13 +998,14 @@ export async function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
-          const owner = resolveObligationOwner(deps.actors, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId, deps.principals);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
           }
 
           try {
+            const creatorId = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.create({
               ownerId: owner.ownerId,
               parentId,
@@ -998,12 +1013,7 @@ export async function handleMeshApiRequest(
               intent,
               externalRef,
               priority,
-              // The dashboard IS the operator, so the creator is bound here from
-              // the server's own identity — the same binding the actor MCP does
-              // with its actor id and the e2e control server does with this one.
-              // Missing it made every dashboard-created obligation
-              // creator-unknown, and #1671 forbids recovering that by inference.
-              creatorId: HUMAN_OPERATOR,
+              creatorId,
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -1056,12 +1066,13 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
+            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.setTerminalStatus(
               id,
               status,
               note,
               resolutionRef,
-              HUMAN_OPERATOR
+              actingPrincipal
             );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
@@ -1113,9 +1124,10 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
+            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             sendJson(res, 200, {
               ok: true,
-              obligation: obligations.setExternalRef(id, externalRef, HUMAN_OPERATOR),
+              obligation: obligations.setExternalRef(id, externalRef, actingPrincipal),
             });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1161,11 +1173,12 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
+            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
             const obligation = obligations.movePriorityInternal(
               id,
               previousId,
               nextId,
-              HUMAN_OPERATOR,
+              actingPrincipal,
               scope
             );
             sendJson(res, 200, { ok: true, obligation });
@@ -1209,7 +1222,8 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reparent(id, parentId, HUMAN_OPERATOR);
+            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
+            const obligation = obligations.reparent(id, parentId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1251,13 +1265,14 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
-          const owner = resolveObligationOwner(deps.actors, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId, deps.principals);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
           }
           try {
-            const obligation = obligations.reassign(id, owner.ownerId, HUMAN_OPERATOR);
+            const actingPrincipal = resolveOperatorPrincipalId(req, deps);
+            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

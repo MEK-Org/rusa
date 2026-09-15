@@ -394,12 +394,16 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
  * controller. Their scope is enforced by the surface that mints them, not by
  * ancestry, since none of them is a node in the tree to begin with.
  */
-function isTrustedControlPrincipal(by: string): boolean {
+function isTrustedControlPrincipal(
+  by: string,
+  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository
+): boolean {
   return (
     by === "root-llm" ||
     by === "human:operator" ||
     by.startsWith("human:") ||
-    by === "e2e-controller"
+    by === "e2e-controller" ||
+    (principals !== undefined && principals.getUser(by) !== undefined)
   );
 }
 
@@ -501,6 +505,7 @@ export interface RetireCleanup {
 
 export interface ActorMeshOptions {
   actors: ActorRepository;
+  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -776,6 +781,7 @@ interface SelectedHeadSnapshot {
 
 export class ActorMesh {
   readonly actors: ActorRepository;
+  readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly supportsExecutionTarget?: (target: string) => boolean;
@@ -881,6 +887,15 @@ export class ActorMesh {
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
+    this.principals =
+      opts.principals ??
+      ("principals" in opts.actors
+        ? (
+            opts.actors as {
+              principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
+            }
+          ).principals
+        : undefined);
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
@@ -2730,7 +2745,10 @@ export class ActorMesh {
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
-    if (isHumanOperator(fromId)) {
+    if (
+      isHumanOperator(fromId) ||
+      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
+    ) {
       throw new Error(
         "Invalid sender ID: actor-facing send path structurally cannot claim human origin"
       );
@@ -2878,10 +2896,10 @@ export class ActorMesh {
     toId: string,
     body: string,
     sessionId: string,
-    opts?: { voice?: boolean }
+    opts?: { voice?: boolean; fromId?: string }
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
-    const fromId = HUMAN_OPERATOR;
+    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
@@ -3318,7 +3336,7 @@ export class ActorMesh {
     // `root-llm` is a RootControlPrincipal, not a thread id. RootControlService
     // scopes its target to the injected rootId's subtree before calling here;
     // human/e2e principals are operator-level bypasses by design.
-    if (!isTrustedControlPrincipal(by) && !this.isAncestorOf(by, targetId)) {
+    if (!isTrustedControlPrincipal(by, this.principals) && !this.isAncestorOf(by, targetId)) {
       throw new Error(
         `actor ${by} may only interrupt its descendants (cannot interrupt ${targetId})`
       );
@@ -3581,7 +3599,7 @@ export class ActorMesh {
       );
     }
     const authorized =
-      isTrustedControlPrincipal(by) ||
+      isTrustedControlPrincipal(by, this.principals) ||
       this.isAncestorOf(by, message.fromId) ||
       this.isAncestorOf(by, message.toId);
     if (!authorized) {

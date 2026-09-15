@@ -123,6 +123,7 @@ export interface WebhookServerOptions {
  */
 export interface DashboardMeshRefs {
   actors: ActorRepository;
+  principals?: PrincipalRepository;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -202,7 +203,7 @@ export interface DashboardServerBaseOptions {
  * together or not at all, so an authenticated dashboard cannot be started without storage. */
 export type DashboardAuthOptions =
   | { auth?: DashboardAuthConfig; principals: PrincipalRepository }
-  | { auth?: undefined; principals?: undefined };
+  | { auth?: undefined; principals?: PrincipalRepository };
 
 export type DashboardServerOptions = DashboardServerBaseOptions & DashboardAuthOptions;
 
@@ -569,6 +570,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     options.mesh && sseHub
       ? {
           actors: options.mesh.actors,
+          principals: options.mesh.principals ?? options.principals,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
           meshChat: options.mesh.meshChat,

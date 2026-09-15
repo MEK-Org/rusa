@@ -13,6 +13,7 @@ export default defineConfig({
     "actor/backfill-run-token-records": "src/actor/backfill-run-token-records.ts",
     "mcp/quota-mcp": "src/mcp/quota-mcp.ts",
     "quota/shared-store": "src/quota/shared-store.ts",
+    "principals/legacy-migration": "src/principals/legacy-migration.ts",
   },
   format: ["esm"],
   target: "node20",
