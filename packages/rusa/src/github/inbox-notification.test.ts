@@ -60,6 +60,32 @@ describe("deriveGitHubInboxNotification", () => {
     expect(notification.payload).toEqual({ type: "pull_request.closed", merged: true });
   });
 
+  it("keeps only the draft discriminator needed by pull_request.opened bubbling", () => {
+    const opened = deriveGitHubInboxNotification("pull_request", {
+      action: "opened",
+      repository: { full_name: "dummy-org/dummy-repo" },
+      pull_request: { number: 910, draft: true, title: "not cached", body: "not cached" },
+    });
+    if (!opened) throw new Error("notification not derived");
+    expect(opened.payload).toEqual({ type: "pull_request.opened", draft: true });
+
+    // Other PR actions do not carry it: the flag exists for the bubbling
+    // decision, not as cached PR state.
+    const synchronized = deriveGitHubInboxNotification("pull_request", {
+      action: "synchronize",
+      repository: { full_name: "dummy-org/dummy-repo" },
+      pull_request: { number: 910, draft: true },
+    });
+    expect(synchronized?.payload).toEqual({ type: "pull_request.synchronize" });
+
+    const ready = deriveGitHubInboxNotification("pull_request", {
+      action: "ready_for_review",
+      repository: { full_name: "dummy-org/dummy-repo" },
+      pull_request: { number: 910, draft: false },
+    });
+    expect(ready?.payload).toEqual({ type: "pull_request.ready_for_review" });
+  });
+
   it("does not copy push content into the inbox payload", () => {
     const notification = deriveGitHubInboxNotification("push", {
       repository: { full_name: "dummy-org/dummy-repo" },

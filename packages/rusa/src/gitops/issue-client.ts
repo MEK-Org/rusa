@@ -38,6 +38,13 @@ export interface CreatePROptions {
    * or to retarget an existing PR to a new base branch.
    */
   base?: string;
+  /**
+   * Draft state for the PR. When omitted, a new PR opens ready for review and
+   * an existing PR keeps whatever state it already has. Supplying it on an
+   * existing PR converts it to draft (true) or marks it ready for review
+   * (false), so one flag covers both creation and the transitions.
+   */
+  draft?: boolean;
 }
 
 export interface CreateIssueOptions {
@@ -64,6 +71,8 @@ export interface CreatedPullRequest {
    * updated in-place via PATCH during an upsert (false).
    */
   wasCreated: boolean;
+  /** Whether the pull request is a draft after this call. */
+  draft: boolean;
 }
 
 export interface MergePullRequestOptions {
@@ -246,6 +255,12 @@ export interface PollIssueOrPullRequest {
   createdAt: string;
   updatedAt: string;
   isPullRequest: boolean;
+  /**
+   * Draft state of a polled pull request. GitHub's issues list carries `draft`
+   * on every PR-backed record, so this is a plain boolean: always false for an
+   * issue, and never "unknown" for a PR.
+   */
+  draft: boolean;
 }
 
 export interface PollIssueComment {
@@ -547,22 +562,61 @@ export class GitHubIssueClient implements IssueClient {
     const body = existing ? (opts.existingBody ?? opts.body) : opts.body;
     let pr: CreatedPullRequest;
     if (existing) {
+      // Draft state is not a PATCH field: GitHub only flips it through two
+      // GraphQL mutations keyed by node id. Resolve everything the transition
+      // needs before the PATCH so a missing id fails with nothing applied.
+      const transitionTo =
+        opts.draft !== undefined && opts.draft !== existing.draft ? opts.draft : undefined;
+      const nodeId = existing.nodeId;
+      if (transitionTo !== undefined && !nodeId) {
+        throw new Error(
+          `pull request #${existing.number} has no node id; cannot change its draft state`
+        );
+      }
       // Update the existing PR's title, body, and base (if provided).
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
         title: opts.title,
         body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      pr = { number: existing.number, htmlUrl: existing.htmlUrl, wasCreated: false };
+      // The transition runs after the body is final so the resulting
+      // ready_for_review event carries the updated PR. A failure here lands
+      // after the PATCH succeeded; the upsert is idempotent, so the caller can
+      // simply re-run it, and the error says so.
+      let draft = existing.draft;
+      if (transitionTo !== undefined && nodeId) {
+        try {
+          await this.setPullRequestDraft(nodeId, transitionTo);
+        } catch (err) {
+          throw new Error(
+            `pull request #${existing.number} was updated but could not be ${transitionTo ? "converted to draft" : "marked ready for review"}: ${err instanceof Error ? err.message : String(err)}. Re-running the same call retries the transition.`
+          );
+        }
+        draft = transitionTo;
+      }
+      pr = { number: existing.number, htmlUrl: existing.htmlUrl, wasCreated: false, draft };
     } else {
       // Unlike `gh pr create`, the REST endpoint requires an explicit base.
       const base = opts.base ?? (await this.getDefaultBranch(opts.repo));
-      const created = await this.api<{ number: number; html_url: string }>(
+      const created = await this.api<{ number: number; html_url: string; draft?: boolean }>(
         "POST",
         `/repos/${opts.repo}/pulls`,
-        { title: opts.title, body, head: opts.head, base }
+        {
+          title: opts.title,
+          body,
+          head: opts.head,
+          base,
+          ...(opts.draft !== undefined ? { draft: opts.draft } : {}),
+        }
       );
-      pr = { number: created.number, htmlUrl: created.html_url, wasCreated: true };
+      pr = {
+        number: created.number,
+        htmlUrl: created.html_url,
+        wasCreated: true,
+        // GitHub reports the state on the create response; only a response
+        // that omits it falls back to what was requested (ready by default).
+        draft: created.draft ?? opts.draft ?? false,
+      };
     }
 
     // Both creation and update are complete before this separate GitHub API
@@ -601,18 +655,31 @@ export class GitHubIssueClient implements IssueClient {
   private async findOpenPullRequestForHead(
     repo: string,
     head: string
-  ): Promise<{ number: number; htmlUrl: string } | null> {
+  ): Promise<{ number: number; htmlUrl: string; draft: boolean; nodeId?: string } | null> {
     try {
       const owner = repo.split("/")[0];
-      const prs = await this.api<Array<{ number: number; html_url: string }>>(
+      const prs = await this.api<
+        Array<{ number: number; html_url: string; draft?: boolean; node_id?: string }>
+      >(
         "GET",
         `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${head}`)}&state=open&per_page=1`
       );
       const pr = prs[0];
-      return pr ? { number: pr.number, htmlUrl: pr.html_url } : null;
+      return pr
+        ? { number: pr.number, htmlUrl: pr.html_url, draft: pr.draft === true, nodeId: pr.node_id }
+        : null;
     } catch {
       return null;
     }
+  }
+
+  /** Flip an open PR between draft and ready for review (GraphQL-only on GitHub). */
+  private async setPullRequestDraft(pullRequestId: string, draft: boolean): Promise<void> {
+    const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
+    await this.graphql(
+      `mutation($pullRequestId: ID!) { ${mutation}(input: { pullRequestId: $pullRequestId }) { pullRequest { isDraft } } }`,
+      { pullRequestId }
+    );
   }
 
   async getParentIssueNumber(repo: string, issueNumber: number): Promise<number | null> {
@@ -1382,7 +1449,12 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
     // for the URL and there is no real PR number to report (0 is the "no PR"
     // placeholder). In practice unreachable: the per-actor tracker tool
     // short-circuits the bridge before reaching the client.
-    return { number: 0, htmlUrl: formatGitBridgePullRequestResult(deliverable), wasCreated: false };
+    return {
+      number: 0,
+      htmlUrl: formatGitBridgePullRequestResult(deliverable),
+      wasCreated: false,
+      draft: false,
+    };
   }
 
   createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {
@@ -1532,9 +1604,11 @@ interface PollIssueResponse {
   created_at: string;
   updated_at: string;
   pull_request?: unknown;
+  draft?: boolean;
 }
 
 function mapPollIssue(issue: PollIssueResponse): PollIssueOrPullRequest {
+  const isPullRequest = issue.pull_request !== undefined;
   return {
     number: issue.number,
     title: issue.title,
@@ -1543,7 +1617,8 @@ function mapPollIssue(issue: PollIssueResponse): PollIssueOrPullRequest {
     state: issue.state,
     createdAt: issue.created_at,
     updatedAt: issue.updated_at,
-    isPullRequest: issue.pull_request !== undefined,
+    isPullRequest,
+    draft: isPullRequest && issue.draft === true,
   };
 }
 

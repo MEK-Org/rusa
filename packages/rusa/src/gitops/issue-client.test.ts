@@ -174,6 +174,7 @@ describe("GitHubIssueClient", () => {
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
       wasCreated: true,
+      draft: false,
     });
     const create = requests.find((r) => r.path === `/repos/${REPO}/pulls` && r.method === "POST");
     expect(create?.body).toEqual({
@@ -210,6 +211,7 @@ describe("GitHubIssueClient", () => {
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
       wasCreated: true,
+      draft: false,
     });
     expect(requests.some((r) => r.path.endsWith("/requested_reviewers"))).toBe(false);
   });
@@ -236,6 +238,7 @@ describe("GitHubIssueClient", () => {
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
       wasCreated: false,
+      draft: false,
     });
     expect(requests.some((r) => r.method === "POST" && r.path === `/repos/${REPO}/pulls`)).toBe(
       false
@@ -248,6 +251,187 @@ describe("GitHubIssueClient", () => {
     });
     const reviewers = requests.find((r) => r.path.endsWith("/requested_reviewers"));
     expect(reviewers?.body).toEqual({ reviewers: ["operator"] });
+  });
+
+  describe("draft pull requests", () => {
+    const HEAD_LOOKUP = `GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`;
+    const PR_URL = "https://github.com/test-org/test-repo/pull/12";
+
+    it("creates a draft PR when draft is true and reports the draft state", async () => {
+      const requests = installFetch({
+        [HEAD_LOOKUP]: { json: [] },
+        [`POST /repos/${REPO}/pulls`]: {
+          status: 201,
+          json: { number: 12, html_url: PR_URL, draft: true },
+        },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Design",
+        body: "Design only.",
+        base: "staging",
+        draft: true,
+      });
+
+      expect(pr).toEqual({ number: 12, htmlUrl: PR_URL, wasCreated: true, draft: true });
+      const create = requests.find((r) => r.method === "POST" && r.path === `/repos/${REPO}/pulls`);
+      expect(create?.body).toEqual({
+        title: "Design",
+        body: "Design only.",
+        head: "mc/issue-9",
+        base: "staging",
+        draft: true,
+      });
+      expect(requests.some((r) => r.path === "/graphql")).toBe(false);
+    });
+
+    it("marks an existing draft PR ready for review after updating its body", async () => {
+      const requests = installFetch({
+        [HEAD_LOOKUP]: {
+          json: [{ number: 12, html_url: PR_URL, draft: true, node_id: "PR_node12" }],
+        },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        "POST /graphql": {
+          json: { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } },
+        },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Ready",
+        body: "Fresh body.",
+        existingBody: "Final body.",
+        draft: false,
+      });
+
+      expect(pr).toEqual({ number: 12, htmlUrl: PR_URL, wasCreated: false, draft: false });
+      // The body lands first so the ready_for_review event carries the final PR.
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        HEAD_LOOKUP,
+        `PATCH /repos/${REPO}/pulls/12`,
+        "POST /graphql",
+      ]);
+      const mutation = requests.find((r) => r.path === "/graphql")?.body as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      expect(mutation.query).toContain("markPullRequestReadyForReview");
+      expect(mutation.variables).toEqual({ pullRequestId: "PR_node12" });
+    });
+
+    it("converts an existing ready PR to draft when draft is true", async () => {
+      const requests = installFetch({
+        [HEAD_LOOKUP]: {
+          json: [{ number: 12, html_url: PR_URL, draft: false, node_id: "PR_node12" }],
+        },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        "POST /graphql": {
+          json: { data: { convertPullRequestToDraft: { pullRequest: { isDraft: true } } } },
+        },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Back to draft",
+        body: "Body.",
+        draft: true,
+      });
+
+      expect(pr.draft).toBe(true);
+      const mutation = requests.find((r) => r.path === "/graphql")?.body as { query: string };
+      expect(mutation.query).toContain("convertPullRequestToDraft");
+    });
+
+    it("leaves an existing PR's draft state alone when draft is omitted or unchanged", async () => {
+      for (const draft of [undefined, true]) {
+        const requests = installFetch({
+          [HEAD_LOOKUP]: {
+            json: [{ number: 12, html_url: PR_URL, draft: true, node_id: "PR_node12" }],
+          },
+          [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        });
+
+        const pr = await new GitHubIssueClient().createPullRequest({
+          repo: REPO,
+          head: "mc/issue-9",
+          title: "Still draft",
+          body: "Body.",
+          ...(draft !== undefined ? { draft } : {}),
+        });
+
+        expect(pr.draft).toBe(true);
+        expect(requests.some((r) => r.path === "/graphql")).toBe(false);
+        expect(requests.find((r) => r.method === "PATCH")?.body).toEqual({
+          title: "Still draft",
+          body: "Body.",
+        });
+      }
+    });
+
+    it("surfaces a failed draft transition, saying the body update already landed", async () => {
+      installFetch({
+        [HEAD_LOOKUP]: {
+          json: [{ number: 12, html_url: PR_URL, draft: true, node_id: "PR_node12" }],
+        },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+        "POST /graphql": { json: { errors: [{ message: "not permitted" }] } },
+      });
+
+      // The PATCH has already succeeded by this point, so the error has to tell
+      // the caller that much and that re-running the idempotent upsert retries.
+      await expect(
+        new GitHubIssueClient().createPullRequest({
+          repo: REPO,
+          head: "mc/issue-9",
+          title: "Ready",
+          body: "Body.",
+          draft: false,
+        })
+      ).rejects.toThrow(
+        /#12 was updated but could not be marked ready for review.*not permitted.*Re-running/s
+      );
+    });
+
+    it("refuses a transition with no node id before touching the PR", async () => {
+      const requests = installFetch({
+        [HEAD_LOOKUP]: { json: [{ number: 12, html_url: PR_URL, draft: true }] },
+        [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+      });
+
+      await expect(
+        new GitHubIssueClient().createPullRequest({
+          repo: REPO,
+          head: "mc/issue-9",
+          title: "Ready",
+          body: "Body.",
+          draft: false,
+        })
+      ).rejects.toThrow("no node id");
+      // Nothing was half-applied: the lookup is the only request made.
+      expect(requests.map((r) => `${r.method} ${r.path}`)).toEqual([HEAD_LOOKUP]);
+    });
+
+    it("falls back to the requested draft state when the create response omits it", async () => {
+      installFetch({
+        [HEAD_LOOKUP]: { json: [] },
+        [`POST /repos/${REPO}/pulls`]: { status: 201, json: { number: 12, html_url: PR_URL } },
+      });
+
+      const pr = await new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Design",
+        body: "Body.",
+        base: "staging",
+        draft: true,
+      });
+
+      expect(pr.draft).toBe(true);
+    });
   });
 
   it("requests no reviewer when updating an existing PR without one", async () => {
@@ -471,6 +655,7 @@ describe("GitHubIssueClient", () => {
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
       wasCreated: false,
+      draft: false,
     });
     const patch = requests.find((r) => r.method === "PATCH");
     expect(patch?.body).toEqual({ title: "Updated title", body: "Updated body." });
@@ -529,7 +714,12 @@ describe("GitHubIssueClient", () => {
       ...({} as IssueClient & GitHubPollingIssueClient),
       createPullRequest: async () => {
         delegateCalls.push("createPullRequest");
-        return { number: 1, htmlUrl: "https://github.example/pr/1", wasCreated: true };
+        return {
+          number: 1,
+          htmlUrl: "https://github.example/pr/1",
+          wasCreated: true,
+          draft: false,
+        };
       },
     };
     const requests = installFetch({});

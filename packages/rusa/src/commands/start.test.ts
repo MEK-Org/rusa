@@ -218,17 +218,23 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
     head: string;
     title: string;
     body: string;
-  }): Promise<{ number: number; htmlUrl: string; wasCreated: boolean }> {
+  }): Promise<{ number: number; htmlUrl: string; wasCreated: boolean; draft: boolean }> {
     const key = `${opts.repo}:${opts.head}`;
     if (this.createdPRs.has(key)) {
       return {
         number: 789,
         htmlUrl: `https://example.test/${opts.repo}/pull/789`,
         wasCreated: false,
+        draft: false,
       };
     }
     this.createdPRs.add(key);
-    return { number: 789, htmlUrl: `https://example.test/${opts.repo}/pull/789`, wasCreated: true };
+    return {
+      number: 789,
+      htmlUrl: `https://example.test/${opts.repo}/pull/789`,
+      wasCreated: true,
+      draft: false,
+    };
   }
 }
 

@@ -27,6 +27,7 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
       number: 1,
       htmlUrl: "https://example.test/pr/1",
       wasCreated: true,
+      draft: false,
     }),
     getOpenPullRequestsByAuthor: async () => [],
     getOpenPullRequests: async () => [],

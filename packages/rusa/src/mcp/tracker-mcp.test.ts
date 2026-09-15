@@ -24,7 +24,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     },
     createPullRequest: async (opts: CreatePROptions) => {
       calls.push({ method: "createPullRequest", args: [opts] });
-      return { number: 1, htmlUrl: "https://example.test/pr/1", wasCreated: true };
+      return { number: 1, htmlUrl: "https://example.test/pr/1", wasCreated: true, draft: false };
     },
     createPrReviewComment: async (opts: CreatePrReviewCommentOptions) => {
       calls.push({ method: "createPrReviewComment", args: [opts] });
@@ -538,6 +538,83 @@ describe("tracker MCP server", () => {
     expect(parseAuthor(body)).toBe("test-actor-2");
   });
 
+  it("create_pull_request leaves draft unset when omitted and answers with the bare URL", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(createTrackerMcpServer("test-actor-2", backend));
+
+    const res = (await client.callTool({
+      name: "create_pull_request",
+      arguments: { repo: "owner/repo", head: "feature-branch", title: "PR Title", body: "PR body" },
+    })) as CallToolResult;
+
+    expect(textOf(res)).toBe("https://example.test/pr/1");
+    const opts = calls.find((call) => call.method === "createPullRequest")
+      ?.args[0] as CreatePROptions;
+    expect("draft" in opts).toBe(false);
+  });
+
+  it("create_pull_request passes draft through and marks a draft result in the response", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    backend.createPullRequest = async (opts) => {
+      calls.push({ method: "createPullRequest", args: [opts] });
+      return { number: 1, htmlUrl: "https://example.test/pr/1", wasCreated: true, draft: true };
+    };
+    const onResourceCreated = vi.fn();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-2", backend, { onResourceCreated })
+    );
+
+    const res = (await client.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        head: "feature-branch",
+        title: "PR Title",
+        body: "PR body",
+        draft: true,
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    // The URL owns its own line so a pasted result stays a usable link.
+    expect(textOf(res)).toBe("https://example.test/pr/1\ndraft: not yet ready for review");
+    const opts = calls.find((call) => call.method === "createPullRequest")
+      ?.args[0] as CreatePROptions;
+    expect(opts.draft).toBe(true);
+    // A draft creation still hands the creator its PR's event source.
+    expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/pulls/1");
+  });
+
+  it("create_pull_request reports the transition when an existing PR is marked ready", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    backend.createPullRequest = async (opts) => {
+      calls.push({ method: "createPullRequest", args: [opts] });
+      return {
+        number: 1,
+        htmlUrl: "https://example.test/pr/1",
+        wasCreated: false,
+        draft: opts.draft === true,
+      };
+    };
+    const client = await connect(createTrackerMcpServer("test-actor-2", backend));
+
+    const res = (await client.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        head: "feature-branch",
+        title: "PR Title",
+        body: "PR body",
+        draft: false,
+      },
+    })) as CallToolResult;
+
+    expect(textOf(res)).toBe("https://example.test/pr/1");
+    const opts = calls.find((call) => call.method === "createPullRequest")
+      ?.args[0] as CreatePROptions;
+    expect(opts.draft).toBe(false);
+  });
+
   it("create_pull_request formats git-bridge instructions when gitBridge option is active", async () => {
     const { client: backend, calls } = recordingIssueClient();
     const onGitBridgeDeliverable = vi.fn();
@@ -903,6 +980,7 @@ describe("tracker MCP server", () => {
       number: 1,
       htmlUrl: "https://example.test/pr/1",
       wasCreated: false,
+      draft: false,
     });
     const onResourceCreated = vi.fn();
     const client = await connect(
