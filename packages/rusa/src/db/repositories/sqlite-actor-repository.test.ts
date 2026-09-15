@@ -255,8 +255,7 @@ describe("SqliteActorRepository", () => {
     expect(
       prepare.mock.calls.filter(
         ([sql]) =>
-          typeof sql === "string" &&
-          sql.includes("ORDER BY recipient_id, ts DESC, id DESC")
+          typeof sql === "string" && sql.includes("ORDER BY recipient_id, ts DESC, id DESC")
       )
     ).toHaveLength(1);
   });
@@ -275,7 +274,14 @@ describe("SqliteActorRepository", () => {
 
     db.prepare(
       "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("msg-user", "2026-09-03T13:20:00.000Z", userPrincipal.id, "root", "hello from user", "user-session-1");
+    ).run(
+      "msg-user",
+      "2026-09-03T13:20:00.000Z",
+      userPrincipal.id,
+      "root",
+      "hello from user",
+      "user-session-1"
+    );
 
     expect(repository.get("root")).toMatchObject({
       humanUnlocked: true,

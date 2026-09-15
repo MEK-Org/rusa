@@ -6,11 +6,7 @@ import {
 } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 
-export type RootControlPrincipal =
-  | "root-llm"
-  | "human:operator"
-  | "e2e-controller"
-  | (string & {});
+export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller" | (string & {});
 
 export interface RootChildRequest {
   executionTarget?: string;
