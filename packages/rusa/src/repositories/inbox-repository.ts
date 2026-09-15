@@ -74,13 +74,24 @@ export type InboxItemsAppendedListener = (items: readonly InboxEntry[]) => void;
  *    are reconciled against durable state via `actorsWithUnhandled()`.
  */
 export interface InboxRepository {
-  /** Append new entries, returning only rows inserted by this call. Duplicate ids are no-ops. */
+  /**
+   * Append new entries, returning only rows inserted by this call. Duplicate
+   * ids are no-ops. Must be called outside any enclosing transaction: the
+   * after-commit notification is only honest once the write is durable.
+   */
   append(entries: InboxAppendInput[]): InboxEntry[];
   /**
    * Subscribe to rows that have been durably committed by `append`. The
    * listener receives only rows actually inserted, so redelivery of an already
    * known id notifies nobody, and a failed or rolled-back append notifies
    * nobody. Returns an unsubscribe function.
+   *
+   * Listeners run synchronously inside the appending caller's turn, after the
+   * commit and before that caller's own follow-up (typically the recipient
+   * wake), so the callback must be cheap and non-blocking: hand off async work
+   * without awaiting it. A thrown error is contained and journaled, never
+   * surfaced to the appender. Calling `append` from inside a listener is out of
+   * contract; it re-enters this notification path and is not guarded.
    */
   onItemsAppended(listener: InboxItemsAppendedListener): () => void;
   list(actorId: string, options?: InboxListOptions): InboxPage;

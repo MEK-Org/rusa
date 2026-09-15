@@ -25,7 +25,10 @@ import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
-import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
+import {
+  type InboxListenerErrorHandler,
+  SqliteInboxRepository,
+} from "./sqlite-inbox-repository.js";
 
 /**
  * Aggregate of the entity repositories the actor mesh + the retained
@@ -48,6 +51,12 @@ export class Repositories {
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
   readonly inbox: InboxRepository;
+  /**
+   * The same object as {@link inbox}, kept concretely so wiring that only the
+   * SQLite implementation offers stays reachable from the composition root
+   * without widening the abstract contract every other caller sees.
+   */
+  private readonly sqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
@@ -73,7 +82,8 @@ export class Repositories {
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
-    this.inbox = new SqliteInboxRepository(db);
+    this.sqliteInbox = new SqliteInboxRepository(db);
+    this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
@@ -99,6 +109,15 @@ export class Repositories {
 
   setOsScheduler(scheduler: ObligationActivationScheduler): void {
     this.obligations.setOsScheduler(scheduler);
+  }
+
+  /**
+   * Journal failures of advisory `onItemsAppended` listeners. Built from a
+   * Database alone, the container has no logger of its own; without this line
+   * a listener that throws is contained and unrecorded.
+   */
+  setInboxListenerErrorHandler(handler: InboxListenerErrorHandler): void {
+    this.sqliteInbox.setListenerErrorHandler(handler);
   }
 }
 
@@ -138,5 +157,5 @@ export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
 export { ReferenceCacheRepository } from "./reference-cache-repository.js";
 export { SqliteActorRepository } from "./sqlite-actor-repository.js";
-export type { SqliteInboxRepositoryOptions } from "./sqlite-inbox-repository.js";
+export type { InboxListenerErrorHandler } from "./sqlite-inbox-repository.js";
 export { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
