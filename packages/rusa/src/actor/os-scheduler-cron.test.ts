@@ -147,7 +147,7 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
     const { io, scheduler } = make();
     await scheduler.schedule("act1", "0 3 * * *", "nightly");
     const lines = io.content.trimEnd().split("\n");
-    expect(lines[0]).toBe("# mc-wake:act1");
+    expect(lines[0]).toBe("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ");
     expect(lines[1].startsWith("0 3 * * * /usr/bin/curl")).toBe(true);
   });
 
@@ -158,7 +158,7 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
     await scheduler.schedule("act1", "30 4 * * *", "second"); // re-schedule same actor
     expect(io.content).toContain("# my own job");
     expect(io.content).toContain("/usr/bin/backup.sh");
-    expect(io.content.match(/# mc-wake:act1/g)).toHaveLength(1); // replaced, not duplicated
+    expect(io.content.match(/# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ$/gm)).toHaveLength(1); // replaced, not duplicated
     const entries = await scheduler.list();
     expect(entries).toEqual([{ actorId: "act1", cronExpr: "30 4 * * *", reason: "second" }]);
   });
@@ -218,6 +218,53 @@ describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
       scheduler.schedule("act2", "0 4 * * *", "two"),
     ]);
     expect((await scheduler.list()).map((e) => e.actorId).sort()).toEqual(["act1", "act2"]);
+  });
+});
+
+describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
+  // Written by a co-hosted instance ("other-instance") for the same actor id.
+  const foreignBlock =
+    "# mc-wake-instance:v1:b3RoZXItaW5zdGFuY2U:YWN0MQ\n" +
+    "0 5 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa-other/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa-other/wake-port)/wake\" -d 'actorId=act1' -d 'reason=foreign'\n";
+  // Pre-scoping blocks: one reads this instance's wake-port file, one reads another instance's.
+  const ownLegacyBlock =
+    "# mc-wake:act1\n" +
+    "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa/wake-port)/wake\" -d 'actorId=act1' -d 'reason=legacy own'\n";
+  const foreignLegacyBlock =
+    "# mc-wake:act2\n" +
+    "0 4 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /home/sf/.rusa-other/wake-token)\" \"http://127.0.0.1:$(cat /home/sf/.rusa-other/wake-port)/wake\" -d 'actorId=act2' -d 'reason=legacy foreign'\n";
+  const userLine = "0 1 * * * /usr/bin/user-job\n";
+
+  it("lists only this instance's blocks: scoped foreign and legacy foreign wakes are invisible", async () => {
+    const { scheduler } = make(userLine + foreignBlock + ownLegacyBlock + foreignLegacyBlock);
+    await scheduler.schedule("act3", "0 6 * * *", "own scoped");
+    expect(await scheduler.list()).toEqual([
+      { actorId: "act1", cronExpr: "0 3 * * *", reason: "legacy own" },
+      { actorId: "act3", cronExpr: "0 6 * * *", reason: "own scoped" },
+    ]);
+  });
+
+  it("schedule/cancel for a shared actor id leave the co-hosted instance's block byte-for-byte untouched", async () => {
+    const { io, scheduler } = make(userLine + foreignBlock + foreignLegacyBlock);
+    await scheduler.schedule("act1", "0 3 * * *", "own");
+    await scheduler.cancel("act2");
+    expect(io.content).toContain(foreignBlock);
+    expect(io.content).toContain(foreignLegacyBlock);
+    await scheduler.cancel("act1");
+    expect(io.content).toBe(userLine + foreignBlock + foreignLegacyBlock);
+  });
+
+  it("adopts a legacy block that reads this instance's own wake-port file: re-scheduling replaces it with the scoped block", async () => {
+    const { io, scheduler } = make(userLine + ownLegacyBlock + foreignLegacyBlock);
+    await scheduler.schedule("act1", "30 3 * * *", "migrated");
+    expect(io.content).not.toContain("# mc-wake:act1\n");
+    expect(io.content.match(/# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ$/gm)).toHaveLength(1);
+    expect(io.content).toContain(foreignLegacyBlock);
+    expect(await scheduler.list()).toEqual([
+      { actorId: "act1", cronExpr: "30 3 * * *", reason: "migrated" },
+    ]);
+    await scheduler.cancel("act1");
+    expect(io.content).toBe(userLine + foreignLegacyBlock);
   });
 });
 

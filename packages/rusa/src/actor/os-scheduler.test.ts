@@ -80,7 +80,7 @@ describe("DefaultOsScheduler", () => {
 
     const [script, date] = vi.mocked(at.schedule).mock.calls[0];
     expect(date).toEqual(new Date(message.deliverAt));
-    expect(script).toContain("# mc-message-delivery:");
+    expect(script).toContain("# mc-message-delivery-instance:v1:dGVzdC1pbnN0YW5jZQ:");
     expect(script).toContain("/wake-message");
     expect(script).toContain('while [ "$rusa_attempt" -lt 120 ]');
     expect(script).toContain("rusa_callback_port=$(cat /port");
@@ -108,7 +108,11 @@ describe("DefaultOsScheduler", () => {
 
   it("fails visibly when an owned host job has a missing or corrupt payload", () => {
     vi.mocked(at.list).mockReturnValue([
-      { id: "broken", script: "# mc-message-delivery:broken\ncurl /wake-message -d 'id=old'\n" },
+      {
+        id: "broken",
+        script:
+          "# mc-message-delivery-instance:v1:dGVzdC1pbnN0YW5jZQ:YnJva2Vu\ncurl /wake-message -d 'id=old'\n",
+      },
     ]);
     expect(() => scheduler.listMessageDeliveries()).toThrow(
       /Invalid scheduled-message host job broken/
@@ -355,7 +359,7 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     expect(cronData).toContain(
       "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
     );
-    expect(cronData).toContain("# mc-wake:actor-a");
+    expect(cronData).toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
     // Every foreign line — the unrelated backup job, the foreign mc-wake
     // block, and the heartbeat job — is preserved byte-for-byte.
     for (const line of foreignLines) {
@@ -369,10 +373,10 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     expect(cronData).not.toContain(
       "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
     );
-    expect(cronData).toContain("# mc-wake:actor-a");
+    expect(cronData).toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
 
     await scheduler.cancel("actor-a");
-    expect(cronData).not.toContain("# mc-wake:actor-a");
+    expect(cronData).not.toContain("# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0b3ItYQ");
     for (const line of foreignLines) {
       expect(cronData).toContain(line);
     }
@@ -787,5 +791,160 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
     expect(at.remove).toHaveBeenCalledWith("at-staging");
     expect(at.remove).not.toHaveBeenCalledWith("at-prod");
     expect(at.remove).not.toHaveBeenCalledWith("at-legacy");
+  });
+});
+
+describe("DefaultOsScheduler instance-scoped OS jobs (#466)", () => {
+  /** One shared per-user `at` queue, as seen by every co-hosted instance. */
+  function sharedAtQueue(seed: { id: string; script: string }[] = []) {
+    const jobs = [...seed];
+    let next = 100;
+    const at: AtIo = {
+      schedule: (script) => {
+        const id = String(next++);
+        jobs.push({ id, script });
+        return id;
+      },
+      list: () => jobs.map((job) => ({ ...job })),
+      remove: (id) => {
+        const index = jobs.findIndex((job) => job.id === id);
+        if (index >= 0) jobs.splice(index, 1);
+      },
+    };
+    return { at, jobs };
+  }
+
+  function instance(instanceId: string, at: AtIo, cron: { data: string }) {
+    const io: CrontabIo = {
+      read: () => cron.data,
+      write: (data) => {
+        cron.data = data;
+      },
+    };
+    return new DefaultOsScheduler(new CrontabMutator(io), at, {
+      tokenFile: `${instanceId}/wake-token`,
+      portFile: `${instanceId}/wake-port`,
+      instanceId,
+    });
+  }
+
+  const message = (id: string, toId: string) => ({
+    id,
+    toId,
+    fromId: "sender",
+    body: `body of ${id}`,
+    deliverAt: "2026-09-16T12:00:00.000Z",
+  });
+
+  /**
+   * ActorMesh.reconcilePendingDeliveries at boot: every listed message whose
+   * recipient this instance does not know is cancelled. Before scoping, the
+   * listing spanned the whole per-user queue, so this cancelled every
+   * co-hosted instance's messages.
+   */
+  function bootReconcile(scheduler: DefaultOsScheduler, knownActors: string[]) {
+    for (const pending of scheduler.listMessageDeliveries()) {
+      if (!knownActors.includes(pending.toId)) scheduler.cancelMessageDelivery(pending.id);
+    }
+  }
+
+  it("writes every tag family (cron block and at job) with this instance's identity through the one shared constructor", async () => {
+    const { at, jobs } = sharedAtQueue();
+    const cron = { data: "" };
+    const prod = instance("/home/sf/.rusa-prod", at, cron);
+
+    await prod.schedule("act1", "0 3 * * *", "nightly");
+    prod.scheduleObligationActivation("ob-cron", { kind: "cron", cronExpr: "0 4 * * *" });
+    prod.scheduleObligationActivation("ob-at", { kind: "at", date: new Date("2026-09-16") });
+    prod.scheduleMessageDelivery(message("msg-a", "recipient"));
+
+    const tagLines = [cron.data, ...jobs.map((job) => job.script)]
+      .flatMap((text) => text.split("\n"))
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("# mc-"));
+    expect(tagLines).toEqual([
+      "# mc-wake-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:YWN0MQ",
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItY3Jvbg",
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItYXQ",
+      "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:bXNnLWE",
+    ]);
+    for (const line of tagLines) {
+      expect(line).toMatch(
+        /^# mc-[a-z-]+-instance(-end)?:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:[A-Za-z0-9_-]+$/
+      );
+    }
+  });
+
+  describe("two co-hosted instances over one shared at queue", () => {
+    const legacyJob = {
+      id: "legacy",
+      script: `# mc-message-delivery:bGVnYWN5\ncurl /wake-message -d 'payload=${encodeScheduledMessagePayload(message("legacy", "legacy-recipient"))}'\n`,
+    };
+
+    function seeded() {
+      const { at, jobs } = sharedAtQueue([legacyJob]);
+      const prod = instance("/home/sf/.rusa-prod", at, { data: "" });
+      const staging = instance("/home/sf/.rusa-staging", at, { data: "" });
+      prod.scheduleMessageDelivery(message("msg-a", "prod-only-actor"));
+      staging.scheduleMessageDelivery(message("msg-b", "staging-only-actor"));
+      return { jobs, prod, staging };
+    }
+
+    it("each instance lists only its own messages; the legacy unscoped job is never listed", () => {
+      const { prod, staging } = seeded();
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "prod-only-actor")]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it.each([
+      ["prod then staging", ["prod", "staging"] as const],
+      ["staging then prod", ["staging", "prod"] as const],
+    ])("boot reconciliation in order %s leaves the other instance's and legacy jobs untouched", (_, order) => {
+      const { jobs, prod, staging } = seeded();
+      const before = jobs.map((job) => ({ ...job }));
+      const known = { prod: ["prod-only-actor"], staging: ["staging-only-actor"] };
+      const schedulers = { prod, staging };
+
+      for (const name of order) bootReconcile(schedulers[name], known[name]);
+
+      expect(jobs).toEqual(before);
+      expect(prod.listMessageDeliveries()).toEqual([message("msg-a", "prod-only-actor")]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it.each([
+      ["prod then staging", ["prod", "staging"] as const],
+      ["staging then prod", ["staging", "prod"] as const],
+    ])("in order %s an instance cancels only its own truly-inactive recipient's message", (_, order) => {
+      const { jobs, prod, staging } = seeded();
+      const schedulers = { prod, staging };
+
+      // Prod's recipient really is gone; staging's is still live.
+      for (const name of order) {
+        bootReconcile(schedulers[name], name === "prod" ? [] : ["staging-only-actor"]);
+      }
+
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101"]);
+      expect(prod.listMessageDeliveries()).toEqual([]);
+      expect(staging.listMessageDeliveries()).toEqual([message("msg-b", "staging-only-actor")]);
+    });
+
+    it("cancelMessageDelivery and stale cleanup never match a foreign or legacy job with the same message id", () => {
+      const { jobs, prod, staging } = seeded();
+      staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
+      const stagingCopy = jobs.find((job) => job.id === "102");
+      expect(stagingCopy?.script).toContain(
+        "# mc-message-delivery-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:bXNnLWE"
+      );
+
+      prod.cancelMessageDelivery("msg-a");
+      prod.cancelMessageDelivery("legacy");
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101", "102"]);
+
+      // Re-scheduling replaces only this instance's stale copy of the id.
+      staging.scheduleMessageDelivery(message("msg-a", "staging-only-actor"));
+      expect(jobs.map((job) => job.id)).toEqual(["legacy", "101", "103"]);
+    });
   });
 });

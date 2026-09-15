@@ -3,13 +3,26 @@ import { assertCronExprCanFire } from "./cron-expression.js";
 import type { CrontabMutator } from "./crontab.js";
 
 const DEFAULT_CURL = "/usr/bin/curl";
-const WAKE_TAG_PREFIX = "# mc-wake:";
-// This distinct prefix is intentional: every old `mc-obligation-activation:`
-// tag, including one whose id contains a colon, remains legacy/foreign. A
-// version marker under the old prefix would still be ambiguous with a legal
-// legacy obligation id such as `v1:abc`.
-const SCOPED_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation-instance:v1:";
-const SCOPED_ACTIVATION_END_TAG_PREFIX = "# mc-obligation-activation-instance-end:v1:";
+
+/**
+ * Every tag family this scheduler writes into the crontab or an `at` job.
+ * The instance component is part of the tag's shape, never a per-family
+ * option: {@link instanceTag} is the only constructor, so a family cannot be
+ * written without the identity of the instance that owns it. Unscoped message
+ * tags once let every co-hosted instance sweep every other instance's pending
+ * messages at boot; a new family cannot repeat that by omission.
+ */
+type InstanceTagFamily = "wake" | "obligation-activation" | "message-delivery";
+/** A multi-line cron block is bounded by a start tag and its `-end` twin. */
+type InstanceTagBoundary = "start" | "end";
+const INSTANCE_TAG_VERSION = "v1";
+
+// Pre-scoping tags are legacy and foreign: `# mc-wake:<actorId>`,
+// `# mc-message-delivery:<base64url id>` and the two below. The `-instance`
+// suffix on the scoped prefixes is intentional: a version marker under an old
+// prefix would still be ambiguous with a legal legacy id such as `v1:abc`, so
+// no legacy line can ever parse as a scoped one.
+const LEGACY_WAKE_TAG_PREFIX = "# mc-wake:";
 const LEGACY_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation:";
 
 /**
@@ -93,38 +106,63 @@ export function isValidActorId(actorId: string): boolean {
 }
 
 /** Encode one tag component so arbitrary legal entity IDs cannot delimit a tag. */
-function encodeActivationTagComponent(value: string): string {
+function encodeTagComponent(value: string): string {
   return Buffer.from(value, "utf8").toString("base64url");
 }
 
 /** Decode only the canonical base64url values emitted by this scheduler. */
-function decodeActivationTagComponent(value: string): string | null {
+function decodeTagComponent(value: string): string | null {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   const decoded = Buffer.from(value, "base64url").toString("utf8");
-  return encodeActivationTagComponent(decoded) === value ? decoded : null;
+  return encodeTagComponent(decoded) === value ? decoded : null;
 }
 
-function scopedActivationTag(instanceId: string, id: string): string {
-  return `${SCOPED_ACTIVATION_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+function instanceTagPrefix(
+  family: InstanceTagFamily,
+  boundary: InstanceTagBoundary = "start"
+): string {
+  return `# mc-${family}-instance${boundary === "end" ? "-end" : ""}:${INSTANCE_TAG_VERSION}:`;
 }
 
-function scopedActivationEndTag(instanceId: string, id: string): string {
-  return `${SCOPED_ACTIVATION_END_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+/** One parsed instance-scoped tag line, from any instance. */
+interface InstanceTagRecord {
+  instanceId: string;
+  id: string;
+}
+
+/**
+ * The single constructor for every OS job tag:
+ * `# mc-<family>-instance[-end]:v1:<base64url instanceId>:<base64url id>`.
+ */
+function instanceTag(
+  family: InstanceTagFamily,
+  instanceId: string,
+  id: string,
+  boundary: InstanceTagBoundary = "start"
+): string {
+  return `${instanceTagPrefix(family, boundary)}${encodeTagComponent(instanceId)}:${encodeTagComponent(id)}`;
+}
+
+/** Parse a line in `family`'s scoped format; legacy and other families yield null. */
+function parseInstanceTag(family: InstanceTagFamily, line: string): InstanceTagRecord | null {
+  const prefix = instanceTagPrefix(family);
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(prefix)) return null;
+  const components = trimmed.slice(prefix.length).split(":");
+  if (components.length !== 2) return null;
+  const instanceId = decodeTagComponent(components[0]);
+  const id = decodeTagComponent(components[1]);
+  return instanceId && id ? { instanceId, id } : null;
 }
 
 function parseObligationActivationTag(line: string): ObligationActivationRecord | null {
-  const trimmed = line.trim();
-  if (trimmed.startsWith(SCOPED_ACTIVATION_TAG_PREFIX)) {
-    const components = trimmed.slice(SCOPED_ACTIVATION_TAG_PREFIX.length).split(":");
-    if (components.length !== 2) return null;
-    const instanceId = decodeActivationTagComponent(components[0]);
-    const id = decodeActivationTagComponent(components[1]);
-    return instanceId && id ? { instanceId, id } : null;
-  }
+  const scoped = parseInstanceTag("obligation-activation", line);
+  if (scoped) return scoped;
 
   // Tags written before scoped ownership are never adopted: a legacy id may
   // contain any delimiter, so it cannot be safely distinguished from a raw
   // instance/id format. Treat it as foreign and leave it untouched.
+  const trimmed = line.trim();
   if (trimmed.startsWith(LEGACY_ACTIVATION_TAG_PREFIX)) {
     const id = trimmed.slice(LEGACY_ACTIVATION_TAG_PREFIX.length).trim();
     return id ? { id } : null;
@@ -135,7 +173,7 @@ function parseObligationActivationTag(line: string): ObligationActivationRecord 
 function activationRecordKey(record: ObligationActivationRecord): string {
   // Length/encoding-safe key: entity IDs permit every delimiter, so raw
   // concatenation could collapse two distinct records during deduplication.
-  return `${record.instanceId === undefined ? "legacy" : "scoped"}:${encodeActivationTagComponent(record.instanceId ?? "")}:${encodeActivationTagComponent(record.id)}`;
+  return `${record.instanceId === undefined ? "legacy" : "scoped"}:${encodeTagComponent(record.instanceId ?? "")}:${encodeTagComponent(record.id)}`;
 }
 
 /** Single-quote a value for a cron command, then escape cron's `%` newline. */
@@ -238,6 +276,47 @@ export class DefaultOsScheduler implements OsScheduler {
     this.instanceId = opts.instanceId;
   }
 
+  /** The only way this scheduler produces a tag line: `family` + this instance + `id`. */
+  private ownedTag(
+    family: InstanceTagFamily,
+    id: string,
+    boundary: InstanceTagBoundary = "start"
+  ): string {
+    return instanceTag(family, this.instanceId, id, boundary);
+  }
+
+  /** The id of an owned tag line, or null for foreign instances, legacy tags and other lines. */
+  private ownedId(family: InstanceTagFamily, line: string): string | null {
+    const record = parseInstanceTag(family, line);
+    return record?.instanceId === this.instanceId ? record.id : null;
+  }
+
+  /**
+   * A pre-scoping `# mc-wake:<actorId>` block belongs to this instance only
+   * when its job line reads this instance's own wake-port file — a path no
+   * co-hosted instance shares — so it can be listed, replaced and cancelled
+   * here without guessing. Every other legacy wake block is foreign. Legacy
+   * wake blocks recur forever and have no boot sweep, so without adoption an
+   * upgrade would strand each live wake as a duplicate of its replacement.
+   */
+  private ownsLegacyWakeBlock(tagLine: string, jobLine: string | undefined): boolean {
+    return (
+      tagLine.trim().startsWith(LEGACY_WAKE_TAG_PREFIX) &&
+      (jobLine ?? "").includes(`$(cat ${this.opts.portFile})`)
+    );
+  }
+
+  /** The actor id of this instance's wake block starting at `lines[index]`, if any. */
+  private ownedWakeActorId(lines: string[], index: number): string | null {
+    const tagLine = lines[index];
+    const scoped = this.ownedId("wake", tagLine);
+    if (scoped !== null) return scoped;
+    if (this.ownsLegacyWakeBlock(tagLine, lines[index + 1])) {
+      return tagLine.trim().slice(LEGACY_WAKE_TAG_PREFIX.length);
+    }
+    return null;
+  }
+
   /** Build the complete cron line for an actor wake. */
   buildWakeJobLine(
     actorId: string,
@@ -259,10 +338,9 @@ export class DefaultOsScheduler implements OsScheduler {
 
   /** Remove the actor's owned two-line wake block while preserving all other entries. */
   private stripWakeBlock(lines: string[], actorId: string): string[] {
-    const tag = WAKE_TAG_PREFIX + actorId;
     const kept: string[] = [];
     for (let index = 0; index < lines.length; index++) {
-      if (lines[index].trim() === tag) {
+      if (this.ownedWakeActorId(lines, index) === actorId) {
         const next = lines[index + 1];
         if (next !== undefined && next.trim() !== "" && !next.trimStart().startsWith("#")) {
           index++;
@@ -285,7 +363,7 @@ export class DefaultOsScheduler implements OsScheduler {
     this.mutator.mutate((lines) => {
       const kept = this.stripWakeBlock(lines, actorId);
       kept.push(
-        WAKE_TAG_PREFIX + actorId,
+        this.ownedTag("wake", actorId),
         this.buildWakeJobLine(actorId, cronExpr, reason, priority)
       );
       return { lines: kept, result: undefined };
@@ -306,12 +384,12 @@ export class DefaultOsScheduler implements OsScheduler {
     const lines = current.replace(/\n$/, "").split("\n");
     const entries: WakeEntry[] = [];
     for (let index = 0; index < lines.length; index++) {
-      const trimmed = lines[index].trim();
-      if (!trimmed.startsWith(WAKE_TAG_PREFIX)) continue;
+      const actorId = this.ownedWakeActorId(lines, index);
+      if (actorId === null) continue;
       const job = lines[index + 1] ?? "";
       const priority = parseWakePriority(job);
       entries.push({
-        actorId: trimmed.slice(WAKE_TAG_PREFIX.length),
+        actorId,
         cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
         reason: parseWakeReason(job),
         ...(priority ? { priority } : {}),
@@ -433,8 +511,8 @@ export class DefaultOsScheduler implements OsScheduler {
   /** The tag/end-tag pair bounding one obligation's managed cron block, scoped to this instance. */
   private activationTags(id: string): { tag: string; endTag: string } {
     return {
-      tag: scopedActivationTag(this.instanceId, id),
-      endTag: scopedActivationEndTag(this.instanceId, id),
+      tag: this.ownedTag("obligation-activation", id),
+      endTag: this.ownedTag("obligation-activation", id, "end"),
     };
   }
 
@@ -541,14 +619,19 @@ export class DefaultOsScheduler implements OsScheduler {
     this.removeAtIds(this.staleAtIds(tag));
   }
 
+  /**
+   * Only this instance's jobs: a co-hosted instance's messages and legacy
+   * unscoped `# mc-message-delivery:` jobs are foreign, never listed here, so
+   * boot reconciliation cannot cancel a recipient it merely does not know.
+   */
   listMessageDeliveries(): ScheduledMessage[] {
     const messages = new Map<string, ScheduledMessage>();
     for (const job of this.atIo.list()) {
       const tagLines = job.script
         .split("\n")
         .map((line) => line.trim())
-        .filter((line) => line.startsWith("# mc-message-delivery:"));
-      if (tagLines.length === 0) continue;
+        .filter((line) => line.startsWith(instanceTagPrefix("message-delivery")));
+      if (!tagLines.some((line) => this.ownedId("message-delivery", line) !== null)) continue;
       let message: ScheduledMessage;
       try {
         message = decodeScheduledMessage(job.script);
@@ -567,6 +650,6 @@ export class DefaultOsScheduler implements OsScheduler {
   }
 
   private messageTag(id: string): string {
-    return `# mc-message-delivery:${Buffer.from(id, "utf8").toString("base64url")}`;
+    return this.ownedTag("message-delivery", id);
   }
 }
