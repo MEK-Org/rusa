@@ -234,6 +234,64 @@ void main() {
   );
 
   testWidgets(
+    'keeps detail actions usable with large text on a narrow pane (#476)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(420, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final ob = makeObligation(
+          'large-text-header-actions',
+          ownerId: 'system:mesh',
+          title: 'Actions beside the obligation title',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId(ob.id);
+
+        await tester.pumpWidget(
+          MediaQuery(
+            data: MediaQueryData(textScaler: TextScaler.linear(2)),
+            child: MaterialApp(
+              home: Scaffold(
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        final title = find.byKey(const ValueKey('obligation-detail-title'));
+        final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final titleRect = tester.getRect(title);
+        final actionsRect = tester.getRect(actions);
+
+        expect(titleRect.height, greaterThan(70));
+        expect(actionsRect.top, greaterThan(titleRect.bottom));
+        expect(actionsRect.left, closeTo(titleRect.left, 0.1));
+        expect(actionsRect.right, lessThanOrEqualTo(420));
+        for (final tooltip in [
+          'Mark Done',
+          'Cancel Obligation',
+          'Reassign obligation',
+          'Add child obligation',
+        ]) {
+          final control = find.byTooltip(tooltip);
+          expect(control, findsOneWidget);
+          expect(tester.getRect(control).right, lessThanOrEqualTo(420));
+        }
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     'excludes quiet terminal roots from the default load, fetches them on '
     'Show Done (#241)',
     (tester) async {
