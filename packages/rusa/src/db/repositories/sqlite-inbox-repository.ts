@@ -4,13 +4,14 @@ import {
   type InboxActorWork,
   type InboxAppendInput,
   type InboxEntry,
+  type InboxItemsAppendedListener,
   type InboxListOptions,
   type InboxPage,
   type InboxPayload,
-  type InboxStore,
+  type InboxRepository,
   type MarkHandledResult,
   validateInboxPayload,
-} from "../../actor/inbox-store.js";
+} from "../../repositories/inbox-repository.js";
 
 interface InboxRow {
   id: string;
@@ -57,12 +58,27 @@ function toEntry(row: InboxRow): InboxEntry {
   };
 }
 
+export interface SqliteInboxRepositoryOptions {
+  /**
+   * Receives an error thrown by an `onItemsAppended` listener. The notification
+   * is advisory, so a listener failure is reported here rather than surfaced to
+   * the appending caller, whose write has already committed.
+   */
+  onListenerError?: (error: unknown) => void;
+}
+
 /** SQLite implementation of the actor inbox persistence seam. */
-export class InboxRepository implements InboxStore {
+export class SqliteInboxRepository implements InboxRepository {
+  private readonly listeners = new Set<InboxItemsAppendedListener>();
+  private readonly onListenerError: (error: unknown) => void;
+
   constructor(
     private readonly db: Database.Database,
-    private readonly now: () => Date = () => new Date()
-  ) {}
+    private readonly now: () => Date = () => new Date(),
+    options: SqliteInboxRepositoryOptions = {}
+  ) {
+    this.onListenerError = options.onListenerError ?? (() => {});
+  }
 
   append(inputs: InboxAppendInput[]): InboxEntry[] {
     if (inputs.length === 0) return [];
@@ -100,9 +116,21 @@ export class InboxRepository implements InboxStore {
       }
       return inserted;
     })();
-    return rows
+    const inserted = rows
       .filter((row) => insertedIds.has(row.id))
       .map((row) => ({ ...row, seenAt: null, handledAt: null, handledNote: null }));
+    // Notify only once the rows are durable. Inside an enclosing transaction
+    // the write above is merely a savepoint whose fate the outer caller decides,
+    // so stay silent and let actorsWithUnhandled() reconciliation find the rows.
+    if (inserted.length > 0 && !this.db.inTransaction) this.notifyItemsAppended(inserted);
+    return inserted;
+  }
+
+  onItemsAppended(listener: InboxItemsAppendedListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   list(actorId: string, options: InboxListOptions = {}): InboxPage {
@@ -252,6 +280,21 @@ export class InboxRepository implements InboxStore {
         };
       });
     })();
+  }
+
+  /**
+   * Advisory delivery after commit. A listener that throws must neither undo
+   * the durable write nor starve the listeners after it, so each failure is
+   * contained and reported through `onListenerError`.
+   */
+  private notifyItemsAppended(items: readonly InboxEntry[]): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(items);
+      } catch (error) {
+        this.onListenerError(error);
+      }
+    }
   }
 
   private actorsWithPending(where: string): InboxActorWork[] {

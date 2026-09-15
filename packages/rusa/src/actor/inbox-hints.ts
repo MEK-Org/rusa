@@ -1,5 +1,5 @@
 import { isHumanOperator } from "../mcp/stamp.js";
-import type { InboxEntry } from "./inbox-store.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 
 /**
  * An inbox entry enriched with an optional run-scoped handling hint.

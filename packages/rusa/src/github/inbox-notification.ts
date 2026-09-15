@@ -1,6 +1,6 @@
 import type { EventResource } from "../actor/event-subscriptions.js";
-import type { InboxPayload } from "../actor/inbox-store.js";
 import { githubBranchReference } from "../references/reference.js";
+import type { InboxPayload } from "../repositories/inbox-repository.js";
 
 export interface GitHubInboxNotification {
   resource: EventResource;

@@ -59,10 +59,30 @@ export interface InboxActorWork {
   priority: "normal" | "responsive";
 }
 
-/** Persistence seam. Only markSeen is allowed to write seenAt. */
-export interface InboxStore {
+/** Listener for rows durably committed by {@link InboxRepository.append}. */
+export type InboxItemsAppendedListener = (items: readonly InboxEntry[]) => void;
+
+/**
+ * Persistence boundary for actor inbox items, alongside `ActorRepository`.
+ * Only markSeen is allowed to write seenAt.
+ *
+ * Invariants the runtime relies on:
+ * 1. Durable storage is the single source of truth about unhandled work.
+ * 2. `onItemsAppended` is an ADVISORY after-commit notification, never the
+ *    source of truth. Dropping one costs latency, not correctness.
+ * 3. Missed notifications (a crash, a restart, a listener registered late)
+ *    are reconciled against durable state via `actorsWithUnhandled()`.
+ */
+export interface InboxRepository {
   /** Append new entries, returning only rows inserted by this call. Duplicate ids are no-ops. */
   append(entries: InboxAppendInput[]): InboxEntry[];
+  /**
+   * Subscribe to rows that have been durably committed by `append`. The
+   * listener receives only rows actually inserted, so redelivery of an already
+   * known id notifies nobody, and a failed or rolled-back append notifies
+   * nobody. Returns an unsubscribe function.
+   */
+  onItemsAppended(listener: InboxItemsAppendedListener): () => void;
   list(actorId: string, options?: InboxListOptions): InboxPage;
   /**
    * Exact queue-card candidate across every unhandled entry, ordered responsive
