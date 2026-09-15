@@ -74,12 +74,35 @@ export interface QuotaCoordinatorHealthResponse {
   ok: boolean;
 }
 
+/**
+ * Per-provider collection health, as readiness reports it.
+ *
+ * `status` is deliberately not derived from the database alone. A probe that
+ * fails before it can persist a scrape row — an unwritable workers directory, a
+ * revoked provider session, a missing CLI — leaves the newest stored row intact
+ * and looking healthy, which is the exact silent failure §9.5's second drill
+ * exists to catch. When the coordinator also collects, the live loop supplies
+ * `lastAttemptAt`, `attempts` and `failures`, and a failing probe shows here as
+ * `error` even while `scrapedAt` still points at the last good reading.
+ */
+export interface QuotaReadyScrapeStatus {
+  /** Newest persisted scrape, or `null` when no probe has ever stored one. */
+  scrapedAt: string | null;
+  /** `pending` means a configured provider that has not yet been probed. */
+  status: "ok" | "error" | "pending";
+  error?: string;
+  /** When a probe was last started, whether or not it stored anything. */
+  lastAttemptAt?: string | null;
+  attempts?: number;
+  failures?: number;
+}
+
 export interface QuotaCoordinatorReadyResponse {
   service: QuotaCoordinatorServiceInfo;
   ready: boolean;
   cold: boolean;
   schemaVersion: number;
-  scrapes?: Record<string, { scrapedAt: string; status: "ok" | "error"; error?: string }>;
+  scrapes?: Record<string, QuotaReadyScrapeStatus>;
 }
 
 export interface PublishedThrottleOptions {

@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  existsSync,
+  constants as fsConstants,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { preflightAt } from "../actor/at-queue.js";
@@ -13,7 +19,9 @@ import {
   getRemoteUrl,
   initializeWorkspace,
 } from "../gitops/worktree.js";
+import { resolveQuotaDatabasePath } from "../quota/shared-store.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
+import { defaultQuotaBackupDir, defaultQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 import {
   type DeploymentMode,
   type ExecutableSource,
@@ -108,6 +116,14 @@ export function buildServiceUnit(opts: {
   startLimit?: { intervalSec: number; burst: number };
   /** OnFailure unit (the alert oneshot). */
   onFailureUnit?: string;
+  /**
+   * The quota coordinator unit this instance reads from, when one is installed.
+   * Declared `After=`/`Wants=` and deliberately never `Requires=`: under v1 an
+   * instance without the coordinator is degraded — it paces on its last applied
+   * interval — not stopped, and `Requires=` would convert a coordinator failure
+   * into an orchestrator outage.
+   */
+  coordinatorUnit?: string;
   /** Boot gate command (verify-build); only set for self-deploy. */
   execStartPre?: string;
   /**
@@ -130,6 +146,10 @@ export function buildServiceUnit(opts: {
     "After=network-online.target",
     "Wants=network-online.target",
   ];
+  if (opts.coordinatorUnit) {
+    unit.push(`After=${opts.coordinatorUnit}`);
+    unit.push(`Wants=${opts.coordinatorUnit}`);
+  }
   if (opts.startLimit) {
     unit.push(`StartLimitIntervalSec=${opts.startLimit.intervalSec}`);
     unit.push(`StartLimitBurst=${opts.startLimit.burst}`);
@@ -186,6 +206,97 @@ export function buildAlertUnit(opts: {
   if (opts.gchatConfigDir) unit.push(`Environment=GCHAT_CONFIG_DIR=${opts.gchatConfigDir}`);
   unit.push(
     `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.notifyScript)} ${quoteExecArg(opts.message)}`,
+    ""
+  );
+  return unit.join("\n");
+}
+
+/** The coordinator's own unit and its `OnFailure=` companion, per instance. */
+export function quotaCoordinatorUnitNames(serviceBasename: string): {
+  serviceUnit: string;
+  alertUnit: string;
+} {
+  return {
+    serviceUnit: `${serviceBasename}-quota-coordinator.service`,
+    alertUnit: `${serviceBasename}-quota-coordinator-alert.service`,
+  };
+}
+
+/**
+ * The quota coordinator unit.
+ *
+ * This is deliberately not a stripped-down copy of the orchestrator unit. The
+ * coordinator *scrapes*, so it needs the environment a probe actually runs in,
+ * and every omission here produces the same failure: a service that starts,
+ * answers `healthz`, and never successfully scrapes — the silent failure the
+ * design's second rollback drill exists to catch. Concretely it needs
+ *
+ * - the provider CLIs on `PATH` with their authentication state readable,
+ *   which is why `PATH` is the same resolved user `PATH` the instance units get
+ *   rather than systemd's default `/usr/bin:/bin`;
+ * - `bwrap`, because the probe sandboxes itself, and `tmux`, because one
+ *   provider's usage panel is only reachable through a PTY — both are on that
+ *   same `PATH` and are preflighted at install time;
+ * - `XDG_RUNTIME_DIR`, for both the tmux socket and the service's own listener.
+ *   The user manager normally exports it, but it is set explicitly because a
+ *   coordinator that silently falls back to `/tmp` for its socket is one whose
+ *   clients then cannot find it;
+ * - a writable workers directory to create `quota-probe-<provider>` under,
+ *   which is `$RUSA_HOME/workers` and is created by the installer.
+ *
+ * `RUSA_LOG_LEVEL=debug` is not a debugging leftover: the metric series ride the
+ * structured logger at debug level, so at the default level the journal would
+ * carry the service's lifecycle records and none of its metrics.
+ */
+export function buildQuotaCoordinatorUnit(opts: {
+  description: string;
+  mcHome: string;
+  cliPath: string;
+  nodePath: string;
+  userPath: string;
+  xdgRuntimeDir: string;
+  onFailureUnit?: string;
+  startLimit?: { intervalSec: number; burst: number };
+}): string {
+  const execArgs = ["quota-coordinator", "--home", opts.mcHome].map(quoteExecArg).join(" ");
+
+  const unit: string[] = [
+    "[Unit]",
+    `Description=${opts.description}`,
+    "After=network-online.target",
+    "Wants=network-online.target",
+  ];
+  if (opts.startLimit) {
+    unit.push(`StartLimitIntervalSec=${opts.startLimit.intervalSec}`);
+    unit.push(`StartLimitBurst=${opts.startLimit.burst}`);
+  }
+  if (opts.onFailureUnit) {
+    unit.push(`OnFailure=${opts.onFailureUnit}`);
+  }
+  unit.push(
+    "",
+    "[Service]",
+    "Type=simple",
+    `ExecStart=${quoteExecArg(opts.nodePath)} ${quoteExecArg(opts.cliPath)} ${execArgs}`,
+    `WorkingDirectory=${opts.mcHome}`,
+    `Environment=RUSA_HOME=${opts.mcHome}`,
+    `Environment=PATH=${opts.userPath}`,
+    `Environment=XDG_RUNTIME_DIR=${opts.xdgRuntimeDir}`,
+    // Metric records are emitted at debug level; see the metrics module.
+    "Environment=RUSA_LOG_LEVEL=debug",
+    "Environment=RUSA_LOG_FORMAT=json",
+    `EnvironmentFile=-${join(opts.mcHome, ".env")}`,
+    // on-failure, not always: unlike the orchestrator, a clean exit here is a
+    // requested stop (SIGTERM from `systemctl stop`), never a self-update.
+    "Restart=on-failure",
+    "RestartSec=10",
+    // The journal is self-rotating and is what `journalctl --user -u <unit>`
+    // reads; the metric stream would otherwise grow an unrotated file forever.
+    "StandardOutput=journal",
+    "StandardError=journal",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
     ""
   );
   return unit.join("\n");
@@ -405,6 +516,14 @@ function installSingleRusaService(opts: {
       restart: "always",
       startLimit: { intervalSec: 300, burst: 5 },
       onFailureUnit: alertUnitName,
+      // Only once the coordinator unit is actually on disk: an ordering
+      // dependency on a unit systemd does not know about is a warning on every
+      // start of an instance that has no coordinator to wait for.
+      coordinatorUnit: existsSync(
+        join(opts.systemdUserDir, quotaCoordinatorUnitNames(instance.serviceBasename).serviceUnit)
+      )
+        ? quotaCoordinatorUnitNames(instance.serviceBasename).serviceUnit
+        : undefined,
       execStartPre,
       logToJournal: opts.logToJournal,
     })
@@ -532,6 +651,155 @@ function installSingleSelfDeploy(opts: {
     logToJournal: true,
     // No deployOnMergeBranch: production deploys manually (or via the self-update tool).
   });
+}
+
+/**
+ * Preflight the probe environment the coordinator unit will run in.
+ *
+ * These are checked at install time rather than left to fail at scrape time
+ * because every one of them fails *quietly*: the service starts, `healthz`
+ * passes, and only the per-provider scrape outcome in `readyz` ever says
+ * otherwise. Missing tools are reported rather than fatal — a host may install
+ * them after the unit — but an unwritable workers directory is fatal, because
+ * no probe can run at all without it.
+ */
+function preflightProbeEnvironment(mcHome: string): { workersDir: string } {
+  const workersDir = join(mcHome, "workers");
+  mkdirSync(workersDir, { recursive: true });
+  try {
+    accessSync(workersDir, fsConstants.W_OK);
+  } catch {
+    throw new Error(
+      `Workers directory ${workersDir} is not writable. The quota coordinator creates ` +
+        "quota-probe-<provider> directories under it for every scrape."
+    );
+  }
+
+  for (const [command, why] of [
+    ["bwrap", "the quota probe sandboxes itself with bubblewrap"],
+    ["tmux", "one provider's usage panel is only reachable through a PTY"],
+  ] as const) {
+    if (!hasCommand(command)) {
+      console.warn(`⚠️  ${command} not found on PATH — ${why}; those scrapes will fail`);
+    }
+  }
+  return { workersDir };
+}
+
+/**
+ * Install the quota coordinator unit and its failure-alert companion.
+ *
+ * Separate from `install-service` rather than folded into it: the coordinator is
+ * one service per *pool*, and the pool is the set of instances sharing a quota
+ * database — installing it implicitly alongside every instance would start a
+ * second collector against the same providers, which is precisely the
+ * duplicate-probe behaviour the coordinator exists to remove.
+ */
+export async function runInstallQuotaCoordinator(opts?: {
+  environment?: ServiceEnvironment;
+  deploymentMode?: DeploymentMode;
+  repoPath?: string;
+  /** Start/restart the unit after installing. Default true. */
+  restart?: boolean;
+}): Promise<void> {
+  const environment = opts?.environment ?? "production";
+  const deploymentMode = opts?.deploymentMode ?? "package";
+
+  if (!hasCommand("systemctl")) {
+    throw new Error(
+      "systemctl is not available on this host. install-quota-coordinator supports systemd only."
+    );
+  }
+  ensureDbusUserSessionPackage();
+  ensureUserSystemdBusAvailable();
+
+  const homeOverride =
+    environment === "production" ? resolveHome() : (process.env.RUSA_HOME ?? undefined);
+  const instance = resolveServiceInstance(environment, homeOverride);
+  const configPath = join(instance.mcHome, "config.yaml");
+  if (!existsSync(configPath)) {
+    throw new Error(`Config file not found at ${configPath}. Run 'rusa init' first.`);
+  }
+  const config = loadConfig(instance.mcHome);
+
+  const configuredDatabasePath =
+    config.quota?.coordinator?.databasePath?.trim() || config.quota?.databasePath?.trim();
+  if (!configuredDatabasePath) {
+    throw new Error(
+      "The quota coordinator needs a database: set quota.coordinator.databasePath " +
+        "(or quota.databasePath) in config.yaml first."
+    );
+  }
+
+  const databasePath = resolveQuotaDatabasePath(configuredDatabasePath, instance.mcHome);
+  const { workersDir } = preflightProbeEnvironment(instance.mcHome);
+
+  const executableSource = resolveExecutableSource(deploymentMode, opts?.repoPath);
+  const cliPath = resolvePathForUnit(executableSource.cliPath);
+  const nodePath = resolvePathForUnit(executableSource.nodePath);
+  const userPath = resolvePathEnvForUnit();
+  const xdgRuntimeDir = process.env.XDG_RUNTIME_DIR?.trim() || `/run/user/${userInfo().uid}`;
+
+  const systemdUserDir = join(homedir(), ".config", "systemd", "user");
+  mkdirSync(systemdUserDir, { recursive: true });
+  const names = quotaCoordinatorUnitNames(instance.serviceBasename);
+
+  installUnit(
+    systemdUserDir,
+    names.alertUnit,
+    buildAlertUnit({
+      description: `Rusa quota coordinator failure alert (${instance.serviceBasename})`,
+      nodePath,
+      notifyScript: join(
+        dirname(dirname(executableSource.cliPath)),
+        "scripts",
+        "notify-failure.mjs"
+      ),
+      mcHome: instance.mcHome,
+      errorChat: config.chat?.errorChat,
+      gchatConfigDir: config.chat?.gchatConfigDir,
+      message: `${names.serviceUnit} entered a failed state`,
+    })
+  );
+
+  installUnit(
+    systemdUserDir,
+    names.serviceUnit,
+    buildQuotaCoordinatorUnit({
+      description:
+        environment === "production"
+          ? "Rusa Quota Coordinator"
+          : "Rusa Quota Coordinator (Staging)",
+      mcHome: instance.mcHome,
+      cliPath,
+      nodePath,
+      userPath,
+      xdgRuntimeDir,
+      onFailureUnit: names.alertUnit,
+      startLimit: { intervalSec: 300, burst: 5 },
+    })
+  );
+
+  runOrThrow("systemctl", ["--user", "daemon-reload"]);
+  if (opts?.restart === false) {
+    runOrThrow("systemctl", ["--user", "enable", names.serviceUnit]);
+    console.log(`✓ Installed ${names.serviceUnit} (--no-restart)`);
+  } else {
+    enableAndRestartUnit(names.serviceUnit);
+  }
+
+  const socketPath =
+    config.quota?.coordinator?.socketPath?.trim() || defaultQuotaCoordinatorSocketPath();
+  console.log(`\n${names.serviceUnit} installed.`);
+  console.log(`- Socket: ${socketPath}`);
+  console.log(`- Database: ${databasePath}`);
+  console.log(
+    `- Backups: ${config.quota?.coordinator?.backupDir?.trim() ?? defaultQuotaBackupDir(databasePath)}`
+  );
+  console.log(`- Workers dir: ${workersDir}`);
+  console.log(`- Status: systemctl --user status ${names.serviceUnit}`);
+  console.log(`- Logs: journalctl --user -u ${names.serviceUnit} -f`);
+  console.log(`- Readiness: curl --unix-socket ${socketPath} http://localhost/v1/readyz`);
 }
 
 /**

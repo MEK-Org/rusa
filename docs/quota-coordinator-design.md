@@ -110,6 +110,14 @@ would have to respect, and nothing more.
   defensible values, and the hard-stale widening takes the wider of the stored
   and configured intervals so that a lowered `maxIntervalSeconds` cannot make a
   stale provider publish faster (§5.7, criterion 2).
+- **Revision 9 attaches the measurement §9.5 and Q7 were written to wait for.**
+  No design decision changes. Operational packaging (§12 item 7) shipped as
+  issue #360, so both rollback drills are now runnable code with recorded
+  transcripts, the rest of §9's operational surface has a runbook
+  ([`quota-coordinator-operations.md`](./quota-coordinator-operations.md)), and
+  Q7 — which deliberately refused to invent a duration — carries the
+  write-quiesce window measured by the drill it named as the place the number
+  would come from.
 
 ## Contents
 
@@ -1605,6 +1613,13 @@ scrape failure, that `quota_service_scrapes_total{outcome="failure"}` alerts, an
 that clients go on applying a frozen interval without complaint. A drill that
 only rehearses the service being *down* will not find this.
 
+Both drills are implemented and runnable against a scratch deployment:
+`packages/rusa/scripts/quota-rollback-drill.mjs`, via
+`pnpm --filter rusa run drill:quota-rollback`. The procedure each one rehearses,
+its recorded transcript, and the operational surface of the rest of §9 are in
+[`quota-coordinator-operations.md`](./quota-coordinator-operations.md) (issue
+#360, §12 item 7).
+
 ---
 
 ## 10. Test criteria
@@ -2043,3 +2058,27 @@ cutting.
   single scheduled quiesce the right instrument at all? — and then put again
   after the drill with a measured window attached. Asking for a tolerance
   against an unknown would get an answer that means nothing.
+
+  **Measured (2026-09-15, issue #360's drill, one scratch deployment).** Against
+  a 81,502,208-byte database holding 8,640 scrapes and 8,640 observations — the
+  30-day retention bound at the five-minute collection cadence:
+
+  | Step | Samples | Median | Slowest |
+  | --- | --- | --- | --- |
+  | backup (`VACUUM INTO`, read-only, service up) | 167 ms, 162 ms, 172 ms | 167 ms | 172 ms |
+  | start → `/v1/readyz` 200 | 1,537 ms, 1,285 ms, 1,677 ms | 1,537 ms | 1,677 ms |
+  | **window = backup + start-to-readyz** | | **1,704 ms** | **1,849 ms** |
+
+  Three samples of each, because a single `VACUUM INTO` measures page-cache
+  warmth as much as database size: the same backup took 1,131 ms in an earlier
+  run of the same drill, on a cold cache. Restore of the same database took
+  465 ms plus a 1,677 ms start.
+
+  So the question can now be put with a number: **the scheduled quiesce is
+  seconds, not minutes** — under two seconds at the worst sample here, and a few
+  seconds if the backup runs cold, on a database at its retention bound, with
+  every other stage-3 step fixed cost. The
+  transcript this comes from is in
+  [`quota-coordinator-operations.md`](./quota-coordinator-operations.md) §4; it
+  is one host's measurement, so re-run the drill on the target host before
+  stage 3 and plan with its numbers.
