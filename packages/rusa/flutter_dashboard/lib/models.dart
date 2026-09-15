@@ -397,7 +397,7 @@ class SupportedVoiceDto {
 
   factory SupportedVoiceDto.fromJson(dynamic json) {
     // Older servers supplied only the prebuilt Gemini voice names.
-    if (json is String)
+    if (json is String) {
       return SupportedVoiceDto(
         label: json,
         providerLabel: 'Gemini',
@@ -406,6 +406,7 @@ class SupportedVoiceDto {
           config: {'voiceName': json},
         ),
       );
+    }
     return SupportedVoiceDto(
       label: json['label'] as String,
       providerLabel: json['providerLabel'] as String,
