@@ -49,6 +49,18 @@ describe("parseLegacySeenKey", () => {
     expect(parseLegacySeenKey("push:master:2026-07-03T00:10:00Z")).toBeUndefined();
     expect(parseLegacySeenKey("")).toBeUndefined();
   });
+
+  it("rejects a second spelled any way but GitHub's, including the epoch", () => {
+    // One instant, one spelling: `:00Z` sorts *after* `:00.000Z`, so a seen
+    // key admitted in either form could be pruned by a retention sweep whose
+    // cutoff `since` still returns. GitHub's `updated_at` never carries a
+    // fraction, and the epoch is a cursor's initial value, never an event's.
+    for (const fraction of [".0Z", ".00Z", ".000Z", ".5Z", ".500Z"]) {
+      const key = `issues:1:2026-07-03T00:10:00${fraction}`;
+      expect(parseLegacySeenKey(key)).toBeUndefined();
+    }
+    expect(parseLegacySeenKey(`issues:1:${GITHUB_POLL_EPOCH}`)).toBeUndefined();
+  });
 });
 
 describe("legacy GitHub poll state import", () => {
@@ -199,16 +211,50 @@ describe("legacy GitHub poll state import", () => {
   });
 
   it("refuses a cursor that is not in the store's timestamp text form", () => {
-    // The store orders timestamps as text. A cursor that parses as a date but
-    // is spelled differently (here with a local offset) would sort by
-    // accident against GitHub's UTC text and could be sent as `since` forever.
-    for (const bad of ["not-a-date", "2026-07-03T02:10:00+02:00", "2026-07-03 00:10:00"]) {
+    // The store orders timestamps as text, so one instant must have exactly
+    // one spelling. A local offset or a space separator sorts by accident
+    // against GitHub's UTC text; a fractional second names a second GitHub
+    // spells without one, and would sort before the runtime's own cursor at
+    // that second and re-send it as `since` forever.
+    for (const bad of [
+      "not-a-date",
+      "2026-07-03T02:10:00+02:00",
+      "2026-07-03 00:10:00",
+      "2026-07-03T00:10:00.0Z",
+      "2026-07-03T00:10:00.00Z",
+      "2026-07-03T00:10:00.000Z",
+      "2026-07-03T00:10:00.500Z",
+    ]) {
       writeLegacy({ [REPO]: { ...legacyRepo, commentsWatermark: bad } });
 
-      expect(() => runImport()).toThrow(/commentsWatermark: must be an ISO-8601 UTC timestamp/);
+      expect(() => runImport()).toThrow(/commentsWatermark: must be a GitHub updated_at timestamp/);
       expect(existsSync(filePath)).toBe(true);
       expect(repositories.githubPollState.list()).toEqual([]);
     }
+  });
+
+  it("admits the epoch as a cursor, because the poller wrote it as one", () => {
+    // The only non-`updated_at` spelling a legacy file legitimately holds:
+    // the initial value of a stream that has never seen an event. Observed in
+    // the staging home's own file, where `issuesWatermark` is still the epoch.
+    writeLegacy({ [REPO]: { ...legacyRepo, issuesWatermark: GITHUB_POLL_EPOCH } });
+    runImport();
+
+    const [imported] = repositories.githubPollState.list();
+    expect(imported.issuesWatermark).toBe(GITHUB_POLL_EPOCH);
+  });
+
+  it("refuses a seen key carrying a fractional second", () => {
+    // Same invariant one level down: retention compares seen timestamps
+    // against a cursor, so an event admitted in a second spelling could be
+    // forgotten while `since` still returns it.
+    writeLegacy({
+      [REPO]: { ...legacyRepo, seen: ["issues:1:2026-07-03T00:10:00.000Z"] },
+    });
+
+    expect(() => runImport()).toThrow(new RegExp(`seen: 'issues:1:2026-07-03T00:10:00\\.000Z'`));
+    expect(existsSync(filePath)).toBe(true);
+    expect(repositories.githubPollState.list()).toEqual([]);
   });
 
   it("copies GitHub's timestamp text rather than reformatting it", () => {

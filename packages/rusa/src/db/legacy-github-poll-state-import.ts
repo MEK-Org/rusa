@@ -23,25 +23,29 @@ interface PlanRepositories {
 }
 
 /**
- * The text form every durable cursor and seen timestamp must have: an
- * ISO-8601 UTC instant in the spelling GitHub's `updated_at` uses, with
- * fractional seconds allowed (the epoch constant carries `.000`). The store
- * compares timestamps as text, and text order is time order only when every
- * value shares this shape — a local-offset or non-ISO value would sort by
- * accident. Values are copied as written, never reformatted: the runtime
- * stores GitHub's text verbatim, and a `.000Z` respelling of the same second
- * would compare *before* it and let retention drop a key `since` can still
- * return.
+ * The text form every durable cursor and seen timestamp must have, and the
+ * only spelling the retired writer ever produced for an event: GitHub's
+ * `updated_at`, an ISO-8601 UTC instant at second precision with no fraction.
+ * The store compares timestamps as text, and text order is time order only
+ * when every value spells an instant exactly one way — `00Z` and `00.000Z`
+ * name the same second yet the second sorts *before* the first, so admitting
+ * both would let retention drop a key `since` can still return. Values are
+ * copied as written, never reformatted. The one other spelling a legacy file
+ * legitimately holds is the epoch constant itself, which the retired poller
+ * wrote as a cursor's initial value and never as an event timestamp; it is
+ * admitted by exact equality, for cursors only, below.
  */
-const ISO_UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const GITHUB_UPDATED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
-export function isIsoUtcTimestamp(value: string): boolean {
-  return ISO_UTC_TIMESTAMP.test(value) && !Number.isNaN(Date.parse(value));
+export function isGitHubUpdatedAt(value: string): boolean {
+  return GITHUB_UPDATED_AT.test(value) && !Number.isNaN(Date.parse(value));
 }
 
 const cursorSchema = z
   .string()
-  .refine(isIsoUtcTimestamp, { message: "must be an ISO-8601 UTC timestamp" });
+  .refine((value) => value === GITHUB_POLL_EPOCH || isGitHubUpdatedAt(value), {
+    message: "must be a GitHub updated_at timestamp (YYYY-MM-DDTHH:MM:SSZ) or the epoch",
+  });
 
 // The shape the retired poller wrote, including the single pre-stream-cursor
 // `watermark` it still knew how to read and the draft set added for #307.
@@ -97,7 +101,7 @@ export function parseLegacySeenKey(key: string): GitHubPollSeenEvent | undefined
   if (second === -1) return undefined;
   const kind = key.slice(0, first);
   const updatedAt = key.slice(second + 1);
-  if (!isIsoUtcTimestamp(updatedAt)) return undefined;
+  if (!isGitHubUpdatedAt(updatedAt)) return undefined;
   const stream = streamForKind(kind);
   if (!stream) return undefined;
   return { key, stream, updatedAt };
@@ -157,7 +161,7 @@ export interface LegacyGitHubPollStateImportPlanResult {
  *   the poller emits is refused, because its stream and timestamp decide when
  *   it may be forgotten;
  * - every cursor and seen timestamp must already be in the store's text form
- *   (see {@link isIsoUtcTimestamp}); it is copied, not reformatted;
+ *   (see {@link isGitHubUpdatedAt}); it is copied, not reformatted;
  * - the draft set is taken as is: a PR number in it was an open draft the
  *   last time the retired poller delivered an event for it.
  */
