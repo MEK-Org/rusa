@@ -6,8 +6,8 @@ import type { Migration } from "./types.js";
  * obliged to turn into an obligation (ISSUE_NUM leg 2).
  *
  * Keyed on `inbox_entry_id` rather than on a parallel (owner, source) tuple.
- * That identity already exists and is already a primary key: `deliverEvent`
- * derives `dedupe:<sha256(dedupeKey \0 actorId)>` and `actor_inbox_entries`
+ * That identity already exists and is already a primary key: delivery derives
+ * `dedupe:<sha256(dedupeKey \0 actorId)>` and `actor_inbox_entries`
  * enforces it. A second tuple would be a second identity free to drift from the
  * first, and the FK here makes a receipt for a delivery that never happened
  * unrepresentable.
