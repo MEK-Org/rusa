@@ -74,6 +74,7 @@ export type ActorEvent =
   | { type: "state"; state: ActorRuntimeState; yielded: boolean }
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode }
+  | { type: "error"; error: string }
   | { type: "result"; result: RunResult }
   | {
       type: "runStart";

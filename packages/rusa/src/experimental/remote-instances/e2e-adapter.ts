@@ -51,11 +51,7 @@ export function instanceWorkerFactory(
         },
         reconnect: Boolean(options.loadSessionId() || record.sessionId),
       },
-      context: {
-        ...context,
-        onQueued: (queued) => options.onQueued?.(queued),
-        onRunEnd: (result) => options.onRunEnd?.(result),
-      },
+      context,
       actorOptions: options,
       snapshot: () => {
         const current = context.getRecord();

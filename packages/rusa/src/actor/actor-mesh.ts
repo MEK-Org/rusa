@@ -35,6 +35,11 @@ import {
   MAX_VOICE_TRANSFER_NOTE_CHARS,
   renderVoiceTransferContext,
 } from "../voice/voice-transfer-context.js";
+import {
+  type ActorLifecycle,
+  type ActorLifecycleListener,
+  createActorLifecycle,
+} from "./actor-lifecycle.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -101,6 +106,8 @@ export interface MeshActor {
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
   setModelConfig?(modelConfig: ProviderModelConfig[]): void;
+  /** Present on provider-backed actors that receive the lifecycle contract. */
+  readonly lifecycle?: ActorLifecycle;
 }
 
 export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
@@ -443,6 +450,8 @@ export interface ActorFactoryContext {
   /** Read the live record (charter + handles can change between wakes). */
   getRecord: () => ActorRecord | undefined;
   mesh: ActorMesh;
+  /** Ordered actor/run observers, already registered with mesh bookkeeping first. */
+  lifecycle: ActorLifecycle;
   /**
    * Wrap the provider run in the shared cross-actor concurrency gate. The
    * actor supplies its declared candidate pool; the gate atomically selects
@@ -583,6 +592,11 @@ export interface ActorMeshOptions {
    * removing the actor's MCP endpoint and its working directory.
    */
   onRetire?: (record: ActorRecord) => void;
+  /**
+   * Ordered actor/run observers. The mesh's own queue and terminal bookkeeping
+   * is always registered first; host integrations follow this declared order.
+   */
+  lifecycleListeners?: readonly ActorLifecycleListener[];
   /**
    * Called on every actor yield, for out-of-band handling the mesh doesn't own
    * (e.g. surfacing a git-bridge deliverable). `notifyingParent` is true only
@@ -794,6 +808,7 @@ export class ActorMesh {
   private readonly handleForId: (id: string) => string;
   private readonly rootId?: string;
   private readonly onRetire?: (record: ActorRecord) => void;
+  private readonly lifecycleListeners: readonly ActorLifecycleListener[];
   private readonly onYield?: (
     actorId: string,
     ctx: { notifyingParent: boolean }
@@ -878,6 +893,7 @@ export class ActorMesh {
    * {@link resolveDropNotifyTarget}, which must not hand a notification to one.
    */
   private readonly retiring = new Set<string>();
+  private readonly lifecycles = new Map<string, ActorLifecycle>();
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
@@ -923,6 +939,7 @@ export class ActorMesh {
     this.now = opts.now ?? (() => new Date().toISOString());
     this.handleForId = opts.handleForId ?? generateHandle;
     this.onRetire = opts.onRetire;
+    this.lifecycleListeners = opts.lifecycleListeners ?? [];
     this.onYield = opts.onYield;
     this.recordRunYield = opts.recordRunYield;
     this.onSpawn = opts.onSpawn;
@@ -1065,6 +1082,43 @@ export class ActorMesh {
   }
 
   /**
+   * Return the one lifecycle fanout for an actor. The execution coordinator
+   * receives this before construction so observers cannot be smuggled through
+   * actor invocation inputs as logging or accounting callbacks.
+   */
+  lifecycleFor(actorId: string): ActorLifecycle {
+    const existing = this.lifecycles.get(actorId);
+    if (existing) return existing;
+    const lifecycle = createActorLifecycle(
+      [
+        {
+          onQueued: (event) => {
+            this.actorQueued(event.actorId, event);
+          },
+          onEnd: (event) => {
+            if (event.terminal.kind === "result") {
+              this.finishInboxRun(event.actorId);
+              this.accountRun(event.actorId, event.terminal.result, event.runId);
+            } else {
+              this.abandonInboxRun(event.actorId);
+            }
+            // A selection is run-scoped regardless of its terminal shape.
+            this.clearSelection(event.actorId);
+          },
+        },
+        ...this.lifecycleListeners,
+      ],
+      (failure) => {
+        this.log(
+          `lifecycle ${failure.event} listener failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`
+        );
+      }
+    );
+    this.lifecycles.set(actorId, lifecycle);
+    return lifecycle;
+  }
+
+  /**
    * Register an externally-created actor (the root) so the mesh can route
    * messages to it and the repository knows it exists. Idempotent on the record.
    *
@@ -1077,6 +1131,8 @@ export class ActorMesh {
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
+    if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
+    else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
 
@@ -1919,6 +1975,7 @@ export class ActorMesh {
     }
     this.live.set(id, actor);
     this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
+    void this.lifecycleFor(id).emit("onSpawn", { actorId: id });
     // Genuine-birth side-effect hook (out-of-band, fire-and-forget) — e.g. kick
     // off avatar generation . Guarded like onRetire so a hook throw can
     // never break spawning, and only here (not createActor, which rehydrate
@@ -3754,6 +3811,7 @@ export class ActorMesh {
     // the only place the `scheduled_message_cancelled` audit record is written.
     // Dropping here would have been a second, unaudited way for a message to
     // die, reachable only by racing a check that cannot actually be raced.
+    if (record) void this.lifecycleFor(id).emit("onRetire", { actorId: id });
     if (record && this.onRetire) {
       try {
         this.onRetire(record);
@@ -3792,6 +3850,7 @@ export class ActorMesh {
       actorId: id,
     });
     if (record) this.runRetireCleanups(record);
+    this.lifecycles.delete(id);
     this.log(`retired ${id}`);
   }
 
@@ -4352,6 +4411,7 @@ export class ActorMesh {
       getRecord: () => this.actors.get(record.id),
       executionTarget: record.executionTarget,
       mesh: this,
+      lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
         const rec = this.actors.get(record.id);

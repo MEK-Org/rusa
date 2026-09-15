@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
@@ -14,6 +15,7 @@ import type {
   RunResult,
   SandboxOptions,
 } from "../providers/types.js";
+import { type ActorLifecycle, createActorLifecycle } from "./actor-lifecycle.js";
 import {
   RunStartCancelledError,
   type RunStartHandle,
@@ -91,6 +93,11 @@ export interface ActorOptions {
    * can read the current charter, inbox contract, and portable context.
    */
   buildPrompt: () => PromptBuild;
+  /**
+   * The sole run/actor observation seam. Logging, durable accounting, mesh
+   * events, compaction, and failure routing subscribe here as peers.
+   */
+  lifecycle?: ActorLifecycle;
   /** Firehose: receives the agent's streamed output. */
   log?: (chunk: string) => void;
   /** Optional model fallback for provider capacity/quota exhaustion. */
@@ -299,6 +306,7 @@ export function formatFallbackRecoveryFailure(input: {
  */
 export class Actor {
   readonly id: string;
+  readonly lifecycle: ActorLifecycle;
   private readonly runner: TriggerRunner;
   private closed = false;
   private killable = true;
@@ -341,6 +349,8 @@ export class Actor {
    * this abandonment closes one. See that field for why the reason can't say.
    */
   private runStartReported = false;
+  /** Identity is minted when the queued opportunity opens, before admission. */
+  private currentRunId: string | undefined;
   private yieldGraceTimer?: NodeJS.Timeout;
   private readonly yieldGraceMs: number;
   private currentRunStartTime: Date | null = null;
@@ -349,6 +359,13 @@ export class Actor {
 
   constructor(private readonly opts: ActorOptions) {
     this.id = opts.id;
+    this.lifecycle =
+      opts.lifecycle ??
+      createActorLifecycle([], (failure) => {
+        this.opts.log?.(
+          `lifecycle ${failure.event} listener failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}\n`
+        );
+      });
     this.yieldGraceMs = opts.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.runner = new TriggerRunner({
       debounceMs: opts.debounceMs,
@@ -667,12 +684,20 @@ export class Actor {
     this.yieldNote = undefined;
     this.runEndReported = false;
     this.runStartReported = false;
+    const runId = randomUUID();
+    this.currentRunId = runId;
     this.currentRunStartTime = new Date();
     // The run is queued until invoke() is selected by both gates.
     this.queued = true;
     this.publishRuntimeStateIfChanged();
     try {
       try {
+        await this.lifecycle.emit("onQueued", {
+          actorId: this.id,
+          runId,
+          responsive: isResponsiveNudge(nudge),
+          mode: nudge.mode ?? "ordinary",
+        });
         this.opts.onQueued?.({
           responsive: isResponsiveNudge(nudge),
           mode: nudge.mode ?? "ordinary",
@@ -699,12 +724,13 @@ export class Actor {
       // one a new path can silently omit. Anything that opens state on onQueued
       // and closes it on onRunEnd — the mesh's in-flight run accounting, ISSUE_NUM —
       // depends on the pairing being total, not on the current list of exits.
-      if (!this.runEndReported) this.reportAbandonedRun();
+      if (!this.runEndReported) await this.reportAbandonedRun();
+      this.currentRunId = undefined;
     }
   }
 
   /** The terminal hook for a run that ended without reporting a result. */
-  private reportAbandonedRun(): void {
+  private async reportAbandonedRun(): Promise<void> {
     // `coalesceAborted` and `lastRunSkipped` are still set from the path that
     // took us here. Neither is required to be: an unclassified terminal path
     // still reports, as `unreported`, because the accounting must not depend on
@@ -714,6 +740,16 @@ export class Actor {
       : this.lastRunSkipped
         ? "start-cancelled"
         : "unreported";
+    const runId = this.currentRunId;
+    if (!runId) return;
+    // Claim the terminal transition before observer fanout. An observer failure
+    // is contained, and a compatibility hook throw cannot produce a duplicate.
+    this.runEndReported = true;
+    await this.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "abandoned", reason, started: this.runStartReported },
+    });
     try {
       this.opts.onRunAbandoned?.({ reason, started: this.runStartReported });
     } catch (err) {
@@ -868,10 +904,20 @@ export class Actor {
               "Do not do additional work in this corrective run.",
           }
         : this.opts.buildPrompt();
+      const runId = this.currentRunId;
+      if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
       // Inside the gate: the provider is starting. The hook fires here rather than
       // beside onQueued so a run queued behind the concurrency cap is
       // distinguishable from one that started and went quiet — same reason the
       // watchdog timers moved in here .
+      await this.lifecycle.emit("onStart", {
+        actorId: this.id,
+        runId,
+        responsive,
+        mode: nudge.mode ?? "ordinary",
+        injectRecord: built.injectRecord,
+        selected,
+      });
       this.opts.onRunStart?.(responsive, built.injectRecord, selected);
       // AFTER the hook, not before: this flag means "a start was announced", so a
       // hook that threw before announcing must not leave a bracket a reader will
@@ -966,6 +1012,8 @@ export class Actor {
         return;
       }
       if (this.coalesceAborted) return;
+      const runId = this.currentRunId;
+      if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: err });
       result = {
         success: false,
         output: err instanceof Error ? (err.stack ?? err.message) : String(err),
@@ -1027,6 +1075,13 @@ export class Actor {
     // outcome. If the hook itself throws partway, the run must not ALSO be
     // reported abandoned — one opportunity, one terminal signal.
     this.runEndReported = true;
+    const runId = this.currentRunId;
+    if (!runId) throw new Error(`actor ${this.id} ended without a lifecycle run id`);
+    await this.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "result", result },
+    });
     await this.opts.onRunEnd?.(result);
   }
 

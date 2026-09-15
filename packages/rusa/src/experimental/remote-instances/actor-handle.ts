@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
@@ -41,6 +42,9 @@ export class ActorHandle implements MeshActor {
   private startupTimer?: ReturnType<typeof setTimeout>;
   /** True between the leader admitting a run and that same run's terminal accounting. */
   private runOpen = false;
+  /** Identity minted by the leader-side execution coordinator before admission. */
+  private queuedRunId: string | undefined;
+  private startedRunId: string | undefined;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -169,7 +173,11 @@ export class ActorHandle implements MeshActor {
     // A connection or startup failure is not itself a run outcome. Only a run
     // the leader actually admitted is terminated here, so an idle disconnect or
     // a boot timeout books nothing.
-    void this.endRun({ success: false, output: error.message, exitCode: -1 });
+    if (this.runOpen) {
+      void this.endRun({ success: false, output: error.message, exitCode: -1 });
+    } else if (this.queuedRunId) {
+      void this.endQueuedRun("start-cancelled", false);
+    }
   }
 
   /**
@@ -183,8 +191,11 @@ export class ActorHandle implements MeshActor {
    * awaiting so a disconnect landing mid-completion finds nothing left to end.
    */
   private async endRun(result: RunResult): Promise<void> {
-    if (!this.runOpen) return;
+    const runId = this.startedRunId;
+    if (!this.runOpen || !runId) return;
     this.runOpen = false;
+    this.startedRunId = undefined;
+    this.queuedRunId = undefined;
     const elapsedMs =
       this.runStartTime !== undefined
         ? Math.round(performance.now() - this.runStartTime)
@@ -197,13 +208,24 @@ export class ActorHandle implements MeshActor {
       exitCode: result.exitCode,
       elapsedMs,
     });
-    try {
-      await this.opts.context.onRunEnd(result);
-    } catch (error) {
-      this.opts.actorOptions?.log?.(
-        `[remote-instance] run accounting failed: ${error instanceof Error ? error.message : String(error)}\n`
-      );
-    }
+    await this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "result", result },
+    });
+  }
+
+  private async endQueuedRun(reason: string, started: boolean): Promise<void> {
+    const runId = started ? this.startedRunId : this.queuedRunId;
+    if (!runId) return;
+    this.runOpen = false;
+    this.startedRunId = undefined;
+    this.queuedRunId = undefined;
+    await this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId,
+      terminal: { kind: "abandoned", reason, started },
+    });
   }
 
   private send(message: LeaderCommand): void {
@@ -230,17 +252,46 @@ export class ActorHandle implements MeshActor {
         this.opts.saveSession(message.sessionId);
         break;
       case "queued":
-        ctx.onQueued(message);
+        this.queuedRunId = randomUUID();
+        await ctx.lifecycle.emit("onQueued", {
+          actorId: this.id,
+          runId: this.queuedRunId,
+          responsive: message.responsive,
+          mode: message.mode,
+        });
         break;
       case "result":
         await this.endRun(message.result);
         break;
+      case "error": {
+        const runId = this.startedRunId ?? this.queuedRunId;
+        if (runId) {
+          await ctx.lifecycle.emit("onError", {
+            actorId: this.id,
+            runId,
+            error: new Error(message.error),
+          });
+        }
+        break;
+      }
       case "runStart":
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
-        hooks?.onRunStart?.(message.responsive, message.injectRecord, message.selected);
+        this.queuedRunId ??= randomUUID();
+        this.startedRunId = this.queuedRunId;
+        // Mark the terminal claim before awaiting observers. The first
+        // lifecycle listener starts synchronously, so accounting is open; a
+        // follower disconnect in an observer's await gap must still close it.
         this.runOpen = true;
+        await ctx.lifecycle.emit("onStart", {
+          actorId: this.id,
+          runId: this.startedRunId,
+          responsive: message.responsive,
+          mode: "ordinary",
+          injectRecord: message.injectRecord,
+          selected: message.selected,
+        });
         this.log.info("remote_run_start", {
           actorId: this.id,
           target: this.opts.target ?? this.channel.nodeId,
@@ -254,8 +305,7 @@ export class ActorHandle implements MeshActor {
       case "abandoned":
         // An abandoned run is already terminal on the leader side; it has no
         // run end left to record.
-        hooks?.onRunAbandoned?.(message.abandon);
-        if (message.abandon.started) this.runOpen = false;
+        await this.endQueuedRun(message.abandon.reason, message.abandon.started);
         break;
       case "continue":
         hooks?.onContinue?.(message.count);
