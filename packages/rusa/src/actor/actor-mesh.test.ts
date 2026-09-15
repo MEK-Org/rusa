@@ -9341,6 +9341,51 @@ describe("strict obligation handling experiment (#382)", () => {
     );
   });
 
+  it("does not record a standing acceptance when another selected head rejects the yield (#468)", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const subject = worker(mesh, "mixed heads");
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({
+      id: "standing-head",
+      title: "Repository stewardship",
+      ownerId: subject,
+      externalRef: "github:MEK-Org/rusa",
+    });
+    repo.create({
+      id: "strict-leaf",
+      title: "Actionable leaf",
+      ownerId: subject,
+      externalRef: "github:MEK-Org/rusa/issues/468",
+    });
+    mesh.deliverReadyHeadAttention(subject, { id: "standing-head", intent: "verify" }, null);
+    mesh.deliverReadyHeadAttention(subject, { id: "strict-leaf", intent: "act" }, "standing-head");
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const entryIds = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === subject &&
+          entry.payload.type === "obligation.ready_head" &&
+          (entry.payload.obligationId === "standing-head" ||
+            entry.payload.obligationId === "strict-leaf")
+      )
+      .map((entry) => entry.id);
+    expect(entryIds).toHaveLength(2);
+    mesh.selectInboxEntries(subject, entryIds);
+
+    repo.setCheckpoint("standing-head", "No repository changes need a child.", subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation strict-leaf \("Actionable leaf"\) was not finished or decomposed/
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_yield_rejected",
+        payload: expect.stringContaining('"obligationId":"strict-leaf"'),
+      })
+    );
+    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
+  });
+
   it("preserves failed-run handling without clean-yield rejection", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);

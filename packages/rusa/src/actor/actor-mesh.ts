@@ -3056,6 +3056,7 @@ export class ActorMesh {
   private assertCleanYieldAllowed(actorId: string): void {
     const runState = this.headClosureRuns.get(actorId);
     if (!runState || runState.headObligationIds.size === 0) return;
+    const verifiedStandingHeads: Obligation[] = [];
     const closure = this.obligations;
     // Selection already refused to arm a run without these reads, so this is
     // the second half of the same fail-closed rule rather than a soft skip: an
@@ -3078,7 +3079,10 @@ export class ActorMesh {
         const selected = runState.selectedHeads.get(obligationId) ?? null;
         const shortfall = this.strictHandoffShortfall(actorId, obligation, selected);
         if (shortfall === null) continue;
-        if (this.isStandingHeadVerifiedNoChange(actorId, obligation, selected)) continue;
+        if (this.isStandingHeadVerifiedNoChange(actorId, obligation, selected)) {
+          verifiedStandingHeads.push(obligation);
+          continue;
+        }
         this.rejectCleanYield(actorId, obligationId, obligation.title, shortfall);
       }
 
@@ -3109,6 +3113,13 @@ export class ActorMesh {
           "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
         );
       }
+    }
+
+    // Do not durably name an accepted disposition until every selected head has
+    // passed. A later failure rejects the whole clean-yield attempt, so emitting
+    // during the loop would leave a false accepted disposition in its history.
+    for (const obligation of verifiedStandingHeads) {
+      this.recordStandingHeadVerified(actorId, obligation);
     }
   }
 
@@ -3187,13 +3198,22 @@ export class ActorMesh {
     if (this.resolveThreadId(obligation.ownerId) !== actorId) return false;
     if (!selected || this.resolveThreadId(selected.ownerId) !== actorId) return false;
     if (!this.checkpointWasRewrittenSinceSelection(actorId, obligation, selected)) return false;
+    return true;
+  }
+
+  /**
+   * Record a verified standing-head disposition only once all selected heads
+   * have passed clean-yield enforcement. This remains a sibling of
+   * `run_yield_rejected`: pilots can count accepted and rejected no-change
+   * attempts without parsing an actor-authored yield note.
+   */
+  private recordStandingHeadVerified(actorId: string, obligation: Obligation): void {
     this.recordEvent({
       kind: "standing_head_verified",
       actorId,
       detail: `Standing head obligation ${obligation.id} verified for clean yield: checkpoint rewritten by this actor during this run`,
       payload: JSON.stringify({ obligationId: obligation.id, title: obligation.title }),
     });
-    return true;
   }
 
   /**
