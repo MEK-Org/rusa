@@ -1,12 +1,40 @@
 import http from "node:http";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
+  type QuotaFreshness,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
+
+/**
+ * What `GET /v1/quota` answers with, minus the `service` envelope: the provider's
+ * `ProviderQuotaSnapshot` unchanged (so `scrapedAt` is the service's own scrape stamp),
+ * plus a `freshness` block on the cold-service shape (§5.5).
+ */
+export type PublishedQuotaSnapshot = ProviderQuotaSnapshot & { freshness?: QuotaFreshness };
+
+/**
+ * A `/v1/quota` body is only usable when it carries the two fields every snapshot has —
+ * including the cold and unsupported shapes, which are answers rather than errors (§5.5).
+ * Anything else is a response this client will not pass off as a provider reading.
+ */
+function isQuotaSnapshotBody(
+  body: unknown
+): body is PublishedQuotaSnapshot & { service?: unknown } {
+  if (typeof body !== "object" || body === null) return false;
+  const candidate = body as { provider?: unknown; status?: unknown };
+  return (
+    typeof candidate.provider === "string" &&
+    (candidate.status === "available" ||
+      candidate.status === "exhausted" ||
+      candidate.status === "unknown" ||
+      candidate.status === "unsupported")
+  );
+}
 
 export interface QuotaCoordinatorClientOptions {
   socketPath: string;
@@ -79,6 +107,27 @@ export class QuotaCoordinatorClient {
     return false;
   }
 
+  /**
+   * The evidence view (§5.5): one provider's `ProviderQuotaSnapshot` as the service last
+   * observed it. Never triggers a probe — a cold service answers `status: "unknown"` with
+   * a `freshness` block, and that shape is returned as-is rather than treated as an error.
+   *
+   * Resolves `null` when the service answered but the response was not usable (a
+   * non-200 status or a protocol-major mismatch); rejects when the socket could not be
+   * reached at all. Callers that need "could not read" as a value rather than a throw
+   * wrap this themselves.
+   */
+  async getQuota(provider: string): Promise<PublishedQuotaSnapshot | null> {
+    const parsed = await this.requestJson(`/v1/quota?provider=${encodeURIComponent(provider)}`);
+    if (parsed === null) return null;
+    if (!this.acceptProtocol(parsed)) return null;
+    if (!isQuotaSnapshotBody(parsed)) return null;
+    // The `service` envelope is the transport's, not the provider's: strip it so what the
+    // caller records as provider evidence is the snapshot the service stored, unchanged.
+    const { service: _service, ...snapshot } = parsed;
+    return snapshot;
+  }
+
   async getThrottle(
     provider?: string
   ): Promise<PublishedThrottleResponse | PublishedThrottleCollectionResponse | null> {
@@ -86,6 +135,46 @@ export class QuotaCoordinatorClient {
       ? `/v1/throttle?provider=${encodeURIComponent(provider)}`
       : "/v1/throttle";
 
+    const parsed = await this.requestJson(path);
+    if (parsed === null) return null;
+    if (!this.acceptProtocol(parsed)) return null;
+
+    if (provider) {
+      this.applyResponse(provider, parsed);
+    } else if (
+      parsed &&
+      typeof parsed === "object" &&
+      "providers" in parsed &&
+      parsed.providers &&
+      typeof parsed.providers === "object"
+    ) {
+      for (const [p, pStatus] of Object.entries(parsed.providers)) {
+        this.applyResponse(p, pStatus);
+      }
+    }
+    return parsed as PublishedThrottleResponse | PublishedThrottleCollectionResponse;
+  }
+
+  /** §5.2: every response is checked for protocol-major compatibility before use. */
+  private acceptProtocol(parsed: unknown): boolean {
+    try {
+      validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
+      return true;
+    } catch (err) {
+      this.options.logger?.warn(
+        `[quota-client] Discarding response due to protocol mismatch: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return false;
+    }
+  }
+
+  /**
+   * One GET over the unix socket. Resolves the parsed body on 200 and `null` on any other
+   * status; rejects on a transport error or an unparseable body.
+   */
+  private requestJson(path: string): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
@@ -99,40 +188,14 @@ export class QuotaCoordinatorClient {
             data += chunk;
           });
           res.on("end", () => {
-            if (res.statusCode === 200) {
-              try {
-                const parsed = JSON.parse(data);
-                try {
-                  validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
-                } catch (err) {
-                  this.options.logger?.warn(
-                    `[quota-client] Discarding response due to protocol mismatch: ${
-                      err instanceof Error ? err.message : String(err)
-                    }`
-                  );
-                  resolve(null);
-                  return;
-                }
-
-                if (provider) {
-                  this.applyResponse(provider, parsed);
-                } else if (
-                  parsed &&
-                  typeof parsed === "object" &&
-                  "providers" in parsed &&
-                  parsed.providers &&
-                  typeof parsed.providers === "object"
-                ) {
-                  for (const [p, pStatus] of Object.entries(parsed.providers)) {
-                    this.applyResponse(p, pStatus);
-                  }
-                }
-                resolve(parsed);
-              } catch (err) {
-                reject(err);
-              }
-            } else {
+            if (res.statusCode !== 200) {
               resolve(null);
+              return;
+            }
+            try {
+              resolve(JSON.parse(data));
+            } catch (err) {
+              reject(err);
             }
           });
         }
