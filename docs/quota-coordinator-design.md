@@ -782,9 +782,11 @@ while `governingBucketKey` still names the weekly one — which is why both the
 key and the per-bucket map are on the wire and no separate governing-age field
 is.
 
-**Omitting `provider` returns every configured provider**, and that is the call a
-client's tick actually makes, so the collection form is part of the contract
-rather than a convenience:
+**Omitting `provider` returns only configured providers that currently have a
+published throttle.** A configured provider with no published throttle is absent
+from the collection; its individual lookup remains `503 not_ready`. That is the
+call a client's tick actually makes, so the collection form is part of the
+contract rather than a convenience:
 
 ```jsonc
 {
