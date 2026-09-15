@@ -5,6 +5,7 @@ import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'avatar.dart';
 import 'brand_mark.dart';
 
 /// The top-level dashboard views the header nav switches between.
@@ -127,6 +128,14 @@ const Map<String, QuotaProviderConfig> kDefaultQuotaProviders = {
 /// ([onBack]) that replaces it rather than costing the detail a second row of
 /// vertical space. Both the inline nav and the quota rings move into the drawer
 /// in that mode.
+///
+/// In that phone shape the header also names the page instead of the product
+/// (issue #462): [pageTitle] — the active destination's label — takes the
+/// wordmark's slot, and once an actor detail is open, [detailActor] replaces
+/// it with the actor's avatar and handle plus an accessible overflow
+/// (three-dot) menu of the actor's actions at the upper right. The desktop
+/// shape (no [onMenuTap]/[onBack] wired) keeps the brand row exactly as
+/// before: wordmark, inline nav, quota rings, and no page title.
 class MeshHeader extends StatelessWidget {
   const MeshHeader({
     super.key,
@@ -136,6 +145,8 @@ class MeshHeader extends StatelessWidget {
     this.quotaProviders = kDefaultQuotaProviders,
     this.onMenuTap,
     this.onBack,
+    this.pageTitle,
+    this.detailActor,
     this.onLogout,
     this.profilePhotoUrl,
   });
@@ -161,6 +172,16 @@ class MeshHeader extends StatelessWidget {
   /// leading slot as [onMenuTap] and wins it while a detail is open.
   final VoidCallback? onBack;
 
+  /// The page identity shown in the wordmark's slot in the phone shape (the
+  /// active destination's label). Ignored on the desktop shape, which keeps
+  /// the RUSA wordmark.
+  final String? pageTitle;
+
+  /// The actor whose phone detail is open, when one is. Switches the phone
+  /// title from [pageTitle] to the actor's avatar + handle and adds the
+  /// actions overflow menu at the upper right.
+  final ThreadDto? detailActor;
+
   @override
   Widget build(BuildContext context) {
     final height = MediaQuery.sizeOf(context).height;
@@ -185,6 +206,10 @@ class MeshHeader extends StatelessWidget {
               // the header keeps to its single brand row.
               final drawerNav = onMenuTap != null || onBack != null;
               final twoTier = !drawerNav && constraints.maxWidth < 850;
+              final detail = drawerNav ? detailActor : null;
+              final detailActions = detail == null
+                  ? const <_ActorHeaderAction>[]
+                  : _actorHeaderActions(store: store, actor: detail);
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -201,16 +226,40 @@ class MeshHeader extends StatelessWidget {
                                 onBack: onBack,
                               ),
                               const SizedBox(width: 10),
-                              const Text(
-                                'RUSA',
-                                maxLines: 1,
-                                style: TextStyle(
-                                  color: MeshColors.textPrimary,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 16,
-                                  letterSpacing: 0.5,
+                              // Phone identity (issue #462): the page — or the
+                              // open actor — takes the wordmark's slot. The
+                              // desktop shape keeps the brand untouched.
+                              if (detail != null)
+                                Flexible(
+                                  child: _DetailIdentity(
+                                    actor: detail,
+                                    store: store,
+                                  ),
+                                )
+                              else if (drawerNav && pageTitle != null)
+                                Flexible(
+                                  child: Text(
+                                    pageTitle!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: MeshColors.textPrimary,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                )
+                              else
+                                const Text(
+                                  'RUSA',
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                    color: MeshColors.textPrimary,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 16,
+                                    letterSpacing: 0.5,
+                                  ),
                                 ),
-                              ),
                               const SizedBox(width: 10),
                               StreamBuilder<bool>(
                                 stream: store.halted,
@@ -264,6 +313,10 @@ class MeshHeader extends StatelessWidget {
                             store: store,
                             quotaProviders: quotaProviders,
                           ),
+                        ],
+                        if (detailActions.isNotEmpty) ...[
+                          const SizedBox(width: 10),
+                          _ActorActionMenu(actions: detailActions),
                         ],
                         if (onLogout != null) ...[
                           const SizedBox(width: 10),
@@ -345,6 +398,147 @@ class ProfileMenu extends StatelessWidget {
                 ),
               ),
       ),
+    );
+  }
+}
+
+/// One actor-detail action surfaced by the phone app bar's overflow menu
+/// (issue #462). Rendered as labelled rows in [_ActorActionMenu].
+class _ActorHeaderAction {
+  const _ActorHeaderAction({
+    required this.label,
+    required this.icon,
+    required this.invoke,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback invoke;
+}
+
+/// The phone actions an actor's current run state supports: queued actors can
+/// run now or drop their queued run; running ones can be interrupted; idle ones
+/// can be run. Retired actors offer nothing.
+List<_ActorHeaderAction> _actorHeaderActions({
+  required DashboardStore store,
+  required ThreadDto actor,
+}) {
+  switch (store.dotFor(actor)) {
+    case DotState.queued:
+      return [
+        _ActorHeaderAction(
+          label: 'Run now',
+          icon: Icons.fast_forward_rounded,
+          invoke: () => store.runNowActor(actor.id),
+        ),
+        _ActorHeaderAction(
+          label: 'Cancel queued run',
+          icon: Icons.stop_rounded,
+          invoke: () => store.interruptActor(actor.id),
+        ),
+      ];
+    case DotState.active:
+      return [
+        _ActorHeaderAction(
+          label: 'Interrupt',
+          icon: Icons.stop_rounded,
+          invoke: () => store.interruptActor(actor.id),
+        ),
+      ];
+    case DotState.idle:
+      return [
+        _ActorHeaderAction(
+          label: 'Run now',
+          icon: Icons.fast_forward_rounded,
+          invoke: () => store.runNowActor(actor.id),
+        ),
+      ];
+    case DotState.retired:
+      return const [];
+  }
+}
+
+/// The phone detail title: the actor's avatar and handle in the app bar, so
+/// the page identifies who you are looking at without the detail body needing
+/// to. Sits in the wordmark's slot; the handle ellipsizes rather than pushing
+/// the badges or the overflow off the row.
+class _DetailIdentity extends StatelessWidget {
+  const _DetailIdentity({required this.actor, required this.store});
+
+  final ThreadDto actor;
+  final DashboardStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ActorAvatar(
+          id: actor.id,
+          size: 30,
+          retired: actor.isRetired,
+          store: store,
+        ),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            actor.handle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: kMonoStyle.copyWith(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: MeshColors.textPrimary,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// The phone actor-detail overflow: the actor's actions behind a three-dot
+/// button at the upper right of the app bar (issue #462). A PopupMenuButton
+/// gives the button a tooltip and each entry a text label, so the menu is
+/// reachable through assistive technology without any extra semantics.
+class _ActorActionMenu extends StatelessWidget {
+  const _ActorActionMenu({required this.actions});
+
+  final List<_ActorHeaderAction> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<_ActorHeaderAction>(
+      tooltip: 'Actor actions',
+      position: PopupMenuPosition.under,
+      style: IconButton.styleFrom(
+        foregroundColor: MeshColors.textSecondary,
+        iconSize: 22,
+      ),
+      onSelected: (action) => action.invoke(),
+      itemBuilder: (_) => [
+        for (final action in actions)
+          PopupMenuItem<_ActorHeaderAction>(
+            value: action,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(action.icon, size: 18),
+                const SizedBox(width: 10),
+                // Flexible + ellipsis: at accessibility text scales the label
+                // fits the menu's bounded width instead of overflowing it.
+                Flexible(
+                  child: Text(
+                    action.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+      icon: const Icon(Icons.more_vert),
     );
   }
 }

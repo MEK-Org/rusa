@@ -171,6 +171,7 @@ class _DashboardBodyState extends State<DashboardBody> {
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
                 onBack: inActorDetail ? widget.store.clearSelection : null,
+                detailActorId: inActorDetail ? snap.data : null,
               ),
             );
           },
@@ -182,23 +183,47 @@ class _DashboardBodyState extends State<DashboardBody> {
   /// The header + current view. Paints the dark base color directly (not just
   /// via the Scaffold) so the detail pane — which draws no background of its
   /// own — stays on-theme everywhere, including the headless screenshot capture.
-  Widget _chrome({VoidCallback? onMenuTap, VoidCallback? onBack}) {
+  Widget _chrome({
+    VoidCallback? onMenuTap,
+    VoidCallback? onBack,
+    String? detailActorId,
+  }) {
+    Widget header(ThreadDto? detail) {
+      return MeshHeader(
+        onLogout: widget.onLogout,
+        profilePhotoUrl: widget.profilePhotoUrl,
+        store: widget.store,
+        selected: _view,
+        onSelect: _selectView,
+        quotaProviders: _quotaProviders(
+          widget.store.dashboardConfig.valueOrNull,
+        ),
+        onMenuTap: onMenuTap,
+        onBack: onBack,
+        pageTitle: _pageTitleFor(_view),
+        detailActor: detail,
+      );
+    }
+
+    // Phone identity must track live run state: the overflow menu's actions
+    // are derived from the actor's dot state, so the header rebuilds off the
+    // actorStates stream — a one-time snapshot here would leave the actions
+    // stale until some unrelated rebuild. Desktop passes no id and keeps the
+    // header it has always built.
+    final phoneHeader = detailActorId == null
+        ? header(null)
+        : StreamBuilder<ActorStateSnapshot>(
+            stream: widget.store.actorStates,
+            initialData: widget.store.actorStates.value,
+            builder: (context, snap) =>
+                header(snap.data?.actors[detailActorId]?.thread),
+          );
+
     return ColoredBox(
       color: MeshColors.bgPrimary,
       child: Column(
         children: [
-          MeshHeader(
-            onLogout: widget.onLogout,
-            profilePhotoUrl: widget.profilePhotoUrl,
-            store: widget.store,
-            selected: _view,
-            onSelect: _selectView,
-            quotaProviders: _quotaProviders(
-              widget.store.dashboardConfig.valueOrNull,
-            ),
-            onMenuTap: onMenuTap,
-            onBack: onBack,
-          ),
+          phoneHeader,
           Expanded(
             child: _view == DashboardView.overview
                 ? OverviewTab(store: widget.store, onSelectView: _selectView)
@@ -218,6 +243,16 @@ class _DashboardBodyState extends State<DashboardBody> {
       ),
     );
   }
+}
+
+/// The phone app bar's page identity (issue #462): the active destination's
+/// label, so the phone header names the page instead of the product. Ignored
+/// by the desktop header shape, which keeps the brand row.
+String _pageTitleFor(DashboardView view) {
+  for (final destination in kDashboardDestinations) {
+    if (destination.isActive(view)) return destination.label;
+  }
+  throw StateError('No dashboard destination configured for view: $view');
 }
 
 /// Where a load lands: the view the address named, if it named one, and
