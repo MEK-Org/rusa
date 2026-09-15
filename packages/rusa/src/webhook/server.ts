@@ -35,6 +35,7 @@ import type { MeshEventRepository } from "../db/repositories/mesh-event-reposito
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
@@ -185,6 +186,12 @@ export interface DashboardServerBaseOptions {
    * TTL cache — never probes per request). Absent → that route 503s.
    */
   quotaApi?: QuotaApiDeps;
+  /**
+   * Health reader for the quota coordinator client. When supplied,
+   * `GET /api/health` includes `quota: { quota_client_service_connected }`.
+   * Absent → omitted (no coordinator configured).
+   */
+  quotaClientHealth?: () => QuotaCoordinatorClientHealth;
   /** Small read-only frontend config payload for dashboard-only UI choices. */
   dashboardConfig?: Pick<DashboardConfig, "quotaProviders">;
   /**
@@ -278,6 +285,7 @@ export function createDashboardRequestHandler(
 
       // Minimal liveness endpoint — always available, even without a live mesh.
       if (req.method === "GET" && pathname === "/api/health") {
+        const quotaHealth = options.quotaClientHealth?.();
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
@@ -285,6 +293,7 @@ export function createDashboardRequestHandler(
             deployedSha,
             startedAt,
             version: packageVersion,
+            ...(quotaHealth ? { quota: quotaHealth } : {}),
           })
         );
         return;

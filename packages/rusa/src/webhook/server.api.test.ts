@@ -18,12 +18,14 @@ const __dirname = dirname(__filename);
 import { describe, expect, it, vi } from "vitest";
 import type { DashboardDataDeps } from "../dashboard/api.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   createDashboardRequestHandler,
   createWebhookRequestHandler,
   parseJsonObjectBody,
   resolveDeployedSha,
+  startDashboardServer,
 } from "./server.js";
 
 /**
@@ -72,8 +74,12 @@ class MockServerResponse extends EventEmitter {
 async function callApiRoute(opts: {
   method: string;
   url: string;
+  quotaClientHealth?: () => QuotaCoordinatorClientHealth;
 }): Promise<{ statusCode: number; body: string }> {
-  const handler = createDashboardRequestHandler({ port: 8787 });
+  const handler = createDashboardRequestHandler({
+    port: 8787,
+    quotaClientHealth: opts.quotaClientHealth,
+  });
   const req = new MockIncomingMessage({ method: opts.method, url: opts.url });
   const res = new MockServerResponse();
   const done = once(res, "finish");
@@ -122,6 +128,55 @@ describe("static dashboard request handler", () => {
     expect(Number.isNaN(Date.parse(data.startedAt))).toBe(false);
     expect(data.version).toBeDefined();
     expect(typeof data.version).toBe("string");
+  });
+
+  it("GET /api/health includes quotaClientHealth when supplied", async () => {
+    const resConnected = await callApiRoute({
+      method: "GET",
+      url: "/api/health",
+      quotaClientHealth: () => ({ quota_client_service_connected: 1 }),
+    });
+    expect(resConnected.statusCode).toBe(200);
+    const dataConnected = JSON.parse(resConnected.body);
+    expect(dataConnected.status).toBe("ok");
+    expect(dataConnected.quota).toEqual({ quota_client_service_connected: 1 });
+
+    const resDisconnected = await callApiRoute({
+      method: "GET",
+      url: "/api/health",
+      quotaClientHealth: () => ({ quota_client_service_connected: 0 }),
+    });
+    expect(resDisconnected.statusCode).toBe(200);
+    const dataDisconnected = JSON.parse(resDisconnected.body);
+    expect(dataDisconnected.quota).toEqual({ quota_client_service_connected: 0 });
+
+    const resDefault = await callApiRoute({ method: "GET", url: "/api/health" });
+    const dataDefault = JSON.parse(resDefault.body);
+    expect(dataDefault.quota).toBeUndefined();
+  });
+
+  it("startDashboardServer passes quotaClientHealth through to GET /api/health", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    let connected: 0 | 1 = 0;
+    const started = await startDashboardServer({
+      port,
+      quotaClientHealth: () => ({ quota_client_service_connected: connected }),
+    });
+    try {
+      const base = `http://127.0.0.1:${port}`;
+      const res0 = (await (await fetch(`${base}/api/health`)).json()) as { quota?: unknown };
+      expect(res0.quota).toEqual({ quota_client_service_connected: 0 });
+
+      connected = 1;
+      const res1 = (await (await fetch(`${base}/api/health`)).json()) as { quota?: unknown };
+      expect(res1.quota).toEqual({ quota_client_service_connected: 1 });
+    } finally {
+      await started.close();
+    }
   });
 
   it("unknown /api/* routes 404 — the v2 API surface is gone", async () => {
