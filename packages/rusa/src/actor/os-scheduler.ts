@@ -216,6 +216,11 @@ function quoteForCron(value: string): string {
   return singleQuoted.replace(/%/g, "\\%");
 }
 
+/** The `actorId` form argument of a wake job line, as {@link DefaultOsScheduler.buildWakeJobLine} writes it. */
+function wakeActorArg(actorId: string): string {
+  return `-d ${quoteForCron(`actorId=${actorId}`)}`;
+}
+
 function parseWakeReason(job: string): string {
   const match = job.match(/-d '(?:reason=)((?:[^']|'\\'')*)'/);
   if (!match) return "";
@@ -371,12 +376,24 @@ export class DefaultOsScheduler implements OsScheduler {
    * upgrade would strand each live wake as a duplicate of its replacement.
    */
   private ownsLegacyWakeBlock(tagLine: string, jobLine: string | undefined): boolean {
-    return tagLine.trim().startsWith(LEGACY_WAKE_TAG_PREFIX) && this.isOwnWakeJobLine(jobLine);
+    const trimmed = tagLine.trim();
+    return (
+      trimmed.startsWith(LEGACY_WAKE_TAG_PREFIX) &&
+      this.isOwnWakeJobLine(jobLine, trimmed.slice(LEGACY_WAKE_TAG_PREFIX.length))
+    );
   }
 
-  /** True only for a wake job line this instance wrote: it curls this instance's own wake port. */
-  private isOwnWakeJobLine(line: string | undefined): boolean {
-    return (line ?? "").includes(`$(cat ${this.opts.portFile})/wake"`);
+  /**
+   * True only for the wake job line this instance wrote for `actorId`: it
+   * curls this instance's own wake port *and* posts that actor id, exactly as
+   * {@link buildWakeJobLine} spells both. The port alone would also accept
+   * this instance's job line for a different actor, so a tag whose own job
+   * line is gone could claim the neighbouring actor's line as its second half.
+   */
+  private isOwnWakeJobLine(line: string | undefined, actorId: string): boolean {
+    // The closing quote of the actor argument delimits the id, so `act1`
+    // cannot match a line written for `act1:slot`.
+    return (line ?? "").includes(`$(cat ${this.opts.portFile})/wake" ${wakeActorArg(actorId)}`);
   }
 
   /** The actor id of this instance's wake block starting at `lines[index]`, if any. */
@@ -469,7 +486,7 @@ export class DefaultOsScheduler implements OsScheduler {
     const priorityArg = responsive ? ` -d ${quoteForCron("priority=responsive")}` : "";
     return (
       `${cronExpr.trim()} ${curl} -fsS -H ${auth} ${url} ` +
-      `-d ${quoteForCron(`actorId=${actorId}`)} -d ${quoteForCron(`reason=${reason}`)}${priorityArg}`
+      `${wakeActorArg(actorId)} -d ${quoteForCron(`reason=${reason}`)}${priorityArg}`
     );
   }
 
@@ -486,7 +503,7 @@ export class DefaultOsScheduler implements OsScheduler {
     const kept: string[] = [];
     for (let index = 0; index < lines.length; index++) {
       if (this.ownedWakeActorId(lines, index) === actorId) {
-        if (!this.isOwnWakeJobLine(lines[index + 1])) {
+        if (!this.isOwnWakeJobLine(lines[index + 1], actorId)) {
           throw new TruncatedCronBlockError(lines[index].trim());
         }
         index++;

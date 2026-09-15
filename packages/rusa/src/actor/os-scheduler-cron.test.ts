@@ -331,6 +331,39 @@ describe("DefaultOsScheduler instance-scoped actor wakes (#466)", () => {
     expect(io.content).toBe(before);
   });
 
+  it("fails closed when an owned wake tag is followed by this instance's job line for a different actor", async () => {
+    // act1's job line was hand-removed, leaving its tag directly above act3's
+    // complete block. act3's line curls this instance's port, so a port-only
+    // ownership check would consume it as act1's second line.
+    const orphanTag = "# mc-wake-instance:v1:dGVzdC1pbnN0YW5jZQ:YWN0MQ\n";
+    const { io, scheduler } = make(userLine);
+    await scheduler.schedule("act3", "0 6 * * *", "neighbour");
+    const act3Block = io.content.slice(userLine.length);
+    const before = userLine + orphanTag + act3Block.slice(act3Block.indexOf("\n") + 1);
+    io.content = before;
+    io.writes.length = 0;
+
+    await expect(scheduler.cancel("act1")).rejects.toThrow(TruncatedCronBlockError);
+    await expect(scheduler.schedule("act1", "0 3 * * *", "again")).rejects.toThrow(
+      TruncatedCronBlockError
+    );
+    expect(io.content).toBe(before);
+    expect(io.writes).toEqual([]);
+  });
+
+  it("does not adopt a legacy wake tag whose job line names a different actor, even on this instance's port", () => {
+    // `# mc-wake:act1` above the job line this instance wrote for act2.
+    const crossActorLegacyBlock =
+      "# mc-wake:act1\n" +
+      "0 3 * * * /usr/bin/curl -fsS -H \"Authorization: Bearer $(cat /srv/rusa/a/wake-token)\" \"http://127.0.0.1:$(cat /srv/rusa/a/wake-port)/wake\" -d 'actorId=act2' -d 'reason=cross'\n";
+    const { io, scheduler } = make(userLine + crossActorLegacyBlock);
+
+    expect(scheduler.reportUnadoptedLegacyWakeBlocks()).toEqual([
+      { actorId: "act1", portFile: "/srv/rusa/a/wake-port", cronExpr: "0 3 * * *" },
+    ]);
+    expect(io.writes).toEqual([]);
+  });
+
   it("names at boot every legacy wake block it declined to adopt, and nothing it owns", () => {
     const { log, records } = recordingLogger();
     const { io, scheduler } = make(
