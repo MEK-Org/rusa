@@ -110,7 +110,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 55,
           resetAtIso: "2026-07-13T02:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
 
@@ -119,12 +119,14 @@ describe("quota MCP server", () => {
         model: string;
         contents: string;
         config: {
+          temperature: number;
           responseSchema: {
             properties: Record<string, unknown>;
           };
         };
       };
       expect(lastCallArgs.model).toBe("gemini-3.5-flash-lite");
+      expect(lastCallArgs.config.temperature).toBe(0);
       expect(lastCallArgs.contents).toContain("Claude output here");
       expect(lastCallArgs.config.responseSchema.properties.windows).toBeDefined();
     });
@@ -141,8 +143,8 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("preserve all printed decimal precision");
       expect(systemInstruction).toContain("For Claude:");
       expect(systemInstruction).toContain("session/week usage windows");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
-      expect(systemInstruction).toContain("Current week (Fable)");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
+      expect(systemInstruction).toContain("Current Week (Fable)");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Codex:");
       expect(systemInstruction).not.toContain("For agy:");
@@ -202,9 +204,9 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("gpt-reserve Weekly limit");
-      expect(systemInstruction).toContain("starts a model-specific subsection");
+      expect(systemInstruction).toContain("beneath a standalone '<model name> limit:' heading");
       expect(systemInstruction).toContain("use the latest such panel");
       expect(systemInstruction).toContain("resets 02:10 on 27 Aug");
       expect(systemInstruction).toContain("15:11 on 1 Sep");
@@ -314,7 +316,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 93,
           resetAtIso: "2026-07-14T12:34:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -398,14 +400,14 @@ describe("quota MCP server", () => {
           kind: "five_hour",
           percentLeft: 90,
           resetAtIso: "2026-09-08T00:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
         {
           label: "Weekly",
           kind: "weekly",
           percentLeft: 58,
           resetAtIso: "2026-09-14T00:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -635,7 +637,7 @@ describe("quota MCP server", () => {
       expect(windowSchema.required).toContain("scope");
     });
 
-    it("drops explicitly model-scoped windows for every provider", async () => {
+    it("drops empty model allocations for every provider", async () => {
       for (const parse of [parseClaudeQuota, parseCodexQuota, parseAgyQuota, parseKimiQuota]) {
         mockGenerateContent.mockReset();
         mockGenerateContent.mockResolvedValue({
@@ -653,7 +655,8 @@ describe("quota MCP server", () => {
                   label: "Named model weekly",
                   kind: "weekly",
                   usedPercent: 0,
-                  scope: "model",
+                  scope: "provider",
+                  models: [],
                 },
               ],
             }),
@@ -666,10 +669,208 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 100,
             resetAtIso: undefined,
-            scope: "provider",
+            scope: expect.objectContaining({ provider: expect.any(String) }),
           },
         ]);
       }
+    });
+
+    it("keeps a configured named-model window beside provider evidence with canonical IDs", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "Current Week (Fable)",
+                kind: "weekly",
+                usedPercent: 30,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: ["FABLE", "claude-fable", "unknown-model"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+        { identifier: "claude-sonnet", displayLabel: "Sonnet", passable: true },
+      ]);
+
+      expect(parsed.limits?.map((limit) => limit.scope)).toEqual([
+        { provider: "claude" },
+        { provider: "claude", models: ["claude-fable"] },
+      ]);
+    });
+
+    it("passes an incomplete configured model window to inference without losing provider evidence", async () => {
+      const resetAtIso = "2026-08-27T10:00:00.000Z";
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso,
+              },
+              {
+                label: "Current Week (Fable)",
+                kind: "weekly",
+                usedPercent: 30,
+                models: ["Fable"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+      ]);
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({
+          label: "Current Week",
+          resetAtIso,
+          scope: { provider: "claude" },
+        }),
+        expect.objectContaining({
+          label: "Current Week (Fable)",
+          resetAtIso: undefined,
+          scope: { provider: "claude", models: ["claude-fable"] },
+        }),
+      ]);
+
+      if (parsed.status !== "available" || !parsed.limits) {
+        throw new Error("expected parsed provider and model windows");
+      }
+
+      const inferred = inferQuotaState({
+        provider: "claude",
+        scrapedAt: "2026-08-20T10:00:00.000Z",
+        status: parsed.status,
+        limits: parsed.limits,
+      });
+      expect(inferred.limits?.[1]?.resetAtIso).toBe(resetAtIso);
+      expect(inferred.explanations).toContainEqual({
+        window: "Current Week (Fable)",
+        field: "resetAtIso",
+        rule: "sibling_window_copy",
+        detail: "copied from the provider-scope weekly in the same scrape",
+      });
+    });
+
+    it("discards an unresolved configured model window without losing provider evidence", async () => {
+      const resetAtIso = "2026-08-27T10:00:00.000Z";
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Current Week",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso,
+              },
+              {
+                label: "Session (Fable)",
+                kind: "session",
+                usedPercent: 30,
+                models: ["Fable"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseClaudeQuota("Claude quota", "test-key", Date.now(), [
+        { identifier: "claude-fable", displayLabel: "Fable", passable: true },
+      ]);
+      if (parsed.status !== "available" || !parsed.limits) {
+        throw new Error("expected parsed provider and model windows");
+      }
+
+      const inferred = inferQuotaState({
+        provider: "claude",
+        scrapedAt: "2026-08-20T10:00:00.000Z",
+        status: parsed.status,
+        limits: parsed.limits,
+      });
+      expect(inferred).toMatchObject({ status: "available" });
+      expect(inferred.limits).toEqual([
+        expect.objectContaining({
+          label: "Current Week",
+          resetAtIso,
+          scope: { provider: "claude" },
+        }),
+      ]);
+    });
+
+    it("drops unconfigured reserve/model labels and retains provider-wide evidence", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 42,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "gpt-reserve Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: ["gpt-reserve"],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("Codex quota", "test-key", Date.now(), []);
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({ label: "Weekly limit", scope: { provider: "codex" } }),
+      ]);
+    });
+
+    it("drops an explicitly empty model scope instead of relabelling it provider-wide", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 42,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+              },
+              {
+                label: "Unnamed reserve",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-08-27T10:00:00.000Z",
+                models: [],
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("Codex quota", "test-key", Date.now(), []);
+      expect(parsed.limits).toEqual([
+        expect.objectContaining({ label: "Weekly limit", scope: { provider: "codex" } }),
+      ]);
     });
 
     it("resolves LLM-extracted ISO durations for relative reset dialects", async () => {
@@ -715,7 +916,7 @@ describe("quota MCP server", () => {
               kind: "weekly",
               percentLeft: 93,
               resetAtIso: expected,
-              scope: "provider",
+              scope: { provider: "codex" },
             },
           ]);
         }
@@ -755,7 +956,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 0,
             resetAtIso: new Date(generatedAt.getTime() + (70 * 60 + 13) * 60_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "agy" },
           },
         ]);
 
@@ -792,12 +993,14 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("For agy:");
       expect(systemInstruction).toContain("reports quota REMAINING");
       expect(systemInstruction).toContain("Use the more precise printed percentage");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
-      expect(systemInstruction).toContain("Ignore every other named model or model-group section");
+      expect(systemInstruction).toContain(
+        "Every other named model or model-group section is model-specific"
+      );
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -826,11 +1029,13 @@ describe("quota MCP server", () => {
 
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toEqual([
-        expect.objectContaining({ label: "Weekly Limit", scope: "provider" }),
+        expect.objectContaining({ label: "Weekly Limit", scope: { provider: "agy" } }),
       ]);
 
       const systemInstruction = lastSystemInstruction();
-      expect(systemInstruction).toContain("Omit every other section (e.g. CLAUDE AND GPT MODELS)");
+      expect(systemInstruction).toContain(
+        "Every other named model or model-group section is model-specific"
+      );
     });
 
     it("scopes the Kimi LLM prompt to Kimi /usage and remaining-percent semantics", async () => {
@@ -842,12 +1047,14 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
-      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("For Kimi:");
       expect(systemInstruction).toContain("interactive /usage panel");
       expect(systemInstruction).toContain("either 'N% used' or 'N% left/remaining'");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
-      expect(systemInstruction).toContain("Ignore every named-model or model-group limit");
+      expect(systemInstruction).toContain(
+        "Every named-model or model-group limit is model-specific"
+      );
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -923,14 +1130,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 72,
             resetAtIso: new Date(generatedAt.getTime() + (3 * 60 + 10) * 60_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "kimi" },
           },
           {
             label: "Weekly",
             kind: "weekly",
             percentLeft: 50,
             resetAtIso: new Date(generatedAt.getTime() + (2 * 24 + 22) * 3_600_000).toISOString(),
-            scope: "provider",
+            scope: { provider: "kimi" },
           },
         ]);
       } finally {
@@ -979,7 +1186,7 @@ describe("quota MCP server", () => {
       const parsed = await parseAgyQuota("GEMINI MODELS Weekly 3% remaining", "test-key");
       const weekly = parsed.limits?.[0];
       expect(weekly?.percentLeft).toBe(3);
-      expect(weekly?.scope).toBe("provider");
+      expect(weekly?.scope).toEqual({ provider: "agy" });
     });
 
     it("fail-loud gate: fails loud with unknown status and error message when window has percentLeft < 100 and no reset ISO ", async () => {
@@ -1013,7 +1220,8 @@ describe("quota MCP server", () => {
                 label: "Sonnet (weekly)",
                 kind: "weekly",
                 usedPercent: 40,
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
             ],
           }),
@@ -1027,7 +1235,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 60,
           resetAtIso: "2026-08-27T10:00:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
     });
@@ -1042,7 +1250,8 @@ describe("quota MCP server", () => {
                 label: "Sonnet (weekly)",
                 kind: "weekly",
                 usedPercent: 40,
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
             ],
           }),
@@ -1070,7 +1279,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 100,
           resetAtIso: undefined,
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -1117,7 +1326,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 90,
           resetAtIso: "2026-07-14T12:34:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
@@ -1183,7 +1392,8 @@ describe("quota MCP server", () => {
                 label: "gpt-reserve Weekly limit",
                 kind: "weekly",
                 usedPercent: 0,
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
               {
                 label: "Weekly limit",
@@ -1192,8 +1402,20 @@ describe("quota MCP server", () => {
                 resetAtIso: "2026-09-07T18:08:00.000Z",
                 scope: "provider",
               },
-              { label: "5h limit", kind: "five_hour", usedPercent: 0, scope: "model" },
-              { label: "Weekly limit", kind: "weekly", usedPercent: 0, scope: "model" },
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                scope: "provider",
+                models: [],
+              },
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                scope: "provider",
+                models: [],
+              },
             ],
           }),
       });
@@ -1214,7 +1436,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 58,
           resetAtIso: "2026-09-07T18:08:00.000Z",
-          scope: "provider",
+          scope: { provider: "codex" },
         },
       ]);
     });
@@ -1242,7 +1464,8 @@ describe("quota MCP server", () => {
                 kind: "weekly",
                 usedPercent: 0,
                 resetAtIso: "2026-09-12T14:56:00.000Z",
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
               {
                 label: "Weekly limit",
@@ -1256,21 +1479,23 @@ describe("quota MCP server", () => {
                 kind: "five_hour",
                 usedPercent: 0,
                 resetAtIso: "2026-09-05T19:56:00.000Z",
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
               {
                 label: "Weekly limit",
                 kind: "weekly",
                 usedPercent: 0,
                 resetAtIso: "2026-09-07T16:11:00.000Z",
-                scope: "model",
+                scope: "provider",
+                models: [],
               },
             ],
           }),
       });
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
-      expect(parsed.limits?.map((l) => l.scope)).toEqual(["provider"]);
+      expect(parsed.limits?.map((l) => l.scope)).toEqual([{ provider: "codex" }]);
 
       // `parseCodexQuota` answers a partial snapshot; the service names the
       // provider it probed, exactly as the cache hands it to the endpoint.
@@ -1315,7 +1540,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 97,
           resetAtIso: "2026-07-13T09:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         },
       ]);
     });
@@ -1923,7 +2148,7 @@ describe("quota MCP server", () => {
             kind: "session",
             percentLeft: 23,
             resetAtIso: "2026-07-13T02:59:00.000Z",
-            scope: "provider",
+            scope: { provider: "claude" },
           },
         ]);
       });
@@ -1955,7 +2180,8 @@ describe("quota MCP server", () => {
                   label: "Sonnet (weekly)",
                   kind: "weekly",
                   usedPercent: 50,
-                  scope: "model",
+                  scope: "provider",
+                  models: [],
                 },
               ],
             }),
@@ -1981,7 +2207,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 60,
             resetAtIso: "2026-08-27T10:00:00.000Z",
-            scope: "provider",
+            scope: { provider: "claude" },
           },
         ]);
         expect(parsed.explanations).toEqual([]);
@@ -2081,7 +2307,7 @@ describe("quota MCP server", () => {
               kind: "weekly",
               percentLeft: 60,
               resetAtIso: "2030-01-01T00:00:00.000Z",
-              scope: "provider",
+              scope: { provider: "codex" },
             },
           ],
         });
@@ -2089,6 +2315,42 @@ describe("quota MCP server", () => {
           expect.arrayContaining([expect.objectContaining({ rule: "carried_forward_bad_read" })])
         );
         expect(carriedForward).toEqual(inferredCurrent);
+      });
+
+      it("does not let a parse failure promote hydrated model-only history into provider state", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [{ label: "broken", kind: "weekly", scope: "provider" }],
+            }),
+        });
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus: vi.fn().mockResolvedValue("malformed current Codex panel"),
+          now: () => Date.parse("2030-01-01T00:00:01.000Z"),
+          ttlMs: 0,
+        });
+        service.hydrate("codex", {
+          provider: "codex",
+          status: "available",
+          scrapedAt: "2030-01-01T00:00:00.000Z",
+          limits: [
+            {
+              label: "Spark weekly",
+              kind: "weekly",
+              percentLeft: 100,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: { provider: "codex", models: ["gpt-spark"] },
+            },
+          ],
+        });
+
+        await expect(service.getQuota("codex")).resolves.toMatchObject({
+          status: "unknown",
+          limits: undefined,
+        });
       });
 
       it("persists a malformed current Codex parse as unknown and fails closed without limits when prior reading has expired", async () => {
@@ -2225,14 +2487,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 99,
             resetAtIso: "2026-07-14T23:32:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
           {
             label: "Weekly limit",
             kind: "weekly",
             percentLeft: 58,
             resetAtIso: "2026-07-14T12:34:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
         ]);
       });
@@ -2468,7 +2730,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 0,
             resetAtIso: "2026-07-07T12:25:00.000Z",
-            scope: "provider",
+            scope: { provider: "codex" },
           },
         ]);
       });
@@ -2708,7 +2970,7 @@ describe("quota MCP server", () => {
           label: "Session",
           kind: "session",
           percentLeft: 88,
-          scope: "provider",
+          scope: { provider: "claude" },
         });
         expect(parsed.limits?.[0].resetAtIso).toBeDefined();
         expect(parsed.limits?.[1]).toMatchObject({
@@ -2716,7 +2978,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 55,
           resetAtIso: "2026-07-13T02:59:00.000Z",
-          scope: "provider",
+          scope: { provider: "claude" },
         });
       });
     });
@@ -2741,7 +3003,7 @@ describe("quota MCP server", () => {
               label: "Session (model)",
               kind: "session",
               percentLeft: 30,
-              scope: "model",
+              scope: { provider: "claude", models: ["claude-fable"] },
             },
           ],
         };
@@ -2822,6 +3084,33 @@ describe("quota MCP server", () => {
         expect(inferred.status).toBe("exhausted");
         expect(inferred.limits?.[0].resetAtIso).toBe(resetIso);
         expect(inferred.limits?.[0].percentLeft).toBe(0);
+      });
+
+      it("carried_forward_bad_read: never promotes model-only history into provider availability", () => {
+        const t0Iso = "2026-08-20T10:00:00.000Z";
+        const t1Iso = "2026-08-20T12:00:00.000Z";
+        const previousState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Fable weekly",
+              kind: "weekly",
+              percentLeft: 80,
+              resetAtIso: "2026-08-27T10:00:00.000Z",
+              scope: { provider: "claude", models: ["claude-fable"] },
+            },
+          ],
+        };
+
+        expect(
+          inferQuotaState(
+            { provider: "claude", status: "unknown", scrapedAt: t1Iso, limits: [] },
+            previousState,
+            t1Iso
+          )
+        ).toMatchObject({ status: "unknown", limits: [] });
       });
 
       it("carried_forward_bad_read: carries forward unexpired resetAtIso when subsequent parse misses reset timestamp for an active window ", () => {
@@ -2960,6 +3249,82 @@ describe("quota MCP server", () => {
             detail: "carried forward previous unexpired window reset after missing reading",
           },
         ]);
+      });
+
+      it("carried_forward_bad_read: Step 3 never crosses canonical model window scopes", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const fableResetIso = "2026-08-26T15:00:00.000Z";
+        const sparkResetIso = "2026-08-26T16:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Fable Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: fableResetIso,
+              scope: { provider: "claude", models: ["claude-fable"] },
+            },
+            {
+              label: "Spark Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: sparkResetIso,
+              scope: { provider: "claude", models: ["claude-spark"] },
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "Spark Weekly",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: { provider: "claude", models: ["claude-spark"] },
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        expect(inferred.limits?.[0].resetAtIso).toBe(sparkResetIso);
+      });
+
+      it("carried_forward_bad_read: Step 3 never crosses providers", () => {
+        const previousState: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: "2026-08-26T15:00:00.000Z",
+              scope: { provider: "claude" },
+            },
+          ],
+        };
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: { provider: "codex" },
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, previousState, "2026-08-26T11:00:00.000Z");
+        expect(inferred.limits?.[0].resetAtIso).toBeUndefined();
       });
 
       it("invariant: empty explanations list => inferred_parsed_state equals parsed_state", () => {

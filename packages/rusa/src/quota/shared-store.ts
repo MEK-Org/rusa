@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import { parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   assertQuotaSchemaVersion,
   QUOTA_SCHEMA_VERSION,
@@ -14,6 +15,9 @@ import {
 import { isProviderScopedWindow } from "./window-scope.js";
 
 export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError };
+// Maintenance scripts consume this bundled shared-store artifact, so expose
+// the one persistence decoder/writer rather than duplicating JSON handling.
+export { parseParsedState, serializeParsedState } from "./parsed-state.js";
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -86,15 +90,6 @@ function hasValidReset(observation: Pick<CanonicalQuotaObservation, "observedAt"
   const observed = Date.parse(observation.observedAt);
   const reset = Date.parse(observation.resetAtIso);
   return Number.isFinite(observed) && Number.isFinite(reset) && reset > observed;
-}
-
-function parsedSnapshot(value: string | null): ProviderQuotaSnapshot | null {
-  if (!value) return null;
-  try {
-    return JSON.parse(value) as ProviderQuotaSnapshot;
-  } catch {
-    return null;
-  }
 }
 
 export interface CanonicalQuotaObservation {
@@ -346,7 +341,7 @@ export class SharedQuotaStore {
     this.db.transaction(() => {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
-        .run(JSON.stringify(inferredState), id);
+        .run(serializeParsedState(inferredState), id);
       this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
     })();
     if (this.controllerOptions) {
@@ -370,7 +365,7 @@ export class SharedQuotaStore {
       )
       .all(provider, sinceIso) as StoredScrapeRow[];
     return rows.map((row) => {
-      const state = parsedSnapshot(row.parsed_state);
+      const state = parseParsedState(row.parsed_state);
       return {
         id: row.id,
         provider: row.provider,
@@ -420,7 +415,7 @@ export class SharedQuotaStore {
       )
       .get(provider) as { parsed_state: string } | undefined;
     if (!row) return null;
-    return parsedSnapshot(row.parsed_state);
+    return parseParsedState(row.parsed_state);
   }
 
   /** Advance every unprocessed observation exactly once across all connections. */

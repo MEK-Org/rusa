@@ -59,9 +59,11 @@ Minimal example:
     secret: GENERATED_SECRET
     externalUrl: https://example.ngrok-free.app/webhook
 
-  # Optional single-user Google login. Omit auth for unauthenticated local mode.
+  # Optional Google login. All admitted users share full operator access.
+  # Omit auth for unauthenticated local mode.
   # auth:
   #   email: owner@example.com
+  #   # Or replace email with allowedEmails: [owner@example.com, colleague@example.com]
   #   firebase:
   #     projectId: example-project
   #     apiKey: YOUR_FIREBASE_WEB_API_KEY
