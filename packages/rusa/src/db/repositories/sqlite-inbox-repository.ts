@@ -58,30 +58,42 @@ function toEntry(row: InboxRow): InboxEntry {
   };
 }
 
-export interface SqliteInboxRepositoryOptions {
-  /**
-   * Receives an error thrown by an `onItemsAppended` listener. The notification
-   * is advisory, so a listener failure is reported here rather than surfaced to
-   * the appending caller, whose write has already committed.
-   */
-  onListenerError?: (error: unknown) => void;
-}
+/**
+ * Receives an error thrown by an `onItemsAppended` listener. The notification
+ * is advisory, so a listener failure is reported here rather than surfaced to
+ * the appending caller, whose write has already committed.
+ */
+export type InboxListenerErrorHandler = (error: unknown) => void;
 
 /** SQLite implementation of the actor inbox persistence seam. */
 export class SqliteInboxRepository implements InboxRepository {
   private readonly listeners = new Set<InboxItemsAppendedListener>();
-  private readonly onListenerError: (error: unknown) => void;
+  private onListenerError: InboxListenerErrorHandler = () => {};
 
   constructor(
     private readonly db: Database.Database,
-    private readonly now: () => Date = () => new Date(),
-    options: SqliteInboxRepositoryOptions = {}
-  ) {
-    this.onListenerError = options.onListenerError ?? (() => {});
+    private readonly now: () => Date = () => new Date()
+  ) {}
+
+  /**
+   * Journal listener failures. Set from the composition root the way
+   * `ActorMesh`'s own log is, so a dropped advisory nudge is visible in the
+   * running service rather than only under test; until it is set, a failure is
+   * contained silently and durable recovery remains the authority.
+   */
+  setListenerErrorHandler(handler: InboxListenerErrorHandler): void {
+    this.onListenerError = handler;
   }
 
   append(inputs: InboxAppendInput[]): InboxEntry[] {
     if (inputs.length === 0) return [];
+    // Inside an enclosing transaction the write would be only a savepoint whose
+    // fate the outer caller decides, so no after-commit notification could be
+    // honest, and a silently deferred row is reconciled only by the next
+    // boot/resume sweep. Refuse before any write rather than defer.
+    if (this.db.inTransaction) {
+      throw new Error("inbox append must not run inside an enclosing transaction");
+    }
     const insert = this.db.prepare(
       `INSERT INTO actor_inbox_entries
         (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
@@ -119,10 +131,10 @@ export class SqliteInboxRepository implements InboxRepository {
     const inserted = rows
       .filter((row) => insertedIds.has(row.id))
       .map((row) => ({ ...row, seenAt: null, handledAt: null, handledNote: null }));
-    // Notify only once the rows are durable. Inside an enclosing transaction
-    // the write above is merely a savepoint whose fate the outer caller decides,
-    // so stay silent and let actorsWithUnhandled() reconciliation find the rows.
-    if (inserted.length > 0 && !this.db.inTransaction) this.notifyItemsAppended(inserted);
+    // Notify only once the rows are durable: the transaction above has
+    // committed, and nothing here is awaited, so the appending caller's own
+    // wake still follows in the same turn.
+    if (inserted.length > 0) this.notifyItemsAppended(inserted);
     return inserted;
   }
 

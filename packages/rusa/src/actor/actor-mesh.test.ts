@@ -122,7 +122,17 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         }))
         .filter((row) => !entries.some((existing) => existing.id === row.id));
       entries.push(...inserted);
-      if (inserted.length > 0) for (const listener of listeners) listener(inserted);
+      // Mirror SqliteInboxRepository: snapshot so an unsubscribe from inside a
+      // callback cannot skip a sibling, and contain a throwing listener.
+      if (inserted.length > 0) {
+        for (const listener of [...listeners]) {
+          try {
+            listener(inserted);
+          } catch {
+            // advisory: the fake, like production, never fails the append
+          }
+        }
+      }
       return inserted;
     },
     onItemsAppended: (listener) => {

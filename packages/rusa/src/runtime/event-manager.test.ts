@@ -55,7 +55,17 @@ class FakeInboxStore implements InboxRepository {
       this.entries.push(entry);
       inserted.push(entry);
     }
-    if (inserted.length > 0) for (const listener of this.listeners) listener(inserted);
+    // Mirror SqliteInboxRepository: snapshot so an unsubscribe from inside a
+    // callback cannot skip a sibling, and contain a throwing listener.
+    if (inserted.length > 0) {
+      for (const listener of [...this.listeners]) {
+        try {
+          listener(inserted);
+        } catch {
+          // advisory: the fake, like production, never fails the append
+        }
+      }
+    }
     return inserted;
   }
 

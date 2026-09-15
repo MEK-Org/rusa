@@ -8,6 +8,7 @@ import type { InboxEntry } from "../../repositories/inbox-repository.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
+import { Repositories } from "./index.js";
 import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
 describe("SqliteInboxRepository", () => {
@@ -247,28 +248,23 @@ describe("SqliteInboxRepository", () => {
       expect(store.actorsWithUnhandled()).toEqual([]);
     });
 
-    it("stays silent inside an enclosing transaction, whose outcome it cannot see", () => {
-      // Nested in an outer transaction the append is only a savepoint: it is
-      // not durable until the outer commit, and vanishes on an outer rollback.
-      // Either way durable recovery through actorsWithUnhandled() is the
-      // authority, so the advisory notification is withheld rather than lied.
+    it("refuses to append inside an enclosing transaction rather than defer notice to boot", () => {
+      // Nested in an outer transaction the write would be only a savepoint,
+      // so the after-commit notification could never be honest, and the only
+      // reconciliation of a silently deferred row is the next boot/resume
+      // sweep. Fail loudly before any write instead.
       const listener = vi.fn();
       store.onItemsAppended(listener);
 
       expect(() =>
         db.transaction(() => {
-          store.append([entry("doomed")]);
-          throw new Error("outer rollback");
+          store.append([entry("nested")]);
         })()
-      ).toThrow(/outer rollback/);
+      ).toThrow(/enclosing transaction/);
       expect(listener).not.toHaveBeenCalled();
-      expect(store.read("actor-a", "doomed")).toBeNull();
-
-      db.transaction(() => {
-        store.append([entry("committed-later")]);
-      })();
-      expect(listener).not.toHaveBeenCalled();
-      expect(store.actorsWithUnhandled()).toEqual([{ actorId: "actor-a", priority: "normal" }]);
+      expect(store.list("actor-a", { status: "all" }).entries).toEqual([]);
+      expect(store.actorsWithUnhandled()).toEqual([]);
+      expect(db.inTransaction).toBe(false);
     });
 
     it("stops notifying an unsubscribed listener while others keep receiving", () => {
@@ -288,9 +284,7 @@ describe("SqliteInboxRepository", () => {
 
     it("contains a throwing subscriber: the write stands and later subscribers still run", () => {
       const errors: unknown[] = [];
-      store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"), {
-        onListenerError: (error) => errors.push(error),
-      });
+      store.setListenerErrorHandler((error) => errors.push(error));
       const after = vi.fn();
       store.onItemsAppended(() => {
         throw new Error("listener boom");
@@ -307,6 +301,24 @@ describe("SqliteInboxRepository", () => {
       expect(store.actorsWithUnhandled()).toEqual([{ actorId: "actor-a", priority: "normal" }]);
     });
 
+    it("reaches the journal the composition root wires, not only a test hook", () => {
+      // Repositories owns the concrete instance and exposes exactly this seam,
+      // which runStart points at the application logger; a listener failure is
+      // therefore recorded in the running service, not silently dropped.
+      const repositories = new Repositories(db);
+      const journaled: unknown[] = [];
+      repositories.setInboxListenerErrorHandler((error) => journaled.push(error));
+      repositories.inbox.onItemsAppended(() => {
+        throw new Error("listener boom");
+      });
+
+      const inserted = repositories.inbox.append([entry("kept-by-container")]);
+
+      expect(inserted.map((row) => row.id)).toEqual(["kept-by-container"]);
+      expect(journaled).toHaveLength(1);
+      expect((journaled[0] as Error).message).toBe("listener boom");
+    });
+
     it("recovers through actorsWithUnhandled() when no notification was delivered", () => {
       // Rows written before any listener existed, or whose callback was
       // dropped, are still found by the durable boot reconciliation query.
@@ -316,6 +328,7 @@ describe("SqliteInboxRepository", () => {
       });
       store.onItemsAppended(dropped);
       store.append([entry("dropped-callback", "actor-b")]);
+      expect(dropped).toHaveBeenCalledTimes(1);
 
       const reopened = new SqliteInboxRepository(db);
       expect(reopened.actorsWithUnhandled()).toEqual([
