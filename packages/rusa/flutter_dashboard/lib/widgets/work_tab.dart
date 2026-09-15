@@ -1532,67 +1532,30 @@ class _DetailViewState extends State<_DetailView> {
     if (o.isTerminal) {
       return titleAndStatus;
     }
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        // SelectableText's RenderEditable expands to a loose Wrap constraint,
-        // so measure its rendered text width to keep the controls adjacent.
-        final defaultTextStyle = DefaultTextStyle.of(context);
-        final effectiveTitleStyle = defaultTextStyle.style
-            .merge(titleStyle)
-            .merge(
-              TextStyle(
-                height: MediaQuery.maybeLineHeightScaleFactorOverrideOf(
-                  context,
-                ),
-                letterSpacing: MediaQuery.maybeLetterSpacingOverrideOf(context),
-                wordSpacing: MediaQuery.maybeWordSpacingOverrideOf(context),
-              ),
-            );
-        final intrinsicTitleWidth = TextPainter.computeMaxIntrinsicWidth(
-          text: TextSpan(text: o.heading, style: effectiveTitleStyle),
-          textDirection: Directionality.of(context),
-          textAlign: defaultTextStyle.textAlign ?? TextAlign.start,
-          textScaler: MediaQuery.textScalerOf(context),
-          locale: Localizations.maybeLocaleOf(context),
-          strutStyle: const StrutStyle(),
-          textWidthBasis: defaultTextStyle.textWidthBasis,
-          textHeightBehavior:
-              defaultTextStyle.textHeightBehavior ??
-              DefaultTextHeightBehavior.maybeOf(context),
-        );
-        // RenderEditable reserves a 1px caret gap and SelectableText's 2px
-        // cursor, so give the rendered title those same three pixels.
-        final titleWidth =
-            (intrinsicTitleWidth + 3).ceilToDouble() > constraints.maxWidth
-            ? constraints.maxWidth
-            : (intrinsicTitleWidth + 3).ceilToDouble();
-        final title = SizedBox(
-          width: titleWidth,
+    return Wrap(
+      alignment: WrapAlignment.start,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      runSpacing: 4,
+      spacing: 8,
+      children: [
+        IntrinsicWidth(
           child: SelectableText(
             o.heading,
             key: const ValueKey('obligation-detail-title'),
             maxLines: 2,
             style: titleStyle,
+            textWidthBasis: TextWidthBasis.longestLine,
           ),
-        );
-        return Wrap(
+        ),
+        Wrap(
+          key: const ValueKey('obligation-detail-actions'),
           alignment: WrapAlignment.start,
           crossAxisAlignment: WrapCrossAlignment.center,
           runSpacing: 4,
           spacing: 8,
-          children: [
-            title,
-            Wrap(
-              key: const ValueKey('obligation-detail-actions'),
-              alignment: WrapAlignment.start,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              runSpacing: 4,
-              spacing: 8,
-              children: [status, ...actions],
-            ),
-          ],
-        );
-      },
+          children: [status, ...actions],
+        ),
+      ],
     );
   }
 }
