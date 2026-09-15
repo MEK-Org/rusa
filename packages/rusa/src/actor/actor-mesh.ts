@@ -2671,11 +2671,15 @@ export class ActorMesh {
    * manager's normalize/route/append is synchronous, so nothing can retire
    * between resolution, persistence, and the wake.
    */
-  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
+  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<DurableEventDelivery> {
     if (!this.eventManager) {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
-    this.notifyPersistedInboxEntries(this.eventManager.handleExternalEvent(raw), raw.priority);
+    const delivery = this.eventManager.handleExternalEvent(raw);
+    this.notifyPersistedInboxEntries(delivery, raw.priority);
+    // Returned so a host-level alarm can tell an uncovered drop from a delivery
+    // and fall back to its own channel rather than trusting mesh routing (#481).
+    return delivery;
   }
 
   /**

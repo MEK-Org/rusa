@@ -43,10 +43,12 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
   });
 
-  it("documents disk-alert routing as implicit instead of a separate config knob", () => {
+  it("documents disk-alert routing as derived from the sensor, not a separate config knob", () => {
     expect(CONFIG_DOCS).toContain(
-      "Configuring this section implicitly subscribes root to responsive system.disk events"
+      "root is subscribed to\n  responsive system.disk events on exactly the same condition"
     );
+    expect(CONFIG_DOCS).toContain("falls back to chat.errorChat");
+    expect(CONFIG_DOCS).toContain("Default: 10 when neither threshold is set");
     expect(CONFIG_DOCS).not.toContain("kind: system");
   });
 

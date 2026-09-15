@@ -264,9 +264,9 @@ export interface DiskAlertConfig {
   enabled?: boolean;
   /** The path to the relevant volume to check. Defaults to "/". */
   volume?: string;
-  /** Free disk space percentage threshold (0-100). Defaults to undefined. */
+  /** Free disk space percentage threshold (0-100). Defaults to 10 when neither threshold is set. */
   thresholdPercent?: number;
-  /** Free disk space threshold in bytes. Evaluated along with thresholdPercent if both are set. Defaults to 2G (2,147,483,648 bytes) when neither threshold is set. */
+  /** Free disk space threshold in bytes. Evaluated along with thresholdPercent if both are set. Defaults to undefined; set it for an absolute floor alongside or instead of the percentage. */
   thresholdBytes?: number;
   /** Scan interval in seconds. Defaults to 600 (10 mins). */
   intervalSeconds?: number;
