@@ -138,9 +138,9 @@ describe("diffQuota — the burn, or an explicit refusal ", () => {
     expect(burn.windows.every((w) => w.note === null)).toBe(true);
   });
 
-  it("REFUSES when both readings carry the same scrapedAt — the TTL cache trap", async () => {
-    // codex's quota TTL is 30 minutes, longer than a short A/B run. A before/after pair
-    // through one cached service returns the identical snapshot twice.
+  it("REFUSES when both readings carry the same scrapedAt — no new observation, not a zero delta", async () => {
+    // The coordinator serves its last observation; a run shorter than its tick reads the
+    // identical snapshot at both ends (as a TTL-cached service once did).
     const cached = kimiSnapshot(AT_LAUNCH, 100, 46);
     const burn = diffQuota(await capture("launch", cached), await capture("exit", cached));
 
@@ -151,7 +151,8 @@ describe("diffQuota — the burn, or an explicit refusal ", () => {
     expect(burn.windows).toHaveLength(2);
     expect(burn.windows.every((w) => w.consumedPoints === null)).toBe(true);
     if (burn.computed) throw new Error("unreachable");
-    expect(burn.reason).toContain("served from the quota TTL cache");
+    expect(burn.reason).toContain("NO MEASUREMENT");
+    expect(burn.reason).toContain("no new quota observation");
     expect(burn.reason).toContain(AT_LAUNCH);
   });
 

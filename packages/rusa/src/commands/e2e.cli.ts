@@ -149,6 +149,11 @@ program
     Number.parseInt(v, 10)
   )
   .option("--native-conv-path <path>", "Native variant's provider conversation store (size proxy)")
+  .option(
+    "--quota-socket <path>",
+    "Quota coordinator socket the run's launch/exit readings are read from " +
+      "(default: the base config home's quota.coordinator.socketPath, else the host default)"
+  )
   .action(
     async (opts: {
       root?: string;
@@ -167,8 +172,9 @@ program
       outDir?: string;
       shuffleSeed?: number;
       nativeConvPath?: string;
+      quotaSocket?: string;
     }) => {
-      await runProviderContextAB(opts);
+      await runProviderContextAB({ ...opts, quotaSocketPath: opts.quotaSocket });
     }
   );
 
