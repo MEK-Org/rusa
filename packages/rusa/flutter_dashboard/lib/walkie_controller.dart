@@ -31,7 +31,7 @@ final class UserMemoEntry extends WalkieEntry {
   final bool delivered;
 }
 
-/// One actor reply that has finished playing.
+/// One actor reply received during this walkie session.
 final class ActorReplyEntry extends WalkieEntry {
   const ActorReplyEntry({required super.timestamp, required this.announcement});
 
@@ -158,9 +158,15 @@ class WalkieController {
   ValueStream<VoiceAnnouncement?> get lastPlayed => _lastPlayed.stream;
   ValueStream<String?> get lastError => _lastError.stream;
 
-  /// Running session transcript : grows as memos are delivered and
-  /// replies are played. Starts empty each time the mode is enabled.
+  /// Running session transcript : grows as memos and replies are received.
+  /// Starts empty each time the mode is enabled.
   ValueStream<List<WalkieEntry>> get transcript => _transcript.stream;
+
+  /// Whether this session has received an assistant reply that Replay can
+  /// target. This intentionally follows receipt, rather than playback
+  /// completion: a stalled clip is still the reply the operator heard last.
+  bool get hasReceivedReply =>
+      _transcript.value.any((entry) => entry is ActorReplyEntry);
 
   /// null = not yet probed, false = voice unconfigured on this instance (503)
   /// → the toggle renders disabled with an explanatory label.
@@ -388,6 +394,11 @@ class WalkieController {
     if (!_seenIds.add(frame.id)) return; // already played or queued
     _queue.add(_QueueItem(frame));
     _queueDepth.add(_queue.length);
+    // Receipt owns the transcript row. Playback only updates that stable row,
+    // so a stalled or replayed clip cannot disappear or append a duplicate.
+    _appendTranscript(
+      ActorReplyEntry(timestamp: DateTime.now(), announcement: frame),
+    );
     unawaited(_drain());
   }
 
@@ -409,10 +420,6 @@ class WalkieController {
         if (_disposed) return;
         _nowPlaying.add(null);
         _lastPlayed.add(item.frame);
-        // Record the played reply in the session transcript .
-        _appendTranscript(
-          ActorReplyEntry(timestamp: DateTime.now(), announcement: item.frame),
-        );
         // Turned off mid-play: leave it unacked so it replays next mode entry.
         if (!_enabled.value) break;
         if (item.ackNeeded) {
@@ -441,13 +448,43 @@ class WalkieController {
     _deps.player.stop();
   }
 
-  /// Queue the most recently played announcement again (no re-ack).
+  /// Replay the latest received assistant reply, including one that is loading
+  /// or stalled. Receipt, not completion, is the operator-visible ordering.
   void replayLast() {
-    final last = _lastPlayed.value;
-    if (last == null || !_enabled.value) return;
-    _queue.insert(0, _QueueItem(last, ackNeeded: false));
+    VoiceAnnouncement? latest;
+    for (final entry in _transcript.value.reversed) {
+      if (entry case ActorReplyEntry(:final announcement)) {
+        latest = announcement;
+        break;
+      }
+    }
+    if (latest != null) replayAnnouncement(latest);
+  }
+
+  /// Bring a received reply to the front of playback without adding another
+  /// transcript row. Used by the Replay control and by taps on older rows.
+  void replayAnnouncement(VoiceAnnouncement announcement) {
+    if (!_enabled.value || _disposed) return;
+    final received = _transcript.value.any(
+      (entry) =>
+          entry is ActorReplyEntry && entry.announcement.id == announcement.id,
+    );
+    if (!received) return;
+    // An already-queued target moves rather than plays twice, and keeps its
+    // pending first-play ack. A reply that has already started or finished
+    // owns its own server acknowledgement, so a replay never acks again.
+    final queuedIndex = _queue.indexWhere(
+      (item) => item.frame.id == announcement.id,
+    );
+    final ackNeeded =
+        queuedIndex >= 0 && _queue.removeAt(queuedIndex).ackNeeded;
+    _queue.insert(0, _QueueItem(announcement, ackNeeded: ackNeeded));
     _queueDepth.add(_queue.length);
-    unawaited(_drain());
+    if (_nowPlaying.value != null) {
+      _deps.player.stop();
+    } else {
+      unawaited(_drain());
+    }
   }
 
   // ── Record flow (tap-toggle) ──
