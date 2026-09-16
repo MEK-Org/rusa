@@ -13,24 +13,30 @@ output of the drill script in this repository, not a worked example.
 
 ## 1. Units
 
-`rusa install-quota-coordinator` writes two `systemd --user` units per
-environment, named after the instance's service basename:
+In the target architecture, the coordinator is provisioned once per **pool** —
+the set of instances sharing a quota database — and instances across
+environments (such as production and staging) are clients of that single shared
+coordinator.
+
+Today, the shipped installer (`packages/rusa/src/commands/install-service.ts`)
+installs coordinator units per environment (`rusa install-quota-coordinator --environment <env>`),
+deriving unit names from the instance's service basename (`<serviceBasename>-quota-coordinator.service`).
+In a multi-environment pool on a shared host, the coordinator is provisioned once
+for the pool, and other environments connect to its shared socket as clients rather
+than running duplicate coordinators. Decoupling unit installation from instance/environment
+basenames into an independent pool-level installer is tracked as a follow-up gap.
+
+The coordinator runs under two `systemd --user` units:
 
 | Unit | Role |
 | --- | --- |
-| `<basename>-quota-coordinator.service` | the coordinator itself (`rusa quota-coordinator --home <RUSA_HOME>`) |
-| `<basename>-quota-coordinator-alert.service` | `OnFailure=` companion; notifies through the configured error chat |
+| `<serviceBasename>-quota-coordinator.service` | the coordinator itself (`rusa quota-coordinator --home <RUSA_HOME>`) |
+| `<serviceBasename>-quota-coordinator-alert.service` | `OnFailure=` companion; notifies through the configured error chat |
 
 ```bash
-# Production; --environment staging installs the staging pair instead.
 rusa install-quota-coordinator
 rusa install-quota-coordinator --no-restart      # write and enable, start later
 ```
-
-One coordinator per **pool** — the set of instances sharing a quota database.
-It is a separate command from `rusa install-service` for that reason: installing
-it implicitly with every instance would start a second collector against the
-same providers, which is the duplicate probing the coordinator exists to remove.
 
 ### What the unit carries, and why
 
@@ -86,6 +92,142 @@ curl --unix-socket "$XDG_RUNTIME_DIR/rusa-quota/coordinator.sock" \
 carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 `lastAttemptAt`, `error`). A coordinator whose probes are broken still passes
 `healthz` — that asymmetry is the point, and drill 2 rehearses it.
+
+### #499 staging proof and the stage-3 handoff
+
+The shipped coordinator has no probe-off switch, and the shipped client has no
+compare-only mode: configuring its socket selects the normal client path and
+applies the coordinator publication. The probe-off stage and compare-only stage
+in the design are still follow-up work ([#502](https://github.com/MEK-Org/rusa/issues/502)
+and [#503](https://github.com/MEK-Org/rusa/issues/503)); neither was executed by
+#499.
+
+Instead, #499 used a separate staging coordinator with a fresh staging database
+and its normal probe loop to prove probing outside the instance, then exercised
+the ordinary production client under real staging traffic. Before the
+synchronized stage-3 flip, verify that `/v1/readyz` reports `ready: true` and
+that each configured provider lane in `scrapes[provider]` has `status: "ok"`.
+The pre-flip gate requires all four quota lanes (`claude`, `codex`, `agy`, and
+`kimi`) to report successful (`ok`) scrapes. Treat an `unknown`, absent, or
+unrecorded provider (or any provider reporting `error` or `pending`) as a
+failed gate, not as a healthy provider. The recorded staging result establishes
+a successful `claude` scrape only; it makes no health claim for the other three.
+(Note: while `kimi` is unsupported for dashboard UI header ring probing due to
+auth-mutation concerns in `config/types.ts:188`, the coordinator's collection loop
+includes `kimi` in `QUOTA_THROTTLE_PROVIDERS` via `QuotaService` /
+`scrapeKimiUsage`; if kimi is unconfigured or failing, the gate does not pass.)
+
+The operator's rollout decision for #501 (documented in PR #504) supersedes the
+stage-3 legacy-DB relocation: the copied database already serving the shared
+coordinator becomes authoritative during canary. Accept divergence between
+legacy production and the coordinator database; do not reconcile or replace it
+from legacy production. When both the legacy database and the coordinator
+database exist simultaneously during canary, running `--relocate` is avoided:
+`relocateQuotaDatabase` (`packages/rusa/src/quota/relocate.ts`) enforces a safety
+interlock that explicitly refuses if the target database already exists
+(`Target database path already exists`). Instead, old instances are quiesced, the
+legacy database is backed up and archived, and the path fence is created
+directly at the legacy path.
+
+#### Final handoff procedure
+
+1. **Stop and fence old instance writers:** Stop production instances to ensure
+   no new transactions are written to the legacy SQLite database.
+2. **Take and verify legacy backup:** Take and verify a self-contained backup of
+   the stopped legacy database using the shipped command:
+   ```bash
+   rusa quota-backup --database /path/to/legacy/quota.db
+   ```
+3. **Preserve coordinator DB:** Leave the live coordinator database untouched.
+   The copied DB already serving the shared coordinator remains authoritative.
+   Do not reconcile or replace it from legacy production.
+4. **Archive legacy database:** Move the legacy `quota.db` plus any associated
+   `-wal` and `-shm` files into a recoverable archive location.
+5. **Create the path fence:** Create the exact empty mode-0700 directory at the
+   legacy path:
+   ```bash
+   mkdir -m 0700 /path/to/legacy/quota.db
+   ```
+   Any legacy instance process attempting to open the legacy path fails
+   immediately with `EISDIR`/`SQLITE_CANTOPEN`.
+6. **Switch production config:** Switch production instance configuration to
+   the already-running shared socket (`quota.coordinator.socketPath`), clearing
+   or omitting `quota.databasePath` for instances.
+7. **Verify client operation:** Verify that `/v1/readyz` passes for all
+   configured providers, check published throttle values on `/v1/throttle`, and
+   verify client launch pacing under real traffic.
+8. **Repoint staging to the shared coordinator and remove temporary staging unit:**
+   Repoint staging configuration (`config.yaml`) to the shared production
+   coordinator socket (`quota.coordinator.socketPath`).
+   To remove the temporary staging coordinator service and revert the staging
+   instance's unit ordering:
+   a. Stop and disable the temporary staging coordinator and alert units:
+      ```bash
+      systemctl --user stop <staging-basename>-quota-coordinator.service <staging-basename>-quota-coordinator-alert.service
+      systemctl --user disable <staging-basename>-quota-coordinator.service <staging-basename>-quota-coordinator-alert.service
+      ```
+   b. Remove the staging coordinator unit files from `~/.config/systemd/user/`:
+      ```bash
+      rm -f ~/.config/systemd/user/<staging-basename>-quota-coordinator.service \
+            ~/.config/systemd/user/<staging-basename>-quota-coordinator-alert.service
+      ```
+   c. Remove the `After=` and `Wants=` coordinator ordering lines from the staging
+      instance unit (`~/.config/systemd/user/<staging-basename>.service`):
+      Remove `After=<staging-basename>-quota-coordinator.service` and
+      `Wants=<staging-basename>-quota-coordinator.service` (or re-run
+      `rusa install-service --environment staging --no-restart`).
+   d. Reload the systemd user daemon:
+      ```bash
+      systemctl --user daemon-reload
+      systemctl --user reset-failed
+      ```
+   e. Restart the staging instance to begin consuming the shared production coordinator socket:
+      ```bash
+      systemctl --user restart <staging-basename>.service
+      ```
+   The end state is one coordinator per pool, with staging instances connecting
+   to the shared pool socket as clients.
+
+#### Rollback procedure
+
+If the flip must be rolled back:
+1. **Preserve coordinator DB:** Leave the live coordinator database untouched.
+2. **Stop production client:** Stop production instances (`systemctl --user stop <basename>.service`).
+3. **Stop the shared coordinator:** Stop the shared coordinator unit:
+   ```bash
+   systemctl --user stop <basename>-quota-coordinator.service
+   ```
+   This ensures the coordinator socket is no longer listening. Staging
+   instances connected to this socket fall back to cached throttle pacing or
+   local fallback during this window (or should be stopped if reverting staging
+   concurrently).
+4. **Remove path fence:** Remove the empty directory path fence at the legacy
+   database path:
+   ```bash
+   rmdir /path/to/legacy/quota.db
+   ```
+5. **Restore legacy database:** Restore the legacy database from the verified
+   backup taken in step 2:
+   ```bash
+   rusa quota-restore --database /path/to/legacy/quota.db --from /path/to/backup.db
+   ```
+   *Note:* Restoring via `rusa quota-restore` is preferred over moving the
+   unverified archived files because `quota-restore` executes preflight integrity
+   checks (`assertRestorableDatabase`) and explicitly verifies that the coordinator
+   socket is stopped or unreachable (`isCoordinatorListening` returns false),
+   ensuring no active coordinator writer conflicts with the restore. The
+   coordinator database is preserved untouched for post-mortem inspection,
+   accepting permanent divergence between the coordinator DB and the restored
+   legacy DB.
+6. **Restore legacy config:** Restore legacy instance configuration (re-enabling
+   `quota.databasePath` and clearing `quota.coordinator.socketPath`).
+7. **Restart production:** Restart production instances (`systemctl --user start <basename>.service`)
+   and verify local in-process scraping and pacing resume.
+8. **Coordinator lifecycle after rollback:**
+   If staging is to continue using the shared coordinator, restart the coordinator
+   unit (`systemctl --user start <basename>-quota-coordinator.service`); its database
+   was preserved untouched. If the entire pool is reverting to pre-coordinator
+   operation, leave the coordinator unit stopped and disabled.
 
 ### Configuration
 

@@ -1308,16 +1308,25 @@ Notes on what remains:
 
 ### 8.1 Existing observations and controller state are preserved
 
-There is **no import and no export**. The service opens the same database the
-instances open today and inherits every `quota_scrapes` and `quota_observations`
-row, including `controller_error`, `controller_derivative`,
-`controller_integral`, `uncapped_interval_seconds` and `interval_seconds`. The
-PID controller keeps its memory across the cutover because the rows are never
-rewritten.
+There is **no import and no export**. In the original cutover design, the service
+was planned to open the same database instances opened, inheriting every
+`quota_scrapes` and `quota_observations` row and preserving PID controller memory
+across the cutover via atomic file rename (§8.2).
 
-The flip does **rename** the file (§8.2). A rename within a directory is atomic
-and byte-preserving; it is not a migration, and it is what buys the old-writer
-guarantee below.
+Under the revised rollout procedure, the coordinator runs beforehand against a
+seeded copy (proving probing and serving canary traffic). While both run, the
+coordinator and legacy production accumulate separate scrapes and observations,
+diverging as noted in §8.3 ("the two files' controller histories diverge the
+instant they fork").
+
+Under the operator's rollout decision (reconciled in [#501](https://github.com/MEK-Org/rusa/issues/501)),
+the live database already serving the shared coordinator during canary remains
+authoritative at cutover, accepting this divergence without reconciling or
+replacing it from legacy production. Legacy writers are quiesced, the legacy DB
+is backed up and archived, and the old path is fenced with an empty mode-0700
+directory. When both files already exist, `--relocate` is not run because its
+safety check in `packages/rusa/src/quota/relocate.ts` refuses when the target file
+exists.
 
 One asymmetry to record for the rollback path: while the service owns the file it
 sets `PRAGMA user_version`, which a pre-service build never reads. Rolling back
@@ -1341,18 +1350,29 @@ rolled-back *services* (§5.2), not pre-service instances.
 Filesystem permissions cannot fence it either, as the instances and the service
 run as the same user against the same path.
 
-**The mechanism is the path, not a flag.** The flip relocates the authoritative
-database:
+**The mechanism is the path, not a flag.**
 
-1. `quota.db` is renamed to `quota-coordinator.db` in the same directory —
-   atomic, byte-preserving, all history intact.
-2. The service is configured with the new path. Instances lose
-   `quota.databasePath` entirely and gain `quota.coordinator.socketPath`.
-3. A **directory** is created at the old `quota.db` path. `new Database(path)`
-   against a directory fails with `SQLITE_CANTOPEN`, so an old build started by
+*(Rollout revision: The initial design planned to relocate the legacy database at
+cutover via atomic rename: `quota.db` -> `quota-coordinator.db`. Because the shared
+coordinator is provisioned and run beforehand against its own database during canary,
+cutover instead leaves the running coordinator database authoritative, accepting
+divergence without reconciling from legacy production. Legacy `quota.db` is backed
+up and archived, and the path fence directory is created directly at the legacy
+path.)*
+
+Under the executed procedure, old writers are fenced by archiving the legacy
+`quota.db` (plus any WAL/SHM files) and creating an exact empty mode-0700
+directory at that path:
+
+1. A **directory** is created at the old `quota.db` path:
+   `mkdir -m 0700 /path/to/legacy/quota.db`. `new Database(path)` against a
+   directory fails with `SQLITE_CANTOPEN` / `EISDIR`, so an old build started by
    hand dies at open instead of silently pacing from a freshly created empty
    database. That failure mode — an old instance quietly pacing off an empty
    file — is the one worth engineering against, because it is silent.
+2. Instances drop `quota.databasePath` and switch to the shared
+   `quota.coordinator.socketPath`.
+3. The live coordinator database continues serving untouched.
 
 That is mechanical: it requires no cooperation from the old binary, because the
 old binary cannot reach the file and cannot open what is in its place.
@@ -1381,15 +1401,78 @@ not to do it.
 
 ### 8.3 Canary and rollback
 
-The read-only surface is what makes this rollout unusually cheap, and stage 2 is
-where that shows.
+The original table is the intended rollout design, not a statement that every
+mode is present in the #499 build. The read-only surface makes the planned stage
+2 especially cheap once [#503](https://github.com/MEK-Org/rusa/issues/503)
+ships.
 
 | Stage | Action | Verifies | Rollback |
 | --- | --- | --- | --- |
-| 0 | Install the unit; service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `healthz`/`readyz`, `GET /v1/throttle` matches what the file says and carries the expected `service.protocolMajor`, backups run, metrics appear | Stop and remove the unit. Nothing touched. |
+| 0 | **Planned, not shipped** ([#502](https://github.com/MEK-Org/rusa/issues/502)): install the unit; service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `healthz`/`readyz`, `GET /v1/throttle` matches what the file says and carries the expected `service.protocolMajor`, backups run, metrics appear | Stop and remove the unit. Nothing touched. |
 | 1 | Enable the probe loop, still against the copy. Instances still scraping. | **The probe works outside an instance process** — bwrap, tmux, provider CLI auth, LLM parse (A5, A5a). Compare the copy's observations against the live file's for the same slots. | Disable the probe loop, or stop the unit. |
-| 2 | Point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
-| 3 | The flip (A6). Back up. Stop all instances. Rename the database, create the blocking directory at the old path, point the service at the real file with the probe loop on, start it, start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances, stop the service, remove the directory, rename back, restore `databasePath`, restart. The observation data never changed; see §8.1 on the leftover `user_version`. |
+| 2 | **Planned, not shipped** ([#503](https://github.com/MEK-Org/rusa/issues/503)): point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
+| 3 | **Revised stage-3 flip** (A6; reconciled in [#501](https://github.com/MEK-Org/rusa/issues/501)): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from verified backup (`rusa quota-restore`); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
+
+The #499 staging proof substituted for the two absent modes. It started a
+separate staging coordinator with a fresh staging database and its normal probe
+loop, proving that probing works outside an instance. It then ran the ordinary
+production client path against that coordinator under real staging traffic. That
+client applies the published result; it was not a compare-only canary.
+
+Before the synchronized stage-3 flip, capture `/v1/readyz` with `ready: true`
+and verify each configured provider lane in `scrapes[provider]` has `status: "ok"`.
+The pre-flip gate requires all four quota lanes (`claude`, `codex`, `agy`, and
+`kimi`) to report successful (`ok`) scrapes. An `unknown`, absent, or unrecorded
+provider (or any provider reporting `error` or `pending`) is not healthy and does
+not pass this four-provider gate. The #499 staging observation records a
+successful `claude` scrape only; it does not establish health for the other
+three providers. (Note on `kimi`: while `kimi` is unsupported for dashboard UI
+header ring probing due to auth-mutation concerns in `config/types.ts:188`, the
+coordinator's collection loop includes `kimi` in `QUOTA_THROTTLE_PROVIDERS` via
+`QuotaService` / `scrapeKimiUsage`; if kimi is unconfigured or failing, the gate
+does not pass.)
+
+The operator's rollout decision for #501 (documented in PR #504) supersedes the
+stage-3 legacy-DB relocation: the copied database already serving the shared
+coordinator becomes authoritative during canary. Accept divergence between legacy
+production and the coordinator database; do not reconcile or replace it from
+legacy production. When both the legacy database and the coordinator database exist
+simultaneously during canary, running `--relocate` is avoided: `relocateQuotaDatabase`
+(`packages/rusa/src/quota/relocate.ts`) enforces a safety interlock that explicitly
+refuses if the target database already exists (`Target database path already exists`).
+Instead, old instances are quiesced, the legacy database is backed up and archived,
+and the path fence is created directly at the legacy path.
+
+The final handoff sequence:
+1. Stop old instance writers to quiesce legacy database activity.
+2. Take and verify a self-contained backup of the stopped legacy database with
+   the shipped command: `rusa quota-backup --database <legacy-path>`.
+3. Preserve the live coordinator database untouched (the copied DB already
+   serving the shared coordinator remains authoritative; do not reconcile or
+   replace it from legacy production).
+4. Archive the legacy `quota.db` plus any WAL/SHM files recoverably.
+5. Create the exact empty mode-0700 directory at the legacy path (`quota.db`) as
+   the path fence (`mkdir -m 0700 <legacy-path>`).
+6. Switch production configuration to the already-running shared socket
+   (`socketPath`, omitting `databasePath` for instance writers) and verify
+   `/v1/readyz`, `/v1/throttle`, and client operation under real traffic.
+7. Repoint staging to the production socket, and remove the temporary staging
+   coordinator unit and its instance ordering (`After=`/`Wants=`). The end
+   state is one coordinator per pool, not a dormant staging collector.
+
+Rollback preserves the live coordinator database:
+1. Stop the production client instances.
+2. Stop the shared coordinator unit so its socket is no longer listening
+   (staging instances enter fallback/cached pacing during this downtime).
+3. Remove the empty directory path fence at the legacy database path (`rmdir <legacy-path>`).
+4. Restore the legacy database from the verified backup with
+   `rusa quota-restore --database <legacy> --from <backup>` while the
+   coordinator socket is stopped or unreachable as required by `quota-restore`.
+5. Restore legacy instance configuration (re-enabling `databasePath` and clearing
+   `socketPath`).
+6. Restart production instances.
+7. If staging remains on the coordinator, restart the coordinator unit;
+   otherwise reconfigure staging if reverting the whole pool.
 
 Two things about stage 1, the first of which is settled:
 
@@ -1516,8 +1599,15 @@ Criterion 14 covers this: the harness reads through the service, takes no
 
 ### 9.1 Ownership and units
 
-A fourth `systemd --user` unit alongside the existing per-environment units
-(`packages/rusa/src/commands/install-service.ts`). It should carry the same
+In the target architecture, the coordinator is provisioned once per pool, with
+instances across environments acting as clients. Today, the shipped installer
+and systemd unit generator (`packages/rusa/src/commands/install-service.ts`)
+write units per environment, naming them `<serviceBasename>-quota-coordinator.service`
+from the instance's service basename. Decoupling coordinator unit installation
+from instance/environment basenames into a distinct pool-level installer is
+tracked as a follow-up gap.
+
+The coordinator unit runs alongside the instance units. It carries the same
 treatment the existing units get: journal logging, restart policy, and a
 failure-alert companion unit (`install-service.ts:345-351`).
 
