@@ -23,10 +23,6 @@ import {
  */
 export type PublishedQuotaSnapshot = ProviderQuotaSnapshot & { freshness?: QuotaFreshness };
 
-const TIMESTAMP_PROP: keyof ProviderQuotaSnapshot = ["scr", "apedAt"].join(
-  ""
-) as keyof ProviderQuotaSnapshot;
-
 /**
  * A `/v1/quota` body is only usable when it matches the requested provider and carries
  * the fields needed for provider evidence. For `available` and `exhausted` snapshots, it
@@ -43,15 +39,13 @@ export function isQuotaSnapshotBody(
     provider?: unknown;
     status?: unknown;
     limits?: unknown;
+    scrapedAt?: unknown;
   };
   if (candidate.provider !== requestedProvider) {
     return false;
   }
   if (candidate.status === "available" || candidate.status === "exhausted") {
-    if (
-      typeof (candidate as Record<string, unknown>)[TIMESTAMP_PROP] !== "string" ||
-      !Array.isArray(candidate.limits)
-    ) {
+    if (typeof candidate.scrapedAt !== "string" || !Array.isArray(candidate.limits)) {
       return false;
     }
     return true;
