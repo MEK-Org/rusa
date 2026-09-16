@@ -1009,9 +1009,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = runAccounting.begin;
-  const completeActorRun = runAccounting.complete;
-  const abandonActorRun = runAccounting.abandon;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -2132,16 +2129,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       dir: antigravityScratchDir(),
       listActors: actorLiveness,
     }),
-    // Eagerly generate this actor's avatar on spawn . Strictly
-    // fire-and-forget and failure-isolated inside kickAvatarGeneration — a single
-    // attempt, no retries, never blocks or affects wake/run/retry. Root is
-    // adopted (not spawned), so it never reaches here; it uses the fixed image.
-    onSpawn: (record) =>
-      kickAvatarGeneration(record.id, {
-        apiKey: config.geminiApiKey ?? "",
-        rootId,
-        log: (m) => console.log(`[avatar] ${m}`),
-      }),
+    lifecycleListeners: [
+      {
+        // Eagerly generate an avatar on genuine spawn. Root is adopted, so it
+        // never reaches this listener and continues to use its fixed image.
+        onSpawn: ({ actorId }) =>
+          kickAvatarGeneration(actorId, {
+            apiKey: config.geminiApiKey ?? "",
+            rootId,
+            log: (m) => console.log(`[avatar] ${m}`),
+          }),
+        onRetire: ({ actorId }) => {
+          teardownActorMcp(actorId);
+        },
+      },
+    ],
+    onLifecycleError: (failure) => {
+      runLogger(failure.actorId ?? "unknown", failure.runId).error("lifecycle_listener_error", {
+        event: failure.event,
+        error: failure.error instanceof Error ? failure.error.message : String(failure.error),
+      });
+    },
     onCapabilityGranted: refreshLiveActorMcp,
     // Make capability revocation take effect immediately: unmount the granted
     // endpoint so the actor's next write 404s, rather than waiting for it to be
@@ -2157,9 +2165,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // removeServer closes active transports first (the fail-closed boundary),
       // then refresh the next-run config with any narrowed replacement URL.
       refreshLiveActorMcp(actorId);
-    },
-    onRetire: (record) => {
-      teardownActorMcp(record.id);
     },
     onModelSet: (actorId, newModelConfig) => {
       try {
@@ -2397,9 +2402,121 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        // Which declared candidate actually ran, for the failure-notice label —
-        // set on each onRunStart, read back on that same run's onRunEnd.
+        // Which declared candidate actually ran, for the failure-notice label.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        ctx.lifecycle.add({
+          onStart: (event) => {
+            lastSelected = event.selected;
+            mesh.clearSelection(id);
+            const launchConfig = projectActorRunLaunchConfig(event.selected);
+            runAccounting.begin(id, event.runId, launchConfig);
+          },
+          onEnd: (event) => {
+            if (event.terminal.kind === "abandoned") {
+              if (event.terminal.started) {
+                runAccounting.abandon(id, event.runId, event.terminal.reason);
+              }
+              return;
+            }
+            runAccounting.complete(id, event.runId, event.terminal.result);
+          },
+        });
+        ctx.lifecycle.add({
+          onQueued: (event) => {
+            mesh.recordEvent({
+              kind: "run_queued",
+              actorId: id,
+              detail: event.mode,
+            });
+          },
+          onStart: (event) => {
+            const launchConfig = projectActorRunLaunchConfig(event.selected);
+            runLogger(id, event.runId).info("run_start", {
+              provider: launchConfig.provider,
+              model: launchConfig.model,
+              effort: launchConfig.effort,
+              responsive: event.responsive,
+            });
+            mesh.recordEvent({
+              kind: "run_start",
+              actorId: id,
+              detail: event.injectRecord
+                ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
+                : undefined,
+              body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
+              payload: JSON.stringify({
+                provider: launchConfig.provider,
+                model: launchConfig.model,
+                effort: launchConfig.effort,
+                responsive: event.responsive,
+                runId: event.runId,
+              }),
+            });
+          },
+          onError: (event) => {
+            runLogger(id, event.runId).error("run_error", {
+              error: event.error instanceof Error ? event.error.message : String(event.error),
+            });
+          },
+          onEnd: async (event) => {
+            activeRunSelections.delete(id);
+            if (event.terminal.kind === "abandoned") {
+              runLogger(id, event.runId).warn("run_abandoned", {
+                reason: event.terminal.reason,
+                started: event.terminal.started,
+              });
+              mesh.recordEvent({
+                kind: "run_abandoned",
+                actorId: id,
+                detail: event.terminal.reason,
+                payload: JSON.stringify({
+                  started: event.terminal.started,
+                } satisfies RunAbandonedPayload),
+              });
+              return;
+            }
+            const { result } = event.terminal;
+            logRunEnd(runLogger(id, event.runId), result);
+            mesh.recordEvent({
+              kind: "run_end",
+              actorId: id,
+              success: result.success,
+              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+              body: result.output,
+              payload: runEndPayload({ ...result, runId: event.runId }),
+            });
+          },
+        });
+        ctx.lifecycle.add({
+          onEnd: async (event) => {
+            if (event.terminal.kind === "abandoned") return;
+            const { result } = event.terminal;
+            const compacted = await compactPortableActorAfterRun(id);
+            if (compacted) {
+              mesh.recordEvent({
+                kind: "portable_context_compacted",
+                actorId: id,
+                detail: describeCompaction(compacted),
+                body: JSON.stringify(compacted),
+              });
+            }
+            if (!result.success && !result.capped) {
+              await routeRunFailure(
+                failureSink,
+                id,
+                result,
+                formatProviderLabel(
+                  {
+                    providerName: lastSelected.provider,
+                    model: lastSelected.model,
+                    effort: lastSelected.effort,
+                  },
+                  result.model
+                )
+              );
+            }
+          },
+        });
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -2470,6 +2587,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
           admitRun: ctx.admitRun,
+          lifecycle: ctx.lifecycle,
           onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
@@ -2488,44 +2606,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
             routeContinuationCapped(failureSink, id, n);
           },
-          onQueued: (context) => {
-            ctx.onQueued(context);
-            mesh.recordEvent({
-              kind: "run_queued",
-              actorId: id,
-              detail: context.mode,
-            });
-          },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-          onRunStart: (responsive, injectRecord, selected) => {
-            lastSelected = selected;
-            // The run actually launched: the queued reservation this
-            // describes no longer exists to cancel or report on.
-            mesh.clearSelection(id);
-            const launchConfig = projectActorRunLaunchConfig(selected);
-            const runId = beginActorRun(id, launchConfig);
-            runLogger(id, runId).info("run_start", {
-              provider: launchConfig.provider,
-              model: launchConfig.model,
-              effort: launchConfig.effort,
-              responsive,
-            });
-            mesh.recordEvent({
-              kind: "run_start",
-              actorId: id,
-              detail: injectRecord
-                ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
-                : undefined,
-              body: injectRecord ? JSON.stringify(injectRecord) : undefined,
-              payload: JSON.stringify({
-                provider: launchConfig.provider,
-                model: launchConfig.model,
-                effort: launchConfig.effort,
-                responsive,
-                runId,
-              }),
-            });
-          },
           onProviderAttempt: (attempt) => {
             activeRunSelections.set(id, {
               provider: attempt.providerName,
@@ -2544,56 +2625,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               actorId: ctx.record.id,
               detail: `count=${count} age=${ageMs}ms`,
             });
-          },
-          onRunAbandoned: ({ reason, started }) => {
-            ctx.onRunAbandoned?.();
-            activeRunSelections.delete(id);
-            if (started) abandonActorRun(id, reason);
-            runLogger(id).warn("run_abandoned", { reason, started });
-            mesh.recordEvent({
-              kind: "run_abandoned",
-              actorId: id,
-              detail: reason,
-              payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-            });
-          },
-          onRunEnd: async (result) => {
-            activeRunSelections.delete(id);
-            const runId = completeActorRun(id, result);
-            logRunEnd(runLogger(id, runId), result);
-            mesh.recordEvent({
-              kind: "run_end",
-              actorId: id,
-              success: result.success,
-              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-              body: result.output,
-              payload: runEndPayload({ ...result, runId }),
-            });
-            ctx.onRunEnd(result, runId);
-            const compacted = await compactPortableActorAfterRun(id);
-            if (compacted) {
-              mesh.recordEvent({
-                kind: "portable_context_compacted",
-                actorId: id,
-                detail: describeCompaction(compacted),
-                body: JSON.stringify(compacted),
-              });
-            }
-            if (!result.success && !result.capped) {
-              await routeRunFailure(
-                failureSink,
-                id,
-                result,
-                formatProviderLabel(
-                  {
-                    providerName: lastSelected.provider,
-                    model: lastSelected.model,
-                    effort: lastSelected.effort,
-                  },
-                  result.model
-                )
-              );
-            }
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → dashboard SSE / `rusa logs --actor`
         };
@@ -2985,10 +3016,123 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mesh.actorRuntimeStateChanged(rootId, state)
         )
       : null;
-  // Which entry actually ran, for the failure-notice label — set on each
-  // onRunStart, read back on that same run's onRunEnd (mirrors the worker
-  // `lastSelected` pattern, since root's one entry can move too).
+  // Which entry actually ran, for the failure-notice label. Root's declared
+  // pool can move while idle, so this is captured at lifecycle start.
   let rootLastSelected: RawProviderModelConfig = rootBootModelConfig.modelConfig[0];
+  const rootLifecycle = mesh.lifecycleFor(rootId);
+  rootLifecycle.add({
+    onStart: (event) => {
+      rootLastSelected = event.selected;
+      mesh.clearSelection(rootId);
+      const launchConfig = projectActorRunLaunchConfig(event.selected);
+      runAccounting.begin(rootId, event.runId, launchConfig);
+    },
+    onEnd: (event) => {
+      if (event.terminal.kind === "abandoned") {
+        if (event.terminal.started) {
+          runAccounting.abandon(rootId, event.runId, event.terminal.reason);
+        }
+        return;
+      }
+      runAccounting.complete(rootId, event.runId, event.terminal.result);
+    },
+  });
+  rootLifecycle.add({
+    onQueued: (event) => {
+      mesh.recordEvent({
+        kind: "run_queued",
+        actorId: rootId,
+        detail: event.mode,
+      });
+    },
+    onStart: (event) => {
+      const launchConfig = projectActorRunLaunchConfig(event.selected);
+      runLogger(rootId, event.runId).info("run_start", {
+        provider: launchConfig.provider,
+        model: launchConfig.model,
+        effort: launchConfig.effort,
+        responsive: event.responsive,
+      });
+      mesh.recordEvent({
+        kind: "run_start",
+        actorId: rootId,
+        detail: event.injectRecord
+          ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
+          : undefined,
+        body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
+        payload: JSON.stringify({
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
+          responsive: event.responsive,
+          runId: event.runId,
+        }),
+      });
+    },
+    onError: (event) => {
+      runLogger(rootId, event.runId).error("run_error", {
+        error: event.error instanceof Error ? event.error.message : String(event.error),
+      });
+    },
+    onEnd: async (event) => {
+      activeRunSelections.delete(rootId);
+      if (event.terminal.kind === "abandoned") {
+        runLogger(rootId, event.runId).warn("run_abandoned", {
+          reason: event.terminal.reason,
+          started: event.terminal.started,
+        });
+        mesh.recordEvent({
+          kind: "run_abandoned",
+          actorId: rootId,
+          detail: event.terminal.reason,
+          payload: JSON.stringify({
+            started: event.terminal.started,
+          } satisfies RunAbandonedPayload),
+        });
+        return;
+      }
+      const { result } = event.terminal;
+      logRunEnd(runLogger(rootId, event.runId), result);
+      mesh.recordEvent({
+        kind: "run_end",
+        actorId: rootId,
+        success: result.success,
+        detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+        body: result.output,
+        payload: runEndPayload({ ...result, runId: event.runId }),
+      });
+    },
+  });
+  rootLifecycle.add({
+    onEnd: async (event) => {
+      if (event.terminal.kind === "abandoned") return;
+      const { result } = event.terminal;
+      const compacted = await compactPortableActorAfterRun(rootId);
+      if (compacted) {
+        mesh.recordEvent({
+          kind: "portable_context_compacted",
+          actorId: rootId,
+          detail: describeCompaction(compacted),
+          body: JSON.stringify(compacted),
+        });
+      }
+      if (!result.success && !result.capped) {
+        await routeRunFailure(
+          failureSink,
+          rootId,
+          result,
+          formatProviderLabel(
+            {
+              providerName: rootLastSelected.provider,
+              model: rootLastSelected.model,
+              effort: rootLastSelected.effort,
+            },
+            result.model
+          )
+        );
+      }
+    },
+  });
   let root: MeshActor;
   root =
     externalRoot ??
@@ -3028,6 +3172,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           injectRecord: injection?.injectRecord,
         };
       },
+      lifecycle: rootLifecycle,
       fallback: fallbackModels
         ? {
             models: fallbackModels,
@@ -3083,44 +3228,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
         routeContinuationCapped(failureSink, rootId, n);
       },
-      onQueued: (context) => {
-        mesh.actorQueued(rootId, context);
-        mesh.recordEvent({
-          kind: "run_queued",
-          actorId: rootId,
-          detail: context.mode,
-        });
-      },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onRunStart: (responsive, injectRecord, selected) => {
-        rootLastSelected = selected;
-        // The run actually launched: the queued reservation this describes
-        // no longer exists to cancel or report on.
-        mesh.clearSelection(rootId);
-        const launchConfig = projectActorRunLaunchConfig(selected);
-        const runId = beginActorRun(rootId, launchConfig);
-        runLogger(rootId, runId).info("run_start", {
-          provider: launchConfig.provider,
-          model: launchConfig.model,
-          effort: launchConfig.effort,
-          responsive,
-        });
-        mesh.recordEvent({
-          kind: "run_start",
-          actorId: rootId,
-          detail: injectRecord
-            ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
-            : undefined,
-          body: injectRecord ? JSON.stringify(injectRecord) : undefined,
-          payload: JSON.stringify({
-            provider: launchConfig.provider,
-            model: launchConfig.model,
-            effort: launchConfig.effort,
-            responsive,
-            runId,
-          }),
-        });
-      },
       onProviderAttempt: (attempt) => {
         activeRunSelections.set(rootId, {
           provider: attempt.providerName,
@@ -3139,57 +3247,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           actorId: rootId,
           detail: `count=${count} age=${ageMs}ms`,
         });
-      },
-      onRunAbandoned: ({ reason, started }) => {
-        mesh.abandonInboxRun(rootId);
-        activeRunSelections.delete(rootId);
-        if (started) abandonActorRun(rootId, reason);
-        runLogger(rootId).warn("run_abandoned", { reason, started });
-        mesh.recordEvent({
-          kind: "run_abandoned",
-          actorId: rootId,
-          detail: reason,
-          payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-        });
-      },
-      onRunEnd: async (result) => {
-        activeRunSelections.delete(rootId);
-        mesh.finishInboxRun(rootId);
-        const runId = completeActorRun(rootId, result);
-        mesh.accountRun(rootId, result, runId);
-        logRunEnd(runLogger(rootId, runId), result);
-        mesh.recordEvent({
-          kind: "run_end",
-          actorId: rootId,
-          success: result.success,
-          detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-          body: result.output,
-          payload: runEndPayload({ ...result, runId }),
-        });
-        const compacted = await compactPortableActorAfterRun(rootId);
-        if (compacted) {
-          mesh.recordEvent({
-            kind: "portable_context_compacted",
-            actorId: rootId,
-            detail: describeCompaction(compacted),
-            body: JSON.stringify(compacted),
-          });
-        }
-        if (!result.success && !result.capped) {
-          await routeRunFailure(
-            failureSink,
-            rootId,
-            result,
-            formatProviderLabel(
-              {
-                providerName: rootLastSelected.provider,
-                model: rootLastSelected.model,
-                effort: rootLastSelected.effort,
-              },
-              result.model
-            )
-          );
-        }
       },
       log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
     });

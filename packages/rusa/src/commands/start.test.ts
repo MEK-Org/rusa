@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -15,7 +16,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { Actor, type RunAbandon } from "../actor/actor.js";
+import { Actor } from "../actor/actor.js";
+import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
@@ -38,6 +40,48 @@ import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
+
+async function startLifecycleRun(
+  actor: Actor,
+  selected: RawProviderModelConfig,
+  options: { queued?: boolean; responsive?: boolean; mode?: "ordinary" | "yield-elicitation" } = {}
+): Promise<string> {
+  const runId = randomUUID();
+  const responsive = options.responsive ?? false;
+  const mode = options.mode ?? "ordinary";
+  if (options.queued !== false) {
+    await actor.lifecycle.emit("onQueued", { actorId: actor.id, runId, responsive, mode });
+  }
+  await actor.lifecycle.emit("onStart", {
+    actorId: actor.id,
+    runId,
+    responsive,
+    mode,
+    selected,
+  });
+  return runId;
+}
+
+async function endLifecycleRun(actor: Actor, runId: string, result: RunResult): Promise<void> {
+  await actor.lifecycle.emit("onEnd", {
+    actorId: actor.id,
+    runId,
+    terminal: { kind: "result", result },
+  });
+}
+
+async function abandonLifecycleRun(
+  actor: Actor,
+  runId: string,
+  reason: ActorLifecycleAbandonmentReason,
+  started: boolean
+): Promise<void> {
+  await actor.lifecycle.emit("onEnd", {
+    actorId: actor.id,
+    runId,
+    terminal: { kind: "abandoned", reason, started },
+  });
+}
 
 const worktreeMock = vi.hoisted(() => ({
   getRemoteUrl: vi.fn(() => "https://github.com/dummy-org/dummy-repo.git" as string | null),
@@ -708,16 +752,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     type LiveActorOptions = {
       mcpServers: Array<{ name: string; url: string }>;
-      onRunStart?: (
-        responsive: boolean,
-        injectRecord: undefined,
-        selected: { provider: string; model: string; effort: string }
-      ) => void;
-      onRunEnd?: (result: {
-        success: boolean;
-        output: string;
-        exitCode: number;
-      }) => void | Promise<void>;
     };
     const optionsOf = (actor: Actor) => (actor as unknown as { opts: LiveActorOptions }).opts;
     const urlOf = (actor: Actor, server: string) => {
@@ -776,12 +810,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // start one through the production run hook.
     const selectHeadOverMcp = async (
       actorId: string
-    ): Promise<{ obligationId: string; selection: Record<string, unknown> }> => {
-      optionsOf(actorOf(actorId)).onRunStart?.(false, undefined, {
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash",
-        effort: "high",
-      });
+    ): Promise<{ obligationId: string; selection: Record<string, unknown>; runId: string }> => {
+      const runId = await startLifecycleRun(
+        actorOf(actorId),
+        {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        { queued: false }
+      );
       const inboxUrl = urlOf(actorOf(actorId), "inbox");
       const listed = payloadOf(await call(inboxUrl, "list", { status: "unhandled" })) as {
         entries: Array<{ id: string; payload: { type: string; obligationId?: string } }>;
@@ -793,7 +831,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         throw new Error(`ready-head inbox entry missing: ${actorId}`);
       const selected = await call(inboxUrl, "select", { entry_ids: [entry.id] });
       expect(selected.isError).toBeFalsy();
-      return { obligationId: entry.payload.obligationId, selection: payloadOf(selected) };
+      return { obligationId: entry.payload.obligationId, selection: payloadOf(selected), runId };
     };
     const strict = await selectHeadOverMcp(optedIn);
     const strictHeadId = strict.obligationId;
@@ -939,7 +977,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).toBeFalsy();
     // End the run the way production ends it, then move this worker's head
     // with a higher-priority obligation so the next run selects fresh.
-    await optionsOf(actorOf(switched)).onRunEnd?.({ success: true, output: "", exitCode: 0 });
+    await endLifecycleRun(actorOf(switched), enrolledRun.runId, {
+      success: true,
+      output: "",
+      exitCode: 0,
+    });
     getRepositories().obligations.create({
       title: "live released head",
       ownerId: switched,
@@ -952,7 +994,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       status: "complete",
     });
     expect(releasedYield.isError).toBeFalsy();
-  });
+  }, 10_000);
 
   describe("worker fallback is root-only ", () => {
     it("never wires an actor-level fallback for a worker, even when root has one configured", async () => {
@@ -1348,11 +1390,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(names(worker)).toContain("obligations");
   });
 
-  it("wires the abandoned-run terminal hook on both production actor factories ", async () => {
-    // The hook only closes the mesh's in-flight accounting if the PRODUCTION
-    // factories pass it. Both are edited by hand and neither is covered by the
-    // Actor-level contract tests, so this asserts on what runStart actually
-    // built — reaching the real closure rather than an injected one.
+  it("wires lifecycle abandonment through both production actor factories", async () => {
+    // The lifecycle listener only closes the mesh's in-flight accounting if both
+    // factories receive the coordinator-owned lifecycle instance.
     writeFileSync(
       join(homeDir, "threads.json"),
       JSON.stringify({
@@ -1389,14 +1429,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const worker = mesh.get("abandon-worker");
     if (!worker) throw new Error("worker not rehydrated");
 
-    type WithAbandonHook = { opts: { onRunAbandoned?: (abandon: RunAbandon) => void } };
-    const workerHook = (worker as unknown as WithAbandonHook).opts.onRunAbandoned;
-    const rootHook = (root as unknown as WithAbandonHook).opts.onRunAbandoned;
-    expect(workerHook).toBeTypeOf("function");
-    expect(rootHook).toBeTypeOf("function");
-
-    workerHook?.({ reason: "start-cancelled", started: false });
-    rootHook?.({ reason: "coalesced", started: true });
+    await abandonLifecycleRun(worker as Actor, randomUUID(), "start-cancelled", false);
+    const rootRunId = await startLifecycleRun(root, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    await abandonLifecycleRun(root, rootRunId, "coalesced", true);
 
     const abandoned = getRepositories()
       .meshEvents.listEventsByActors(["abandon-worker", "root"], {
@@ -1473,30 +1512,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return mesh;
     };
 
-    type RunHooks = {
-      opts: {
-        onRunStart?: (
-          responsive: boolean,
-          injectRecord: undefined,
-          selected: RawProviderModelConfig
-        ) => void;
-        onRunEnd?: (result: RunResult) => Promise<void> | void;
-      };
-    };
-
-    const hooksFor = (mesh: ActorMesh, workerId: string): RunHooks["opts"] => {
+    const actorFor = (mesh: ActorMesh, workerId: string): Actor => {
       const worker = mesh.get(workerId);
       if (!worker) throw new Error("worker not rehydrated");
-      return (worker as unknown as RunHooks).opts;
+      return worker as Actor;
     };
 
-    const startRun = (opts: RunHooks["opts"]): void => {
-      opts.onRunStart?.(false, undefined, {
+    const startRun = (actor: Actor): Promise<string> =>
+      startLifecycleRun(actor, {
         provider: "antigravity",
         model: "Gemini 3.7 Flash (High)",
         effort: "high",
       });
-    };
 
     const mechanicalNotes = (actorId: string): string[] =>
       getRepositories()
@@ -1533,14 +1560,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }) => {
       const workerId = `grace-kill-worker-${status}`;
       const mesh = await bootWithWorker(workerId);
-      const opts = hooksFor(mesh, workerId);
+      const actor = actorFor(mesh, workerId);
 
-      startRun(opts);
+      const runId = await startRun(actor);
       selectParentMessage(mesh, workerId);
       mesh.declareYield(workerId, status, note);
       // The result the Actor produces for a grace-kill that followed an accepted
       // yield: the yield's outcome, with the raw process exit kept as annotation.
-      await opts.onRunEnd?.({
+      await endLifecycleRun(actor, runId, {
         success: true,
         graceKilled: true,
         cancelled: true,
@@ -1582,10 +1609,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
     it("still forwards a genuine failure on the same wiring", async () => {
       const workerId = "genuine-failure-worker";
       const mesh = await bootWithWorker(workerId);
-      const opts = hooksFor(mesh, workerId);
+      const actor = actorFor(mesh, workerId);
 
-      startRun(opts);
-      await opts.onRunEnd?.({
+      const runId = await startRun(actor);
+      await endLifecycleRun(actor, runId, {
         success: false,
         exitCode: 1,
         output: "worktree checkout failed",
@@ -2810,16 +2837,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
           buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
-          onRunStart?: (
-            responsive: boolean,
-            injectRecord: { runCount: number } | undefined,
-            selected: { provider: string; model?: string; effort?: string }
-          ) => void;
-          onRunEnd?: (result: {
-            success: boolean;
-            output: string;
-            exitCode: number;
-          }) => Promise<void>;
         };
       }
     ).opts;
@@ -2835,12 +2852,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
     ).toBe(true);
 
-    actorOpts.onRunStart?.(false, undefined, {
+    const runId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
       effort: "high",
     });
-    await actorOpts.onRunEnd?.({
+    await endLifecycleRun(rootActor as Actor, runId, {
       success: true,
       output: "PORTABLE_ROOT_CONTEXT_MARKER",
       exitCode: 0,
@@ -2951,25 +2968,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
       rootActor as unknown as {
         opts: {
           buildPrompt: () => { prompt: string };
-          onRunStart?: (
-            responsive: boolean,
-            injectRecord: { runCount: number } | undefined,
-            selected: { provider: string; model?: string; effort?: string }
-          ) => void;
-          onRunEnd?: (result: {
-            success: boolean;
-            output: string;
-            exitCode: number;
-          }) => Promise<void>;
         };
       }
     ).opts;
-    actorOpts.onRunStart?.(false, undefined, {
+    const firstRunId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
       effort: "high",
     });
-    await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
+    await endLifecycleRun(rootActor as Actor, firstRunId, {
+      success: true,
+      output: "root completed",
+      exitCode: 0,
+    });
 
     expect(compactSpy).toHaveBeenCalledOnce();
     const state = JSON.parse(
@@ -3000,12 +3011,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       recipientId: "root",
       body: "Fold this after truncation.",
     });
-    actorOpts.onRunStart?.(false, undefined, {
+    const secondRunId = await startLifecycleRun(rootActor as Actor, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
       effort: "high",
     });
-    await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
+    await endLifecycleRun(rootActor as Actor, secondRunId, {
+      success: true,
+      output: "second run",
+      exitCode: 0,
+    });
     expect(compactSpy).toHaveBeenCalledTimes(2);
     const advancedState = JSON.parse(
       readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
@@ -3049,19 +3064,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
     const rootId = rootActor.id;
-    const actorOpts = (
-      rootActor as unknown as {
-        opts: {
-          onRunStart?: (
-            responsive: boolean,
-            injectRecord: unknown,
-            selected: { provider: string; model?: string; effort?: string }
-          ) => void;
-          onRunEnd?: (result: RunResult) => Promise<void>;
-        };
-      }
-    ).opts;
-
     // 1. Root run with reported Claude token usage
     const claudeUsage = {
       provider: "claude" as const,
@@ -3073,11 +3075,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       reasoning: null,
       response: null,
     };
-    actorOpts.onRunStart?.(false, undefined, {
+    const claudeRunId = await startLifecycleRun(rootActor as Actor, {
       provider: "claude",
       model: "claude-sonnet-4-6",
     });
-    await actorOpts.onRunEnd?.({
+    await endLifecycleRun(rootActor as Actor, claudeRunId, {
       success: true,
       output: "claude root run done",
       exitCode: 0,
@@ -3130,11 +3132,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       reasoning: null,
       response: null,
     };
-    actorOpts.onRunStart?.(false, undefined, {
+    const codexRunId = await startLifecycleRun(rootActor as Actor, {
       provider: "codex",
       model: "gpt-5.6-sol",
     });
-    await actorOpts.onRunEnd?.({
+    await endLifecycleRun(rootActor as Actor, codexRunId, {
       success: true,
       output: "codex root run done",
       exitCode: 0,
@@ -3157,11 +3159,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     // 3. Root run without token usage (e.g. provider returns none / honest absence)
-    actorOpts.onRunStart?.(false, undefined, {
+    const noUsageRunId = await startLifecycleRun(rootActor as Actor, {
       provider: "claude",
       model: "claude-sonnet-4-6",
     });
-    await actorOpts.onRunEnd?.({
+    await endLifecycleRun(rootActor as Actor, noUsageRunId, {
       success: true,
       output: "root run with no usage",
       exitCode: 0,
@@ -4442,18 +4444,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe(originalModel);
     expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
 
-    // Directly invoke the production beforeRun/onRunStart closures — the
-    // same technique used elsewhere in this file to exercise root's real
-    // dispatch-time wiring without driving a full provider/gate/queue cycle.
+    // Invoke the production beforeRun closure, then the root's lifecycle
+    // fanout, without driving a provider/gate/queue cycle.
     const actorOpts = (
       rootActor as unknown as {
         opts: {
           beforeRun?: (arg: { mode: string }) => boolean;
-          onRunStart?: (
-            responsive: boolean,
-            injectRecord: undefined,
-            selected: ProviderModelConfig
-          ) => void;
         };
       }
     ).opts;
@@ -4463,7 +4459,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const liveSelected = activeMesh.actors.get("root")?.modelConfig?.[0];
     if (!liveSelected) throw new Error("root modelConfig missing after dispatch");
-    actorOpts.onRunStart?.(false, undefined, liveSelected);
+    await startLifecycleRun(rootActor as Actor, liveSelected);
 
     const runStartEvents = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["run_start"],
@@ -4753,11 +4749,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(modelSetEvents()).toHaveLength(1);
     });
 
-    // `runWithFallback` is the production boundary that resolves a fallback,
-    // and `onRunStart` is the hook `Actor.invoke` fires with the entry it
-    // selected just before calling it. `requestRun` is mocked file-wide, so a
-    // run is driven the way the rest of this file drives one: through those
-    // hooks with a stubbed provider, classifying the primary as exhausted.
+    // `runWithFallback` is the production boundary that resolves a fallback.
+    // `requestRun` is mocked file-wide, so this drives the lifecycle with a
+    // stubbed provider and classifies the primary as exhausted.
     const rootFallbackRun = async (
       mesh: ActorMesh,
       selected: ProviderModelConfig,
@@ -4772,12 +4766,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const actor = root as unknown as {
         opts: {
           fallback?: { classify: (result: RunResult) => Promise<{ exhausted: boolean }> };
-          onRunStart?: (
-            responsive: boolean,
-            injectRecord: undefined,
-            selected: ProviderModelConfig
-          ) => void;
-          onRunEnd?: (result: RunResult) => Promise<void>;
         };
         runWithFallback: (
           primary: CodingProvider,
@@ -4786,7 +4774,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       };
       if (!actor.opts.fallback) throw new Error("root fallback not configured");
       actor.opts.fallback.classify = vi.fn(async () => ({ exhausted: true }));
-      actor.opts.onRunStart?.(false, undefined, selected);
+      const lifecycleActor = root as Actor;
+      const runId = await startLifecycleRun(lifecycleActor, selected);
       const primary: CodingProvider = {
         name: selected.provider,
         providerName: selected.provider,
@@ -4801,9 +4790,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
           ? { success: false, output: "quota exhausted", exitCode: 1 }
           : recover(provider);
       });
-      // Close the durable run the way `Actor.invoke` does, so the outcome is
-      // forwarded and the next run can start.
-      await actor.opts.onRunEnd?.(result);
+      // Close the durable lifecycle run the way `Actor.invoke` does.
+      await endLifecycleRun(lifecycleActor, runId, result);
       return { attempts, result };
     };
     const runEndEvents = () =>
@@ -5953,7 +5941,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
   });
 
-  it("records token usage linked to actor_runs.id through the real worker onRunEnd factory wiring", async () => {
+  it("records token usage linked to actor_runs.id through the real worker lifecycle wiring", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
     await new Promise<void>((resolve) => {
@@ -5978,20 +5966,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const worker = mesh.get(workerId) as Actor | undefined;
     if (!worker) throw new Error("worker not found");
 
-    type WorkerOpts = {
-      opts: {
-        onRunStart?: (
-          responsive: boolean,
-          injectRecord: undefined,
-          selected: { provider: string; model: string; effort: string }
-        ) => void;
-        onRunEnd?: (result: RunResult) => void | Promise<void>;
-      };
-    };
-    const workerOpts = (worker as unknown as WorkerOpts).opts;
-
     // Start a run for the worker
-    workerOpts.onRunStart?.(false, undefined, {
+    const runId = await startLifecycleRun(worker, {
       provider: "antigravity",
       model: "Gemini 3.7 Flash",
       effort: "high",
@@ -6013,7 +5989,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         response: null,
       },
     };
-    await workerOpts.onRunEnd?.(result);
+    await endLifecycleRun(worker, runId, result);
 
     // Assert that the run_end event was recorded and carried the runId
     const db = getDb();

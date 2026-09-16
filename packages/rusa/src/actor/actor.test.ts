@@ -12,6 +12,7 @@ import {
   WATCHDOG_CEILING_TIMEOUT_MS,
   WATCHDOG_STALL_TIMEOUT_MS,
 } from "./actor.js";
+import { createActorLifecycle } from "./actor-lifecycle.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
   ConcurrencyLimiter,
@@ -25,8 +26,55 @@ const flush = async () => {
   for (let i = 0; i < 30; i++) await Promise.resolve();
 };
 
-function makeActor(over: Partial<ActorOptions> = {}, provider = new FakeProvider()): Actor {
+type TestActorHooks = {
+  onQueued?: (event: { responsive: boolean; mode: string }) => unknown;
+  onRunStart?: (
+    responsive: boolean,
+    injectRecord?: unknown,
+    selected?: RawProviderModelConfig
+  ) => unknown;
+  onRunEnd?: (result: RunResult) => unknown;
+  onRunAbandoned?: (abandon: RunAbandon) => unknown;
+};
+
+function makeActor(
+  over: Partial<ActorOptions> & TestActorHooks = {},
+  provider = new FakeProvider()
+): Actor {
   let session: string | undefined;
+  const {
+    onQueued,
+    onRunStart,
+    onRunEnd,
+    onRunAbandoned,
+    lifecycle: explicitLifecycle,
+    ...actorOpts
+  } = over;
+  const lifecycle = explicitLifecycle ?? createActorLifecycle();
+  if (onQueued || onRunStart || onRunEnd || onRunAbandoned) {
+    lifecycle.add({
+      onQueued: onQueued
+        ? async (event) => {
+            await onQueued({ responsive: event.responsive, mode: event.mode });
+          }
+        : undefined,
+      onStart: onRunStart
+        ? async (event) => {
+            await onRunStart(event.responsive, event.injectRecord, event.selected);
+          }
+        : undefined,
+      onEnd: async (event) => {
+        if (event.terminal.kind === "result") {
+          await onRunEnd?.(event.terminal.result);
+        } else {
+          await onRunAbandoned?.({
+            reason: event.terminal.reason,
+            started: event.terminal.started,
+          });
+        }
+      },
+    });
+  }
   return new Actor({
     id: "a1",
     cwd: "/tmp/a1",
@@ -39,7 +87,8 @@ function makeActor(over: Partial<ActorOptions> = {}, provider = new FakeProvider
     },
     buildPrompt: () => ({ prompt: "PROMPT: inbox work" }),
     debounceMs: 10,
-    ...over,
+    lifecycle,
+    ...actorOpts,
   });
 }
 
@@ -1639,31 +1688,41 @@ describe("Actor", () => {
       expect(provider.calls).toHaveLength(0);
     });
 
-    it("turns an onRunStart failure into a failed result without invoking the provider", async () => {
+    it("contains an onStart observer failure without aborting the run or preventing provider execution", async () => {
       const results: RunResult[] = [];
-      const provider = new FakeProvider();
-      const actor = makeActor(
-        {
-          onRunStart: () => {
-            throw new Error("launch configuration rejected");
+      let actor!: Actor;
+      const provider = new FakeProvider(() => {
+        actor.declareYield();
+        return { success: true, exitCode: 0, output: "done" };
+      });
+      const errors: unknown[] = [];
+      const lifecycle = createActorLifecycle(
+        [
+          {
+            onStart: () => {
+              throw new Error("launch configuration rejected");
+            },
+            onEnd: (event) => {
+              if (event.terminal.kind === "result") {
+                results.push(event.terminal.result);
+              }
+            },
           },
-          onRunEnd: (result) => {
-            results.push(result);
-          },
-        },
-        provider
+        ],
+        (failure) => errors.push(failure.error)
       );
+      actor = makeActor({ lifecycle }, provider);
 
       actor.requestRun();
       await vi.advanceTimersByTimeAsync(10);
       await flush();
 
-      expect(provider.calls).toHaveLength(0);
+      expect(provider.calls).toHaveLength(1);
+      expect(errors).toHaveLength(1);
       expect(results).toHaveLength(1);
       expect(results[0]).toMatchObject({
-        success: false,
-        exitCode: 1,
-        output: expect.stringContaining("launch configuration rejected"),
+        success: true,
+        exitCode: 0,
       });
     });
 
