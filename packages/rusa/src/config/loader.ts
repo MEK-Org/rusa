@@ -344,9 +344,9 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         }
       }
     }
-    if (quota.throttle?.enabled === true && !quota.databasePath) {
+    if (quota.throttle?.enabled === true && !quota.coordinator?.socketPath) {
       throw new Error(
-        "config.yaml: quota.databasePath is required when quota.throttle.enabled is true"
+        "config.yaml: quota.coordinator.socketPath is required when quota.throttle.enabled is true"
       );
     }
   }

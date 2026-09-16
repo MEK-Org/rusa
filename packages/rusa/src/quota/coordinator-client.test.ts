@@ -3,8 +3,21 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { QuotaCoordinatorClient } from "./coordinator-client.js";
-import { COORDINATOR_PROTOCOL_MAJOR, COORDINATOR_PROTOCOL_MINOR } from "./coordinator-protocol.js";
+import { ProviderPacer } from "../actor/provider-pacer.js";
+import {
+  applyThrottleStatusToPacer,
+  initialPacerIntervalSeconds,
+  QuotaCoordinatorClient,
+  reconcileProviderPacersFromClient,
+} from "./coordinator-client.js";
+import {
+  COORDINATOR_PROTOCOL_MAJOR,
+  COORDINATOR_PROTOCOL_MINOR,
+  HISTORY_WINDOW_MS,
+  type PublishedHistoryRecord,
+  type PublishedThrottleCollectionResponse,
+  type PublishedThrottleResponse,
+} from "./coordinator-protocol.js";
 
 function serviceInfo(protocolMajor: number = COORDINATOR_PROTOCOL_MAJOR) {
   return {
@@ -258,12 +271,13 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     });
 
     const client = new QuotaCoordinatorClient({ socketPath, maxIntervalSeconds: 3600 });
-    await expect(client.getThrottle("claude")).resolves.toBeNull();
+    await expect(client.getThrottle("kimi")).resolves.toBeNull();
     expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
-    expect(client.getLastAppliedInterval("claude")).toBe(3600);
+    // Rule 0 ceiling: cold coordinator has no interval to apply
+    expect(client.getLastAppliedInterval("kimi")).toBe(3600);
   });
 
-  it("marks reachable on 200 not_ready cold single provider while retaining interval (#480)", async () => {
+  it("marks reachable on 200 not_ready while returning cold envelope without modifying interval (#480)", async () => {
     root = mkdtempSync(join(tmpdir(), "quota-client-notready-200-"));
     const socketPath = join(root, "coordinator.sock");
     await listen(socketPath, (_req, res) => {
@@ -467,5 +481,847 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     ]) {
       expect(body, `coordinator client must not reference ${forbidden}`).not.toMatch(forbidden);
     }
+  });
+});
+
+describe("Issue #355: Quota coordinator client read mode in instance", () => {
+  let root: string | undefined;
+  let server: http.Server | undefined;
+
+  async function listen(socketPath: string, handler: http.RequestListener): Promise<void> {
+    server = http.createServer(handler);
+    await new Promise<void>((resolve, reject) => {
+      server?.once("error", reject);
+      server?.listen(socketPath, resolve);
+    });
+  }
+
+  async function stopServer(): Promise<void> {
+    const running = server;
+    server = undefined;
+    if (!running?.listening) return;
+    running.closeAllConnections?.();
+    await new Promise<void>((resolve, reject) => {
+      running.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await stopServer();
+    if (root) rmSync(root, { recursive: true, force: true });
+    root = undefined;
+  });
+
+  describe("Acceptance Criterion 3: client applies published interval and exhaustedUntil", () => {
+    it("applies intervalSeconds to ProviderPacer and sets deferUntil from exhaustedUntil via production apply function", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit3-"));
+      const socketPath = join(root, "coordinator.sock");
+      const nowMs = 1773619200000;
+      const exhaustedUntilIso = new Date(nowMs + 3_600_000).toISOString();
+      const exhaustedUntilMs = Date.parse(exhaustedUntilIso);
+
+      const publishedStatus: PublishedThrottleResponse = {
+        service: serviceInfo(),
+        provider: "claude",
+        intervalSeconds: 450,
+        uncappedIntervalSeconds: 450,
+        governingBucketKey: "claude:session",
+        capped: false,
+        expired: true,
+        exhaustedUntil: exhaustedUntilIso,
+        updatedAt: new Date(nowMs).toISOString(),
+        buckets: [
+          {
+            key: "claude:session",
+            percentLeft: 0,
+            timeRemainingPct: 50,
+            error: -50,
+            derivative: 0,
+            requiredIntervalSeconds: 450,
+            resetAtIso: exhaustedUntilIso,
+            observedAt: new Date(nowMs).toISOString(),
+          },
+        ],
+        freshness: { ageMs: 0, buckets: {}, stale: false, hardStale: false },
+      };
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(publishedStatus));
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds: 3600,
+        now: () => nowMs,
+      });
+      const pacer = new ProviderPacer(3600 * 1000, () => nowMs);
+
+      const response = await client.getThrottle("claude");
+      expect(response).not.toBeNull();
+      if (response && "intervalSeconds" in response) {
+        applyThrottleStatusToPacer(pacer, response);
+      }
+
+      expect(pacer.interval).toBe(450 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      const published = client.getLastPublishedStatus("claude");
+      expect(published).toBeDefined();
+      expect(published?.governingBucketKey).toBe("claude:session");
+    });
+
+    it("applies collection response items via production apply function and tracks status", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit3-col-"));
+      const socketPath = join(root, "coordinator.sock");
+
+      const collectionBody: PublishedThrottleCollectionResponse = {
+        service: serviceInfo(),
+        providers: {
+          claude: {
+            provider: "claude",
+            intervalSeconds: 500,
+            uncappedIntervalSeconds: 500,
+            governingBucketKey: "claude:session",
+            capped: false,
+            expired: false,
+            exhaustedUntil: null,
+            updatedAt: new Date().toISOString(),
+            buckets: [],
+            freshness: { ageMs: 0, buckets: {}, stale: false, hardStale: false },
+          },
+        },
+      };
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(collectionBody));
+      });
+
+      const client = new QuotaCoordinatorClient({ socketPath });
+      const pacer = new ProviderPacer(3600 * 1000);
+
+      const response = await client.getThrottle();
+      expect(response).not.toBeNull();
+
+      const status = client.getLastPublishedStatus("claude");
+      expect(status).toBeDefined();
+      if (status) {
+        applyThrottleStatusToPacer(pacer, status);
+      }
+
+      expect(pacer.interval).toBe(500 * 1000);
+    });
+  });
+
+  describe("Acceptance Criterion 6 restart case: cold absent and incompatible service", () => {
+    it("launches at maxIntervalSeconds when restarted with absent socket", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-restart-absent-"));
+      const absentSocketPath = join(root, "absent-coordinator.sock");
+      const maxIntervalSeconds = 1800;
+
+      const client = new QuotaCoordinatorClient({
+        socketPath: absentSocketPath,
+        maxIntervalSeconds,
+      });
+
+      const initialInterval = client.getLastAppliedInterval("claude");
+      const pacer = new ProviderPacer(initialInterval * 1000);
+
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+      expect(pacer.interval).not.toBe(0);
+
+      const result = await client.getThrottle();
+      expect(result).toBeNull();
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+    });
+
+    it("launches at maxIntervalSeconds when service answers with protocolMajor mismatch", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-restart-mismatch-"));
+      const socketPath = join(root, "coordinator.sock");
+      const maxIntervalSeconds = 2400;
+      const warnLogs: string[] = [];
+      const logger = {
+        warn: (msg: unknown) => warnLogs.push(String(msg)),
+        error: vi.fn(),
+      };
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(COORDINATOR_PROTOCOL_MAJOR + 1),
+            providers: {
+              claude: providerStatus(120),
+            },
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds,
+        logger,
+      });
+
+      const initialInterval = client.getLastAppliedInterval("claude");
+      const pacer = new ProviderPacer(initialInterval * 1000);
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+
+      const response = await client.getThrottle();
+      expect(response).toBeNull();
+      expect(client.getLastAppliedInterval("claude")).toBe(maxIntervalSeconds);
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+      expect(warnLogs.some((l) => /protocol/i.test(l))).toBe(true);
+    });
+  });
+
+  describe("Production wiring: unpaced when throttle disabled via initialPacerIntervalSeconds", () => {
+    it("returns unpaced (0) when throttling is disabled even if coordinator socket client is configured", () => {
+      const client = new QuotaCoordinatorClient({
+        socketPath: "/tmp/any.sock",
+        maxIntervalSeconds: 3600,
+      });
+
+      expect(initialPacerIntervalSeconds(false, client, "claude")).toBe(0);
+      expect(initialPacerIntervalSeconds(false, null, "claude")).toBe(0);
+    });
+
+    it("returns client lastAppliedInterval on cold start when throttling is enabled", () => {
+      const client = new QuotaCoordinatorClient({
+        socketPath: "/tmp/any.sock",
+        maxIntervalSeconds: 1800,
+      });
+
+      expect(initialPacerIntervalSeconds(true, client, "claude")).toBe(1800);
+      expect(initialPacerIntervalSeconds(true, null, "claude", 2400)).toBe(2400);
+    });
+  });
+
+  describe("Dashboard history bridge", () => {
+    it("fetches /v1/history bounded by 3-day window and caches records for synchronous getCachedHistory reads", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-"));
+      const socketPath = join(root, "coordinator.sock");
+      let requestedUrl = "";
+
+      const historyRecords: PublishedHistoryRecord[] = [
+        {
+          scope: "provider",
+          kind: "session",
+          label: "Claude session",
+          observedAt: "2026-09-15T20:00:00.000Z",
+          percentLeft: 85,
+          resetAtIso: "2026-09-15T23:00:00.000Z",
+          controllerError: -5,
+          intervalSeconds: 300,
+        },
+        {
+          scope: "provider",
+          kind: "weekly",
+          label: "Claude weekly",
+          observedAt: "2026-09-15T20:00:00.000Z",
+          percentLeft: 70,
+          resetAtIso: "2026-09-22T00:00:00.000Z",
+          controllerError: -10,
+          intervalSeconds: 600,
+        },
+      ];
+
+      await listen(socketPath, (req, res) => {
+        requestedUrl = req.url ?? "";
+        if (req.url?.startsWith("/v1/history")) {
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "claude",
+              since: "2026-09-12T20:00:00.000Z",
+              records: historyRecords,
+            })
+          );
+        } else {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+
+      const nowMs = 1773619200000;
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        now: () => nowMs,
+      });
+
+      expect(client.getCachedHistory("claude")).toEqual([]);
+
+      const records = await client.getHistory("claude");
+      expect(records).not.toBeNull();
+      expect(records).toHaveLength(2);
+
+      // Verify bounded by 3 days window in default query
+      const expectedSince = new Date(nowMs - HISTORY_WINDOW_MS).toISOString();
+      expect(requestedUrl).toContain(encodeURIComponent(expectedSince));
+
+      const cached = client.getCachedHistory("claude");
+      expect(cached).toHaveLength(2);
+      expect(cached[0].kind).toBe("session");
+
+      const filtered = client.getCachedHistory("claude", "2026-09-15T20:30:00.000Z");
+      expect(filtered).toHaveLength(0);
+    });
+
+    it("treats history failures as null without replacing existing cache on error, timeout, HTTP failure, protocol mismatch, identity mismatch, or bad shape", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-failures-"));
+      const socketPath = join(root, "coordinator.sock");
+      let handlerMode:
+        | "valid"
+        | "500"
+        | "protocol_mismatch"
+        | "wrong_provider"
+        | "bad_shape"
+        | "empty" = "valid";
+
+      const validRecord: PublishedHistoryRecord = {
+        scope: "provider",
+        kind: "session",
+        label: "Claude session",
+        observedAt: "2026-09-15T20:00:00.000Z",
+        percentLeft: 80,
+        resetAtIso: null,
+        controllerError: null,
+        intervalSeconds: 300,
+      };
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        if (handlerMode === "valid") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "claude",
+              since: "2026-09-15T00:00:00.000Z",
+              records: [validRecord],
+            })
+          );
+        } else if (handlerMode === "500") {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: "internal error" }));
+        } else if (handlerMode === "protocol_mismatch") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(COORDINATOR_PROTOCOL_MAJOR + 1),
+              provider: "claude",
+              since: "2026-09-15T00:00:00.000Z",
+              records: [],
+            })
+          );
+        } else if (handlerMode === "wrong_provider") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "codex", // mismatched provider
+              since: "2026-09-15T00:00:00.000Z",
+              records: [],
+            })
+          );
+        } else if (handlerMode === "bad_shape") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "claude",
+              since: "2026-09-15T00:00:00.000Z",
+              records: [{ invalid: "not a history record" }],
+            })
+          );
+        } else if (handlerMode === "empty") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "claude",
+              since: "2026-09-15T00:00:00.000Z",
+              records: [],
+            })
+          );
+        }
+      });
+
+      const client = new QuotaCoordinatorClient({ socketPath });
+
+      // 1. Valid fetch populates cache
+      handlerMode = "valid";
+      const initial = await client.getHistory("claude");
+      expect(initial).toHaveLength(1);
+      expect(client.getCachedHistory("claude")).toHaveLength(1);
+
+      // 2. HTTP 500 failure returns null and preserves cache
+      handlerMode = "500";
+      expect(await client.getHistory("claude")).toBeNull();
+      expect(client.getCachedHistory("claude")).toHaveLength(1);
+
+      // 3. Protocol mismatch returns null and preserves cache
+      handlerMode = "protocol_mismatch";
+      expect(await client.getHistory("claude")).toBeNull();
+      expect(client.getCachedHistory("claude")).toHaveLength(1);
+
+      // 4. Provider identity mismatch returns null and preserves cache
+      handlerMode = "wrong_provider";
+      expect(await client.getHistory("claude")).toBeNull();
+      expect(client.getCachedHistory("claude")).toHaveLength(1);
+
+      // 5. Bad shape returns null and preserves cache
+      handlerMode = "bad_shape";
+      expect(await client.getHistory("claude")).toBeNull();
+      expect(client.getCachedHistory("claude")).toHaveLength(1);
+
+      // 6. Valid empty response replaces cache with []
+      handlerMode = "empty";
+      const emptyResult = await client.getHistory("claude");
+      expect(emptyResult).toEqual([]);
+      expect(client.getCachedHistory("claude")).toEqual([]);
+    });
+
+    it("times out coordinator history request when socket hangs", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-hung-"));
+      const socketPath = join(root, "coordinator.sock");
+      await listen(socketPath, () => {
+        // Deliberately never respond
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        requestTimeoutMs: 50,
+      });
+
+      const result = await client.getHistory("claude");
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("Production tick reconciliation: warm → outage/cold → hard-stale", () => {
+    it("reconciles pacers from client across warm -> outage -> hard-stale progression", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-reconcile-"));
+      const socketPath = join(root, "coordinator.sock");
+      let nowMs = 10000;
+      let handlerMode: "warm" | "outage" | "cold" = "warm";
+      const maxIntervalSeconds = 3600;
+      const hardStaleAfterMs = 5000;
+
+      await listen(socketPath, (_req, res) => {
+        if (handlerMode === "warm") {
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              providers: {
+                claude: providerStatus(120, "claude"),
+                codex: providerStatus(180, "codex"),
+              },
+            })
+          );
+        } else if (handlerMode === "cold") {
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              providers: {
+                claude: {
+                  error: { code: "not_ready", retryable: true, message: "cold lane" },
+                },
+              },
+            })
+          );
+        } else {
+          res.statusCode = 500;
+          res.end("internal error");
+        }
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds,
+        hardStaleAfterMs,
+        now: () => nowMs,
+      });
+
+      const pacers = new Map([
+        ["claude", new ProviderPacer(maxIntervalSeconds * 1000, () => nowMs)],
+        ["codex", new ProviderPacer(maxIntervalSeconds * 1000, () => nowMs)],
+      ]);
+      const pacerFor = (p: string) => {
+        const pacer = pacers.get(p);
+        if (!pacer) throw new Error(`missing pacer for ${p}`);
+        return pacer;
+      };
+      const configuredProviders = ["claude", "codex"] as const;
+
+      // 0. Cold start: both pacers start at maxIntervalSeconds
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      expect(pacerFor("claude").interval).toBe(maxIntervalSeconds * 1000);
+      expect(pacerFor("codex").interval).toBe(maxIntervalSeconds * 1000);
+
+      // 1. Warm tick: both lanes receive published intervals
+      const warmResp = await client.getThrottle();
+      expect(warmResp).not.toBeNull();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      expect(pacerFor("claude").interval).toBe(120 * 1000);
+      expect(pacerFor("codex").interval).toBe(180 * 1000);
+
+      const claudePublished = client.getLastPublishedStatus("claude");
+      expect(claudePublished?.intervalSeconds).toBe(120);
+
+      // 2. Outage tick within hardStaleAfterMs (nowMs + 3000ms < hardStaleAfterMs 5000ms)
+      nowMs += 3000;
+      handlerMode = "outage";
+      const outageResp = await client.getThrottle();
+      expect(outageResp).toBeNull();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      // Retains previous warm interval
+      expect(pacerFor("claude").interval).toBe(120 * 1000);
+      expect(pacerFor("codex").interval).toBe(180 * 1000);
+      // Published status details preserved intact
+      expect(client.getLastPublishedStatus("claude")?.intervalSeconds).toBe(120);
+
+      // 3. Cold lane response within hardStaleAfterMs (nowMs + 1000ms, total 4000ms < 5000ms)
+      nowMs += 1000;
+      handlerMode = "cold";
+      const coldResp = await client.getThrottle();
+      expect(coldResp).not.toBeNull();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      // Still within hard-stale window -> retained
+      expect(pacerFor("claude").interval).toBe(120 * 1000);
+      expect(pacerFor("codex").interval).toBe(180 * 1000);
+
+      // 4. Hard-stale widening past hardStaleAfterMs (nowMs + 2000ms, total 6000ms > 5000ms)
+      nowMs += 2000;
+      await client.getThrottle();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      // Both pacers widen to maxIntervalSeconds on client clock
+      expect(pacerFor("claude").interval).toBe(maxIntervalSeconds * 1000);
+      expect(pacerFor("codex").interval).toBe(maxIntervalSeconds * 1000);
+      // Published status details remain preserved
+      expect(client.getLastPublishedStatus("claude")?.intervalSeconds).toBe(120);
+
+      // 5. Recovery tick: service answers with fresh warm interval
+      nowMs += 1000;
+      handlerMode = "warm";
+      await client.getThrottle();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      expect(pacerFor("claude").interval).toBe(120 * 1000);
+      expect(pacerFor("codex").interval).toBe(180 * 1000);
+    });
+
+    it("reconciles omitted lane in collection response to hard-stale while present lane remains warm", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-omitted-"));
+      const socketPath = join(root, "coordinator.sock");
+      let nowMs = 10000;
+      let omitCodex = false;
+      const maxIntervalSeconds = 3600;
+      const hardStaleAfterMs = 5000;
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        const providers: Record<string, unknown> = {
+          claude: providerStatus(100, "claude"),
+        };
+        if (!omitCodex) {
+          providers.codex = providerStatus(200, "codex");
+        }
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            providers,
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds,
+        hardStaleAfterMs,
+        now: () => nowMs,
+      });
+
+      const pacers = new Map([
+        ["claude", new ProviderPacer(maxIntervalSeconds * 1000, () => nowMs)],
+        ["codex", new ProviderPacer(maxIntervalSeconds * 1000, () => nowMs)],
+      ]);
+      const pacerFor = (p: string) => {
+        const pacer = pacers.get(p);
+        if (!pacer) throw new Error(`missing pacer for ${p}`);
+        return pacer;
+      };
+      const configuredProviders = ["claude", "codex"] as const;
+
+      // Tick 1: both warm
+      await client.getThrottle();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+      expect(pacerFor("claude").interval).toBe(100 * 1000);
+      expect(pacerFor("codex").interval).toBe(200 * 1000);
+
+      // Tick 2: codex omitted and time advanced past hardStaleAfterMs
+      nowMs += 6000;
+      omitCodex = true;
+      await client.getThrottle();
+      reconcileProviderPacersFromClient(pacerFor, configuredProviders, client);
+
+      // claude updated with fresh warm interval (100s)
+      expect(pacerFor("claude").interval).toBe(100 * 1000);
+      // codex was omitted; past hard-stale window -> widened to maxIntervalSeconds
+      expect(pacerFor("codex").interval).toBe(maxIntervalSeconds * 1000);
+    });
+
+    it("preserves deferUntil(exhaustedUntil) across reconciliation on an active pacer with started run", async () => {
+      const nowMs = 10000;
+      const pacer = new ProviderPacer(0, () => nowMs);
+
+      // 1. Submit and start one run on the pacer so lastStartedAt is populated
+      const run = pacer.submit(async () => "run-1", {
+        enqueueNormal: (fn) => ({
+          result: fn(),
+          started: true,
+          promote: () => {},
+          cancel: () => true,
+        }),
+      });
+      await run.result;
+      expect(run.started).toBe(true);
+
+      // 2. Apply an expired status with exhaustedUntil via applyThrottleStatusToPacer
+      const exhaustedUntilMs = nowMs + 3_600_000;
+      const publishedStatus: PublishedThrottleResponse = {
+        service: serviceInfo(),
+        provider: "claude",
+        intervalSeconds: 60,
+        uncappedIntervalSeconds: 60,
+        governingBucketKey: "claude:session",
+        capped: false,
+        expired: true,
+        exhaustedUntil: new Date(exhaustedUntilMs).toISOString(),
+        updatedAt: new Date(nowMs).toISOString(),
+        buckets: [],
+        freshness: { ageMs: 0, buckets: {}, stale: false, hardStale: false },
+      };
+
+      applyThrottleStatusToPacer(pacer, publishedStatus);
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      // 3. Call reconcileProviderPacersFromClient with client reporting same target interval
+      const mockClient = {
+        getLastAppliedInterval: vi.fn().mockReturnValue(60),
+      };
+      const pacerFor = (_provider: string) => pacer;
+      reconcileProviderPacersFromClient(pacerFor, ["claude"], mockClient);
+
+      // 4. Assert the pacer's next availability still honors exhaustedUntil
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+    });
+
+    it("preserves deferUntil(exhaustedUntil) across live socket tick reconciliation after a run starts", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-defer-survive-"));
+      const socketPath = join(root, "coordinator.sock");
+      const nowMs = 10000;
+      const exhaustedUntilMs = nowMs + 3_600_000;
+      const exhaustedUntilIso = new Date(exhaustedUntilMs).toISOString();
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            providers: {
+              claude: {
+                ...providerStatus(60, "claude"),
+                expired: true,
+                exhaustedUntil: exhaustedUntilIso,
+              },
+            },
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds: 3600,
+        now: () => nowMs,
+      });
+
+      const pacer = new ProviderPacer(0, () => nowMs);
+      const pacerFor = (_provider: string) => pacer;
+
+      // 1. Submit and start one run so lastStartedAt is populated
+      const run = pacer.submit(async () => "run-1", {
+        enqueueNormal: (fn) => ({
+          result: fn(),
+          started: true,
+          promote: () => {},
+          cancel: () => true,
+        }),
+      });
+      await run.result;
+      expect(run.started).toBe(true);
+
+      // 2. Fetch throttle and apply status to pacer
+      const response = await client.getThrottle();
+      expect(response).not.toBeNull();
+      const status = client.getLastPublishedStatus("claude");
+      expect(status).toBeDefined();
+      if (status) {
+        applyThrottleStatusToPacer(pacer, status);
+      }
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      // 3. Reconcile pacer from client (simulating tick finally)
+      reconcileProviderPacersFromClient(pacerFor, ["claude"], client);
+
+      // 4. Assert deferUntil is preserved and availability still equals exhaustedUntil
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+    });
+
+    it("preserves deferUntil(exhaustedUntil) across hard-stale interval widening when exhaustedUntil is later than lastStartedAt + maxIntervalSeconds", async () => {
+      let nowMs = 10000;
+      const maxIntervalSeconds = 3600;
+      const hardStaleAfterMs = 5000;
+
+      const client = new QuotaCoordinatorClient({
+        socketPath: "/tmp/any.sock",
+        maxIntervalSeconds,
+        hardStaleAfterMs,
+        now: () => nowMs,
+      });
+
+      const pacer = new ProviderPacer(0, () => nowMs);
+
+      // 1. Submit and start one run on the pacer so lastStartedAt is populated (10000)
+      const run = pacer.submit(async () => "run-1", {
+        enqueueNormal: (fn) => ({
+          result: fn(),
+          started: true,
+          promote: () => {},
+          cancel: () => true,
+        }),
+      });
+      await run.result;
+      expect(run.started).toBe(true);
+
+      // 2. Apply an expired status with exhaustedUntil 5 hours out (18010000)
+      const exhaustedUntilMs = nowMs + 5 * 3600_000;
+      const publishedStatus: PublishedThrottleResponse = {
+        service: serviceInfo(),
+        provider: "claude",
+        intervalSeconds: 60,
+        uncappedIntervalSeconds: 60,
+        governingBucketKey: "claude:session",
+        capped: false,
+        expired: true,
+        exhaustedUntil: new Date(exhaustedUntilMs).toISOString(),
+        updatedAt: new Date(nowMs).toISOString(),
+        buckets: [],
+        freshness: { ageMs: 0, buckets: {}, stale: false, hardStale: false },
+      };
+
+      client.applyResponse("claude", publishedStatus);
+      applyThrottleStatusToPacer(pacer, publishedStatus);
+
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      // 3. Advance clock past hardStaleAfterMs (e.g. 1 hour later)
+      nowMs += 3600_000;
+      expect(client.getLastAppliedInterval("claude")).toBe(maxIntervalSeconds);
+      // Verify lastStartedAt + maxIntervalSeconds * 1000 (3610000) is earlier than exhaustedUntilMs (18010000)
+      expect(10000 + maxIntervalSeconds * 1000).toBeLessThan(exhaustedUntilMs);
+
+      // 4. Reconcile pacer from client where target interval changes from 60s to 3600s
+      const pacerFor = (_provider: string) => pacer;
+      reconcileProviderPacersFromClient(pacerFor, ["claude"], client);
+
+      // 5. Assert pacer interval widened to maxIntervalSeconds AND quote still honors exhaustedUntilMs
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+    });
+
+    it("preserves deferUntil(exhaustedUntil) across live outage past hard-stale widening when exhaustedUntil is later than lastStartedAt + maxIntervalSeconds", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-defer-hardstale-"));
+      const socketPath = join(root, "coordinator.sock");
+      let nowMs = 10000;
+      const maxIntervalSeconds = 3600;
+      const hardStaleAfterMs = 5000;
+      const exhaustedUntilMs = nowMs + 5 * 3600_000; // 5 hours out
+      const exhaustedUntilIso = new Date(exhaustedUntilMs).toISOString();
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            providers: {
+              claude: {
+                ...providerStatus(60, "claude"),
+                expired: true,
+                exhaustedUntil: exhaustedUntilIso,
+              },
+            },
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        maxIntervalSeconds,
+        hardStaleAfterMs,
+        now: () => nowMs,
+      });
+
+      const pacer = new ProviderPacer(0, () => nowMs);
+      const pacerFor = (_provider: string) => pacer;
+
+      // 1. Submit and start one run so lastStartedAt is populated (10000)
+      const run = pacer.submit(async () => "run-1", {
+        enqueueNormal: (fn) => ({
+          result: fn(),
+          started: true,
+          promote: () => {},
+          cancel: () => true,
+        }),
+      });
+      await run.result;
+      expect(run.started).toBe(true);
+
+      // 2. Fetch warm throttle and apply status to pacer
+      const response = await client.getThrottle();
+      expect(response).not.toBeNull();
+      const status = client.getLastPublishedStatus("claude");
+      expect(status).toBeDefined();
+      if (status) {
+        applyThrottleStatusToPacer(pacer, status);
+      }
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      // 3. Reconcile on warm tick (no-op)
+      reconcileProviderPacersFromClient(pacerFor, ["claude"], client);
+      expect(pacer.interval).toBe(60 * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+
+      // 4. Coordinator goes down (outage) and clock advances past hard-stale window (1 hour later)
+      await stopServer();
+      nowMs += 3600_000; // nowMs = 3610000
+      expect(10000 + maxIntervalSeconds * 1000).toBeLessThan(exhaustedUntilMs);
+
+      const outageResp = await client.getThrottle();
+      expect(outageResp).toBeNull();
+      expect(client.getLastAppliedInterval("claude")).toBe(maxIntervalSeconds);
+
+      // 5. Reconcile pacer (simulating tick finally during hard-stale outage)
+      reconcileProviderPacersFromClient(pacerFor, ["claude"], client);
+
+      // 6. Assert pacer interval widened to maxIntervalSeconds AND quote still honors exhaustedUntilMs
+      expect(pacer.interval).toBe(maxIntervalSeconds * 1000);
+      expect(pacer.quote(nowMs)).toBe(exhaustedUntilMs);
+    });
   });
 });
