@@ -353,10 +353,11 @@ function verifySignedStamp(opts: {
   const now = Date.now();
   const ageMs = now - issuedAt;
   // issuedAt is set at post-time but the stamp is verified when the webhook delivery is
-  // processed, so a legit self-post can age by GitHub's delivery latency plus any queueing or
-  // redelivery on our side before it is seen. A window shorter than that expires legit
-  // self-stamps and leaks self-echoes as delivered; 15min comfortably covers a delayed or
-  // manually redelivered webhook.
+  // processed, so a legit self-post can age by GitHub's delivery latency plus any queueing on
+  // our side before it is seen. A window shorter than that expires legit self-stamps and leaks
+  // self-echoes as delivered; 15min covers the expected delivery/queue delay. A webhook manually
+  // redelivered later than that carries an expired stamp and is intentionally fail-open: the
+  // event is delivered and the expiry is reported as an anomaly (see resolveStampedAuthor below).
   const FRESHNESS_WINDOW_MS = 15 * 60 * 1000;
   if (Math.abs(ageMs) > FRESHNESS_WINDOW_MS) {
     return {

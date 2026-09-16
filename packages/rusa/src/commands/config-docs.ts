@@ -105,8 +105,8 @@ Minimal example:
 Top-level fields:
 
   profile                  Optional. Named config profile. "quickstart" enables local git bridge delivery
-                           and GitHub poll ingestion unless explicitly overridden.
-  github                   Required. GitHub polling and bot identity.
+                           and a container-boundary sandbox unless explicitly overridden.
+  github                   Required. GitHub bot identity and webhook-subscribed repositories.
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
