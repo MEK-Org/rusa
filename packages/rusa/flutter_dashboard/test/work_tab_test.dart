@@ -6,8 +6,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/obligation_status.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
+
 
 import 'fakes.dart';
 
@@ -206,10 +208,24 @@ void main() {
             .single;
         final wideTitleRect = tester.getRect(title);
         final wideActionsRect = tester.getRect(actions);
-
         // The controls are adjacent to the title rather than at the far edge
         // of the wide detail pane.
+
         expect(wideActionsRect.left, closeTo(wideTitleRect.right + 8, 1));
+        // The title and adjacent controls share the same visual axis (#508).
+        expect(wideActionsRect.center.dy, closeTo(wideTitleRect.center.dy, 1.0));
+        final status = find.descendant(of: actions, matching: find.byType(ObligationStatusChip));
+        expect(tester.getRect(status).center.dy, closeTo(wideTitleRect.center.dy, 1.0));
+        for (final tooltip in [
+          'Mark Done',
+          'Cancel Obligation',
+          'Reassign obligation',
+          'Add child obligation',
+        ]) {
+          final controlRect = tester.getRect(find.byTooltip(tooltip));
+          expect(controlRect.center.dy, closeTo(wideTitleRect.center.dy, 1.0));
+        }
+
         expect(
           editableRender
               .getBoxesForSelection(
@@ -309,6 +325,134 @@ void main() {
   );
 
   testWidgets(
+    'aligns obligation title and actions on the same visual axis across dashboard widths (#508)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'visual-axis-header',
+          ownerId: 'root',
+          title: 'Aligned Title',
+        );
+        final terminalOb = makeObligation(
+          'terminal-visual-axis',
+          ownerId: 'root',
+          title: 'Terminal Aligned Title',
+          status: 'done',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob, terminalOb];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId(ob.id);
+
+        // Wide and standard desktop widths where title and action controls sit side-by-side
+        for (final width in [1600.0, 1200.0]) {
+          await tester.binding.setSurfaceSize(Size(width, 800));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump();
+          await tester.pump();
+
+          final title = find.byKey(const ValueKey('obligation-detail-title'));
+          final actions = find.byKey(const ValueKey('obligation-detail-actions'));
+          final titleRect = tester.getRect(title);
+          final actionsRect = tester.getRect(actions);
+
+          // The title occupies only its 1 line of height rather than inflating to 2 lines
+          expect(titleRect.height, lessThan(40.0));
+
+          // Shared horizontal visual axis between title and control wrap
+          expect(
+            actionsRect.center.dy,
+            closeTo(titleRect.center.dy, 1.0),
+            reason: 'Actions not centered with title at width $width',
+          );
+
+          // Status chip on the same visual axis
+          final status = find.descendant(of: actions, matching: find.byType(ObligationStatusChip));
+          expect(
+            tester.getRect(status).center.dy,
+            closeTo(titleRect.center.dy, 1.0),
+            reason: 'Status chip not centered with title at width $width',
+          );
+
+          // Each individual action button on the same visual axis
+          for (final tooltip in [
+            'Mark Done',
+            'Cancel Obligation',
+            'Reassign obligation',
+            'Add child obligation',
+          ]) {
+            final btnRect = tester.getRect(find.byTooltip(tooltip));
+            expect(
+              btnRect.center.dy,
+              closeTo(titleRect.center.dy, 1.0),
+              reason: '$tooltip button not centered with title at width $width',
+            );
+          }
+        }
+
+        // Narrow width where controls wrap to the next line
+        await tester.binding.setSurfaceSize(const Size(400, 800));
+        await tester.pump();
+        await tester.pump();
+
+        final narrowTitle = find.byKey(const ValueKey('obligation-detail-title'));
+        final narrowActions = find.byKey(const ValueKey('obligation-detail-actions'));
+        final narrowTitleRect = tester.getRect(narrowTitle);
+        final narrowActionsRect = tester.getRect(narrowActions);
+
+        expect(narrowActionsRect.top, greaterThanOrEqualTo(narrowTitleRect.bottom));
+        // Inside the wrapped actions, controls remain aligned on the same visual axis
+        final narrowStatus = find.descendant(of: narrowActions, matching: find.byType(ObligationStatusChip));
+        final narrowStatusRect = tester.getRect(narrowStatus);
+        final doneBtnRect = tester.getRect(find.byTooltip('Mark Done'));
+        expect(
+          narrowStatusRect.center.dy,
+          closeTo(doneBtnRect.center.dy, 1.0),
+          reason: 'Status chip not centered with action buttons in wrapped run',
+        );
+
+        // Verify terminal header visual axis alignment as well
+        store.setFocusedObligationId(terminalOb.id);
+        await tester.binding.setSurfaceSize(const Size(1200, 800));
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildMeshTheme(),
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        final terminalStatus = find.byType(ObligationStatusChip);
+        final terminalTitle = find.byType(SelectableText).first;
+        expect(
+          tester.getRect(terminalStatus).center.dy,
+          closeTo(tester.getRect(terminalTitle).center.dy, 1.0),
+          reason: 'Terminal status chip not centered with terminal title',
+        );
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+
     'excludes quiet terminal roots from the default load, fetches them on '
     'Show Done (#241)',
     (tester) async {
