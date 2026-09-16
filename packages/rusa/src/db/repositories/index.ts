@@ -79,6 +79,7 @@ export class Repositories {
     this.modelScrapes = new ModelScrapeRepository(db);
     this.modelClasses = new ModelClassRepository(db);
     this.obligations = new ObligationRepository(db);
+    this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);
     this.referenceCache = new ReferenceCacheRepository(db);
   }

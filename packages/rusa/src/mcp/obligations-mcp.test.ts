@@ -35,10 +35,11 @@ function dataOf(result: CallToolResult): unknown {
 }
 
 describe("obligations MCP", () => {
+  let db: Database.Database;
   let repository: ObligationRepository;
 
   beforeEach(() => {
-    const db = new Database(":memory:");
+    db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     obligations.up(db);
     obligationPriority.up(db);
@@ -213,6 +214,47 @@ describe("obligations MCP", () => {
       })) as CallToolResult;
       expect(res.isError, ownerId).toBeFalsy();
     }
+  });
+
+  it("creates human-owned work by durable id and legacy alias without actor attention", async () => {
+    const user = {
+      kind: "user" as const,
+      id: "fb394608-d6d6-4f2e-aebe-51a59bd01374",
+      createdAt: "2026-09-16T00:00:00.000Z",
+      email: "operator@example.com",
+    };
+    const registry = new Map([["actor-a", { status: "active" }]]);
+    const principals = {
+      get: (id: string) => (id === user.id ? user : undefined),
+      listUsers: () => [user],
+    };
+    repository.setActorExists((id) => registry.get(id)?.status === "active");
+    repository.setPrincipalKind((id) => principals.get(id)?.kind);
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", {
+        resolveOwner: (raw) =>
+          resolveObligationOwner(
+            { get: (id: string) => registry.get(id) as never },
+            raw,
+            principals
+          ),
+      })
+    );
+
+    for (const ownerId of [user.id, "human:operator"]) {
+      const result = (await client.callTool({
+        name: "create_obligation",
+        arguments: { title: `owned through ${ownerId}`, owner_id: ownerId },
+      })) as CallToolResult;
+      expect(result.isError, ownerId).toBeFalsy();
+      expect((dataOf(result) as { obligation: { ownerId: string } }).obligation.ownerId).toBe(
+        user.id
+      );
+    }
+
+    expect(
+      db.prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = ?").all(user.id)
+    ).toEqual([]);
   });
 
   it("records the actor's stated reason on the terminal transition", async () => {
