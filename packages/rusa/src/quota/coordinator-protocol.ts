@@ -5,6 +5,7 @@ export const COORDINATOR_PROTOCOL_MINOR = 0;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
+export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;
@@ -37,9 +38,61 @@ export interface PublishedThrottleResponse extends PublishedThrottleProviderStat
   service: QuotaCoordinatorServiceInfo;
 }
 
+/**
+ * A configured provider the coordinator has no stored throttle for yet. It is
+ * a valid application state, not a transport failure, so it is served with
+ * HTTP 200: the single-provider form is `{ service, error }` and the
+ * collection form carries the same object minus `service` (§5.5, criterion 16).
+ * `503` stays reserved for genuine infrastructure failure (`healthz`/`readyz`).
+ */
+export interface PublishedThrottleColdStatus {
+  error: QuotaCoordinatorError & { code: "not_ready"; retryable: true };
+}
+
+export interface PublishedThrottleColdResponse extends PublishedThrottleColdStatus {
+  service: QuotaCoordinatorServiceInfo;
+}
+
+export type PublishedThrottleLaneStatus =
+  | PublishedThrottleProviderStatus
+  | PublishedThrottleColdStatus;
+
 export interface PublishedThrottleCollectionResponse {
   service: QuotaCoordinatorServiceInfo;
-  providers: Record<string, PublishedThrottleProviderStatus>;
+  providers: Record<string, PublishedThrottleLaneStatus>;
+}
+
+export interface PublishedHistoryRecord {
+  scope: "provider" | "model";
+  kind: string;
+  label: string;
+  observedAt: string;
+  percentLeft: number;
+  resetAtIso: string | null;
+  controllerError: number | null;
+  intervalSeconds: number | null;
+}
+
+export interface PublishedHistoryResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  since: string;
+  records: PublishedHistoryRecord[];
+}
+
+export function isValidHistoryRecord(record: unknown): record is PublishedHistoryRecord {
+  if (typeof record !== "object" || record === null) return false;
+  const r = record as Record<string, unknown>;
+  return (
+    (r.scope === "provider" || r.scope === "model") &&
+    typeof r.kind === "string" &&
+    typeof r.label === "string" &&
+    typeof r.observedAt === "string" &&
+    typeof r.percentLeft === "number" &&
+    (r.resetAtIso === null || typeof r.resetAtIso === "string") &&
+    (r.controllerError === null || typeof r.controllerError === "number") &&
+    (r.intervalSeconds === null || typeof r.intervalSeconds === "number")
+  );
 }
 
 export type QuotaCoordinatorErrorCode =
@@ -74,12 +127,35 @@ export interface QuotaCoordinatorHealthResponse {
   ok: boolean;
 }
 
+/**
+ * Per-provider collection health, as readiness reports it.
+ *
+ * `status` is deliberately not derived from the database alone. A probe that
+ * fails before it can persist a scrape row — an unwritable workers directory, a
+ * revoked provider session, a missing CLI — leaves the newest stored row intact
+ * and looking healthy, which is the exact silent failure §9.5's second drill
+ * exists to catch. When the coordinator also collects, the live loop supplies
+ * `lastAttemptAt`, `attempts` and `failures`, and a failing probe shows here as
+ * `error` even while `scrapedAt` still points at the last good reading.
+ */
+export interface QuotaReadyScrapeStatus {
+  /** Newest persisted scrape, or `null` when no probe has ever stored one. */
+  scrapedAt: string | null;
+  /** `pending` means a configured provider that has not yet been probed. */
+  status: "ok" | "error" | "pending";
+  error?: string;
+  /** When a probe was last started, whether or not it stored anything. */
+  lastAttemptAt?: string | null;
+  attempts?: number;
+  failures?: number;
+}
+
 export interface QuotaCoordinatorReadyResponse {
   service: QuotaCoordinatorServiceInfo;
   ready: boolean;
   cold: boolean;
   schemaVersion: number;
-  scrapes?: Record<string, { scrapedAt: string; status: "ok" | "error"; error?: string }>;
+  scrapes?: Record<string, QuotaReadyScrapeStatus>;
 }
 
 export interface PublishedThrottleOptions {

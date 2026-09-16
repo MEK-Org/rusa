@@ -11,9 +11,10 @@ import { runDev } from "./commands/dev.js";
 import { runActorMeshE2EUp } from "./commands/e2e-actor-mesh.js";
 import { runForwardWebhooks } from "./commands/forward-webhooks.js";
 import { runInit } from "./commands/init.js";
-import { runInstallService } from "./commands/install-service.js";
+import { runInstallQuotaCoordinator, runInstallService } from "./commands/install-service.js";
 import { runActorLogs, runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runQuotaBackup, runQuotaBackupList, runQuotaRestore } from "./commands/quota-backup.js";
 import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
@@ -338,14 +339,108 @@ program
   .description("Start the shared quota coordinator service")
   .option("--home <path>", "Override RUSA_HOME for this coordinator")
   .option("--socket <path>", "Override socket path")
+  .option("--database <path>", "Override service-owned quota database path")
+  .option(
+    "--legacy-database <path>",
+    "Legacy direct-mode database path for the scheduled relocation"
+  )
+  .option(
+    "--relocate",
+    "Perform the scheduled stage-3 relocation and create the legacy-path blocking directory"
+  )
+  .action(
+    async (opts: {
+      home?: string;
+      socket?: string;
+      database?: string;
+      legacyDatabase?: string;
+      relocate?: boolean;
+    }) => {
+      await runQuotaCoordinator({
+        home: opts.home,
+        socketPath: opts.socket,
+        databasePath: opts.database,
+        legacyDatabasePath: opts.legacyDatabase,
+        relocate: opts.relocate,
+      });
+    }
+  );
+
+program
+  .command("install-quota-coordinator")
+  .description("Install the quota coordinator systemd user service and its failure alert")
+  .option("--environment <environment>", "Service environment: production or staging", "production")
+  .option("--deployment-mode <mode>", "Executable source: package or self", "package")
+  .option("--repo-path <path>", "Repo root or package directory to use for self deployment mode")
+  .option("--no-restart", "write/enable units and reload systemd, but do not start the service")
+  .action(
+    async (opts: {
+      environment: ServiceEnvironment;
+      deploymentMode: DeploymentMode;
+      repoPath?: string;
+      restart: boolean;
+    }) => {
+      await runInstallQuotaCoordinator({
+        environment: opts.environment,
+        deploymentMode: opts.deploymentMode,
+        repoPath: opts.repoPath,
+        restart: opts.restart,
+      });
+    }
+  );
+
+program
+  .command("quota-backup")
+  .description("Back up the quota database with VACUUM INTO and apply retention")
+  .option("--home <path>", "Override RUSA_HOME")
   .option("--database <path>", "Override quota database path")
-  .action(async (opts: { home?: string; socket?: string; database?: string }) => {
-    await runQuotaCoordinator({
-      home: opts.home,
-      socketPath: opts.socket,
-      databasePath: opts.database,
-    });
-  });
+  .option("--backup-dir <path>", "Override backup directory")
+  .option("--retain <count>", "Override how many daily backups to keep", Number.parseInt)
+  .option("--list", "List existing backups instead of taking one")
+  .action(
+    (opts: {
+      home?: string;
+      database?: string;
+      backupDir?: string;
+      retain?: number;
+      list?: boolean;
+    }) => {
+      const args = {
+        home: opts.home,
+        databasePath: opts.database,
+        backupDir: opts.backupDir,
+        retain: opts.retain,
+      };
+      if (opts.list) runQuotaBackupList(args);
+      else runQuotaBackup(args);
+    }
+  );
+
+program
+  .command("quota-restore")
+  .description("Restore a quota database backup (the coordinator must be stopped)")
+  .option("--home <path>", "Override RUSA_HOME")
+  .option("--from <path>", "Backup file to restore; defaults to the newest one")
+  .option("--database <path>", "Override quota database path")
+  .option("--backup-dir <path>", "Override backup directory")
+  .option("--socket <path>", "Override the socket checked for a running coordinator")
+  .action(
+    async (opts: {
+      home?: string;
+      from?: string;
+      database?: string;
+      backupDir?: string;
+      socket?: string;
+    }) => {
+      await runQuotaRestore({
+        home: opts.home,
+        from: opts.from,
+        databasePath: opts.database,
+        backupDir: opts.backupDir,
+        socketPath: opts.socket,
+      });
+    }
+  );
 
 const understanding = program
   .command("understanding")

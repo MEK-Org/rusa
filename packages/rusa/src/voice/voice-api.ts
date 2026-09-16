@@ -17,7 +17,9 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import { requireOperatorPrincipal } from "../dashboard/api.js";
 import type { SseHub } from "../dashboard/sse.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import type { Logger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toFrame, VOICE_MEMO_PREFIX, type VoiceService } from "./voice-service.js";
@@ -30,6 +32,8 @@ export interface VoiceApiDeps {
   mesh?: ActorMesh;
   /** Null when voice is unconfigured (no geminiApiKey) → routes 503. */
   service: VoiceService | null;
+  /** Durable principals, so a memo is attributed to its sender rather than the legacy alias. */
+  principals?: PrincipalRepository;
   /** Optional structured logger for route events (silenced under tests when omitted). */
   logger?: Logger;
 }
@@ -205,7 +209,11 @@ export function handleVoiceApiRequest(
       // A memo to a non-live actor still transcribes and records (the mesh
       // event is durable), mirroring chat semantics — `delivered` tells the
       // client whether the actor was actually woken.
-      const result = mesh.sendHumanMessage(actorId, VOICE_MEMO_PREFIX + transcript, sessionId);
+      const fromId = requireOperatorPrincipal(req, res, deps);
+      if (!fromId) return;
+      const result = mesh.sendHumanMessage(actorId, VOICE_MEMO_PREFIX + transcript, sessionId, {
+        fromId,
+      });
       sendJson(res, 200, { ok: true, transcript, delivered: result.delivered });
     })().catch((err) => {
       sendJson(res, 500, { error: String(err) });

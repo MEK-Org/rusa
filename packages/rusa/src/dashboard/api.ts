@@ -5,7 +5,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
-import type { RootControlService } from "../actor/root-control.js";
+import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
   generateAvatarForce,
@@ -20,21 +20,24 @@ import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
-import { isAuthenticatedOperatorRequest } from "./auth.js";
+import { getDashboardRequestPrincipal } from "./auth.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
   actors: ActorRepository;
+  principals?: PrincipalRepository;
   /** Application logger for route diagnostics. Absent → nothing is logged. */
   logger?: Logger;
   meshEvents: MeshEventRepository;
@@ -510,6 +513,71 @@ function parseKinds(url: URL): string[] | undefined {
 }
 
 /**
+ * The durable principal a dashboard mutation is attributed to. An
+ * authenticated session carries its verified identity. In auth-disabled local
+ * mode the process boundary is the trust boundary, so the sole active durable
+ * user is the attribution — and only when exactly one exists. Zero or several
+ * active users is refused with the reason, never guessed at and never the
+ * legacy `human:operator` alias (#460).
+ */
+export function resolveOperatorPrincipalId(
+  req: IncomingMessage,
+  deps?: Pick<DashboardDataDeps, "principals"> | null
+): { ok: true; principalId: RootControlPrincipal } | { ok: false; error: string } {
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
+  const sole = resolveSoleActiveUser(deps?.principals);
+  if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
+  return { ok: false, error: sole.error };
+}
+
+/**
+ * Resolve the acting principal or answer the request with 403 and the reason.
+ * Returns null once the response has been sent so the caller can simply return.
+ */
+export function requireOperatorPrincipal(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps?: Pick<DashboardDataDeps, "principals"> | null
+): RootControlPrincipal | null {
+  const resolved = resolveOperatorPrincipalId(req, deps);
+  if (resolved.ok) return resolved.principalId;
+  sendJson(res, 403, { error: resolved.error });
+  return null;
+}
+
+/**
+ * The durable user a read surface should treat as "me": the authenticated
+ * identity, else local mode's sole active user, else null. Read paths never
+ * fail on this — they just cannot personalize.
+ */
+export function viewingUserPrincipalId(
+  req: IncomingMessage,
+  principals: DashboardDataDeps["principals"]
+): string | null {
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) return reqPrincipal.id;
+  const sole = resolveSoleActiveUser(principals);
+  return sole.ok ? sole.user.id : null;
+}
+
+export function resolveChatQueryActors(
+  actors: string[],
+  deps: DashboardDataDeps | null,
+  req: IncomingMessage
+): string[] {
+  const result = new Set(actors);
+  const reqPrincipal = getDashboardRequestPrincipal(req);
+  if (reqPrincipal) result.add(reqPrincipal.id);
+  if (result.has(HUMAN_OPERATOR) && deps?.principals) {
+    for (const u of deps.principals.listUsers()) {
+      result.add(u.id);
+    }
+  }
+  return [...result];
+}
+
+/**
  * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
  * (responded or took over the socket for SSE), false to let the caller fall
  * through to static asset serving. When `deps` is null (e.g. the e2e UI-only
@@ -544,6 +612,8 @@ export async function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
           try {
             // Portable context  is opt-in per actor: absent means native, so
             // an existing caller that never sends the field keeps the old record.
@@ -564,7 +634,7 @@ export async function handleMeshApiRequest(
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
-              "human:operator"
+              principal
             );
             sendJson(res, 201, { id });
           } catch (err) {
@@ -602,8 +672,10 @@ export async function handleMeshApiRequest(
             sendJson(res, 400, { error: "parentId is required" });
             return;
           }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
           try {
-            rootControl.reparentChild(actorId, parentId.trim(), "human:operator");
+            rootControl.reparentChild(actorId, parentId.trim(), principal);
             sendJson(res, 200, { ok: true });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -658,7 +730,9 @@ export async function handleMeshApiRequest(
             return;
           }
 
-          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice });
+          const fromId = requireOperatorPrincipal(req, res, deps);
+          if (!fromId) return;
+          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice, fromId });
           if (result.delivered) {
             sendJson(res, 200, { ok: true });
           } else {
@@ -692,24 +766,13 @@ export async function handleMeshApiRequest(
         sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
         return true;
       }
+      // The body is drained but never read: `by` is bound server-side from
+      // the acting principal, and a body value is neither an identity claim
+      // nor a fallback (#460).
       readBody(req)
-        .then((bodyStr) => {
-          let by = "human:operator";
-          if (bodyStr.trim()) {
-            try {
-              const parsed = JSON.parse(bodyStr);
-              if (
-                !isAuthenticatedOperatorRequest(req) &&
-                parsed &&
-                typeof parsed.by === "string" &&
-                parsed.by.trim()
-              ) {
-                by = parsed.by.trim();
-              }
-            } catch {
-              // Ignore body parse errors, default to human:operator
-            }
-          }
+        .then(() => {
+          const by = requireOperatorPrincipal(req, res, deps);
+          if (!by) return;
           try {
             const result = mesh.interrupt(actorId, by);
             sendJson(res, 200, {
@@ -745,8 +808,10 @@ export async function handleMeshApiRequest(
         sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
         return true;
       }
+      const principal = requireOperatorPrincipal(req, res, deps);
+      if (!principal) return true;
       try {
-        const result = deps.mesh.runNow(actorId, "human:operator");
+        const result = deps.mesh.runNow(actorId, principal);
         sendJson(res, 200, { ok: true, queued: result.queued });
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -984,12 +1049,14 @@ export async function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
-          const owner = resolveObligationOwner(deps.actors, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId, deps.principals);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
           }
 
+          const creatorId = requireOperatorPrincipal(req, res, deps);
+          if (!creatorId) return;
           try {
             const obligation = obligations.create({
               ownerId: owner.ownerId,
@@ -998,12 +1065,7 @@ export async function handleMeshApiRequest(
               intent,
               externalRef,
               priority,
-              // The dashboard IS the operator, so the creator is bound here from
-              // the server's own identity — the same binding the actor MCP does
-              // with its actor id and the e2e control server does with this one.
-              // Missing it made every dashboard-created obligation
-              // creator-unknown, and #1671 forbids recovering that by inference.
-              creatorId: HUMAN_OPERATOR,
+              creatorId,
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -1055,13 +1117,15 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
             const obligation = obligations.setTerminalStatus(
               id,
               status,
               note,
               resolutionRef,
-              HUMAN_OPERATOR
+              actingPrincipal
             );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
@@ -1112,10 +1176,12 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
             sendJson(res, 200, {
               ok: true,
-              obligation: obligations.setExternalRef(id, externalRef, HUMAN_OPERATOR),
+              obligation: obligations.setExternalRef(id, externalRef, actingPrincipal),
             });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1160,12 +1226,14 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
             const obligation = obligations.movePriorityInternal(
               id,
               previousId,
               nextId,
-              HUMAN_OPERATOR,
+              actingPrincipal,
               scope
             );
             sendJson(res, 200, { ok: true, obligation });
@@ -1208,8 +1276,10 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reparent(id, parentId, HUMAN_OPERATOR);
+            const obligation = obligations.reparent(id, parentId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1251,13 +1321,15 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
-          const owner = resolveObligationOwner(deps.actors, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId, deps.principals);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
           }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
           try {
-            const obligation = obligations.reassign(id, owner.ownerId, HUMAN_OPERATOR);
+            const obligation = obligations.reassign(id, owner.ownerId, actingPrincipal);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1483,12 +1555,14 @@ export async function handleMeshApiRequest(
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
+    const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
       supportedVoices: SUPPORTED_TTS_VOICES,
+      userPrincipalId,
     });
     return true;
   }
@@ -1507,7 +1581,8 @@ export async function handleMeshApiRequest(
       sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
       return true;
     }
-    const actors = parseActors(url);
+    const rawActors = parseActors(url);
+    const actors = resolveChatQueryActors(rawActors, deps, req);
     const conversation = url.searchParams.get("conversation") === "true";
     const page = meshEvents.listEventsByActors(actors, {
       limit: clampLimit(url),
@@ -1521,7 +1596,8 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
   if (pathname === "/api/mesh/chat") {
-    const actors = parseActors(url);
+    const rawActors = parseActors(url);
+    const actors = resolveChatQueryActors(rawActors, deps, req);
     const page = deps.meshChat.listChatByActors(actors, {
       limit: clampLimit(url),
       before: parsePositiveInt(url, "before") ?? null,

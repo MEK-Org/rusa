@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { HISTORY_WINDOW_MS, type PublishedHistoryRecord } from "../quota/coordinator-protocol.js";
 import { isProviderScopedWindow } from "../quota/window-scope.js";
 
 /**
@@ -127,16 +128,7 @@ export interface QuotaHistoryDto {
   history: QuotaHistorySeriesDto[];
 }
 
-export interface QuotaHistorySource {
-  scope: "provider" | "model";
-  kind: string;
-  label: string;
-  observedAt: string;
-  percentLeft: number;
-  resetAtIso: string | null;
-  controllerError: number | null;
-  intervalSeconds: number | null;
-}
+export type QuotaHistorySource = PublishedHistoryRecord;
 
 /** Injected by the wiring that owns the shared `QuotaService` cache. */
 export interface QuotaApiDeps {
@@ -289,7 +281,7 @@ function toProviderDto(
   };
 }
 
-const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+export { HISTORY_WINDOW_MS };
 
 /**
  * A provider's windows are its provider-scoped ones only, decided by the same

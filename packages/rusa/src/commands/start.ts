@@ -186,7 +186,13 @@ import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
-import { DiskUsageAlert } from "../observability/disk-alert.js";
+import {
+  DiskUsageAlert,
+  type DiskUsageAlertDeps,
+  describeDiskAlertConfig,
+  diskAlertActive,
+  resolveDiskAlertConfig,
+} from "../observability/disk-alert.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -214,10 +220,24 @@ import {
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
-import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
+import {
+  applyThrottleStatusToPacer,
+  initialPacerIntervalSeconds,
+  QuotaCoordinatorClient,
+  reconcileProviderPacersFromClient,
+} from "../quota/coordinator-client.js";
+import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
+import {
+  HISTORY_WINDOW_MS,
+  type PublishedThrottleProviderStatus,
+} from "../quota/coordinator-protocol.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
-import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import {
+  type DurableEventDelivery,
+  EventManager,
+  HierarchicalEventSourceResolver,
+} from "../runtime/event-manager.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -375,7 +395,7 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
   return [...providers];
 }
 
-function configuredRootEventSources(config: RusaConfig): EventResource[] {
+export function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
 
   for (const entry of config.github.orgs ?? []) {
@@ -393,14 +413,63 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
     configured.push("gchat:spaces");
   }
 
-  // Disk alerts are a host-owned event source, so configuring the producer is
-  // also the subscription declaration. Keeping that derivation here avoids a
-  // second config knob that can drift from observability.diskAlert.
-  if (config.observability?.diskAlert !== undefined) {
+  // Disk alerts are a host-owned event source, so whatever runs the producer is
+  // also the subscription declaration. Both sides read `diskAlertActive`, so a
+  // running sensor always has a receiver: an absent `observability` block used
+  // to leave the sensor emitting into a source nobody covered, and every alert
+  // it raised was dropped at the routing boundary (#481).
+  if (diskAlertActive(config)) {
     configured.push("system:events");
   }
 
   return configured;
+}
+
+/**
+ * A running disk sensor with no covering root source — the shape that silently
+ * threw away four hours of low-disk warning before a host filled up. Both sides
+ * now derive from one predicate, so this reads false by construction; it stays
+ * as the boot-time alarm that says so out loud if they ever drift again (#481).
+ */
+export function diskAlertUncovered(
+  config: RusaConfig,
+  configuredRoots: readonly EventResource[]
+): boolean {
+  if (!diskAlertActive(config)) return false;
+  return !configuredRoots.some((configured) => isSubResourceOf("system:events", configured));
+}
+
+/** What happened to a host-level alarm once it left the sensor. */
+export type HostAlarmOutcome = "delivered" | "errorChat" | "dropped";
+
+/**
+ * Raise a host-level alarm through the mesh, falling back to a direct error-chat
+ * send when the delivery lands in nobody's inbox or when mesh delivery rejects.
+ * A full disk is precisely the condition under which mesh routing and persistence
+ * may already be degraded, so the alarm keeps the pre-mesh direct send as its
+ * floor rather than trusting routing (#481).
+ */
+export async function deliverHostAlarm(opts: {
+  deliver: () => Promise<DurableEventDelivery>;
+  message: string;
+  sendToErrorChat: ((text: string) => void) | null;
+  log?: Logger;
+}): Promise<HostAlarmOutcome> {
+  let delivery: DurableEventDelivery;
+  try {
+    delivery = await opts.deliver();
+  } catch (error) {
+    opts.log?.warn("disk_alert_delivery_failed", {
+      err: error,
+    });
+    if (!opts.sendToErrorChat) return "dropped";
+    opts.sendToErrorChat(opts.message);
+    return "errorChat";
+  }
+  if (delivery.entries.length > 0) return "delivered";
+  if (!opts.sendToErrorChat) return "dropped";
+  opts.sendToErrorChat(opts.message);
+  return "errorChat";
 }
 
 /** Legacy cap value retained for event detail; Actor now allows one corrective yield run. */
@@ -526,6 +595,8 @@ export interface RunStartE2EHooks {
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
+  /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
+  diskAlertDeps?: DiskUsageAlertDeps;
   onReady?: (handles: RunStartE2EHandles) => void;
 }
 
@@ -881,8 +952,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Database initialization above creates the home when needed; resolving
       // it here makes relative spellings and symlink aliases one owner.
       instanceId: realpathSync(mcHome),
+      log,
     }
   );
+  // A pre-scoping wake block this instance cannot prove it owns keeps firing
+  // with nothing able to cancel it, and a pre-scoping message job fires
+  // without any instance listing it; name each one now, at boot, rather than
+  // leaving it to be discovered by its firing.
+  try {
+    osScheduler.reportUnadoptedLegacyWakeBlocks();
+  } catch (err) {
+    log.warn("legacy_wake_audit_failed", { err });
+  }
+  try {
+    osScheduler.reportLegacyMessageDeliveryJobs();
+  } catch (err) {
+    log.warn("legacy_message_audit_failed", { err });
+  }
   const wakeToken = ensureWakeToken(mcHome);
 
   const legacyActorImport = importLegacyActorState({
@@ -1164,13 +1250,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   }
-  const sharedQuotaStore = config.quota?.databasePath
-    ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
+  const coordinatorSocketPath = config.quota?.coordinator?.socketPath;
+  const maxIntervalSeconds = config.quota?.throttle?.maxIntervalSeconds ?? 3600;
+  const serviceBasename =
+    basename(mcHome) === ".rusa-staging" || basename(mcHome) === "rusa-staging"
+      ? "rusa-staging"
+      : "rusa";
+  const quotaCoordinatorClient = coordinatorSocketPath
+    ? new QuotaCoordinatorClient({
+        socketPath: coordinatorSocketPath,
+        maxIntervalSeconds,
+        source: serviceBasename,
+        metrics: createQuotaMetrics(log),
+        logger: {
+          warn: (...args: unknown[]) =>
+            log.warn("quota_client_warning", { message: args.map(String).join(" ") }),
+          error: (...args: unknown[]) =>
+            log.error("quota_client_error", { message: args.map(String).join(" ") }),
+        },
+      })
     : null;
-  sharedQuotaStore?.configureController({
-    maxIntervalSeconds: config.quota?.throttle?.maxIntervalSeconds ?? 3600,
-  });
-  const quotaScrapesStore = sharedQuotaStore ?? getRepositories().quotaScrapes;
+  const quotaScrapesStore = getRepositories().quotaScrapes;
   // Shared across the `get_quota` MCP tool and the dashboard's `/api/quota`
   // endpoint  — one TTL cache, so neither surface probes independently.
   const quotaService = createQuotaService({
@@ -1319,7 +1419,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch {
     /* the flap check must never wedge startup */
   }
-  // Quota pacing is backed exclusively by the configured shared quota store.
+  // Quota pacing is backed by the coordinator client reading published intervals.
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
   const quotaProviders = configuredQuotaThrottleProviders(config);
@@ -1327,7 +1427,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
-      pacer = new ProviderPacer(0);
+      const initialInterval = initialPacerIntervalSeconds(
+        quotaThrottleEnabled,
+        quotaCoordinatorClient,
+        providerName,
+        maxIntervalSeconds
+      );
+      pacer = new ProviderPacer(initialInterval * 1000);
       providerPacers.set(providerName, pacer);
     }
     return pacer;
@@ -1337,9 +1443,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // absent or stale evidence is deliberately left for submitPoolGate's
   // declared-order fallback.
   const weeklyQuotaFor = (providerName: string) => {
-    const bucket = sharedQuotaStore
-      ?.getProviderThrottle(providerName)
-      ?.buckets.find((candidate) => candidate.key === `${providerName}:weekly`);
+    const published = quotaCoordinatorClient?.getLastPublishedStatus(providerName);
+    const bucket = published?.buckets.find(
+      (candidate) => candidate.key === `${providerName}:weekly`
+    );
     if (!bucket?.resetAtIso) return undefined;
     return {
       percentLeft: bucket.percentLeft,
@@ -1388,18 +1495,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   };
-  const applyPersistedQuotaThrottle = (providerName: QuotaThrottleProvider): boolean => {
-    if (!sharedQuotaStore) return false;
-    const persisted = sharedQuotaStore.getProviderThrottle(providerName);
-    if (!persisted) return false;
+  const applyCoordinatorThrottleStatus = (
+    providerName: QuotaThrottleProvider,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const pacer = pacerFor(providerName);
+    applyThrottleStatusToPacer(pacer, status);
     recordQuotaThrottleTick(
       providerName,
       {
-        intervalSeconds: persisted.intervalSeconds,
-        uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
-        expired: persisted.expired,
-        capped: persisted.capped,
-        buckets: persisted.buckets.map((bucket) => ({
+        intervalSeconds: status.intervalSeconds,
+        uncappedIntervalSeconds: status.uncappedIntervalSeconds,
+        expired: status.expired,
+        capped: status.capped,
+        buckets: status.buckets.map((bucket) => ({
           key: bucket.key,
           percentLeft: bucket.percentLeft,
           timeRemainingPct: bucket.timeRemainingPct,
@@ -1407,46 +1516,60 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
       },
-      persisted.updatedAt,
-      persisted.exhaustedUntil
+      status.updatedAt,
+      status.exhaustedUntil
     );
-    return true;
   };
-  sharedQuotaStore?.setControllerUpdatedListener((providerName) => {
-    if (quotaThrottleEnabled && isQuotaThrottleProvider(providerName)) {
-      applyPersistedQuotaThrottle(providerName);
-    }
-  });
-  if (quotaThrottleEnabled && sharedQuotaStore) {
-    for (const providerName of quotaProviders) applyPersistedQuotaThrottle(providerName);
-  }
   const tickQuotaThrottle = async (): Promise<void> => {
-    if (!quotaThrottleEnabled || !sharedQuotaStore) return;
+    if (!quotaThrottleEnabled || !quotaCoordinatorClient) return;
     try {
-      await Promise.all(
-        quotaProviders.map(async (providerName) => {
-          try {
-            await quotaService.getQuota(providerName);
-            sharedQuotaStore.advancePendingController(
-              { maxIntervalSeconds: quotaThrottleConfig?.maxIntervalSeconds ?? 3600 },
-              providerName
-            );
-            applyPersistedQuotaThrottle(providerName);
-          } catch (err) {
-            // Keep the last persisted reasoned interval when a scrape fails.
-            // Do not turn one provider's probe failure into a mesh failure.
-            console.warn(
-              `[quota-throttle] provider=${providerName} tick failed: ${err instanceof Error ? err.message : String(err)}`
-            );
+      const response = await quotaCoordinatorClient.getThrottle();
+      if (response) {
+        if ("providers" in response && response.providers) {
+          for (const [providerKey, providerStatus] of Object.entries(response.providers)) {
+            if (isQuotaThrottleProvider(providerKey) && "intervalSeconds" in providerStatus) {
+              applyCoordinatorThrottleStatus(providerKey, providerStatus);
+            }
           }
-        })
-      );
-    } catch (outerErr) {
+        } else if (
+          "provider" in response &&
+          "intervalSeconds" in response &&
+          isQuotaThrottleProvider(response.provider)
+        ) {
+          applyCoordinatorThrottleStatus(response.provider, response);
+        }
+      }
+    } catch (err) {
       console.warn(
-        `[quota-throttle] tickQuotaThrottle failed: ${outerErr instanceof Error ? outerErr.message : String(outerErr)}`
+        `[quota-throttle] tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
       );
+    } finally {
+      reconcileProviderPacersFromClient(pacerFor, quotaProviders, quotaCoordinatorClient);
     }
   };
+
+  let historyRefreshInFlight = false;
+  const refreshQuotaHistory = async (): Promise<void> => {
+    if (!quotaCoordinatorClient || historyRefreshInFlight) return;
+    historyRefreshInFlight = true;
+    try {
+      const sinceIso = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
+      await Promise.allSettled(
+        quotaProviders.map((provider) => quotaCoordinatorClient.getHistory(provider, sinceIso))
+      );
+    } catch (err) {
+      log.warn("quota_history_refresh_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      historyRefreshInFlight = false;
+    }
+  };
+
+  if (quotaThrottleEnabled && quotaCoordinatorClient) {
+    await tickQuotaThrottle();
+    void refreshQuotaHistory();
+  }
 
   // ── Capability grants  ──
   // Durable, actor-id-keyed grants of extra MCP capabilities beyond the default
@@ -1788,6 +1911,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
     actors,
+    principals: getRepositories().principals,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
     // is wired. Unknown or disconnected targets fail closed.
@@ -2138,7 +2262,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+            resolveOwner: (raw) =>
+              resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
@@ -2573,6 +2698,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
+    principals: getRepositories().principals,
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
@@ -2673,7 +2799,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canManage: () => true,
-      resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+      resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
     })
   );
@@ -3347,6 +3473,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
           return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
         },
+        // Post-#460 replies target the durable user principal, not the legacy
+        // alias; principal storage is what says a recipient is a person.
+        isHumanRecipient: (principalId) =>
+          getRepositories().principals.getUser(principalId) !== undefined,
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
         logger: log.child({ component: "voice-session" }),
       })
@@ -3363,6 +3493,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         port: dashboardPort,
         bindHost: dashboardBindHost,
         logger: log,
+        quotaClientHealth: quotaCoordinatorClient
+          ? () => quotaCoordinatorClient.getHealth()
+          : undefined,
         // Bind the live mesh so the dashboard Data API + SSE serve real data.
         mesh: {
           mesh,
@@ -3442,14 +3575,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
         // the request path (issue #10). It serves the latest known reading
         // immediately (stale-while-revalidate) and kicks any refresh in the
-        // background; a cold cache falls back to the durable quota DB below via
+        // background; a cold cache falls back to durable coordinator history below via
         // `listHistory`.
         quotaApi: opts?.e2e?.quotaApi ?? {
           getQuota: async (provider) => quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
-          listHistory: sharedQuotaStore
-            ? (provider, sinceIso) => sharedQuotaStore.listHistorySince(provider, sinceIso)
+          listHistory: quotaCoordinatorClient
+            ? (provider, sinceIso) => quotaCoordinatorClient.getCachedHistory(provider, sinceIso)
             : undefined,
         },
         // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
@@ -3707,7 +3840,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         /* already closed */
       }
     }
-    sharedQuotaStore?.close();
     // `closeDb()` below drops the repository container, but the listener it
     // holds is a closure over this `runStart`'s `readyHeadSink`. Clearing the
     // sink first stops a dead mesh being reachable through that closure, and
@@ -3731,46 +3863,81 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   webhookSilenceCheck.unref?.();
 
   if (quotaThrottleEnabled) {
-    // The quota service's cache is the sensor cadence (normally five minutes),
-    // so a default five-minute controller tick never adds probe pressure. An
-    // immediate pass makes an enabled controller useful after boot rather than
-    // leaving a full-rate blind interval.
-    void tickQuotaThrottle().catch((err) => {
-      console.warn(
-        `[quota-throttle] boot tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    });
+    // The coordinator tick interval keeps pacers informed on the configured cadence.
     quotaThrottleCheck = setInterval(
-      () =>
+      () => {
         void tickQuotaThrottle().catch((err) => {
           console.warn(
             `[quota-throttle] interval tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
           );
-        }),
+        });
+        void refreshQuotaHistory().catch((err) => {
+          log.warn("quota_history_interval_failed", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
     quotaThrottleCheck.unref?.();
   }
 
   const diskAlertConfig = config.observability?.diskAlert;
+  const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);
   let diskAlert: DiskUsageAlert | null = null;
-  if (diskAlertConfig?.enabled !== false) {
-    const activeDiskAlert = new DiskUsageAlert(diskAlertConfig, async (event) => {
-      await mesh.deliverExternalEvent({
-        sourceType: "timer",
-        rawResource: "system:events",
-        rawPayload: event,
-        priority: "responsive",
-        eventSummary: event.message,
-      });
+  if (diskAlertActive(config)) {
+    // The effective settings are stated at boot: an operator reading the journal
+    // should never have to infer which threshold the sensor is actually using.
+    log.info("disk_alert_active", {
+      volume: diskAlertSettings.volume,
+      thresholdPercent: diskAlertSettings.thresholdPercent,
+      thresholdBytes: diskAlertSettings.thresholdBytes,
+      intervalSeconds: diskAlertSettings.intervalSeconds,
+      cooldownSeconds: diskAlertSettings.cooldownSeconds,
+      summary: describeDiskAlertConfig(diskAlertSettings),
     });
+    if (diskAlertUncovered(config, configuredRoots)) {
+      log.warn("disk_alert_uncovered", {
+        detail:
+          "disk sensor is active but system:events is not a configured root source — host alarms will reach only errorChat",
+        errorChatConfigured: sendToErrorChat !== null,
+      });
+    }
+    const activeDiskAlert = new DiskUsageAlert(
+      diskAlertConfig,
+      async (event) => {
+        const outcome = await deliverHostAlarm({
+          deliver: () =>
+            mesh.deliverExternalEvent({
+              sourceType: "timer",
+              rawResource: "system:events",
+              rawPayload: event,
+              priority: "responsive",
+              eventSummary: event.message,
+            }),
+          message: event.message,
+          sendToErrorChat,
+          log,
+        });
+        if (outcome !== "delivered") {
+          log.warn("disk_alert_not_delivered_to_mesh", {
+            fallback: outcome,
+            volume: event.volume,
+            freePercent: Number(event.freePercent.toFixed(1)),
+          });
+        }
+      },
+      undefined,
+      opts?.e2e?.diskAlertDeps
+    );
     diskAlert = activeDiskAlert;
-    // Reuse the 10-minute check interval for disk alerting or the configured one
     diskAlertCheck = setInterval(
       () => void activeDiskAlert.check(),
-      (diskAlertConfig?.intervalSeconds ?? 600) * 1000
+      diskAlertSettings.intervalSeconds * 1000
     );
     diskAlertCheck.unref?.();
+  } else {
+    log.info("disk_alert_disabled", { detail: "observability.diskAlert.enabled is false" });
   }
 
   // Probe model catalogs on startup and daily thereafter

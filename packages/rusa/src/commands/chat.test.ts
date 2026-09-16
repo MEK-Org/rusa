@@ -230,4 +230,65 @@ describe("turn-based actor chat", () => {
     expect(output).toContain("\u001B[32m\u001B[1myou");
     expect(output).toContain("\u001B[33m[cloudy-porpoise is running]\u001B[39m\n\n");
   });
+
+  it("renders replies addressed to authenticated userPrincipalId", async () => {
+    let sent = false;
+    const userPrincipalId = "durable-user-uuid-123";
+    const fetchMock = async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/api/mesh/threads")) {
+        return Response.json({
+          threads: [actor("thread-1", "cloudy-porpoise")],
+          userPrincipalId,
+        });
+      }
+      if (url.includes("/api/mesh/events?")) {
+        expect(url).toContain(userPrincipalId);
+        return Response.json({
+          events: sent
+            ? [
+                {
+                  id: "reply-1",
+                  kind: "message_sent",
+                  actorId: "thread-1",
+                  detail: "session-1",
+                  body: "Attributed to durable user principal.",
+                  payload: JSON.stringify({ messageId: "m-1", to: userPrincipalId }),
+                },
+              ]
+            : [],
+        });
+      }
+      if (url.endsWith("/api/mesh/actors/thread-1/chat")) {
+        sent = true;
+        return Response.json({ ok: true });
+      }
+      return Response.json({ error: "unexpected request" }, { status: 500 });
+    };
+    let output = "";
+    const sink = new Writable({
+      write(chunk, _encoding, callback) {
+        output += String(chunk);
+        callback();
+      },
+    });
+    const input = new PassThrough();
+
+    const chat = runActorChat(
+      { actor: "cloudy-porpoise", url: "http://mesh.test", history: 0 },
+      {
+        fetch: fetchMock as typeof fetch,
+        input,
+        output: sink,
+        sessionId: () => "session-1",
+        sleep: () => new Promise((resolve) => setImmediate(resolve)),
+      }
+    );
+    input.write("ping\n");
+    await vi.waitFor(() => {
+      expect(output).toContain("cloudy-porpoise > Attributed to durable user principal.\n\n");
+    });
+    input.end("/exit\n");
+    await chat;
+  });
 });

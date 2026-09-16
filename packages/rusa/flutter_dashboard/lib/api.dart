@@ -226,12 +226,13 @@ class DashboardApi {
   }
 
   /// `POST /api/mesh/actors/:actorId/interrupt` — interrupt a running actor .
-  Future<void> interruptActor(
-    String actorId, {
-    String by = 'human:operator',
-  }) async {
+  ///
+  /// Sends no `by`: the server binds the acting principal from the request
+  /// (authenticated identity, or the sole durable user in local mode), so a
+  /// client-supplied attribution could only be a guess or the legacy alias.
+  Future<void> interruptActor(String actorId) async {
     final uri = _u('/api/mesh/actors/$actorId/interrupt');
-    final payload = {'by': by};
+    final payload = <String, dynamic>{};
     final res = await _client.post(
       uri,
       headers: {

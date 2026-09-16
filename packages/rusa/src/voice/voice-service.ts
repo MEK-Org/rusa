@@ -135,6 +135,13 @@ export interface VoiceServiceOptions {
    * this: it stays instance-wide.
    */
   voiceNameFor?: (actorId: string) => string | undefined;
+  /**
+   * Whether a message recipient is a human the walkie should speak for. The
+   * legacy `human:operator` alias always is; after the #460 cutover replies
+   * target the durable user principal, which only principal storage can
+   * recognize. Absent → only the legacy alias is spoken.
+   */
+  isHumanRecipient?: (principalId: string) => boolean;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
   /**
@@ -184,6 +191,7 @@ export class VoiceService {
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
   private readonly voiceNameFor: ((actorId: string) => string | undefined) | undefined;
+  private readonly isHumanRecipient: (principalId: string) => boolean;
   private readonly log: Logger;
 
   /** Live `voice` SSE subscription count per actor. */
@@ -216,6 +224,7 @@ export class VoiceService {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
     this.voiceNameFor = options.voiceNameFor;
+    this.isHumanRecipient = options.isHumanRecipient ?? (() => false);
     this.onSessionEnded = options.onSessionEnded;
     this.log = options.logger ?? nullLogger;
   }
@@ -476,7 +485,8 @@ export class VoiceService {
   // ── Outbound: reply TTS ─────────────────────────────────────────────────
 
   /**
-   * Mesh-event hook: on a reply to `human:operator` from an actor with walkie
+   * Mesh-event hook: on a reply to a human (the legacy `human:operator` alias
+   * or a durable user principal) from an actor with walkie
    * presence, render TTS, store it under `voice/outbox/`, register the
    * announcement, and return it (the caller pushes the SSE frame). Returns null
    * for every event this hook doesn't own.
@@ -500,8 +510,9 @@ export class VoiceService {
       }
     }
 
-    if (recipientId !== HUMAN_OPERATOR) return null;
-    if (!senderId || senderId === HUMAN_OPERATOR) return null;
+    if (!recipientId) return null;
+    if (recipientId !== HUMAN_OPERATOR && !this.isHumanRecipient(recipientId)) return null;
+    if (!senderId || senderId === HUMAN_OPERATOR || this.isHumanRecipient(senderId)) return null;
     if (!event.body) return null;
     if (!this.hasPresence(senderId)) return null;
 

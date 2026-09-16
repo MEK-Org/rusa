@@ -110,6 +110,14 @@ would have to respect, and nothing more.
   defensible values, and the hard-stale widening takes the wider of the stored
   and configured intervals so that a lowered `maxIntervalSeconds` cannot make a
   stale provider publish faster (§5.7, criterion 2).
+- **Revision 9 attaches the measurement §9.5 and Q7 were written to wait for.**
+  No design decision changes. Operational packaging (§12 item 7) shipped as
+  issue #360, so both rollback drills are now runnable code with recorded
+  transcripts, the rest of §9's operational surface has a runbook
+  ([`quota-coordinator-operations.md`](./quota-coordinator-operations.md)), and
+  Q7 — which deliberately refused to invent a duration — carries the
+  write-quiesce window measured by the drill it named as the place the number
+  would come from.
 
 ## Contents
 
@@ -782,16 +790,30 @@ while `governingBucketKey` still names the weekly one — which is why both the
 key and the per-bucket map are on the wire and no separate governing-age field
 is.
 
-**Omitting `provider` returns every configured provider**, and that is the call a
-client's tick actually makes, so the collection form is part of the contract
-rather than a convenience:
+**A configured provider with no stored throttle yet — `stored(p)` null, §5.7 —
+answers `200` with the `not_ready` envelope** (§5.6), not a `503`. Being cold is
+a valid application state the service handled correctly: there is simply
+nothing to say yet. `503` is reserved for genuine infrastructure failure
+(`healthz`/`readyz` below), and a client that had to read `503` as "nothing yet"
+could not tell that apart from the service actually being unavailable. This is
+the same rule `GET /v1/quota` already follows — the cold answer is a shape, not
+an error. A stale or hard-stale lane is not cold: it has a stored throttle and
+publishes the body above, marked in `freshness`.
+
+**Omitting `provider` returns every configured provider.** A cold lane is
+present, carrying the same `not_ready` envelope minus `service`, so the map
+always has one key per configured provider and a client never has to infer a
+lane's state from its absence. The collection is the call a client's tick
+actually makes, so the collection form is part of the contract rather than a
+convenience:
 
 ```jsonc
 {
   "service": { /* as above */ },
   "providers": {
     "claude": { /* every field above except "service" */ },
-    "codex":  { /* … */ }
+    "codex":  { /* … */ },
+    "kimi":   { "error": { "code": "not_ready", "message": "…", "retryable": true } }
   }
 }
 ```
@@ -907,10 +929,17 @@ own, since a frozen interval looks exactly like a stable one (§5.7).
 
 One error envelope: `{ "error": { "code": "...", "message": "...", "retryable": bool } }`.
 
-| Code | Meaning | Client action |
-| --- | --- | --- |
-| `not_ready` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
-| `provider_unknown` | Provider argument is blank or not configured on this service | Refuse; this is a configuration error, not a runtime one |
+| Code | HTTP | Meaning | Client action |
+| --- | --- | --- | --- |
+| `not_ready` | `200` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
+| `provider_unknown` | `404` | Provider argument is blank or not configured on this service | Refuse; this is a configuration error, not a runtime one |
+
+`not_ready` rides a `200` because the HTTP status answers a different question
+from the code: the status says whether the service could handle the request,
+the code says what it found. A cold lane is handled fine — there is nothing to
+report yet — and the envelope says so explicitly, so the client keeps its JSON
+contract and `503` keeps meaning what it means everywhere else, a service that
+cannot serve (§5.5).
 
 **Two application-state codes, and revision 8 deleted three.** Each deletion is
 a claim that the code could not fire, so each is worth its sentence:
@@ -1605,6 +1634,13 @@ scrape failure, that `quota_service_scrapes_total{outcome="failure"}` alerts, an
 that clients go on applying a frozen interval without complaint. A drill that
 only rehearses the service being *down* will not find this.
 
+Both drills are implemented and runnable against a scratch deployment:
+`packages/rusa/scripts/quota-rollback-drill.mjs`, via
+`pnpm --filter rusa run drill:quota-rollback`. The procedure each one rehearses,
+its recorded transcript, and the operational surface of the rest of §9 are in
+[`quota-coordinator-operations.md`](./quota-coordinator-operations.md) (issue
+#360, §12 item 7).
+
 ---
 
 ## 10. Test criteria
@@ -1766,9 +1802,12 @@ right foundation for 1 and 8.
 16. **The collection form is the single form, repeated.** Call
     `GET /v1/throttle` with no `provider`, and assert the response is a map keyed
     by provider whose every value is byte-identical to that provider's
-    single-provider response with the `service` block removed. This is the shape
-    every client's tick actually uses (§5.5), and without this criterion it is
-    the one part of the publication contract no criterion pins.
+    single-provider response with the `service` block removed. Assert also that
+    a configured provider with no stored throttle is present in the map, that
+    its single-provider request is `200` with the `not_ready` envelope, and that
+    the identity holds for it too (§5.5). This is the shape every client's tick
+    actually uses (§5.5), and without this criterion it is the one part of the
+    publication contract no criterion pins.
 
 ---
 
@@ -2043,3 +2082,29 @@ cutting.
   single scheduled quiesce the right instrument at all? — and then put again
   after the drill with a measured window attached. Asking for a tolerance
   against an unknown would get an answer that means nothing.
+
+  **Measured (2026-09-15, issue #360's drill, one scratch deployment).** Against
+  an 81,498,112-byte database holding 8,640 scrapes and 8,640 observations — the
+  30-day retention bound at the five-minute collection cadence:
+
+  | Step | Samples | Median | Slowest |
+  | --- | --- | --- | --- |
+  | backup (`VACUUM INTO`, read-only, service up) | 390 ms, 335 ms, 205 ms | 335 ms | 390 ms |
+  | start → `/v1/readyz` 200 | 2,678 ms, 3,387 ms, 3,880 ms | 3,387 ms | 3,880 ms |
+  | **window = backup + start-to-readyz** | | **3,722 ms** | **4,270 ms** |
+
+  Three samples of each, because a single `VACUUM INTO` measures page-cache
+  warmth as much as database size: the three above fall from 390 ms to 205 ms as
+  the cache warms, and an earlier run of the same drill on a quieter host
+  measured 167 ms median with starts around 1.5 s. Restore of the same database
+  took 1,304 ms plus the 3,880 ms start that followed it. The first start also
+  carries the boot backup, which is taken before readiness is announced.
+
+  So the question can now be put with a number: **the scheduled quiesce is
+  seconds, not minutes** — under five seconds at the worst sample here, on a
+  contended host, on a database at its retention bound, with every other
+  stage-3 step fixed cost. The
+  transcript this comes from is in
+  [`quota-coordinator-operations.md`](./quota-coordinator-operations.md) §4; it
+  is one host's measurement, so re-run the drill on the target host before
+  stage 3 and plan with its numbers.

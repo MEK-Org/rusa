@@ -30,6 +30,7 @@ describe("FakeIssueClient", () => {
       number: 1,
       htmlUrl: "http://localhost:8084/rusa-e2e/scratch/pull/1",
       wasCreated: true,
+      draft: false,
     });
   });
 

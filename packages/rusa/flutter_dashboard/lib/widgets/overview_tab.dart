@@ -4,6 +4,7 @@ import 'package:rxdart/rxdart.dart';
 
 import '../breakpoints.dart';
 import '../models.dart';
+import '../principals.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../util.dart';
@@ -30,22 +31,45 @@ class _OverviewTabState extends State<OverviewTab> {
   String _searchQuery = '';
   String? _statusFilter;
   late Future<Map<String, dynamic>> _humanQueueFuture;
+  StreamSubscription<String?>? _viewerPrincipalSub;
+
+  /// The ids this queue is "mine" for: the durable user principal the server
+  /// resolved plus the legacy alias, so a database that is only partly
+  /// migrated still shows every obligation the person owns.
+  List<String> get _viewerOwnerIds =>
+      viewerPrincipalIds(widget.store.dashboardConfig.value?.userPrincipalId);
+
+  String get _newObligationOwnerId =>
+      viewerOwnerId(widget.store.dashboardConfig.value?.userPrincipalId);
 
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
+    final ownerIds = _viewerOwnerIds;
     final results = await Future.wait([
-      api.fetchObligations(ownerId: 'human:operator'),
+      for (final ownerId in ownerIds) api.fetchObligations(ownerId: ownerId),
       // Fetched as its own filtered page rather than carved out of the
       // unfiltered page above: with enough ready/waiting rows, that page's
       // limit could be exhausted before a single scheduled row appears in
       // it, silently dropping every scheduled row from this section.
-      api.fetchObligations(ownerId: 'human:operator', status: 'scheduled'),
+      for (final ownerId in ownerIds)
+        api.fetchObligations(ownerId: ownerId, status: 'scheduled'),
     ]);
-    final page = results[0];
-    final scheduledPage = results[1];
-    final ready = page.obligations.where((o) => o.isReady).toList();
-    final waiting = page.obligations.where((o) => o.isWaiting).toList();
-    final scheduled = scheduledPage.obligations.toList()
+    // One obligation has one owner, but the two ids are queried separately,
+    // so dedupe by id rather than trusting the pages to be disjoint.
+    List<ObligationDto> merge(Iterable<ObligationPage> pages) {
+      final byId = <String, ObligationDto>{};
+      for (final page in pages) {
+        for (final o in page.obligations) {
+          byId.putIfAbsent(o.id, () => o);
+        }
+      }
+      return byId.values.toList();
+    }
+
+    final owned = merge(results.take(ownerIds.length));
+    final ready = owned.where((o) => o.isReady).toList();
+    final waiting = owned.where((o) => o.isWaiting).toList();
+    final scheduled = merge(results.skip(ownerIds.length))
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
     final blockers = await Future.wait(
       waiting.map((o) => api.fetchObligationDetail(o.id)),
@@ -74,10 +98,22 @@ class _OverviewTabState extends State<OverviewTab> {
     widget.store.refreshYieldEvents();
     widget.store.refreshQuotaHistory();
     _humanQueueFuture = _loadHumanQueue();
+    // The dashboard config — and with it the durable user principal — is
+    // fetched after init returns, so this first load can only have asked for
+    // the alias. Re-ask once the server names the viewing principal, or a
+    // migrated instance would show an empty queue until a manual refresh.
+    _viewerPrincipalSub = widget.store.dashboardConfig
+        .map((c) => c?.userPrincipalId)
+        .distinct()
+        .skip(1)
+        .listen((_) {
+          if (mounted) _refreshHumanQueue();
+        });
   }
 
   @override
   void dispose() {
+    _viewerPrincipalSub?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -209,7 +245,7 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// My obligations queue for the viewing human operator (human:operator).
+  /// My obligations queue for the viewing person, under every id they hold.
   Widget _buildMyQueueSection() {
     return FutureBuilder<Map<String, dynamic>>(
       future: _humanQueueFuture,
@@ -244,7 +280,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      defaultOwnerId: 'human:operator',
+                      defaultOwnerId: _newObligationOwnerId,
                       onCreated: _refreshHumanQueue,
                     ),
                     icon: const Icon(Icons.add, size: 14),
@@ -278,7 +314,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      defaultOwnerId: 'human:operator',
+                      defaultOwnerId: _newObligationOwnerId,
                       onCreated: _refreshHumanQueue,
                     ),
                   ),
@@ -388,7 +424,7 @@ class _OverviewTabState extends State<OverviewTab> {
                                   onPressed: () => showCreateObligationDialog(
                                     context,
                                     widget.store,
-                                    defaultOwnerId: 'human:operator',
+                                    defaultOwnerId: _newObligationOwnerId,
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
@@ -426,7 +462,7 @@ class _OverviewTabState extends State<OverviewTab> {
                                   onPressed: () => showCreateObligationDialog(
                                     context,
                                     widget.store,
-                                    defaultOwnerId: 'human:operator',
+                                    defaultOwnerId: _newObligationOwnerId,
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
@@ -470,17 +506,15 @@ class _OverviewTabState extends State<OverviewTab> {
                               vertical: 1,
                             ),
                             decoration: BoxDecoration(
-                              color: ObligationStatusColors
-                                  .ready
-                                  .chipBackground,
+                              color:
+                                  ObligationStatusColors.ready.chipBackground,
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: Text(
                               '${ready.length} ready',
                               style: kMonoStyle.copyWith(
-                                color: ObligationStatusColors
-                                    .ready
-                                    .chipForeground,
+                                color:
+                                    ObligationStatusColors.ready.chipForeground,
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
                               ),
@@ -512,9 +546,8 @@ class _OverviewTabState extends State<OverviewTab> {
                               vertical: 1,
                             ),
                             decoration: BoxDecoration(
-                              color: ObligationStatusColors
-                                  .waiting
-                                  .chipBackground,
+                              color:
+                                  ObligationStatusColors.waiting.chipBackground,
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: Text(
@@ -732,10 +765,7 @@ class _OverviewTabState extends State<OverviewTab> {
                       runSpacing: 12,
                       children: [
                         for (final t in runningThreads)
-                          _buildActorContextCard(
-                            t,
-                            width: itemWidth,
-                          ),
+                          _buildActorContextCard(t, width: itemWidth),
                       ],
                     );
                   },
@@ -892,10 +922,7 @@ class _OverviewTabState extends State<OverviewTab> {
                           ],
                         ),
                         const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: details,
-                        ),
+                        Align(alignment: Alignment.centerRight, child: details),
                       ],
                     );
                   }

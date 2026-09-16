@@ -80,6 +80,7 @@ function serializePr(pr: TrackerPr) {
     headRef: pr.headRef,
     base: pr.base,
     state: pr.state,
+    draft: pr.draft,
     author: pr.author,
     labels: pr.labels,
     createdAt: pr.createdAt,

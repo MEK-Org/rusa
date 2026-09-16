@@ -1,10 +1,11 @@
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ActorMesh, MeshActor } from "../actor/actor-mesh.js";
 import { runEndModel } from "../actor/mesh-events.js";
 import { portableContextMaxRuns } from "../actor/portable-context.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
+import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
 import { getRepositories } from "../db/index.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
@@ -90,8 +91,10 @@ import {
 } from "../harness/scenario.js";
 import { summarizeActivity, waitForActorIdle } from "../harness/wait-idle.js";
 import { scanVendorPaths, snapshotWorkdir } from "../harness/workdir-capture.js";
-import { createQuotaService, type ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
+import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
 /**
@@ -207,8 +210,9 @@ export function adoptRigHolder(mesh: ActorMesh, rootId: string): string {
  * for cloudy-porpoise to route to the reviewer tier.
  *
  * This is a deliberate, quota-consuming dev run (real providers above the seam) — NOT
- * a CI test. Consult `get_quota` before running (and capture it before/after: the
- * batched quota delta is the ground-truth burn the report leaves a slot for).
+ * a CI test. Consult `get_quota` before running; the rig records the quota coordinator's
+ * reading at launch and at exit itself (see {@link QuotaRecorder}), and the delta between
+ * them is the ground-truth burn the report carries.
  */
 export interface AbContextOptions {
   /** Reuse a specific instance root instead of a fresh tempdir. */
@@ -271,10 +275,16 @@ export interface AbContextOptions {
    */
   nativeConvPath?: string;
   /**
+   * Unix socket of the quota coordinator the run's before/after readings are read from.
+   * Defaults to the base config home's `quota.coordinator.socketPath`, else the host
+   * default — the same resolution the `quota-coordinator` command binds with.
+   */
+  quotaSocketPath?: string;
+  /**
    * Reads one provider's quota, for the run's own before/after window readings. Injectable
-   * so a test can drive the recorder without a provider CLI; defaults to a quota service
-   * built against the provisioned instance with **`ttlMs: 0`** — see
-   * {@link QuotaRecorder} for why a cached one would measure nothing.
+   * so a test can drive the recorder without a coordinator; defaults to
+   * {@link coordinatorQuotaReader} against {@link AbContextOptions.quotaSocketPath} — see
+   * {@link QuotaRecorder} for what the rig does and does not measure through it.
    */
   readQuota?: (provider: string) => Promise<ProviderQuotaSnapshot>;
 }
@@ -295,6 +305,71 @@ const DEFAULT_STEP_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_DISK_SAMPLE_MS = 30_000;
 
 /**
+ * Reads one provider's quota from the coordinator's evidence view (`GET /v1/quota`).
+ *
+ * This is the rig's ONLY quota source. It builds no `QuotaService`, opens no quota
+ * database and runs no probe of its own: every reading is whatever the service last
+ * observed, carrying the service's own `scrapedAt` stamp, which is the field
+ * {@link diffQuota} keys on. `/v1/quota` is the endpoint used deliberately — it returns the
+ * snapshot unchanged, where `/v1/throttle` publishes a controller decision with no single
+ * canonical scrape stamp.
+ *
+ * Throws when the service could not be read (socket absent, non-200, protocol mismatch)
+ * so that {@link captureQuota} records the failure as a capture outcome rather than
+ * inventing a reading. A cold service is not a failure: it answers `status: "unknown"`
+ * with no windows, which `captureQuota` records as `unreadable`.
+ */
+export function coordinatorQuotaReader(
+  socketPath: string
+): (provider: string) => Promise<ProviderQuotaSnapshot> {
+  const client = new QuotaCoordinatorClient({ socketPath });
+  return async (provider) => {
+    const snapshot = await client.getQuota(provider);
+    if (!snapshot) {
+      throw new Error(
+        `quota coordinator at ${socketPath} gave no usable /v1/quota answer for ${provider}`
+      );
+    }
+    return snapshot;
+  };
+}
+
+/**
+ * The socket the rig reads quota from: an explicit option, else whatever the base config
+ * home the providers were seeded from names, else the host default. The provisioned
+ * instance's own config never carries one — the coordinator is a host service, not part
+ * of the disposable instance.
+ *
+ * Only a genuinely absent base config (no config.yaml) falls back to the host default;
+ * a present config that fails to parse or validate throws and names the broken config home
+ * so the rig refuses launch before spending provider quota.
+ */
+export function resolveAbQuotaSocketPath(opts: {
+  quotaSocketPath?: string;
+  baseConfigHome?: string;
+}): string {
+  if (opts.quotaSocketPath) {
+    return opts.quotaSocketPath;
+  }
+  const home = opts.baseConfigHome ?? resolveHome();
+  const configPath = join(home, "config.yaml");
+  if (!existsSync(configPath)) {
+    return resolveQuotaCoordinatorSocketPath(null, opts.quotaSocketPath);
+  }
+  let baseConfig: RusaConfig;
+  try {
+    baseConfig = loadConfig(home);
+  } catch (err) {
+    throw new Error(
+      `failed to load base config from ${home} for quota coordinator resolution: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+  return resolveQuotaCoordinatorSocketPath(baseConfig, opts.quotaSocketPath);
+}
+
+/**
  * Takes the run's own quota readings and makes sure they reach the disk (an issue).
  *
  * ## What was here before
@@ -306,11 +381,18 @@ const DEFAULT_DISK_SAMPLE_MS = 30_000;
  *
  * ## Three properties, each of which was a way this went wrong
  *
- * **The readings must be real probes, not the same probe twice.** `QuotaService` caches
- * for 5 minutes on claude/agy/kimi and **30 minutes on codex**, longer than a short run.
- * The default service here is built with `ttlMs: 0`; `diffQuota` independently refuses
- * when both readings carry the same `scrapedAt`, so a caller who reintroduces a cache
- * gets a refusal rather than a fictional burn of `0`.
+ * **The rig is a client of the quota coordinator, not a second scraper.** It used to build
+ * its own `QuotaService` with `ttlMs: 0` so the exit reading was a fresh probe; that was a
+ * second scraper against the shared account, and it is gone. Both readings now come from
+ * {@link coordinatorQuotaReader}, so the rig measures at the service's tick: a run shorter
+ * than one tick can land entirely between two observations. That costs resolution, not
+ * correctness — `diffQuota` refuses when both readings carry the same `scrapedAt`, and
+ * with the service as the source an unchanged stamp means "no new observation", which the
+ * run reports as NO MEASUREMENT rather than as a burn of `0`. A run that needs finer
+ * resolution runs the coordinator's cadence tighter; it does not probe.
+ * Because readings are the service's last observations, the measured window is also
+ * shifted: each reading is up to one tick earlier than the moment requested, so the
+ * window can include pre-run consumption and omit the run's tail.
  *
  * **The exit reading must survive the run failing.** {@link finish} is called from a
  * `finally`, and once from the happy path just before the report is assembled; it is
@@ -322,43 +404,33 @@ const DEFAULT_DISK_SAMPLE_MS = 30_000;
  * launch write is the one that survives a `SIGKILL`, an OOM, or a worker plane that
  * destroys the process's PID namespace mid-run, none of which run a `finally`.
  */
-class QuotaRecorder {
-  private target: { provider: string; outDir: string; deps: CaptureQuotaDeps } | null = null;
+export class QuotaRecorder {
+  private target: { provider: string; outDir: string } | null = null;
+  private readonly deps: CaptureQuotaDeps;
   private launch: QuotaCapture | null = null;
   private exit: QuotaCapture | null = null;
   private exitTaken = false;
   private runError: string | null = null;
 
-  constructor(private readonly readQuota?: AbContextOptions["readQuota"]) {}
+  /**
+   * @param readQuota the single quota source for BOTH readings — the coordinator client
+   *   in production ({@link coordinatorQuotaReader}), a stub in tests. Nothing else in the
+   *   recorder reads quota; there is no config, workers dir or database path to hand it,
+   *   because the rig has nothing to probe with.
+   */
+  constructor(readQuota: NonNullable<AbContextOptions["readQuota"]>) {
+    this.deps = { readQuota };
+  }
 
   /**
-   * Point the recorder at the provisioned instance and take the launch reading.
+   * Point the recorder at the run's output directory and take the launch reading.
    *
-   * Called after provisioning because the probe must run against the SAME home and
-   * provider credentials the arms will burn — a reading of some other installation's
-   * window is worse than none.
+   * Called after provisioning and before the arms exist, so it is a reading of the window
+   * they start from; the service observes the same shared account the arms will burn.
    */
-  async start(target: {
-    provider: string;
-    outDir: string;
-    config: RusaConfig;
-    workersDir: string;
-  }): Promise<QuotaCapture> {
-    const readQuota =
-      this.readQuota ??
-      (() => {
-        // ttlMs: 0 — see the class comment. A cached service would hand the exit call the
-        // launch snapshot and the run would report a burn of exactly nothing.
-        const service = createQuotaService({
-          config: target.config,
-          workersDir: target.workersDir,
-          ttlMs: 0,
-        });
-        return (provider: string) =>
-          service.getQuota(provider as "claude" | "codex" | "agy" | "kimi");
-      })();
-    this.target = { provider: target.provider, outDir: target.outDir, deps: { readQuota } };
-    this.launch = await captureQuota("launch", target.provider, this.target.deps);
+  async start(target: { provider: string; outDir: string }): Promise<QuotaCapture> {
+    this.target = { provider: target.provider, outDir: target.outDir };
+    this.launch = await captureQuota("launch", target.provider, this.deps);
     this.persist();
     return this.launch;
   }
@@ -378,7 +450,7 @@ class QuotaRecorder {
     if (!target) return null;
     if (!this.exitTaken) {
       this.exitTaken = true;
-      this.exit = await captureQuota("exit", target.provider, target.deps);
+      this.exit = await captureQuota("exit", target.provider, this.deps);
     }
     const evidence = this.persist();
     return evidence;
@@ -417,7 +489,9 @@ class QuotaRecorder {
  * is the runs that end by throwing.
  */
 export async function runProviderContextAB(opts: AbContextOptions): Promise<void> {
-  const quota = new QuotaRecorder(opts.readQuota);
+  const quota = new QuotaRecorder(
+    opts.readQuota ?? coordinatorQuotaReader(resolveAbQuotaSocketPath(opts))
+  );
   try {
     await runProviderContextABBody(opts, quota);
   } catch (err) {
@@ -569,16 +643,11 @@ async function runProviderContextABBody(
   // line, so "this cannot fit" is otherwise invisible until the 403 lands on the probe.
   console.log(`${windowFit.ok ? "" : "⚠️  "}${windowFit.message.split("\n")[0]}`);
 
-  // The run's own launch-side window reading . Taken here — after provisioning, so
-  // it probes the home the arms will actually burn, and before the arms exist, so it is a
-  // reading of the window they start from. This used to be a line telling the operator to
-  // do it by hand; the runs that most needed it are the ones where nobody was watching.
-  const launchQuota = await quota.start({
-    provider: rootProvider,
-    outDir,
-    config,
-    workersDir: join(home, "workers"),
-  });
+  // The run's own launch-side window reading, read from the quota coordinator. Taken here —
+  // after provisioning and before the arms exist, so it is a reading of the window they
+  // start from. This used to be a line telling the operator to do it by hand; the runs that
+  // most needed it are the ones where nobody was watching.
+  const launchQuota = await quota.start({ provider: rootProvider, outDir });
   console.log(
     `${launchQuota.outcome === "read" ? "" : "⚠️  "}${launchQuota.message}\n` +
       `   (a second reading is taken when the run ends, however it ends → ${join(outDir, "quota.json")})`
