@@ -23,7 +23,12 @@ interface RecordedRequest {
  * Route-table fetch mock: maps "METHOD /path" to a response. The client is
  * tested at the HTTP boundary — request shapes out, GitHub wire shapes in.
  */
-function installFetch(routes: Record<string, { status?: number; json?: unknown }>) {
+interface MockResponse {
+  status?: number;
+  json?: unknown;
+}
+
+function installFetch(routes: Record<string, MockResponse & { responses?: MockResponse[] }>) {
   const requests: RecordedRequest[] = [];
   vi.stubGlobal(
     "fetch",
@@ -40,8 +45,9 @@ function installFetch(routes: Record<string, { status?: number; json?: unknown }
       if (!route) {
         return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
       }
-      return new Response(route.json !== undefined ? JSON.stringify(route.json) : "", {
-        status: route.status ?? 200,
+      const response = route.responses?.shift() ?? route;
+      return new Response(response.json !== undefined ? JSON.stringify(response.json) : "", {
+        status: response.status ?? 200,
       });
     })
   );
@@ -906,6 +912,9 @@ describe("GitHubIssueClient", () => {
       [`PUT /repos/${REPO}/pulls/12/merge`]: {
         json: { sha: "deadbeef", merged: true, message: "merged" },
       },
+      [`GET /repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`]: {
+        json: [],
+      },
       [`DELETE /repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`]: {
         status: 200,
       },
@@ -921,10 +930,15 @@ describe("GitHubIssueClient", () => {
     expect(sha).toBe("deadbeef");
     expect(requests.map((r) => [r.method, r.path])).toEqual([
       ["GET", `/repos/${REPO}/pulls/12`],
+      ["POST", "/graphql"],
       ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      [
+        "GET",
+        `/repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`,
+      ],
       ["DELETE", `/repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`],
     ]);
-    const merge = requests.find((r) => r.method === "PUT");
+    const merge = requests.find((r) => r.path.endsWith("/merge"));
     expect(merge?.body).toEqual({ merge_method: "squash" });
   });
 
@@ -943,8 +957,8 @@ describe("GitHubIssueClient", () => {
     });
 
     expect(sha).toBe("cafebabe");
-    expect(requests).toHaveLength(1);
-    expect(requests[0].body).toEqual({ merge_method: "rebase" });
+    expect(requests).toHaveLength(2);
+    expect(requests[1].body).toEqual({ merge_method: "rebase" });
   });
 
   it("passes an override commit message into the squash merge request", async () => {
@@ -962,7 +976,7 @@ describe("GitHubIssueClient", () => {
       commitMessage: "Merged over non-green checks by actor. Reason: emergency",
     });
 
-    expect(requests[0].body).toEqual({
+    expect(requests[1].body).toEqual({
       merge_method: "squash",
       commit_message: "Merged over non-green checks by actor. Reason: emergency",
     });
@@ -983,10 +997,279 @@ describe("GitHubIssueClient", () => {
       expectedHeadSha: "evaluated-head-sha",
     });
 
-    expect(requests[0].body).toEqual({
+    expect(requests[1].body).toEqual({
       merge_method: "squash",
       sha: "evaluated-head-sha",
     });
+  });
+
+  it("merges a detected bottom stack asynchronously with the exact checked SHA", async () => {
+    const delays: number[] = [];
+    const requests = installFetch({
+      [`GET /repos/${REPO}/pulls/12`]: {
+        json: {
+          number: 12,
+          title: "Add feature",
+          body: "",
+          html_url: `https://github.com/${REPO}/pull/12`,
+          head: { ref: "mc/issue-9" },
+          state: "open",
+        },
+      },
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: { stack: { id: "stack-id" }, stackEntry: { position: 1 } },
+            },
+          },
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
+        status: 202,
+        json: { status: "pending", details: { uuid: "merge-uuid" } },
+      },
+      [`GET /repos/${REPO}/pulls/12/merge-async/merge-uuid`]: {
+        responses: [
+          { json: { status: "pending", details: { uuid: "merge-uuid" } } },
+          { json: { status: "merged", details: { sha: "stack-merge-sha" } } },
+        ],
+      },
+      [`GET /repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`]: {
+        json: [],
+      },
+      [`DELETE /repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`]: {
+        status: 200,
+      },
+    });
+
+    const sha = await new GitHubIssueClient({
+      asyncMergePollDelay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+    }).mergePullRequest({
+      repo: REPO,
+      prNumber: 12,
+      method: "squash",
+      deleteBranch: true,
+      expectedHeadSha: "evaluated-head-sha",
+    });
+
+    expect(sha).toBe("stack-merge-sha");
+    expect(delays).toEqual([1_000, 1_000]);
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["GET", `/repos/${REPO}/pulls/12`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
+      ["GET", `/repos/${REPO}/pulls/12/merge-async/merge-uuid`],
+      ["GET", `/repos/${REPO}/pulls/12/merge-async/merge-uuid`],
+      [
+        "GET",
+        `/repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`,
+      ],
+      ["DELETE", `/repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`],
+    ]);
+    expect(requests[2].body).toEqual({
+      merge_method: "squash",
+      merge_action: "direct_merge",
+      sha: "evaluated-head-sha",
+    });
+  });
+
+  it("falls back to the asynchronous endpoint after the legacy stacked-merge rejection", async () => {
+    const requests = installFetch({
+      "POST /graphql": {
+        responses: [
+          {
+            json: {
+              data: { repository: { pullRequest: { stack: null, stackEntry: null } } },
+            },
+          },
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: { stack: { id: "stack-id" }, stackEntry: { position: 1 } },
+                },
+              },
+            },
+          },
+        ],
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge`]: {
+        status: 403,
+        json: {
+          message:
+            "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
+        status: 200,
+        json: { status: "merged", details: { sha: "fallback-stack-merge-sha" } },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+        expectedHeadSha: "evaluated-head-sha",
+      })
+    ).resolves.toBe("fallback-stack-merge-sha");
+
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
+    ]);
+    expect(requests[3].body).toEqual({
+      merge_method: "squash",
+      merge_action: "direct_merge",
+      sha: "evaluated-head-sha",
+    });
+  });
+
+  it("polls an already-accepted asynchronous stack merge to its terminal result", async () => {
+    const requests = installFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: { stack: { id: "stack-id" }, stackEntry: { position: 1 } },
+            },
+          },
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
+        status: 409,
+        json: { status: "pending", details: { uuid: "existing-merge-uuid" } },
+      },
+      [`GET /repos/${REPO}/pulls/12/merge-async/existing-merge-uuid`]: {
+        json: { status: "merged", details: { sha: "existing-stack-merge-sha" } },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient({ asyncMergePollDelay: async () => {} }).mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).resolves.toBe("existing-stack-merge-sha");
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
+      ["GET", `/repos/${REPO}/pulls/12/merge-async/existing-merge-uuid`],
+    ]);
+  });
+
+  it("refuses a non-bottom pull request in a detected stack", async () => {
+    const requests = installFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: { stack: { id: "stack-id" }, stackEntry: { position: 2 } },
+            },
+          },
+        },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).rejects.toThrow("Merge the bottom pull request (position 1) instead");
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["POST", "/graphql"],
+    ]);
+  });
+
+  it("surfaces a terminal asynchronous merge failure", async () => {
+    const requests = installFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: { stack: { id: "stack-id" }, stackEntry: { position: 1 } },
+            },
+          },
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
+        status: 202,
+        json: { status: "pending", details: { uuid: "merge-uuid" } },
+      },
+      [`GET /repos/${REPO}/pulls/12/merge-async/merge-uuid`]: {
+        json: { status: "failed", details: { message: "required check failed" } },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient({ asyncMergePollDelay: async () => {} }).mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).rejects.toThrow("Asynchronous merge failed for test-org/test-repo#12: required check failed");
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
+      ["GET", `/repos/${REPO}/pulls/12/merge-async/merge-uuid`],
+    ]);
+  });
+
+  it("preserves a merged head branch when an open pull request still bases on it", async () => {
+    const requests = installFetch({
+      [`GET /repos/${REPO}/pulls/12`]: {
+        json: {
+          number: 12,
+          title: "Add feature",
+          body: "",
+          html_url: `https://github.com/${REPO}/pull/12`,
+          head: { ref: "mc/issue-9" },
+          state: "open",
+        },
+      },
+      "POST /graphql": {
+        json: {
+          data: { repository: { pullRequest: { stack: null, stackEntry: null } } },
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge`]: {
+        json: { sha: "deadbeef", merged: true, message: "merged" },
+      },
+      [`GET /repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`]: {
+        json: [{ number: 13 }],
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: true,
+      })
+    ).resolves.toBe("deadbeef");
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["GET", `/repos/${REPO}/pulls/12`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      [
+        "GET",
+        `/repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`,
+      ],
+    ]);
   });
 
   it("maps a merge 409 with expected head sha to a head-advanced error", async () => {
@@ -1046,6 +1329,9 @@ describe("GitHubIssueClient", () => {
       [`PUT /repos/${REPO}/pulls/12/merge`]: {
         json: { sha: "deadbeef", merged: true, message: "merged" },
       },
+      [`GET /repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`]: {
+        json: [],
+      },
       [`DELETE /repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`]: {
         status: 422,
         json: { message: "Reference does not exist" },
@@ -1076,6 +1362,9 @@ describe("GitHubIssueClient", () => {
       },
       [`PUT /repos/${REPO}/pulls/12/merge`]: {
         json: { sha: "deadbeef", merged: true, message: "merged" },
+      },
+      [`GET /repos/${REPO}/pulls?base=${encodeURIComponent("mc/issue-9")}&state=open&per_page=1`]: {
+        json: [],
       },
       [`DELETE /repos/${REPO}/git/refs/heads/${encodeURIComponent("mc/issue-9")}`]: {
         status: 500,

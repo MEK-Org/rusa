@@ -423,7 +423,7 @@ export class GitHubApiError extends Error {
     readonly status: number,
     readonly method: string,
     readonly path: string,
-    body: string
+    readonly body: string
   ) {
     super(`GitHub API ${method} ${path} failed with ${status}: ${body.slice(0, 500)}`);
     this.name = "GitHubApiError";
@@ -463,6 +463,21 @@ export class PullRequestHeadAdvancedError extends Error {
 }
 
 const API_BASE = "https://api.github.com";
+const ASYNC_MERGE_POLL_INTERVAL_MS = 1_000;
+
+interface AsyncMergeResponse {
+  status: string;
+  details?: {
+    message?: string;
+    sha?: string;
+    uuid?: string;
+  };
+}
+
+interface GitHubIssueClientOptions {
+  /** Test seam for async stack-merge polling. */
+  asyncMergePollDelay?: (milliseconds: number) => Promise<void>;
+}
 
 /**
  * Production {@link IssueClient}: direct REST calls against api.github.com.
@@ -477,6 +492,8 @@ const API_BASE = "https://api.github.com";
  */
 export class GitHubIssueClient implements IssueClient {
   private token: string | null = null;
+
+  constructor(private readonly options: GitHubIssueClientOptions = {}) {}
 
   private async resolveToken(): Promise<string> {
     if (this.token) return this.token;
@@ -959,45 +976,215 @@ export class GitHubIssueClient implements IssueClient {
       ? (await this.getPullRequestDetails(opts.repo, opts.prNumber)).headRef
       : undefined;
 
-    let result: { sha: string };
+    // GraphQL exposes stackEntry.position while REST's legacy merge endpoint does
+    // not. Read it before selecting the merge API so a non-bottom request is
+    // rejected before it can merge every ancestor in the stack.
+    let stackPosition: number | null | undefined;
     try {
-      result = await this.api<{ sha: string }>(
-        "PUT",
-        `/repos/${opts.repo}/pulls/${opts.prNumber}/merge`,
-        {
-          merge_method: opts.method,
-          ...(opts.commitMessage ? { commit_message: opts.commitMessage } : {}),
-          ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
-        }
-      );
-    } catch (err) {
-      if (
-        err instanceof GitHubApiError &&
-        err.status === 409 &&
-        opts.expectedHeadSha &&
-        err.message.includes("Head branch was modified")
-      ) {
-        throw new PullRequestHeadAdvancedError(opts.repo, opts.prNumber, opts.expectedHeadSha, err);
-      }
-      throw err;
+      stackPosition = await this.getPullRequestStackPosition(opts.repo, opts.prNumber);
+    } catch {
+      // Stacks are still in GitHub public preview. Preserve legacy merges when
+      // the metadata query is temporarily unavailable, but fail closed if the
+      // legacy endpoint subsequently identifies this as a stack.
+      stackPosition = undefined;
     }
 
-    if (headRef) {
+    let sha: string;
+    if (stackPosition !== null && stackPosition !== undefined) {
+      this.requireBottomOfStack(opts, stackPosition);
+      sha = await this.mergePullRequestAsync(opts);
+    } else {
       try {
-        await this.api(
-          "DELETE",
-          `/repos/${opts.repo}/git/refs/heads/${encodeURIComponent(headRef)}`
+        const result = await this.api<{ sha: string }>(
+          "PUT",
+          `/repos/${opts.repo}/pulls/${opts.prNumber}/merge`,
+          {
+            merge_method: opts.method,
+            ...(opts.commitMessage ? { commit_message: opts.commitMessage } : {}),
+            ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
+          }
         );
+        sha = result.sha;
       } catch (err) {
-        // Tolerate a branch that's already gone (auto-delete-branch repo setting,
-        // a prior manual delete, etc). GitHub reports this as 422 or 404.
-        if (!(err instanceof GitHubApiError && (err.status === 422 || err.status === 404))) {
+        if (this.isLegacyStackMergeRejection(err)) {
+          const fallbackStackPosition = await this.getPullRequestStackPosition(
+            opts.repo,
+            opts.prNumber
+          );
+          if (fallbackStackPosition === null) {
+            throw new Error(
+              `GitHub reported ${opts.repo}#${opts.prNumber} as a stacked pull request, ` +
+                "but its stack position could not be read; refusing an unvalidated stack merge."
+            );
+          }
+          this.requireBottomOfStack(opts, fallbackStackPosition);
+          sha = await this.mergePullRequestAsync(opts);
+        } else if (
+          err instanceof GitHubApiError &&
+          err.status === 409 &&
+          opts.expectedHeadSha &&
+          err.message.includes("Head branch was modified")
+        ) {
+          throw new PullRequestHeadAdvancedError(
+            opts.repo,
+            opts.prNumber,
+            opts.expectedHeadSha,
+            err
+          );
+        } else {
           throw err;
         }
       }
     }
 
-    return result.sha;
+    if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
+
+    return sha;
+  }
+
+  private async getPullRequestStackPosition(
+    repo: string,
+    prNumber: number
+  ): Promise<number | null> {
+    const [owner, name] = repo.split("/");
+    if (!owner || !name) throw new Error(`Invalid repository name: ${repo}`);
+
+    const data = await this.graphql<{
+      repository?: {
+        pullRequest?: {
+          stack?: { id: string } | null;
+          stackEntry?: { position: number } | null;
+        } | null;
+      } | null;
+    }>(
+      `query($owner: String!, $name: String!, $number: Int!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            stack { id }
+            stackEntry { position }
+          }
+        }
+      }`,
+      { owner, name, number: prNumber }
+    );
+    const pr = data.repository?.pullRequest;
+    if (!pr) throw new Error(`pull request ${repo}#${prNumber} not found`);
+    if (pr.stack === null && pr.stackEntry === null) return null;
+    if (!pr.stack || !pr.stackEntry) {
+      throw new Error(`GitHub returned incomplete stack metadata for ${repo}#${prNumber}`);
+    }
+    return pr.stackEntry.position;
+  }
+
+  private requireBottomOfStack(opts: MergePullRequestOptions, position: number): void {
+    if (position !== 1) {
+      throw new Error(
+        `Refusing to merge ${opts.repo}#${opts.prNumber}: it is position ${position} in a ` +
+          "stack. Merge the bottom pull request (position 1) instead."
+      );
+    }
+  }
+
+  private isLegacyStackMergeRejection(err: unknown): err is GitHubApiError {
+    return (
+      err instanceof GitHubApiError &&
+      err.status === 403 &&
+      err.message.includes("Merging stacked PRs via this endpoint is not supported")
+    );
+  }
+
+  private async mergePullRequestAsync(opts: MergePullRequestOptions): Promise<string> {
+    try {
+      const result = await this.api<AsyncMergeResponse>(
+        "PUT",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}/merge-async`,
+        {
+          merge_method: opts.method,
+          merge_action: "direct_merge",
+          ...(opts.commitMessage ? { commit_message: opts.commitMessage } : {}),
+          ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
+        }
+      );
+      return this.awaitAsyncMergeResult(opts, result);
+    } catch (err) {
+      // A 409 carries the UUID of an async request GitHub already accepted for
+      // this PR. Its outcome is still unknown, so join that request and wait
+      // for its terminal result rather than treating an in-progress merge as a failure.
+      if (err instanceof GitHubApiError && err.status === 409) {
+        try {
+          return this.awaitAsyncMergeResult(opts, JSON.parse(err.body) as AsyncMergeResponse);
+        } catch (parseError) {
+          if (!(parseError instanceof SyntaxError)) throw parseError;
+        }
+      }
+      throw err;
+    }
+  }
+
+  private async awaitAsyncMergeResult(
+    opts: MergePullRequestOptions,
+    initial: AsyncMergeResponse
+  ): Promise<string> {
+    let result = initial;
+    for (;;) {
+      if (result.status === "merged") {
+        const sha = result.details?.sha;
+        if (!sha) {
+          throw new Error(
+            `GitHub reported ${opts.repo}#${opts.prNumber} merged asynchronously without a merge SHA.`
+          );
+        }
+        return sha;
+      }
+      if (result.status === "failed") {
+        throw new Error(
+          `Asynchronous merge failed for ${opts.repo}#${opts.prNumber}: ` +
+            (result.details?.message ?? "GitHub did not provide a failure reason.")
+        );
+      }
+
+      const uuid = result.details?.uuid;
+      if (!uuid) {
+        throw new Error(
+          `GitHub returned non-terminal asynchronous merge status '${result.status}' for ` +
+            `${opts.repo}#${opts.prNumber} without a polling UUID.`
+        );
+      }
+      await this.asyncMergePollDelay(ASYNC_MERGE_POLL_INTERVAL_MS);
+      result = await this.api<AsyncMergeResponse>(
+        "GET",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}/merge-async/${encodeURIComponent(uuid)}`
+      );
+    }
+  }
+
+  private async asyncMergePollDelay(milliseconds: number): Promise<void> {
+    if (this.options.asyncMergePollDelay) {
+      await this.options.asyncMergePollDelay(milliseconds);
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  private async deleteMergedHeadBranchIfNoOpenDependents(
+    repo: string,
+    headRef: string
+  ): Promise<void> {
+    const dependents = await this.api<unknown[]>(
+      "GET",
+      `/repos/${repo}/pulls?base=${encodeURIComponent(headRef)}&state=open&per_page=1`
+    );
+    if (dependents.length > 0) return;
+
+    try {
+      await this.api("DELETE", `/repos/${repo}/git/refs/heads/${encodeURIComponent(headRef)}`);
+    } catch (err) {
+      // Tolerate a branch that's already gone (auto-delete-branch repo setting,
+      // a prior manual delete, etc). GitHub reports this as 422 or 404.
+      if (!(err instanceof GitHubApiError && (err.status === 422 || err.status === 404))) {
+        throw err;
+      }
+    }
   }
 
   async createPullRequestReview(opts: CreatePullRequestReviewOptions): Promise<string | undefined> {
