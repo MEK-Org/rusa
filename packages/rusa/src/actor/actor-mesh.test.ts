@@ -9156,15 +9156,8 @@ describe("strict obligation handling experiment (#382)", () => {
     );
     mesh.abandonInboxRun(source);
 
-    // Self-reassignment is a no-op, even with a fresh checkpoint. The head is
-    // issue-ref'd, so it stays strict: the standing no-change exit (#468) does
-    // not apply to it.
-    repo.create({
-      id: "self",
-      title: "Self handoff",
-      ownerId: source,
-      externalRef: "github:MEK-Org/rusa/issues/1001",
-    });
+    // Self-reassignment is a no-op, even with a fresh checkpoint.
+    repo.create({ id: "self", title: "Self handoff", ownerId: source });
     selectHead(mesh, source, "self");
     repo.setCheckpoint("self", "I cannot hand this off to myself.", source);
     expect((await handoff("self", source)).isError).toBeFalsy();
@@ -9174,12 +9167,7 @@ describe("strict obligation handling experiment (#382)", () => {
     // The production owner resolver refuses a retired recipient, so the
     // transfer fails and the source still owns the selected head.
     mesh.retire(retired);
-    repo.create({
-      id: "failed",
-      title: "Failed handoff",
-      ownerId: source,
-      externalRef: "github:MEK-Org/rusa/issues/1002",
-    });
+    repo.create({ id: "failed", title: "Failed handoff", ownerId: source });
     selectHead(mesh, source, "failed");
     repo.setCheckpoint("failed", "Transfer attempt failed; source still owns it.", source);
     expect((await handoff("failed", retired)).isError).toBe(true);
@@ -9359,244 +9347,6 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.finishInboxRun(subject);
   });
 
-  it("accepts a clean yield on a standing repository head whose checkpoint this run rewrote (#468)", () => {
-    const events: MeshEventInput[] = [];
-    const { mesh } = strictMesh((event) => events.push(event));
-    const steward = worker(mesh, "repo steward");
-    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "repo-node",
-      title: "glass_goals",
-      ownerId: steward,
-      externalRef: "github:MEK-Org/rusa",
-    });
-    selectHead(mesh, steward, "repo-node");
-
-    // The no-change run: exact-head workflows green, no open PRs, backlog
-    // parked. The only act is recording what the re-derivation found — a
-    // checkpoint rewrite against the row as selected.
-    repo.setCheckpoint(
-      "repo-node",
-      "Re-derived: master unchanged, exact-head workflows green, no open PRs, backlog parked.",
-      steward
-    );
-    expect(() => mesh.declareYield(steward, "complete")).not.toThrow();
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        kind: "standing_head_verified",
-        actorId: steward,
-        payload: expect.stringContaining('"obligationId":"repo-node"'),
-      })
-    );
-    expect(events).not.toContainEqual(expect.objectContaining({ kind: "run_yield_rejected" }));
-  });
-
-  it("classifies a ref-free parentless head as standing and accepts its fresh-checkpoint yield (#468)", () => {
-    const { mesh } = strictMesh();
-    const subject = worker(mesh);
-    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({ id: "apex-node", title: "Apex", ownerId: subject });
-    selectHead(mesh, subject, "apex-node");
-
-    repo.setCheckpoint("apex-node", "Children all closed; nothing new to raise.", subject);
-    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
-  });
-
-  it("accepts a clean yield on a standing owner head whose checkpoint this run rewrote (#468)", () => {
-    const events: MeshEventInput[] = [];
-    const { mesh } = strictMesh((event) => events.push(event));
-    const steward = worker(mesh, "org steward");
-    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "org-node",
-      title: "MEK-Org",
-      ownerId: steward,
-      externalRef: "github:MEK-Org",
-    });
-    selectHead(mesh, steward, "org-node");
-
-    repo.setCheckpoint(
-      "org-node",
-      "Re-derived the organization: no changes need a new obligation.",
-      steward
-    );
-    expect(() => mesh.declareYield(steward, "complete")).not.toThrow();
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        kind: "standing_head_verified",
-        actorId: steward,
-        payload: expect.stringContaining('"obligationId":"org-node"'),
-      })
-    );
-    expect(events).not.toContainEqual(expect.objectContaining({ kind: "run_yield_rejected" }));
-  });
-
-  it("rejects a standing repository head carrying a checkpoint written before the run (#468)", () => {
-    const events: MeshEventInput[] = [];
-    const { mesh } = strictMesh((event) => events.push(event));
-    const steward = worker(mesh, "repo steward");
-    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "repo-node",
-      title: "glass_goals",
-      ownerId: steward,
-      externalRef: "github:MEK-Org/rusa",
-    });
-    // Left by an earlier run; the snapshot at selection sees exactly this
-    // triple, so the standing it records cannot attribute an act to this one.
-    repo.setCheckpoint("repo-node", "Verified last week; nothing since.", steward);
-    selectHead(mesh, steward, "repo-node");
-
-    expect(() => mesh.declareYield(steward, "complete")).toThrow(
-      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
-    );
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        kind: "run_yield_rejected",
-        payload: expect.stringContaining('"obligationId":"repo-node"'),
-      })
-    );
-    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
-  });
-
-  it("rejects a standing head whose fresh checkpoint was written by another actor (#468)", () => {
-    const { mesh } = strictMesh();
-    const steward = worker(mesh, "repo steward");
-    const other = worker(mesh, "other actor");
-    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "repo-node",
-      title: "glass_goals",
-      ownerId: steward,
-      externalRef: "github:MEK-Org/rusa",
-    });
-    selectHead(mesh, steward, "repo-node");
-
-    repo.setCheckpoint("repo-node", "Another actor's verification.", other);
-    expect(() => mesh.declareYield(steward, "complete")).toThrow(
-      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
-    );
-  });
-
-  it("rejects a standing head unreadable at selection even after its owner writes a checkpoint (#468)", () => {
-    const unreadable = new Set<string>(["repo-node"]);
-    const { mesh } = setup({
-      inboxStore,
-      experimentEnrollments: enrollments,
-      obligations: {
-        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
-        get: (id) => (unreadable.has(id) ? null : repo.get(id)),
-        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
-        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-      },
-    });
-    const steward = worker(mesh, "repo steward");
-    mesh.enrollActorInExperiment(steward, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "repo-node",
-      title: "glass_goals",
-      ownerId: steward,
-      externalRef: "github:MEK-Org/rusa",
-    });
-    selectHead(mesh, steward, "repo-node");
-
-    unreadable.delete("repo-node");
-    repo.setCheckpoint("repo-node", "Re-derived; no new work exists.", steward);
-    expect(() => mesh.declareYield(steward, "complete")).toThrow(
-      /selected head obligation repo-node \("glass_goals"\) was not finished or decomposed/
-    );
-  });
-
-  it("keeps an issue-ref'd leaf strict even with a checkpoint rewritten during the run (#468)", () => {
-    const events: MeshEventInput[] = [];
-    const { mesh } = strictMesh((event) => events.push(event));
-    const subject = worker(mesh);
-    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "issue-leaf",
-      title: "Fix the thing",
-      ownerId: subject,
-      externalRef: "github:MEK-Org/rusa/issues/468",
-    });
-    selectHead(mesh, subject, "issue-leaf");
-
-    repo.setCheckpoint("issue-leaf", "Investigated; the fix is not mine to make alone.", subject);
-    expect(() => mesh.declareYield(subject, "complete")).toThrow(
-      /selected head obligation issue-leaf \("Fix the thing"\) was not finished or decomposed/
-    );
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        kind: "run_yield_rejected",
-        payload: expect.stringContaining('"obligationId":"issue-leaf"'),
-      })
-    );
-    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
-  });
-
-  it("keeps a ref-free leaf strict even with a checkpoint rewritten during the run (#468)", () => {
-    const { mesh } = strictMesh();
-    const subject = worker(mesh);
-    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({ id: "root-node", title: "rusa", ownerId: subject });
-    repo.create({
-      id: "leaf-node",
-      parentId: "root-node",
-      title: "Leaf task",
-      ownerId: subject,
-    });
-    selectHead(mesh, subject, "leaf-node");
-
-    repo.setCheckpoint("leaf-node", "Did what I could; still unresolved.", subject);
-    expect(() => mesh.declareYield(subject, "complete")).toThrow(
-      /selected head obligation leaf-node \("Leaf task"\) was not finished or decomposed/
-    );
-  });
-
-  it("does not record a standing acceptance when another selected head rejects the yield (#468)", () => {
-    const events: MeshEventInput[] = [];
-    const { mesh } = strictMesh((event) => events.push(event));
-    const subject = worker(mesh, "mixed heads");
-    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
-    repo.create({
-      id: "standing-head",
-      title: "Repository stewardship",
-      ownerId: subject,
-      externalRef: "github:MEK-Org/rusa",
-    });
-    repo.create({
-      id: "strict-leaf",
-      title: "Actionable leaf",
-      ownerId: subject,
-      externalRef: "github:MEK-Org/rusa/issues/468",
-    });
-    mesh.deliverReadyHeadAttention(subject, { id: "standing-head", intent: "verify" }, null);
-    mesh.deliverReadyHeadAttention(subject, { id: "strict-leaf", intent: "act" }, "standing-head");
-    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
-    const entryIds = inboxStore.entries
-      .filter(
-        (entry) =>
-          entry.actorId === subject &&
-          entry.payload.type === "obligation.ready_head" &&
-          (entry.payload.obligationId === "standing-head" ||
-            entry.payload.obligationId === "strict-leaf")
-      )
-      .map((entry) => entry.id);
-    expect(entryIds).toHaveLength(2);
-    mesh.selectInboxEntries(subject, entryIds);
-
-    repo.setCheckpoint("standing-head", "No repository changes need a child.", subject);
-    expect(() => mesh.declareYield(subject, "complete")).toThrow(
-      /selected head obligation strict-leaf \("Actionable leaf"\) was not finished or decomposed/
-    );
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        kind: "run_yield_rejected",
-        payload: expect.stringContaining('"obligationId":"strict-leaf"'),
-      })
-    );
-    expect(events).not.toContainEqual(expect.objectContaining({ kind: "standing_head_verified" }));
-  });
-
   it("preserves failed-run handling without clean-yield rejection", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
@@ -9671,7 +9421,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).toContain("told-head");
     // The exits it names are the exits enforcement accepts, worded once.
     const exits =
-      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor, or — for a standing (owner/repository-level or ref-free root) head — rewrite its checkpoint during the run to record the no-change verification you performed";
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
     expect(notice).toContain(exits);
     expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
 

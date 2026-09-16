@@ -205,10 +205,6 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_coalesced: "ignored",
   // Rejection is rollout observability; it records no commitment progress.
   run_yield_rejected: "ignored",
-  // The accepted no-change disposition of a standing head (#468) is rollout
-  // observability, exactly like the rejected disposition beside it: the run is
-  // bracketed by events this projection already reads.
-  standing_head_verified: "ignored",
   stamp_invalid: "ignored",
   // The decider's other events in the same run (`run_start`, `run_yielded`) are
   // what say it was working; withdrawing one scheduled delivery neither opens
