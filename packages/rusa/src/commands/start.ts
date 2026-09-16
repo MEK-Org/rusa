@@ -226,6 +226,7 @@ import {
   QuotaCoordinatorClient,
   reconcileProviderPacersFromClient,
 } from "../quota/coordinator-client.js";
+import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   HISTORY_WINDOW_MS,
   type PublishedThrottleProviderStatus,
@@ -1251,10 +1252,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
   const coordinatorSocketPath = config.quota?.coordinator?.socketPath;
   const maxIntervalSeconds = config.quota?.throttle?.maxIntervalSeconds ?? 3600;
+  const serviceBasename =
+    basename(mcHome) === ".rusa-staging" || basename(mcHome) === "rusa-staging"
+      ? "rusa-staging"
+      : "rusa";
   const quotaCoordinatorClient = coordinatorSocketPath
     ? new QuotaCoordinatorClient({
         socketPath: coordinatorSocketPath,
         maxIntervalSeconds,
+        source: serviceBasename,
+        metrics: createQuotaMetrics(log),
         logger: {
           warn: (...args: unknown[]) =>
             log.warn("quota_client_warning", { message: args.map(String).join(" ") }),

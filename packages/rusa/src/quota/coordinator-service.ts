@@ -3,6 +3,12 @@ import http from "node:http";
 import net from "node:net";
 import { dirname } from "node:path";
 import { normalizeProviderThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
+import type { QuotaCollectionStats } from "./coordinator-collection.js";
+import {
+  nullQuotaMetrics,
+  QUOTA_SERVICE_METRICS,
+  type QuotaMetrics,
+} from "./coordinator-metrics.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
@@ -16,6 +22,7 @@ import {
   type QuotaCoordinatorErrorResponse,
   type QuotaCoordinatorPathMismatchError,
   type QuotaCoordinatorServiceInfo,
+  type QuotaReadyScrapeStatus,
 } from "./coordinator-protocol.js";
 import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
 import type { SharedQuotaStore } from "./shared-store.js";
@@ -39,6 +46,14 @@ export interface QuotaCoordinatorServiceOptions {
   hardStaleAfterMs?: number;
   version?: string;
   now?: () => number;
+  /** Metric sink; defaults to the discarding one. */
+  metrics?: QuotaMetrics;
+  /**
+   * Live per-provider collection stats, when this service runs in a process
+   * that also collects. Readiness needs them because a probe that fails before
+   * it can persist a scrape row leaves nothing in the database to report.
+   */
+  collectionStats?: () => Record<string, Readonly<QuotaCollectionStats>>;
 }
 
 export class QuotaCoordinatorService {
@@ -48,8 +63,10 @@ export class QuotaCoordinatorService {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
+  private readonly metrics: QuotaMetrics;
 
   constructor(readonly options: QuotaCoordinatorServiceOptions) {
+    this.metrics = options.metrics ?? nullQuotaMetrics;
     this.configuredProviders = options.configuredProviders ?? DEFAULT_COORDINATOR_PROVIDERS;
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
@@ -194,6 +211,48 @@ export class QuotaCoordinatorService {
         message: err instanceof Error ? err.message : String(err),
         retryable: true,
       });
+    } finally {
+      // Counted once per request, after the response status is decided, and
+      // labelled with the routed path rather than the raw URL: the query string
+      // carries a provider name, and a per-URL label set would grow with every
+      // distinct query a client happens to send.
+      const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      this.metrics.counter(QUOTA_SERVICE_METRICS.readsTotal, {
+        path: (SERVED_ROUTES as readonly string[]).includes(pathname) ? pathname : "unrouted",
+        status: res.statusCode,
+      });
+    }
+  }
+
+  /**
+   * Overlay the live collection loop's view on the stored-scrape view.
+   *
+   * The stored rows answer "what is the newest reading we have"; the loop
+   * answers "did the last probe work". Readiness needs both, and the loop's
+   * answer wins on `status`, because a provider whose probes started failing an
+   * hour ago still has a perfectly well-formed newest row.
+   */
+  private mergeCollectionStats(scrapes: Record<string, QuotaReadyScrapeStatus>): void {
+    const stats = this.options.collectionStats?.();
+    if (!stats) return;
+    for (const [provider, stat] of Object.entries(stats)) {
+      const existing = scrapes[provider];
+      const status: QuotaReadyScrapeStatus["status"] =
+        stat.lastOutcome === "failure"
+          ? "error"
+          : stat.lastOutcome === "ok"
+            ? (existing?.status ?? "ok")
+            : (existing?.status ?? "pending");
+      const error =
+        stat.lastOutcome === "failure" ? (stat.lastError ?? undefined) : existing?.error;
+      scrapes[provider] = {
+        scrapedAt: existing?.scrapedAt ?? stat.lastScrapedAt ?? null,
+        status,
+        ...(error ? { error } : {}),
+        lastAttemptAt: stat.lastAttemptAt,
+        attempts: stat.attempts,
+        failures: stat.failures,
+      };
     }
   }
 
@@ -416,10 +475,7 @@ export class QuotaCoordinatorService {
           )
           .all() as Array<{ provider: string; scraped_at: string; parse_error: string | null }>;
 
-        const scrapes: Record<
-          string,
-          { scrapedAt: string; status: "ok" | "error"; error?: string }
-        > = {};
+        const scrapes: Record<string, QuotaReadyScrapeStatus> = {};
         for (const r of scrapeRows) {
           scrapes[r.provider] = {
             scrapedAt: r.scraped_at,
@@ -427,6 +483,7 @@ export class QuotaCoordinatorService {
             ...(r.parse_error ? { error: r.parse_error } : {}),
           };
         }
+        this.mergeCollectionStats(scrapes);
 
         this.sendJson(res, 200, {
           service: serviceInfo,

@@ -1,6 +1,11 @@
 import http from "node:http";
 import type { ProviderPacer } from "../actor/provider-pacer.js";
 import {
+  nullQuotaMetrics,
+  QUOTA_CLIENT_METRICS,
+  type QuotaMetrics,
+} from "./coordinator-metrics.js";
+import {
   COORDINATOR_PROTOCOL_MAJOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
@@ -26,6 +31,15 @@ export interface QuotaCoordinatorClientOptions {
   requestTimeoutMs?: number;
   now?: () => number;
   logger?: { warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
+  /** Metric sink; defaults to the discarding one. */
+  metrics?: QuotaMetrics;
+  /**
+   * The `source` label the two client series carry — which reader this is.
+   * The series exist to be compared across many readers at once, so an
+   * unlabelled one is not useful; an unset source reports as `unknown` rather
+   * than silently merging distinct readers into one line.
+   */
+  source?: string;
 }
 
 /**
@@ -184,8 +198,25 @@ export class QuotaCoordinatorClient {
   private serviceConnected = false;
   private nextReadAllowedAtMs = 0;
   private reconnectBackoffMs = RECONNECT_BACKOFF_MIN_MS;
+  private readonly metrics: QuotaMetrics;
+  private readonly source: string;
 
-  constructor(readonly options: QuotaCoordinatorClientOptions) {}
+  constructor(readonly options: QuotaCoordinatorClientOptions) {
+    this.metrics = options.metrics ?? nullQuotaMetrics;
+    this.source = options.source ?? "unknown";
+  }
+
+  /**
+   * Whether the last read reached the service. Reported as 0/1 rather than as
+   * an event, because the condition that matters is a client sitting
+   * disconnected across ticks — a gauge shows that as a flat line at zero,
+   * where a failure counter only shows it as an absence of increments.
+   */
+  private recordConnected(connected: boolean): void {
+    this.metrics.gauge(QUOTA_CLIENT_METRICS.serviceConnected, connected ? 1 : 0, {
+      source: this.source,
+    });
+  }
 
   /**
    * `quota_client_service_connected`: 1 once a response the client could
@@ -298,6 +329,7 @@ export class QuotaCoordinatorClient {
     // backoff window is skipped, which is indistinguishable to a caller from a
     // read that failed — both mean "no new interval", never "do not launch".
     if (this.nowMs() < this.nextReadAllowedAtMs) {
+      this.recordConnected(false);
       return null;
     }
 
@@ -425,7 +457,6 @@ export class QuotaCoordinatorClient {
         req.destroy(new Error(`coordinator read timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       deadlineTimer.unref?.();
-
       req.end();
     });
   }
@@ -550,6 +581,10 @@ export class QuotaCoordinatorClient {
       if ("buckets" in body && Array.isArray((body as { buckets: unknown }).buckets)) {
         this.lastPublishedStatuses.set(provider, body as PublishedThrottleProviderStatus);
       }
+      this.metrics.gauge(QUOTA_CLIENT_METRICS.appliedIntervalSeconds, interval, {
+        source: this.source,
+        provider,
+      });
       return true;
     }
 
@@ -560,11 +595,13 @@ export class QuotaCoordinatorClient {
     this.serviceConnected = true;
     this.nextReadAllowedAtMs = 0;
     this.reconnectBackoffMs = RECONNECT_BACKOFF_MIN_MS;
+    this.recordConnected(true);
   }
 
   private markUnavailable(): void {
     this.serviceConnected = false;
     this.nextReadAllowedAtMs = this.nowMs() + this.reconnectBackoffMs;
     this.reconnectBackoffMs = Math.min(this.reconnectBackoffMs * 2, RECONNECT_BACKOFF_MAX_MS);
+    this.recordConnected(false);
   }
 }
