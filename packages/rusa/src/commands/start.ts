@@ -1256,9 +1256,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     basename(mcHome) === ".rusa-staging" || basename(mcHome) === "rusa-staging"
       ? "rusa-staging"
       : "rusa";
+  const quotaProviders = configuredQuotaThrottleProviders(config);
   const quotaCoordinatorClient = coordinatorSocketPath
     ? new QuotaCoordinatorClient({
         socketPath: coordinatorSocketPath,
+        configuredProviders: quotaProviders,
         maxIntervalSeconds,
         source: serviceBasename,
         metrics: createQuotaMetrics(log),
@@ -1296,10 +1298,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         meshEvents: getRepositories().meshEvents,
         rootHandle,
       }),
-    // One shared QuotaService instance : both actor-invoked `get_quota`
-    // calls and the dashboard's `/api/quota` endpoint below read the same TTL
-    // cache, so neither surface can double the probe rate.
-    [QUOTA_MCP_NAME]: () => createQuotaMcpServer({ config, workersDir }, quotaService),
+    // Route agent get_quota through the coordinator client when configured (§12 item 4, #356)
+    [QUOTA_MCP_NAME]: () =>
+      createQuotaMcpServer(
+        { config, workersDir, coordinatorClient: quotaCoordinatorClient },
+        quotaService
+      ),
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
   let gchat: GchatClient | null = null;
@@ -1422,7 +1426,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Quota pacing is backed by the coordinator client reading published intervals.
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
-  const quotaProviders = configuredQuotaThrottleProviders(config);
   const providerPacers = new Map<string, ProviderPacer>();
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
@@ -1568,6 +1571,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   if (quotaThrottleEnabled && quotaCoordinatorClient) {
     await tickQuotaThrottle();
+  }
+  // The dashboard's history panel and cold-snapshot fallback read the client's
+  // history cache (`listHistory` below, §12 item 4 / #356), so the cache is
+  // warmed whenever a coordinator is configured — independent of whether launch
+  // pacing (`quota.throttle.enabled`) is on.
+  if (quotaCoordinatorClient) {
     void refreshQuotaHistory();
   }
 
@@ -2323,7 +2332,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           )
         );
         const quotaUrl = mcpHttp.addServer(`${id}:${QUOTA_MCP_NAME}`, () =>
-          createQuotaMcpServer({ config, workersDir }, quotaService, { isFenced })
+          createQuotaMcpServer(
+            { config, workersDir, coordinatorClient: quotaCoordinatorClient },
+            quotaService,
+            { isFenced }
+          )
         );
 
         const perActorShared: McpServerSpec[] = [
@@ -3570,15 +3583,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           ...createUnderstandingStringsResolver(config),
           rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
         },
-        // Cached per-provider quota snapshot : reads the same shared
-        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
-        // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
-        // the request path (issue #10). It serves the latest known reading
-        // immediately (stale-while-revalidate) and kicks any refresh in the
-        // background; a cold cache falls back to durable coordinator history below via
-        // `listHistory`.
+        // Route dashboard quota through GET /v1/quota and history through GET /v1/history
+        // via the coordinator client (§12 item 4, #356), preserving quotaApi's dependency shape.
+        // Falls back to local QuotaService.getQuotaCached only when no coordinator client exists.
         quotaApi: opts?.e2e?.quotaApi ?? {
-          getQuota: async (provider) => quotaService.getQuotaCached(provider),
+          getQuota: async (provider) =>
+            quotaCoordinatorClient
+              ? quotaCoordinatorClient.getQuotaWithFallback(provider)
+              : quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
           listHistory: quotaCoordinatorClient
@@ -3764,6 +3776,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let webhookSilenceCheck: ReturnType<typeof setInterval> | null = null;
   let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
   let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
+  let quotaHistoryCheck: ReturnType<typeof setInterval> | null = null;
   let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
@@ -3780,6 +3793,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (webhookSilenceCheck) clearInterval(webhookSilenceCheck);
     if (diskAlertCheck) clearInterval(diskAlertCheck);
     if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
+    if (quotaHistoryCheck) clearInterval(quotaHistoryCheck);
     if (modelProbeCheck) clearInterval(modelProbeCheck);
     // Clearing the interval only stops the next probe. Abort reaches the one
     // running now - it kills the spawned tree synchronously - and awaiting it
@@ -3871,6 +3885,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             `[quota-throttle] interval tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
           );
         });
+      },
+      (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
+    );
+    quotaThrottleCheck.unref?.();
+  }
+  if (quotaCoordinatorClient) {
+    // History cache refresh runs on the same cadence but is not gated on
+    // throttling: the dashboard reads history through the client either way.
+    quotaHistoryCheck = setInterval(
+      () => {
         void refreshQuotaHistory().catch((err) => {
           log.warn("quota_history_interval_failed", {
             err: err instanceof Error ? err.message : String(err),
@@ -3879,7 +3903,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
-    quotaThrottleCheck.unref?.();
+    quotaHistoryCheck.unref?.();
   }
 
   const diskAlertConfig = config.observability?.diskAlert;

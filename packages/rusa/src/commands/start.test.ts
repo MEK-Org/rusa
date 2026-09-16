@@ -34,6 +34,7 @@ import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -622,6 +623,69 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(passedOpts.quotaClientHealth?.()).toEqual({ quota_client_service_connected: 0 });
     } finally {
       startDashboardServerSpy.mockRestore();
+    }
+  });
+
+  it("reads dashboard quota and history through the coordinator client with launch pacing disabled (#356)", async () => {
+    // §12 item 4: the dashboard is a consumer of GET /v1/quota and GET /v1/history
+    // whenever a coordinator socket is configured. `quota.throttle.enabled` governs
+    // launch pacing only; it must not gate the history cache the dashboard reads.
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    const getHistorySpy = vi
+      .spyOn(QuotaCoordinatorClient.prototype, "getHistory")
+      .mockResolvedValue([]);
+    const getQuotaSpy = vi
+      .spyOn(QuotaCoordinatorClient.prototype, "getQuotaWithFallback")
+      .mockResolvedValue({
+        provider: "agy",
+        status: "unknown",
+        limits: [],
+        freshness: { ageMs: null, buckets: {}, stale: true, hardStale: true },
+      });
+    const configWithCoordinator = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      geminiApiKey: "fake-gemini-key",
+      quota: {
+        coordinator: { socketPath: "/tmp/mock-coordinator.sock" },
+      },
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(configWithCoordinator), "utf8");
+
+    try {
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      // History cache warmed at boot for the configured provider, throttle off.
+      expect(getHistorySpy).toHaveBeenCalledWith("agy", expect.any(String));
+
+      const passedOpts = startDashboardServerSpy.mock.calls[0][0];
+      const quotaApi = passedOpts.quotaApi;
+      if (!quotaApi) throw new Error("quotaApi not wired");
+      expect(quotaApi.providers).toEqual(["agy"]);
+      expect(quotaApi.listHistory).toBeTypeOf("function");
+
+      // Snapshot reads go through the client, and the cold answer is a shape.
+      const snapshot = await quotaApi.getQuota("agy");
+      expect(getQuotaSpy).toHaveBeenCalledWith("agy");
+      expect(snapshot.status).toBe("unknown");
+      expect(snapshot.freshness?.hardStale).toBe(true);
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      getHistorySpy.mockRestore();
+      getQuotaSpy.mockRestore();
     }
   });
 
