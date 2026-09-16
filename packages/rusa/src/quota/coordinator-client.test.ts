@@ -1361,7 +1361,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         configuredProviders: ["claude"],
       });
 
-      const result = await client.getQuota("claude");
+      const result = await client.getQuotaWithFallback("claude");
       expect(getQuotaRequested).toBe(true);
       expect(result.status).toBe("available");
       expect(result.provider).toBe("claude");
@@ -1403,7 +1403,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         configuredProviders: ["claude"],
       });
 
-      const result = await client.getQuota("claude");
+      const result = await client.getQuotaWithFallback("claude");
       expect(getQuotaRequested).toBe(true);
       expect(result.status).toBe("unknown");
       expect(result.provider).toBe("claude");
@@ -1422,7 +1422,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         configuredProviders: ["claude"],
       });
 
-      const result = await client.getQuota("claude");
+      const result = await client.getQuotaWithFallback("claude");
       expect(result.status).toBe("unknown");
       expect(result.provider).toBe("claude");
       expect(result.limits).toEqual([]);
@@ -1459,7 +1459,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         socketPath,
       });
 
-      const result = await client.getQuota("codex");
+      const result = await client.getQuotaWithFallback("codex");
       expect(getQuotaRequested).toBe(true);
       expect(result.status).toBe("unsupported");
       expect(result.provider).toBe("codex");
@@ -1474,9 +1474,156 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         configuredProviders: ["claude"],
       });
 
-      const result = await client.getQuota("codex");
+      const result = await client.getQuotaWithFallback("codex");
       expect(result.status).toBe("unsupported");
       expect(result.provider).toBe("codex");
+    });
+
+    it("answers unsupported for an unconfigured provider without touching the socket even when warm", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit15-unsupp-nosock-"));
+      const socketPath = join(root, "coordinator.sock");
+      let requests = 0;
+
+      await listen(socketPath, (_req, res) => {
+        requests += 1;
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            provider: "codex",
+            status: "available",
+            limits: [],
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        configuredProviders: ["claude"],
+      });
+
+      const result = await client.getQuotaWithFallback("codex");
+      expect(requests).toBe(0);
+      expect(result.status).toBe("unsupported");
+      expect(result.provider).toBe("codex");
+      expect(result.message).toContain("is not configured");
+    });
+
+    it("treats a non-200 answer as unavailability: cold unknown fallback and service disconnected", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit15-non200-"));
+      const socketPath = join(root, "coordinator.sock");
+
+      await listen(socketPath, (_req, res) => {
+        res.statusCode = 500;
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            error: { code: "internal_error", message: "boom", retryable: true },
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        configuredProviders: ["claude"],
+      });
+
+      const result = await client.getQuotaWithFallback("claude");
+      expect(result.status).toBe("unknown");
+      expect(result.freshness).toEqual({ ageMs: null, buckets: {}, stale: true, hardStale: true });
+      expect(client.getHealth().quota_client_service_connected).toBe(0);
+    });
+
+    it.each([
+      ["limits is not an array", { limits: { label: "Weekly", percentLeft: 50 } }],
+      ["a limit lacks percentLeft", { limits: [{ label: "Weekly" }] }],
+      [
+        "a limit has a non-numeric percentLeft",
+        { limits: [{ label: "Weekly", percentLeft: "50" }] },
+      ],
+      [
+        "a limit carries an unknown kind",
+        { limits: [{ label: "Weekly", percentLeft: 50, kind: "monthly" }] },
+      ],
+      [
+        "a limit scope is malformed",
+        { limits: [{ label: "Weekly", percentLeft: 50, scope: { models: ["x"] } }] },
+      ],
+      ["freshness is malformed", { limits: [], freshness: { stale: "yes" } }],
+      ["message is not a string", { limits: [], message: 42 }],
+    ])("rejects a matching-major 200 body whose nested fields are malformed (%s) as cold unknown", async (_label, overrides) => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit15-malformed-"));
+      const socketPath = join(root, "coordinator.sock");
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            provider: "claude",
+            status: "available",
+            ...overrides,
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        configuredProviders: ["claude"],
+      });
+
+      const result = await client.getQuotaWithFallback("claude");
+      expect(result.status).toBe("unknown");
+      expect(result.limits).toEqual([]);
+      expect(result.freshness?.hardStale).toBe(true);
+      expect(client.getHealth().quota_client_service_connected).toBe(0);
+    });
+
+    it("passes a well-formed 200 body through with nested limits, scope, and freshness intact", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-crit15-wellformed-"));
+      const socketPath = join(root, "coordinator.sock");
+
+      const body = {
+        service: serviceInfo(),
+        provider: "claude",
+        status: "exhausted",
+        limits: [
+          {
+            label: "Session",
+            kind: "session",
+            percentLeft: 0,
+            resetAtIso: "2026-01-01T00:00:00.000Z",
+          },
+          {
+            label: "Opus",
+            kind: "weekly",
+            percentLeft: 12,
+            scope: { provider: "claude", models: ["opus"] },
+          },
+          { label: "Legacy", percentLeft: 3, scope: "provider" },
+        ],
+        freshness: { ageMs: 1234, buckets: { weekly: 1234 }, stale: false, hardStale: false },
+        message: "banner",
+        scrapedAt: "2026-01-01T00:00:00.000Z",
+      };
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(body));
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        configuredProviders: ["claude"],
+      });
+
+      const result = await client.getQuotaWithFallback("claude");
+      expect(result.status).toBe("exhausted");
+      expect(result.limits).toEqual(body.limits);
+      expect(result.freshness).toEqual(body.freshness);
+      expect(result.message).toBe("banner");
+      expect(client.getHealth().quota_client_service_connected).toBe(1);
     });
 
     it("refuses protocolMajor mismatch by returning cold unknown fallback and marking service disconnected", async () => {
@@ -1500,7 +1647,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         configuredProviders: ["claude"],
       });
 
-      const result = await client.getQuota("claude");
+      const result = await client.getQuotaWithFallback("claude");
       expect(result.status).toBe("unknown");
       expect(result.freshness?.stale).toBe(true);
       expect(client.getHealth().quota_client_service_connected).toBe(0);

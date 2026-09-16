@@ -2992,6 +2992,7 @@ describe("quota MCP server", () => {
                   },
                   provider: "claude",
                   status: "available",
+                  scrapedAt: new Date(0).toISOString(),
                   limits: [
                     {
                       label: "Weekly",

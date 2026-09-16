@@ -1385,23 +1385,14 @@ export function createQuotaService(deps: QuotaMcpDeps): QuotaService {
  */
 export function createQuotaMcpServer(
   deps: QuotaMcpDeps,
-  service: QuotaService | QuotaCoordinatorClient = deps.coordinatorClient ??
-    createQuotaService(deps),
-  options?: { isFenced?: () => boolean; coordinatorClient?: QuotaCoordinatorClient | null }
+  service: QuotaService = createQuotaService(deps),
+  options?: { isFenced?: () => boolean }
 ): McpServer {
-  const coordinatorClient: QuotaCoordinatorClient | null =
-    options?.coordinatorClient ??
-    deps.coordinatorClient ??
-    (service && "getQuota" in service && "getLastAppliedInterval" in service
-      ? (service as QuotaCoordinatorClient)
-      : null);
-
-  const configuredProviders = new Set(
-    Object.entries(deps.config.providers).map(([name, provider]) => {
-      const command = provider.cliCommand ?? name;
-      return command === "antigravity" ? "agy" : command;
-    })
-  );
+  // §12 item 4 (#356): when a coordinator client is wired, get_quota reads
+  // through GET /v1/quota and never reaches the local probe path. Both the
+  // client and QuotaService answer an admitted-but-unconfigured provider with
+  // `status: "unsupported"` themselves, so there is one dispatch seam here.
+  const coordinatorClient = deps.coordinatorClient ?? null;
 
   const server = createMcpServer(
     { name: QUOTA_MCP_NAME, version: "0.1.0" },
@@ -1419,18 +1410,11 @@ export function createQuotaMcpServer(
     },
     async ({ provider }) => {
       try {
-        if (!configuredProviders.has(provider)) {
-          return toolOk({
-            provider,
-            status: "unsupported",
-            limits: [],
-            message: `${provider} is not configured on this instance`,
-          });
-        }
-        if (coordinatorClient) {
-          return toolOk(await coordinatorClient.getQuota(provider));
-        }
-        return toolOk(await (service as QuotaService).getQuota(provider));
+        return toolOk(
+          await (coordinatorClient
+            ? coordinatorClient.getQuotaWithFallback(provider)
+            : service.getQuota(provider))
+        );
       } catch (err) {
         return toolError(err);
       }

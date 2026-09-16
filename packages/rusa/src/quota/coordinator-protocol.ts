@@ -265,15 +265,90 @@ export interface PublishedQuotaResponse extends ProviderQuotaSnapshot {
   freshness?: QuotaFreshness;
 }
 
-export function isValidQuotaPayload(body: unknown, provider?: string): boolean {
+const QUOTA_STATUSES: ReadonlySet<string> = new Set([
+  "available",
+  "exhausted",
+  "unknown",
+  "unsupported",
+]);
+const QUOTA_WINDOW_KINDS: ReadonlySet<string> = new Set([
+  "session",
+  "five_hour",
+  "weekly",
+  "other",
+]);
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isValidQuotaWindowScope(value: unknown): boolean {
+  if (value === "provider" || value === "model") return true;
+  if (typeof value !== "object" || value === null) return false;
+  const scope = value as Record<string, unknown>;
+  return (
+    typeof scope.provider === "string" &&
+    (scope.models === undefined ||
+      (Array.isArray(scope.models) && scope.models.every((m) => typeof m === "string")))
+  );
+}
+
+function isValidQuotaLimit(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const limit = value as Record<string, unknown>;
+  return (
+    typeof limit.label === "string" &&
+    typeof limit.percentLeft === "number" &&
+    Number.isFinite(limit.percentLeft) &&
+    (limit.kind === undefined ||
+      (typeof limit.kind === "string" && QUOTA_WINDOW_KINDS.has(limit.kind))) &&
+    isOptionalString(limit.resetAtIso) &&
+    (limit.scope === undefined || isValidQuotaWindowScope(limit.scope))
+  );
+}
+
+export function isValidQuotaFreshness(value: unknown): value is QuotaFreshness {
+  if (typeof value !== "object" || value === null) return false;
+  const freshness = value as Record<string, unknown>;
+  return (
+    (freshness.ageMs === null || typeof freshness.ageMs === "number") &&
+    typeof freshness.buckets === "object" &&
+    freshness.buckets !== null &&
+    !Array.isArray(freshness.buckets) &&
+    Object.values(freshness.buckets as Record<string, unknown>).every(
+      (v) => typeof v === "number"
+    ) &&
+    typeof freshness.stale === "boolean" &&
+    typeof freshness.hardStale === "boolean"
+  );
+}
+
+/**
+ * Structural check on a `GET /v1/quota` body before the client hands it to
+ * consumers as a `ProviderQuotaSnapshot`. Matching protocolMajor promises the
+ * envelope, not the nested fields, so every field a consumer dereferences
+ * (`quota-api.ts` window builders, the MCP tool output) is checked here the
+ * same way `isValidHistoryRecord` checks history rows. Unknown extra fields
+ * pass through: a newer minor may add them.
+ */
+export function isValidQuotaPayload(
+  body: unknown,
+  provider?: string
+): body is PublishedQuotaResponse {
   if (typeof body !== "object" || body === null) return false;
-  const obj = body as { provider?: unknown; status?: unknown };
+  const obj = body as Record<string, unknown>;
   if (typeof obj.provider !== "string" || typeof obj.status !== "string") {
     return false;
   }
   if (provider !== undefined && obj.provider !== provider) {
     return false;
   }
-  const validStatuses = ["available", "exhausted", "unknown", "unsupported"];
-  return validStatuses.includes(obj.status);
+  if (!QUOTA_STATUSES.has(obj.status)) return false;
+  if (obj.limits !== undefined) {
+    if (!Array.isArray(obj.limits) || !obj.limits.every(isValidQuotaLimit)) return false;
+  }
+  if (obj.freshness !== undefined && !isValidQuotaFreshness(obj.freshness)) return false;
+  return (
+    isOptionalString(obj.message) && isOptionalString(obj.raw) && isOptionalString(obj.scrapedAt)
+  );
 }

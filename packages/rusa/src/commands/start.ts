@@ -1571,6 +1571,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   if (quotaThrottleEnabled && quotaCoordinatorClient) {
     await tickQuotaThrottle();
+  }
+  // The dashboard's history panel and cold-snapshot fallback read the client's
+  // history cache (`listHistory` below, §12 item 4 / #356), so the cache is
+  // warmed whenever a coordinator is configured — independent of whether launch
+  // pacing (`quota.throttle.enabled`) is on.
+  if (quotaCoordinatorClient) {
     void refreshQuotaHistory();
   }
 
@@ -3583,7 +3589,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         quotaApi: opts?.e2e?.quotaApi ?? {
           getQuota: async (provider) =>
             quotaCoordinatorClient
-              ? quotaCoordinatorClient.getQuota(provider)
+              ? quotaCoordinatorClient.getQuotaWithFallback(provider)
               : quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
@@ -3770,6 +3776,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let webhookSilenceCheck: ReturnType<typeof setInterval> | null = null;
   let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
   let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
+  let quotaHistoryCheck: ReturnType<typeof setInterval> | null = null;
   let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
@@ -3786,6 +3793,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (webhookSilenceCheck) clearInterval(webhookSilenceCheck);
     if (diskAlertCheck) clearInterval(diskAlertCheck);
     if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
+    if (quotaHistoryCheck) clearInterval(quotaHistoryCheck);
     if (modelProbeCheck) clearInterval(modelProbeCheck);
     // Clearing the interval only stops the next probe. Abort reaches the one
     // running now - it kills the spawned tree synchronously - and awaiting it
@@ -3877,6 +3885,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             `[quota-throttle] interval tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
           );
         });
+      },
+      (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
+    );
+    quotaThrottleCheck.unref?.();
+  }
+  if (quotaCoordinatorClient) {
+    // History cache refresh runs on the same cadence but is not gated on
+    // throttling: the dashboard reads history through the client either way.
+    quotaHistoryCheck = setInterval(
+      () => {
         void refreshQuotaHistory().catch((err) => {
           log.warn("quota_history_interval_failed", {
             err: err instanceof Error ? err.message : String(err),
@@ -3885,7 +3903,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
-    quotaThrottleCheck.unref?.();
+    quotaHistoryCheck.unref?.();
   }
 
   const diskAlertConfig = config.observability?.diskAlert;
