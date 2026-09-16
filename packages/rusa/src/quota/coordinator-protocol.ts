@@ -244,6 +244,21 @@ export function publishedThrottle(
   };
 }
 
+/**
+ * Project a published throttle status onto the weekly admission observation
+ * it carries. Returns undefined when there is no status or no weekly bucket
+ * with a reset instant, which leaves pool ranking in declared order.
+ */
+export function weeklyAdmissionObservation(status: PublishedThrottleProviderStatus | undefined) {
+  const bucket = status?.buckets.find((candidate) => candidate.key === `${status.provider}:weekly`);
+  if (!bucket?.resetAtIso) return undefined;
+  return {
+    percentLeft: bucket.percentLeft,
+    observedAt: bucket.observedAt,
+    resetAtIso: bucket.resetAtIso,
+  };
+}
+
 export function validateProtocolMajor(
   body: unknown,
   expectedMajor: number = COORDINATOR_PROTOCOL_MAJOR

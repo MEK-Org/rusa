@@ -222,6 +222,7 @@ import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   HISTORY_WINDOW_MS,
   type PublishedThrottleProviderStatus,
+  weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -554,6 +555,8 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
+  /** The production coordinator client, exposed only to in-process E2E drivers. */
+  quotaCoordinatorClient: QuotaCoordinatorClient | null;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1429,22 +1432,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
     return pacer;
   };
-  // Admission only reads the canonical provider-wide weekly observation that
-  // already feeds quota pacing. No quota probe is initiated on a run path;
-  // absent or stale evidence is deliberately left for submitPoolGate's
-  // declared-order fallback.
-  const weeklyQuotaFor = (providerName: string) => {
-    const published = quotaCoordinatorClient?.getLastPublishedStatus(providerName);
-    const bucket = published?.buckets.find(
-      (candidate) => candidate.key === `${providerName}:weekly`
-    );
-    if (!bucket?.resetAtIso) return undefined;
-    return {
-      percentLeft: bucket.percentLeft,
-      observedAt: bucket.observedAt,
-      resetAtIso: bucket.resetAtIso,
-    };
-  };
+  // Admission projects the existing cached coordinator bucket representation.
+  // It starts no quota read: missing, stale, invalid, and tied evidence leaves
+  // selection in declared order, while a still-fresh trusted observation stays
+  // usable through a transient cold, unavailable, or incompatible response.
+  const weeklyQuotaFor = (providerName: string) =>
+    weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -4060,6 +4053,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // runner live handles so it can inject events and tear down deterministically.
   opts?.e2e?.onReady?.({
     mesh,
+    quotaCoordinatorClient,
     root,
     rootControl,
     externalRoot,
