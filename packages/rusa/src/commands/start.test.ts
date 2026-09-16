@@ -35,6 +35,7 @@ import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -580,6 +581,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     } finally {
       emitted.mockRestore();
+    }
+  });
+
+  it("passes quotaClientHealth from live quotaCoordinatorClient to startDashboardServer in production composition", async () => {
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    const configWithCoordinator = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      geminiApiKey: "fake-gemini-key",
+      quota: {
+        coordinator: { socketPath: "/tmp/mock-coordinator.sock" },
+        throttle: { enabled: true },
+      },
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(configWithCoordinator), "utf8");
+
+    try {
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      expect(startDashboardServerSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          quotaClientHealth: expect.any(Function),
+        })
+      );
+      const passedOpts = startDashboardServerSpy.mock.calls[0][0];
+      expect(passedOpts.quotaClientHealth?.()).toEqual({ quota_client_service_connected: 0 });
+    } finally {
+      startDashboardServerSpy.mockRestore();
     }
   });
 
