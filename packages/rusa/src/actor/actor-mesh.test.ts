@@ -350,16 +350,13 @@ function setup(
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
         admitRun: ctx.admitRun,
-        onQueued: ctx.onQueued,
+        lifecycle: ctx.lifecycle,
         onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-        onRunAbandoned: ctx.onRunAbandoned,
-        // Mirrors the production onRunStart wiring in start.ts (#199): apply a
-        // pending model/provider/effort tuple before this run's own dispatch,
-        // the same way start.ts calls `mesh.applyPendingModel` there.
-        onRunStart: () => mesh.applyPendingModel(ctx.record.id),
-        onRunEnd: ctx.onRunEnd,
         onRuntimeStateChanged: ctx.onRuntimeStateChanged,
         debounceMs: DEBOUNCE,
+      });
+      ctx.lifecycle.add({
+        onStart: () => mesh.applyPendingModel(ctx.record.id),
       });
       return actor;
     },
@@ -372,6 +369,10 @@ function setup(
     return {};
   });
   const rootId = opts.rootId ?? "root";
+  const rootLifecycle = mesh.lifecycleFor(rootId);
+  rootLifecycle.add({
+    onStart: () => mesh.applyPendingModel(rootId),
+  });
   providers.set(rootId, rootProvider);
   root = new Actor({
     id: rootId,
@@ -382,12 +383,9 @@ function setup(
     loadSessionId: () => registry.get(rootId)?.sessionId,
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
-    onQueued: (context) => mesh.actorQueued(rootId, context),
     admitRun: ({ responsive, mode }) =>
       responsive || mode !== "ordinary" || !(opts.isVoiceSessionActive?.(rootId) ?? false),
-    onRunStart: () => mesh.applyPendingModel(rootId),
-    onRunEnd: () => mesh.finishInboxRun(rootId),
-    onRunAbandoned: () => mesh.abandonInboxRun(rootId),
+    lifecycle: rootLifecycle,
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
   });
@@ -746,7 +744,7 @@ describe("ActorMesh", () => {
           loadSessionId: () => undefined,
           saveSessionId: () => {},
           buildPrompt: () => ({ prompt: "Read inbox" }),
-          onRunEnd: () => {},
+          lifecycle: ctx.lifecycle,
         });
       },
     });
@@ -4135,8 +4133,7 @@ describe("ActorMesh", () => {
           buildPrompt: () => ({ prompt: "Work from your inbox." }),
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
-          onQueued: ctx.onQueued,
-          onRunEnd: ctx.onRunEnd,
+          lifecycle: ctx.lifecycle,
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           debounceMs: DEBOUNCE,
         });
@@ -4256,14 +4253,17 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "work" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
+            lifecycle: ctx.lifecycle,
             onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRunEnd: async (result) => {
-              completed.push(result.output);
-              ctx.onRunEnd(result);
-            },
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
+          });
+          ctx.lifecycle.add({
+            onEnd: (event) => {
+              if (event.terminal.kind === "result") {
+                completed.push(event.terminal.result.output);
+              }
+            },
           });
           return actor;
         },
@@ -4654,8 +4654,7 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "work" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
-            onRunEnd: (result) => ctx.onRunEnd(result),
+            lifecycle: ctx.lifecycle,
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
           });
@@ -4800,9 +4799,8 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "work" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
+            lifecycle: ctx.lifecycle,
             onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRunEnd: (result) => ctx.onRunEnd(result),
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
           });
@@ -4979,9 +4977,8 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "work" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
+            lifecycle: ctx.lifecycle,
             onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRunEnd: (result) => ctx.onRunEnd(result),
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
           });
@@ -5156,9 +5153,8 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "work" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
+            lifecycle: ctx.lifecycle,
             onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRunEnd: (result) => ctx.onRunEnd(result),
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
           });
@@ -7605,8 +7601,7 @@ describe("ActorMesh", () => {
             buildPrompt: () => ({ prompt: "prompt" }),
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
-            onRunEnd: ctx.onRunEnd,
+            lifecycle: ctx.lifecycle,
             debounceMs: DEBOUNCE,
           });
           return actor;
@@ -7696,14 +7691,15 @@ describe("ActorMesh", () => {
               return ctx.gate(fn, candidates, resp);
             },
             beforeRun: ctx.beforeRun,
-            onQueued: ctx.onQueued,
-            onRunEnd: async (res) => {
-              if (ctx.record.id === "t1") {
+            lifecycle: ctx.lifecycle,
+            debounceMs: DEBOUNCE,
+          });
+          ctx.lifecycle.add({
+            onEnd: (event) => {
+              if (ctx.record.id === "t1" && event.terminal.kind === "result") {
                 onRunEndCalled = true;
               }
-              await ctx.onRunEnd?.(res);
             },
-            debounceMs: DEBOUNCE,
           });
           return actor;
         },

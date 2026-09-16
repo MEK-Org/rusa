@@ -306,9 +306,8 @@ describe("remote actor run accounting", () => {
         executionTarget: "test-follower",
         record: { id: "actor-with-session" },
         getRecord: () => ({ id: "actor-with-session" }),
-        onRunEnd: () => {},
+        lifecycle: createActorLifecycle(),
         onRuntimeStateChanged: () => {},
-        onQueued: () => {},
       } as unknown as ActorFactoryContext,
       snapshot: () => ({
         record: {
@@ -332,6 +331,71 @@ describe("remote actor run accounting", () => {
     } finally {
       handleWithOptions.close();
       remote2.close();
+    }
+  });
+
+  it("preserves FIFO lifecycle emit ordering on ActorHandle even when onStart observer is async", async () => {
+    const events: string[] = [];
+    const orderedLifecycle = createActorLifecycle([
+      {
+        onQueued: async () => {
+          events.push("queued");
+        },
+        onStart: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          events.push("start");
+        },
+        onEnd: async () => {
+          events.push("end");
+        },
+      },
+    ]);
+
+    const orderedHandle = new ActorHandle({
+      host: remote.createHost("ordered-actor"),
+      bootstrap: { id: "ordered-actor", cwd: "/tmp/ordered" },
+      context: {
+        executionTarget: "test-follower",
+        record: { id: "ordered-actor" },
+        getRecord: () => ({ id: "ordered-actor" }),
+        lifecycle: orderedLifecycle,
+        onRuntimeStateChanged: () => {},
+      } as unknown as ActorFactoryContext,
+      snapshot: () => {
+        throw new Error("not needed");
+      },
+      saveSession: () => {},
+      onFailure: () => {},
+    });
+
+    try {
+      remote.receive({ actorId: "ordered-actor", message: { type: "ready", pid: 1234 } });
+      remote.receive({
+        actorId: "ordered-actor",
+        message: { type: "queued", responsive: false, mode: "ordinary" },
+      });
+      remote.receive({
+        actorId: "ordered-actor",
+        message: {
+          type: "runStart",
+          responsive: false,
+          selected: { provider: "codex", model: "gpt-5.5" },
+        },
+      });
+      remote.receive({
+        actorId: "ordered-actor",
+        message: {
+          type: "request",
+          requestId: 10,
+          request: { op: "complete", result: RESULT },
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(events).toEqual(["queued", "start", "end"]);
+    } finally {
+      orderedHandle.close();
     }
   });
 });

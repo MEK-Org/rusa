@@ -128,11 +128,9 @@ describe("createRunAccounting", () => {
   it("abandons an open run and reports none when there is nothing open", () => {
     const runId = "run-a";
     accounting.begin("actor-a", runId, CODEX_LAUNCH);
-    accounting.abandon("actor-a", runId, "coalesced");
+    expect(accounting.abandon("actor-a", runId, "coalesced")).toBe(runId);
     expect(runs.getById(runId)).toMatchObject({ outcome: "abandoned", abandonReason: "coalesced" });
-    expect(() => accounting.abandon("actor-a", runId, "coalesced")).toThrow(
-      /no active durable run/
-    );
+    expect(accounting.abandon("actor-a", runId, "coalesced")).toBeNull();
   });
 
   it("keeps each actor's run separate", () => {

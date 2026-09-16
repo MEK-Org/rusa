@@ -2026,6 +2026,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         },
       },
     ],
+    onLifecycleError: (failure) => {
+      runLogger(failure.actorId ?? "unknown", failure.runId).error("lifecycle_listener_error", {
+        event: failure.event,
+        error: failure.error instanceof Error ? failure.error.message : String(failure.error),
+      });
+    },
     onCapabilityGranted: refreshLiveActorMcp,
     // Make capability revocation take effect immediately: unmount the granted
     // endpoint so the actor's next write 404s, rather than waiting for it to be

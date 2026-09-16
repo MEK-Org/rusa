@@ -36,9 +36,11 @@ export interface ActorLifecycleErrorEvent extends ActorLifecycleRunEvent {
   error: unknown;
 }
 
+export type ActorLifecycleAbandonmentReason = "start-cancelled" | "coalesced" | "unreported";
+
 export type ActorLifecycleTerminal =
   | { kind: "result"; result: RunResult }
-  | { kind: "abandoned"; reason: string; started: boolean };
+  | { kind: "abandoned"; reason: ActorLifecycleAbandonmentReason; started: boolean };
 
 export interface ActorLifecycleEndEvent extends ActorLifecycleRunEvent {
   /** Every queued run has exactly one terminal event, including an abandonment. */
@@ -51,6 +53,8 @@ export interface ActorLifecycleListenerFailure {
   event: ActorLifecycleEventName;
   listener: ActorLifecycleListener;
   error: unknown;
+  actorId?: string;
+  runId?: string;
 }
 
 type ActorLifecycleEvent =
@@ -79,25 +83,65 @@ export class ActorLifecycle {
     this.listeners.push(listener);
   }
 
-  async emit<K extends ActorLifecycleEventName>(
+  emit<K extends ActorLifecycleEventName>(
     event: K,
     payload: Parameters<NonNullable<ActorLifecycleListener[K]>>[0]
-  ): Promise<void> {
-    for (const listener of this.listeners) {
+  ): void | Promise<void> {
+    for (let i = 0; i < this.listeners.length; i++) {
+      const listener = this.listeners[i];
+      if (!listener) continue;
       const handler = listener[event];
       if (!handler) continue;
       try {
-        await (handler as (value: ActorLifecycleEvent) => void | Promise<void>).call(
+        const result = (handler as (value: ActorLifecycleEvent) => void | Promise<void>).call(
           listener,
           payload as ActorLifecycleEvent
         );
-      } catch (error) {
-        try {
-          this.onListenerError({ event, listener, error });
-        } catch {
-          // Reporting must not turn a failed observer into an actor failure.
+        if (result && typeof (result as Promise<void>).then === "function") {
+          return (async () => {
+            try {
+              await result;
+            } catch (error) {
+              this.reportListenerError(event, listener, payload, error);
+            }
+            for (let j = i + 1; j < this.listeners.length; j++) {
+              const remainingListener = this.listeners[j];
+              if (!remainingListener) continue;
+              const remainingHandler = remainingListener[event];
+              if (!remainingHandler) continue;
+              try {
+                await (
+                  remainingHandler as (value: ActorLifecycleEvent) => void | Promise<void>
+                ).call(remainingListener, payload as ActorLifecycleEvent);
+              } catch (error) {
+                this.reportListenerError(event, remainingListener, payload, error);
+              }
+            }
+          })();
         }
+      } catch (error) {
+        this.reportListenerError(event, listener, payload, error);
       }
+    }
+  }
+
+  private reportListenerError(
+    event: ActorLifecycleEventName,
+    listener: ActorLifecycleListener,
+    payload: unknown,
+    error: unknown
+  ): void {
+    try {
+      const eventPayload = payload as Partial<ActorLifecycleRunEvent> | undefined;
+      this.onListenerError({
+        event,
+        listener,
+        error,
+        actorId: eventPayload?.actorId,
+        runId: eventPayload?.runId,
+      });
+    } catch {
+      // Reporting must not turn a failed observer into an actor failure.
     }
   }
 }

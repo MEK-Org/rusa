@@ -137,13 +137,19 @@ export function createActorRuntime(
       lifecycle: createActorLifecycle([
         {
           onQueued: (event) =>
-            send({ type: "queued", responsive: event.responsive, mode: event.mode }),
+            send({
+              type: "queued",
+              responsive: event.responsive,
+              mode: event.mode,
+              runId: event.runId,
+            }),
           onStart: (event) =>
             send({
               type: "runStart",
               responsive: event.responsive,
               injectRecord: event.injectRecord,
               selected: event.selected,
+              runId: event.runId,
             }),
           onError: (event) =>
             send({
@@ -155,7 +161,7 @@ export function createActorRuntime(
               send({
                 type: "abandoned",
                 abandon: {
-                  reason: event.terminal.reason as "start-cancelled" | "coalesced" | "unreported",
+                  reason: event.terminal.reason,
                   started: event.terminal.started,
                 },
               });

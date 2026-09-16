@@ -38,6 +38,7 @@ import {
 import {
   type ActorLifecycle,
   type ActorLifecycleListener,
+  type ActorLifecycleListenerFailure,
   createActorLifecycle,
 } from "./actor-lifecycle.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
@@ -467,21 +468,15 @@ export interface ActorFactoryContext {
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
   /** Final admission after provider pacing selects a run, before it launches. */
   admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean;
-  /** General lifecycle hook after the pre-run gate and before scheduler admission. */
-  onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
-  /** Post-run accounting (token usage) + completion-review hook. */
-  onRunEnd: (result: RunResult, runId?: string) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
   /**
    * Fires when a genuinely queued (not yet started) run is cancelled —
    * an operator HALT or an explicit interrupt — so the mesh can clear any
    * recorded {@link QueuedSelection} for this actor. Never fires once the
-   * run has actually started; `onRunEnd` is the clearing point for that case.
+   * run has actually started; onEnd is the clearing point for that case.
    */
   onQueuedRunCancelled?: () => void;
-  /** Closes mesh run-scoped state when a queued opportunity never starts. */
-  onRunAbandoned?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -597,6 +592,8 @@ export interface ActorMeshOptions {
    * is always registered first; host integrations follow this declared order.
    */
   lifecycleListeners?: readonly ActorLifecycleListener[];
+  /** Forward observer errors to host telemetry or structured logging. */
+  onLifecycleError?: (failure: ActorLifecycleListenerFailure) => void;
   /**
    * Called on every actor yield, for out-of-band handling the mesh doesn't own
    * (e.g. surfacing a git-bridge deliverable). `notifyingParent` is true only
@@ -809,6 +806,7 @@ export class ActorMesh {
   private readonly rootId?: string;
   private readonly onRetire?: (record: ActorRecord) => void;
   private readonly lifecycleListeners: readonly ActorLifecycleListener[];
+  private readonly onLifecycleError?: ActorMeshOptions["onLifecycleError"];
   private readonly onYield?: (
     actorId: string,
     ctx: { notifyingParent: boolean }
@@ -940,6 +938,7 @@ export class ActorMesh {
     this.handleForId = opts.handleForId ?? generateHandle;
     this.onRetire = opts.onRetire;
     this.lifecycleListeners = opts.lifecycleListeners ?? [];
+    this.onLifecycleError = opts.onLifecycleError;
     this.onYield = opts.onYield;
     this.recordRunYield = opts.recordRunYield;
     this.onSpawn = opts.onSpawn;
@@ -1112,6 +1111,7 @@ export class ActorMesh {
         this.log(
           `lifecycle ${failure.event} listener failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`
         );
+        this.onLifecycleError?.(failure);
       }
     );
     this.lifecycles.set(actorId, lifecycle);
@@ -4442,22 +4442,8 @@ export class ActorMesh {
       },
       admitRun: ({ responsive, mode }) =>
         responsive || mode !== "ordinary" || !this.isVoiceSessionActive(record.id),
-      onQueued: (context) => {
-        this.actorQueued(record.id, context);
-      },
-      onRunEnd: (result, runId) => {
-        this.finishInboxRun(record.id);
-        this.accountRun(record.id, result, runId);
-        // Safety net: the start/cancel hooks are the primary clearing
-        // points, but a selection must never survive past its run ending.
-        this.clearSelection(record.id);
-      },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
-      onRunAbandoned: () => {
-        this.abandonInboxRun(record.id);
-        this.clearSelection(record.id);
-      },
     };
   }
 

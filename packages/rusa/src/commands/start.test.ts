@@ -17,6 +17,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
+import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
@@ -69,7 +70,7 @@ async function endLifecycleRun(actor: Actor, runId: string, result: RunResult): 
 async function abandonLifecycleRun(
   actor: Actor,
   runId: string,
-  reason: string,
+  reason: ActorLifecycleAbandonmentReason,
   started: boolean
 ): Promise<void> {
   await actor.lifecycle.emit("onEnd", {

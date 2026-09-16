@@ -15,7 +15,11 @@ import type {
   RunResult,
   SandboxOptions,
 } from "../providers/types.js";
-import { type ActorLifecycle, createActorLifecycle } from "./actor-lifecycle.js";
+import {
+  type ActorLifecycle,
+  type ActorLifecycleAbandonmentReason,
+  createActorLifecycle,
+} from "./actor-lifecycle.js";
 import {
   RunStartCancelledError,
   type RunStartHandle,
@@ -38,9 +42,7 @@ const YIELD_ELICITATION_MAX = 1;
 /**
  * What {@link ActorOptions.buildPrompt} returns: the assembled prompt, plus —
  * for portable-context actors (design ISSUE_NUM) — the inject record describing the
- * mesh-portable context folded into this run's prompt. The Actor forwards that
- * record to {@link ActorOptions.onRunStart}, where admission-time prompt state
- * belongs.
+ * mesh-portable context folded into this run's prompt.
  */
 export interface PromptBuild {
   prompt: string;
@@ -145,33 +147,9 @@ export interface ActorOptions {
    */
   admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean | Promise<boolean>;
   /**
-   * General lifecycle notification after {@link beforeRun} passes and before the
-   * provider/concurrency scheduler. No work content or prompt state crosses it.
-   */
-  onQueued?: (context: { responsive: boolean; mode: ActorRunMode }) => void;
-  /**
    * Optional hook fired when a run is aborted due to a voice quick-start coalesce.
    */
   onCoalesceAborted?: (count: number, ageMs: number) => void;
-  /**
-   * Optional hook fired INSIDE {@link gate}, at the moment the provider invoke
-   * actually begins — the same point the watchdog timers start , so a run
-   * queued behind the concurrency cap never fires it.
-   *
-   * Paired with {@link onQueued} this separates a run that never started from
-   * one that started and went quiet: no start = it was still queued behind
-   * a start slot; started = the provider invoke was live, so silence
-   * after this point belongs to the provider rather than the mesh.
-   *
-   * It deliberately stops short of saying *why* a started run went quiet —
-   * telling "the provider never answered" apart from a genuine mid-run stall
-   * needs a first-chunk timestamp, which {@link onFirstChunk} carries.
-   */
-  onRunStart?: (
-    responsive: boolean,
-    injectRecord: InjectRecord | undefined,
-    selected: RawProviderModelConfig
-  ) => void;
   /**
    * Called immediately before each provider attempt with the instance that will
    * run. Unlike onRunStart, this includes fallbacks without changing run
@@ -181,41 +159,9 @@ export interface ActorOptions {
   onProviderAttempt?: (provider: CodingProvider) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
-   * the moment it starts answering, as distinct from the moment we asked .
-   *
-   * This is the third timestamp that makes a quiet run classifiable instead of
-   * guessable. With {@link onQueued} and {@link onRunStart}: queued but never
-   * started = it was waiting to start; started but no first chunk ever
-   * = the provider never answered; first chunk then silence = a genuine mid-run
-   * stall. Only the last of those is what "stall" means, and before this hook we
-   * had no way to tell the three apart — every watchdog kill on record is the
-   * middle case, which is a provider that hadn't answered yet.
-   *
-   * Fires on the FIRST chunk only, so its cost is one boolean per run rather
-   * than per chunk. A run killed before the provider answers never fires it, and
-   * that absence is the signal — do not synthesize one on the kill path.
+   * the moment it starts answering, as distinct from the moment we asked.
    */
   onFirstChunk?: () => void;
-  /** Optional post-run hook (completion review, token accounting, firehose tap). */
-  onRunEnd?: (result: RunResult) => void | Promise<void>;
-  /**
-   * The other terminal hook: the run opportunity ended WITHOUT reporting a
-   * result, so {@link onRunEnd} never fired. `reason` says which path took it.
-   *
-   * Every {@link onQueued} is followed by exactly one of the two, because this
-   * one fires from the same `finally` that clears `queued`/`executing` rather
-   * than from each early-return site. That is the whole point of it: the two
-   * paths that terminate without a result (a cancelled queued start and a
-   * coalesce-abort) each returned early, and anything downstream that opened
-   * state on `onQueued` and closed it on `onRunEnd` leaked once per occurrence
-   * . A new early return inherits this hook by construction instead of
-   * having to remember to fire it.
-   *
-   * An abandoned run carries no result: it produced no output, no exit code and
-   * no outcome to judge, so this hook takes none. Handing it a synthesized
-   * failure result would put a run that never ran into failure accounting.
-   */
-  onRunAbandoned?: (abandon: RunAbandon) => void;
   /** Publish the actor's derived runtime state after each real flag mutation cluster. */
   onRuntimeStateChanged?: (state: "queued" | "running" | "winding_down" | "idle") => void;
   /**
@@ -223,7 +169,7 @@ export interface ActorOptions {
    * cancelled — from {@link cancelQueuedRun} or a successful cancel inside
    * {@link preemptForResponsive} — so a caller tracking queued-selection
    * state (which lane a queued run reserved) can clear it. Never fires once
-   * the run has started; {@link onRunEnd}/{@link onRunAbandoned} cover that.
+   * the run has started; onEnd covers that.
    */
   onQueuedRunCancelled?: () => void;
 }
@@ -232,33 +178,13 @@ export interface ActorOptions {
 export interface RunAbandon {
   reason: RunAbandonReason;
   /**
-   * Whether {@link ActorOptions.onRunStart} already fired for this run.
-   *
-   * There are TWO nested brackets around a run and they do not close together.
-   * The outer one — opened by {@link ActorOptions.onQueued} — is always closed by
-   * a terminal hook. The inner one is opened by `onRunStart`, which fires INSIDE
-   * the gate at the provider invoke, so a run cancelled while still queued behind
-   * the concurrency cap never opens it at all.
-   *
-   * A reader that tracks started-but-unfinished runs therefore cannot treat every
-   * abandonment as closing a start: counting a start-cancelled abandonment against
-   * an unrelated live run reports the actor idle while it is mid-run. It also
-   * cannot infer this from {@link reason}, because `unreported` is by definition
-   * a path nobody has classified. So the actor — which is the only party that
-   * knows — states it.
+   * Whether the inner start bracket already opened for this run.
    */
   started: boolean;
 }
 
-/**
- * Why a run opportunity ended without a result.
- *
- * `unreported` is the catch-all, and it is deliberately reachable: it is what a
- * terminal path nobody has classified yet reports. Accounting stays correct
- * whatever produced it, and the unfamiliar reason in the event log is the signal
- * to come back and name it.
- */
-export type RunAbandonReason = "start-cancelled" | "coalesced" | "unreported";
+/** Why a run opportunity ended without a result. */
+export type RunAbandonReason = ActorLifecycleAbandonmentReason;
 
 /**
  * Compose the failure report for a fallback that ran but failed for a reason
@@ -691,20 +617,12 @@ export class Actor {
     this.queued = true;
     this.publishRuntimeStateIfChanged();
     try {
-      try {
-        await this.lifecycle.emit("onQueued", {
-          actorId: this.id,
-          runId,
-          responsive: isResponsiveNudge(nudge),
-          mode: nudge.mode ?? "ordinary",
-        });
-        this.opts.onQueued?.({
-          responsive: isResponsiveNudge(nudge),
-          mode: nudge.mode ?? "ordinary",
-        });
-      } catch (err) {
-        this.opts.log?.(`onQueued failed: ${err instanceof Error ? err.message : String(err)}\n`);
-      }
+      await this.lifecycle.emit("onQueued", {
+        actorId: this.id,
+        runId,
+        responsive: isResponsiveNudge(nudge),
+        mode: nudge.mode ?? "ordinary",
+      });
       await this.executeTurn(nudge);
     } finally {
       if (this.opts.sandbox) {
@@ -750,15 +668,6 @@ export class Actor {
       runId,
       terminal: { kind: "abandoned", reason, started: this.runStartReported },
     });
-    try {
-      this.opts.onRunAbandoned?.({ reason, started: this.runStartReported });
-    } catch (err) {
-      // Swallowing here matches onQueued: an observability sink must not be able
-      // to break the run loop from inside a `finally`.
-      this.opts.log?.(
-        `onRunAbandoned failed: ${err instanceof Error ? err.message : String(err)}\n`
-      );
-    }
   }
 
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
@@ -918,7 +827,6 @@ export class Actor {
         injectRecord: built.injectRecord,
         selected,
       });
-      this.opts.onRunStart?.(responsive, built.injectRecord, selected);
       // AFTER the hook, not before: this flag means "a start was announced", so a
       // hook that threw before announcing must not leave a bracket a reader will
       // wait forever to see closed. (The mirror of `runEndReported`, which is set
@@ -1082,7 +990,6 @@ export class Actor {
       runId,
       terminal: { kind: "result", result },
     });
-    await this.opts.onRunEnd?.(result);
   }
 
   /**

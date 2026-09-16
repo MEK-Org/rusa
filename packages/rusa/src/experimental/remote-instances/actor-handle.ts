@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { ActorOptions } from "../../actor/actor.js";
+import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
-import type { RunNudge } from "../../actor/trigger-runner.js";
+import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
@@ -45,6 +46,8 @@ export class ActorHandle implements MeshActor {
   /** Identity minted by the leader-side execution coordinator before admission. */
   private queuedRunId: string | undefined;
   private startedRunId: string | undefined;
+  private queuedMode: ActorRunMode | undefined;
+  private receiveChain: Promise<void> | undefined;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -77,8 +80,9 @@ export class ActorHandle implements MeshActor {
       if (message.type === "ready") {
         clearTimeout(this.startupTimer);
         resolveReady(message.pid);
+        return;
       }
-      void this.receive(message).catch((error) => this.fail(error));
+      this.enqueueReceive(message);
     });
     channel.on("error", (error) => {
       rejectReady(error);
@@ -166,6 +170,31 @@ export class ActorHandle implements MeshActor {
     this.gates.clear();
   }
 
+  private enqueueReceive(message: ActorEvent): void {
+    const run = () => {
+      try {
+        const res = this.receive(message);
+        if (res && typeof (res as Promise<void>).then === "function") {
+          return (res as Promise<void>).catch((error) => this.fail(error));
+        }
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    if (!this.receiveChain) {
+      const res = run();
+      if (res) {
+        this.receiveChain = res.finally(() => {
+          if (this.receiveChain === res) {
+            this.receiveChain = undefined;
+          }
+        });
+      }
+    } else {
+      this.receiveChain = this.receiveChain.then(run);
+    }
+  }
+
   private fail(error: Error): void {
     if (this.closed) return;
     this.close();
@@ -173,10 +202,17 @@ export class ActorHandle implements MeshActor {
     // A connection or startup failure is not itself a run outcome. Only a run
     // the leader actually admitted is terminated here, so an idle disconnect or
     // a boot timeout books nothing.
-    if (this.runOpen) {
-      void this.endRun({ success: false, output: error.message, exitCode: -1 });
-    } else if (this.queuedRunId) {
-      void this.endQueuedRun("start-cancelled", false);
+    const terminate = () => {
+      if (this.runOpen) {
+        void this.endRun({ success: false, output: error.message, exitCode: -1 });
+      } else if (this.queuedRunId) {
+        void this.endQueuedRun("start-cancelled", false);
+      }
+    };
+    if (this.receiveChain) {
+      this.receiveChain = this.receiveChain.then(terminate).catch(() => {});
+    } else {
+      terminate();
     }
   }
 
@@ -190,7 +226,7 @@ export class ActorHandle implements MeshActor {
    * not the trigger, decides whether anything ends. The flag is cleared before
    * awaiting so a disconnect landing mid-completion finds nothing left to end.
    */
-  private async endRun(result: RunResult): Promise<void> {
+  private endRun(result: RunResult): void | Promise<void> {
     const runId = this.startedRunId;
     if (!this.runOpen || !runId) return;
     this.runOpen = false;
@@ -208,20 +244,23 @@ export class ActorHandle implements MeshActor {
       exitCode: result.exitCode,
       elapsedMs,
     });
-    await this.opts.context.lifecycle.emit("onEnd", {
+    return this.opts.context.lifecycle.emit("onEnd", {
       actorId: this.id,
       runId,
       terminal: { kind: "result", result },
     });
   }
 
-  private async endQueuedRun(reason: string, started: boolean): Promise<void> {
+  private endQueuedRun(
+    reason: ActorLifecycleAbandonmentReason,
+    started: boolean
+  ): void | Promise<void> {
     const runId = started ? this.startedRunId : this.queuedRunId;
     if (!runId) return;
     this.runOpen = false;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
-    await this.opts.context.lifecycle.emit("onEnd", {
+    return this.opts.context.lifecycle.emit("onEnd", {
       actorId: this.id,
       runId,
       terminal: { kind: "abandoned", reason, started },
@@ -235,7 +274,7 @@ export class ActorHandle implements MeshActor {
       });
   }
 
-  private async receive(message: ActorEvent): Promise<void> {
+  private receive(message: ActorEvent): void | Promise<void> {
     const ctx = this.opts.context;
     const hooks = this.opts.actorOptions;
     this.opts.onEvent?.(message);
@@ -252,21 +291,20 @@ export class ActorHandle implements MeshActor {
         this.opts.saveSession(message.sessionId);
         break;
       case "queued":
-        this.queuedRunId = randomUUID();
-        await ctx.lifecycle.emit("onQueued", {
+        this.queuedRunId = message.runId ?? randomUUID();
+        this.queuedMode = message.mode;
+        return ctx.lifecycle.emit("onQueued", {
           actorId: this.id,
           runId: this.queuedRunId,
           responsive: message.responsive,
           mode: message.mode,
         });
-        break;
       case "result":
-        await this.endRun(message.result);
-        break;
+        return this.endRun(message.result);
       case "error": {
         const runId = this.startedRunId ?? this.queuedRunId;
         if (runId) {
-          await ctx.lifecycle.emit("onError", {
+          return ctx.lifecycle.emit("onError", {
             actorId: this.id,
             runId,
             error: new Error(message.error),
@@ -278,35 +316,33 @@ export class ActorHandle implements MeshActor {
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
-        this.queuedRunId ??= randomUUID();
+        this.queuedRunId = message.runId ?? this.queuedRunId ?? randomUUID();
         this.startedRunId = this.queuedRunId;
         // Mark the terminal claim before awaiting observers. The first
         // lifecycle listener starts synchronously, so accounting is open; a
         // follower disconnect in an observer's await gap must still close it.
         this.runOpen = true;
-        await ctx.lifecycle.emit("onStart", {
-          actorId: this.id,
-          runId: this.startedRunId,
-          responsive: message.responsive,
-          mode: "ordinary",
-          injectRecord: message.injectRecord,
-          selected: message.selected,
-        });
         this.log.info("remote_run_start", {
           actorId: this.id,
           target: this.opts.target ?? this.channel.nodeId,
           responsive: message.responsive,
           selected: message.selected,
         });
-        break;
+        return ctx.lifecycle.emit("onStart", {
+          actorId: this.id,
+          runId: this.startedRunId,
+          responsive: message.responsive,
+          mode: this.queuedMode ?? "ordinary",
+          injectRecord: message.injectRecord,
+          selected: message.selected,
+        });
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;
       case "abandoned":
         // An abandoned run is already terminal on the leader side; it has no
         // run end left to record.
-        await this.endQueuedRun(message.abandon.reason, message.abandon.started);
-        break;
+        return this.endQueuedRun(message.abandon.reason, message.abandon.started);
       case "continue":
         hooks?.onContinue?.(message.count);
         break;
@@ -328,28 +364,52 @@ export class ActorHandle implements MeshActor {
         try {
           if (this.closed) throw new Error("Actor is closed");
           switch (request.op) {
-            case "beforeRun":
+            case "beforeRun": {
+              const beforeRunResult = hooks?.beforeRun?.(request) ?? ctx.beforeRun(request);
+              if (
+                beforeRunResult &&
+                typeof (beforeRunResult as Promise<boolean>).then === "function"
+              ) {
+                return (beforeRunResult as Promise<boolean>).then((allowed) => {
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    value: {
+                      allowed,
+                      sessionId: hooks?.loadSessionId() ?? ctx.getRecord()?.sessionId,
+                    },
+                  });
+                });
+              }
               this.send({
                 type: "reply",
                 requestId,
                 value: {
-                  allowed: await (hooks?.beforeRun?.(request) ?? ctx.beforeRun(request)),
+                  allowed: beforeRunResult,
                   sessionId: hooks?.loadSessionId() ?? ctx.getRecord()?.sessionId,
                 },
               });
               break;
+            }
             case "prepareMount":
-              this.send({
-                type: "reply",
-                requestId,
-                value: await hooks?.prepareUnderstandingMount?.(),
-              });
-              break;
-            case "complete":
+              return (async () => {
+                this.send({
+                  type: "reply",
+                  requestId,
+                  value: await hooks?.prepareUnderstandingMount?.(),
+                });
+              })();
+            case "complete": {
               this.opts.onEvent?.({ type: "result", result: request.result });
-              await this.endRun(request.result);
+              const endResult = this.endRun(request.result);
+              if (endResult && typeof (endResult as Promise<void>).then === "function") {
+                return (endResult as Promise<void>).then(() => {
+                  this.send({ type: "reply", requestId });
+                });
+              }
               this.send({ type: "reply", requestId });
               break;
+            }
             case "sendMessage":
               // Bind sender identity here; the remote actor cannot choose a different actor.
               this.send({
@@ -359,58 +419,59 @@ export class ActorHandle implements MeshActor {
               });
               break;
             case "admit": {
-              // A remote actor's provider gate lives here, not inside the
-              // follower. Recheck host authority immediately before reserving
-              // capacity so ordinary work queued before voice opens cannot
-              // cross the boundary after it changes.
-              if (
-                !(await (ctx.admitRun?.({
-                  responsive: request.responsive,
-                  mode: request.mode,
-                }) ?? true))
-              ) {
-                this.send({ type: "reply", requestId, value: { deferred: true } });
-                break;
-              }
-              let release!: () => void;
-              const finished = new Promise<void>((resolve) => {
-                release = resolve;
-              });
-              const handle = ctx.gate(
-                async (selected) => {
-                  // Provider pacing can delay this callback after the first
-                  // preflight above. Recheck the live host authority at the
-                  // actual admission boundary before exposing a snapshot to
-                  // the follower, so no ordinary provider launch can cross a
-                  // newly opened voice session.
-                  if (
-                    !(await (ctx.admitRun?.({
-                      responsive: request.responsive,
-                      mode: request.mode,
-                    }) ?? true))
-                  ) {
-                    this.send({ type: "reply", requestId, value: { deferred: true } });
-                    return;
-                  }
-                  if (this.closed) throw new Error("Actor closed before admission");
-                  // Selection is decided here and carried to the follower, so the
-                  // remote run uses the candidate the leader actually reserved.
-                  this.send({
-                    type: "reply",
-                    requestId,
-                    value: { ...this.opts.snapshot(), selected },
-                  });
-                  await finished;
-                },
-                request.candidates,
-                request.responsive
-              );
-              this.gates.set(requestId, { handle, release });
-              void handle.result.catch((error: Error) => {
-                this.gates.delete(requestId);
-                this.send({ type: "reply", requestId, error: error.message });
-              });
-              break;
+              return (async () => {
+                // A remote actor's provider gate lives here, not inside the
+                // follower. Recheck host authority immediately before reserving
+                // capacity so ordinary work queued before voice opens cannot
+                // cross the boundary after it changes.
+                if (
+                  !(await (ctx.admitRun?.({
+                    responsive: request.responsive,
+                    mode: request.mode,
+                  }) ?? true))
+                ) {
+                  this.send({ type: "reply", requestId, value: { deferred: true } });
+                  return;
+                }
+                let release!: () => void;
+                const finished = new Promise<void>((resolve) => {
+                  release = resolve;
+                });
+                const handle = ctx.gate(
+                  async (selected) => {
+                    // Provider pacing can delay this callback after the first
+                    // preflight above. Recheck the live host authority at the
+                    // actual admission boundary before exposing a snapshot to
+                    // the follower, so no ordinary provider launch can cross a
+                    // newly opened voice session.
+                    if (
+                      !(await (ctx.admitRun?.({
+                        responsive: request.responsive,
+                        mode: request.mode,
+                      }) ?? true))
+                    ) {
+                      this.send({ type: "reply", requestId, value: { deferred: true } });
+                      return;
+                    }
+                    if (this.closed) throw new Error("Actor closed before admission");
+                    // Selection is decided here and carried to the follower, so the
+                    // remote run uses the candidate the leader actually reserved.
+                    this.send({
+                      type: "reply",
+                      requestId,
+                      value: { ...this.opts.snapshot(), selected },
+                    });
+                    await finished;
+                  },
+                  request.candidates,
+                  request.responsive
+                );
+                this.gates.set(requestId, { handle, release });
+                void handle.result.catch((error: Error) => {
+                  this.gates.delete(requestId);
+                  this.send({ type: "reply", requestId, error: error.message });
+                });
+              })();
             }
           }
         } catch (error) {

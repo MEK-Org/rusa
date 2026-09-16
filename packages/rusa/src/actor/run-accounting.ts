@@ -34,8 +34,8 @@ export interface RunAccounting {
   begin(actorId: string, runId: string, modelConfig: ActorRunModelConfig): void;
   /** Close this actor's named open run. Throws if it is not the active run. */
   complete(actorId: string, runId: string, result: RunResult): void;
-  /** Close this actor's named open run as abandoned. */
-  abandon(actorId: string, runId: string, reason: string): void;
+  /** Close this actor's named open run as abandoned, or report there was none. */
+  abandon(actorId: string, runId: string, reason: string): string | null;
   /** The run this actor currently has open, if any. */
   activeRunId(actorId: string): string | undefined;
 }
@@ -75,9 +75,14 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
     },
     complete,
     abandon: (actorId, runId, reason) => {
-      assertActive(actorId, runId);
+      const activeRunId = activeRunIds.get(actorId);
+      if (!activeRunId) return null;
+      if (activeRunId !== runId) {
+        throw new Error(`actor ${actorId} has active durable run ${activeRunId}, not ${runId}`);
+      }
       runs().abandon(runId, reason);
       activeRunIds.delete(actorId);
+      return runId;
     },
     activeRunId: (actorId) => activeRunIds.get(actorId),
   };

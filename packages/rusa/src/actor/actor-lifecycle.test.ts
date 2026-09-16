@@ -268,4 +268,62 @@ describe("actor lifecycle contract", () => {
     expect(observed.map(({ event }) => event)).toEqual(["queued", "end"]);
     expect(new Set(observed.map(({ runId }) => runId))).toHaveLength(1);
   });
+
+  it("executes mesh internal listeners before external host listeners on onEnd", async () => {
+    const sequence: string[] = [];
+    const mesh = new ActorMesh({
+      actors: new InMemoryActorRepository(),
+      createActor: (context): MeshActor => ({
+        id: context.record.id,
+        lifecycle: context.lifecycle,
+        requestRun: () => {},
+        declareYield: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        preemptForResponsive: () => ({ preempted: false }),
+        isRunning: false,
+      }),
+    });
+
+    const actorId = "worker-1";
+    const lifecycle = mesh.lifecycleFor(actorId);
+
+    const origFinish = mesh.finishInboxRun.bind(mesh);
+    const origAccount = mesh.accountRun.bind(mesh);
+    const origClear = mesh.clearSelection.bind(mesh);
+    vi.spyOn(mesh, "finishInboxRun").mockImplementation((id) => {
+      sequence.push("mesh:finishInboxRun");
+      return origFinish(id);
+    });
+    vi.spyOn(mesh, "accountRun").mockImplementation((id, result, runId) => {
+      sequence.push("mesh:accountRun");
+      return origAccount(id, result, runId);
+    });
+    vi.spyOn(mesh, "clearSelection").mockImplementation((id) => {
+      sequence.push("mesh:clearSelection");
+      return origClear(id);
+    });
+
+    lifecycle.add({
+      onEnd: () => {
+        sequence.push("host:runAccounting.complete");
+      },
+    });
+
+    await lifecycle.emit("onEnd", {
+      actorId,
+      runId: "run-123",
+      terminal: {
+        kind: "result",
+        result: { success: true, output: "done", exitCode: 0 },
+      },
+    });
+
+    expect(sequence).toEqual([
+      "mesh:finishInboxRun",
+      "mesh:accountRun",
+      "mesh:clearSelection",
+      "host:runAccounting.complete",
+    ]);
+  });
 });
