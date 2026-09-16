@@ -253,6 +253,7 @@ class WalkiePanel extends StatelessWidget {
       entries: entries,
       nowPlaying: nowPlaying,
       constrained: constrained,
+      onReplyTap: controller.replayAnnouncement,
     );
   }
 
@@ -260,7 +261,6 @@ class WalkiePanel extends StatelessWidget {
     RecordStatus record,
     VoiceAnnouncement? nowPlaying,
   ) {
-    final lastPlayed = controller.lastPlayed.valueOrNull;
     final isRecording =
         record.phase == RecordPhase.recording ||
         record.phase == RecordPhase.starting;
@@ -283,7 +283,7 @@ class WalkiePanel extends StatelessWidget {
                 key: const ValueKey('walkie-replay'),
                 icon: Icons.replay,
                 label: 'Replay',
-                enabled: lastPlayed != null,
+                enabled: controller.hasReceivedReply,
                 onTap: controller.replayLast,
               ),
             _RecordButton(record: record, onTap: controller.toggleRecord),
@@ -372,11 +372,13 @@ class _WalkieTranscriptView extends StatefulWidget {
     required this.entries,
     required this.nowPlaying,
     required this.constrained,
+    required this.onReplyTap,
   });
 
   final List<WalkieEntry> entries;
   final VoiceAnnouncement? nowPlaying;
   final bool constrained;
+  final void Function(VoiceAnnouncement announcement) onReplyTap;
 
   @override
   State<_WalkieTranscriptView> createState() => _WalkieTranscriptViewState();
@@ -388,8 +390,8 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
   @override
   void didUpdateWidget(_WalkieTranscriptView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final oldCount = oldWidget.entries.length + (oldWidget.nowPlaying != null ? 1 : 0);
-    final newCount = widget.entries.length + (widget.nowPlaying != null ? 1 : 0);
+    final oldCount = oldWidget.entries.length;
+    final newCount = widget.entries.length;
     if (newCount <= oldCount) return;
     // Capture "was at bottom" synchronously, while _scroll.position still
     // reflects the pre-update extent (before the new entry is laid out).
@@ -410,9 +412,6 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
       }
     });
   }
-
-
-
   @override
   void dispose() {
     _scroll.dispose();
@@ -433,18 +432,8 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
       physics: constrained
           ? const NeverScrollableScrollPhysics()
           : const ClampingScrollPhysics(),
-      itemCount: entries.length + (nowPlaying != null ? 1 : 0),
+      itemCount: entries.length,
       itemBuilder: (context, index) {
-        if (nowPlaying != null && index == entries.length) {
-          return _WalkieTranscriptEntry(
-            label: 'NOW PLAYING',
-            labelColor: MeshColors.statusActive,
-            labelIcon: Icons.volume_up,
-            text: nowPlaying.text,
-            textColor: MeshColors.textPrimary,
-            isMemo: false,
-          );
-        }
         final entry = entries[index];
         return switch (entry) {
           UserMemoEntry e => _WalkieTranscriptEntry(
@@ -455,13 +444,26 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
             textColor: MeshColors.textPrimary,
             isMemo: true,
           ),
-          ActorReplyEntry e => _WalkieTranscriptEntry(
-            label: 'REPLY',
-            labelColor: MeshColors.textMuted,
-            labelIcon: Icons.history,
-            text: e.announcement.text,
-            textColor: MeshColors.textSecondary,
-            isMemo: false,
+          ActorReplyEntry e => InkWell(
+            key: ValueKey('walkie-reply-${e.announcement.id}'),
+            onTap: () => widget.onReplyTap(e.announcement),
+            borderRadius: BorderRadius.circular(8),
+            child: _WalkieTranscriptEntry(
+              label: nowPlaying?.id == e.announcement.id
+                  ? 'PLAYING / LOADING'
+                  : 'RECEIVED',
+              labelColor: nowPlaying?.id == e.announcement.id
+                  ? MeshColors.statusActive
+                  : MeshColors.textMuted,
+              labelIcon: nowPlaying?.id == e.announcement.id
+                  ? Icons.volume_up
+                  : Icons.history,
+              text: e.announcement.text,
+              textColor: nowPlaying?.id == e.announcement.id
+                  ? MeshColors.textPrimary
+                  : MeshColors.textSecondary,
+              isMemo: false,
+            ),
           ),
         };
       },

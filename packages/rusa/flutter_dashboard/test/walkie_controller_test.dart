@@ -315,6 +315,41 @@ void main() {
     });
 
     test(
+      'Replay targets received B after completed A when B is stalled mid-play',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('a')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+
+        // A completes, then B arrives and begins playback but never finishes.
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+        walkie.stream.framesCtrl.add(makeAnnouncement('b'));
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'b');
+
+        // Replay must restart the most recently received reply (B), rather
+        // than the most recently completed reply (A).
+        controller.replayLast();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/a',
+          '/api/mesh/voice/audio/b',
+          '/api/mesh/voice/audio/b',
+        ]);
+        expect(controller.nowPlaying.value?.id, 'b');
+        final replies = controller.transcript.value
+            .whereType<ActorReplyEntry>()
+            .map((entry) => entry.announcement.id)
+            .toList();
+        expect(replies, ['a', 'b']);
+      },
+    );
+
+    test(
       'a playback failure surfaces on lastError and the queue advances',
       () async {
         api.backlogPages = [
