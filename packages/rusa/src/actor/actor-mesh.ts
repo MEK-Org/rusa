@@ -1535,7 +1535,7 @@ export class ActorMesh {
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
     // run after. A tuple staged while idle/queued is applied earlier, at that
-    // run's own dispatch (see the `onRunStart` wiring), so this call is then a
+    // run's own dispatch through `beforeRun`, so this call is then a
     // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
   }
@@ -4104,13 +4104,12 @@ export class ActorMesh {
 
   /**
    * Apply the staged modelConfig replacement at whichever boundary the
-   * actor's current state puts it behind next: dispatch (queued/idle, called
-   * from the `onRunStart` wiring just before that run's `run_start` is
-   * recorded and its provider launches) or run end (mid-run, called from
-   * {@link finishInboxRun}).
-   * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
-   * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
-   * outside the `createActor` factory and must call this directly.
+   * actor's current state puts it behind next: dispatch (queued/idle, from
+   * `beforeRun` just before that run's `run_start` is recorded and its provider
+   * launches) or run end (mid-run, from {@link finishInboxRun}).
+   * Public — like {@link finishInboxRun} and {@link actorQueued} — because both
+   * factory-created workers and the externally-constructed root invoke it at
+   * their dispatch boundary.
    * A no-op when nothing is staged, so calling it from both boundaries on the
    * same run is safe: whichever fires first consumes the pending pool.
    */
