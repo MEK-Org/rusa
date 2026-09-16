@@ -24,6 +24,8 @@ import {
 } from "../providers/model-catalog.js";
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
+import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import type { QuotaFreshness } from "../quota/coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
 import {
   hasSameQuotaWindowScope,
@@ -135,6 +137,11 @@ export interface ProviderQuotaSnapshot {
    * snapshot is identical to the raw parser output.
    */
   explanations?: QuotaInferenceExplanation[];
+  /**
+   * Coordinator freshness block (§5.5, criterion 15) when served via the coordinator service.
+   * Cold coordinator answers status: "unknown" with freshness.
+   */
+  freshness?: QuotaFreshness;
 }
 
 export interface QuotaMcpDeps {
@@ -177,6 +184,11 @@ export interface QuotaMcpDeps {
     ): void;
     recordParseError(id: string, error: unknown): void;
   };
+  /**
+   * Quota coordinator client for reading quota status via GET /v1/quota without local probes
+   * (§12 item 4, #356). When configured, get_quota routes through the coordinator client.
+   */
+  coordinatorClient?: QuotaCoordinatorClient | null;
 }
 
 /**
@@ -1373,9 +1385,24 @@ export function createQuotaService(deps: QuotaMcpDeps): QuotaService {
  */
 export function createQuotaMcpServer(
   deps: QuotaMcpDeps,
-  service: QuotaService = createQuotaService(deps),
-  options?: { isFenced?: () => boolean }
+  service: QuotaService | QuotaCoordinatorClient = deps.coordinatorClient ??
+    createQuotaService(deps),
+  options?: { isFenced?: () => boolean; coordinatorClient?: QuotaCoordinatorClient | null }
 ): McpServer {
+  const coordinatorClient: QuotaCoordinatorClient | null =
+    options?.coordinatorClient ??
+    deps.coordinatorClient ??
+    (service && "getQuota" in service && "getLastAppliedInterval" in service
+      ? (service as QuotaCoordinatorClient)
+      : null);
+
+  const configuredProviders = new Set(
+    Object.entries(deps.config.providers).map(([name, provider]) => {
+      const command = provider.cliCommand ?? name;
+      return command === "antigravity" ? "agy" : command;
+    })
+  );
+
   const server = createMcpServer(
     { name: QUOTA_MCP_NAME, version: "0.1.0" },
     { isFenced: options?.isFenced }
@@ -1392,7 +1419,18 @@ export function createQuotaMcpServer(
     },
     async ({ provider }) => {
       try {
-        return toolOk(await service.getQuota(provider));
+        if (!configuredProviders.has(provider)) {
+          return toolOk({
+            provider,
+            status: "unsupported",
+            limits: [],
+            message: `${provider} is not configured on this instance`,
+          });
+        }
+        if (coordinatorClient) {
+          return toolOk(await coordinatorClient.getQuota(provider));
+        }
+        return toolOk(await (service as QuotaService).getQuota(provider));
       } catch (err) {
         return toolError(err);
       }

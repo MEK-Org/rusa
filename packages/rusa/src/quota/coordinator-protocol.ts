@@ -1,3 +1,4 @@
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import type { PersistedQuotaBucketStatus, PersistedQuotaProviderStatus } from "./shared-store.js";
 
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
@@ -257,4 +258,22 @@ export function validateProtocolMajor(
   if (service.protocolMajor !== expectedMajor) {
     throw new ProtocolMismatchError(service.protocolMajor, expectedMajor);
   }
+}
+
+export interface PublishedQuotaResponse extends ProviderQuotaSnapshot {
+  service: QuotaCoordinatorServiceInfo;
+  freshness?: QuotaFreshness;
+}
+
+export function isValidQuotaPayload(body: unknown, provider?: string): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const obj = body as { provider?: unknown; status?: unknown };
+  if (typeof obj.provider !== "string" || typeof obj.status !== "string") {
+    return false;
+  }
+  if (provider !== undefined && obj.provider !== provider) {
+    return false;
+  }
+  const validStatuses = ["available", "exhausted", "unknown", "unsupported"];
+  return validStatuses.includes(obj.status);
 }
