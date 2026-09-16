@@ -708,6 +708,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
+  it("adopts the external E2E root through the configured-root construction path", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: unknown;
+    let externalRoot: unknown;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          rootDriver: "external",
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root;
+            externalRoot = handles.externalRoot;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(externalRoot).not.toBeNull();
+    expect(root).toBe(externalRoot);
+    expect(mesh?.get("root")).toBe(externalRoot);
+  });
+
   it("tells and gates a root-enrolled worker across the live MCP boundary while an unenrolled control is untouched", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
