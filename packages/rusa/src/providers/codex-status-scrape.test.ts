@@ -257,6 +257,7 @@ describe("codex-status-scrape", () => {
     it("rejects when the underlying scrape process exits with a non-zero code", async () => {
       const mockChild = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
         pid: 12345,
       });
 
@@ -275,9 +276,42 @@ describe("codex-status-scrape", () => {
       ).rejects.toThrow("codex /status scrape failed with exit code 1");
     });
 
+    it("names the failing stage from the script's stderr on a non-zero exit", async () => {
+      // The coordinator only ever sees this message. Without the stderr tail a
+      // codex TUI that never launched and a panel that never parsed both read
+      // as "exit code 1", which is the failure mode #517's production evidence
+      // showed for hours on end.
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stderr.emit(
+            "data",
+            Buffer.from("ERROR: /status panel never rendered in Codex session\n")
+          );
+          mockChild.emit("close", 1);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      await expect(
+        scrapeCodexStatus({
+          actorDir: "/tmp/actor",
+          codexConfigDir: "/tmp/codex-config",
+        })
+      ).rejects.toThrow(
+        "codex /status scrape failed with exit code 1: ERROR: /status panel never rendered in Codex session"
+      );
+    });
+
     it("resolves stdout when the scrape process exits with 0", async () => {
       const mockChild = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
         pid: 12345,
       });
 
@@ -302,6 +336,7 @@ describe("codex-status-scrape", () => {
 
       const mockChild = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
         pid: 12345,
       });
 

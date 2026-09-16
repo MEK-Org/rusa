@@ -1551,6 +1551,381 @@ describe("quota MCP server", () => {
         },
       ]);
     });
+
+    describe("codex refresh-pending retry and reserve-only blocks (#517)", () => {
+      // The configured codex catalog for this pool. No Spark model is
+      // configured, so every Spark reserve row must disappear at the trust
+      // boundary rather than stand in for the provider's own weekly.
+      const codexCatalog = [
+        { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
+        { displayLabel: "gpt-5.5", identifier: "gpt-5.5" },
+      ];
+      const twoPanelCapture = () =>
+        readFileSync(join(__dirname, "fixtures", "codex-status-refresh-then-reserve.txt"), "utf-8");
+      const pendingOnlyCapture = () =>
+        readFileSync(join(__dirname, "fixtures", "codex-status-refresh-pending.txt"), "utf-8");
+      // The scrape instant of the captured production panel this fixture came from.
+      const scrapedAtMs = Date.parse("2026-09-16T11:20:19.523Z");
+      // codex prints wall-clock reset text with no timezone, so the panel's
+      // "08:49 on 19 Sep" resolves in the host's local zone — the same zone the
+      // prompt hands the model as "now".
+      const displayedWeeklyReset = new Date(2026, 8, 19, 8, 49, 0, 0).toISOString();
+
+      /** The completed panel as the model reads it: one provider weekly + a Spark reserve block. */
+      const reservePanelResponse = {
+        status: "available",
+        windows: [
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            usedPercent: 61,
+            resetText: "08:49 on 19 Sep",
+            placeholder: false,
+            scope: "provider",
+          },
+          {
+            label: "5h limit",
+            kind: "five_hour",
+            usedPercent: 0,
+            resetText: "16:20",
+            placeholder: false,
+            scope: "provider",
+            models: ["gpt-5.3-codex-spark"],
+          },
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            usedPercent: 0,
+            resetText: "11:20 on 23 Sep",
+            placeholder: false,
+            scope: "provider",
+            models: ["gpt-5.3-codex-spark"],
+          },
+        ],
+      };
+
+      it("parses the completed panel and never shows the refresh-pending panel to the model", async () => {
+        mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+
+        await parseCodexQuota(twoPanelCapture(), "test-key", scrapedAtMs, codexCatalog);
+
+        const { contents } = mockGenerateContent.mock.calls[0][0] as { contents: string };
+        // The capture holds codex's refresh-pending answer AND the completed
+        // panel it rendered after the in-session retry. Only the completed panel
+        // is a reading, so only the completed panel is parsed: leaving the
+        // pending text in the prompt invites a pending/real mix-up on the very
+        // panel that matters.
+        expect(contents).toContain("39% left (resets 08:49 on 19 Sep)");
+        expect(contents).toContain("GPT-5.3-Codex-Spark limit:");
+        expect(contents).not.toContain("refresh requested");
+        expect(contents).not.toContain("usage limit resets available");
+      });
+
+      it("resolves the displayed weekly reset deterministically instead of failing the trust gate", async () => {
+        mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+
+        const parsed = await parseCodexQuota(
+          twoPanelCapture(),
+          "test-key",
+          scrapedAtMs,
+          codexCatalog
+        );
+
+        // One attempt: the reset arithmetic is code's job, so the model has no
+        // wall-clock judgment left to hesitate over and no reason to escalate.
+        expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+        expect(parsed.status).toBe("available");
+        // The panel's printed date is reported as printed. A manual reset can
+        // make that displayed date an unverified effective reset, but the parser
+        // reports the display and never invents an override of its own.
+        expect(parsed.limits).toEqual([
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            percentLeft: 39,
+            resetAtIso: displayedWeeklyReset,
+            scope: { provider: "codex" },
+          },
+        ]);
+      });
+
+      it("yields the post-reset weekly reset ISO deterministically from the printed text", async () => {
+        // Production evidence (2026-09-16 19:14Z): after a manual weekly reset
+        // the completed panel read `Weekly limit: 98% left (resets 15:28 on 23
+        // Sep)` and both native scrapers resolved it only intermittently — the
+        // model sometimes declined the date arithmetic and left resetAtIso
+        // empty. With the printed text copied verbatim the reset is code's
+        // arithmetic, so the same panel yields the same instant every time: the
+        // date as displayed, with no override invented for the manual reset.
+        const postResetPanel = twoPanelCapture()
+          .replace("39% left (resets 08:49 on 19 Sep)", "98% left (resets 15:28 on 23 Sep)")
+          .replace("[████████░░░░░░░░░░░░]", "[████████████████████]");
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Weekly limit",
+                  kind: "weekly",
+                  usedPercent: 2,
+                  resetText: "15:28 on 23 Sep",
+                  placeholder: false,
+                  scope: "provider",
+                },
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 0,
+                  resetText: "16:20",
+                  placeholder: false,
+                  scope: "provider",
+                  models: ["gpt-5.3-codex-spark"],
+                },
+                {
+                  label: "Weekly limit",
+                  kind: "weekly",
+                  usedPercent: 0,
+                  resetText: "11:20 on 23 Sep",
+                  placeholder: false,
+                  scope: "provider",
+                  models: ["gpt-5.3-codex-spark"],
+                },
+              ],
+            }),
+        });
+
+        const scrapedAt19_14 = Date.parse("2026-09-16T19:14:00.000Z");
+        const first = await parseCodexQuota(
+          postResetPanel,
+          "test-key",
+          scrapedAt19_14,
+          codexCatalog
+        );
+        const second = await parseCodexQuota(
+          postResetPanel,
+          "test-key",
+          scrapedAt19_14,
+          codexCatalog
+        );
+
+        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+        const expected = [
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            percentLeft: 98,
+            resetAtIso: new Date(2026, 8, 23, 15, 28, 0, 0).toISOString(),
+            scope: { provider: "codex" },
+          },
+        ];
+        expect(first.status).toBe("available");
+        expect(first.limits).toEqual(expected);
+        expect(second.limits).toEqual(expected);
+      });
+
+      it("prefers an explicit reset ISO or duration over the printed reset text", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Weekly limit",
+                  kind: "weekly",
+                  usedPercent: 61,
+                  resetAtIso: "2026-09-19T08:49:00.000Z",
+                  resetText: "08:49 on 19 Sep",
+                  placeholder: false,
+                  scope: "provider",
+                },
+              ],
+            }),
+        });
+
+        const parsed = await parseCodexQuota(
+          twoPanelCapture(),
+          "test-key",
+          scrapedAtMs,
+          codexCatalog
+        );
+
+        expect(parsed.limits?.[0].resetAtIso).toBe("2026-09-19T08:49:00.000Z");
+      });
+
+      it("rejects a reserve block read as a second provider-wide window of the same kind", async () => {
+        // The failure mode this guards: the Spark heading's rows come back with
+        // no `models`, so the reserve weekly stands beside the provider's own
+        // weekly as if the account had two. Whichever one downstream picks, the
+        // provider reset is contaminated — so the parse fails and escalates
+        // rather than publishing an ambiguous panel.
+        mockGenerateContent
+          .mockResolvedValueOnce({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Weekly limit",
+                    kind: "weekly",
+                    usedPercent: 61,
+                    resetText: "08:49 on 19 Sep",
+                    placeholder: false,
+                    scope: "provider",
+                  },
+                  {
+                    label: "Weekly limit",
+                    kind: "weekly",
+                    usedPercent: 0,
+                    resetText: "11:20 on 23 Sep",
+                    placeholder: false,
+                    scope: "provider",
+                  },
+                ],
+              }),
+          })
+          .mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+
+        const parsed = await parseCodexQuota(
+          twoPanelCapture(),
+          "test-key",
+          scrapedAtMs,
+          codexCatalog
+        );
+
+        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+        expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+          "gemini-3.5-flash"
+        );
+        expect(parsed.limits).toEqual([
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            percentLeft: 39,
+            resetAtIso: displayedWeeklyReset,
+            scope: { provider: "codex" },
+          },
+        ]);
+      });
+
+      it("instructs the model to copy the printed reset text verbatim", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+
+        await parseCodexQuota(pendingOnlyCapture(), "test-key", scrapedAtMs, codexCatalog);
+
+        const systemInstruction = lastSystemInstruction();
+        expect(systemInstruction).toContain("RESET TEXT REQUIREMENT");
+        expect(systemInstruction).toContain("copy it VERBATIM into `resetText`");
+        const { config } = mockGenerateContent.mock.calls[0][0] as {
+          config: {
+            responseSchema: {
+              properties: { windows: { items: { required: string[] } } };
+            };
+          };
+        };
+        expect(config.responseSchema.properties.windows.items.required).toContain("resetText");
+      });
+
+      it("publishes the completed panel's provider weekly and drops the reserve block end to end", async () => {
+        const capture = twoPanelCapture();
+        const scrapeStore = {
+          recordRaw: vi.fn().mockReturnValue("scrape-1"),
+          recordParsed: vi.fn(),
+          recordParseError: vi.fn(),
+        };
+        mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+        const service = new QuotaService({
+          config: {
+            providers: { codex: { cliCommand: "codex" } },
+            geminiApiKey: "test-gemini-key",
+          } as unknown as RusaConfig,
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus: vi.fn().mockResolvedValue(capture),
+          modelCatalogFor: () => codexCatalog,
+          scrapeStore,
+          now: () => scrapedAtMs,
+          ttlMs: 0,
+        });
+
+        const state = await service.getQuota("codex");
+
+        expect(state).toMatchObject({
+          provider: "codex",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 39,
+              resetAtIso: displayedWeeklyReset,
+              scope: { provider: "codex" },
+            },
+          ],
+        });
+        // The durable row keeps the whole capture, pending panel included —
+        // panel selection is a parse-time decision, not an edit to the evidence.
+        expect(scrapeStore.recordRaw).toHaveBeenCalledWith({
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: capture,
+        });
+        const [, , inferred] = scrapeStore.recordParsed.mock.calls[0];
+        expect(inferred.limits).toHaveLength(1);
+      });
+
+      it("keeps the last good reading when the refresh never completes within the bounded retry", async () => {
+        const capture = pendingOnlyCapture();
+        const scrapeCodexStatus = vi.fn().mockResolvedValue(capture);
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+        const service = new QuotaService({
+          config: {
+            providers: { codex: { cliCommand: "codex" } },
+            geminiApiKey: "test-gemini-key",
+          } as unknown as RusaConfig,
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus,
+          modelCatalogFor: () => codexCatalog,
+          now: () => scrapedAtMs,
+          ttlMs: 0,
+        });
+        service.hydrate("codex", {
+          provider: "codex",
+          status: "available",
+          scrapedAt: "2026-09-16T10:47:36.825Z",
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 39,
+              resetAtIso: displayedWeeklyReset,
+              scope: { provider: "codex" },
+            },
+          ],
+        });
+
+        const state = await service.getQuota("codex");
+
+        // Exactly one scrape: the retry that matters already happened inside the
+        // codex session, and a second cold session would only re-render pending.
+        expect(scrapeCodexStatus).toHaveBeenCalledTimes(1);
+        // The pending panel IS shown to the model here — classifying it as a
+        // known no-data state is the whole point of parsing it.
+        expect((mockGenerateContent.mock.calls[0][0] as { contents: string }).contents).toContain(
+          "refresh requested"
+        );
+        expect(state).toMatchObject({
+          status: "available",
+          limits: [{ label: "Weekly limit", percentLeft: 39, resetAtIso: displayedWeeklyReset }],
+        });
+        expect(state.explanations).toEqual(
+          expect.arrayContaining([expect.objectContaining({ rule: "carried_forward_bad_read" })])
+        );
+      });
+    });
   });
 
   describe("parseAgyQuota (no geminiApiKey)", () => {
