@@ -22,11 +22,14 @@ export function createVoiceService(options: {
    * instance-wide configured default.
    */
   voiceNameFor?: (actorId: string) => string | undefined;
+  /** Recognize durable user principals as spoken-to humans (#460). */
+  isHumanRecipient?: (principalId: string) => boolean;
   onSessionEnded?: (actorId: string) => void;
   logger?: Logger;
 }): VoiceService {
   return new VoiceService({
     home: options.home,
+    isHumanRecipient: options.isHumanRecipient,
     speech: createGeminiSpeechClient({
       apiKey: options.apiKey,
       transcriptionModel: options.voice?.transcriptionModel,

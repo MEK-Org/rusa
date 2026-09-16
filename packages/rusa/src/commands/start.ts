@@ -81,10 +81,7 @@ import {
   quarantineCountsByClass,
   resolvePortableContextCompactorModel,
 } from "../actor/portable-context-compactor.js";
-import {
-  FilePortableContextStore,
-  type PortableContextStore,
-} from "../actor/portable-context-state.js";
+import type { PortableContextStore } from "../actor/portable-context-state.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
@@ -129,6 +126,7 @@ import {
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
+import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -180,7 +178,13 @@ import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
-import { DiskUsageAlert } from "../observability/disk-alert.js";
+import {
+  DiskUsageAlert,
+  type DiskUsageAlertDeps,
+  describeDiskAlertConfig,
+  diskAlertActive,
+  resolveDiskAlertConfig,
+} from "../observability/disk-alert.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -208,10 +212,24 @@ import {
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
-import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
+import {
+  applyThrottleStatusToPacer,
+  initialPacerIntervalSeconds,
+  QuotaCoordinatorClient,
+  reconcileProviderPacersFromClient,
+} from "../quota/coordinator-client.js";
+import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
+import {
+  HISTORY_WINDOW_MS,
+  type PublishedThrottleProviderStatus,
+} from "../quota/coordinator-protocol.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
-import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import {
+  type DurableEventDelivery,
+  EventManager,
+  HierarchicalEventSourceResolver,
+} from "../runtime/event-manager.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -369,7 +387,7 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
   return [...providers];
 }
 
-function configuredRootEventSources(config: RusaConfig): EventResource[] {
+export function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
 
   for (const entry of config.github.orgs ?? []) {
@@ -387,14 +405,63 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
     configured.push("gchat:spaces");
   }
 
-  // Disk alerts are a host-owned event source, so configuring the producer is
-  // also the subscription declaration. Keeping that derivation here avoids a
-  // second config knob that can drift from observability.diskAlert.
-  if (config.observability?.diskAlert !== undefined) {
+  // Disk alerts are a host-owned event source, so whatever runs the producer is
+  // also the subscription declaration. Both sides read `diskAlertActive`, so a
+  // running sensor always has a receiver: an absent `observability` block used
+  // to leave the sensor emitting into a source nobody covered, and every alert
+  // it raised was dropped at the routing boundary (#481).
+  if (diskAlertActive(config)) {
     configured.push("system:events");
   }
 
   return configured;
+}
+
+/**
+ * A running disk sensor with no covering root source — the shape that silently
+ * threw away four hours of low-disk warning before a host filled up. Both sides
+ * now derive from one predicate, so this reads false by construction; it stays
+ * as the boot-time alarm that says so out loud if they ever drift again (#481).
+ */
+export function diskAlertUncovered(
+  config: RusaConfig,
+  configuredRoots: readonly EventResource[]
+): boolean {
+  if (!diskAlertActive(config)) return false;
+  return !configuredRoots.some((configured) => isSubResourceOf("system:events", configured));
+}
+
+/** What happened to a host-level alarm once it left the sensor. */
+export type HostAlarmOutcome = "delivered" | "errorChat" | "dropped";
+
+/**
+ * Raise a host-level alarm through the mesh, falling back to a direct error-chat
+ * send when the delivery lands in nobody's inbox or when mesh delivery rejects.
+ * A full disk is precisely the condition under which mesh routing and persistence
+ * may already be degraded, so the alarm keeps the pre-mesh direct send as its
+ * floor rather than trusting routing (#481).
+ */
+export async function deliverHostAlarm(opts: {
+  deliver: () => Promise<DurableEventDelivery>;
+  message: string;
+  sendToErrorChat: ((text: string) => void) | null;
+  log?: Logger;
+}): Promise<HostAlarmOutcome> {
+  let delivery: DurableEventDelivery;
+  try {
+    delivery = await opts.deliver();
+  } catch (error) {
+    opts.log?.warn("disk_alert_delivery_failed", {
+      err: error,
+    });
+    if (!opts.sendToErrorChat) return "dropped";
+    opts.sendToErrorChat(opts.message);
+    return "errorChat";
+  }
+  if (delivery.entries.length > 0) return "delivered";
+  if (!opts.sendToErrorChat) return "dropped";
+  opts.sendToErrorChat(opts.message);
+  return "errorChat";
 }
 
 /** Legacy cap value retained for event detail; Actor now allows one corrective yield run. */
@@ -520,6 +587,8 @@ export interface RunStartE2EHooks {
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
+  /** Deterministic statfs/clock for the host disk sensor; production reads the real volume. */
+  diskAlertDeps?: DiskUsageAlertDeps;
   onReady?: (handles: RunStartE2EHandles) => void;
 }
 
@@ -821,7 +890,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       impact: "too short to remove from log text; only credential-named fields are redacted",
     });
   }
-  const portableContextStore = new FilePortableContextStore(join(mcHome, "portable-context"));
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();
   const compactorFor = (context: PortableContextConfig): PortableContextCompactor | null => {
@@ -933,9 +1001,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = runAccounting.begin;
-  const completeActorRun = runAccounting.complete;
-  const abandonActorRun = runAccounting.abandon;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -1172,13 +1237,29 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   }
-  const sharedQuotaStore = config.quota?.databasePath
-    ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
+  const coordinatorSocketPath = config.quota?.coordinator?.socketPath;
+  const maxIntervalSeconds = config.quota?.throttle?.maxIntervalSeconds ?? 3600;
+  const serviceBasename =
+    basename(mcHome) === ".rusa-staging" || basename(mcHome) === "rusa-staging"
+      ? "rusa-staging"
+      : "rusa";
+  const quotaProviders = configuredQuotaThrottleProviders(config);
+  const quotaCoordinatorClient = coordinatorSocketPath
+    ? new QuotaCoordinatorClient({
+        socketPath: coordinatorSocketPath,
+        configuredProviders: quotaProviders,
+        maxIntervalSeconds,
+        source: serviceBasename,
+        metrics: createQuotaMetrics(log),
+        logger: {
+          warn: (...args: unknown[]) =>
+            log.warn("quota_client_warning", { message: args.map(String).join(" ") }),
+          error: (...args: unknown[]) =>
+            log.error("quota_client_error", { message: args.map(String).join(" ") }),
+        },
+      })
     : null;
-  sharedQuotaStore?.configureController({
-    maxIntervalSeconds: config.quota?.throttle?.maxIntervalSeconds ?? 3600,
-  });
-  const quotaScrapesStore = sharedQuotaStore ?? getRepositories().quotaScrapes;
+  const quotaScrapesStore = getRepositories().quotaScrapes;
   // Shared across the `get_quota` MCP tool and the dashboard's `/api/quota`
   // endpoint  — one TTL cache, so neither surface probes independently.
   const quotaService = createQuotaService({
@@ -1204,10 +1285,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         meshEvents: getRepositories().meshEvents,
         rootHandle,
       }),
-    // One shared QuotaService instance : both actor-invoked `get_quota`
-    // calls and the dashboard's `/api/quota` endpoint below read the same TTL
-    // cache, so neither surface can double the probe rate.
-    [QUOTA_MCP_NAME]: () => createQuotaMcpServer({ config, workersDir }, quotaService),
+    // Route agent get_quota through the coordinator client when configured (§12 item 4, #356)
+    [QUOTA_MCP_NAME]: () =>
+      createQuotaMcpServer(
+        { config, workersDir, coordinatorClient: quotaCoordinatorClient },
+        quotaService
+      ),
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
   let gchat: GchatClient | null = null;
@@ -1327,15 +1410,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch {
     /* the flap check must never wedge startup */
   }
-  // Quota pacing is backed exclusively by the configured shared quota store.
+  // Quota pacing is backed by the coordinator client reading published intervals.
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
-  const quotaProviders = configuredQuotaThrottleProviders(config);
   const providerPacers = new Map<string, ProviderPacer>();
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
-      pacer = new ProviderPacer(0);
+      const initialInterval = initialPacerIntervalSeconds(
+        quotaThrottleEnabled,
+        quotaCoordinatorClient,
+        providerName,
+        maxIntervalSeconds
+      );
+      pacer = new ProviderPacer(initialInterval * 1000);
       providerPacers.set(providerName, pacer);
     }
     return pacer;
@@ -1345,9 +1433,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // absent or stale evidence is deliberately left for submitPoolGate's
   // declared-order fallback.
   const weeklyQuotaFor = (providerName: string) => {
-    const bucket = sharedQuotaStore
-      ?.getProviderThrottle(providerName)
-      ?.buckets.find((candidate) => candidate.key === `${providerName}:weekly`);
+    const published = quotaCoordinatorClient?.getLastPublishedStatus(providerName);
+    const bucket = published?.buckets.find(
+      (candidate) => candidate.key === `${providerName}:weekly`
+    );
     if (!bucket?.resetAtIso) return undefined;
     return {
       percentLeft: bucket.percentLeft,
@@ -1396,18 +1485,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   };
-  const applyPersistedQuotaThrottle = (providerName: QuotaThrottleProvider): boolean => {
-    if (!sharedQuotaStore) return false;
-    const persisted = sharedQuotaStore.getProviderThrottle(providerName);
-    if (!persisted) return false;
+  const applyCoordinatorThrottleStatus = (
+    providerName: QuotaThrottleProvider,
+    status: PublishedThrottleProviderStatus
+  ): void => {
+    const pacer = pacerFor(providerName);
+    applyThrottleStatusToPacer(pacer, status);
     recordQuotaThrottleTick(
       providerName,
       {
-        intervalSeconds: persisted.intervalSeconds,
-        uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
-        expired: persisted.expired,
-        capped: persisted.capped,
-        buckets: persisted.buckets.map((bucket) => ({
+        intervalSeconds: status.intervalSeconds,
+        uncappedIntervalSeconds: status.uncappedIntervalSeconds,
+        expired: status.expired,
+        capped: status.capped,
+        buckets: status.buckets.map((bucket) => ({
           key: bucket.key,
           percentLeft: bucket.percentLeft,
           timeRemainingPct: bucket.timeRemainingPct,
@@ -1415,46 +1506,66 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
       },
-      persisted.updatedAt,
-      persisted.exhaustedUntil
+      status.updatedAt,
+      status.exhaustedUntil
     );
-    return true;
   };
-  sharedQuotaStore?.setControllerUpdatedListener((providerName) => {
-    if (quotaThrottleEnabled && isQuotaThrottleProvider(providerName)) {
-      applyPersistedQuotaThrottle(providerName);
-    }
-  });
-  if (quotaThrottleEnabled && sharedQuotaStore) {
-    for (const providerName of quotaProviders) applyPersistedQuotaThrottle(providerName);
-  }
   const tickQuotaThrottle = async (): Promise<void> => {
-    if (!quotaThrottleEnabled || !sharedQuotaStore) return;
+    if (!quotaThrottleEnabled || !quotaCoordinatorClient) return;
     try {
-      await Promise.all(
-        quotaProviders.map(async (providerName) => {
-          try {
-            await quotaService.getQuota(providerName);
-            sharedQuotaStore.advancePendingController(
-              { maxIntervalSeconds: quotaThrottleConfig?.maxIntervalSeconds ?? 3600 },
-              providerName
-            );
-            applyPersistedQuotaThrottle(providerName);
-          } catch (err) {
-            // Keep the last persisted reasoned interval when a scrape fails.
-            // Do not turn one provider's probe failure into a mesh failure.
-            console.warn(
-              `[quota-throttle] provider=${providerName} tick failed: ${err instanceof Error ? err.message : String(err)}`
-            );
+      const response = await quotaCoordinatorClient.getThrottle();
+      if (response) {
+        if ("providers" in response && response.providers) {
+          for (const [providerKey, providerStatus] of Object.entries(response.providers)) {
+            if (isQuotaThrottleProvider(providerKey) && "intervalSeconds" in providerStatus) {
+              applyCoordinatorThrottleStatus(providerKey, providerStatus);
+            }
           }
-        })
-      );
-    } catch (outerErr) {
+        } else if (
+          "provider" in response &&
+          "intervalSeconds" in response &&
+          isQuotaThrottleProvider(response.provider)
+        ) {
+          applyCoordinatorThrottleStatus(response.provider, response);
+        }
+      }
+    } catch (err) {
       console.warn(
-        `[quota-throttle] tickQuotaThrottle failed: ${outerErr instanceof Error ? outerErr.message : String(outerErr)}`
+        `[quota-throttle] tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
       );
+    } finally {
+      reconcileProviderPacersFromClient(pacerFor, quotaProviders, quotaCoordinatorClient);
     }
   };
+
+  let historyRefreshInFlight = false;
+  const refreshQuotaHistory = async (): Promise<void> => {
+    if (!quotaCoordinatorClient || historyRefreshInFlight) return;
+    historyRefreshInFlight = true;
+    try {
+      const sinceIso = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
+      await Promise.allSettled(
+        quotaProviders.map((provider) => quotaCoordinatorClient.getHistory(provider, sinceIso))
+      );
+    } catch (err) {
+      log.warn("quota_history_refresh_failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      historyRefreshInFlight = false;
+    }
+  };
+
+  if (quotaThrottleEnabled && quotaCoordinatorClient) {
+    await tickQuotaThrottle();
+  }
+  // The dashboard's history panel and cold-snapshot fallback read the client's
+  // history cache (`listHistory` below, §12 item 4 / #356), so the cache is
+  // warmed whenever a coordinator is configured — independent of whether launch
+  // pacing (`quota.throttle.enabled`) is on.
+  if (quotaCoordinatorClient) {
+    void refreshQuotaHistory();
+  }
 
   // ── Capability grants  ──
   // Durable, actor-id-keyed grants of extra MCP capabilities beyond the default
@@ -1515,6 +1626,32 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
   }
   const hostJobStore = getRepositories().hostJobs;
+  // Portable-context snapshots are authoritative memory: the ledger item
+  // ids, statuses, priorities, generation counter and `lastFoldedSourceId` in
+  // one were minted by a model fold and cannot be rebuilt from the messages and
+  // run outputs they were folded from. Durable in SQLite; `portable-context/`
+  // is only a legacy source, imported once and then archived.
+  const legacyPortableContextImport = importLegacyPortableContextState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyPortableContextImport.importedSnapshots > 0) {
+    log.info("legacy_portable_context_imported", {
+      snapshots: legacyPortableContextImport.importedSnapshots,
+    });
+  } else if (legacyPortableContextImport.backupFiles.length > 0) {
+    // A source directory still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the snapshots they put back took effect. `warn`, not
+    // `info`: nothing is broken, but memory someone placed there did not become
+    // state, and the backup path is where to find it.
+    log.warn("legacy_portable_context_archived_unread", {
+      backups: legacyPortableContextImport.backupFiles,
+    });
+  }
+  const portableContextStore: PortableContextStore = getRepositories().portableContext;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
@@ -1796,6 +1933,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
     actors,
+    principals: getRepositories().principals,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
     // is wired. Unknown or disconnected targets fail closed.
@@ -2007,16 +2145,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       dir: antigravityScratchDir(),
       listActors: actorLiveness,
     }),
-    // Eagerly generate this actor's avatar on spawn . Strictly
-    // fire-and-forget and failure-isolated inside kickAvatarGeneration — a single
-    // attempt, no retries, never blocks or affects wake/run/retry. Root is
-    // adopted (not spawned), so it never reaches here; it uses the fixed image.
-    onSpawn: (record) =>
-      kickAvatarGeneration(record.id, {
-        apiKey: config.geminiApiKey ?? "",
-        rootId,
-        log: (m) => console.log(`[avatar] ${m}`),
-      }),
+    lifecycleListeners: [
+      {
+        // Eagerly generate an avatar on genuine spawn. Root is adopted, so it
+        // never reaches this listener and continues to use its fixed image.
+        onSpawn: ({ actorId }) =>
+          kickAvatarGeneration(actorId, {
+            apiKey: config.geminiApiKey ?? "",
+            rootId,
+            log: (m) => console.log(`[avatar] ${m}`),
+          }),
+        onRetire: ({ actorId }) => {
+          teardownActorMcp(actorId);
+        },
+      },
+    ],
+    onLifecycleError: (failure) => {
+      runLogger(failure.actorId ?? "unknown", failure.runId).error("lifecycle_listener_error", {
+        event: failure.event,
+        error: failure.error instanceof Error ? failure.error.message : String(failure.error),
+      });
+    },
     onCapabilityGranted: refreshLiveActorMcp,
     // Make capability revocation take effect immediately: unmount the granted
     // endpoint so the actor's next write 404s, rather than waiting for it to be
@@ -2032,9 +2181,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // removeServer closes active transports first (the fail-closed boundary),
       // then refresh the next-run config with any narrowed replacement URL.
       refreshLiveActorMcp(actorId);
-    },
-    onRetire: (record) => {
-      teardownActorMcp(record.id);
     },
     onModelSet: (actorId, newModelConfig) => {
       try {
@@ -2146,7 +2292,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+            resolveOwner: (raw) =>
+              resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
@@ -2206,7 +2353,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           )
         );
         const quotaUrl = mcpHttp.addServer(`${id}:${QUOTA_MCP_NAME}`, () =>
-          createQuotaMcpServer({ config, workersDir }, quotaService, { isFenced })
+          createQuotaMcpServer(
+            { config, workersDir, coordinatorClient: quotaCoordinatorClient },
+            quotaService,
+            { isFenced }
+          )
         );
 
         const perActorShared: McpServerSpec[] = [
@@ -2267,9 +2418,121 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        // Which declared candidate actually ran, for the failure-notice label —
-        // set on each onRunStart, read back on that same run's onRunEnd.
+        // Which declared candidate actually ran, for the failure-notice label.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        ctx.lifecycle.add({
+          onStart: (event) => {
+            lastSelected = event.selected;
+            mesh.clearSelection(id);
+            const launchConfig = projectActorRunLaunchConfig(event.selected);
+            runAccounting.begin(id, event.runId, launchConfig);
+          },
+          onEnd: (event) => {
+            if (event.terminal.kind === "abandoned") {
+              if (event.terminal.started) {
+                runAccounting.abandon(id, event.runId, event.terminal.reason);
+              }
+              return;
+            }
+            runAccounting.complete(id, event.runId, event.terminal.result);
+          },
+        });
+        ctx.lifecycle.add({
+          onQueued: (event) => {
+            mesh.recordEvent({
+              kind: "run_queued",
+              actorId: id,
+              detail: event.mode,
+            });
+          },
+          onStart: (event) => {
+            const launchConfig = projectActorRunLaunchConfig(event.selected);
+            runLogger(id, event.runId).info("run_start", {
+              provider: launchConfig.provider,
+              model: launchConfig.model,
+              effort: launchConfig.effort,
+              responsive: event.responsive,
+            });
+            mesh.recordEvent({
+              kind: "run_start",
+              actorId: id,
+              detail: event.injectRecord
+                ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
+                : undefined,
+              body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
+              payload: JSON.stringify({
+                provider: launchConfig.provider,
+                model: launchConfig.model,
+                effort: launchConfig.effort,
+                responsive: event.responsive,
+                runId: event.runId,
+              }),
+            });
+          },
+          onError: (event) => {
+            runLogger(id, event.runId).error("run_error", {
+              error: event.error instanceof Error ? event.error.message : String(event.error),
+            });
+          },
+          onEnd: async (event) => {
+            activeRunSelections.delete(id);
+            if (event.terminal.kind === "abandoned") {
+              runLogger(id, event.runId).warn("run_abandoned", {
+                reason: event.terminal.reason,
+                started: event.terminal.started,
+              });
+              mesh.recordEvent({
+                kind: "run_abandoned",
+                actorId: id,
+                detail: event.terminal.reason,
+                payload: JSON.stringify({
+                  started: event.terminal.started,
+                } satisfies RunAbandonedPayload),
+              });
+              return;
+            }
+            const { result } = event.terminal;
+            logRunEnd(runLogger(id, event.runId), result);
+            mesh.recordEvent({
+              kind: "run_end",
+              actorId: id,
+              success: result.success,
+              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+              body: result.output,
+              payload: runEndPayload({ ...result, runId: event.runId }),
+            });
+          },
+        });
+        ctx.lifecycle.add({
+          onEnd: async (event) => {
+            if (event.terminal.kind === "abandoned") return;
+            const { result } = event.terminal;
+            const compacted = await compactPortableActorAfterRun(id);
+            if (compacted) {
+              mesh.recordEvent({
+                kind: "portable_context_compacted",
+                actorId: id,
+                detail: describeCompaction(compacted),
+                body: JSON.stringify(compacted),
+              });
+            }
+            if (!result.success && !result.capped) {
+              await routeRunFailure(
+                failureSink,
+                id,
+                result,
+                formatProviderLabel(
+                  {
+                    providerName: lastSelected.provider,
+                    model: lastSelected.model,
+                    effort: lastSelected.effort,
+                  },
+                  result.model
+                )
+              );
+            }
+          },
+        });
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -2340,6 +2603,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
           admitRun: ctx.admitRun,
+          lifecycle: ctx.lifecycle,
           onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
@@ -2358,44 +2622,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
             routeContinuationCapped(failureSink, id, n);
           },
-          onQueued: (context) => {
-            ctx.onQueued(context);
-            mesh.recordEvent({
-              kind: "run_queued",
-              actorId: id,
-              detail: context.mode,
-            });
-          },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-          onRunStart: (responsive, injectRecord, selected) => {
-            lastSelected = selected;
-            // The run actually launched: the queued reservation this
-            // describes no longer exists to cancel or report on.
-            mesh.clearSelection(id);
-            const launchConfig = projectActorRunLaunchConfig(selected);
-            const runId = beginActorRun(id, launchConfig);
-            runLogger(id, runId).info("run_start", {
-              provider: launchConfig.provider,
-              model: launchConfig.model,
-              effort: launchConfig.effort,
-              responsive,
-            });
-            mesh.recordEvent({
-              kind: "run_start",
-              actorId: id,
-              detail: injectRecord
-                ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
-                : undefined,
-              body: injectRecord ? JSON.stringify(injectRecord) : undefined,
-              payload: JSON.stringify({
-                provider: launchConfig.provider,
-                model: launchConfig.model,
-                effort: launchConfig.effort,
-                responsive,
-                runId,
-              }),
-            });
-          },
           onProviderAttempt: (attempt) => {
             activeRunSelections.set(id, {
               provider: attempt.providerName,
@@ -2414,56 +2641,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               actorId: ctx.record.id,
               detail: `count=${count} age=${ageMs}ms`,
             });
-          },
-          onRunAbandoned: ({ reason, started }) => {
-            ctx.onRunAbandoned?.();
-            activeRunSelections.delete(id);
-            if (started) abandonActorRun(id, reason);
-            runLogger(id).warn("run_abandoned", { reason, started });
-            mesh.recordEvent({
-              kind: "run_abandoned",
-              actorId: id,
-              detail: reason,
-              payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-            });
-          },
-          onRunEnd: async (result) => {
-            activeRunSelections.delete(id);
-            const runId = completeActorRun(id, result);
-            logRunEnd(runLogger(id, runId), result);
-            mesh.recordEvent({
-              kind: "run_end",
-              actorId: id,
-              success: result.success,
-              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-              body: result.output,
-              payload: runEndPayload({ ...result, runId }),
-            });
-            ctx.onRunEnd(result, runId);
-            const compacted = await compactPortableActorAfterRun(id);
-            if (compacted) {
-              mesh.recordEvent({
-                kind: "portable_context_compacted",
-                actorId: id,
-                detail: describeCompaction(compacted),
-                body: JSON.stringify(compacted),
-              });
-            }
-            if (!result.success && !result.capped) {
-              await routeRunFailure(
-                failureSink,
-                id,
-                result,
-                formatProviderLabel(
-                  {
-                    providerName: lastSelected.provider,
-                    model: lastSelected.model,
-                    effort: lastSelected.effort,
-                  },
-                  result.model
-                )
-              );
-            }
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → dashboard SSE / `rusa logs --actor`
         };
@@ -2581,6 +2758,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
+    principals: getRepositories().principals,
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
@@ -2681,7 +2859,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canManage: () => true,
-      resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+      resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
     })
   );
@@ -2854,10 +3032,123 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mesh.actorRuntimeStateChanged(rootId, state)
         )
       : null;
-  // Which entry actually ran, for the failure-notice label — set on each
-  // onRunStart, read back on that same run's onRunEnd (mirrors the worker
-  // `lastSelected` pattern, since root's one entry can move too).
+  // Which entry actually ran, for the failure-notice label. Root's declared
+  // pool can move while idle, so this is captured at lifecycle start.
   let rootLastSelected: RawProviderModelConfig = rootBootModelConfig.modelConfig[0];
+  const rootLifecycle = mesh.lifecycleFor(rootId);
+  rootLifecycle.add({
+    onStart: (event) => {
+      rootLastSelected = event.selected;
+      mesh.clearSelection(rootId);
+      const launchConfig = projectActorRunLaunchConfig(event.selected);
+      runAccounting.begin(rootId, event.runId, launchConfig);
+    },
+    onEnd: (event) => {
+      if (event.terminal.kind === "abandoned") {
+        if (event.terminal.started) {
+          runAccounting.abandon(rootId, event.runId, event.terminal.reason);
+        }
+        return;
+      }
+      runAccounting.complete(rootId, event.runId, event.terminal.result);
+    },
+  });
+  rootLifecycle.add({
+    onQueued: (event) => {
+      mesh.recordEvent({
+        kind: "run_queued",
+        actorId: rootId,
+        detail: event.mode,
+      });
+    },
+    onStart: (event) => {
+      const launchConfig = projectActorRunLaunchConfig(event.selected);
+      runLogger(rootId, event.runId).info("run_start", {
+        provider: launchConfig.provider,
+        model: launchConfig.model,
+        effort: launchConfig.effort,
+        responsive: event.responsive,
+      });
+      mesh.recordEvent({
+        kind: "run_start",
+        actorId: rootId,
+        detail: event.injectRecord
+          ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
+          : undefined,
+        body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
+        payload: JSON.stringify({
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
+          responsive: event.responsive,
+          runId: event.runId,
+        }),
+      });
+    },
+    onError: (event) => {
+      runLogger(rootId, event.runId).error("run_error", {
+        error: event.error instanceof Error ? event.error.message : String(event.error),
+      });
+    },
+    onEnd: async (event) => {
+      activeRunSelections.delete(rootId);
+      if (event.terminal.kind === "abandoned") {
+        runLogger(rootId, event.runId).warn("run_abandoned", {
+          reason: event.terminal.reason,
+          started: event.terminal.started,
+        });
+        mesh.recordEvent({
+          kind: "run_abandoned",
+          actorId: rootId,
+          detail: event.terminal.reason,
+          payload: JSON.stringify({
+            started: event.terminal.started,
+          } satisfies RunAbandonedPayload),
+        });
+        return;
+      }
+      const { result } = event.terminal;
+      logRunEnd(runLogger(rootId, event.runId), result);
+      mesh.recordEvent({
+        kind: "run_end",
+        actorId: rootId,
+        success: result.success,
+        detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+        body: result.output,
+        payload: runEndPayload({ ...result, runId: event.runId }),
+      });
+    },
+  });
+  rootLifecycle.add({
+    onEnd: async (event) => {
+      if (event.terminal.kind === "abandoned") return;
+      const { result } = event.terminal;
+      const compacted = await compactPortableActorAfterRun(rootId);
+      if (compacted) {
+        mesh.recordEvent({
+          kind: "portable_context_compacted",
+          actorId: rootId,
+          detail: describeCompaction(compacted),
+          body: JSON.stringify(compacted),
+        });
+      }
+      if (!result.success && !result.capped) {
+        await routeRunFailure(
+          failureSink,
+          rootId,
+          result,
+          formatProviderLabel(
+            {
+              providerName: rootLastSelected.provider,
+              model: rootLastSelected.model,
+              effort: rootLastSelected.effort,
+            },
+            result.model
+          )
+        );
+      }
+    },
+  });
   let root: MeshActor;
   root =
     externalRoot ??
@@ -2897,6 +3188,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           injectRecord: injection?.injectRecord,
         };
       },
+      lifecycle: rootLifecycle,
       fallback: fallbackModels
         ? {
             models: fallbackModels,
@@ -2952,44 +3244,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
         routeContinuationCapped(failureSink, rootId, n);
       },
-      onQueued: (context) => {
-        mesh.actorQueued(rootId, context);
-        mesh.recordEvent({
-          kind: "run_queued",
-          actorId: rootId,
-          detail: context.mode,
-        });
-      },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onRunStart: (responsive, injectRecord, selected) => {
-        rootLastSelected = selected;
-        // The run actually launched: the queued reservation this describes
-        // no longer exists to cancel or report on.
-        mesh.clearSelection(rootId);
-        const launchConfig = projectActorRunLaunchConfig(selected);
-        const runId = beginActorRun(rootId, launchConfig);
-        runLogger(rootId, runId).info("run_start", {
-          provider: launchConfig.provider,
-          model: launchConfig.model,
-          effort: launchConfig.effort,
-          responsive,
-        });
-        mesh.recordEvent({
-          kind: "run_start",
-          actorId: rootId,
-          detail: injectRecord
-            ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
-            : undefined,
-          body: injectRecord ? JSON.stringify(injectRecord) : undefined,
-          payload: JSON.stringify({
-            provider: launchConfig.provider,
-            model: launchConfig.model,
-            effort: launchConfig.effort,
-            responsive,
-            runId,
-          }),
-        });
-      },
       onProviderAttempt: (attempt) => {
         activeRunSelections.set(rootId, {
           provider: attempt.providerName,
@@ -3008,57 +3263,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           actorId: rootId,
           detail: `count=${count} age=${ageMs}ms`,
         });
-      },
-      onRunAbandoned: ({ reason, started }) => {
-        mesh.abandonInboxRun(rootId);
-        activeRunSelections.delete(rootId);
-        if (started) abandonActorRun(rootId, reason);
-        runLogger(rootId).warn("run_abandoned", { reason, started });
-        mesh.recordEvent({
-          kind: "run_abandoned",
-          actorId: rootId,
-          detail: reason,
-          payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-        });
-      },
-      onRunEnd: async (result) => {
-        activeRunSelections.delete(rootId);
-        mesh.finishInboxRun(rootId);
-        const runId = completeActorRun(rootId, result);
-        mesh.accountRun(rootId, result, runId);
-        logRunEnd(runLogger(rootId, runId), result);
-        mesh.recordEvent({
-          kind: "run_end",
-          actorId: rootId,
-          success: result.success,
-          detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-          body: result.output,
-          payload: runEndPayload({ ...result, runId }),
-        });
-        const compacted = await compactPortableActorAfterRun(rootId);
-        if (compacted) {
-          mesh.recordEvent({
-            kind: "portable_context_compacted",
-            actorId: rootId,
-            detail: describeCompaction(compacted),
-            body: JSON.stringify(compacted),
-          });
-        }
-        if (!result.success && !result.capped) {
-          await routeRunFailure(
-            failureSink,
-            rootId,
-            result,
-            formatProviderLabel(
-              {
-                providerName: rootLastSelected.provider,
-                model: rootLastSelected.model,
-                effort: rootLastSelected.effort,
-              },
-              result.model
-            )
-          );
-        }
       },
       log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
     });
@@ -3340,6 +3544,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
           return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
         },
+        // Post-#460 replies target the durable user principal, not the legacy
+        // alias; principal storage is what says a recipient is a person.
+        isHumanRecipient: (principalId) =>
+          getRepositories().principals.getUser(principalId) !== undefined,
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
         logger: log.child({ component: "voice-session" }),
       })
@@ -3356,6 +3564,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         port: dashboardPort,
         bindHost: dashboardBindHost,
         logger: log,
+        quotaClientHealth: quotaCoordinatorClient
+          ? () => quotaCoordinatorClient.getHealth()
+          : undefined,
         // Bind the live mesh so the dashboard Data API + SSE serve real data.
         mesh: {
           mesh,
@@ -3430,19 +3641,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           ...createUnderstandingStringsResolver(config),
           rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
         },
-        // Cached per-provider quota snapshot : reads the same shared
-        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
-        // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
-        // the request path (issue #10). It serves the latest known reading
-        // immediately (stale-while-revalidate) and kicks any refresh in the
-        // background; a cold cache falls back to the durable quota DB below via
-        // `listHistory`.
+        // Route dashboard quota through GET /v1/quota and history through GET /v1/history
+        // via the coordinator client (§12 item 4, #356), preserving quotaApi's dependency shape.
+        // Falls back to local QuotaService.getQuotaCached only when no coordinator client exists.
         quotaApi: opts?.e2e?.quotaApi ?? {
-          getQuota: async (provider) => quotaService.getQuotaCached(provider),
+          getQuota: async (provider) =>
+            quotaCoordinatorClient
+              ? quotaCoordinatorClient.getQuotaWithFallback(provider)
+              : quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
-          listHistory: sharedQuotaStore
-            ? (provider, sinceIso) => sharedQuotaStore.listHistorySince(provider, sinceIso)
+          listHistory: quotaCoordinatorClient
+            ? (provider, sinceIso) => quotaCoordinatorClient.getCachedHistory(provider, sinceIso)
             : undefined,
         },
         // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
@@ -3624,6 +3834,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let webhookSilenceCheck: ReturnType<typeof setInterval> | null = null;
   let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
   let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
+  let quotaHistoryCheck: ReturnType<typeof setInterval> | null = null;
   let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
@@ -3640,6 +3851,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (webhookSilenceCheck) clearInterval(webhookSilenceCheck);
     if (diskAlertCheck) clearInterval(diskAlertCheck);
     if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
+    if (quotaHistoryCheck) clearInterval(quotaHistoryCheck);
     if (modelProbeCheck) clearInterval(modelProbeCheck);
     // Clearing the interval only stops the next probe. Abort reaches the one
     // running now - it kills the spawned tree synchronously - and awaiting it
@@ -3699,7 +3911,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         /* already closed */
       }
     }
-    sharedQuotaStore?.close();
     // `closeDb()` below drops the repository container, but the listener it
     // holds is a closure over this `runStart`'s `readyHeadSink`. Clearing the
     // sink first stops a dead mesh being reachable through that closure, and
@@ -3723,46 +3934,91 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   webhookSilenceCheck.unref?.();
 
   if (quotaThrottleEnabled) {
-    // The quota service's cache is the sensor cadence (normally five minutes),
-    // so a default five-minute controller tick never adds probe pressure. An
-    // immediate pass makes an enabled controller useful after boot rather than
-    // leaving a full-rate blind interval.
-    void tickQuotaThrottle().catch((err) => {
-      console.warn(
-        `[quota-throttle] boot tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    });
+    // The coordinator tick interval keeps pacers informed on the configured cadence.
     quotaThrottleCheck = setInterval(
-      () =>
+      () => {
         void tickQuotaThrottle().catch((err) => {
           console.warn(
             `[quota-throttle] interval tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
           );
-        }),
+        });
+      },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
     quotaThrottleCheck.unref?.();
   }
+  if (quotaCoordinatorClient) {
+    // History cache refresh runs on the same cadence but is not gated on
+    // throttling: the dashboard reads history through the client either way.
+    quotaHistoryCheck = setInterval(
+      () => {
+        void refreshQuotaHistory().catch((err) => {
+          log.warn("quota_history_interval_failed", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      },
+      (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
+    );
+    quotaHistoryCheck.unref?.();
+  }
 
   const diskAlertConfig = config.observability?.diskAlert;
+  const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);
   let diskAlert: DiskUsageAlert | null = null;
-  if (diskAlertConfig?.enabled !== false) {
-    const activeDiskAlert = new DiskUsageAlert(diskAlertConfig, async (event) => {
-      await mesh.deliverExternalEvent({
-        sourceType: "timer",
-        rawResource: "system:events",
-        rawPayload: event,
-        priority: "responsive",
-        eventSummary: event.message,
-      });
+  if (diskAlertActive(config)) {
+    // The effective settings are stated at boot: an operator reading the journal
+    // should never have to infer which threshold the sensor is actually using.
+    log.info("disk_alert_active", {
+      volume: diskAlertSettings.volume,
+      thresholdPercent: diskAlertSettings.thresholdPercent,
+      thresholdBytes: diskAlertSettings.thresholdBytes,
+      intervalSeconds: diskAlertSettings.intervalSeconds,
+      cooldownSeconds: diskAlertSettings.cooldownSeconds,
+      summary: describeDiskAlertConfig(diskAlertSettings),
     });
+    if (diskAlertUncovered(config, configuredRoots)) {
+      log.warn("disk_alert_uncovered", {
+        detail:
+          "disk sensor is active but system:events is not a configured root source — host alarms will reach only errorChat",
+        errorChatConfigured: sendToErrorChat !== null,
+      });
+    }
+    const activeDiskAlert = new DiskUsageAlert(
+      diskAlertConfig,
+      async (event) => {
+        const outcome = await deliverHostAlarm({
+          deliver: () =>
+            mesh.deliverExternalEvent({
+              sourceType: "timer",
+              rawResource: "system:events",
+              rawPayload: event,
+              priority: "responsive",
+              eventSummary: event.message,
+            }),
+          message: event.message,
+          sendToErrorChat,
+          log,
+        });
+        if (outcome !== "delivered") {
+          log.warn("disk_alert_not_delivered_to_mesh", {
+            fallback: outcome,
+            volume: event.volume,
+            freePercent: Number(event.freePercent.toFixed(1)),
+          });
+        }
+      },
+      undefined,
+      opts?.e2e?.diskAlertDeps
+    );
     diskAlert = activeDiskAlert;
-    // Reuse the 10-minute check interval for disk alerting or the configured one
     diskAlertCheck = setInterval(
       () => void activeDiskAlert.check(),
-      (diskAlertConfig?.intervalSeconds ?? 600) * 1000
+      diskAlertSettings.intervalSeconds * 1000
     );
     diskAlertCheck.unref?.();
+  } else {
+    log.info("disk_alert_disabled", { detail: "observability.diskAlert.enabled is false" });
   }
 
   // Probe model catalogs on startup and daily thereafter

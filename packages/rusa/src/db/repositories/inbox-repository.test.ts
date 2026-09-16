@@ -198,11 +198,7 @@ describe("InboxRepository", () => {
       loadSessionId: () => undefined,
       saveSessionId: () => {},
       buildPrompt: () => ({ prompt: "Read inbox" }),
-      onQueued: (context) => {
-        mesh.actorQueued("actor", context);
-        mesh.recordEvent({ kind: "run_queued", actorId: "actor" });
-      },
-      onRunEnd: () => mesh.recordEvent({ kind: "run_end", actorId: "actor", success: true }),
+      lifecycle: mesh.lifecycleFor("actor"),
       debounceMs: 1,
     });
     mesh.adopt(

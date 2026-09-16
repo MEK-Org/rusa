@@ -250,7 +250,7 @@ void main() {
         await tester.tap(find.text('Cancel queued run'));
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 50));
-        expect(api.interruptCalls.map((c) => c.actorId).toList(), [_actorId]);
+        expect(api.interruptCalls, [_actorId]);
 
         await store.dispose();
       });
@@ -271,7 +271,7 @@ void main() {
         await tester.tap(find.text('Interrupt'));
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 50));
-        expect(api.interruptCalls.map((c) => c.actorId).toList(), [_actorId]);
+        expect(api.interruptCalls, [_actorId]);
 
         await store.dispose();
       });

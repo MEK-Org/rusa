@@ -30,6 +30,7 @@ const MAINTENANCE_BUILD = "pnpm --reporter=silent run build:maintenance --silent
 const SCRIPT_FILES = {
   "backfill:codex-quota": "backfill-codex-quota-parses.mjs",
   "backfill:token-records": "backfill-run-token-records.mjs",
+  "drill:quota-rollback": "quota-rollback-drill.mjs",
   "eval:quota": "eval-quota-extraction.mjs",
   "replay:codex-observations": "replay-codex-quota-observations.mjs",
 } as const;
@@ -39,6 +40,10 @@ const MAINTENANCE_SCRIPTS = Object.keys(SCRIPT_FILES) as (keyof typeof SCRIPT_FI
 const MAINTENANCE_ENTRIES = [
   "actor/backfill-run-token-records.js",
   "mcp/quota-mcp.js",
+  "observability/logger.js",
+  "quota/coordinator-backup.js",
+  "quota/coordinator-client.js",
+  "quota/coordinator-metrics.js",
   "quota/shared-store.js",
 ] as const;
 

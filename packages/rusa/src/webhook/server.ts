@@ -8,7 +8,11 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
-import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
+import {
+  type DashboardDataDeps,
+  handleMeshApiRequest,
+  viewingUserPrincipalId,
+} from "../dashboard/api.js";
 import {
   getDashboardAsset,
   getDashboardAssetDir,
@@ -35,6 +39,7 @@ import type { MeshEventRepository } from "../db/repositories/mesh-event-reposito
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
+import type { QuotaCoordinatorClientHealth } from "../quota/coordinator-client.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
@@ -123,6 +128,7 @@ export interface WebhookServerOptions {
  */
 export interface DashboardMeshRefs {
   actors: ActorRepository;
+  principals?: PrincipalRepository;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -185,6 +191,12 @@ export interface DashboardServerBaseOptions {
    * TTL cache — never probes per request). Absent → that route 503s.
    */
   quotaApi?: QuotaApiDeps;
+  /**
+   * Health reader for the quota coordinator client. When supplied,
+   * `GET /api/health` includes `quota: { quota_client_service_connected }`.
+   * Absent → omitted (no coordinator configured).
+   */
+  quotaClientHealth?: () => QuotaCoordinatorClientHealth;
   /** Small read-only frontend config payload for dashboard-only UI choices. */
   dashboardConfig?: Pick<DashboardConfig, "quotaProviders">;
   /**
@@ -198,11 +210,12 @@ export interface DashboardServerBaseOptions {
   logger?: Logger;
 }
 
-/** Configured `auth` and the principal repository its identities resolve through arrive
- * together or not at all, so an authenticated dashboard cannot be started without storage. */
+/** When `auth` is configured, `principals` storage is required so authenticated
+ * identities can be resolved. Storage may also be provided without external `auth`
+ * (e.g. in local mode or during maintenance). */
 export type DashboardAuthOptions =
-  | { auth?: DashboardAuthConfig; principals: PrincipalRepository }
-  | { auth?: undefined; principals?: undefined };
+  | { auth: DashboardAuthConfig; principals: PrincipalRepository }
+  | { auth?: undefined; principals?: PrincipalRepository };
 
 export type DashboardServerOptions = DashboardServerBaseOptions & DashboardAuthOptions;
 
@@ -278,6 +291,7 @@ export function createDashboardRequestHandler(
 
       // Minimal liveness endpoint — always available, even without a live mesh.
       if (req.method === "GET" && pathname === "/api/health") {
+        const quotaHealth = options.quotaClientHealth?.();
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
@@ -285,6 +299,7 @@ export function createDashboardRequestHandler(
             deployedSha,
             startedAt,
             version: packageVersion,
+            ...(quotaHealth ? { quota: quotaHealth } : {}),
           })
         );
         return;
@@ -337,7 +352,16 @@ export function createDashboardRequestHandler(
           "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify({ quotaProviders: options.dashboardConfig?.quotaProviders ?? {} }));
+        // The viewing user: the authenticated identity, else local mode's
+        // sole active durable user, so the client personalizes "my" surfaces
+        // (obligation queue, chat) without assuming the legacy alias (#460).
+        const userPrincipalId = viewingUserPrincipalId(req, dataDeps?.principals);
+        res.end(
+          JSON.stringify({
+            quotaProviders: options.dashboardConfig?.quotaProviders ?? {},
+            ...(userPrincipalId ? { userPrincipalId } : {}),
+          })
+        );
         return;
       }
 
@@ -569,6 +593,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     options.mesh && sseHub
       ? {
           actors: options.mesh.actors,
+          principals: options.mesh.principals ?? options.principals,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
           meshChat: options.mesh.meshChat,
@@ -601,6 +626,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
+          principals: options.mesh.principals ?? options.principals,
           logger: log.child({ component: "voice-route" }),
         }
       : null;

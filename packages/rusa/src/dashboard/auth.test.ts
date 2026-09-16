@@ -188,8 +188,8 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         requestPrincipals.push(getDashboardRequestPrincipal(req));
       }
       expect(interrupt).toHaveBeenCalledTimes(2);
-      expect(interrupt).toHaveBeenNthCalledWith(1, "actor", "human:operator");
-      expect(interrupt).toHaveBeenNthCalledWith(2, "actor", "human:operator");
+      expect(interrupt).toHaveBeenNthCalledWith(1, "actor", requestPrincipals[0]?.id);
+      expect(interrupt).toHaveBeenNthCalledWith(2, "actor", requestPrincipals[1]?.id);
       expect(requestPrincipals[0]?.id).not.toBe(requestPrincipals[1]?.id);
       for (const principal of requestPrincipals) {
         expect(principal?.kind).toBe("user");
@@ -572,8 +572,10 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     ).toBe(401);
   });
 
-  it("binds authenticated actions to human:operator instead of a body-supplied identity", async () => {
+  it("binds authenticated actions to durable principal instead of a body-supplied identity", async () => {
     const cookie = await login();
+    const user = principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub });
+    if (!user) throw new Error("Expected durable user");
     const bootstrap = await fetch(`${origin}/api/auth/csrf`, {
       headers: { "X-Rusa-CSRF-Bootstrap": "1", Cookie: cookie },
     });
@@ -589,7 +591,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
       body: JSON.stringify({ by: "forged-actor" }),
     });
     expect(res.status).toBe(200);
-    expect(interrupt).toHaveBeenCalledWith("actor", "human:operator");
+    expect(interrupt).toHaveBeenCalledWith("actor", user.id);
   });
 
   it("closes live streams on revocation and after an hour", async () => {

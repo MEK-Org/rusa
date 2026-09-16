@@ -1,10 +1,12 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import http from "node:http";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGenerateContent = vi.fn();
 
@@ -29,6 +31,11 @@ import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import type { CodingProvider } from "../providers/types.js";
+import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import {
+  COORDINATOR_PROTOCOL_MAJOR,
+  COORDINATOR_PROTOCOL_MINOR,
+} from "../quota/coordinator-protocol.js";
 import {
   createQuotaMcpServer,
   inferQuotaState,
@@ -2934,6 +2941,170 @@ describe("quota MCP server", () => {
         });
 
         expect(scrapeKimiUsage).toHaveBeenCalledOnce();
+      });
+
+      describe("routing through QuotaCoordinatorClient (§12 item 4, issue #356, criterion 15)", () => {
+        let root: string | undefined;
+        let server: http.Server | undefined;
+
+        async function listen(socketPath: string, handler: http.RequestListener): Promise<void> {
+          server = http.createServer(handler);
+          await new Promise<void>((resolve, reject) => {
+            server?.once("error", reject);
+            server?.listen(socketPath, resolve);
+          });
+        }
+
+        async function stopServer(): Promise<void> {
+          const running = server;
+          server = undefined;
+          if (!running?.listening) return;
+          running.closeAllConnections?.();
+          await new Promise<void>((resolve, reject) => {
+            running.close((err) => (err ? reject(err) : resolve()));
+          });
+        }
+
+        afterEach(async () => {
+          await stopServer();
+          if (root) {
+            rmSync(root, { recursive: true, force: true });
+            root = undefined;
+          }
+        });
+
+        it("with coordinator socket present: get_quota answers from GET /v1/quota and triggers 0 probes", async () => {
+          root = mkdtempSync(join(tmpdir(), "quota-mcp-crit15-live-"));
+          const socketPath = join(root, "coordinator.sock");
+          let coordinatorQueried = false;
+
+          await listen(socketPath, (req, res) => {
+            if (req.method === "GET" && req.url === "/v1/quota?provider=claude") {
+              coordinatorQueried = true;
+              res.setHeader("content-type", "application/json");
+              res.end(
+                JSON.stringify({
+                  service: {
+                    protocolMajor: COORDINATOR_PROTOCOL_MAJOR,
+                    protocolMinor: COORDINATOR_PROTOCOL_MINOR,
+                    serverVersion: "test",
+                    serverTime: new Date(0).toISOString(),
+                  },
+                  provider: "claude",
+                  status: "available",
+                  scrapedAt: new Date(0).toISOString(),
+                  limits: [
+                    {
+                      label: "Weekly",
+                      kind: "weekly",
+                      percentLeft: 75,
+                    },
+                  ],
+                })
+              );
+              return;
+            }
+            res.statusCode = 404;
+            res.end();
+          });
+
+          const coordinatorClient = new QuotaCoordinatorClient({
+            socketPath,
+            configuredProviders: ["claude", "codex"],
+          });
+
+          const mcpServer = createQuotaMcpServer({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+            coordinatorClient,
+          });
+
+          const client = await connect(mcpServer);
+          const result = (await client.callTool({
+            name: "get_quota",
+            arguments: { provider: "claude" },
+          })) as CallToolResult;
+
+          expect(coordinatorQueried).toBe(true);
+          // Triggers 0 probes: mockClaudeProvider.run must not be called!
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(0);
+
+          const parsed = JSON.parse(textOf(result));
+          expect(parsed.status).toBe("available");
+          expect(parsed.provider).toBe("claude");
+          expect(parsed.limits?.[0].percentLeft).toBe(75);
+        });
+
+        it("with service cold (or socket absent): returns status unknown with freshness block, triggering 0 probes", async () => {
+          root = mkdtempSync(join(tmpdir(), "quota-mcp-crit15-cold-"));
+          const socketPath = join(root, "absent-coordinator.sock");
+
+          const coordinatorClient = new QuotaCoordinatorClient({
+            socketPath,
+            configuredProviders: ["claude", "codex"],
+          });
+
+          const mcpServer = createQuotaMcpServer({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+            coordinatorClient,
+          });
+
+          const client = await connect(mcpServer);
+          const result = (await client.callTool({
+            name: "get_quota",
+            arguments: { provider: "claude" },
+          })) as CallToolResult;
+
+          // Triggers 0 probes: mockClaudeProvider.run must not be called!
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(0);
+
+          // Does not return an error; returns toolOk with unknown + freshness block
+          expect(result.isError).toBeFalsy();
+          const parsed = JSON.parse(textOf(result));
+          expect(parsed.status).toBe("unknown");
+          expect(parsed.provider).toBe("claude");
+          expect(parsed.freshness).toBeDefined();
+          expect(parsed.freshness.stale).toBe(true);
+          expect(parsed.freshness.hardStale).toBe(true);
+        });
+
+        it("admitted but unconfigured provider: returns status unsupported without error, triggering 0 probes", async () => {
+          root = mkdtempSync(join(tmpdir(), "quota-mcp-crit15-unsupp-"));
+          const socketPath = join(root, "coordinator.sock");
+
+          const coordinatorClient = new QuotaCoordinatorClient({
+            socketPath,
+            configuredProviders: ["claude"],
+          });
+
+          const mcpServer = createQuotaMcpServer({
+            config: {
+              ...mockConfig,
+              providers: { claude: { cliCommand: "claude" } },
+            } as unknown as RusaConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+            coordinatorClient,
+          });
+
+          const client = await connect(mcpServer);
+          // "codex" is admitted by provider schema / type, but not in config.providers
+          const result = (await client.callTool({
+            name: "get_quota",
+            arguments: { provider: "codex" },
+          })) as CallToolResult;
+
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(0);
+          expect(mockCodexProvider.run).toHaveBeenCalledTimes(0);
+          expect(result.isError).toBeFalsy();
+          const parsed = JSON.parse(textOf(result));
+          expect(parsed.status).toBe("unsupported");
+          expect(parsed.provider).toBe("codex");
+          expect(parsed.message).toContain("is not configured");
+        });
       });
 
       it("parses Claude quota from newly banked /usage screen scrape fixture file", async () => {

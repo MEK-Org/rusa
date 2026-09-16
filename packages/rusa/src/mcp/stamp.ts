@@ -455,7 +455,8 @@ export function isHumanOperator(actorId: string): boolean {
 /**
  * A `system:*` actor id marks a persistence-only write performed by mesh
  * infrastructure itself (e.g. system background tasks) rather than by a peer actor.
- * Used by ActorMesh.deliverEvent to withhold such events from every
+ * Used by `applyAuthorSuppression` (the mesh's one author-suppression rule,
+ * in `runtime/event-manager.ts`) to withhold such events from every
  * destination, not just the actor that would match on author identity — see
  * the mesh-wide suppression rule there. Only a VERIFIED stamp may rely on
  * this (the caller must have gone through verifyAuthorStamp/resolveStampedAuthor);

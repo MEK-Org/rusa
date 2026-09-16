@@ -95,9 +95,9 @@ Minimal example:
       # level: info   # debug | info | warn | error | silent (RUSA_LOG_LEVEL overrides)
       # format: auto  # auto | json | pretty (RUSA_LOG_FORMAT overrides)
     diskAlert:
-      # enabled: true
+      # enabled: true          # on by default; set false to turn the sensor off
       # volume: "/"
-      # thresholdPercent: 10
+      # thresholdPercent: 10   # default when neither threshold is set
       # thresholdBytes: 2000000000
       # intervalSeconds: 600
       # cooldownSeconds: 21600
@@ -233,16 +233,21 @@ observability.logging:
 
 observability.diskAlert:
 
-  Configuring this section implicitly subscribes root to responsive system.disk events.
+  The disk sensor runs unless it is explicitly disabled, and root is subscribed to
+  responsive system.disk events on exactly the same condition — so this section can be
+  omitted entirely and alerts still reach root. When a disk alert resolves no recipient,
+  it falls back to chat.errorChat so a host-level alarm never depends on mesh routing.
   enabled                  Optional boolean. Disk headroom alert is enabled by default;
-                           set enabled: false to deactivate.
+                           set enabled: false to deactivate it and drop the subscription.
   volume                   Optional string. The path to the relevant volume to check.
                            Default: "/".
   thresholdPercent         Optional number. Free disk space percentage threshold (0-100).
-                           Default: undefined.
-  thresholdBytes           Optional number. Free disk space threshold in bytes. Evaluated
-                           along with thresholdPercent if both are set. Default: 2147483648 (2 GB)
-                           when neither threshold is set.
+                           Default: 10 when neither threshold is set — a percentage scales
+                           with the volume, where a flat byte floor gives a large disk
+                           almost no warning.
+  thresholdBytes           Optional number. Free disk space threshold in bytes, for an
+                           absolute floor. Evaluated along with thresholdPercent if both
+                           are set. Default: unset.
   intervalSeconds          Optional number. Scan cadence. Default: 600 (10 minutes).
   cooldownSeconds          Optional number. Cooldown in seconds before alerting again
                            after a threshold is crossed. Default: 21600 (6 hours).

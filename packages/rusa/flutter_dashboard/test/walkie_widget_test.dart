@@ -177,16 +177,53 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('On it, boss.'), findsOneWidget);
-      expect(find.text('NOW PLAYING'), findsOneWidget);
+      expect(find.text('PLAYING / LOADING'), findsOneWidget);
 
       await tester.tap(find.byKey(const ValueKey('walkie-skip')));
       await tester.pump();
       await tester.pump();
       expect(api.ackedIds, ['m1']);
-      // Skipped: the text stays glanceable — it lands in the transcript as a
-      // played reply rather than vanishing with the now-playing tail .
-      expect(find.text('REPLY'), findsOneWidget);
+      // Skipped: the text stays glanceable in its original received row.
+      expect(find.text('RECEIVED'), findsOneWidget);
       expect(find.text('On it, boss.'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'received replies stay on their original rows and an older row replays itself',
+    (tester) async {
+      api.backlogPages = [
+        [makeAnnouncement('a', text: 'First reply')],
+      ];
+      await selectActor(tester);
+      await tester.tap(find.byKey(const ValueKey('walkie-toggle')));
+      await tester.pump();
+      await tester.pump();
+
+      // A finishes; B arrives and stalls in playback.
+      walkie.player.finishCurrent();
+      await tester.pump();
+      walkie.stream.framesCtrl.add(makeAnnouncement('b', text: 'Latest reply'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('First reply'), findsOneWidget);
+      expect(find.text('Latest reply'), findsOneWidget);
+      expect(find.text('PLAYING / LOADING'), findsOneWidget);
+
+      // Tapping the original A row switches playback to A without appending it.
+      await tester.tap(find.byKey(const ValueKey('walkie-reply-a')));
+      await tester.pump();
+      await tester.pump();
+
+      expect(walkie.player.playedUrls, [
+        '/api/mesh/voice/audio/a',
+        '/api/mesh/voice/audio/b',
+        '/api/mesh/voice/audio/a',
+      ]);
+      expect(find.text('First reply'), findsOneWidget);
+      expect(find.text('Latest reply'), findsOneWidget);
+      expect(find.text('PLAYING / LOADING'), findsOneWidget);
     },
   );
 

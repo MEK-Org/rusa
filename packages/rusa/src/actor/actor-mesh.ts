@@ -21,7 +21,6 @@ import {
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
-  applyAuthorSuppression,
   type DurableEventDelivery,
   deduplicatedInboxEntryId,
   type EventManager,
@@ -35,6 +34,12 @@ import {
   MAX_VOICE_TRANSFER_NOTE_CHARS,
   renderVoiceTransferContext,
 } from "../voice/voice-transfer-context.js";
+import {
+  type ActorLifecycle,
+  type ActorLifecycleListener,
+  type ActorLifecycleListenerFailure,
+  createActorLifecycle,
+} from "./actor-lifecycle.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -101,6 +106,8 @@ export interface MeshActor {
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
   setModelConfig?(modelConfig: ProviderModelConfig[]): void;
+  /** Present on provider-backed actors that receive the lifecycle contract. */
+  readonly lifecycle?: ActorLifecycle;
 }
 
 export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
@@ -394,12 +401,16 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
  * controller. Their scope is enforced by the surface that mints them, not by
  * ancestry, since none of them is a node in the tree to begin with.
  */
-function isTrustedControlPrincipal(by: string): boolean {
+function isTrustedControlPrincipal(
+  by: string,
+  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository
+): boolean {
   return (
     by === "root-llm" ||
     by === "human:operator" ||
     by.startsWith("human:") ||
-    by === "e2e-controller"
+    by === "e2e-controller" ||
+    (principals !== undefined && principals.getUser(by) !== undefined)
   );
 }
 
@@ -443,6 +454,8 @@ export interface ActorFactoryContext {
   /** Read the live record (charter + handles can change between wakes). */
   getRecord: () => ActorRecord | undefined;
   mesh: ActorMesh;
+  /** Ordered actor/run observers, already registered with mesh bookkeeping first. */
+  lifecycle: ActorLifecycle;
   /**
    * Wrap the provider run in the shared cross-actor concurrency gate. The
    * actor supplies its declared candidate pool; the gate atomically selects
@@ -458,36 +471,18 @@ export interface ActorFactoryContext {
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
   /** Final admission after provider pacing selects a run, before it launches. */
   admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean;
-  /** General lifecycle hook after the pre-run gate and before scheduler admission. */
-  onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
-  /** Post-run accounting (token usage) + completion-review hook. */
-  onRunEnd: (result: RunResult, runId?: string) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
   /**
    * Fires when a genuinely queued (not yet started) run is cancelled —
    * an operator HALT or an explicit interrupt — so the mesh can clear any
    * recorded {@link QueuedSelection} for this actor. Never fires once the
-   * run has actually started; `onRunEnd` is the clearing point for that case.
+   * run has actually started; onEnd is the clearing point for that case.
    */
   onQueuedRunCancelled?: () => void;
-  /** Closes mesh run-scoped state when a queued opportunity never starts. */
-  onRunAbandoned?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
-
-export interface EventDeliveryOptions {
-  directedTarget?: string | null;
-  stampedAuthor?: { actorId: string; instanceId: string } | null;
-  instanceId?: string;
-  /** When present, persist one notification per destination before waking it. */
-  inboxPayload?: InboxPayload;
-  /** Stable ingress id; combined with actor identity to make retries no-ops. */
-  inboxDedupeKey?: string;
-  inboxDeliveredAt?: Date;
-  inboxPriority?: "responsive" | "normal";
-}
 
 export interface RetireCleanup {
   name: string;
@@ -501,6 +496,7 @@ export interface RetireCleanup {
 
 export interface ActorMeshOptions {
   actors: ActorRepository;
+  principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -583,6 +579,13 @@ export interface ActorMeshOptions {
    * removing the actor's MCP endpoint and its working directory.
    */
   onRetire?: (record: ActorRecord) => void;
+  /**
+   * Ordered actor/run observers. The mesh's own queue and terminal bookkeeping
+   * is always registered first; host integrations follow this declared order.
+   */
+  lifecycleListeners?: readonly ActorLifecycleListener[];
+  /** Forward observer errors to host telemetry or structured logging. */
+  onLifecycleError?: (failure: ActorLifecycleListenerFailure) => void;
   /**
    * Called on every actor yield, for out-of-band handling the mesh doesn't own
    * (e.g. surfacing a git-bridge deliverable). `notifyingParent` is true only
@@ -724,7 +727,7 @@ export interface ActorMeshOptions {
  * anyway. One wording means the instruction cannot drift from the rule.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor, or — for a standing (owner/repository-level or ref-free root) head — rewrite its checkpoint during the run to record the no-change verification you performed";
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
@@ -776,6 +779,7 @@ interface SelectedHeadSnapshot {
 
 export class ActorMesh {
   readonly actors: ActorRepository;
+  readonly principals?: import("../db/repositories/principal-repository.js").PrincipalRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly supportsExecutionTarget?: (target: string) => boolean;
@@ -794,6 +798,8 @@ export class ActorMesh {
   private readonly handleForId: (id: string) => string;
   private readonly rootId?: string;
   private readonly onRetire?: (record: ActorRecord) => void;
+  private readonly lifecycleListeners: readonly ActorLifecycleListener[];
+  private readonly onLifecycleError?: ActorMeshOptions["onLifecycleError"];
   private readonly onYield?: (
     actorId: string,
     ctx: { notifyingParent: boolean }
@@ -878,9 +884,11 @@ export class ActorMesh {
    * {@link resolveDropNotifyTarget}, which must not hand a notification to one.
    */
   private readonly retiring = new Set<string>();
+  private readonly lifecycles = new Map<string, ActorLifecycle>();
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
+    this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
@@ -923,6 +931,8 @@ export class ActorMesh {
     this.now = opts.now ?? (() => new Date().toISOString());
     this.handleForId = opts.handleForId ?? generateHandle;
     this.onRetire = opts.onRetire;
+    this.lifecycleListeners = opts.lifecycleListeners ?? [];
+    this.onLifecycleError = opts.onLifecycleError;
     this.onYield = opts.onYield;
     this.recordRunYield = opts.recordRunYield;
     this.onSpawn = opts.onSpawn;
@@ -1065,6 +1075,44 @@ export class ActorMesh {
   }
 
   /**
+   * Return the one lifecycle fanout for an actor. The execution coordinator
+   * receives this before construction so observers cannot be smuggled through
+   * actor invocation inputs as logging or accounting callbacks.
+   */
+  lifecycleFor(actorId: string): ActorLifecycle {
+    const existing = this.lifecycles.get(actorId);
+    if (existing) return existing;
+    const lifecycle = createActorLifecycle(
+      [
+        {
+          onQueued: (event) => {
+            this.actorQueued(event.actorId, event);
+          },
+          onEnd: (event) => {
+            if (event.terminal.kind === "result") {
+              this.finishInboxRun(event.actorId);
+              this.accountRun(event.actorId, event.terminal.result, event.runId);
+            } else {
+              this.abandonInboxRun(event.actorId);
+            }
+            // A selection is run-scoped regardless of its terminal shape.
+            this.clearSelection(event.actorId);
+          },
+        },
+        ...this.lifecycleListeners,
+      ],
+      (failure) => {
+        this.log(
+          `lifecycle ${failure.event} listener failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`
+        );
+        this.onLifecycleError?.(failure);
+      }
+    );
+    this.lifecycles.set(actorId, lifecycle);
+    return lifecycle;
+  }
+
+  /**
    * Register an externally-created actor (the root) so the mesh can route
    * messages to it and the repository knows it exists. Idempotent on the record.
    *
@@ -1077,6 +1125,8 @@ export class ActorMesh {
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
+    if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
+    else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
 
@@ -1479,7 +1529,7 @@ export class ActorMesh {
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
     // run after. A tuple staged while idle/queued is applied earlier, at that
-    // run's own dispatch (see the `onRunStart` wiring), so this call is then a
+    // run's own dispatch through `beforeRun`, so this call is then a
     // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
   }
@@ -1919,6 +1969,7 @@ export class ActorMesh {
     }
     this.live.set(id, actor);
     this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
+    void this.lifecycleFor(id).emit("onSpawn", { actorId: id });
     // Genuine-birth side-effect hook (out-of-band, fire-and-forget) — e.g. kick
     // off avatar generation . Guarded like onRetire so a hook throw can
     // never break spawning, and only here (not createActor, which rehydrate
@@ -2327,8 +2378,8 @@ export class ActorMesh {
    * liveness check, and parent bubbling across delivery, delegation guards, and audit inspection.
    *
    * Note: Bubbling policy is enforced only when `opts.enforceBubblingPolicy` is true (for event
-   * delivery in {@link deliverEvent}); delegation guards and audit inspection walk ancestors
-   * unconditionally to determine governing authority.
+   * delivery in {@link deliverExternalEvent}); delegation guards and audit inspection walk
+   * ancestors unconditionally to determine governing authority.
    */
   private resolveRoutingDecision(
     resource: EventResource,
@@ -2499,7 +2550,7 @@ export class ActorMesh {
    * fall back to most-specific-live-subscriber-wins with parent bubbling.
    *
    * Note: This walk is unconditional for authority inspection. A reported
-   * ancestor-level route is only deliverable by {@link deliverEvent} for
+   * ancestor-level route is only deliverable by {@link deliverExternalEvent} for
    * bubble-eligible event classes; non-bubbling event classes are exact-only.
    * Direct subscriptions are delivery-only and never confer ownership.
    */
@@ -2568,114 +2619,41 @@ export class ActorMesh {
   }
 
   /**
-   * Resolve the active subscriber for a hierarchy-aware EventResource, checking liveness,
-   * and delivering to the governing live owner (live obligation claims taking precedence over
-   * stored subscriptions, with fallback to most-specific live subscriber). An allowlisted event may bubble
-   * up the ancestor chain past dead/absent exact subscribers; every other class is exact-only.
-   * An event no subscription covers is DROPPED (journal-visible):
-   * sources are config-declared , so an uncovered event is out-of-scope for this
-   * instance by definition — unconditional bubbling to root turned the repo-scoped staging
-   * instance back into an org-wide firehose . A covering org source is considered only
-   * for the event classes explicitly allowed by {@link mayBubbleToParent} .
-   * Follows the CRITICAL invariant of checking liveness and delivering synchronously.
-   * TRANSITIONAL: production ingress enters {@link deliverExternalEvent}. Since
-   * the GitHub, Chat, and timer callers moved there, this payload-bearing path
-   * has no in-repo caller outside tests; it remains only as the published
-   * embedder contract and as characterization coverage. #393 tracks collapsing
-   * it into the EventManager path so the most-tested entry point is again the
-   * production one.
-   */
-  async deliverEvent(
-    resource: EventResource,
-    eventSummary: string,
-    opts: EventDeliveryOptions = {}
-  ): Promise<void> {
-    // CRITICAL: no `await` may appear between recipient resolution and the
-    // notification below. EventManager's routing and append are synchronous for
-    // exactly this reason, and this method stays async only to preserve its
-    // public contract — as it did before the extraction. Yield anywhere in
-    // here and an actor can retire after being resolved as live, leaving a
-    // durable unhandled row with nobody alive to take it.
-    if (opts.inboxPayload) {
-      if (!this.eventManager) {
-        throw new Error("Inbox delivery requires a host-assembled EventManager");
-      }
-      const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-      const delivery = this.eventManager.handleNormalizedEvent({
-        resource: rawResource,
-        payload: {
-          ...opts.inboxPayload,
-          ...(opts.inboxPriority === "responsive" ? { priority: "responsive" } : {}),
-        },
-        deliveredAt: opts.inboxDeliveredAt,
-        dedupeKey: opts.inboxDedupeKey,
-        directedTarget: opts.directedTarget,
-        stampedAuthor: opts.stampedAuthor,
-        instanceId: opts.instanceId,
-        eventSummary,
-      });
-      this.notifyPersistedInboxEntries(delivery, opts.inboxPriority);
-      return;
-    }
-
-    const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-    const routing = this.routing;
-    if (!routing) {
-      throw new Error("Event routing requires a host-assembled EventManager");
-    }
-    const recipients = routing.resolveRecipients(rawResource, {
-      directedTarget: opts.directedTarget,
-      eventPayload: opts.inboxPayload,
-      eventSummary,
-    });
-    const destinations: string[] = [];
-    for (const id of recipients.ownerIds) {
-      if (!destinations.includes(id)) destinations.push(id);
-    }
-    for (const sub of recipients.subscriberIds) {
-      if (!destinations.includes(sub)) destinations.push(sub);
-    }
-
-    if (destinations.length === 0) {
-      // See the drop rationale in EventManager.handleExternalEvent: an
-      // uncovered event is out-of-scope for this instance by definition,
-      // because root retains a covering source for anything it delegates from.
-      this.log(`event not covered by any subscription — dropped (${eventSummary})`);
-      return;
-    }
-
-    const deliverable = applyAuthorSuppression({
-      directed: recipients.directed,
-      destinations,
-      stampedAuthor: opts.stampedAuthor,
-      instanceId: opts.instanceId,
-      eventSummary,
-      log: this.log,
-    });
-    if (deliverable.length === 0) return;
-
-    for (const dest of deliverable) {
-      const isOwner = recipients.ownerIds.includes(dest);
-      if (!this.notifyEventRecipient(dest, opts.inboxPriority, isOwner)) {
-        this.log(`Delivery target ${dest} is not live; cannot deliver event`);
-      }
-    }
-  }
-
-  /**
-   * The host's three external ingress paths enter here with an explicit raw
-   * source shape. EventManager owns normalize → route → append; Mesh owns the
+   * The one way an event enters the mesh. The host's three ingress paths —
+   * GitHub, Chat, and timer — arrive with an explicit raw source shape;
+   * EventManager owns normalize → route → append, and Mesh owns the
    * after-commit wake until #384 extracts that notification seam.
    *
-   * Like {@link deliverEvent}, the body runs to completion in one turn: the
-   * manager's normalize/route/append is synchronous, so nothing can retire
-   * between resolution, persistence, and the wake.
+   * #393 collapsed the transitional `deliverEvent` into this method: routing,
+   * source canonicalization, author suppression, durable append, and
+   * owners-then-subscribers ordering now have one implementation, and the
+   * characterization suite enters where production enters.
+   *
+   * That collapse also dropped a capability rather than only a duplicate:
+   * `deliverEvent` without an `inboxPayload` could route, suppress, and wake
+   * with no inbox row behind the wake. Delivery now always leaves a durable
+   * row, and a notification without one is not expressible — which is the
+   * point, because a woken actor that restarts before it reads finds nothing
+   * to work from. Nothing replaces that shape: {@link deliverWake}, the other
+   * way to reach a live actor, records its own durable row too.
+   *
+   * CRITICAL: the body runs to completion in one turn. No `await` may appear
+   * between recipient resolution and the wake — the manager's
+   * normalize/route/append is synchronous for exactly this reason, and this
+   * method stays async only for its public contract. Yield anywhere in here
+   * and an actor can retire after being resolved as live, leaving a durable
+   * unhandled row with nobody alive to take it. `actor-mesh.test.ts` pins this
+   * with a retirement queued as a microtask before the call.
    */
-  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
+  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<DurableEventDelivery> {
     if (!this.eventManager) {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
-    this.notifyPersistedInboxEntries(this.eventManager.handleExternalEvent(raw), raw.priority);
+    const delivery = this.eventManager.handleExternalEvent(raw);
+    this.notifyPersistedInboxEntries(delivery, raw.priority);
+    // Returned so a host-level alarm can tell an uncovered drop from a delivery
+    // and fall back to its own channel rather than trusting mesh routing (#481).
+    return delivery;
   }
 
   /**
@@ -2730,7 +2708,10 @@ export class ActorMesh {
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
-    if (isHumanOperator(fromId)) {
+    if (
+      isHumanOperator(fromId) ||
+      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
+    ) {
       throw new Error(
         "Invalid sender ID: actor-facing send path structurally cannot claim human origin"
       );
@@ -2878,10 +2859,10 @@ export class ActorMesh {
     toId: string,
     body: string,
     sessionId: string,
-    opts?: { voice?: boolean }
+    opts?: { voice?: boolean; fromId?: string }
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
-    const fromId = HUMAN_OPERATOR;
+    const fromId = opts?.fromId ?? HUMAN_OPERATOR;
     const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
@@ -2890,6 +2871,7 @@ export class ActorMesh {
     this.actors.patch(toId, {
       humanUnlocked: true,
       lastChatSessionId: sessionId,
+      lastChatPrincipalId: fromId,
     });
     const target = this.live.get(toId);
     const messageId = this.recordMessageEmitted({
@@ -3056,7 +3038,6 @@ export class ActorMesh {
   private assertCleanYieldAllowed(actorId: string): void {
     const runState = this.headClosureRuns.get(actorId);
     if (!runState || runState.headObligationIds.size === 0) return;
-    const verifiedStandingHeads: Obligation[] = [];
     const closure = this.obligations;
     // Selection already refused to arm a run without these reads, so this is
     // the second half of the same fail-closed rule rather than a soft skip: an
@@ -3076,13 +3057,12 @@ export class ActorMesh {
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
 
       if (obligation.status === "ready") {
-        const selected = runState.selectedHeads.get(obligationId) ?? null;
-        const shortfall = this.strictHandoffShortfall(actorId, obligation, selected);
+        const shortfall = this.strictHandoffShortfall(
+          actorId,
+          obligation,
+          runState.selectedHeads.get(obligationId) ?? null
+        );
         if (shortfall === null) continue;
-        if (this.isStandingHeadVerifiedNoChange(actorId, obligation, selected)) {
-          verifiedStandingHeads.push(obligation);
-          continue;
-        }
         this.rejectCleanYield(actorId, obligationId, obligation.title, shortfall);
       }
 
@@ -3113,13 +3093,6 @@ export class ActorMesh {
           "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
         );
       }
-    }
-
-    // Do not durably name an accepted disposition until every selected head has
-    // passed. A later failure rejects the whole clean-yield attempt, so emitting
-    // during the loop would leave a false accepted disposition in its history.
-    for (const obligation of verifiedStandingHeads) {
-      this.recordStandingHeadVerified(actorId, obligation);
     }
   }
 
@@ -3160,83 +3133,17 @@ export class ActorMesh {
     if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
       return `${moved} without a checkpoint written by this actor`;
     }
-    if (!this.checkpointWasRewrittenSinceSelection(outgoingActorId, obligation, selected)) {
+    if (
+      obligation.checkpoint === selected.checkpoint &&
+      obligation.checkpointAt === selected.checkpointAt &&
+      obligation.checkpointBy === selected.checkpointBy
+    ) {
       return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
     }
     if (!this.isWakeableRecipient(obligation.ownerId)) {
       return `${moved}, which is not an active actor that can be woken`;
     }
     return null;
-  }
-
-  /**
-   * Whether a still-ready head this actor still owns is a *standing* head it
-   * verified during this run, making a no-change clean yield legal (#468).
-   *
-   * A head is standing when it names a GitHub owner or repository — a ref whose
-   * path is one or two segments (`github:OWNER`, `github:OWNER/REPO`) — or when
-   * it has no ref and no parent: the never-finished nodes (repo stewardship,
-   * apexes) that re-ready whenever their last live child clears. Issue/PR-ref'd
-   * heads, non-GitHub refs, and ref-free leaves are not standing and keep every
-   * strict exit.
-   * The ref-free parentless classification is convention-backed, not
-   * schema-backed: the model has no persistent apex discriminator.
-   *
-   * The evidence demanded of the run is the same attribution
-   * {@link strictHandoffShortfall} already makes: the checkpoint on the row was
-   * rewritten by this actor against the selection-time snapshot, so a standing
-   * left by an earlier run cannot stand in for this one. A null snapshot (the
-   * head was unreadable when selected) fails closed, as it does for a handoff.
-   */
-  private isStandingHeadVerifiedNoChange(
-    actorId: string,
-    obligation: Obligation,
-    selected: SelectedHeadSnapshot | null
-  ): boolean {
-    const standing =
-      obligation.externalRef !== null
-        ? obligation.externalRef.scheme === "github" && obligation.externalRef.segments.length <= 2
-        : obligation.parentId === null;
-    if (!standing) return false;
-    if (this.resolveThreadId(obligation.ownerId) !== actorId) return false;
-    if (!selected || this.resolveThreadId(selected.ownerId) !== actorId) return false;
-    if (!this.checkpointWasRewrittenSinceSelection(actorId, obligation, selected)) return false;
-    return true;
-  }
-
-  /**
-   * Record a verified standing-head disposition only once all selected heads
-   * have passed clean-yield enforcement. This remains a sibling of
-   * `run_yield_rejected`: pilots can count accepted and rejected no-change
-   * attempts without parsing an actor-authored yield note.
-   */
-  private recordStandingHeadVerified(actorId: string, obligation: Obligation): void {
-    this.recordEvent({
-      kind: "standing_head_verified",
-      actorId,
-      detail: `Standing head obligation ${obligation.id} verified for clean yield: checkpoint rewritten by this actor during this run`,
-      payload: JSON.stringify({ obligationId: obligation.id, title: obligation.title }),
-    });
-  }
-
-  /**
-   * The run-attribution check shared by strict handoffs and verified standing
-   * no-change yields. Selection snapshots the checkpoint's complete identity;
-   * a different complete identity on a checkpoint written by this actor is
-   * the durable proof it was rewritten after selection.
-   */
-  private checkpointWasRewrittenSinceSelection(
-    actorId: string,
-    obligation: Obligation,
-    selected: SelectedHeadSnapshot
-  ): boolean {
-    return (
-      Boolean(obligation.checkpoint) &&
-      obligation.checkpointBy === actorId &&
-      (obligation.checkpoint !== selected.checkpoint ||
-        obligation.checkpointAt !== selected.checkpointAt ||
-        obligation.checkpointBy !== selected.checkpointBy)
-    );
   }
 
   /**
@@ -3393,7 +3300,7 @@ export class ActorMesh {
     // `root-llm` is a RootControlPrincipal, not a thread id. RootControlService
     // scopes its target to the injected rootId's subtree before calling here;
     // human/e2e principals are operator-level bypasses by design.
-    if (!isTrustedControlPrincipal(by) && !this.isAncestorOf(by, targetId)) {
+    if (!isTrustedControlPrincipal(by, this.principals) && !this.isAncestorOf(by, targetId)) {
       throw new Error(
         `actor ${by} may only interrupt its descendants (cannot interrupt ${targetId})`
       );
@@ -3656,7 +3563,7 @@ export class ActorMesh {
       );
     }
     const authorized =
-      isTrustedControlPrincipal(by) ||
+      isTrustedControlPrincipal(by, this.principals) ||
       this.isAncestorOf(by, message.fromId) ||
       this.isAncestorOf(by, message.toId);
     if (!authorized) {
@@ -3754,6 +3661,7 @@ export class ActorMesh {
     // the only place the `scheduled_message_cancelled` audit record is written.
     // Dropping here would have been a second, unaudited way for a message to
     // die, reachable only by racing a check that cannot actually be raced.
+    if (record) void this.lifecycleFor(id).emit("onRetire", { actorId: id });
     if (record && this.onRetire) {
       try {
         this.onRetire(record);
@@ -3792,6 +3700,7 @@ export class ActorMesh {
       actorId: id,
     });
     if (record) this.runRetireCleanups(record);
+    this.lifecycles.delete(id);
     this.log(`retired ${id}`);
   }
 
@@ -4045,13 +3954,12 @@ export class ActorMesh {
 
   /**
    * Apply the staged modelConfig replacement at whichever boundary the
-   * actor's current state puts it behind next: dispatch (queued/idle, called
-   * from the `onRunStart` wiring just before that run's `run_start` is
-   * recorded and its provider launches) or run end (mid-run, called from
-   * {@link finishInboxRun}).
-   * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
-   * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
-   * outside the `createActor` factory and must call this directly.
+   * actor's current state puts it behind next: dispatch (queued/idle, from
+   * `beforeRun` just before that run's `run_start` is recorded and its provider
+   * launches) or run end (mid-run, from {@link finishInboxRun}).
+   * Public — like {@link finishInboxRun} and {@link actorQueued} — because both
+   * factory-created workers and the externally-constructed root invoke it at
+   * their dispatch boundary.
    * A no-op when nothing is staged, so calling it from both boundaries on the
    * same run is safe: whichever fires first consumes the pending pool.
    */
@@ -4352,6 +4260,7 @@ export class ActorMesh {
       getRecord: () => this.actors.get(record.id),
       executionTarget: record.executionTarget,
       mesh: this,
+      lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
         const rec = this.actors.get(record.id);
@@ -4382,22 +4291,8 @@ export class ActorMesh {
       },
       admitRun: ({ responsive, mode }) =>
         responsive || mode !== "ordinary" || !this.isVoiceSessionActive(record.id),
-      onQueued: (context) => {
-        this.actorQueued(record.id, context);
-      },
-      onRunEnd: (result, runId) => {
-        this.finishInboxRun(record.id);
-        this.accountRun(record.id, result, runId);
-        // Safety net: the start/cancel hooks are the primary clearing
-        // points, but a selection must never survive past its run ending.
-        this.clearSelection(record.id);
-      },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
-      onRunAbandoned: () => {
-        this.abandonInboxRun(record.id);
-        this.clearSelection(record.id);
-      },
     };
   }
 

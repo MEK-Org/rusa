@@ -75,8 +75,9 @@ this branch, not permanently.
 
 **Prefix tests on a caller's identity**
 
-- `src/actor/actor-mesh.ts` — human-origin message handling, and the
-  system-author suppression rule in `deliverEvent`.
+- `src/actor/actor-mesh.ts` — human-origin message handling.
+- `src/runtime/event-manager.ts` — the system-author suppression rule in
+  `applyAuthorSuppression`.
 - `src/mcp/agent-exec-mcp.ts` — the human-operator branch on `selfId`.
 - `src/actor/inbox-hints.ts` — human-origin hinting on `fromId`.
 - `src/actor/failure-sink.ts` — `isHumanOperatorCancelled`.

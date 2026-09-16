@@ -681,7 +681,7 @@ describe("loadConfig quota throttle", () => {
     ).toThrow(/mesh\.quotaThrottle has moved to quota\.throttle/);
   });
 
-  it("requires shared persistence when adaptive pacing is enabled", () => {
+  it("requires coordinator socket when adaptive pacing is enabled", () => {
     expect(() =>
       loadConfig(
         writeConfig({
@@ -690,28 +690,36 @@ describe("loadConfig quota throttle", () => {
           },
         })
       )
-    ).toThrow(/quota\.databasePath is required/);
+    ).toThrow(/quota\.coordinator\.socketPath is required/);
   });
 
-  it("accepts the canonical quota location", () => {
+  it("rejects databasePath-only configuration when quota.throttle.enabled is true", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            databasePath: "/srv/rusa/quota.db",
+            throttle: {
+              enabled: true,
+              maxIntervalSeconds: 3600,
+              tickSeconds: 300,
+            },
+          },
+        })
+      )
+    ).toThrow(/quota\.coordinator\.socketPath is required/);
+  });
+
+  it("accepts databasePath when throttling is disabled", () => {
     const config = loadConfig(
       writeConfig({
         quota: {
           databasePath: "/srv/rusa/quota.db",
-          throttle: {
-            enabled: true,
-            maxIntervalSeconds: 3600,
-            tickSeconds: 300,
-          },
         },
       })
     );
 
-    expect(config.quota?.throttle).toEqual({
-      enabled: true,
-      maxIntervalSeconds: 3600,
-      tickSeconds: 300,
-    });
+    expect(config.quota?.databasePath).toBe("/srv/rusa/quota.db");
   });
 
   it.each([
@@ -793,6 +801,54 @@ describe("loadConfig shared quota store", () => {
         })
       )
     ).toThrow(/unknown key quota.coordinator.socketpath/);
+  });
+
+  it("accepts quota.coordinator.socketPath when quota.throttle.enabled is true without databasePath", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          coordinator: {
+            socketPath: "/run/rusa/coordinator.sock",
+          },
+          throttle: {
+            enabled: true,
+            maxIntervalSeconds: 1800,
+          },
+        },
+      })
+    );
+
+    expect(config.quota?.coordinator?.socketPath).toBe("/run/rusa/coordinator.sock");
+    expect(config.quota?.throttle?.enabled).toBe(true);
+    expect(config.quota?.throttle?.maxIntervalSeconds).toBe(1800);
+    expect(config.quota?.databasePath).toBeUndefined();
+  });
+
+  it("accepts and trims the backup location", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          coordinator: {
+            databasePath: "/srv/rusa/quota-coordinator.db",
+            backupDir: "  /srv/rusa/quota-backups  ",
+            backupRetention: 30,
+          },
+        },
+      })
+    );
+    expect(config.quota?.coordinator?.backupDir).toBe("/srv/rusa/quota-backups");
+    expect(config.quota?.coordinator?.backupRetention).toBe(30);
+  });
+
+  it("rejects a retention that would keep nothing", () => {
+    for (const backupRetention of [0, -1, 1.5]) {
+      expect(() =>
+        loadConfig(writeConfig({ quota: { coordinator: { backupRetention } } }))
+      ).toThrow(/quota.coordinator.backupRetention must be a positive integer/);
+    }
+    expect(() => loadConfig(writeConfig({ quota: { coordinator: { backupDir: "   " } } }))).toThrow(
+      /quota.coordinator.backupDir must be a non-empty string/
+    );
   });
 });
 

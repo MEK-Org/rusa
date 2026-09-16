@@ -1,4 +1,5 @@
 import { Actor } from "../../actor/actor.js";
+import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
 import type { McpServerSpec } from "../../providers/types.js";
@@ -133,13 +134,45 @@ export function createActorRuntime(
           finishClose();
         }
       },
-      onQueued: (context) => send({ type: "queued", ...context }),
-      onRunEnd: (result) =>
-        stopping ? Promise.resolve() : request<void>({ op: "complete", result }).result,
-      onRunStart: (responsive, injectRecord, selected) =>
-        send({ type: "runStart", responsive, injectRecord, selected }),
+      lifecycle: createActorLifecycle([
+        {
+          onQueued: (event) =>
+            send({
+              type: "queued",
+              responsive: event.responsive,
+              mode: event.mode,
+              runId: event.runId,
+            }),
+          onStart: (event) =>
+            send({
+              type: "runStart",
+              responsive: event.responsive,
+              injectRecord: event.injectRecord,
+              selected: event.selected,
+              runId: event.runId,
+            }),
+          onError: (event) =>
+            send({
+              type: "error",
+              error: event.error instanceof Error ? event.error.message : String(event.error),
+            }),
+          onEnd: (event) => {
+            if (event.terminal.kind === "abandoned") {
+              send({
+                type: "abandoned",
+                abandon: {
+                  reason: event.terminal.reason,
+                  started: event.terminal.started,
+                },
+              });
+              return;
+            }
+            if (!stopping)
+              return request<void>({ op: "complete", result: event.terminal.result }).result;
+          },
+        },
+      ]),
       onFirstChunk: () => send({ type: "firstChunk" }),
-      onRunAbandoned: (abandon) => send({ type: "abandoned", abandon }),
       onContinue: (count) => send({ type: "continue", count }),
       onContinuationCapped: (count) => send({ type: "capped", count }),
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),

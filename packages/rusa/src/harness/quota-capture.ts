@@ -28,19 +28,17 @@
  * side would be a number measuring nothing — this arc's recurring failure — so
  * {@link diffQuota} refuses, with the reason attached, rather than producing one.
  *
- * ## The cache trap, stated because it nearly landed
- * `QuotaService.getQuota` is TTL-cached: 5 minutes for claude/agy/kimi and **30 minutes for
- * codex**. A short A/B run finishes well inside the codex TTL, so a naive before/after
- * through one shared service returns the SAME snapshot twice and computes a burn of exactly
- * `0` — a green-looking measurement of nothing at all. Two defences, because one of them is
- * a configuration a caller can get wrong:
- *
- * - the driver builds its capture service with `ttlMs: 0` so every capture is a real probe;
- * - {@link diffQuota} compares the two readings' `scrapedAt` stamps and REFUSES when they
- *   are identical, because that is the cache serving the launch reading at exit.
- *
- * The second one is the load-bearing one: it detects the mistake instead of trusting that
- * nobody made it.
+ * ## Equal `scrapedAt` is "no measurement", never a zero
+ * The rig reads both of its readings from the quota coordinator's evidence view
+ * (`GET /v1/quota`), which serves the service's last observation and never probes on
+ * request. A run shorter than the service's tick can land entirely between two
+ * observations: the exit reading is then the launch reading again, and a naive subtraction
+ * computes a burn of exactly `0` — a green-looking measurement of nothing at all. This is
+ * the same trap the rig's former TTL-cached `QuotaService` set, with a different source
+ * behind it, and the same defence covers both: {@link diffQuota} compares the two
+ * readings' `scrapedAt` stamps and REFUSES when they are identical, because an unchanged
+ * stamp means no new observation was made, not that nothing was consumed. It detects the
+ * condition instead of trusting that the run was long enough.
  */
 
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
@@ -82,9 +80,9 @@ export interface QuotaCapture {
   requestedAt: string;
   outcome: QuotaReadOutcome;
   /**
-   * When the PROBE says it actually scraped the provider, when it says at all. Distinct
+   * When the SOURCE says it actually scraped the provider, when it says at all. Distinct
    * from {@link requestedAt} on purpose: it is what {@link diffQuota} uses to tell a fresh
-   * exit reading from the launch reading served back out of the TTL cache.
+   * exit observation from the launch observation served again unchanged.
    */
   scrapedAt: string | null;
   /** The provider's own status verbatim (`available` / `exhausted` / `unknown` / …). */
@@ -212,7 +210,7 @@ export async function captureQuota(
     scrapedAt,
     status,
     windows,
-    message: `quota read at ${phase} — ${usable
+    message: `quota read at ${phase}${scrapedAt ? ` (observed ${scrapedAt})` : ""} — ${usable
       .map((w) => `${w.label} ${w.percentLeft}% left`)
       .join(", ")}`,
   };
@@ -319,13 +317,15 @@ export function diffQuota(before: QuotaCapture | null, after: QuotaCapture | nul
     );
   }
 
-  // The cache trap. Identical scrape stamps mean the exit call was served the launch
-  // reading out of the TTL cache and no second probe ever ran, which would otherwise
-  // compute a perfect, entirely fictional burn of 0.
+  // Identical scrape stamps mean the exit reading IS the launch reading — the source made
+  // no new observation in between (the coordinator's tick did not fall inside the run, or
+  // a cache served the first reading twice) — which would otherwise compute a perfect,
+  // entirely fictional burn of 0. That is no measurement, not a zero delta.
   if (before.scrapedAt !== null && before.scrapedAt === after.scrapedAt) {
     return refuse(
-      `both readings carry the same scrapedAt (${before.scrapedAt}) — the exit reading is ` +
-        `the launch reading served from the quota TTL cache, not a second probe`,
+      `both readings carry the same scrapedAt (${before.scrapedAt}) — no new quota ` +
+        `observation was made between launch and exit, so this run has NO MEASUREMENT ` +
+        `(not a zero delta)`,
       pairWindows(before.windows, after.windows)
     );
   }
@@ -336,10 +336,15 @@ export function diffQuota(before: QuotaCapture | null, after: QuotaCapture | nul
     return refuse("no window has a numbered reading at BOTH ends", windows);
   }
 
+  const windowPrefix =
+    before.scrapedAt && after.scrapedAt
+      ? `burn (observed ${before.scrapedAt} → ${after.scrapedAt})`
+      : "burn";
+
   return {
     computed: true,
     windows,
-    message: `burn — ${measured
+    message: `${windowPrefix} — ${measured
       .map(
         (w) =>
           `${w.label} ${w.beforePercentLeft}% → ${w.afterPercentLeft}% left (${w.consumedPoints} pts)`

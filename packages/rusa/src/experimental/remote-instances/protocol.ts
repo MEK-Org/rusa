@@ -73,7 +73,8 @@ export type ActorEvent =
   | { type: "release"; requestId: number }
   | { type: "state"; state: ActorRuntimeState; yielded: boolean }
   | { type: "session"; sessionId: string }
-  | { type: "queued"; responsive: boolean; mode: ActorRunMode }
+  | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
+  | { type: "error"; error: string }
   | { type: "result"; result: RunResult }
   | {
       type: "runStart";
@@ -81,6 +82,7 @@ export type ActorEvent =
       injectRecord?: PromptBuild["injectRecord"];
       /** The candidate this run actually launched on, for leader-side accounting. */
       selected: RawProviderModelConfig;
+      runId?: string;
     }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }

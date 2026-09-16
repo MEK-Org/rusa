@@ -182,8 +182,7 @@ function setup(
         buildPrompt: () => ({ prompt: "Read inbox" }),
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
-        onQueued: ctx.onQueued,
-        onRunEnd: ctx.onRunEnd,
+        lifecycle: ctx.lifecycle,
         debounceMs: 1,
       }),
   });

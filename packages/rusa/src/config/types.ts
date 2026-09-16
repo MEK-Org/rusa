@@ -100,14 +100,25 @@ export interface QuotaCoordinatorConfig {
   socketPath?: string;
   /** Relocated database path owned exclusively by the coordinator. */
   databasePath?: string;
+  /**
+   * Directory the daily `VACUUM INTO` backups are written to.
+   * Defaults to a `backups/` directory beside the coordinator database, which
+   * keeps a backup on the same filesystem as its source.
+   *
+   * A relative path resolves against `RUSA_HOME` (the instance home, e.g.
+   * `~/.rusa`), not against the process working directory — the coordinator
+   * runs as a systemd user unit whose working directory is not something an
+   * operator editing this file should have to know.
+   */
+  backupDir?: string;
+  /** How many daily backups to keep. Defaults to 14. */
+  backupRetention?: number;
 }
 
 /** Shared quota evidence, controller state, and launch pacing. */
 export interface QuotaConfig {
   /**
-   * SQLite database used for quota scrapes, canonical observations, and pacing state.
-   * Multiple rusa instances that share provider credentials should point at the same file.
-   * Required when quota.throttle is enabled.
+   * SQLite database used by the coordinator process; not read by instances.
    */
   databasePath?: string;
   /** Closed-loop launch pacing configuration. */
@@ -261,9 +272,9 @@ export interface DiskAlertConfig {
   enabled?: boolean;
   /** The path to the relevant volume to check. Defaults to "/". */
   volume?: string;
-  /** Free disk space percentage threshold (0-100). Defaults to undefined. */
+  /** Free disk space percentage threshold (0-100). Defaults to 10 when neither threshold is set. */
   thresholdPercent?: number;
-  /** Free disk space threshold in bytes. Evaluated along with thresholdPercent if both are set. Defaults to 2G (2,147,483,648 bytes) when neither threshold is set. */
+  /** Free disk space threshold in bytes. Evaluated along with thresholdPercent if both are set. Defaults to undefined; set it for an absolute floor alongside or instead of the percentage. */
   thresholdBytes?: number;
   /** Scan interval in seconds. Defaults to 600 (10 mins). */
   intervalSeconds?: number;

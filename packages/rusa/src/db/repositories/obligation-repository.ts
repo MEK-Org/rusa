@@ -29,6 +29,7 @@ import {
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
+import type { PrincipalKind } from "../../principals/principal-ref.js";
 
 function isActorEntityId(id: EntityId): boolean {
   return !id.startsWith("human:") && !id.startsWith("system:");
@@ -351,6 +352,9 @@ export class ObligationRepository {
 
   private scheduler?: ObligationActivationScheduler;
 
+  /** Resolves durable principal ids whose kind cannot be inferred from a prefix. */
+  private principalKind?: (principalId: string) => PrincipalKind | undefined;
+
   /** Set once the connection carries the TEMP capture table and trigger. */
   private historyCaptureInstalled = false;
 
@@ -594,6 +598,26 @@ export class ObligationRepository {
     this.actorExists = probe;
   }
 
+  /**
+   * Supply the authoritative principal-kind lookup used by owner validation
+   * and actor-only ready-head delivery. The prefix check remains only as a
+   * compatibility fallback for repositories constructed without principals.
+   */
+  setPrincipalKind(probe: (principalId: string) => PrincipalKind | undefined): void {
+    this.principalKind = probe;
+  }
+
+  private isActorOwner(ownerId: EntityId): boolean {
+    const kind = this.principalKind?.(ownerId);
+    return kind === undefined ? isActorEntityId(ownerId) : kind === "actor";
+  }
+
+  private assertOwnerExists(ownerId: EntityId): void {
+    if (this.isActorOwner(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
+      throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
+    }
+  }
+
   setReadyHeadListener(listener: ((change: ReadyHeadChange) => void) | undefined): void {
     this.readyHeadListener = listener;
   }
@@ -786,7 +810,7 @@ export class ObligationRepository {
       const after = this.readyHeads();
 
       for (const ownerId of before.keys()) {
-        if (!after.has(ownerId) && isActorEntityId(ownerId)) {
+        if (!after.has(ownerId) && this.isActorOwner(ownerId)) {
           const previousHeadId = before.get(ownerId) ?? null;
           const now = this.stamp();
           this.db
@@ -812,7 +836,7 @@ export class ObligationRepository {
       for (const [ownerId, headId] of after) {
         const previousHeadId = before.get(ownerId) ?? null;
         if (previousHeadId === headId) continue;
-        if (!isActorEntityId(ownerId)) continue;
+        if (!this.isActorOwner(ownerId)) continue;
         const head = this.get(headId);
         if (!head) continue;
 
@@ -1073,9 +1097,7 @@ export class ObligationRepository {
       if (parentId === id) throw new ObligationValidationError("obligation cannot parent itself");
       const ownerId = validateEntityId(input.ownerId);
       const title = validateObligationTitle(input.title);
-      if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
-        throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
-      }
+      this.assertOwnerExists(ownerId);
 
       const recurrence = input.recurrence;
       if (recurrence?.policy === "cron") this.assertFiringCronExpr(recurrence.cronExpr);
@@ -1885,9 +1907,7 @@ export class ObligationRepository {
         throw new ObligationValidationError("terminal obligations cannot be reassigned");
       }
       const ownerId = validateEntityId(newOwnerId);
-      if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
-        throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
-      }
+      this.assertOwnerExists(ownerId);
       if (ownerId === obligation.ownerId) {
         return obligation;
       }

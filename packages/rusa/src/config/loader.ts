@@ -308,13 +308,18 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       ) {
         throw new Error("config.yaml: quota.coordinator must be a mapping when set");
       }
-      const allowedCoordinatorKeys = new Set(["socketPath", "databasePath"]);
+      const allowedCoordinatorKeys = new Set([
+        "socketPath",
+        "databasePath",
+        "backupDir",
+        "backupRetention",
+      ]);
       for (const k of Object.keys(quota.coordinator)) {
         if (!allowedCoordinatorKeys.has(k)) {
           throw new Error(`config.yaml: unknown key quota.coordinator.${k}`);
         }
       }
-      for (const key of ["socketPath", "databasePath"] as const) {
+      for (const key of ["socketPath", "databasePath", "backupDir"] as const) {
         const value = quota.coordinator[key];
         if (value !== undefined) {
           if (typeof value !== "string" || !value.trim()) {
@@ -325,10 +330,21 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
           quota.coordinator[key] = value.trim();
         }
       }
+      const retention = quota.coordinator.backupRetention;
+      if (retention !== undefined) {
+        // Retention zero would mean "delete the backup you just took", so the
+        // floor is one rather than zero: turning backups off is not spelled
+        // "keep none of them".
+        if (typeof retention !== "number" || !Number.isInteger(retention) || retention < 1) {
+          throw new Error(
+            "config.yaml: quota.coordinator.backupRetention must be a positive integer when set"
+          );
+        }
+      }
     }
-    if (quota.throttle?.enabled === true && !quota.databasePath) {
+    if (quota.throttle?.enabled === true && !quota.coordinator?.socketPath) {
       throw new Error(
-        "config.yaml: quota.databasePath is required when quota.throttle.enabled is true"
+        "config.yaml: quota.coordinator.socketPath is required when quota.throttle.enabled is true"
       );
     }
   }
