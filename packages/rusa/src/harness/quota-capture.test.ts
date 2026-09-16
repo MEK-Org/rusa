@@ -86,6 +86,7 @@ describe("captureQuota — a reading never ends the run ", () => {
 
     expect(capture.outcome).toBe("read");
     expect(capture.scrapedAt).toBe(AT_LAUNCH);
+    expect(capture.message).toContain(`observed ${AT_LAUNCH}`);
     expect(capture.windows).toEqual([
       { label: "5h limit", kind: "five_hour", percentLeft: 100 },
       { label: "Weekly limit", kind: "weekly", percentLeft: 46 },
@@ -131,6 +132,7 @@ describe("diffQuota — the burn, or an explicit refusal ", () => {
     );
 
     expect(burn.computed).toBe(true);
+    expect(burn.message).toContain(`burn (observed ${AT_LAUNCH} → ${AT_EXIT})`);
     expect(burn.windows.map((w) => [w.kind, w.consumedPoints])).toEqual([
       ["five_hour", 73],
       ["weekly", 14],
@@ -138,9 +140,9 @@ describe("diffQuota — the burn, or an explicit refusal ", () => {
     expect(burn.windows.every((w) => w.note === null)).toBe(true);
   });
 
-  it("REFUSES when both readings carry the same scrapedAt — the TTL cache trap", async () => {
-    // codex's quota TTL is 30 minutes, longer than a short A/B run. A before/after pair
-    // through one cached service returns the identical snapshot twice.
+  it("REFUSES when both readings carry the same scrapedAt — no new observation, not a zero delta", async () => {
+    // The coordinator serves its last observation; a run shorter than its tick reads the
+    // identical snapshot at both ends (as a TTL-cached service once did).
     const cached = kimiSnapshot(AT_LAUNCH, 100, 46);
     const burn = diffQuota(await capture("launch", cached), await capture("exit", cached));
 
@@ -151,7 +153,8 @@ describe("diffQuota — the burn, or an explicit refusal ", () => {
     expect(burn.windows).toHaveLength(2);
     expect(burn.windows.every((w) => w.consumedPoints === null)).toBe(true);
     if (burn.computed) throw new Error("unreachable");
-    expect(burn.reason).toContain("served from the quota TTL cache");
+    expect(burn.reason).toContain("NO MEASUREMENT");
+    expect(burn.reason).toContain("no new quota observation");
     expect(burn.reason).toContain(AT_LAUNCH);
   });
 

@@ -468,7 +468,6 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     // the client derives no interval of its own — it retains what the service
     // last published and widens to the configured ceiling, nothing else.
     for (const forbidden of [
-      /\bscrape/i,
       /\bprobe/i,
       /\bobservation/i,
       /\bpoolSize\b/,

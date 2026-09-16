@@ -55,6 +55,25 @@ export function defaultQuotaCoordinatorSocketPath(): string {
 }
 
 /**
+ * Where the coordinator listens: an explicit override, else the configured
+ * `quota.coordinator.socketPath`, else the host default. One resolution shared by the
+ * service that binds the socket and every client that dials it, so that two callers
+ * handing it the same config cannot resolve different paths. Resolving the appropriate
+ * config home is the caller's responsibility, with `resolveHome()` being what the service
+ * uses.
+ */
+export function resolveQuotaCoordinatorSocketPath(
+  config: RusaConfig | null | undefined,
+  override?: string
+): string {
+  return (
+    override?.trim() ||
+    config?.quota?.coordinator?.socketPath?.trim() ||
+    defaultQuotaCoordinatorSocketPath()
+  );
+}
+
+/**
  * The coordinator is a separate process, so restore the last durable runtime
  * model catalog before it asks the quota parser to classify model windows.
  * This is intentionally a read-only best-effort input: an absent local catalog
@@ -103,10 +122,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
 
-  const socketPath =
-    opts.socketPath?.trim() ||
-    config.quota?.coordinator?.socketPath?.trim() ||
-    defaultQuotaCoordinatorSocketPath();
+  const socketPath = resolveQuotaCoordinatorSocketPath(config, opts.socketPath);
 
   const configuredDb =
     opts.databasePath?.trim() ||
