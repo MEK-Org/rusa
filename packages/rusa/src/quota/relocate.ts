@@ -83,8 +83,8 @@ function createBlockingDirectory(path: string): boolean {
  * Fold WAL state into the main file so the one rename below moves everything.
  *
  * Stage 3 is a scheduled quiesce, and this is where a missed quiesce shows up:
- * a checkpoint that finds another connection fails immediately (busy timeout
- * zero) with every path untouched, rather than waiting behind a live instance
+ * a checkpoint that encounters another active reader or writer fails immediately
+ * (busy timeout zero) with every path untouched, rather than waiting behind a live instance
  * and turning the flip into a concurrency window. There is deliberately no
  * attempt to make a three-file SQLite rename look atomic.
  */
