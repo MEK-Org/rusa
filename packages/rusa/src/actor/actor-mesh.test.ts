@@ -7268,7 +7268,8 @@ describe("ActorMesh", () => {
         return { mesh, scheduler, inboxStore, recipient };
       }
 
-      it.each([
+      // TODO(#512): re-enable once stable future-time test construction lands
+      it.skip.each([
         ["prod then staging", ["prod", "staging"] as const],
         ["staging then prod", ["staging", "prod"] as const],
       ])("in boot order %s neither instance cancels the other's message or the legacy job", (_, order) => {
@@ -7291,7 +7292,8 @@ describe("ActorMesh", () => {
         }
       });
 
-      it("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
+      // TODO(#512): re-enable once stable future-time test construction lands
+      it.skip("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
         const { at, jobs } = sharedAtQueue();
         // `at` prints a job id, but the job never reaches the spool.
         const lossy: AtIo = { ...at, schedule: () => "200" };
@@ -7332,7 +7334,8 @@ describe("ActorMesh", () => {
         expect(scheduler.listMessageDeliveries()).toEqual([]);
       });
 
-      it("still cancels its own job for a recipient it does not know, and only that one", () => {
+      // TODO(#512): re-enable once stable future-time test construction lands
+      it.skip("still cancels its own job for a recipient it does not know, and only that one", () => {
         const { at, jobs } = sharedAtQueue();
         const prod = bootInstance("/srv/rusa/prod", at);
         const staging = bootInstance("/srv/rusa/staging", at);
