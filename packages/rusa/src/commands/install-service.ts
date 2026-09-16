@@ -20,9 +20,12 @@ import {
   getRemoteUrl,
   initializeWorkspace,
 } from "../gitops/worktree.js";
-import { resolveQuotaDatabasePath } from "../quota/shared-store.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
-import { defaultQuotaBackupDir, defaultQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
+import {
+  defaultQuotaBackupDir,
+  defaultQuotaCoordinatorSocketPath,
+  resolveCoordinatorDatabasePaths,
+} from "./quota-coordinator.js";
 import {
   type DeploymentMode,
   type ExecutableSource,
@@ -760,16 +763,11 @@ export async function runInstallQuotaCoordinator(opts?: {
   }
   const config = loadConfig(instance.mcHome);
 
-  const configuredDatabasePath =
-    config.quota?.coordinator?.databasePath?.trim() || config.quota?.databasePath?.trim();
-  if (!configuredDatabasePath) {
-    throw new Error(
-      "The quota coordinator needs a database: set quota.coordinator.databasePath " +
-        "(or quota.databasePath) in config.yaml first."
-    );
-  }
-
-  const databasePath = resolveQuotaDatabasePath(configuredDatabasePath, instance.mcHome);
+  // The unit runs `quota-coordinator` with no `--database`, so the preflight
+  // applies the same rule the service will: only the service-owned path
+  // starts, and a config still naming the pre-service file is refused here
+  // rather than by a unit that fails on its first start.
+  const { databasePath } = resolveCoordinatorDatabasePaths(config, instance.mcHome);
   const { workersDir } = preflightProbeEnvironment(instance.mcHome);
 
   const executableSource = resolveExecutableSource(deploymentMode, opts?.repoPath);
