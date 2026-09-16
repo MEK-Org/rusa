@@ -18,7 +18,16 @@ const googleVoiceConfigSchema = z
  * provider union in one place; API ingress, actor records, and storage all
  * consume this same schema and inferred type.
  */
-export const voiceConfigSchema = z.discriminatedUnion("provider", [googleVoiceConfigSchema]);
+export const voiceConfigSchema = z.discriminatedUnion("provider", [
+  googleVoiceConfigSchema,
+  z
+    .object({
+      schemaVersion: z.literal(1),
+      provider: z.literal("elevenlabs"),
+      config: z.object({ voiceId: z.string().trim().min(1) }).strict(),
+    })
+    .strict(),
+]);
 
 export type VoiceConfigDocument = z.infer<typeof voiceConfigSchema>;
 

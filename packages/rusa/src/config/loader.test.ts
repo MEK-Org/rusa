@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { providerThrottleKey } from "../providers/registry.js";
 import { loadConfig } from "./loader.js";
+import { ELEVENLABS_API_KEY_SECRET_FILENAME } from "./secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
 function writeConfig(overrides: Record<string, unknown> = {}): string {
@@ -190,6 +191,23 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeFileSync(join(dir, name), value, { mode: 0o600 });
   }
+
+  it("loads the ElevenLabs host secret ahead of the inline key and warns about the duplicate", () => {
+    const home = writeConfig({ elevenlabsApiKey: "inline-key" });
+    writeSecret(home, ELEVENLABS_API_KEY_SECRET_FILENAME, "  file-key  ");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const config = loadConfig(home);
+    expect(config.elevenlabsApiKey).toBe("file-key");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/elevenlabsApiKey.*secrets file wins/)
+    );
+    for (const call of warnSpy.mock.calls) {
+      expect(String(call[0])).not.toContain("file-key");
+      expect(String(call[0])).not.toContain("inline-key");
+    }
+    warnSpy.mockRestore();
+  });
 
   it("secrets/gemini-api-key wins over the inline geminiApiKey (trimmed) and warns about the duplicate", () => {
     const home = writeConfig({ geminiApiKey: "inline-key" });
@@ -890,7 +908,52 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   });
 });
 
-describe("loadConfig voice (ISSUE_NUM, optional)", () => {
+describe("loadConfig voice (optional)", () => {
+  it("loads a mixed provider catalog and canonicalizes its documents", () => {
+    const voiceConfig = { schemaVersion: 1, provider: "google", config: { voiceName: " puck " } };
+    const eleven = { schemaVersion: 1, provider: "elevenlabs", config: { voiceId: " id " } };
+    const voice = loadConfig(
+      writeConfig({
+        voice: {
+          supportedVoices: [
+            { label: " Puck ", voiceConfig },
+            { label: "Christopher", voiceConfig: eleven },
+          ],
+        },
+      })
+    ).voice;
+    expect(voice?.supportedVoices).toEqual([
+      { label: "Puck", voiceConfig: { ...voiceConfig, config: { voiceName: "Puck" } } },
+      { label: "Christopher", voiceConfig: { ...eleven, config: { voiceId: "id" } } },
+    ]);
+    const entry = { label: "Puck", voiceConfig };
+    for (const entries of [
+      null,
+      ["id"],
+      [{ ...entry, label: " " }],
+      [{ ...entry, voiceConfig: { ...voiceConfig, provider: "unknown" } }],
+      [entry, entry],
+    ]) {
+      expect(() => loadConfig(writeConfig({ voice: { supportedVoices: entries } }))).toThrow(
+        /supportedVoices/
+      );
+    }
+    expect(
+      loadConfig(writeConfig({ voice: { supportedVoices: [] } })).voice?.supportedVoices
+    ).toEqual([]);
+  });
+
+  it("loads ElevenLabs transcription and rejects unknown providers", () => {
+    const config = loadConfig(
+      writeConfig({ elevenlabsApiKey: "key", voice: { transcriptionProvider: "elevenlabs" } })
+    );
+    expect(config.voice?.transcriptionProvider).toBe("elevenlabs");
+    expect(config.elevenlabsApiKey).toBe("key");
+    expect(() => loadConfig(writeConfig({ voice: { transcriptionProvider: "unknown" } }))).toThrow(
+      /transcriptionProvider/
+    );
+  });
+
   it("loads a config that omits the voice section", () => {
     expect(loadConfig(writeConfig()).voice).toBeUndefined();
   });

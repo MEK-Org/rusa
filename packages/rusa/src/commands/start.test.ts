@@ -26,8 +26,10 @@ import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
+import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { buildE2EConfig } from "../e2e/provision.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
@@ -38,6 +40,7 @@ import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/m
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
@@ -5937,5 +5940,210 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(joined).toBeDefined();
     expect(joined?.run_id).toBe(payload.runId);
     expect(joined?.actor_id).toBe(workerId);
+  });
+
+  it("fails startup when configured supportedVoices has no entries matching configured provider credentials", async () => {
+    let ready = false;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        elevenlabsApiKey: "fake-elevenlabs-key",
+        voice: {
+          supportedVoices: [
+            {
+              label: "Puck",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "google",
+                config: { voiceName: "Puck" },
+              },
+            },
+          ],
+        },
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      })
+    ).rejects.toThrow(
+      "voice.supportedVoices has no entries matching configured provider credentials"
+    );
+    expect(ready).toBe(false);
+  });
+
+  it("preserves default Google random voice assignment when supportedVoices is omitted", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const workerId = mesh.spawn({
+      charter: "omitted voice roster worker",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const record = getRepositories().actors.get(workerId);
+    expect(record?.voiceConfig?.provider).toBe("google");
+    expect(record?.voiceConfig?.schemaVersion).toBe(1);
+    if (record?.voiceConfig?.provider === "google") {
+      expect(SUPPORTED_TTS_VOICES).toContain(record.voiceConfig.config.voiceName);
+    }
+  });
+
+  it("starts an e2e instance provisioned from an ElevenLabs-only base config without credential-mismatch failure", async () => {
+    let ready = false;
+    const baseConfig = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash",
+        effort: "high",
+      },
+      geminiApiKey: "fake-gemini-key",
+      elevenlabsApiKey: "fake-elevenlabs-key",
+      voice: {
+        transcriptionProvider: "elevenlabs",
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "synthetic-voice-id-1" },
+            },
+          },
+        ],
+      },
+    } as unknown as RusaConfig;
+
+    const e2eConfig = buildE2EConfig({
+      scratchPath: join(homeDir, "scratch"),
+      baseConfig,
+    });
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(e2eConfig), "utf8");
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(ready).toBe(true);
+  });
+
+  it("warns when configured supportedVoices entries are excluded due to missing provider credentials", async () => {
+    logCapture.lines.length = 0;
+    let ready = false;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+        voice: {
+          supportedVoices: [
+            {
+              label: "Puck",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "google",
+                config: { voiceName: "Puck" },
+              },
+            },
+            {
+              label: "Christopher",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "elevenlabs",
+                config: { voiceId: "synthetic-voice-id-1" },
+              },
+            },
+          ],
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(ready).toBe(true);
+    const warningRecords = logCapture.lines
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((record) => record?.msg === "voice_supported_voices_excluded");
+    expect(warningRecords).toHaveLength(1);
+    expect(warningRecords[0]).toMatchObject({
+      level: "warn",
+      msg: "voice_supported_voices_excluded",
+      excludedCount: 1,
+      configuredCount: 2,
+      activeCount: 1,
+    });
   });
 });

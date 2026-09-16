@@ -272,7 +272,7 @@ class DashboardStore {
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
-  final _supportedVoices = BehaviorSubject<List<String>>.seeded(const []);
+  final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(const []);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
@@ -341,7 +341,7 @@ class DashboardStore {
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
-  ValueStream<List<String>> get supportedVoices => _supportedVoices.stream;
+  ValueStream<List<SupportedVoiceDto>> get supportedVoices => _supportedVoices.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
@@ -1130,15 +1130,21 @@ class DashboardStore {
   /// Set (or, with null, clear) the actor's persisted walkie-talkie voice.
   /// The next threads refresh reflects the change; synthesis picks it up on
   /// the actor's next spoken reply.
-  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+  Future<void> updateActorVoice(
+    String actorId,
+    VoiceConfigDto? voiceConfig,
+  ) async {
     try {
-      final updatedVoiceName = await _api.updateActorVoice(actorId, voiceName);
+      final updatedVoiceConfig = await _api.updateActorVoice(
+        actorId,
+        voiceConfig,
+      );
       final current = _actorStates.value;
       final existing = current.actors[actorId];
       if (existing != null) {
         final updatedActors = Map<String, ActorViewState>.of(current.actors);
         updatedActors[actorId] = existing.copyWith(
-          thread: existing.thread.copyWith(voiceName: updatedVoiceName),
+          thread: existing.thread.copyWith(voiceConfig: updatedVoiceConfig),
         );
         _actorStates.add(
           current.copyWith(
