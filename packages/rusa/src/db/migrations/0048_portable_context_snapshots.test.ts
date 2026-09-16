@@ -16,18 +16,10 @@ function seedDb(): Database.Database {
   return db;
 }
 
-const store = (
-  db: Database.Database,
-  over: { actorId?: string; generation?: number; snapshot?: string } = {}
-): void => {
-  db.prepare(
-    `INSERT INTO portable_context_snapshots
-       (actor_id, schema_version, generation, updated_at, snapshot)
-     VALUES (?, 3, ?, '2026-07-01T00:00:00.000Z', ?)`
-  ).run(
+const store = (db: Database.Database, over: { actorId?: string; snapshot?: string } = {}): void => {
+  db.prepare("INSERT INTO portable_context_snapshots (actor_id, snapshot) VALUES (?, ?)").run(
     over.actorId ?? "actor-a",
-    over.generation ?? 1,
-    over.snapshot ?? '{"schemaVersion":3,"actorId":"actor-a"}'
+    over.snapshot ?? '{"schemaVersion":3,"actorId":"actor-a","generation":1}'
   );
 };
 
@@ -54,7 +46,9 @@ describe("0048_portable_context_snapshots", () => {
     const db = seedDb();
     portableContextSnapshots.up(db);
     store(db);
-    expect(() => store(db, { generation: 2 })).toThrow();
+    expect(() =>
+      store(db, { snapshot: '{"schemaVersion":3,"actorId":"actor-a","generation":2}' })
+    ).toThrow();
   });
 
   it("requires a real actor", () => {
@@ -88,5 +82,17 @@ describe("0048_portable_context_snapshots", () => {
       .prepare("SELECT sql FROM sqlite_master WHERE name = 'portable_context_snapshots'")
       .get() as { sql: string };
     expect(sql.sql).not.toMatch(/CHECK|json_valid|json_extract/i);
+  });
+
+  // The document is the state. Mirroring its fields into columns would be a
+  // second copy of memory with no constraint keeping it honest, and nothing
+  // selects on those fields; a real query can add a projection with an index.
+  it("stores the document whole with nothing projected into its own column", () => {
+    const db = seedDb();
+    portableContextSnapshots.up(db);
+    const columns = db
+      .prepare("SELECT name FROM pragma_table_info('portable_context_snapshots')")
+      .all() as { name: string }[];
+    expect(columns.map((c) => c.name)).toEqual(["actor_id", "snapshot"]);
   });
 });

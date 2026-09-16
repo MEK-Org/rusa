@@ -21,7 +21,7 @@ export const PORTABLE_CONTEXT_IMPORT_SOURCE = PORTABLE_CONTEXT_DIRNAME;
 /** The read-only slice of {@link Repositories} a plan is allowed to touch. */
 interface PlanRepositories {
   actors: Pick<Repositories["actors"], "list">;
-  portableContext: Pick<Repositories["portableContext"], "find">;
+  portableContext: Pick<Repositories["portableContext"], "count">;
   legacyImportReceipts: Pick<Repositories["legacyImportReceipts"], "has">;
 }
 
@@ -162,17 +162,18 @@ export function planLegacyPortableContextImport(options: {
     }
   }
 
-  // No receipt but a durable snapshot already exists: something folded outside
+  // No receipt but durable snapshots already exist: something folded outside
   // the importer, so neither side can be shown to be newer. Refuse rather than
-  // guess which memory survives.
-  const alreadyDurable = snapshots.filter(
-    ({ actorId }) => options.repositories.portableContext.find(actorId) !== undefined
-  );
-  if (alreadyDurable.length > 0) {
+  // guess which memory survives. This is table-wide, not per file — the
+  // receipt is the precedence boundary for the whole source, so a directory
+  // holding only actors the database has never folded still cannot be
+  // blessed alongside rows that arrived some other way: that would issue a
+  // receipt for a database whose memory came from two provenances at once.
+  const durable = options.repositories.portableContext.count();
+  if (durable > 0) {
     throw new Error(
-      `Legacy portable-context import: ${directoryPath} is present but ` +
-        `${alreadyDurable.length} durable snapshot(s) were written without an import ` +
-        `receipt (e.g. '${alreadyDurable[0]?.actorId}'); refusing to overwrite them`
+      `Legacy portable-context import: ${directoryPath} is present but ${durable} durable ` +
+        "snapshot(s) were written without an import receipt; refusing to overwrite them"
     );
   }
 

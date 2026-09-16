@@ -5811,20 +5811,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // happens to be holding in memory.
     const probe = new Database(join(homeDir, "data", "mesh.db"));
     try {
-      expect(
-        probe
-          .prepare("SELECT actor_id, schema_version, generation FROM portable_context_snapshots")
-          .all()
-      ).toEqual([{ actor_id: "root", schema_version: 3, generation: 5 }]);
+      const committed = probe
+        .prepare("SELECT actor_id, snapshot FROM portable_context_snapshots")
+        .all() as { actor_id: string; snapshot: string }[];
+      expect(committed.map((row) => row.actor_id)).toEqual(["root"]);
+      expect(JSON.parse(committed[0]?.snapshot ?? "")).toMatchObject({
+        schemaVersion: 3,
+        generation: 5,
+      });
 
       // A fold the booted mesh has never seen, committed after boot by another
       // connection. A store that read the file once at startup cannot see this.
       probe
-        .prepare(
-          `UPDATE portable_context_snapshots
-             SET generation = 6, snapshot = ?
-           WHERE actor_id = 'root'`
-        )
+        .prepare("UPDATE portable_context_snapshots SET snapshot = ? WHERE actor_id = 'root'")
         .run(
           JSON.stringify({
             schemaVersion: 3,

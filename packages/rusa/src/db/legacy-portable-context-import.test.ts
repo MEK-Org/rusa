@@ -236,6 +236,25 @@ describe("legacy portable-context import", () => {
       expect(backups()).toEqual([]);
     });
 
+    // The receipt is the precedence boundary for the whole source, so the
+    // check is table-wide: a directory holding only actors the database has
+    // never folded still cannot be blessed next to rows that arrived some other
+    // way. Importing A here would issue a receipt for a database whose memory
+    // came from two provenances at once.
+    it("refuses when any durable snapshot exists with no receipt, even for an actor the directory lacks", () => {
+      repositories.portableContext.save(state(ACTOR_B, { generation: 9 }));
+      writeLegacy(`${ACTOR_A}.json`, state(ACTOR_A));
+
+      expect(() => runImport()).toThrow(
+        /1 durable snapshot\(s\) were written without an import receipt/
+      );
+      expect(repositories.portableContext.find(ACTOR_A)).toBeUndefined();
+      expect(repositories.portableContext.load(ACTOR_B).generation).toBe(9);
+      expect(repositories.legacyImportReceipts.has(PORTABLE_CONTEXT_IMPORT_SOURCE)).toBe(false);
+      expect(existsSync(directoryPath)).toBe(true);
+      expect(backups()).toEqual([]);
+    });
+
     // Preflight plans every import against one un-mutated copy, so a snapshot's
     // actor may legitimately be planned rather than committed.
     it("accepts an actor a legacy actor import has planned but not committed", () => {

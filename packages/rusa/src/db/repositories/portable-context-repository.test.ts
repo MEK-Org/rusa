@@ -100,10 +100,9 @@ describe("DbPortableContextStore", () => {
     store.save(state({ generation: 2, lastFoldedSourceId: "chat-2" }));
 
     expect(store.load(ACTOR_A)).toMatchObject({ generation: 2, lastFoldedSourceId: "chat-2" });
-    const rows = db
-      .prepare("SELECT actor_id, schema_version, generation FROM portable_context_snapshots")
-      .all();
-    expect(rows).toEqual([{ actor_id: ACTOR_A, schema_version: 3, generation: 2 }]);
+    const rows = db.prepare("SELECT actor_id FROM portable_context_snapshots").all();
+    expect(rows).toEqual([{ actor_id: ACTOR_A }]);
+    expect(store.count()).toBe(1);
   });
 
   it("keeps each actor's memory to itself", () => {
@@ -129,11 +128,10 @@ describe("DbPortableContextStore", () => {
       lastFoldedSourceId: undefined,
       lastFoldedMessageEventId: "legacy-message-event",
     };
-    db.prepare(
-      `INSERT INTO portable_context_snapshots
-         (actor_id, schema_version, generation, updated_at, snapshot)
-       VALUES (?, 2, 1, '2026-07-01T00:00:00.000Z', ?)`
-    ).run(ACTOR_A, JSON.stringify(legacy));
+    db.prepare("INSERT INTO portable_context_snapshots (actor_id, snapshot) VALUES (?, ?)").run(
+      ACTOR_A,
+      JSON.stringify(legacy)
+    );
 
     expect(store.load(ACTOR_A)).toMatchObject({
       schemaVersion: 3,
@@ -145,20 +143,17 @@ describe("DbPortableContextStore", () => {
   // unreconstructable memory with a generation-1 document.
   it("names an unreadable stored snapshot rather than reporting the actor as unfolded", () => {
     db.prepare(
-      `INSERT INTO portable_context_snapshots
-         (actor_id, schema_version, generation, updated_at, snapshot)
-       VALUES (?, 3, 1, '2026-07-01T00:00:00.000Z', 'not json at all')`
+      "INSERT INTO portable_context_snapshots (actor_id, snapshot) VALUES (?, 'not json at all')"
     ).run(ACTOR_A);
 
     expect(() => store.load(ACTOR_A)).toThrow(/invalid portable-context snapshot/);
   });
 
   it("refuses a snapshot filed under the wrong actor", () => {
-    db.prepare(
-      `INSERT INTO portable_context_snapshots
-         (actor_id, schema_version, generation, updated_at, snapshot)
-       VALUES (?, 3, 1, '2026-07-01T00:00:00.000Z', ?)`
-    ).run(ACTOR_B, JSON.stringify(state({ actorId: ACTOR_A })));
+    db.prepare("INSERT INTO portable_context_snapshots (actor_id, snapshot) VALUES (?, ?)").run(
+      ACTOR_B,
+      JSON.stringify(state({ actorId: ACTOR_A }))
+    );
 
     expect(() => store.load(ACTOR_B)).toThrow(/actor mismatch/);
   });

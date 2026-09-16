@@ -5,6 +5,11 @@ import type { Migration } from "./types.js";
  * Durable storage for portable-context snapshots (#473), retiring the
  * per-actor `portable-context/<actorId>.json` files as a source of truth.
  *
+ * The operator asked for this boundary crossing in
+ * https://github.com/MEK-Org/rusa/issues/173#issuecomment-5525963850 — "any
+ * persistence that lives in a json file today should be moved into the db" —
+ * which #175 turned into the inventory this table is one slice of.
+ *
  * A snapshot is authoritative memory, not a cache. Its ledger item ids,
  * statuses, priorities, generation counter and `lastFoldedSourceId` cursor are
  * minted by the compactor as it folds messages and run outputs; nothing can
@@ -26,11 +31,10 @@ import type { Migration } from "./types.js";
  * consumption, which is also the one place that knows how to read an older
  * version forward.
  *
- * `schema_version`, `generation` and `updated_at` are write-time projections
- * of the document, kept as columns so an operator can see which document
- * versions an instance holds and how far each actor's memory has advanced
- * without parsing a blob. They are never read back as state: the reader takes
- * the document, and only the document, as the snapshot.
+ * Nothing from the document is projected into its own column. No reader
+ * selects on schema version, generation or update time today, and a column
+ * that only mirrors the blob is a second copy of memory with no constraint
+ * keeping it honest. A real query can add one with an index when it arrives.
  *
  * ## `ON DELETE RESTRICT`
  *
@@ -49,11 +53,8 @@ export const portableContextSnapshots: Migration = {
   up: (db: Database) => {
     db.exec(`
       CREATE TABLE portable_context_snapshots (
-        actor_id       TEXT PRIMARY KEY REFERENCES actors(id) ON DELETE RESTRICT,
-        schema_version INTEGER NOT NULL,
-        generation     INTEGER NOT NULL,
-        updated_at     TEXT NOT NULL,
-        snapshot       TEXT NOT NULL
+        actor_id TEXT PRIMARY KEY REFERENCES actors(id) ON DELETE RESTRICT,
+        snapshot TEXT NOT NULL
       );
     `);
   },

@@ -66,25 +66,24 @@ export class DbPortableContextStore implements PortableContextStore {
 
   save(state: PortableContextState): void {
     portableContextStateSchema.parse(state);
-    // The three projected columns are written from the document rather than
-    // alongside it, so they cannot drift from what the reader will see.
     this.db
       .prepare(
-        `INSERT INTO portable_context_snapshots
-           (actor_id, schema_version, generation, updated_at, snapshot)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(actor_id) DO UPDATE SET
-           schema_version = excluded.schema_version,
-           generation     = excluded.generation,
-           updated_at     = excluded.updated_at,
-           snapshot       = excluded.snapshot`
+        `INSERT INTO portable_context_snapshots (actor_id, snapshot)
+         VALUES (?, ?)
+         ON CONFLICT(actor_id) DO UPDATE SET snapshot = excluded.snapshot`
       )
-      .run(
-        state.actorId,
-        state.schemaVersion,
-        state.generation,
-        state.updatedAt,
-        JSON.stringify(state)
-      );
+      .run(state.actorId, JSON.stringify(state));
+  }
+
+  /**
+   * How many actors hold durable memory. The legacy importer asks this before
+   * it issues the import receipt: any row at all means the database already
+   * became authoritative, whatever the legacy directory holds.
+   */
+  count(): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM portable_context_snapshots")
+      .get() as { count: number };
+    return row.count;
   }
 }
