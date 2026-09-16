@@ -339,14 +339,32 @@ program
   .description("Start the shared quota coordinator service")
   .option("--home <path>", "Override RUSA_HOME for this coordinator")
   .option("--socket <path>", "Override socket path")
-  .option("--database <path>", "Override quota database path")
-  .action(async (opts: { home?: string; socket?: string; database?: string }) => {
-    await runQuotaCoordinator({
-      home: opts.home,
-      socketPath: opts.socket,
-      databasePath: opts.database,
-    });
-  });
+  .option("--database <path>", "Override service-owned quota database path")
+  .option(
+    "--legacy-database <path>",
+    "Legacy direct-mode database path for the scheduled relocation"
+  )
+  .option(
+    "--relocate",
+    "Perform the scheduled stage-3 relocation and create the legacy-path blocking directory"
+  )
+  .action(
+    async (opts: {
+      home?: string;
+      socket?: string;
+      database?: string;
+      legacyDatabase?: string;
+      relocate?: boolean;
+    }) => {
+      await runQuotaCoordinator({
+        home: opts.home,
+        socketPath: opts.socket,
+        databasePath: opts.database,
+        legacyDatabasePath: opts.legacyDatabase,
+        relocate: opts.relocate,
+      });
+    }
+  );
 
 program
   .command("install-quota-coordinator")

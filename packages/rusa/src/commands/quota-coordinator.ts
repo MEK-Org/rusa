@@ -20,6 +20,7 @@ import {
   DEFAULT_STALE_AFTER_MS,
 } from "../quota/coordinator-protocol.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
+import { DEFAULT_RELOCATED_QUOTA_DB_NAME, relocateQuotaDatabase } from "../quota/relocate.js";
 import {
   assertQuotaSchemaVersion,
   QUOTA_SCHEMA_VERSION,
@@ -30,7 +31,12 @@ import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-stor
 export interface RunQuotaCoordinatorOptions {
   home?: string;
   socketPath?: string;
+  /** Service-owned database path (`quota.coordinator.databasePath`). */
   databasePath?: string;
+  /** Legacy direct-mode database path (`quota.databasePath`), read only by the stage-3 flip. */
+  legacyDatabasePath?: string;
+  /** Perform the scheduled stage-3 flip (§8.3) before opening the service-owned database. */
+  relocate?: boolean;
 }
 
 /**
@@ -52,6 +58,65 @@ export function defaultQuotaCoordinatorSocketPath(): string {
     return join(runtimeDir.trim(), "rusa-quota", "coordinator.sock");
   }
   return join(tmpdir(), "rusa-quota", "coordinator.sock");
+}
+
+export interface CoordinatorDatabasePaths {
+  /** The file the service opens and owns. */
+  databasePath: string;
+  /** The pre-service file the flip renames away; only present when relocating. */
+  legacyDatabasePath?: string;
+}
+
+/**
+ * Decide which file the coordinator opens.
+ *
+ * `quota.coordinator.databasePath` is the service-owned file and the only path
+ * an ordinary start accepts. `quota.databasePath` is the pre-service file the
+ * instances used to open directly; it is read here only by the explicit
+ * stage-3 flip (§8.3), which renames it to the service-owned path and fences
+ * the old name. A configuration that still names only the legacy key is
+ * refused rather than opened in place, because opening it in place is exactly
+ * the concurrent old-and-new-writer state §8.2 rules out — the refusal is the
+ * misconfiguration guard a service-aware build can give.
+ */
+export function resolveCoordinatorDatabasePaths(
+  config: RusaConfig,
+  mcHome: string,
+  opts: Pick<RunQuotaCoordinatorOptions, "databasePath" | "legacyDatabasePath" | "relocate"> = {}
+): CoordinatorDatabasePaths {
+  const configuredServiceDb =
+    opts.databasePath?.trim() || config.quota?.coordinator?.databasePath?.trim();
+  const configuredLegacyDb = opts.legacyDatabasePath?.trim() || config.quota?.databasePath?.trim();
+
+  if (opts.relocate) {
+    if (!configuredLegacyDb) {
+      throw new Error(
+        "Legacy database path is required for --relocate: configure quota.databasePath or specify --legacy-database"
+      );
+    }
+    const legacyDatabasePath = resolveQuotaDatabasePath(configuredLegacyDb, mcHome);
+    const databasePath = configuredServiceDb
+      ? resolveQuotaDatabasePath(configuredServiceDb, mcHome)
+      : join(dirname(legacyDatabasePath), DEFAULT_RELOCATED_QUOTA_DB_NAME);
+    if (databasePath === legacyDatabasePath) {
+      throw new Error(
+        "--relocate requires a distinct service-owned database path; set quota.coordinator.databasePath or --database"
+      );
+    }
+    return { databasePath, legacyDatabasePath };
+  }
+
+  if (!configuredServiceDb) {
+    if (configuredLegacyDb) {
+      throw new Error(
+        "quota.databasePath is the pre-service database; run the scheduled stage-3 flip with `rusa quota-coordinator --relocate`, then configure quota.coordinator.databasePath"
+      );
+    }
+    throw new Error(
+      "Service-owned database path is required: configure quota.coordinator.databasePath or specify --database"
+    );
+  }
+  return { databasePath: resolveQuotaDatabasePath(configuredServiceDb, mcHome) };
 }
 
 /**
@@ -108,18 +173,20 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     config.quota?.coordinator?.socketPath?.trim() ||
     defaultQuotaCoordinatorSocketPath();
 
-  const configuredDb =
-    opts.databasePath?.trim() ||
-    config.quota?.coordinator?.databasePath?.trim() ||
-    config.quota?.databasePath?.trim();
-
-  if (!configuredDb) {
-    throw new Error(
-      "Database path is required to run quota coordinator: configure quota.coordinator.databasePath (or quota.databasePath) or specify --database"
-    );
+  const paths = resolveCoordinatorDatabasePaths(config, mcHome, opts);
+  const databasePath = paths.databasePath;
+  if (paths.legacyDatabasePath) {
+    const flip = relocateQuotaDatabase({
+      oldDatabasePath: paths.legacyDatabasePath,
+      newDatabasePath: databasePath,
+    });
+    log.info("Quota database relocated to service ownership", {
+      legacyDatabasePath: paths.legacyDatabasePath,
+      databasePath,
+      renamed: flip.renamed,
+      placeholderCreated: flip.placeholderCreated,
+    });
   }
-
-  const databasePath = resolveQuotaDatabasePath(configuredDb, mcHome);
 
   try {
     try {
