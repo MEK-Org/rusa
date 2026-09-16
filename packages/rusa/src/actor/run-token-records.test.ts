@@ -87,7 +87,8 @@ describe("run_token_records run identity", () => {
     if (!factoryCtx) throw new Error("factoryCtx not initialized");
 
     // Run 1 for actor
-    const runId1 = accounting.begin(workerId, MODEL_CONFIG);
+    const runId1 = "run-1";
+    accounting.begin(workerId, runId1, MODEL_CONFIG);
     const result1: RunResult = {
       success: true,
       output: "run 1 finished",
@@ -103,11 +104,16 @@ describe("run_token_records run identity", () => {
         response: null,
       },
     };
-    accounting.complete(workerId, result1);
-    factoryCtx.onRunEnd(result1, runId1);
+    accounting.complete(workerId, runId1, result1);
+    await factoryCtx.lifecycle.emit("onEnd", {
+      actorId: workerId,
+      runId: runId1,
+      terminal: { kind: "result", result: result1 },
+    });
 
     // Run 2 for actor
-    const runId2 = accounting.begin(workerId, MODEL_CONFIG);
+    const runId2 = "run-2";
+    accounting.begin(workerId, runId2, MODEL_CONFIG);
     const result2: RunResult = {
       success: true,
       output: "run 2 finished",
@@ -123,8 +129,12 @@ describe("run_token_records run identity", () => {
         response: null,
       },
     };
-    accounting.complete(workerId, result2);
-    factoryCtx.onRunEnd(result2, runId2);
+    accounting.complete(workerId, runId2, result2);
+    await factoryCtx.lifecycle.emit("onEnd", {
+      actorId: workerId,
+      runId: runId2,
+      terminal: { kind: "result", result: result2 },
+    });
 
     // 1. Token records must NOT store the actor ID in run_id
     const actorIdMatches = db
@@ -186,10 +196,10 @@ describe("run_token_records run identity", () => {
     });
     expect(factoryCtx).toBeDefined();
     if (!factoryCtx) throw new Error("factoryCtx not initialized");
-    const activeCtx = factoryCtx;
 
     // Run created in actor_runs
-    const runId = accounting.begin(workerId, MODEL_CONFIG);
+    const runId = "run-1";
+    accounting.begin(workerId, runId, MODEL_CONFIG);
     const resultWithTokens: RunResult = {
       success: true,
       output: "done",
@@ -205,13 +215,15 @@ describe("run_token_records run identity", () => {
         response: null,
       },
     };
-    accounting.complete(workerId, resultWithTokens);
+    accounting.complete(workerId, runId, resultWithTokens);
 
     // Call without passing runId: throws because token accounting requires explicit runId
-    expect(() => activeCtx.onRunEnd(resultWithTokens)).toThrow(/token accounting requires a runId/);
+    expect(() => mesh.accountRun(workerId, resultWithTokens)).toThrow(
+      /token accounting requires a runId/
+    );
 
     // Call with runId: succeeds
-    expect(() => activeCtx.onRunEnd(resultWithTokens, runId)).not.toThrow();
+    expect(() => mesh.accountRun(workerId, resultWithTokens, runId)).not.toThrow();
 
     const record = db.prepare("SELECT run_id FROM run_token_records WHERE run_id = ?").get(runId) as
       | { run_id: string }
@@ -224,7 +236,7 @@ describe("run_token_records run identity", () => {
       output: "done without tokens",
       exitCode: 0,
     };
-    expect(() => activeCtx.onRunEnd(resultWithoutTokens)).not.toThrow();
+    expect(() => mesh.accountRun(workerId, resultWithoutTokens)).not.toThrow();
   });
 
   describe("backfill-run-token-records", () => {

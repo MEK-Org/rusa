@@ -12,6 +12,7 @@ import {
   DEFAULT_MAX_INTERVAL_SECONDS,
   HISTORY_WINDOW_MS,
   isValidHistoryRecord,
+  isValidQuotaPayload,
   type PublishedHistoryRecord,
   type PublishedThrottleColdResponse,
   type PublishedThrottleCollectionResponse,
@@ -39,16 +40,12 @@ export function isQuotaSnapshotBody(
   body: unknown,
   requestedProvider: string
 ): body is PublishedQuotaSnapshot & { service?: unknown } {
-  if (typeof body !== "object" || body === null) return false;
+  if (!isValidQuotaPayload(body, requestedProvider)) return false;
   const candidate = body as {
-    provider?: unknown;
     status?: unknown;
     limits?: unknown;
     scrapedAt?: unknown;
   };
-  if (candidate.provider !== requestedProvider) {
-    return false;
-  }
   if (candidate.status === "available" || candidate.status === "exhausted") {
     if (typeof candidate.scrapedAt !== "string" || !Array.isArray(candidate.limits)) {
       return false;
@@ -63,6 +60,7 @@ export function isQuotaSnapshotBody(
 
 export interface QuotaCoordinatorClientOptions {
   socketPath: string;
+  configuredProviders?: readonly string[];
   maxIntervalSeconds?: number;
   hardStaleAfterMs?: number;
   /**
@@ -613,7 +611,8 @@ export class QuotaCoordinatorClient {
    *
    * Treats quota read failures as null on transport error, timeout, HTTP non-200, JSON parse error,
    * protocolMajor mismatch, requested provider mismatch, or invalid shape. Never rejects.
-   * Callers that need "could not read" as a failure wrap this themselves.
+   * This is the A/B harness contract: it distinguishes an unavailable service from a valid
+   * cold `unknown` reading without inventing a reading.
    */
   async getQuota(provider: string): Promise<PublishedQuotaSnapshot | null> {
     const path = `/v1/quota?provider=${encodeURIComponent(provider)}`;
@@ -632,6 +631,7 @@ export class QuotaCoordinatorClient {
       };
 
       const fail = (err: unknown): void => {
+        this.markUnavailable();
         this.options.logger?.warn(
           `[quota-client] Coordinator quota read failed for ${path}: ${
             err instanceof Error ? err.message : String(err)
@@ -672,6 +672,7 @@ export class QuotaCoordinatorClient {
               return;
             }
 
+            this.markReachable();
             const { service: _service, ...snapshot } = parsed as PublishedQuotaSnapshot & {
               service?: unknown;
             };
@@ -690,6 +691,39 @@ export class QuotaCoordinatorClient {
 
       req.end();
     });
+  }
+
+  /**
+   * Read the evidence view for interactive consumers (dashboard and `get_quota`).
+   * Unlike {@link getQuota}, an unavailable coordinator is represented as the
+   * cold `unknown` snapshot required by §5.5. An admitted provider absent from
+   * this instance's configured set returns `unsupported` before opening a
+   * socket, matching the local `QuotaService` contract.
+   */
+  async getQuotaWithFallback(provider: string): Promise<ProviderQuotaSnapshot> {
+    if (this.options.configuredProviders && !this.options.configuredProviders.includes(provider)) {
+      return {
+        provider,
+        status: "unsupported",
+        limits: [],
+        message: `${provider} is not configured on this instance`,
+      };
+    }
+
+    const snapshot = await this.getQuota(provider);
+    if (snapshot) return snapshot;
+
+    return {
+      provider,
+      status: "unknown",
+      limits: [],
+      freshness: {
+        ageMs: null,
+        buckets: {},
+        stale: true,
+        hardStale: true,
+      },
+    };
   }
 
   private nowMs(): number {

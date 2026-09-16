@@ -19,6 +19,7 @@ import { MeshEventRepository } from "./mesh-event-repository.js";
 import { ModelClassRepository } from "./model-class-repository.js";
 import { ModelScrapeRepository } from "./model-scrape-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
+import { DbPortableContextStore } from "./portable-context-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
@@ -52,6 +53,7 @@ export class Repositories {
   readonly modelScrapes: ModelScrapeRepository;
   readonly modelClasses: ModelClassRepository;
   readonly obligations: ObligationRepository;
+  readonly portableContext: DbPortableContextStore;
   readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
 
@@ -77,6 +79,8 @@ export class Repositories {
     this.modelScrapes = new ModelScrapeRepository(db);
     this.modelClasses = new ModelClassRepository(db);
     this.obligations = new ObligationRepository(db);
+    this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
+    this.portableContext = new DbPortableContextStore(db);
     this.referenceCache = new ReferenceCacheRepository(db);
   }
 
@@ -126,6 +130,7 @@ export type {
   ListOwnedObligationsOptions,
 } from "./obligation-repository.js";
 export { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-repository.js";
+export { DbPortableContextStore } from "./portable-context-repository.js";
 export type { CreateUserInput } from "./principal-repository.js";
 export { normalizeEmail, PrincipalRepository } from "./principal-repository.js";
 export { QuotaScrapeRepository } from "./quota-scrape-repository.js";

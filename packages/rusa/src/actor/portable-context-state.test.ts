@@ -1,45 +1,21 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   authorableMemoryKindSchema,
   emptyPortableContextState,
-  FilePortableContextStore,
+  InMemoryPortableContextStore,
   isRetiredMemoryKind,
+  parsePortableContextState,
   portableMemoryKindSchema,
   RETIRED_MEMORY_KINDS,
 } from "./portable-context-state.js";
 
-describe("FilePortableContextStore", () => {
-  const dirs: string[] = [];
-  afterEach(() => {
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("returns an empty state when no materialized cache exists", () => {
-    const dir = mkdtempSync(join(tmpdir(), "portable-context-store-"));
-    dirs.push(dir);
-    const state = new FilePortableContextStore(dir).load("actor-a");
-    expect(state).toMatchObject({ actorId: "actor-a", generation: 0, items: [] });
-  });
-
-  it("atomically writes human-readable state without leaving a temp file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "portable-context-store-"));
-    dirs.push(dir);
-    const store = new FilePortableContextStore(dir);
+describe("parsePortableContextState", () => {
+  it("reads a current-version document straight through", () => {
     const state = { ...emptyPortableContextState("actor-a"), generation: 2 };
-    store.save(state);
-
-    expect(store.load("actor-a")).toEqual(state);
-    expect(readFileSync(store.pathFor("actor-a"), "utf8")).toContain('"generation": 2');
-    expect(readdirSync(dir).some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(parsePortableContextState(JSON.parse(JSON.stringify(state)))).toEqual(state);
   });
 
-  it("migrates a v2 event watermark to the durable-source cursor on load", () => {
-    const dir = mkdtempSync(join(tmpdir(), "portable-context-store-"));
-    dirs.push(dir);
-    const store = new FilePortableContextStore(dir);
+  it("migrates a v2 event watermark to the durable-source cursor", () => {
     const current = emptyPortableContextState("actor-a");
     const legacy = {
       ...current,
@@ -47,25 +23,21 @@ describe("FilePortableContextStore", () => {
       lastFoldedSourceId: undefined,
       lastFoldedMessageEventId: "legacy-message-event",
     };
-    writeFileSync(store.pathFor("actor-a"), JSON.stringify(legacy), "utf8");
 
-    expect(store.load("actor-a")).toMatchObject({
+    expect(parsePortableContextState(JSON.parse(JSON.stringify(legacy)))).toMatchObject({
       schemaVersion: 3,
       lastFoldedSourceId: "legacy-message-event",
     });
   });
 
-  it("still loads a file holding retired kinds (ISSUE_NUM leg 3)", () => {
-    // The load path `parse()`s persisted state, so the persisted kind enum is a
-    // data-compatibility contract, not just a producer constraint. Narrowing it
-    // to match what the compactor may author would reject files already on disk
-    // — 17 of 17 live state files and 100 of 127 items when this was measured
-    // on 2026-08-21 — and the ZodError reaches `buildPrompt` uncaught, so the
-    // owning actor cannot start at all. This test is the guard on that.
-    const dir = mkdtempSync(join(tmpdir(), "portable-context-store-"));
-    dirs.push(dir);
-    const store = new FilePortableContextStore(dir);
-    const onDisk = {
+  it("still accepts a document holding retired kinds (ISSUE_NUM leg 3)", () => {
+    // Every stored snapshot goes through this parse, so the persisted kind enum
+    // is a data-compatibility contract, not just a producer constraint.
+    // Narrowing it to match what the compactor may author would reject memory
+    // already persisted — 17 of 17 live documents and 100 of 127 items when
+    // this was measured on 2026-08-21 — and the ZodError reaches `buildPrompt`
+    // uncaught, so the owning actor cannot start at all.
+    const stored = {
       ...emptyPortableContextState("actor-a"),
       generation: 9,
       items: RETIRED_MEMORY_KINDS.map((kind, index) => ({
@@ -80,11 +52,45 @@ describe("FilePortableContextStore", () => {
         updatedAt: "2026-07-01T00:00:00.000Z",
       })),
     };
-    // Written as bytes rather than through save(), because save() would only
-    // prove the schema agrees with itself. The file is the input under test.
-    writeFileSync(store.pathFor("actor-a"), JSON.stringify(onDisk), "utf8");
 
-    expect(store.load("actor-a").items.map((item) => item.kind)).toEqual([...RETIRED_MEMORY_KINDS]);
+    expect(
+      parsePortableContextState(JSON.parse(JSON.stringify(stored))).items.map((item) => item.kind)
+    ).toEqual([...RETIRED_MEMORY_KINDS]);
+  });
+
+  it("refuses a document of an unknown schema version rather than reading it as current", () => {
+    const future = { ...emptyPortableContextState("actor-a"), schemaVersion: 99 };
+    expect(() => parsePortableContextState(future)).toThrow();
+  });
+});
+
+describe("InMemoryPortableContextStore", () => {
+  it("returns an empty state for an actor that has never been folded", () => {
+    expect(new InMemoryPortableContextStore().load("actor-a")).toMatchObject({
+      actorId: "actor-a",
+      generation: 0,
+      items: [],
+    });
+  });
+
+  it("hands back a copy, so a caller cannot mutate stored memory in place", () => {
+    const store = new InMemoryPortableContextStore();
+    const state = { ...emptyPortableContextState("actor-a"), generation: 2 };
+    store.save(state);
+
+    store.load("actor-a").items.push({
+      id: "mem-smuggled",
+      kind: "decision",
+      priority: "must",
+      status: "active",
+      statement: "Written through a handed-out reference.",
+      evidence: [
+        { eventId: "e1", sender: "root", ts: "2026-07-01T00:00:00.000Z", quote: "smuggled" },
+      ],
+      updatedAt: "2026-07-01T00:00:00.000Z",
+    });
+
+    expect(store.load("actor-a")).toEqual(state);
   });
 });
 
