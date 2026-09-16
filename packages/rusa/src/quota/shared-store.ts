@@ -6,6 +6,12 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import {
+  nullQuotaMetrics,
+  QUOTA_SERVICE_METRICS,
+  type QuotaMetrics,
+  type QuotaObservationResult,
+} from "./coordinator-metrics.js";
 import { parseParsedState, serializeParsedState } from "./parsed-state.js";
 import {
   assertQuotaSchemaVersion,
@@ -180,6 +186,14 @@ export class SharedQuotaStore {
   readonly db: Database.Database;
   private controllerOptions: QuotaControllerOptions | null = null;
   private controllerUpdated: ((provider: string) => void) | null = null;
+  /**
+   * The parse, observation, and controller series are only observable here:
+   * this is where a parse becomes a stored snapshot and where an observation
+   * becomes a reasoned interval. Default is the discarding sink, so every
+   * existing caller — tests and the instance-side store alike — keeps its
+   * current behaviour and only the coordinator process opts in.
+   */
+  private metrics: QuotaMetrics = nullQuotaMetrics;
 
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
@@ -209,6 +223,11 @@ export class SharedQuotaStore {
 
   setControllerUpdatedListener(listener: ((provider: string) => void) | null): void {
     this.controllerUpdated = listener;
+  }
+
+  /** Attach the coordinator's metric sink; `null` restores the discarding one. */
+  setMetrics(metrics: QuotaMetrics | null): void {
+    this.metrics = metrics ?? nullQuotaMetrics;
   }
 
   private ensureSchema(): void {
@@ -344,6 +363,10 @@ export class SharedQuotaStore {
         .run(serializeParsedState(inferredState), id);
       this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
     })();
+    this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
+      provider: scrape?.provider ?? inferredParsed.provider,
+      outcome: "success",
+    });
     if (this.controllerOptions) {
       this.advancePendingController(this.controllerOptions, inferredParsed.provider);
       this.controllerUpdated?.(inferredParsed.provider);
@@ -354,6 +377,13 @@ export class SharedQuotaStore {
     this.db
       .prepare("UPDATE quota_scrapes SET parse_error = ? WHERE id = ?")
       .run(error instanceof Error ? (error.stack ?? error.message) : String(error), id);
+    const scrape = this.db.prepare("SELECT provider FROM quota_scrapes WHERE id = ?").get(id) as
+      | { provider: string }
+      | undefined;
+    this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
+      provider: scrape?.provider ?? "unknown",
+      outcome: "failure",
+    });
   }
 
   listSince(provider: string, sinceIso: string): QuotaScrape[] {
@@ -448,6 +478,9 @@ export class SharedQuotaStore {
       observation.percentLeft <= 0
     ) {
       this.markProcessed(observation);
+      this.metrics.counter(QUOTA_SERVICE_METRICS.controllerStepsTotal, {
+        provider: observation.provider,
+      });
       return;
     }
 
@@ -569,6 +602,9 @@ export class SharedQuotaStore {
         observation.kind,
         observation.slot
       );
+    this.metrics.counter(QUOTA_SERVICE_METRICS.controllerStepsTotal, {
+      provider: observation.provider,
+    });
   }
 
   private markProcessed(observation: Pick<StoredObservation, "provider" | "kind" | "slot">): void {
@@ -701,12 +737,28 @@ export class SharedQuotaStore {
     const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
     if (!observedAt || !Number.isFinite(observedMs)) return;
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
+    const observed = (result: QuotaObservationResult): void => {
+      this.metrics.counter(QUOTA_SERVICE_METRICS.observationsTotal, { provider, result });
+    };
     const seenKinds = new Set<string>();
     for (const limit of state.limits ?? []) {
-      if (!isProviderScopedWindow(limit) || !Number.isFinite(limit.percentLeft)) continue;
-      if (limit.percentLeft < 0 || limit.percentLeft > 100) continue;
+      // A window this store will not reason about — model-scoped, or a percent
+      // outside 0..100 — is counted as rejected rather than dropped silently,
+      // because a parser regression shows up here as reads that produce
+      // observations no controller ever sees.
+      if (!isProviderScopedWindow(limit) || !Number.isFinite(limit.percentLeft)) {
+        observed("rejected");
+        continue;
+      }
+      if (limit.percentLeft < 0 || limit.percentLeft > 100) {
+        observed("rejected");
+        continue;
+      }
       const kind = normalizeKind(limit.kind);
-      if (seenKinds.has(kind)) continue;
+      if (seenKinds.has(kind)) {
+        observed("superseded");
+        continue;
+      }
       seenKinds.add(kind);
       const candidate: StoredObservation = {
         provider,
@@ -729,13 +781,19 @@ export class SharedQuotaStore {
            WHERE provider = ? AND kind = ? AND observed_slot = ?`
         )
         .get(provider, kind, candidate.slot) as StoredObservation | undefined;
-      if (existing?.processed === 1) continue;
+      if (existing?.processed === 1) {
+        observed("superseded");
+        continue;
+      }
       const candidateWins =
         !existing ||
         (hasValidReset(candidate) && !hasValidReset(existing)) ||
         (hasValidReset(candidate) === hasValidReset(existing) &&
           Date.parse(candidate.observedAt) > Date.parse(existing.observedAt));
-      if (!candidateWins) continue;
+      if (!candidateWins) {
+        observed("superseded");
+        continue;
+      }
       this.db
         .prepare(
           `INSERT INTO quota_observations
@@ -759,6 +817,7 @@ export class SharedQuotaStore {
           candidate.resetAtIso,
           candidate.windowMs
         );
+      observed("recorded");
     }
   }
 }

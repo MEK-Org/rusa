@@ -829,6 +829,33 @@ describe("loadConfig shared quota store", () => {
     expect(config.quota?.throttle?.maxIntervalSeconds).toBe(1800);
     expect(config.quota?.databasePath).toBeUndefined();
   });
+
+  it("accepts and trims the backup location", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          coordinator: {
+            databasePath: "/srv/rusa/quota-coordinator.db",
+            backupDir: "  /srv/rusa/quota-backups  ",
+            backupRetention: 30,
+          },
+        },
+      })
+    );
+    expect(config.quota?.coordinator?.backupDir).toBe("/srv/rusa/quota-backups");
+    expect(config.quota?.coordinator?.backupRetention).toBe(30);
+  });
+
+  it("rejects a retention that would keep nothing", () => {
+    for (const backupRetention of [0, -1, 1.5]) {
+      expect(() =>
+        loadConfig(writeConfig({ quota: { coordinator: { backupRetention } } }))
+      ).toThrow(/quota.coordinator.backupRetention must be a positive integer/);
+    }
+    expect(() => loadConfig(writeConfig({ quota: { coordinator: { backupDir: "   " } } }))).toThrow(
+      /quota.coordinator.backupDir must be a non-empty string/
+    );
+  });
 });
 
 describe("loadConfig understanding root", () => {

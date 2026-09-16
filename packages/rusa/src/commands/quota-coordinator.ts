@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
@@ -9,7 +9,12 @@ import { createQuotaService } from "../mcp/quota-mcp.js";
 import { createLogger } from "../observability/logger.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
+import {
+  DEFAULT_QUOTA_BACKUP_RETENTION,
+  QuotaBackupScheduler,
+} from "../quota/coordinator-backup.js";
 import { QuotaCollectionLoop } from "../quota/coordinator-collection.js";
+import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
@@ -26,6 +31,19 @@ export interface RunQuotaCoordinatorOptions {
   home?: string;
   socketPath?: string;
   databasePath?: string;
+}
+
+/**
+ * Where daily backups live when the configuration does not say.
+ *
+ * Beside the database, not under `$RUSA_HOME`: `VACUUM INTO` writes the backup
+ * directly and the finished file is renamed into place, and both are only cheap
+ * and atomic when source and destination share a filesystem. An operator who
+ * wants backups on other storage sets `quota.coordinator.backupDir` and accepts
+ * the copy.
+ */
+export function defaultQuotaBackupDir(databasePath: string): string {
+  return join(dirname(databasePath), "backups");
 }
 
 export function defaultQuotaCoordinatorSocketPath(): string {
@@ -132,16 +150,20 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       : DEFAULT_STALE_AFTER_MS;
 
     const store = new SharedQuotaStore(databasePath);
+    const metrics = createQuotaMetrics(log);
+    store.setMetrics(metrics);
+
+    const configuredBackupDir = config.quota?.coordinator?.backupDir?.trim();
+    const backupDir = configuredBackupDir
+      ? isAbsolute(configuredBackupDir)
+        ? configuredBackupDir
+        : resolve(mcHome, configuredBackupDir)
+      : defaultQuotaBackupDir(databasePath);
+    const backupRetention =
+      config.quota?.coordinator?.backupRetention ?? DEFAULT_QUOTA_BACKUP_RETENTION;
 
     const { configuredProviders, collectionProviders } = coordinatorProviderLanes(config);
 
-    const service = new QuotaCoordinatorService({
-      socketPath,
-      store,
-      configuredProviders,
-      maxIntervalSeconds,
-      staleAfterMs,
-    });
     const quotaService = createQuotaService({
       config,
       workersDir: join(mcHome, "workers"),
@@ -150,9 +172,14 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     const collection = new QuotaCollectionLoop({
       store,
       quotaService,
+      metrics,
       providers: collectionProviders,
       tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
       maxIntervalSeconds,
+      // The loop publishes the interval and snapshot-age gauges after each
+      // controller step, so it needs the same freshness thresholds the service
+      // serves with; otherwise the gauge and the response would disagree.
+      staleAfterMs,
       onError: (provider, error) =>
         log.warn("Quota collection tick failed", {
           provider,
@@ -160,14 +187,50 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
         }),
     });
 
-    log.info("Starting quota-coordinator service", { socketPath, databasePath });
+    const service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders,
+      maxIntervalSeconds,
+      staleAfterMs,
+      metrics,
+      collectionStats: () => collection.getAllStats(),
+    });
+    const backups = new QuotaBackupScheduler({
+      databasePath,
+      backupDir,
+      retain: backupRetention,
+      onBackup: (result) =>
+        log.info("Quota database backed up", {
+          path: result.path,
+          bytes: result.bytes,
+          durationMs: result.durationMs,
+          pruned: result.pruned.length,
+        }),
+      onError: (error) =>
+        log.error("Quota database backup failed", {
+          backupDir,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    });
 
+    log.info("Starting quota-coordinator service", { socketPath, databasePath, backupDir });
+
+    // Order matters, and it is the reverse of what "start the cheap things
+    // first" would suggest. The boot backup runs before the socket is
+    // announced as ready, so the copy it takes is of the database as it was
+    // *before* this process wrote anything to it — which is the copy an
+    // operator restoring after a bad deploy actually wants. Readiness is
+    // logged last for the same reason: a coordinator that says it is ready has
+    // already taken whatever backup this boot owed.
     await service.start();
     collection.start();
+    backups.start();
     log.info("Quota coordinator ready and listening for requests");
 
     const shutdown = async () => {
       log.info("Stopping quota-coordinator service...");
+      backups.stop();
       collection.stop();
       await service.stop();
       store.close();

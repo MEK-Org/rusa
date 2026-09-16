@@ -103,6 +103,19 @@ export interface QuotaCoordinatorConfig {
   socketPath?: string;
   /** Relocated database path owned exclusively by the coordinator. */
   databasePath?: string;
+  /**
+   * Directory the daily `VACUUM INTO` backups are written to.
+   * Defaults to a `backups/` directory beside the coordinator database, which
+   * keeps a backup on the same filesystem as its source.
+   *
+   * A relative path resolves against `RUSA_HOME` (the instance home, e.g.
+   * `~/.rusa`), not against the process working directory — the coordinator
+   * runs as a systemd user unit whose working directory is not something an
+   * operator editing this file should have to know.
+   */
+  backupDir?: string;
+  /** How many daily backups to keep. Defaults to 14. */
+  backupRetention?: number;
 }
 
 /** Shared quota evidence, controller state, and launch pacing. */

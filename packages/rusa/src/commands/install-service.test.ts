@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildAlertUnit, buildServiceUnit } from "./install-service.js";
+import {
+  buildAlertUnit,
+  buildQuotaCoordinatorUnit,
+  buildServiceUnit,
+  quotaCoordinatorUnitNames,
+  withCoordinatorOrdering,
+} from "./install-service.js";
 
 const base = {
   description: "Rusa",
@@ -79,5 +85,135 @@ describe("buildAlertUnit — OnFailure oneshot (build-independent notifier)", ()
     });
     expect(unit).not.toContain("RUSA_ERROR_CHAT");
     expect(unit).not.toContain("GCHAT_CONFIG_DIR");
+  });
+});
+
+describe("buildServiceUnit — coordinator ordering", () => {
+  it("orders after the coordinator without depending on it", () => {
+    const unit = buildServiceUnit({
+      ...base,
+      coordinatorUnit: "rusa-quota-coordinator.service",
+    });
+    expect(unit).toContain("After=rusa-quota-coordinator.service");
+    expect(unit).toContain("Wants=rusa-quota-coordinator.service");
+    // An instance whose coordinator is down paces on its last applied interval;
+    // Requires= would turn that degradation into an orchestrator outage.
+    expect(unit).not.toContain("Requires=");
+    expect(unit.indexOf("Wants=rusa-quota-coordinator.service")).toBeLessThan(
+      unit.indexOf("[Service]")
+    );
+  });
+
+  it("omits the ordering entirely when no coordinator is installed", () => {
+    expect(buildServiceUnit(base)).not.toContain("quota-coordinator");
+  });
+});
+
+describe("quotaCoordinatorUnitNames", () => {
+  it("derives both names from the instance basename, so staging cannot collide", () => {
+    expect(quotaCoordinatorUnitNames("rusa")).toEqual({
+      serviceUnit: "rusa-quota-coordinator.service",
+      alertUnit: "rusa-quota-coordinator-alert.service",
+    });
+    expect(quotaCoordinatorUnitNames("rusa-staging").serviceUnit).toBe(
+      "rusa-staging-quota-coordinator.service"
+    );
+  });
+});
+
+describe("buildQuotaCoordinatorUnit — the probe environment", () => {
+  const coordinatorBase = { ...base, xdgRuntimeDir: "/run/user/1000" };
+
+  it("runs the coordinator against the instance home", () => {
+    const unit = buildQuotaCoordinatorUnit(coordinatorBase);
+    expect(unit).toContain(
+      'ExecStart="/usr/bin/node" "/deploy/rusa-prod/packages/rusa/dist/cli.js"' +
+        ' "quota-coordinator" "--home" "/home/x/.rusa"'
+    );
+    expect(unit).toContain("WorkingDirectory=/home/x/.rusa");
+    expect(unit).toContain("WantedBy=default.target");
+  });
+
+  it("carries the environment a probe needs, not systemd's default", () => {
+    const unit = buildQuotaCoordinatorUnit(coordinatorBase);
+    // The provider CLIs, bwrap and tmux all live on the user PATH; systemd's
+    // default PATH would start a service that answers healthz and never scrapes.
+    expect(unit).toContain("Environment=PATH=/usr/bin:/bin");
+    // Set explicitly: a coordinator that falls back to /tmp for its socket is
+    // one its clients cannot find.
+    expect(unit).toContain("Environment=XDG_RUNTIME_DIR=/run/user/1000");
+    expect(unit).toContain("Environment=RUSA_HOME=/home/x/.rusa");
+    expect(unit).toContain("EnvironmentFile=-/home/x/.rusa/.env");
+  });
+
+  it("logs JSON to the journal at the default level; the metric event name is the selector", () => {
+    const unit = buildQuotaCoordinatorUnit(coordinatorBase);
+    expect(unit).not.toContain("RUSA_LOG_LEVEL");
+    expect(unit).toContain("Environment=RUSA_LOG_FORMAT=json");
+    expect(unit).toContain("StandardOutput=journal");
+    expect(unit).toContain("StandardError=journal");
+    expect(unit).not.toContain("append:");
+  });
+
+  it("restarts on failure only, because a clean exit here is a requested stop", () => {
+    const unit = buildQuotaCoordinatorUnit(coordinatorBase);
+    expect(unit).toContain("Restart=on-failure");
+    expect(unit).not.toContain("Restart=always");
+    expect(unit).toContain("RestartSec=10");
+  });
+
+  it("gives up on a crash loop and fires its own alert companion", () => {
+    const unit = buildQuotaCoordinatorUnit({
+      ...coordinatorBase,
+      startLimit: { intervalSec: 300, burst: 5 },
+      onFailureUnit: "rusa-quota-coordinator-alert.service",
+    });
+    expect(unit).toContain("StartLimitIntervalSec=300");
+    expect(unit).toContain("StartLimitBurst=5");
+    expect(unit).toContain("OnFailure=rusa-quota-coordinator-alert.service");
+    expect(unit.indexOf("StartLimitBurst")).toBeLessThan(unit.indexOf("[Service]"));
+    expect(unit.indexOf("OnFailure=")).toBeLessThan(unit.indexOf("[Service]"));
+  });
+});
+
+describe("withCoordinatorOrdering — the instance that was installed first", () => {
+  const coordinator = "rusa-quota-coordinator.service";
+
+  it("adds After=/Wants= to an instance unit written before the coordinator existed", () => {
+    const before = buildServiceUnit({
+      ...base,
+      restart: "always",
+      onFailureUnit: "rusa-alert.service",
+    });
+    expect(before).not.toContain("quota-coordinator");
+
+    const after = withCoordinatorOrdering(before, coordinator);
+
+    expect(after).toContain(`After=${coordinator}`);
+    expect(after).toContain(`Wants=${coordinator}`);
+    expect(after).not.toContain("Requires=");
+    // Inside [Unit], before [Service]; and the rest of the unit is untouched.
+    expect(after.indexOf(`Wants=${coordinator}`)).toBeLessThan(after.indexOf("[Service]"));
+    expect(after.replace(`After=${coordinator}\n`, "").replace(`Wants=${coordinator}\n`, "")).toBe(
+      before
+    );
+  });
+
+  it("is idempotent, so a repeated install adds nothing", () => {
+    const once = withCoordinatorOrdering(buildServiceUnit(base), coordinator);
+    const twice = withCoordinatorOrdering(once, coordinator);
+    expect(twice).toBe(once);
+    expect(once.split(`After=${coordinator}`)).toHaveLength(2);
+  });
+
+  it("leaves a unit installed after the coordinator exactly as install-service wrote it", () => {
+    // The other install order: install-service already saw the coordinator
+    // unit on disk and wrote the ordering itself.
+    const written = buildServiceUnit({ ...base, coordinatorUnit: coordinator });
+    expect(withCoordinatorOrdering(written, coordinator)).toBe(written);
+  });
+
+  it("refuses a file that is not a unit rather than guessing where the section is", () => {
+    expect(() => withCoordinatorOrdering("not a unit\n", coordinator)).toThrow(/\[Unit\]/);
   });
 });
