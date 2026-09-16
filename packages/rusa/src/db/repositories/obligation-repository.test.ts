@@ -125,6 +125,34 @@ describe("ObligationRepository", () => {
       expect(heads).toEqual([]);
     });
 
+    it("keeps durable user owners out of actor validation and ready-head tracking", () => {
+      const userId = "fb394608-d6d6-4f2e-aebe-51a59bd01374";
+      repository.setPrincipalKind((id) => (id === userId ? "user" : undefined));
+
+      repository.create({ title: "human root", id: "human-root", ownerId: userId, priority: 10 });
+      repository.create({
+        title: "actor work",
+        id: "actor-work",
+        ownerId: "actor-a",
+        priority: 20,
+      });
+      repository.reassign("actor-work", userId, "system:mesh");
+
+      repository.create({ title: "human parent", id: "human-parent", ownerId: userId });
+      repository.create({ title: "actor child", id: "actor-child", ownerId: "actor-b" });
+      repository.reparent("actor-child", "human-parent", "system:mesh");
+
+      expect(repository.listOwned(userId).map((obligation) => obligation.id)).toEqual([
+        "human-root",
+        "actor-work",
+        "human-parent",
+      ]);
+      expect(heads.some((change) => change.ownerId === userId)).toBe(false);
+      expect(
+        db.prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = ?").all(userId)
+      ).toEqual([]);
+    });
+
     it("carries the head it displaced, so a restored head is not a repeat", () => {
       const transitions: Array<{ from: string | null; to: string | null }> = [];
       repository.setReadyHeadListener(({ head, previousHeadId }) =>
