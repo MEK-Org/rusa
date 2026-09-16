@@ -18,6 +18,7 @@ interface ThreadDto {
 
 interface ThreadsResponse {
   threads: ThreadDto[];
+  userPrincipalId?: string | null;
 }
 
 interface MeshEvent {
@@ -158,16 +159,25 @@ function counterparty(event: MeshEvent): string | null {
   return null;
 }
 
-function isActorReply(event: MeshEvent, actorId: string, sessionId: string): boolean {
+function isActorReply(
+  event: MeshEvent,
+  actorId: string,
+  sessionId: string,
+  userPrincipalId?: string | null
+): boolean {
+  const peer = counterparty(event);
+  const isHuman = peer === HUMAN_OPERATOR || (userPrincipalId && peer === userPrincipalId);
   return (
     event.kind === "message_sent" &&
     event.actorId === actorId &&
     event.detail === sessionId &&
-    counterparty(event) === HUMAN_OPERATOR
+    Boolean(isHuman)
   );
 }
 
 class ActorChatClient {
+  userPrincipalId?: string | null;
+
   constructor(
     private readonly baseUrl: string,
     private readonly fetchImpl: typeof fetch
@@ -177,12 +187,21 @@ class ActorChatClient {
     const response = await this.fetchImpl(`${this.baseUrl}/api/mesh/threads`, {
       headers: { Accept: "application/json" },
     });
-    return (await responseJson<ThreadsResponse>(response)).threads;
+    const parsed = await responseJson<ThreadsResponse>(response);
+    if (parsed.userPrincipalId !== undefined) {
+      this.userPrincipalId = parsed.userPrincipalId;
+    }
+    return parsed.threads;
   }
 
   async conversation(actorId: string, limit: number): Promise<MeshEvent[]> {
+    const peer = this.userPrincipalId ?? HUMAN_OPERATOR;
+    const actorsParam =
+      peer !== HUMAN_OPERATOR
+        ? `${actorId},${HUMAN_OPERATOR},${peer}`
+        : `${actorId},${HUMAN_OPERATOR}`;
     const query = new URLSearchParams({
-      actors: `${actorId},${HUMAN_OPERATOR}`,
+      actors: actorsParam,
       kinds: "message_sent",
       conversation: "true",
       limit: String(limit),
@@ -210,10 +229,17 @@ function write(output: Writable, text: string): void {
   output.write(text);
 }
 
-function renderHistory(events: MeshEvent[], output: Writable, theme: ChatTheme): void {
+function renderHistory(
+  events: MeshEvent[],
+  output: Writable,
+  theme: ChatTheme,
+  userPrincipalId?: string | null
+): void {
   for (const event of [...events].reverse()) {
     if (!event.body) continue;
-    const label = event.actorId === HUMAN_OPERATOR ? theme.youLabel : theme.actorLabel;
+    const isHuman =
+      event.actorId === HUMAN_OPERATOR || (userPrincipalId && event.actorId === userPrincipalId);
+    const label = isHuman ? theme.youLabel : theme.actorLabel;
     write(output, `${label} > ${event.body}\n\n`);
   }
 }
@@ -239,7 +265,7 @@ async function pollForUpdates(
       for (const event of [...events].reverse()) {
         if (seenEventIds.has(event.id)) continue;
         seenEventIds.add(event.id);
-        if (event.body && isActorReply(event, actor.id, sessionId)) {
+        if (event.body && isActorReply(event, actor.id, sessionId, client.userPrincipalId)) {
           render(`${theme.actorLabel} > ${event.body}\n\n`);
         }
       }
@@ -281,7 +307,7 @@ export async function runActorChat(
   write(deps.output, "Type /exit to leave or /help for commands.\n\n");
 
   const initialEvents = historyLimit > 0 ? await client.conversation(actor.id, historyLimit) : [];
-  renderHistory(initialEvents, deps.output, theme);
+  renderHistory(initialEvents, deps.output, theme, client.userPrincipalId);
   const seenEventIds = new Set(initialEvents.map((event) => event.id));
 
   const terminal = Boolean((deps.input as NodeJS.ReadStream).isTTY);

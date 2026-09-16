@@ -10,6 +10,7 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
+import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -203,6 +204,13 @@ describe("handleVoiceApiRequest", () => {
   let deps: VoiceApiDeps;
   let transcribe: Mock<(audio: Buffer, mimeType: string) => Promise<string>>;
   let now: number;
+  /** Local mode's sole active durable user; every memo is attributed to it (#460). */
+  const LOCAL_USER = "11111111-0000-4000-8000-000000000001";
+  const principals = {
+    listUsers: () => [
+      { kind: "user", id: LOCAL_USER, email: "op@example.com", createdAt: "2026-01-01T00:00:00Z" },
+    ],
+  } as unknown as PrincipalRepository;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "voice-api-"));
@@ -246,6 +254,7 @@ describe("handleVoiceApiRequest", () => {
       sseHub: hub,
       mesh: { sendHumanMessage } as unknown as ActorMesh,
       service,
+      principals,
     };
   });
 
@@ -289,7 +298,8 @@ describe("handleVoiceApiRequest", () => {
       expect(sendHumanMessage).toHaveBeenCalledWith(
         UUID_A,
         `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
-        "sess-9"
+        "sess-9",
+        { fromId: LOCAL_USER }
       );
       expect(transcribe).toHaveBeenCalledWith(audio, "audio/webm");
       const inbox = readdirSync(join(home, "voice", "inbox"));
@@ -338,6 +348,7 @@ describe("handleVoiceApiRequest", () => {
         UUID_A,
         `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
         sessionId,
+        { fromId: LOCAL_USER },
       ]);
     });
 

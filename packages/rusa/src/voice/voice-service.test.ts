@@ -36,6 +36,7 @@ function makeService(
     sessionLeaseMs?: number;
     onSessionEnded?: (actorId: string) => void;
     voiceNameFor?: (actorId: string) => string | undefined;
+    isHumanRecipient?: (principalId: string) => boolean;
     logger?: Logger;
   } = {}
 ) {
@@ -48,6 +49,7 @@ function makeService(
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
     voiceNameFor: opts.voiceNameFor,
+    isHumanRecipient: opts.isHumanRecipient,
     logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
@@ -288,6 +290,24 @@ describe("VoiceService outbound reply TTS", () => {
     service.presenceDisconnect([ACTOR]);
     now += VOICE_PRESENCE_GRACE_MS + 1;
     expect(await service.handleMeshEvent(replyEvent())).toBeNull();
+  });
+
+  it("renders a reply to a durable user principal once storage says the recipient is a person", async () => {
+    // After the #460 cutover an actor's reply targets the migrated user id,
+    // not the legacy alias; the walkie must keep speaking those.
+    const USER = "11111111-0000-4000-8000-000000000001";
+    const spoken = makeService({ isHumanRecipient: (id) => id === USER });
+    spoken.service.presenceConnect([ACTOR]);
+    expect(
+      await spoken.service.handleMeshEvent(replyEvent({ payload: JSON.stringify({ to: USER }) }))
+    ).not.toBeNull();
+
+    // Without principal storage a bare id is just another actor, so it stays silent.
+    const silent = makeService();
+    silent.service.presenceConnect([ACTOR]);
+    expect(
+      await silent.service.handleMeshEvent(replyEvent({ payload: JSON.stringify({ to: USER }) }))
+    ).toBeNull();
   });
 
   it("ignores events that are not replies to human:operator", async () => {

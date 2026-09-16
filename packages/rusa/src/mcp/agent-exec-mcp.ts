@@ -226,9 +226,10 @@ export function createAgentExecMcpServer(
           const r = mesh.actors.get(selfId);
           const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? r?.lastChatSessionId;
           if (!sessionId) throw new Error("reply requires an active human conversation");
+          const toId = r?.lastChatPrincipalId ?? HUMAN_OPERATOR;
           mesh.recordMessageEmitted({
             fromId: selfId,
-            toId: HUMAN_OPERATOR,
+            toId,
             body: message,
             sessionId,
             isDrop: false,

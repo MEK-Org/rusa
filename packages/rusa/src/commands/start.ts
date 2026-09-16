@@ -1904,6 +1904,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
     actors,
+    principals: getRepositories().principals,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
     // is wired. Unknown or disconnected targets fail closed.
@@ -2254,7 +2255,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+            resolveOwner: (raw) =>
+              resolveObligationOwner(actors, raw, getRepositories().principals),
             canManage: (callerId, obligation) =>
               canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
@@ -2689,6 +2691,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootId: rootId,
     log: (m) => console.warn(`[failure-sink] ${m}`),
     workersDir,
+    principals: getRepositories().principals,
     // ISSUE_NUM: name quota exhaustion in the failure notice so a worker's parent
     // (who now owns the fallback judgment) can see the cause up front.
     classify: classifyExhaustion,
@@ -2789,7 +2792,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canManage: () => true,
-      resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+      resolveOwner: (raw) => resolveObligationOwner(actors, raw, getRepositories().principals),
       recordEvent: (event) => mesh.recordEvent(event),
     })
   );
@@ -3463,6 +3466,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
           return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
         },
+        // Post-#460 replies target the durable user principal, not the legacy
+        // alias; principal storage is what says a recipient is a person.
+        isHumanRecipient: (principalId) =>
+          getRepositories().principals.getUser(principalId) !== undefined,
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
         logger: log.child({ component: "voice-session" }),
       })
