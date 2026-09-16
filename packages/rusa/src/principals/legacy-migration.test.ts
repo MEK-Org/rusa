@@ -797,23 +797,20 @@ describe("legacy-migration", () => {
       const db = setupLegacyDatabase(dbFile);
       db.pragma("journal_mode = WAL");
 
-      // Seed representative data across all relevant tables
-      const obInsert = db.prepare(
-        `INSERT INTO obligations (id, owner_id, creator_id, title, intent, created_at, updated_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      );
+      // Seed representative data across all relevant tables through the repository
+      const repo = new ObligationRepository(db);
       for (let i = 10; i < 20; i++) {
-        obInsert.run(
-          `rep-ob-${i}`,
-          i % 2 === 0 ? HUMAN_OPERATOR : ROOT_ID,
-          HUMAN_OPERATOR,
-          `Representative task ${i}`,
-          `Intent for task ${i} with human:operator mention`,
-          "2026-09-02T00:00:00.000Z",
-          "2026-09-02T00:00:00.000Z",
-          "ready"
-        );
+        repo.create({
+          id: `rep-ob-${i}`,
+          ownerId: i % 2 === 0 ? HUMAN_OPERATOR : ROOT_ID,
+          creatorId: HUMAN_OPERATOR,
+          title: `Representative task ${i}`,
+          intent: `Intent for task ${i} with human:operator mention`,
+        });
       }
+
+      // Verify derived state is exercised
+      expect(repo.readyHeads().get(HUMAN_OPERATOR)).toBe("ob-1");
 
       const histInsert = db.prepare(
         `INSERT INTO obligation_history (id, obligation_id, timestamp, mutation_kind, acting_principal, payload)
@@ -872,6 +869,10 @@ describe("legacy-migration", () => {
       expect(applyResult.postInventory?.totalAuthoritative).toBe(0);
       expect(applyResult.postInventory?.totalDangling).toBe(0);
 
+      // Derived ready heads reflect cutover to the durable principal
+      expect(repo.readyHeads().get(applyResult.principalId)).toBe("ob-1");
+      expect(repo.readyHeads().has(HUMAN_OPERATOR)).toBe(false);
+
       // 3. Idempotent rerun
       const rerunResult = executeLegacyPrincipalMigration(db, {
         email: "operator@example.com",
@@ -882,6 +883,67 @@ describe("legacy-migration", () => {
       expect(rerunResult.principalCreated).toBe(false);
       expect(rerunResult.rewritesApplied).toBe(0);
       expect(rerunResult.postInventory?.totalAuthoritative).toBe(0);
+
+      db.close();
+    });
+
+    it("proves a production-shaped rehearsal starting with legacy ready-head table reaches zero unclassified references after migration 0049", async () => {
+      const dbFile = join(tempDir, "production-shaped-rehearsal.db");
+      const db = new Database(dbFile);
+      db.pragma("foreign_keys = ON");
+      runMigrations(db);
+
+      // Verify that migration 0049 dropped obligation_ready_heads table
+      const tableRow = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get();
+      expect(tableRow).toBeUndefined();
+
+      // Seed obligations through ObligationRepository exercising derived state
+      const repo = new ObligationRepository(db);
+      repo.create({
+        id: "prod-ob-1",
+        ownerId: HUMAN_OPERATOR,
+        creatorId: HUMAN_OPERATOR,
+        title: "Migrate legacy principal in production",
+        intent: "Zero unclassified references",
+      });
+      repo.create({
+        id: "prod-ob-2",
+        ownerId: ROOT_ID,
+        creatorId: HUMAN_OPERATOR,
+        title: "Root ongoing task",
+        intent: "Continuous execution",
+      });
+
+      // Derived ready heads reflect active heads on the fly
+      expect(repo.readyHeads().get(HUMAN_OPERATOR)).toBe("prod-ob-1");
+      expect(repo.readyHeads().get(ROOT_ID)).toBe("prod-ob-2");
+
+      // Dry run must report zero dangling references
+      const dryRunResult = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: false,
+      });
+      expect(dryRunResult.applied).toBe(false);
+      expect(dryRunResult.preInventory.totalDangling).toBe(0);
+      expect(dryRunResult.preInventory.dangling).toEqual([]);
+
+      // Apply migration
+      const applyResult = executeLegacyPrincipalMigration(db, {
+        email: "operator@example.com",
+        apply: true,
+      });
+      expect(applyResult.applied).toBe(true);
+      expect(applyResult.postInventory?.totalAuthoritative).toBe(0);
+      expect(applyResult.postInventory?.totalDangling).toBe(0);
+      expect(applyResult.postInventory?.dangling).toEqual([]);
+
+      // Derived heads are now attributed to the durable principal
+      expect(repo.readyHeads().get(applyResult.principalId)).toBe("prod-ob-1");
+      expect(repo.readyHeads().has(HUMAN_OPERATOR)).toBe(false);
 
       db.close();
     });

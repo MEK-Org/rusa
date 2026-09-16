@@ -105,7 +105,15 @@ describe("Database Migration System", () => {
       "0047_actor_experiments",
       "0048_portable_context_snapshots",
       "0049_obligation_responsive",
+      "0050_drop_obligation_ready_heads",
     ]);
+
+    const tableNames = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
+        name: string;
+      }>
+    ).map((t) => t.name);
+    expect(tableNames).not.toContain("obligation_ready_heads");
 
     const meshEventsColumns = (
       db.prepare("PRAGMA table_info(mesh_events)").all() as Array<{ name: string }>
