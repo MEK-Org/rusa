@@ -166,6 +166,23 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     return cookie.split(";")[0];
   }
 
+  it("requires a verified durable principal for authenticated dashboard mutations (#509)", async () => {
+    const missingPrincipal = await post("/api/mesh/actors/actor/interrupt");
+    expect(missingPrincipal.status).toBe(401);
+    expect(interrupt).not.toHaveBeenCalled();
+
+    const cookie = await login();
+    const principal = principals.findUserByExternalIdentity({
+      issuer: token.iss,
+      subject: token.sub,
+    });
+    expect(principal).toBeDefined();
+
+    const authenticated = await post("/api/mesh/actors/actor/interrupt", cookie);
+    expect(authenticated.status).toBe(200);
+    expect(interrupt).toHaveBeenCalledWith("actor", principal?.id);
+  });
+
   it.skipIf(mode !== "shared")(
     "gives two distinct, rootless humans equal reads and mutations while denying outsiders",
     async () => {

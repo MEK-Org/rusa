@@ -515,10 +515,10 @@ function parseKinds(url: URL): string[] | undefined {
 /**
  * The durable principal a dashboard mutation is attributed to. An
  * authenticated session carries its verified identity. In auth-disabled local
- * mode the process boundary is the trust boundary, so the sole active durable
- * user is the attribution — and only when exactly one exists. Zero or several
- * active users is refused with the reason, never guessed at and never the
- * legacy `human:operator` alias (#460).
+ * mode the process boundary is the trust boundary. A sole active durable user
+ * remains attributable after #460; when no active durable user exists, local
+ * actions retain the legacy `human:operator` identity rather than becoming
+ * unusable. Several active users are still refused rather than guessed at.
  */
 export function resolveOperatorPrincipalId(
   req: IncomingMessage,
@@ -528,6 +528,7 @@ export function resolveOperatorPrincipalId(
   if (reqPrincipal) return { ok: true, principalId: reqPrincipal.id as RootControlPrincipal };
   const sole = resolveSoleActiveUser(deps?.principals);
   if (sole.ok) return { ok: true, principalId: sole.user.id as RootControlPrincipal };
+  if (sole.reason === "none") return { ok: true, principalId: HUMAN_OPERATOR };
   return { ok: false, error: sole.error };
 }
 
