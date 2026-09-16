@@ -350,6 +350,60 @@ void main() {
     );
 
     test(
+      'Replay skips a later user memo and targets the latest reply',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('a')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        // A memo recorded after A is the newest transcript row, but it is not
+        // a reply, so Replay must still choose A.
+        await controller.toggleRecord();
+        await controller.toggleRecord();
+        await pumpEventQueue();
+        expect(controller.transcript.value.last, isA<UserMemoEntry>());
+
+        controller.replayLast();
+        await pumpEventQueue();
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/a',
+          '/api/mesh/voice/audio/a',
+        ]);
+        expect(controller.nowPlaying.value?.id, 'a');
+      },
+    );
+
+    test(
+      'replaying a reply still waiting in the queue keeps its first-play ack',
+      () async {
+        api.backlogPages = [
+          [makeAnnouncement('b'), makeAnnouncement('c')],
+        ];
+        await controller.enable();
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'b');
+
+        // C has been received but never started. Tapping it is its first
+        // playback, so the server acknowledgement must still happen.
+        controller.replayAnnouncement(makeAnnouncement('c'));
+        await pumpEventQueue();
+        expect(controller.nowPlaying.value?.id, 'c');
+        walkie.player.finishCurrent();
+        await pumpEventQueue();
+
+        expect(walkie.player.playedUrls, [
+          '/api/mesh/voice/audio/b',
+          '/api/mesh/voice/audio/c',
+        ]);
+        expect(api.ackedIds, ['b', 'c']);
+      },
+    );
+
+    test(
       'a playback failure surfaces on lastError and the queue advances',
       () async {
         api.backlogPages = [

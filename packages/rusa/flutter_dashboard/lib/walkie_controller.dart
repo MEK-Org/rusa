@@ -470,10 +470,15 @@ class WalkieController {
           entry is ActorReplyEntry && entry.announcement.id == announcement.id,
     );
     if (!received) return;
-    // An already-queued target moves rather than plays twice. Replays are
-    // local; the original delivery owns the server acknowledgement.
-    _queue.removeWhere((item) => item.frame.id == announcement.id);
-    _queue.insert(0, _QueueItem(announcement, ackNeeded: false));
+    // An already-queued target moves rather than plays twice, and keeps its
+    // pending first-play ack. A reply that has already started or finished
+    // owns its own server acknowledgement, so a replay never acks again.
+    final queuedIndex = _queue.indexWhere(
+      (item) => item.frame.id == announcement.id,
+    );
+    final ackNeeded =
+        queuedIndex >= 0 && _queue.removeAt(queuedIndex).ackNeeded;
+    _queue.insert(0, _QueueItem(announcement, ackNeeded: ackNeeded));
     _queueDepth.add(_queue.length);
     if (_nowPlaying.value != null) {
       _deps.player.stop();
