@@ -1828,6 +1828,101 @@ describe("quota MCP server", () => {
         expect(config.responseSchema.properties.windows.items.required).toContain("resetText");
       });
 
+      it("instructs the model that GPT-5.3-Codex-Spark limit is a heading and all rows beneath it are scoped only to gpt-5.3-codex-spark", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
+        });
+
+        await parseCodexQuota(pendingOnlyCapture(), "test-key", scrapedAtMs, codexCatalog);
+
+        const systemInstruction = lastSystemInstruction();
+        expect(systemInstruction).toContain(
+          "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class"
+        );
+        expect(systemInstruction).toContain("Account rows above the heading remain provider scope");
+      });
+
+      it("scopes both Spark 5h and Weekly rows to gpt-5.3-codex-spark when configured in the catalog", async () => {
+        const catalogWithSpark = [
+          ...codexCatalog,
+          { displayLabel: "gpt-5.3-codex-spark", identifier: "gpt-5.3-codex-spark" },
+        ];
+        mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
+
+        const parsed = await parseCodexQuota(
+          twoPanelCapture(),
+          "test-key",
+          scrapedAtMs,
+          catalogWithSpark
+        );
+
+        expect(parsed.status).toBe("available");
+        expect(parsed.limits).toEqual([
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            percentLeft: 39,
+            resetAtIso: displayedWeeklyReset,
+            scope: { provider: "codex" },
+          },
+          {
+            label: "5h limit",
+            kind: "five_hour",
+            percentLeft: 100,
+            resetAtIso: new Date(2026, 8, 16, 16, 20, 0, 0).toISOString(),
+            scope: { provider: "codex", models: ["gpt-5.3-codex-spark"] },
+          },
+          {
+            label: "Weekly limit",
+            kind: "weekly",
+            percentLeft: 100,
+            resetAtIso: new Date(2026, 8, 23, 11, 20, 0, 0).toISOString(),
+            scope: { provider: "codex", models: ["gpt-5.3-codex-spark"] },
+          },
+        ]);
+      });
+
+      it("resolves printed minute without rolling over 24 hours when scrape occurs mid-minute", async () => {
+        // Scrape at 16:20:30 reading "16:20" must resolve to today 16:20:00, not tomorrow.
+        const now = new Date(scrapedAtMs);
+        const midMinuteScrapeMs = new Date(
+          now.getFullYear(),
+          now.getMonth(),
+          now.getDate(),
+          16,
+          20,
+          30,
+          0
+        ).getTime();
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 0,
+                  resetText: "16:20",
+                  placeholder: false,
+                  scope: "provider",
+                },
+              ],
+            }),
+        });
+
+        const parsed = await parseCodexQuota(
+          twoPanelCapture(),
+          "test-key",
+          midMinuteScrapeMs,
+          codexCatalog
+        );
+
+        expect(parsed.limits?.[0].resetAtIso).toBe(
+          new Date(now.getFullYear(), now.getMonth(), now.getDate(), 16, 20, 0, 0).toISOString()
+        );
+      });
+
       it("publishes the completed panel's provider weekly and drops the reserve block end to end", async () => {
         const capture = twoPanelCapture();
         const scrapeStore = {

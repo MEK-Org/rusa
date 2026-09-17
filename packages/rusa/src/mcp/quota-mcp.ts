@@ -437,11 +437,20 @@ function parseWallClockResetText(
   if (hour > 23 || minute > 59) return undefined;
 
   const now = new Date(generatedAtMs);
+  const nowFlooredMs = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    now.getHours(),
+    now.getMinutes(),
+    0,
+    0
+  ).getTime();
   if (dayRaw === undefined) {
     // Time only: the next occurrence of that clock time at or after the scrape.
     const sameDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
     const resolved =
-      sameDay.getTime() >= generatedAtMs
+      sameDay.getTime() >= nowFlooredMs
         ? sameDay
         : new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, hour, minute, 0, 0);
     return resolved.toISOString();
@@ -459,7 +468,7 @@ function parseWallClockResetText(
   if (yearRaw !== undefined) return build(Number(yearRaw))?.toISOString();
   // No printed year: the panel means the next such date at or after the scrape.
   const thisYear = build(now.getFullYear());
-  if (thisYear && thisYear.getTime() >= generatedAtMs) return thisYear.toISOString();
+  if (thisYear && thisYear.getTime() >= nowFlooredMs) return thisYear.toISOString();
   return build(now.getFullYear() + 1)?.toISOString();
 }
 
@@ -533,8 +542,9 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
-          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' are provider-wide: emit them with no `models`; they alone determine status. " +
-          "Named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), and any 5h or Weekly rows beneath a standalone '<model name> limit:' heading (for example beneath a Codex Spark heading). " +
+          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' appearing above any model heading are provider-wide account rows: emit them with no `models`; they alone determine status. " +
+          "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
+          "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
           "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
           "Codex percentages say LEFT. Convert the printed N% left to usedPercent = 100 - N exactly. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
