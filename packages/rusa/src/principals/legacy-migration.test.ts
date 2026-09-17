@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
+import { migrations } from "../db/migrations/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -34,11 +35,32 @@ function createMockLiveActor(id: string): Actor {
   } as unknown as Actor;
 }
 
+function runMigrationsThrough(db: Database.Database, throughId: string): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  // Zero-padded ids sort lexicographically in application order.
+  for (const migration of migrations) {
+    if (migration.id > throughId) break;
+    if (migration.noTransaction) {
+      migration.up(db);
+      db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
+    } else {
+      db.transaction(() => {
+        migration.up(db);
+        db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
+      })();
+    }
+  }
+}
+
 function setupLegacyDatabase(dbPath?: string): Database.Database {
   const db = new Database(dbPath ?? ":memory:");
   db.pragma("foreign_keys = ON");
   runMigrations(db);
-
   // Seed actors
   const actorRepo = new SqliteActorRepository(db);
   actorRepo.upsert({
@@ -887,42 +909,90 @@ describe("legacy-migration", () => {
       db.close();
     });
 
-    it("proves a production-shaped rehearsal starting with legacy ready-head table reaches zero unclassified references after migration 0049", async () => {
+    it("proves a production-shaped rehearsal: 0048 schema with a legacy ready-head row upgrades via 0049, then the principal migration reaches zero unclassified references", async () => {
       const dbFile = join(tempDir, "production-shaped-rehearsal.db");
       const db = new Database(dbFile);
       db.pragma("foreign_keys = ON");
-      runMigrations(db);
 
-      // Verify that migration 0049 dropped obligation_ready_heads table
-      const tableRow = db
+      // 1. Build the schema exactly as a pre-0049 production instance has it:
+      // migration 0025 created obligation_ready_heads and it still exists at 0048.
+      runMigrationsThrough(db, "0048_portable_context_snapshots");
+      const legacyTableAt0048 = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
         )
         .get();
-      expect(tableRow).toBeUndefined();
+      expect(legacyTableAt0048).toBeDefined();
 
-      // Seed obligations through ObligationRepository exercising derived state
+      // 2. Seed the exact production failure shape from #513: a ready
+      // obligation owned by the legacy alias plus its ready-head cache row
+      // keyed by owner_id, and a standing root obligation.
+      db.prepare(
+        `INSERT INTO obligations (id, owner_id, creator_id, title, intent, created_at, updated_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "prod-ob-1",
+        HUMAN_OPERATOR,
+        HUMAN_OPERATOR,
+        "Migrate legacy principal in production",
+        "Zero unclassified references",
+        "2026-09-01T02:00:00.000Z",
+        "2026-09-01T02:00:00.000Z",
+        "ready"
+      );
+      db.prepare(
+        `INSERT INTO obligations (id, owner_id, creator_id, title, created_at, updated_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        "prod-ob-2",
+        ROOT_ID,
+        HUMAN_OPERATOR,
+        "Root ongoing task",
+        "2026-09-01T02:05:00.000Z",
+        "2026-09-01T02:05:00.000Z",
+        "ready"
+      );
+      db.prepare(
+        `INSERT INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(HUMAN_OPERATOR, "prod-ob-1", null, 1, "2026-09-01T02:00:00.000Z");
+
+      // Before the schema upgrade, the seeded row is the dangling reference
+      // that aborted every apply rehearsal in #513, and it still does.
+      const preUpgradeInventory = inventoryLegacyReferences(db);
+      expect(preUpgradeInventory.dangling).toContainEqual({
+        table: "obligation_ready_heads",
+        column: "owner_id",
+        count: 1,
+      });
+      expect(() =>
+        executeLegacyPrincipalMigration(db, {
+          email: "operator@example.com",
+          apply: true,
+        })
+      ).toThrow(/unclassified legacy references detected/);
+      // The aborted apply rolls back, leaving the legacy row untouched.
+      const rolledBack = db
+        .prepare("SELECT owner_id FROM obligation_ready_heads WHERE owner_id = ?")
+        .get(HUMAN_OPERATOR);
+      expect(rolledBack).toBeDefined();
+
+      // 3. The production upgrade path: forward schema migration 0049 runs
+      // first and drops the recomputable cache table, legacy row included.
+      runMigrations(db);
+      const tableAfter0049 = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get();
+      expect(tableAfter0049).toBeUndefined();
+
+      // 4. Derived ready heads still reflect the obligations rows on the fly.
       const repo = new ObligationRepository(db);
-      repo.create({
-        id: "prod-ob-1",
-        ownerId: HUMAN_OPERATOR,
-        creatorId: HUMAN_OPERATOR,
-        title: "Migrate legacy principal in production",
-        intent: "Zero unclassified references",
-      });
-      repo.create({
-        id: "prod-ob-2",
-        ownerId: ROOT_ID,
-        creatorId: HUMAN_OPERATOR,
-        title: "Root ongoing task",
-        intent: "Continuous execution",
-      });
-
-      // Derived ready heads reflect active heads on the fly
       expect(repo.readyHeads().get(HUMAN_OPERATOR)).toBe("prod-ob-1");
       expect(repo.readyHeads().get(ROOT_ID)).toBe("prod-ob-2");
 
-      // Dry run must report zero dangling references
+      // 5. Dry run and apply now both report zero dangling references.
       const dryRunResult = executeLegacyPrincipalMigration(db, {
         email: "operator@example.com",
         apply: false,
@@ -931,7 +1001,6 @@ describe("legacy-migration", () => {
       expect(dryRunResult.preInventory.totalDangling).toBe(0);
       expect(dryRunResult.preInventory.dangling).toEqual([]);
 
-      // Apply migration
       const applyResult = executeLegacyPrincipalMigration(db, {
         email: "operator@example.com",
         apply: true,

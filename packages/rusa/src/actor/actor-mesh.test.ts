@@ -1529,20 +1529,20 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("is idempotent when transition-based attention was already delivered before restart", async () => {
+  it("reconcile after a restart adds its one permanent repair entry over a handled live entry, then stays silent", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1, sequence 1)
+    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1, sequence 1).
+    // Live entries are epoch-scoped, so this id belongs to this process only.
     mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0", 1);
     await tick();
     expect(rootEntries()).toHaveLength(1);
     expect(rootEntries()[0].source).toBe("obligation:ob-1");
+    inboxStore.markHandled("root", [rootEntries()[0].id]);
 
-    const callsBeforeReconcile = fake("root").calls.length;
-
-    // Simulate restart and run reconcileReadyHeads
+    // Simulate restart and run reconcileReadyHeads over the same transition fact.
     const obligations = {
       readyHeadTransitions: () => [
         { ownerId: "root", headId: "ob-1", previousHeadId: "ob-0", sequence: 1 },
@@ -1550,12 +1550,122 @@ describe("ActorMesh", () => {
       get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "ship it" } : null),
     };
 
+    const callsBeforeReconcile = fake("root").calls.length;
     mesh.reconcileReadyHeads(obligations);
     await tick();
 
-    // No duplicate entry or extra wake!
+    // Reconcile entries are epoch-free and permanent: the restart generation
+    // gets exactly one repair entry for the fact (the accepted at-most-one
+    // duplicate of the #513 operator ruling), not a silent suppression —
+    // the handled live entry belongs to a dead epoch and cannot satisfy repair.
+    expect(rootEntries()).toHaveLength(2);
+    expect(rootEntries()[1].source).toBe("obligation:ob-1");
+    expect(fake("root").calls.length).toBe(callsBeforeReconcile + 1);
+
+    // A second reconcile pass over unchanged facts is silent.
+    const callsBeforePass2 = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+    expect(rootEntries()).toHaveLength(2);
+    expect(fake("root").calls.length).toBe(callsBeforePass2);
+  });
+
+  it("never lets inbox dedupe suppress a genuine repeated transition delivered by a restarted mesh (#513)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    const first = setup({ inboxStore, actors });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // Restart-generation 1 observes B -> A at sequence 1 and the actor handles it.
+    expect(
+      first.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+    ).toBe(true);
+    await first.tick();
     expect(rootEntries()).toHaveLength(1);
-    expect(fake("root").calls.length).toBe(callsBeforeReconcile);
+    inboxStore.markHandled("root", [rootEntries()[0].id]);
+
+    // Restart-generation 2: a brand-new process (fresh epoch) commits the SAME
+    // real transition B -> A, again at sequence 1 — the repository's in-memory
+    // sequence restarted, so the triple collides with the handled entry.
+    const restarted = setup({ inboxStore, actors });
+
+    // Pre-fix this append hit ON CONFLICT DO NOTHING and the actor lost the
+    // wake; the epoch in the dedupe key makes the recurrence a distinct entry.
+    expect(
+      restarted.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+    ).toBe(true);
+    await restarted.tick();
+    expect(rootEntries()).toHaveLength(2);
+
+    // Replays within the restarted process are still suppressed exactly once.
+    expect(
+      restarted.mesh.deliverReadyHeadAttention("root", { id: "ob-a", intent: "work A" }, "ob-b", 1)
+    ).toBe(false);
+    expect(rootEntries()).toHaveLength(2);
+  });
+
+  it("delivers a real B -> A recurrence across repository and mesh restarts even when the sequence collides (#513)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+    const wire = (mesh: ActorMesh, repo: ObligationRepository) =>
+      repo.setReadyHeadListener(({ ownerId, head, previousHeadId, sequence }) =>
+        mesh.deliverReadyHeadAttention(
+          ownerId,
+          head === null
+            ? null
+            : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
+          previousHeadId,
+          sequence
+        )
+      );
+
+    // Process 1: A arrives, B displaces it, then B leaves and returns, leaving
+    // B as the head. Transition #3 is B -> A at sequence 3; the actor handles
+    // every entry including that one.
+    const repo1 = new ObligationRepository(db);
+    const mesh1 = setup({ inboxStore, actors });
+    wire(mesh1.mesh, repo1);
+    repo1.create({ id: "ob-a", title: "Task A", ownerId: "root", priority: 1 });
+    repo1.create({ id: "ob-b", title: "Task B", ownerId: "root", priority: 0 });
+    repo1.reassign("ob-b", "actor-someone-else", "system:mesh");
+    repo1.reassign("ob-b", "root", "system:mesh");
+    expect(headEntries()).toHaveLength(4);
+    expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-a" });
+    for (const entry of headEntries()) inboxStore.markHandled("root", [entry.id]);
+
+    // Process 2 (restart): fresh repository (sequence memory empty) and fresh
+    // mesh (fresh epoch) over the same database and inbox. The same three-step
+    // churn repeats and produces B -> A at sequence 3 again — the exact
+    // (previousHeadId, headId, sequence) triple process 1 already delivered and
+    // had handled.
+    const repo2 = new ObligationRepository(db);
+    const mesh2 = setup({ inboxStore, actors });
+    wire(mesh2.mesh, repo2);
+    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    expect(headEntries()).toHaveLength(5);
+    inboxStore.markHandled("root", [headEntries()[4].id]);
+    repo2.reassign("ob-b", "root", "system:mesh");
+    expect(headEntries()).toHaveLength(6);
+    inboxStore.markHandled("root", [headEntries()[5].id]);
+
+    // The recurring B -> A must reach the inbox. Pre-fix its id was identical
+    // to process 1's handled entry, so ON CONFLICT DO NOTHING swallowed it and
+    // the actor was never woken about live work; the epoch in the dedupe key
+    // keeps the recurrence a distinct entry. Replays within this process are
+    // still suppressed.
+    repo2.reassign("ob-b", "actor-someone-else", "system:mesh");
+    expect(headEntries()).toHaveLength(7);
+    expect(headEntries()[6].payload).toMatchObject({ obligationId: "ob-a" });
+
+    db.close();
   });
 
   it("reconciles a missed recurrence transition when multiple consecutive listener failures occurred", async () => {

@@ -882,6 +882,9 @@ export class ObligationRepository {
    *
    * Ready-head transitions are maintained in process memory to guarantee
    * exactly-once delivery within a session without SQLite table persistence (#513).
+   * Because sequences restart at 1 after a restart, the mesh scopes its durable
+   * inbox dedupe with a per-process epoch so a genuine repeated transition
+   * across restarts still delivers instead of colliding with a handled entry.
    */
   private mutate<T>(principal: EntityId, work: () => T): T {
     if (this.isMutating) {
