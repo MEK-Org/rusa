@@ -135,14 +135,8 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import { startGitHubEventPoller } from "../github/poller.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
-import {
-  GitBridgeIssueClient,
-  type GitHubPollingIssueClient,
-  getIssueClient,
-  type IssueClient,
-} from "../gitops/issue-client.js";
+import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
@@ -606,11 +600,12 @@ export interface RunStartOptions {
   e2e?: RunStartE2EHooks;
 }
 
-export function shouldBindWebhookServer(params: {
-  e2eMode: boolean;
-  ingestionMode: string | undefined;
-}): boolean {
-  return !params.e2eMode && (params.ingestionMode ?? "webhook") === "webhook";
+/**
+ * Webhooks are the only GitHub ingestion edge, so the listener binds whenever
+ * the runner is not driving events in-process (e2e mode).
+ */
+export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
 }
 
 export function shouldBindDashboardServer(params: {
@@ -1102,11 +1097,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const gitBridgeServer = config.gitBridge
     ? startGitHttpServer(mcHome, gitBridgePort, { bindHost: gitBridgeBindHost })
     : null;
-  const issueClient: IssueClient & GitHubPollingIssueClient = config.gitBridge
-    ? new GitBridgeIssueClient(baseIssueClient as IssueClient & GitHubPollingIssueClient, {
-        port: gitBridgePort,
-      })
-    : (baseIssueClient as IssueClient & GitHubPollingIssueClient);
+  const issueClient: IssueClient = config.gitBridge
+    ? new GitBridgeIssueClient(baseIssueClient, { port: gitBridgePort })
+    : baseIssueClient;
   const gitBridgeDeliverables = new Map<string, string>();
   // ONE local-first would-be-graph client (ISSUE_NUM 2b) backs BOTH the read and write
   // understanding servers (no module-global state — Operator's DI review of ISSUE_NUM): a normal
@@ -3521,8 +3514,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // collisions and the need to sign synthetic webhook payloads).
   const e2eMode = Boolean(opts?.e2e?.onReady);
   const noDashboardServer = opts?.noDashboardServer ?? false;
-  const ingestionMode = config.github.ingestionMode ?? "webhook";
-  const webhookServer = shouldBindWebhookServer({ e2eMode, ingestionMode })
+  const webhookServer = shouldBindWebhookServer({ e2eMode })
     ? await startWebhookServer({
         secret: webhookSecret,
         onEvent,
@@ -3533,20 +3525,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           : undefined,
       })
     : null;
-  const githubPoller =
-    !e2eMode &&
-    ingestionMode === "poll" &&
-    ((config.github.repos?.length ?? 0) > 0 || (config.github.orgs?.length ?? 0) > 0)
-      ? startGitHubEventPoller({
-          repos: config.github.repos ?? [],
-          orgs: config.github.orgs ?? [],
-          deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
-          intervalSeconds: config.github.pollIntervalSeconds,
-          home: mcHome,
-          issueClient,
-          onEvent,
-        })
-      : null;
   // Walkie-talkie mode, server half : gated on geminiApiKey (transcription
   // and TTS are host-side Gemini calls — the key never reaches workers). When
   // absent the voice routes 503 with a clear error and nothing else changes.
@@ -3900,7 +3878,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     }
     try {
-      githubPoller?.close();
       await webhookServer?.close();
     } catch {
       /* already closed */

@@ -44,6 +44,9 @@ The root `quickstart` command accepts the following options:
 4. **Launching the Orchestrator**
    Once configuration is complete, the quickstart CLI automatically tears down the temporary setup container and boots the main app container (`rusa-quickstart`). This container mounts the volume and starts the orchestrator service.
 
+### Local Repository, Not GitHub
+Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) but subscribes to no repositories: the orchestrator still binds the webhook listener inside the container, but the port is not published and no repository is admitted, so any GitHub delivery that did reach it is dropped as not covered by any subscription. Rusa has no GitHub polling fallback: connecting a quickstart instance to GitHub means adding `github.repos`, publishing the webhook port (`9742`, not published by the quickstart container by default), and registering a GitHub webhook that can reach it. See `rusa config-docs` for the `webhook` keys. A `github-poller-state.json` left in the volume by an earlier build is ignored.
+
 ### Local Git Bridge
 Once the orchestrator is running, each repository explicitly listed in `github.repos` has a Git HTTP bridge endpoint. The quickstart wizard does not add this configuration automatically; add the repository's `owner/name` to `github.repos` in the volume's `config.yaml` first. You can then connect a matching local workspace repository to it using:
 
@@ -79,18 +82,17 @@ When the GitHub client needs to authenticate API requests, it resolves the token
 3. **CLI Token**: Runs the CLI credential helper `gh auth token` command.
 
 ### Optional GitHub PAT
-Providing a GitHub PAT is **optional for the local Git bridge itself**. GitHub polling and tracker operations require a credential through one of the resolution paths above.
+Providing a GitHub PAT is **optional for the local Git bridge itself**. Tracker operations against GitHub (issues, pull requests, comments) require a credential through one of the resolution paths above.
 
 ### Worker-Sandbox GitHub Credential Split (`github.workerTokenPath`)
 
 By default, every sandboxed worker actor sees the **same** GitHub credential the host plane uses (whatever `gh auth token` / `$RUSA_HOME/github-token` / `GH_TOKEN` resolves to) — including a full-`repo`-scope classic token if that's what you've authenticated `gh` with. That means any worker can write anything to GitHub the host account can.
 
-Setting `github.workerTokenPath` narrows this: sandboxed workers are handed a **read-mostly, fine-grained PAT** instead, while the host plane (root actor, `tracker` MCP, the issue poller) keeps using its own, more privileged credential.
+Setting `github.workerTokenPath` narrows this: sandboxed workers are handed a **read-mostly, fine-grained PAT** instead, while the host plane (root actor, `tracker` MCP) keeps using its own, more privileged credential.
 
 ```yaml
 github:
   account: your-github-account
-  pollIntervalSeconds: 300
   workerTokenPath: /home/svc/.rusa/worker-github-token
 ```
 

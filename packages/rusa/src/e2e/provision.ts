@@ -66,11 +66,7 @@ export function buildE2EConfig(opts: {
   return {
     rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
-    github: {
-      account: E2E_BOT,
-      // No real polling surface; keep the fallback interval long.
-      pollIntervalSeconds: 3600,
-    },
+    github: { account: E2E_BOT },
     providers: {
       ...(base?.providers ?? { antigravity: { cliCommand: "agy" } }),
       fake: { cliCommand: "fake" },

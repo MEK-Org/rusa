@@ -66,7 +66,6 @@ describe("runQuotaCoordinator startup relocation", () => {
       `
 github:
   account: mock-bot
-  ingestionMode: poll
 rootActor:
   provider: claude
   model: claude-3-5-sonnet
@@ -88,7 +87,6 @@ quota:
       `
 github:
   account: mock-bot
-  ingestionMode: poll
 rootActor:
   provider: claude
   model: claude-3-5-sonnet
@@ -144,7 +142,6 @@ quota:
       `
 github:
   account: mock-bot
-  ingestionMode: poll
 rootActor:
   provider: claude
   model: claude-3-5-sonnet

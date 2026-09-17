@@ -19,6 +19,7 @@ import {
 } from "./secrets.js";
 import {
   DEFAULT_DEPLOY_BRANCH,
+  type GitHubConfig,
   type GitHubOrgConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
@@ -53,7 +54,7 @@ export interface LoadConfigOptions {
 
 export const QUICKSTART_PROFILE = {
   // No separate single-user config toggle exists today; the current root/operator shape is structural.
-  github: { ingestionMode: "poll", account: "quickstart-user" },
+  github: { account: "quickstart-user" },
   sandbox: "container-boundary",
   dashboard: { port: 8080, bindHost: "0.0.0.0" },
   gitBridge: true,
@@ -134,26 +135,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (parsed.github && !parsed.github.account) {
     parsed.github.account = "quickstart-user";
   }
-  if (
-    parsed.github.ingestionMode !== undefined &&
-    parsed.github.ingestionMode !== "webhook" &&
-    parsed.github.ingestionMode !== "poll"
-  ) {
-    throw new Error('config.yaml: github.ingestionMode must be "webhook" or "poll" when set');
-  }
-  // Validate-when-set rather than default-when-absent: the absent case is already
-  // handled at the poller, and defaulting here too would make that guard look
-  // unreachable to a later reader — which is how the key came to be treated as
-  // deletable in the first place . What the poller's `??` cannot catch is a
-  // key that IS set to something non-numeric, so that is what this rejects.
-  if (parsed.github.pollIntervalSeconds !== undefined) {
-    const interval = parsed.github.pollIntervalSeconds;
-    if (typeof interval !== "number" || !Number.isFinite(interval) || interval <= 0) {
-      throw new Error(
-        "config.yaml: github.pollIntervalSeconds must be a positive number of seconds when set"
-      );
-    }
-  }
+  rejectRemovedGitHubPollingKeys(parsed.github);
   if (parsed.github.workerTokenPath !== undefined) {
     if (
       typeof parsed.github.workerTokenPath !== "string" ||
@@ -712,6 +694,25 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
       );
     }
     parsed.webhook.secret = fileWebhookSecret;
+  }
+}
+
+/**
+ * GitHub polling was removed; webhooks are the only ingestion edge. A config
+ * that still carries a polling key is refused rather than ignored, because a
+ * key that used to change how events arrive going silent is exactly how a
+ * stale install would run in a mode its operator never chose. `in` rather than
+ * `!== undefined` so an explicit null still names the removal.
+ */
+const REMOVED_GITHUB_POLLING_KEYS = ["ingestionMode", "pollIntervalSeconds"] as const;
+
+function rejectRemovedGitHubPollingKeys(github: GitHubConfig): void {
+  for (const key of REMOVED_GITHUB_POLLING_KEYS) {
+    if (key in github) {
+      throw new Error(
+        `config.yaml: github.${key} was removed along with GitHub polling; GitHub events now arrive only through the webhook listener (webhook.port). Delete the key from config.yaml.`
+      );
+    }
   }
 }
 

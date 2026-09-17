@@ -12,7 +12,7 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
   writeFileSync(
     join(home, "config.yaml"),
     toYaml({
-      github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+      github: { account: "CodeChopsBot" },
       providers: { codex: { cliCommand: "codex" } },
       rootActor: { provider: "codex", model: "gpt-5.6-sol" },
       geminiApiKey: "test-key",
@@ -30,7 +30,7 @@ describe("loadConfig deployBranch", () => {
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
-        github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+        github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
         webhook: { port: 9742, secret: "secret" },
       }),
@@ -63,7 +63,7 @@ describe("loadConfig geminiApiKey (optional)", () => {
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
-        github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+        github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
         rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
@@ -240,7 +240,7 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
-        github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+        github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
         rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "" },
@@ -274,7 +274,7 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     writeFileSync(
       join(home, "config.yaml"),
       toYaml({
-        github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+        github: { account: "CodeChopsBot" },
         providers: { codex: { cliCommand: "codex" } },
         rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
@@ -292,26 +292,46 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
   });
 });
 
-describe("loadConfig GitHub ingestion mode", () => {
-  it("accepts poll ingestion mode", () => {
-    expect(
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", ingestionMode: "poll" } })).github
-        .ingestionMode
-    ).toBe("poll");
+describe("loadConfig removed GitHub polling keys", () => {
+  // GitHub polling is gone; webhooks are the only ingestion edge. A config that
+  // still carries either key must fail at load and say what to do, never boot
+  // in a mode its operator did not pick.
+  const removal = /was removed along with GitHub polling.*webhook listener.*Delete the key/;
+
+  it("rejects github.ingestionMode even when it names webhook, the only mode left", () => {
+    expect(() =>
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", ingestionMode: "webhook" } }))
+    ).toThrow(/github\.ingestionMode was removed/);
+    expect(() =>
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", ingestionMode: "poll" } }))
+    ).toThrow(removal);
   });
 
-  it("rejects an unknown ingestion mode", () => {
+  it("rejects github.pollIntervalSeconds, which every pre-removal init wrote by default", () => {
     expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", ingestionMode: "socket" } }))
-    ).toThrow(/github\.ingestionMode/);
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } }))
+    ).toThrow(/github\.pollIntervalSeconds was removed/);
+    expect(() =>
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } }))
+    ).toThrow(removal);
+  });
+
+  it("rejects a removed key set to null rather than treating it as absent", () => {
+    expect(() =>
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", ingestionMode: null } }))
+    ).toThrow(/github\.ingestionMode was removed/);
+  });
+
+  it("loads a config that omits both keys, which is what every live install already does", () => {
+    const github = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } })).github;
+    expect(github).not.toHaveProperty("ingestionMode");
+    expect(github).not.toHaveProperty("pollIntervalSeconds");
   });
 });
 
 describe("loadConfig github.repos (multi-repo identity and subscriptions)", () => {
   it("defaults to undefined when omitted", () => {
-    const config = loadConfig(
-      writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } })
-    );
+    const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
     expect(config.github.repos).toBeUndefined();
   });
 
@@ -513,9 +533,7 @@ describe("loadConfig removed eventSources field", () => {
 
 describe("loadConfig github.workerTokenPath (optional, worker-sandbox credential split)", () => {
   it("defaults to undefined when omitted (workers see the host gh credential, unchanged)", () => {
-    const config = loadConfig(
-      writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } })
-    );
+    const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
     expect(config.github.workerTokenPath).toBeUndefined();
   });
 
@@ -524,7 +542,6 @@ describe("loadConfig github.workerTokenPath (optional, worker-sandbox credential
       writeConfig({
         github: {
           account: "CodeChopsBot",
-          pollIntervalSeconds: 300,
           workerTokenPath: "  /home/svc/.rusa/worker-github-token  ",
         },
       })
@@ -536,33 +553,10 @@ describe("loadConfig github.workerTokenPath (optional, worker-sandbox credential
     expect(() =>
       loadConfig(
         writeConfig({
-          github: { account: "CodeChopsBot", pollIntervalSeconds: 300, workerTokenPath: "   " },
+          github: { account: "CodeChopsBot", workerTokenPath: "   " },
         })
       )
     ).toThrow(/github\.workerTokenPath must be a non-empty string/);
-  });
-});
-
-describe("loadConfig github.pollIntervalSeconds (optional, poller-defaulted)", () => {
-  it("loads with the key absent — the poller owns the default, so this is not an error ", () => {
-    const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
-    expect(config.github.pollIntervalSeconds).toBeUndefined();
-  });
-
-  it("rejects a non-numeric value, which the poller's `??` cannot catch", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          github: { account: "CodeChopsBot", pollIntervalSeconds: "300" as unknown as number },
-        })
-      )
-    ).toThrow(/github\.pollIntervalSeconds must be a positive number of seconds when set/);
-  });
-
-  it("rejects zero, which would be a hot poll loop stated explicitly", () => {
-    expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 0 } }))
-    ).toThrow(/github\.pollIntervalSeconds must be a positive number of seconds when set/);
   });
 });
 
@@ -577,7 +571,7 @@ describe("loadConfig profiles", () => {
     expect(config.gitBridge).toBe(true);
     expect(config.gitBridgePort).toBe(8085);
     expect(config.gitBridgeBindHost).toBe("0.0.0.0");
-    expect(config.github.ingestionMode).toBe("poll");
+    expect(config.github).not.toHaveProperty("ingestionMode");
   });
 
   it("keeps prod sandbox and bind defaults when no profile is configured", () => {
@@ -593,7 +587,7 @@ describe("loadConfig profiles", () => {
     const config = loadConfig(
       writeConfig({
         profile: "quickstart",
-        github: { account: "CodeChopsBot", pollIntervalSeconds: 300, ingestionMode: "webhook" },
+        github: { account: "CodeChopsBot" },
         sandbox: "bwrap",
         dashboard: { port: 9090, bindHost: "127.0.0.1" },
         gitBridge: false,
@@ -605,7 +599,7 @@ describe("loadConfig profiles", () => {
     expect(config.dashboard?.bindHost).toBe("127.0.0.1");
     expect(config.gitBridge).toBe(false);
     expect(config.gitBridgeBindHost).toBe("127.0.0.1");
-    expect(config.github.ingestionMode).toBe("webhook");
+    expect(config.github.account).toBe("CodeChopsBot");
   });
 
   it("applies a CLI profile option over the config file", () => {
@@ -614,7 +608,7 @@ describe("loadConfig profiles", () => {
     expect(config.profile).toBe("quickstart");
     expect(config.sandbox).toBe("container-boundary");
     expect(config.gitBridge).toBe(true);
-    expect(config.github.ingestionMode).toBe("poll");
+    expect(config.gitBridgePort).toBe(8085);
   });
 
   it("rejects an unknown profile", () => {

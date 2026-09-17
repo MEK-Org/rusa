@@ -143,10 +143,7 @@ describe("quickstart command", () => {
 
     expect(config.profile).toBe("quickstart");
     expect(readFileSync(join(home, "secrets", "gemini-api-key"), "utf8")).toBe("test-gemini-key\n");
-    expect(config.github).toEqual({
-      pollIntervalSeconds: 30,
-      ingestionMode: "poll",
-    });
+    expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.provider).toBe("codex");
     expect(config.rootActor?.model).toBe("gpt-5.6-sol");
@@ -183,10 +180,7 @@ describe("quickstart command", () => {
     const config = parseYaml(readFileSync(configPath, "utf8")) as RusaConfig;
 
     expect(readFileSync(join(home, "secrets", "gemini-api-key"), "utf8")).toBe("test-gemini-key\n");
-    expect(config.github).toEqual({
-      pollIntervalSeconds: 30,
-      ingestionMode: "poll",
-    });
+    expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
   });
