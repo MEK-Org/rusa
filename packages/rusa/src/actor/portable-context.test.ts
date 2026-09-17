@@ -442,6 +442,8 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     priority,
     effectivePriority: priority,
     prioritySourceId: id,
+    responsive: null,
+    effectiveResponsive: false,
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: "2026-08-01T00:00:00.000Z",
     creatorId: "actor-a",

@@ -56,6 +56,20 @@ export interface Obligation {
   /** Obligation whose explicit priority supplies effectivePriority. */
   prioritySourceId: string;
   /**
+   * Explicit responsive override (#531): `true` or `false` set on this row,
+   * `null` to inherit from the nearest ancestor with an explicit value. A
+   * responsive obligation is one whose `effectiveResponsive` resolves true.
+   */
+  responsive: boolean | null;
+  /**
+   * Whether this obligation (or an ancestor it inherits from) is responsive:
+   * ready/assignment attention for it is delivered as immediately responsive
+   * inbox work. Resolved dynamically from ancestry, the same way
+   * {@link effectivePriority} is — reparenting into or out of a responsive
+   * subtree changes this with no write to the row.
+   */
+  effectiveResponsive: boolean;
+  /**
    * When this obligation was created (ISO-8601). `null` only for rows that
    * predate the timestamp columns and have no recoverable creation time —
    * never a stand-in for "now".

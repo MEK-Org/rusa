@@ -23,6 +23,7 @@ import { recurringObligations } from "../migrations/0035_recurring_obligations.j
 import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
 import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
 import { obligationHistory } from "../migrations/0045_obligation_history.js";
+import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
 import { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -66,6 +67,7 @@ describe("ObligationRepository", () => {
     obligationDependencies.up(db);
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
+    obligationResponsive.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -93,6 +95,216 @@ describe("ObligationRepository", () => {
     expect(Date.parse(after.updatedAt as string)).toBeGreaterThan(
       Date.parse(created.updatedAt as string)
     );
+  });
+
+  describe("responsive obligations (#531)", () => {
+    it("inherits responsiveness through ancestry and honors an explicit override", () => {
+      repository.create({
+        title: "root",
+        id: "root",
+        ownerId: "actor-a",
+        responsive: true,
+      });
+      const child = repository.create({
+        title: "child",
+        id: "child",
+        ownerId: "actor-a",
+        parentId: "root",
+      });
+      const grandchild = repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        ownerId: "actor-a",
+        parentId: "child",
+      });
+      const optedOut = repository.create({
+        title: "opted out",
+        id: "opted-out",
+        ownerId: "actor-a",
+        parentId: "root",
+        responsive: false,
+      });
+
+      expect(repository.require("root")).toMatchObject({
+        responsive: true,
+        effectiveResponsive: true,
+      });
+      expect(child).toMatchObject({ responsive: null, effectiveResponsive: true });
+      expect(grandchild.effectiveResponsive).toBe(true);
+      expect(optedOut).toMatchObject({ responsive: false, effectiveResponsive: false });
+    });
+
+    it("resolves responsiveness dynamically on reparenting, with no row rewrite", () => {
+      repository.create({
+        title: "responsive root",
+        id: "r-root",
+        ownerId: "actor-a",
+        responsive: true,
+      });
+      const moving = repository.create({ title: "moving", id: "moving", ownerId: "actor-a" });
+      expect(moving.effectiveResponsive).toBe(false);
+
+      repository.reparent("moving", "r-root", "system:mesh");
+      expect(repository.require("moving").effectiveResponsive).toBe(true);
+      expect(db.prepare("SELECT responsive FROM obligations WHERE id = 'moving'").get()).toEqual({
+        responsive: null,
+      });
+
+      repository.reparent("moving", null, "system:mesh");
+      expect(repository.require("moving").effectiveResponsive).toBe(false);
+    });
+
+    it("persists the explicit value and recomputes inheritance after reload", () => {
+      repository.create({ title: "root", id: "root", ownerId: "actor-a", responsive: true });
+      repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "root" });
+
+      // A fresh repository over the same database is the reload: the column
+      // survives on disk and the CTE re-derives the inherited value.
+      const reloaded = new ObligationRepository(
+        db,
+        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
+        () => now++
+      );
+      expect(reloaded.require("root")).toMatchObject({
+        responsive: true,
+        effectiveResponsive: true,
+      });
+      expect(reloaded.require("child")).toMatchObject({
+        responsive: null,
+        effectiveResponsive: true,
+      });
+    });
+
+    it("defaults non-responsive obligations to not responsive", () => {
+      const obligation = repository.create({ title: "plain", id: "plain", ownerId: "actor-a" });
+      expect(obligation).toMatchObject({ responsive: null, effectiveResponsive: false });
+    });
+
+    describe("responsive-ready attention", () => {
+      let announced: Array<{ id: string; actingPrincipal: string }>;
+
+      beforeEach(() => {
+        announced = [];
+        repository.setResponsiveReadyListener((obligation, actingPrincipal) =>
+          announced.push({ id: obligation.id, actingPrincipal })
+        );
+      });
+
+      it("announces a responsive obligation that becomes ready behind the head", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+        expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hotfix"]);
+      });
+
+      it("leaves the head announcement to the ready-head change", () => {
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          responsive: true,
+        });
+        expect(announced).toEqual([]);
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
+      });
+
+      it("announces a re-released responsive head through the head change, responsively", () => {
+        const headChanges: Array<{ headId: string | null; responsive: boolean }> = [];
+        repository.setReadyHeadListener(({ head }) =>
+          headChanges.push({
+            headId: head?.id ?? null,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
+        repository.create({
+          title: "parent",
+          id: "parent",
+          ownerId: "actor-a",
+          responsive: true,
+        });
+        repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "parent" });
+        expect(repository.require("parent").status).toBe("waiting");
+        expect(announced).toEqual([]);
+
+        repository.setTerminalStatus("child", "done", null, null, "system:mesh");
+        // Re-released as the owner's head: the head change is the announcement,
+        // and it carries responsiveness so the mesh delivers it responsively.
+        expect(announced).toEqual([]);
+        expect(headChanges).toContainEqual({ headId: "parent", responsive: true });
+      });
+
+      it("announces a responsive obligation that re-readies behind the head on prerequisite completion", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "gate",
+          id: "gate",
+          ownerId: "actor-a",
+          priority: 2,
+        });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          priority: 3,
+          blockedBy: ["gate"],
+          responsive: true,
+        });
+        expect(announced).toEqual([]);
+
+        repository.setTerminalStatus("gate", "done", null, null, "system:mesh");
+        expect(repository.require("gate").status).toBe("done");
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+      });
+
+      it("does not announce non-responsive readiness (regression)", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({ title: "plain", id: "plain", ownerId: "actor-a", priority: 2 });
+        expect(announced).toEqual([]);
+        expect(repository.listResponsiveReadyAttention()).toEqual([]);
+      });
+
+      it("does not announce responsive obligations owned by humans", () => {
+        const userId = "fb394608-d6d6-4f2e-aebe-51a59bd01374";
+        repository.setPrincipalKind((id) => (id === userId ? "user" : undefined));
+        repository.create({ title: "decision", id: "decision", ownerId: userId, responsive: true });
+        expect(announced).toEqual([]);
+      });
+
+      it("retries a failed delivery from persisted truth on the next mutation", () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        repository.setReadyHeadListener(() => {});
+        let fail = true;
+        repository.setResponsiveReadyListener((obligation, actingPrincipal) => {
+          if (!fail) announced.push({ id: obligation.id, actingPrincipal });
+          else throw new Error("inbox is unavailable");
+        });
+
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        expect(announced).toEqual([]);
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("responsive-ready listener failed")
+        );
+
+        fail = false;
+        repository.create({ title: "other", id: "other", ownerId: "actor-b" });
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+        warn.mockRestore();
+      });
+    });
   });
 
   describe("ready-head attention (#1645)", () => {
@@ -3359,6 +3571,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationDependencies.up(d);
     obligationCheckpoint.up(d);
     obligationHistory.up(d);
+    obligationResponsive.up(d);
     return d;
   };
 

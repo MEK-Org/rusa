@@ -15,6 +15,7 @@ import { recurringObligations } from "../db/migrations/0035_recurring_obligation
 import { obligationDependencies } from "../db/migrations/0037_obligation_dependencies.js";
 import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoint.js";
 import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
+import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
@@ -51,6 +52,7 @@ describe("obligations MCP", () => {
     obligationDependencies.up(db);
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
+    obligationResponsive.up(db);
     repository = new ObligationRepository(db);
   });
 
@@ -72,6 +74,50 @@ describe("obligations MCP", () => {
       "set_obligation_recurrence",
       "set_obligation_status",
     ]);
+  });
+
+  it("creates responsive obligations and reports inherited responsiveness", async () => {
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const parent = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "bless cut",
+        owner_id: "actor-a",
+        responsive: true,
+      },
+    })) as CallToolResult;
+    expect(parent.isError).toBeFalsy();
+    const { obligation: root } = dataOf(parent) as {
+      obligation: { id: string; responsive: boolean | null; effectiveResponsive: boolean };
+    };
+    expect(root).toMatchObject({ responsive: true, effectiveResponsive: true });
+
+    const child = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "child step",
+        owner_id: "actor-a",
+        parent_id: root.id,
+      },
+    })) as CallToolResult;
+    expect(child.isError).toBeFalsy();
+    const { obligation: inherited } = dataOf(child) as {
+      obligation: { responsive: boolean | null; effectiveResponsive: boolean };
+    };
+    expect(inherited).toMatchObject({ responsive: null, effectiveResponsive: true });
+
+    const plain = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "plain",
+        owner_id: "actor-a",
+        responsive: false,
+      },
+    })) as CallToolResult;
+    const { obligation: optedOut } = dataOf(plain) as {
+      obligation: { responsive: boolean | null; effectiveResponsive: boolean };
+    };
+    expect(optedOut).toMatchObject({ responsive: false, effectiveResponsive: false });
   });
 
   it("stamps the creating actor as creator, distinct from the owner", async () => {

@@ -45,6 +45,8 @@ interface ObligationRow {
   priority: number | null;
   effective_priority: number;
   priority_source_id: string;
+  responsive: number | null;
+  effective_responsive: number;
   created_at: string | null;
   updated_at: string | null;
   creator_id: string | null;
@@ -105,6 +107,12 @@ export interface CreateObligationInput {
   externalRef?: string | null;
   /** Explicit finite priority. Defaults to creation time when omitted/null. */
   priority?: number | null;
+  /**
+   * Explicit responsive override (#531); null/omitted inherits from ancestry.
+   * Descendants inherit the resolved value dynamically, so a row filed under a
+   * responsive obligation is responsive without carrying its own value.
+   */
+  responsive?: boolean | null;
   /**
    * The entity raising this obligation, bound by the calling server — never
    * taken from model-supplied payload (#1671 trust boundary). Omitted only by
@@ -211,14 +219,15 @@ export interface RetirementInheritanceResult {
 }
 
 const EFFECTIVE_PRIORITY_CTE = `
-  WITH RECURSIVE effective_priority(id, effective_priority, priority_source_id) AS (
-    SELECT id, priority, id
+  WITH RECURSIVE effective_priority(id, effective_priority, priority_source_id, effective_responsive) AS (
+    SELECT id, priority, id, COALESCE(responsive, 0)
     FROM obligations
     WHERE parent_id IS NULL
     UNION ALL
     SELECT child.id,
            COALESCE(child.priority, parent.effective_priority),
-           CASE WHEN child.priority IS NULL THEN parent.priority_source_id ELSE child.id END
+           CASE WHEN child.priority IS NULL THEN parent.priority_source_id ELSE child.id END,
+           COALESCE(child.responsive, parent.effective_responsive)
     FROM obligations child
     JOIN effective_priority parent ON parent.id = child.parent_id
   )
@@ -228,6 +237,7 @@ const PROJECTED_OBLIGATION = `
   SELECT obligation.*,
          effective_priority.effective_priority,
          effective_priority.priority_source_id,
+         effective_priority.effective_responsive,
          EXISTS(
            SELECT 1
            FROM obligation_completions
@@ -314,6 +324,8 @@ function toObligation(row: ObligationRow): Obligation {
     priority: row.priority,
     effectivePriority: validatePriority(row.effective_priority),
     prioritySourceId: row.priority_source_id,
+    responsive: row.responsive === null ? null : row.responsive === 1,
+    effectiveResponsive: row.effective_responsive === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     creatorId: row.creator_id,
@@ -669,6 +681,66 @@ export class ObligationRepository {
   }
 
   /**
+   * Notified once per obligation that became `ready` this transaction and
+   * resolves responsive (#531) — created ready, re-released, or scheduled
+   * activation — unless it is its owner's current ready head, whose change is
+   * the ready-head listener's announcement (delivered responsively when the
+   * head is responsive). A transition to ready is a one-shot fact within a
+   * transaction, so delivery is keyed by obligation id and re-derived from
+   * committed state before firing; `actingPrincipal` is the entity whose
+   * mutation caused the transition, so a consumer can tell "this actor made
+   * its own work ready" from "someone else did".
+   */
+  private responsiveReadyListener?: (obligation: Obligation, actingPrincipal: EntityId) => void;
+
+  /**
+   * Obligation ids that transitioned to `ready` this transaction, pending
+   * listener delivery once it commits — same shape as
+   * {@link pendingCancellationAttention}.
+   */
+  private pendingResponsiveReady: string[] = [];
+
+  /** Delivery keys that threw on a previous {@link mutate} call, retried from current persisted truth. */
+  private failedResponsiveReadyKeys = new Set<string>();
+
+  setResponsiveReadyListener(
+    listener: ((obligation: Obligation, actingPrincipal: EntityId) => void) | undefined
+  ): void {
+    this.responsiveReadyListener = listener;
+  }
+
+  /**
+   * Every live ready responsive actor-owned obligation that is not its owner's
+   * current ready head — the set the responsive-ready listener announces.
+   * Derived fresh from persisted state (status, ancestry-resolved
+   * responsiveness, head ordering) rather than a separate ledger, the same
+   * role {@link listPrerequisiteCancellationAttention} plays for cancellation
+   * repair: boot reconciliation replays it through the same idempotent
+   * delivery path, and in-process retries re-derive from it after a failed
+   * delivery.
+   */
+  listResponsiveReadyAttention(): Obligation[] {
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE}
+         SELECT obligation.id
+         FROM obligations obligation
+         JOIN effective_priority ON effective_priority.id = obligation.id
+         WHERE obligation.status = 'ready'
+           AND effective_priority.effective_responsive = 1`
+      )
+      .all() as Array<{ id: string }>;
+    const heads = this.readyHeads();
+    return rows
+      .map((row) => this.get(row.id))
+      .filter((obligation): obligation is Obligation => obligation !== null)
+      .filter(
+        (obligation) =>
+          this.isActorOwner(obligation.ownerId) && heads.get(obligation.ownerId) !== obligation.id
+      );
+  }
+
+  /**
    * Every live dependent currently blocked on a cancelled prerequisite,
    * derived fresh from persisted state rather than a separate ledger — a
    * cancellation is permanent, so "is this edge still dangling" is always just
@@ -780,6 +852,7 @@ export class ObligationRepository {
     const changes: ReadyHeadChange[] = [];
     this.dirtyScheduleIds.clear();
     this.pendingCancellationAttention = [];
+    this.pendingResponsiveReady = [];
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     const result = this.db.transaction(() => {
@@ -919,6 +992,52 @@ export class ObligationRepository {
       }
     }
     this.pendingCancellationAttention = [];
+
+    const responsiveReadyListener = this.responsiveReadyListener;
+    if (responsiveReadyListener) {
+      const toDeliver = new Map<string, Obligation>();
+      for (const id of new Set(this.pendingResponsiveReady)) {
+        const obligation = this.get(id);
+        if (!obligation) continue;
+        if (obligation.status !== "ready" || !obligation.effectiveResponsive) continue;
+        if (!this.isActorOwner(obligation.ownerId)) continue;
+        // The owner's ready head announces itself through the ready-head
+        // change, responsively when the head is responsive — only obligations
+        // behind the head need this separate attention.
+        if (this.readyHeads().get(obligation.ownerId) === obligation.id) continue;
+        toDeliver.set(obligation.id, obligation);
+      }
+
+      // A prior mutation's delivery may have thrown (e.g. a transient inbox
+      // append failure) — retry from current persisted truth, the same repair
+      // the cancellation-attention loop performs above.
+      if (this.failedResponsiveReadyKeys.size > 0) {
+        const stillFailing = new Set(this.failedResponsiveReadyKeys);
+        for (const obligation of this.listResponsiveReadyAttention()) {
+          if (!this.failedResponsiveReadyKeys.has(obligation.id) || toDeliver.has(obligation.id)) {
+            continue;
+          }
+          toDeliver.set(obligation.id, obligation);
+          stillFailing.delete(obligation.id);
+        }
+        for (const key of stillFailing) this.failedResponsiveReadyKeys.delete(key);
+      }
+
+      for (const obligation of toDeliver.values()) {
+        try {
+          responsiveReadyListener(obligation, actingPrincipal);
+          this.failedResponsiveReadyKeys.delete(obligation.id);
+        } catch (err) {
+          this.failedResponsiveReadyKeys.add(obligation.id);
+          console.warn(
+            `[obligations] responsive-ready listener failed for ${obligation.id}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+    }
+    this.pendingResponsiveReady = [];
 
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
@@ -1180,8 +1299,8 @@ export class ObligationRepository {
       try {
         this.db
           .prepare(
-            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority,
-                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority, responsive,
+                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             id,
@@ -1192,6 +1311,7 @@ export class ObligationRepository {
             externalRef,
             initialStatus,
             priority,
+            input.responsive == null ? null : input.responsive ? 1 : 0,
             stampedAt,
             stampedAt,
             creatorId,
@@ -1214,6 +1334,9 @@ export class ObligationRepository {
           );
         }
         throw error;
+      }
+      if (initialStatus === "ready") {
+        this.pendingResponsiveReady.push(id);
       }
 
       for (const prerequisite of prerequisites) {
@@ -2462,6 +2585,7 @@ export class ObligationRepository {
           `UPDATE obligations SET status = 'ready', next_ready_at = NULL, updated_at = ? WHERE id = ?`
         )
         .run(this.stamp(), id);
+      this.pendingResponsiveReady.push(id);
 
       return this.require(id);
     });
@@ -2662,6 +2786,7 @@ export class ObligationRepository {
     this.db
       .prepare("UPDATE obligations SET status = 'ready', updated_at = ? WHERE id = ?")
       .run(this.stamp(), id);
+    this.pendingResponsiveReady.push(id);
   }
 
   /** Release every dependent that was only waiting on `prerequisiteId` (#212). */
