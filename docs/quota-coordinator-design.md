@@ -847,6 +847,21 @@ Notes on the shape, because the shape is the point:
   should. The per-bucket map is published alongside so a reader can see *which*
   window is old rather than only that one is; `updatedAt` keeps its current
   meaning and is display-only. Criterion 5a is the failure test.
+  **A bucket is no longer *current* once its reset instant has passed and the
+  newest scrape no longer emits it.** Codex prints its 5h row only while that
+  window is in use; after the window rolls over, a scrape emits the weekly row
+  alone, and the previous 5h row — reset already behind it — is a leftover of
+  a window that has ended, not a live window that went unrefreshed. Counting
+  it would hold the provider hard-stale indefinitely and widen the interval to
+  `maxIntervalSeconds` while the governing weekly bucket was minutes old
+  (#517). Such a bucket stays in the per-bucket map at its true age, so the
+  reader can still see it, but it does not contribute to `ageMs`. The rule is
+  deliberately both-conditions: an aged bucket whose reset is still ahead is a
+  live window the scrape failed to refresh and keeps aging the lane (5a); an
+  expired bucket the newest scrape *did* emit is that scrape's own reading of
+  the window and is likewise kept. "Newest scrape" is `updatedAt`, the newest
+  `observed_at` across kinds, so a bucket observed before it was omitted by
+  that scrape. Criterion 5b is the failure test.
 - **`stale` and `hardStale` are published rather than left to the client, and
   that is deliberate.** A client could compute both from `ageMs` — but only
   against `staleAfterMs` and `hardStaleAfterMs`, which are *service*
@@ -1705,6 +1720,16 @@ right foundation for 1 and 8.
    `freshness`, and separately assert that `updatedAt` still carries its current
    newest-stamp meaning, so the display field and the safety field cannot be
    confused for each other.
+   **5b. An expired bucket the newest scrape no longer emits does not age the
+   lane.** Beside a weekly bucket observed by the newest scrape, keep a
+   `five_hour` bucket whose `resetAtIso` is already in the past and whose
+   `observedAt` predates the weekly one by more than `hardStaleAfterMs`.
+   Assert that `freshness.ageMs` follows the weekly bucket, that `hardStale`
+   is false, that the published interval is the stored one rather than
+   `maxIntervalSeconds`, and that the per-bucket map still reports the expired
+   bucket's true age. Assert separately that the same aged bucket with its
+   reset still ahead keeps the lane hard-stale (5a holds), and that an expired
+   bucket sharing the newest scrape's `observedAt` is not excluded.
 6. **Unavailability changes nothing dangerous.** Remove the socket. Assert:
    clients keep launching, normal and responsive alike; each client's applied
    interval is unchanged until `hardStaleAfterMs` since its own last successful
@@ -1943,7 +1968,7 @@ approved — that is a human decision, not a mesh one.
    from the latest persisted `parsed_state`** (`shared-store.ts:318-333`);
    `geminiApiKey` on the service; controller advancement moved out of the
    instance tick; freshness computed from the oldest current bucket rather than
-   the newest stamp. Covers 1, 4, 5, 5a, 11 and 13.
+   the newest stamp. Covers 1, 4, 5, 5a, 5b, 11 and 13.
 3. **Client read mode in the instance.** `quota.coordinator.socketPath`; the tick
    body loses its probe and its controller step and keeps its apply
    (`start.ts:1355-1360`); `SharedQuotaStore` construction goes away

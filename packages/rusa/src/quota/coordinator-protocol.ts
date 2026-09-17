@@ -189,22 +189,39 @@ export function calculateFreshness(
   const hardStaleAfterMs = options?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
 
   const buckets: Record<string, number> = {};
+  const currentAges: number[] = [];
   if (stored.buckets && stored.buckets.length > 0) {
+    // `updatedAt` is the newest `observed_at` across kinds, i.e. the instant of
+    // the newest scrape; a bucket observed before it was not emitted by that
+    // scrape (§5.5).
+    const newestObservedMs = Math.max(
+      Date.parse(stored.updatedAt),
+      ...stored.buckets.map((b) => Date.parse(b.observedAt)).filter(Number.isFinite)
+    );
     for (const b of stored.buckets) {
       const observedMs = Date.parse(b.observedAt);
-      buckets[b.key] = Number.isFinite(observedMs)
+      const ageMs = Number.isFinite(observedMs)
         ? Math.max(0, nowMs - observedMs)
         : Number.POSITIVE_INFINITY;
+      buckets[b.key] = ageMs;
+      // A bucket whose reset instant has passed and which the newest scrape no
+      // longer emits is a leftover of a window that has since rolled over, not a
+      // current window that went unrefreshed. It stays visible in the per-bucket
+      // map but does not age the provider (§5.5, criterion 5b).
+      const resetMs = b.resetAtIso ? Date.parse(b.resetAtIso) : Number.NaN;
+      const expired = Number.isFinite(resetMs) && resetMs <= nowMs;
+      const omittedByNewestScrape = Number.isFinite(observedMs) && observedMs < newestObservedMs;
+      if (expired && omittedByNewestScrape) continue;
+      currentAges.push(ageMs);
     }
   }
 
-  const bucketAges = Object.values(buckets);
   const updatedParsed = Date.parse(stored.updatedAt);
   const updatedAge = Number.isFinite(updatedParsed)
     ? Math.max(0, nowMs - updatedParsed)
     : Number.POSITIVE_INFINITY;
 
-  const ageMs = bucketAges.length > 0 ? Math.max(...bucketAges) : updatedAge;
+  const ageMs = currentAges.length > 0 ? Math.max(...currentAges) : updatedAge;
 
   const stale = ageMs > staleAfterMs;
   const hardStale = ageMs > hardStaleAfterMs;
