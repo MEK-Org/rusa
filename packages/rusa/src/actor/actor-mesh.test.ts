@@ -24,7 +24,11 @@ import {
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import {
+  type DurableEventDelivery,
+  EventManager,
+  HierarchicalEventSourceResolver,
+} from "../runtime/event-manager.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import { Actor } from "./actor.js";
 import type {
@@ -487,13 +491,13 @@ interface CanonicalEventOptions {
  * reads the raw priority is a real divergence, latent because the only
  * production timer caller states its priority — #477.
  */
-const deliverCanonicalEvent = async (
+const deliverCanonicalEvent = (
   mesh: ActorMesh,
   resource: EventResource | string,
   eventSummary: string,
   opts: CanonicalEventOptions
-): Promise<void> => {
-  await mesh.deliverExternalEvent({
+): Promise<DurableEventDelivery> =>
+  mesh.deliverExternalEvent({
     sourceType: "timer",
     rawResource: resource,
     rawPayload: opts.payload,
@@ -505,7 +509,6 @@ const deliverCanonicalEvent = async (
     instanceId: opts.instanceId,
     eventSummary,
   });
-};
 
 describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -5511,7 +5514,7 @@ describe("ActorMesh", () => {
       expect(mesh).toBeDefined();
     });
 
-    it.skip("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
+    it("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
@@ -5532,10 +5535,15 @@ describe("ActorMesh", () => {
         payload: payload("push"),
       });
 
-      await expect(delivery).resolves.toBeUndefined();
+      const delivered = await delivery;
       await retirement;
 
-      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+      // The resolved value is the durable result itself (#481), so the row
+      // the store holds and the row the caller was told about are the same.
+      expect(delivered.entries.map((entry) => entry.actorId)).toEqual([worker]);
+      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toEqual(
+        delivered.entries
+      );
     });
 
     it("canonicalizes a legacy resource once for both routing and durable inbox source", async () => {
