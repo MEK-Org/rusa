@@ -316,6 +316,84 @@ describe("ObligationRepository", () => {
         expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hotfix"]);
       });
 
+      it("announces ready responsive obligations inherited during actor retirement behind the inheriting owner's head", () => {
+        repository.create({ title: "b-head", id: "b-head", ownerId: "actor-b", priority: 1 });
+        repository.create({
+          title: "retiring-responsive-1",
+          id: "r-resp-1",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        repository.create({
+          title: "retiring-responsive-2",
+          id: "r-resp-2",
+          ownerId: "actor-a",
+          priority: 3,
+          responsive: true,
+        });
+        repository.create({
+          title: "retiring-plain",
+          id: "r-plain",
+          ownerId: "actor-a",
+          priority: 4,
+        });
+
+        // r-resp-1 was actor-a's head when created; r-resp-2 was behind r-resp-1, so it announced on creation.
+        announced.length = 0;
+
+        repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh");
+
+        // actor-b's existing head is b-head (priority 1). Both r-resp-1 and r-resp-2
+        // are transferred behind b-head and must be announced immediately.
+        // r-plain is not responsive, so it must not be announced.
+        expect(announced).toEqual([
+          { id: "r-resp-1", actingPrincipal: "system:mesh" },
+          { id: "r-resp-2", actingPrincipal: "system:mesh" },
+        ]);
+        expect(
+          repository
+            .listResponsiveReadyAttention()
+            .map((o) => o.id)
+            .sort()
+        ).toEqual(["r-resp-1", "r-resp-2"].sort());
+      });
+
+      it("announces inherited responsive head via ready-head change and behind-head obligations via responsiveReadyListener", () => {
+        const headChanges: Array<{ headId: string | null; responsive: boolean }> = [];
+        repository.setReadyHeadListener(({ head }) =>
+          headChanges.push({
+            headId: head?.id ?? null,
+            responsive: head?.effectiveResponsive ?? false,
+          })
+        );
+        repository.create({
+          title: "retiring-top",
+          id: "r-top",
+          ownerId: "actor-a",
+          priority: 1,
+          responsive: true,
+        });
+        repository.create({
+          title: "retiring-behind",
+          id: "r-behind",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        announced.length = 0;
+        headChanges.length = 0;
+
+        // actor-b has no ready obligations before this transfer.
+        repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh");
+
+        // r-top becomes actor-b's new head and is announced via readyHeadListener as responsive.
+        expect(headChanges).toContainEqual({ headId: "r-top", responsive: true });
+        // r-behind is behind the new head r-top, so it is delivered via responsiveReadyListener.
+        // r-top must NOT be in announced (preventing double-delivery).
+        expect(announced).toEqual([{ id: "r-behind", actingPrincipal: "system:mesh" }]);
+      });
+
       it("announces ready subtree members that turn responsive through reparenting, including descendants", () => {
         repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
         repository.create({

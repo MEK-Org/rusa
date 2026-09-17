@@ -70,6 +70,7 @@ export interface Obligation {
   effectiveResponsive: boolean;
   /**
    * How many times this obligation has transitioned into `ready` (0 = never).
+   * Initialized to 1 at migration 0049 for rows already in `ready`, 0 for unready rows.
    * Each transition starts a new episode of responsive attention: the
    * behind-head announcement is deduped per (obligation, episode), so a
    * recurring responsive obligation re-armed behind a persistent head, or a

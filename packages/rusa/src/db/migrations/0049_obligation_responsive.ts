@@ -13,6 +13,10 @@ import type { Migration } from "./types.js";
  * announcement is deduped per (obligation, episode), so a recurring responsive
  * obligation that re-arms behind a persistent head announces again instead of
  * being swallowed by the already-handled episode's dedupe key.
+ *
+ * For rows existing at migration time, obligations already in `ready` are
+ * initialized to 1 to reflect that they have entered ready at least once;
+ * unready or terminal rows start at 0.
  */
 export const obligationResponsive: Migration = {
   id: "0049_obligation_responsive",
@@ -22,6 +26,7 @@ export const obligationResponsive: Migration = {
         CHECK (responsive IS NULL OR responsive = 1);
       ALTER TABLE obligations ADD COLUMN ready_count INTEGER NOT NULL DEFAULT 0
         CHECK (ready_count >= 0);
+      UPDATE obligations SET ready_count = 1 WHERE status = 'ready';
     `);
   },
 };

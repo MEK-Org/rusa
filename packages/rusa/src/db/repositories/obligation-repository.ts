@@ -2901,6 +2901,15 @@ export class ObligationRepository {
       )
       .all(retiringActorId, status) as Array<{ dependent_id: string; prerequisite_id: string }>;
 
+    const readyCandidateIds =
+      status === "ready"
+        ? (
+            this.db
+              .prepare(`SELECT id FROM obligations WHERE owner_id = ? AND status = 'ready'`)
+              .all(retiringActorId) as Array<{ id: string }>
+          ).map((r) => r.id)
+        : [];
+
     const result = this.db
       .prepare(
         `UPDATE obligations
@@ -2915,6 +2924,22 @@ export class ObligationRepository {
         dependentOwnerId: parentActorId,
         prerequisiteId,
       });
+    }
+
+    if (status === "ready") {
+      // Ready responsive obligations transferred behind the inheriting owner's
+      // head change neither status nor head, so neither transition nor
+      // ready-head diff fires. Enqueue every transferred ready responsive
+      // obligation so the behind-head ones announce promptly (#531: assigned
+      // ready responsive work always announces). If one becomes the inheriting
+      // owner's head, the ready-head change announces it and the listener's
+      // behind-head filter skips it to prevent double delivery.
+      for (const id of readyCandidateIds) {
+        const obligation = this.get(id);
+        if (obligation?.effectiveResponsive) {
+          this.pendingResponsiveReady.push(id);
+        }
+      }
     }
 
     return result.changes;
