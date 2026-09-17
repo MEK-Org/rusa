@@ -1716,15 +1716,20 @@ export class ActorMesh {
    * covers the responsive work that lands behind one, which would otherwise
    * wait for the head to clear before the owner ever heard about it.
    *
-   * The dedupe key is permanent per obligation — one announcement per ready
-   * episode, the same one-shot contract as
-   * {@link deliverPrerequisiteCancelledAttention}. A responsive obligation
-   * that re-arms (recurrence) surfaces again through the head path once it
-   * reaches the top of the queue.
+   * The dedupe key is per (obligation, ready episode) — one announcement per
+   * ready episode, the same one-shot contract as
+   * {@link deliverPrerequisiteCancelledAttention} with the episode counter
+   * standing in for the permanent cancelled fact. A permanent per-obligation
+   * key would be exactly-once but not live: a recurring responsive obligation
+   * re-armed behind a persistent head, or a non-recurring one cycling
+   * waiting→ready more than once, would re-arm into a key the owner already
+   * handled and never be announced again. Keying on the obligation's
+   * `readyEpisode` makes every new episode a distinct entry; a replay of the
+   * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
    */
   deliverResponsiveReadyAttention(
     ownerId: string,
-    obligation: { id: string; intent: string | null },
+    obligation: { id: string; intent: string | null; readyEpisode?: number },
     /**
      * The owner made its own obligation ready mid-run: it is already running
      * and will see the obligation in its queue, so a normal follow-up nudge
@@ -1737,8 +1742,9 @@ export class ActorMesh {
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
+    const episodeKey = obligation.readyEpisode !== undefined ? `:${obligation.readyEpisode}` : "";
     const entryId = deduplicatedInboxEntryId(
-      `obligation-ready-responsive:${obligation.id}`,
+      `obligation-ready-responsive:${obligation.id}${episodeKey}`,
       actorId
     );
     const entries = this.inboxStore.append([
@@ -1776,6 +1782,7 @@ export class ActorMesh {
       id: string;
       ownerId: string;
       intent: string | null;
+      readyEpisode?: number;
     }>;
   }): void {
     if (!this.inboxStore) return;
@@ -1788,7 +1795,10 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(obligation.ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
+        this.deliverResponsiveReadyAttention(
+          obligation.ownerId,
+          obligation as { id: string; intent: string | null; readyEpisode?: number }
+        );
       }
     } catch (err) {
       this.log(

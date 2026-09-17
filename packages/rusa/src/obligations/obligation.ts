@@ -70,6 +70,15 @@ export interface Obligation {
    */
   effectiveResponsive: boolean;
   /**
+   * How many times this obligation has transitioned into `ready` (0 = never).
+   * Each transition starts a new episode of responsive attention: the
+   * behind-head announcement is deduped per (obligation, episode), so a
+   * recurring responsive obligation re-armed behind a persistent head, or a
+   * non-recurring one cycling waiting→ready more than once, announces once per
+   * episode instead of being swallowed by the previous episode's dedupe key.
+   */
+  readyEpisode: number;
+  /**
    * When this obligation was created (ISO-8601). `null` only for rows that
    * predate the timestamp columns and have no recoverable creation time —
    * never a stand-in for "now".

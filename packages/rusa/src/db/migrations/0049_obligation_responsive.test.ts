@@ -5,7 +5,7 @@ import { obligationPriority } from "./0017_obligation_priority.js";
 import { obligationResponsive } from "./0049_obligation_responsive.js";
 
 describe("0049_obligation_responsive", () => {
-  it("adds a nullable responsive column that accepts only 0, 1, or NULL", () => {
+  it("adds nullable responsive and ready_episode columns with their CHECKs", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     obligations.up(db);
@@ -14,20 +14,25 @@ describe("0049_obligation_responsive", () => {
     obligationResponsive.up(db);
 
     const columns = db.prepare("PRAGMA table_info(obligations)").all() as Array<{ name: string }>;
-    expect(columns.map(({ name }) => name)).toContain("responsive");
+    expect(columns.map(({ name }) => name)).toEqual(
+      expect.arrayContaining(["responsive", "ready_episode"])
+    );
 
     const insert = db.prepare(
       `INSERT INTO obligations
-         (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority, responsive)
-       VALUES (?, ?, 'actor', 'actor-a', NULL, NULL, 'ready', 1, ?)`
+         (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority, responsive, ready_episode)
+       VALUES (?, ?, 'actor', 'actor-a', NULL, NULL, 'ready', 1, ?, ?)`
     );
-    insert.run("explicit", null, 1);
-    insert.run("inherited", null, null);
-    expect(db.prepare("SELECT id, responsive FROM obligations ORDER BY id").all()).toEqual([
-      { id: "explicit", responsive: 1 },
-      { id: "inherited", responsive: null },
+    insert.run("explicit", null, 1, 1);
+    insert.run("inherited", null, null, 0);
+    expect(
+      db.prepare("SELECT id, responsive, ready_episode FROM obligations ORDER BY id").all()
+    ).toEqual([
+      { id: "explicit", responsive: 1, ready_episode: 1 },
+      { id: "inherited", responsive: null, ready_episode: 0 },
     ]);
 
-    expect(() => insert.run("bad", null, 2)).toThrow(/CHECK/);
+    expect(() => insert.run("bad", null, 2, 0)).toThrow(/CHECK/);
+    expect(() => insert.run("bad-episode", null, null, -1)).toThrow(/CHECK/);
   });
 });

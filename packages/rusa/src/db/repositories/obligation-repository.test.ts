@@ -304,6 +304,112 @@ describe("ObligationRepository", () => {
         expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
         warn.mockRestore();
       });
+
+      it("announces a ready responsive obligation reassigned behind the new owner's existing head", () => {
+        repository.create({ title: "b-head", id: "b-head", ownerId: "actor-b", priority: 1 });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          responsive: true,
+        });
+        // hotfix is actor-a's head at creation: the ready-head change announces
+        // it, not this listener.
+        expect(announced).toEqual([]);
+
+        // Behind actor-b's existing head neither a status nor a head changes —
+        // the reassignment itself must announce (assigned ready responsive
+        // work always creates inbox attention, #531).
+        repository.reassign("hotfix", "actor-b", "system:mesh");
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+        expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["hotfix"]);
+      });
+
+      it("announces ready subtree members that turn responsive through reparenting, including descendants", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "responsive root",
+          id: "r-root",
+          ownerId: "actor-a",
+          priority: 5,
+          responsive: true,
+        });
+        repository.create({ title: "moving", id: "moving", ownerId: "actor-a", priority: 6 });
+        repository.create({
+          title: "moving-child",
+          id: "moving-child",
+          ownerId: "actor-a",
+          parentId: "moving",
+          priority: 7,
+        });
+        // r-root became ready behind the head and was announced at creation.
+        expect(announced).toEqual([{ id: "r-root", actingPrincipal: "system:mesh" }]);
+
+        // Filing the child demoted 'moving' to waiting. Reparenting the
+        // subtree under r-root flips both members' resolved responsiveness;
+        // the ready child behind the unchanged head must announce immediately,
+        // not wait for a boot sweep.
+        repository.reparent("moving", "r-root", "system:mesh");
+        expect(announced).toEqual([
+          { id: "r-root", actingPrincipal: "system:mesh" },
+          { id: "moving-child", actingPrincipal: "system:mesh" },
+        ]);
+      });
+
+      it("retries a failed delivery with the original acting principal, not a later mutation's", () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        let fail = true;
+        repository.setResponsiveReadyListener((obligation, actingPrincipal) => {
+          if (fail) throw new Error("inbox is unavailable");
+          announced.push({ id: obligation.id, actingPrincipal });
+        });
+
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+          creatorId: "actor-b",
+        });
+        expect(announced).toEqual([]);
+
+        fail = false;
+        // An unrelated mutation by a different principal triggers the retry;
+        // the delivery keeps the cause of the ready transition it belongs to.
+        repository.create({
+          title: "other",
+          id: "other",
+          ownerId: "actor-b",
+          creatorId: "actor-c",
+        });
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "actor-b" }]);
+        warn.mockRestore();
+      });
+
+      it("counts a new ready episode on every transition into ready", () => {
+        repository.create({ title: "gate", id: "gate", ownerId: "actor-a" });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          blockedBy: ["gate"],
+          responsive: true,
+        });
+        expect(repository.require("hotfix").readyEpisode).toBe(0);
+
+        repository.setTerminalStatus("gate", "done", null, null, "system:mesh");
+        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyEpisode: 1 });
+
+        // A waiting→ready cycle (child filed, then completed) starts a new
+        // episode — the episode counter is what keeps repeated episodes
+        // distinct in the inbox dedupe key.
+        repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
+        expect(repository.require("hotfix").status).toBe("waiting");
+        repository.setTerminalStatus("child", "done", null, null, "system:mesh");
+        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyEpisode: 2 });
+      });
     });
   });
 

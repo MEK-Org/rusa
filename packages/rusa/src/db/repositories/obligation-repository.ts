@@ -47,6 +47,7 @@ interface ObligationRow {
   priority_source_id: string;
   responsive: number | null;
   effective_responsive: number;
+  ready_episode: number;
   created_at: string | null;
   updated_at: string | null;
   creator_id: string | null;
@@ -326,6 +327,7 @@ function toObligation(row: ObligationRow): Obligation {
     prioritySourceId: row.priority_source_id,
     responsive: row.responsive === null ? null : row.responsive === 1,
     effectiveResponsive: row.effective_responsive === 1,
+    readyEpisode: row.ready_episode,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     creatorId: row.creator_id,
@@ -700,8 +702,15 @@ export class ObligationRepository {
    */
   private pendingResponsiveReady: string[] = [];
 
-  /** Delivery keys that threw on a previous {@link mutate} call, retried from current persisted truth. */
-  private failedResponsiveReadyKeys = new Set<string>();
+  /**
+   * Deliveries that threw on a previous {@link mutate} call, retried from
+   * current persisted truth. The value is the acting principal whose
+   * transition the failed delivery belonged to: a retry must not borrow the
+   * *current* mutation's principal, or an unrelated later mutation could
+   * invert the preemption rule (self-caused urgency retried as peer-caused,
+   * or the reverse).
+   */
+  private failedResponsiveReadyDeliveries = new Map<string, EntityId>();
 
   setResponsiveReadyListener(
     listener: ((obligation: Obligation, actingPrincipal: EntityId) => void) | undefined
@@ -995,7 +1004,7 @@ export class ObligationRepository {
 
     const responsiveReadyListener = this.responsiveReadyListener;
     if (responsiveReadyListener) {
-      const toDeliver = new Map<string, Obligation>();
+      const toDeliver = new Map<string, { obligation: Obligation; actingPrincipal: EntityId }>();
       for (const id of new Set(this.pendingResponsiveReady)) {
         const obligation = this.get(id);
         if (!obligation) continue;
@@ -1005,30 +1014,34 @@ export class ObligationRepository {
         // change, responsively when the head is responsive — only obligations
         // behind the head need this separate attention.
         if (this.readyHeads().get(obligation.ownerId) === obligation.id) continue;
-        toDeliver.set(obligation.id, obligation);
+        toDeliver.set(obligation.id, { obligation, actingPrincipal });
       }
 
       // A prior mutation's delivery may have thrown (e.g. a transient inbox
       // append failure) — retry from current persisted truth, the same repair
-      // the cancellation-attention loop performs above.
-      if (this.failedResponsiveReadyKeys.size > 0) {
-        const stillFailing = new Set(this.failedResponsiveReadyKeys);
+      // the cancellation-attention loop performs above. The retry carries the
+      // original acting principal, not this mutation's: the cause of the
+      // ready transition determines the preemption rule, and borrowing the
+      // current principal could invert it.
+      if (this.failedResponsiveReadyDeliveries.size > 0) {
+        const stillFailing = new Set(this.failedResponsiveReadyDeliveries.keys());
         for (const obligation of this.listResponsiveReadyAttention()) {
-          if (!this.failedResponsiveReadyKeys.has(obligation.id) || toDeliver.has(obligation.id)) {
+          const failedCause = this.failedResponsiveReadyDeliveries.get(obligation.id);
+          if (failedCause === undefined || toDeliver.has(obligation.id)) {
             continue;
           }
-          toDeliver.set(obligation.id, obligation);
+          toDeliver.set(obligation.id, { obligation, actingPrincipal: failedCause });
           stillFailing.delete(obligation.id);
         }
-        for (const key of stillFailing) this.failedResponsiveReadyKeys.delete(key);
+        for (const key of stillFailing) this.failedResponsiveReadyDeliveries.delete(key);
       }
 
-      for (const obligation of toDeliver.values()) {
+      for (const { obligation, actingPrincipal: cause } of toDeliver.values()) {
         try {
-          responsiveReadyListener(obligation, actingPrincipal);
-          this.failedResponsiveReadyKeys.delete(obligation.id);
+          responsiveReadyListener(obligation, cause);
+          this.failedResponsiveReadyDeliveries.delete(obligation.id);
         } catch (err) {
-          this.failedResponsiveReadyKeys.add(obligation.id);
+          this.failedResponsiveReadyDeliveries.set(obligation.id, cause);
           console.warn(
             `[obligations] responsive-ready listener failed for ${obligation.id}: ${
               err instanceof Error ? err.message : String(err)
@@ -1299,8 +1312,8 @@ export class ObligationRepository {
       try {
         this.db
           .prepare(
-            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority, responsive,
-                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority, responsive, ready_episode,
+                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             id,
@@ -1312,6 +1325,7 @@ export class ObligationRepository {
             initialStatus,
             priority,
             input.responsive == null ? null : input.responsive ? 1 : 0,
+            initialStatus === "ready" ? 1 : 0,
             stampedAt,
             stampedAt,
             creatorId,
@@ -2039,6 +2053,18 @@ export class ObligationRepository {
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")
         .run(ownerId, this.stamp(), id);
 
+      // A ready responsive obligation transferred behind the new owner's
+      // existing head changes neither a status nor a head, so neither the
+      // ready-head diff nor any transition fires — without this enqueue the
+      // new owner would not hear about it until a boot sweep (#531: assigned
+      // ready responsive work always announces). If it instead became the
+      // owner's head, the ready-head change announces it and the listener's
+      // behind-head filter keeps this enqueue from double-delivering.
+      const transferred = this.require(id);
+      if (transferred.status === "ready" && transferred.effectiveResponsive) {
+        this.pendingResponsiveReady.push(id);
+      }
+
       // Reassignment moves the standing block to a new owner who has never
       // seen it — re-deliver cancellation-repair attention at the moment of
       // transfer rather than leaving it to boot reconciliation (#212).
@@ -2547,7 +2573,7 @@ export class ObligationRepository {
               // direct scheduled→ready transition has no prerequisite to check.
               this.db
                 .prepare(
-                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?`
                 )
                 .run(recurrence.intervalSeconds, this.stamp(), id);
             } else {
@@ -2582,7 +2608,7 @@ export class ObligationRepository {
       // prerequisite to check.
       this.db
         .prepare(
-          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, updated_at = ? WHERE id = ?`
+          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?`
         )
         .run(this.stamp(), id);
       this.pendingResponsiveReady.push(id);
@@ -2641,6 +2667,29 @@ export class ObligationRepository {
 
       const oldParentId = obligation.parentId;
 
+      // Reparenting re-resolves responsiveness for the whole moved subtree,
+      // not just the row whose parent_id changes. Capture each member's
+      // current effective value so the post-update sweep below can announce
+      // ready members that flipped to responsive — a projection-only change
+      // that fires neither a status transition nor a head change, and would
+      // otherwise stay silent until a boot sweep (#531).
+      const subtreeBefore = new Map<string, boolean>();
+      const subtreeRows = this.db
+        .prepare(
+          `WITH RECURSIVE subtree(id) AS (
+             SELECT id FROM obligations WHERE id = ?
+             UNION ALL
+             SELECT child.id
+             FROM obligations child
+             JOIN subtree parent ON child.parent_id = parent.id
+           )
+           SELECT id FROM subtree`
+        )
+        .all(id) as Array<{ id: string }>;
+      for (const row of subtreeRows) {
+        subtreeBefore.set(row.id, this.require(row.id).effectiveResponsive);
+      }
+
       if (newParentId === null && obligation.priority === null) {
         this.db
           .prepare(
@@ -2663,6 +2712,13 @@ export class ObligationRepository {
 
       if (oldParentId !== null) {
         this.tryRelease(oldParentId);
+      }
+
+      for (const [memberId, wasResponsive] of subtreeBefore) {
+        if (wasResponsive) continue;
+        const member = this.get(memberId);
+        if (!member || member.status !== "ready" || !member.effectiveResponsive) continue;
+        this.pendingResponsiveReady.push(memberId);
       }
 
       return this.require(id);
@@ -2784,7 +2840,9 @@ export class ObligationRepository {
     if (liveChildren.count !== 0) return;
     if (!this.prerequisitesSatisfied(id)) return;
     this.db
-      .prepare("UPDATE obligations SET status = 'ready', updated_at = ? WHERE id = ?")
+      .prepare(
+        "UPDATE obligations SET status = 'ready', ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?"
+      )
       .run(this.stamp(), id);
     this.pendingResponsiveReady.push(id);
   }
