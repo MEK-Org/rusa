@@ -705,11 +705,13 @@ export class ObligationRepository {
 
   /**
    * Deliveries that threw on a previous {@link mutate} call, retried from
-   * current persisted truth. The value is the acting principal whose
-   * transition the failed delivery belonged to: a retry must not borrow the
-   * *current* mutation's principal, or an unrelated later mutation could
-   * invert the preemption rule (self-caused urgency retried as peer-caused,
-   * or the reverse).
+   * current persisted truth. This is purely defensive design parity with
+   * {@link failedCancellationAttentionKeys} for in-process retry without
+   * requiring a process restart (no inbox append failures have been observed in
+   * production). The value is the acting principal whose transition the failed
+   * delivery belonged to: a retry must not borrow the *current* mutation's
+   * principal, or an unrelated later mutation could invert the preemption rule
+   * (self-caused urgency retried as peer-caused, or the reverse).
    */
   private failedResponsiveReadyDeliveries = new Map<string, EntityId>();
 
@@ -830,13 +832,19 @@ export class ObligationRepository {
    * byte-identical to `listOwned`'s ordering (effective priority, then id) or
    * an actor would be told about a head its own queue does not show first.
    */
-  readyHeads(): Map<string, string> {
+  /**
+   * Current ready head per owner along with resolved responsiveness.
+   * Runs in a single CTE pass so callers do not need subsequent
+   * `isEffectivelyResponsive` evaluations.
+   */
+  readyHeadRecords(): Array<{ ownerId: string; headId: string; responsive: boolean }> {
     const rows = this.db
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE}
-         SELECT owner_id, id FROM (
+         SELECT owner_id, id, effective_responsive FROM (
            SELECT obligation.owner_id,
                   obligation.id,
+                  effective_priority.effective_responsive,
                   ROW_NUMBER() OVER (
                     PARTITION BY obligation.owner_id
                     ORDER BY effective_priority.effective_priority, obligation.id
@@ -847,8 +855,16 @@ export class ObligationRepository {
          )
          WHERE rank = 1`
       )
-      .all() as Array<{ owner_id: string; id: string }>;
-    return new Map(rows.map((row) => [row.owner_id, row.id]));
+      .all() as Array<{ owner_id: string; id: string; effective_responsive: number }>;
+    return rows.map((row) => ({
+      ownerId: row.owner_id,
+      headId: row.id,
+      responsive: row.effective_responsive === 1,
+    }));
+  }
+
+  readyHeads(): Map<string, string> {
+    return new Map(this.readyHeadRecords().map((row) => [row.ownerId, row.headId]));
   }
 
   /**
@@ -900,12 +916,11 @@ export class ObligationRepository {
     this.pendingResponsiveReady = [];
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
+    let afterHeads = new Map<string, string>();
     const result = this.db.transaction(() => {
-      const before = this.readyHeads();
-      const beforeHeadResponsive = new Map<string, boolean>();
-      for (const [ownerId, headId] of before) {
-        beforeHeadResponsive.set(ownerId, this.isEffectivelyResponsive(headId));
-      }
+      const beforeRecords = this.readyHeadRecords();
+      const before = new Map(beforeRecords.map((r) => [r.ownerId, r.headId]));
+      const beforeHeadResponsive = new Map(beforeRecords.map((r) => [r.ownerId, r.responsive]));
 
       // A tracked-column write outside mutate() is an audited-seam violation.
       // Assert the delta table is empty rather than silently discarding leftover
@@ -929,7 +944,10 @@ export class ObligationRepository {
 
       this.recordMutationHistory(actingPrincipal);
 
-      const after = this.readyHeads();
+      const afterRecords = this.readyHeadRecords();
+      const after = new Map(afterRecords.map((r) => [r.ownerId, r.headId]));
+      const afterHeadResponsive = new Map(afterRecords.map((r) => [r.ownerId, r.responsive]));
+      afterHeads = after;
 
       for (const ownerId of before.keys()) {
         if (!after.has(ownerId) && this.isActorOwner(ownerId)) {
@@ -991,7 +1009,7 @@ export class ObligationRepository {
       for (const [ownerId, headId] of after) {
         if (before.get(ownerId) !== headId || beforeHeadResponsive.get(ownerId)) continue;
         if (!this.isActorOwner(ownerId)) continue;
-        if (!this.isEffectivelyResponsive(headId)) continue;
+        if (!afterHeadResponsive.get(ownerId)) continue;
         const head = this.get(headId);
         if (!head) continue;
 
@@ -1082,16 +1100,17 @@ export class ObligationRepository {
         // The owner's ready head announces itself through the ready-head
         // change, responsively when the head is responsive — only obligations
         // behind the head need this separate attention.
-        if (this.readyHeads().get(obligation.ownerId) === obligation.id) continue;
+        if (afterHeads.get(obligation.ownerId) === obligation.id) continue;
         toDeliver.set(obligation.id, { obligation, actingPrincipal });
       }
 
-      // A prior mutation's delivery may have thrown (e.g. a transient inbox
-      // append failure) — retry from current persisted truth, the same repair
-      // the cancellation-attention loop performs above. The retry carries the
-      // original acting principal, not this mutation's: the cause of the
-      // ready transition determines the preemption rule, and borrowing the
-      // current principal could invert it.
+      // A prior mutation's delivery may have thrown (defensive in-process
+      // retry parity with the cancellation-attention repair loop above; boot
+      // reconciliation remains the durable cross-restart recovery mechanism) —
+      // retry from current persisted truth. The retry carries the original
+      // acting principal, not this mutation's: the cause of the ready transition
+      // determines the preemption rule, and borrowing the current principal could
+      // invert it.
       if (this.failedResponsiveReadyDeliveries.size > 0) {
         const stillFailing = new Set(this.failedResponsiveReadyDeliveries.keys());
         for (const obligation of this.listResponsiveReadyAttention()) {
@@ -2796,22 +2815,6 @@ export class ObligationRepository {
       subtreeBefore.set(row.id, row.effective_responsive === 1);
     }
     return subtreeBefore;
-  }
-
-  /**
-   * Read just the responsive projection without materializing an obligation.
-   * Some legacy migration tests intentionally retain malformed historical
-   * priority rows that `toObligation` rejects; observing a head's urgency must
-   * not broaden that validation boundary.
-   */
-  private isEffectivelyResponsive(id: string): boolean {
-    const row = this.db
-      .prepare(
-        `${EFFECTIVE_PRIORITY_CTE}
-         SELECT effective_responsive FROM effective_priority WHERE id = ?`
-      )
-      .get(id) as { effective_responsive: number } | undefined;
-    return row?.effective_responsive === 1;
   }
 
   private enqueueNewlyResponsiveReadyMembers(subtreeBefore: Map<string, boolean>): void {

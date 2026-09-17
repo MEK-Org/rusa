@@ -15,8 +15,11 @@ import type { Migration } from "./types.js";
  * being swallowed by the already-handled episode's dedupe key.
  *
  * For rows existing at migration time, obligations already in `ready` are
- * initialized to 1 to reflect that they have entered ready at least once;
- * unready or terminal rows start at 0.
+ * initialized to 1 for semantic consistency with the documented invariant
+ * (0 = never ready, >0 indicates the obligation entered ready at least once);
+ * unready or terminal rows start at 0. Because `obligation.ready_responsive`
+ * inbox entries did not exist prior to this migration, there are no older
+ * entries to collide with; this backfill is strictly for model consistency.
  */
 export const obligationResponsive: Migration = {
   id: "0049_obligation_responsive",

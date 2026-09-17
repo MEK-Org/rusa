@@ -1476,6 +1476,11 @@ export class ActorMesh {
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
+    // Note: STRICT_OBLIGATION_HANDLING_EXPERIMENT intentionally tracks only the
+    // actor's queue head (obligation.ready_head), asserting closure on that top
+    // commitment before clean yield. Behind-head responsive work
+    // (obligation.ready_responsive) alerts the actor of urgent work without
+    // asserting head-closure semantics on yield unless the actor selects it as head.
     const headObligationIds = this.isEnrolledInExperiment(
       actorId,
       STRICT_OBLIGATION_HANDLING_EXPERIMENT

@@ -707,6 +707,30 @@ describe("ObligationRepository", () => {
       warn.mockRestore();
     });
 
+    it("reports ready heads with effective responsiveness in a single pass", () => {
+      repository.create({
+        title: "Responsive root",
+        id: "resp-root",
+        ownerId: "actor-a",
+        priority: 10,
+        responsive: true,
+      });
+      repository.create({
+        title: "Normal task",
+        id: "norm-task",
+        ownerId: "actor-b",
+        priority: 10,
+      });
+
+      const records = repository.readyHeadRecords();
+      expect(records).toEqual(
+        expect.arrayContaining([
+          { ownerId: "actor-a", headId: "resp-root", responsive: true },
+          { ownerId: "actor-b", headId: "norm-task", responsive: false },
+        ])
+      );
+    });
+
     it("preserves and increments the sequence number when queue drains completely and recurs", () => {
       // 1. Initial ready head "ob-1" (sequence 1)
       repository.create({ title: "Task 1", id: "ob-1", ownerId: "actor-a", priority: 10 });
