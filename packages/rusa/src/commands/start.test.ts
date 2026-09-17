@@ -39,6 +39,7 @@ import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
@@ -879,6 +880,213 @@ describe("runStart webhook event routing (Phase 4)", () => {
       await new Promise<void>((resolve, reject) => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
+    }
+  });
+
+  it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
+    // The response gate keeps the coordinator warmup in flight without using
+    // wall-clock timing. A ready dashboard must not expose its history API
+    // until the first cache fill has either completed or failed (#527).
+    const socketPath = join(homeDir, "coordinator.sock");
+    const record = {
+      scope: "provider",
+      kind: "5h",
+      label: "5h",
+      observedAt: new Date().toISOString(),
+      percentLeft: 42,
+      resetAtIso: null,
+      controllerError: null,
+      intervalSeconds: null,
+    };
+    let historyRequestCount = 0;
+    let releaseHistoryResponse: (() => void) | undefined;
+    const historyResponseGate = new Promise<void>((resolve) => {
+      releaseHistoryResponse = resolve;
+    });
+    let resolveHistoryRequest: () => void;
+    const historyRequestSeen = new Promise<void>((resolve) => {
+      resolveHistoryRequest = resolve;
+    });
+    const coordinator = createServer(async (req, res) => {
+      const sendHistory = () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            service: {
+              protocolMajor: 1,
+              protocolMinor: 0,
+              serverVersion: "test-coordinator",
+              serverTime: new Date().toISOString(),
+            },
+            provider: "agy",
+            since: new Date(Date.now() - HISTORY_WINDOW_MS).toISOString(),
+            records: [record],
+          })
+        );
+      };
+      if (req.url?.startsWith("/v1/history")) {
+        historyRequestCount += 1;
+        resolveHistoryRequest();
+        await historyResponseGate;
+        sendHistory();
+      } else {
+        sendHistory();
+      }
+    });
+    await new Promise<void>((resolve) => coordinator.listen(socketPath, resolve));
+
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    const configWithCoordinator = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      geminiApiKey: "fake-gemini-key",
+      quota: {
+        coordinator: { socketPath },
+      },
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(configWithCoordinator), "utf8");
+
+    let readyPromise: Promise<void> | undefined;
+    try {
+      let ready = false;
+      readyPromise = new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              ready = true;
+              resolve();
+            },
+          },
+        });
+      });
+
+      // The warmup request is outstanding. The old un-awaited boot path has
+      // already announced dashboard readiness at this point.
+      await historyRequestSeen;
+      expect(historyRequestCount).toBe(1);
+      expect(startDashboardServerSpy).not.toHaveBeenCalled();
+      expect(ready).toBe(false);
+
+      releaseHistoryResponse?.();
+      await readyPromise;
+
+      expect(startDashboardServerSpy).toHaveBeenCalledTimes(1);
+      const quotaApi = startDashboardServerSpy.mock.calls[0][0].quotaApi;
+      if (!quotaApi?.listHistory) throw new Error("listHistory not wired");
+
+      // The first dashboard history read after readiness sees the coordinator
+      // records, and a valid empty coordinator response would still remain
+      // a valid empty cache.
+      const firstRead = await quotaApi.listHistory("agy", new Date(0).toISOString());
+      expect(firstRead).toEqual([record]);
+    } finally {
+      // Do not leave a gated request alive when an assertion deliberately
+      // fails against the pre-fix startup path.
+      releaseHistoryResponse?.();
+      if (readyPromise) await readyPromise.catch(() => {});
+      const shutdown = shutdownFn;
+      shutdownFn = undefined;
+      await shutdown?.();
+      startDashboardServerSpy.mockRestore();
+      await new Promise<void>((resolve, reject) =>
+        coordinator.close((err) => (err ? reject(err) : resolve()))
+      );
+    }
+  });
+
+  it("does not delay headless startup while coordinator history warmup is in flight", async () => {
+    const socketPath = join(homeDir, "coordinator-headless.sock");
+    let historyRequestCount = 0;
+    let releaseHistoryResponse: (() => void) | undefined;
+    const historyResponseGate = new Promise<void>((resolve) => {
+      releaseHistoryResponse = resolve;
+    });
+    let resolveHistoryRequest: () => void;
+    const historyRequestSeen = new Promise<void>((resolve) => {
+      resolveHistoryRequest = resolve;
+    });
+    const coordinator = createServer(async (req, res) => {
+      const sendHistory = () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            service: {
+              protocolMajor: 1,
+              protocolMinor: 0,
+              serverVersion: "test-coordinator",
+              serverTime: new Date().toISOString(),
+            },
+            provider: "agy",
+            since: new Date(Date.now() - HISTORY_WINDOW_MS).toISOString(),
+            records: [],
+          })
+        );
+      };
+      if (req.url?.startsWith("/v1/history")) {
+        historyRequestCount += 1;
+        resolveHistoryRequest();
+        await historyResponseGate;
+        sendHistory();
+      } else {
+        sendHistory();
+      }
+    });
+    await new Promise<void>((resolve) => coordinator.listen(socketPath, resolve));
+
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    const configWithCoordinator = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      geminiApiKey: "fake-gemini-key",
+      quota: {
+        coordinator: { socketPath },
+      },
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(configWithCoordinator), "utf8");
+
+    let readyPromise: Promise<void> | undefined;
+    try {
+      let ready = false;
+      readyPromise = new Promise<void>((resolve) => {
+        void runStart({
+          noDashboardServer: true,
+          e2e: {
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              ready = true;
+              resolve();
+            },
+          },
+        });
+      });
+
+      // Warmup request is dispatched in the background...
+      await historyRequestSeen;
+      expect(historyRequestCount).toBe(1);
+
+      // ...but headless startup does not gate on it and reaches readiness
+      // without waiting for the stalled coordinator history response.
+      await readyPromise;
+      expect(ready).toBe(true);
+      expect(startDashboardServerSpy).not.toHaveBeenCalled();
+    } finally {
+      releaseHistoryResponse?.();
+      if (readyPromise) await readyPromise.catch(() => {});
+      const shutdown = shutdownFn;
+      shutdownFn = undefined;
+      await shutdown?.();
+      startDashboardServerSpy.mockRestore();
+      await new Promise<void>((resolve, reject) =>
+        coordinator.close((err) => (err ? reject(err) : resolve()))
+      );
     }
   });
 
