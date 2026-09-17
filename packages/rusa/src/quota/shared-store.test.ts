@@ -897,3 +897,246 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   }, 15_000);
 });
+
+describe("SharedQuotaStore operator pacing reset", () => {
+  const reset = "2030-01-08T00:00:00.000Z";
+  const startedMs = Date.parse("2030-01-01T00:00:00.000Z");
+  const resetMs = Date.parse(reset);
+  const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+
+  /** Record `slots` five-minute observations holding a standing error. */
+  function recordStandingError(
+    store: SharedQuotaStore,
+    provider: string,
+    slots: number,
+    standingError: number,
+    fromSlot = 0
+  ): void {
+    for (let slot = fromSlot; slot < fromSlot + slots; slot += 1) {
+      const observedMs = startedMs + slot * 5 * 60 * 1000;
+      const timeRemainingPct = ((resetMs - observedMs) / weeklyMs) * 100;
+      recordObservation(
+        store,
+        provider,
+        new Date(observedMs).toISOString(),
+        timeRemainingPct - standingError,
+        reset
+      );
+    }
+  }
+
+  it("zeroes integral, derivative and the current period, keeps observations and errors, then paces forward from zero", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-reset-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      recordStandingError(store, "claude", 13, 10);
+      recordStandingError(store, "codex", 13, 10);
+
+      const before = reasonedRows(store, "claude");
+      expect(before).toHaveLength(13);
+      const carried = before.at(-1) as ReasonedRow;
+      expect(carried.integral).toBeGreaterThan(0);
+      expect(carried.interval).toBeGreaterThan(0);
+      const codexBefore = store.getProviderThrottle("codex");
+      const observationsBefore = store.listCanonicalSince("claude", "2000-01-01T00:00:00.000Z");
+      const errorsBefore = store
+        .listHistorySince("claude", "2000-01-01T00:00:00.000Z")
+        .map((point) => point.controllerError);
+
+      const result = store.resetController("claude");
+      expect(result).toEqual({ provider: "claude", clearedDecisions: 13, observations: 13 });
+
+      // The current pacing setting is zeroed immediately: nothing governs the lane.
+      const throttle = store.getProviderThrottle("claude");
+      expect(throttle?.intervalSeconds).toBe(0);
+      expect(throttle?.uncappedIntervalSeconds).toBe(0);
+      expect(throttle?.governingBucketKey).toBeNull();
+      expect(throttle?.buckets).toEqual([]);
+      expect(reasonedRows(store, "claude")).toEqual([]);
+
+      // Observations and the proportional signal they imply are untouched; only
+      // controller memory is gone.
+      expect(store.listCanonicalSince("claude", "2000-01-01T00:00:00.000Z")).toEqual(
+        observationsBefore
+      );
+      const history = store.listHistorySince("claude", "2000-01-01T00:00:00.000Z");
+      expect(history.map((point) => point.controllerError)).toEqual(errorsBefore);
+      expect(history.every((point) => point.intervalSeconds === null)).toBe(true);
+      expect(
+        store.db
+          .prepare(
+            `SELECT count(*) AS n FROM quota_observations
+             WHERE provider = 'claude' AND processed = 1
+               AND controller_integral IS NULL AND controller_derivative IS NULL
+               AND uncapped_interval_seconds IS NULL AND interval_seconds IS NULL`
+          )
+          .get()
+      ).toEqual({ n: 13 });
+
+      // Another provider's learned state is not part of the reset.
+      expect(store.getProviderThrottle("codex")).toEqual(codexBefore);
+      expect(reasonedRows(store, "codex")).toHaveLength(13);
+
+      // The next observation is reasoned as a cold start: the proportional
+      // term stands alone and the period is smoothed up from zero, not from
+      // the pre-reset period.
+      recordStandingError(store, "claude", 1, 10, 13);
+      const fresh = reasonedRows(store, "claude");
+      expect(fresh).toHaveLength(1);
+      const first = fresh[0] as ReasonedRow;
+      expect(first.integral).toBe(0);
+      expect(first.derivative).toBe(0);
+      expect(first.error).toBeCloseTo(10, 9);
+      expect(first.uncapped).toBeCloseTo(
+        QUOTA_ACTUATOR_SMOOTHING * QUOTA_KP_SECONDS_PER_POINT * first.error,
+        6
+      );
+      expect(first.interval).toBeLessThan(carried.interval);
+      expect(store.getProviderThrottle("claude")?.intervalSeconds).toBeCloseTo(first.interval, 9);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("is durable: a restarted controller on a fresh connection sees the reset, not the old memory", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-reset-restart-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const first = new SharedQuotaStore(path);
+    try {
+      first.configureController({ maxIntervalSeconds: 36000 });
+      recordStandingError(first, "agy", 13, 10);
+      expect(first.getProviderThrottle("agy")?.intervalSeconds).toBeGreaterThan(0);
+    } finally {
+      first.close();
+    }
+
+    // The operator command runs in its own process without a controller.
+    const operator = new SharedQuotaStore(path);
+    try {
+      expect(operator.resetController("agy").clearedDecisions).toBe(13);
+    } finally {
+      operator.close();
+    }
+
+    const restarted = new SharedQuotaStore(path);
+    try {
+      restarted.configureController({ maxIntervalSeconds: 36000 });
+      expect(restarted.getProviderThrottle("agy")?.intervalSeconds).toBe(0);
+      recordStandingError(restarted, "agy", 1, 10, 13);
+      const fresh = reasonedRows(restarted, "agy");
+      expect(fresh).toHaveLength(1);
+      expect(fresh[0]?.integral).toBe(0);
+      expect(fresh[0]?.derivative).toBe(0);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it("resets every window kind on the lane, because the widest one governs it", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-reset-kinds-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      // A five-hourly window alongside the weekly one, each carrying its own
+      // standing error and so its own retained decision.
+      const fiveHourReset = "2030-01-01T05:00:00.000Z";
+      for (let slot = 0; slot < 13; slot += 1) {
+        const observedMs = startedMs + slot * 5 * 60 * 1000;
+        const weeklyRemaining = ((resetMs - observedMs) / weeklyMs) * 100;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          weeklyRemaining - 10,
+          reset
+        );
+        const fiveHourRemaining =
+          ((Date.parse(fiveHourReset) - observedMs) / (5 * 60 * 60 * 1000)) * 100;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          fiveHourRemaining - 20,
+          fiveHourReset,
+          "five_hour"
+        );
+      }
+      expect(reasonedRows(store, "claude", "weekly")).toHaveLength(13);
+      expect(reasonedRows(store, "claude", "five_hour")).toHaveLength(13);
+      expect(store.getProviderThrottle("claude")?.intervalSeconds).toBeGreaterThan(0);
+
+      const result = store.resetController("claude");
+      expect(result).toEqual({ provider: "claude", clearedDecisions: 26, observations: 26 });
+
+      // Neither kind is left holding a decision that could govern the lane.
+      expect(reasonedRows(store, "claude", "weekly")).toEqual([]);
+      expect(reasonedRows(store, "claude", "five_hour")).toEqual([]);
+      const throttle = store.getProviderThrottle("claude");
+      expect(throttle?.intervalSeconds).toBe(0);
+      expect(throttle?.governingBucketKey).toBeNull();
+
+      // Both windows' observations are still evidence and are still there.
+      expect(store.listCanonicalSince("claude", "2000-01-01T00:00:00.000Z")).toHaveLength(26);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps an exhausted lane gated: it resets pacing policy, it does not claim quota came back", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-reset-exhausted-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      recordStandingError(store, "claude", 13, 10);
+      // The lane then reads as exhausted, with the window's reset still ahead.
+      const exhaustedAt = new Date(startedMs + 13 * 5 * 60 * 1000).toISOString();
+      recordObservation(store, "claude", exhaustedAt, 0, reset);
+      expect(store.getExhaustedUntil("claude")).toBe(reset);
+
+      store.resetController("claude");
+
+      // The period is gone, but the exhaustion gate is untouched: `percent_left`
+      // and `reset_at_iso` are observations, and only a fresh scrape can say
+      // the budget refilled.
+      const throttle = store.getProviderThrottle("claude");
+      expect(throttle?.intervalSeconds).toBe(0);
+      expect(throttle?.expired).toBe(true);
+      expect(throttle?.exhaustedUntil).toBe(reset);
+      expect(store.getExhaustedUntil("claude")).toBe(reset);
+
+      // A fresh scrape showing real headroom is what releases it.
+      recordObservation(
+        store,
+        "claude",
+        new Date(startedMs + 14 * 5 * 60 * 1000).toISOString(),
+        80,
+        reset
+      );
+      expect(store.getExhaustedUntil("claude")).toBeNull();
+      expect(store.getProviderThrottle("claude")?.expired).toBe(false);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reports nothing cleared for a provider without controller memory", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-reset-empty-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      expect(store.resetController("kimi")).toEqual({
+        provider: "kimi",
+        clearedDecisions: 0,
+        observations: 0,
+      });
+      expect(store.getProviderThrottle("kimi")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+});

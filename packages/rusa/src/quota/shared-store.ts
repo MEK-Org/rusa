@@ -112,6 +112,20 @@ export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
 }
 
+export interface QuotaControllerResetResult {
+  provider: string;
+  /**
+   * Reasoned observations whose controller memory was cleared, counted as rows
+   * across every window kind on the lane. Matched on `interval_seconds IS NOT
+   * NULL`, which is every reasoned row: the reasoning step is the only writer
+   * of the controller columns and writes all of them together, and rows
+   * reasoned before `controller_integral` existed still carry their period.
+   */
+  clearedDecisions: number;
+  /** Canonical observations still stored for the provider; the reset never removes one. */
+  observations: number;
+}
+
 export interface PersistedQuotaBucketStatus {
   key: string;
   percentLeft: number;
@@ -614,6 +628,120 @@ export class SharedQuotaStore {
          WHERE provider = ? AND kind = ? AND observed_slot = ?`
       )
       .run(observation.provider, observation.kind, observation.slot);
+  }
+
+  /**
+   * Operator hard reset of one provider's PID controller.
+   *
+   * The controller's only memory is the newest reasoned observation per
+   * `(provider, kind)`: its derivative filter state, its integral area and the
+   * period it commanded (the slew and smoothing baseline). Clearing those
+   * columns on every reasoned row makes the provider's next observation reason
+   * as a cold start — derivative and integral at zero, the period smoothed up
+   * from zero — and drops the published period to zero until that observation
+   * arrives. Nothing else moves: the observations stay (they are quota
+   * evidence, not controller state), `controller_error` stays because it is a
+   * pure function of its observation and is the proportional history the
+   * dashboard charts, and other providers are untouched.
+   *
+   * This is a persisted row update, so it survives a coordinator restart and
+   * is visible to every connection on the shared file; the process performing
+   * it needs no controller of its own.
+   *
+   * ## Why every retained decision is cleared, not just the newest
+   *
+   * Clearing only the newest reasoned row per `(provider, kind)` is incorrect:
+   * both the controller's prior-state lookup and {@link getProviderThrottle}
+   * find their row by `interval_seconds IS NOT NULL ... ORDER BY observed_at
+   * DESC LIMIT 1`, so blanking the newest simply promotes the one before it
+   * and an older period silently becomes current again — the precise failure
+   * the reset exists to prevent.
+   *
+   * `interval_seconds` *is* the lookup key, so hiding a row from the
+   * controller and keeping its historical value are the same operation with
+   * opposite requirements. Preserving history would take a reset marker or
+   * cutoff the lookup could read past — a new column or table, i.e. a schema
+   * migration. #521 itself asks only for the zeroing; the no-migration
+   * boundary comes from its triage (issue comment 5702034188), which
+   * commissioned this as a focused, no-schema change. Within that boundary
+   * the nulling is forced, not preferred.
+   *
+   * The in-between variant — zero the newest reasoned row per kind in place
+   * (`controller_integral = 0, controller_derivative = 0,
+   * uncapped_interval_seconds = 0, interval_seconds = 0`) and leave older
+   * rows alone — gives the same actuator baseline and the same published `0`
+   * while keeping every earlier period, and was rejected for one reason:
+   * `0` is a value the reasoning step legitimately writes (`Math.max(0, …)`
+   * when a lane is ahead of pace). A zeroed row is therefore
+   * indistinguishable, in `listHistorySince`, in the published buckets and to
+   * the controller itself, from a decision the controller actually made at
+   * that row's `observed_at` — it rewrites one real decision per kind to a
+   * value that was never commanded, at an instant before the reset happened,
+   * and a published status reading "governing bucket commanded 0" cannot be
+   * told apart from "reset, awaiting its first observation". `NULL` is the one
+   * value the reasoning step never writes, so it is the only unambiguous
+   * "no decision" available without a schema change, and the published status
+   * shows it as such (`governingBucketKey: null`, no buckets). The variant's
+   * first step is also not quite a cold start — the gap since the zeroed row
+   * feeds the integral (`error × min(dt, QUOTA_INTEGRAL_MAX_STEP_SECONDS)`,
+   * at most a twelfth of the proportional term) and its retained
+   * `controller_error` feeds the raw derivative — but that is bounded and
+   * would not on its own have disqualified it.
+   *
+   * The accepted cost is real and bounded: the provider's retained *actuator*
+   * history goes null, so `listHistorySince` reports `intervalSeconds: null`
+   * for its past points and dashboard period charts lose that provider's
+   * pre-reset line — at most {@link QUOTA_OBSERVATION_RETENTION_MS} of a
+   * series that ages out on that schedule anyway. What survives is the
+   * evidence and the policy signal — every canonical observation (percent
+   * left, reset instants) and every `controller_error`, which is a pure
+   * function of its own observation and is the proportional history those
+   * dashboards chart. Inserting a synthetic zero-period row to keep the series
+   * contiguous was rejected for the same reason as zeroing in place: it would
+   * record a controller decision that never happened. A future change that
+   * does carry a migration can add the cutoff marker and keep both.
+   *
+   * ## Why the whole provider lane, across every window kind
+   *
+   * Pacing is applied per provider lane, and
+   * {@link getProviderThrottle} elects the governing bucket as the widest
+   * uncapped period across that provider's kinds. Resetting a single kind
+   * would leave another kind's stale decision governing the lane, so the
+   * reset would not be one. Provider-wide is the unit that matches the
+   * actuator.
+   *
+   * ## What it deliberately does not touch
+   *
+   * An exhausted observation (`percent_left = 0` with a future reset instant)
+   * stays, so {@link getExhaustedUntil} keeps gating the lane. This command
+   * resets *pacing policy*; it does not assert that quota was replenished.
+   * Only a fresh scrape is evidence of that.
+   *
+   * ## Against a live coordinator
+   *
+   * The write runs as `BEGIN IMMEDIATE` ({@link run.immediate}), taking the
+   * RESERVED lock up front instead of upgrading mid-transaction, so it cannot
+   * deadlock against the collection loop's own immediate transaction. In WAL
+   * mode with the connection's `busy_timeout`, a writer that finds the lock
+   * held waits it out rather than failing, so neither process sees
+   * `SQLITE_BUSY` for ordinary contention.
+   */
+  resetController(provider: string): QuotaControllerResetResult {
+    const run = this.db.transaction(() => {
+      const clearedDecisions = this.db
+        .prepare(
+          `UPDATE quota_observations
+           SET controller_derivative = NULL, controller_integral = NULL,
+               uncapped_interval_seconds = NULL, interval_seconds = NULL
+           WHERE provider = ? AND interval_seconds IS NOT NULL`
+        )
+        .run(provider).changes;
+      const { n: observations } = this.db
+        .prepare("SELECT count(*) AS n FROM quota_observations WHERE provider = ?")
+        .get(provider) as { n: number };
+      return { provider, clearedDecisions, observations };
+    });
+    return run.immediate();
   }
 
   /** Resolve the temporary exhaustion gate without persisting it as a period. */

@@ -8,8 +8,11 @@ import {
   listQuotaBackups,
   restoreQuotaDatabase,
 } from "../quota/coordinator-backup.js";
-import { resolveQuotaDatabasePath } from "../quota/shared-store.js";
-import { defaultQuotaBackupDir, defaultQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
+import {
+  defaultQuotaBackupDir,
+  defaultQuotaCoordinatorSocketPath,
+  resolveOperatorQuotaDatabasePath,
+} from "./quota-coordinator.js";
 
 export interface QuotaBackupCommandOptions {
   home?: string;
@@ -29,16 +32,7 @@ function resolvePaths(
   config: RusaConfig,
   mcHome: string
 ): { databasePath: string; backupDir: string; retain: number } {
-  const configuredDb =
-    opts.databasePath?.trim() ||
-    config.quota?.coordinator?.databasePath?.trim() ||
-    config.quota?.databasePath?.trim();
-  if (!configuredDb) {
-    throw new Error(
-      "No quota database configured: set quota.coordinator.databasePath (or quota.databasePath), or pass --database"
-    );
-  }
-  const databasePath = resolveQuotaDatabasePath(configuredDb, mcHome);
+  const databasePath = resolveOperatorQuotaDatabasePath(opts, config, mcHome);
 
   const configuredBackupDir =
     opts.backupDir?.trim() || config.quota?.coordinator?.backupDir?.trim();
