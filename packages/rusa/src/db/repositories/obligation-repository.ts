@@ -47,7 +47,7 @@ interface ObligationRow {
   priority_source_id: string;
   responsive: number | null;
   effective_responsive: number;
-  ready_episode: number;
+  ready_count: number;
   created_at: string | null;
   updated_at: string | null;
   creator_id: string | null;
@@ -328,7 +328,7 @@ function toObligation(row: ObligationRow): Obligation {
     prioritySourceId: row.priority_source_id,
     responsive: row.responsive === null ? null : row.responsive === 1,
     effectiveResponsive: row.effective_responsive === 1,
-    readyEpisode: row.ready_episode,
+    readyCount: row.ready_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     creatorId: row.creator_id,
@@ -756,22 +756,33 @@ export class ObligationRepository {
   listResponsiveReadyAttention(): Obligation[] {
     const rows = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE}
-         SELECT obligation.id
-         FROM obligations obligation
-         JOIN effective_priority ON effective_priority.id = obligation.id
+        `${EFFECTIVE_PRIORITY_CTE},
+         ready_heads(owner_id, id) AS (
+           SELECT owner_id, id FROM (
+             SELECT obligation.owner_id,
+                    obligation.id,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY obligation.owner_id
+                      ORDER BY effective_priority.effective_priority, obligation.id
+                    ) AS rank
+             FROM obligations obligation
+             JOIN effective_priority ON effective_priority.id = obligation.id
+             WHERE obligation.status = 'ready'
+           )
+           WHERE rank = 1
+         )
+         ${PROJECTED_OBLIGATION}
          WHERE obligation.status = 'ready'
-           AND effective_priority.effective_responsive = 1`
+           AND effective_priority.effective_responsive = 1
+           AND NOT EXISTS (
+             SELECT 1 FROM ready_heads
+             WHERE ready_heads.owner_id = obligation.owner_id
+               AND ready_heads.id = obligation.id
+           )
+         ORDER BY obligation.owner_id, obligation.id`
       )
-      .all() as Array<{ id: string }>;
-    const heads = this.readyHeads();
-    return rows
-      .map((row) => this.get(row.id))
-      .filter((obligation): obligation is Obligation => obligation !== null)
-      .filter(
-        (obligation) =>
-          this.isActorOwner(obligation.ownerId) && heads.get(obligation.ownerId) !== obligation.id
-      );
+      .all() as ObligationRow[];
+    return rows.map(toObligation).filter((obligation) => this.isActorOwner(obligation.ownerId));
   }
 
   /**
@@ -988,7 +999,8 @@ export class ObligationRepository {
         this.db
           .prepare(
             `UPDATE obligation_ready_heads
-             SET sequence = sequence + 1,
+             SET previous_head_id = head_id,
+                 sequence = sequence + 1,
                  updated_at = ?
              WHERE owner_id = ?`
           )
@@ -1369,7 +1381,7 @@ export class ObligationRepository {
       try {
         this.db
           .prepare(
-            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority, responsive, ready_episode,
+            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority, responsive, ready_count,
                 created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
@@ -2630,9 +2642,10 @@ export class ObligationRepository {
               // direct scheduled→ready transition has no prerequisite to check.
               this.db
                 .prepare(
-                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?`
+                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, ready_count = ready_count + 1, updated_at = ? WHERE id = ?`
                 )
                 .run(recurrence.intervalSeconds, this.stamp(), id);
+              this.pendingResponsiveReady.push(id);
             } else {
               const nextReadyAt = new Date(readyTime).toISOString();
               this.db
@@ -2665,7 +2678,7 @@ export class ObligationRepository {
       // prerequisite to check.
       this.db
         .prepare(
-          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?`
+          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, ready_count = ready_count + 1, updated_at = ? WHERE id = ?`
         )
         .run(this.stamp(), id);
       this.pendingResponsiveReady.push(id);
@@ -2766,18 +2779,21 @@ export class ObligationRepository {
     const subtreeBefore = new Map<string, boolean>();
     const subtreeRows = this.db
       .prepare(
-        `WITH RECURSIVE subtree(id) AS (
+        `${EFFECTIVE_PRIORITY_CTE},
+         subtree(id) AS (
            SELECT id FROM obligations WHERE id = ?
            UNION ALL
            SELECT child.id
            FROM obligations child
            JOIN subtree parent ON child.parent_id = parent.id
          )
-         SELECT id FROM subtree`
+         SELECT subtree.id, effective_priority.effective_responsive
+         FROM subtree
+         JOIN effective_priority ON effective_priority.id = subtree.id`
       )
-      .all(id) as Array<{ id: string }>;
+      .all(id) as Array<{ id: string; effective_responsive: number }>;
     for (const row of subtreeRows) {
-      subtreeBefore.set(row.id, this.require(row.id).effectiveResponsive);
+      subtreeBefore.set(row.id, row.effective_responsive === 1);
     }
     return subtreeBefore;
   }
@@ -2923,7 +2939,7 @@ export class ObligationRepository {
     if (!this.prerequisitesSatisfied(id)) return;
     this.db
       .prepare(
-        "UPDATE obligations SET status = 'ready', ready_episode = ready_episode + 1, updated_at = ? WHERE id = ?"
+        "UPDATE obligations SET status = 'ready', ready_count = ready_count + 1, updated_at = ? WHERE id = ?"
       )
       .run(this.stamp(), id);
     this.pendingResponsiveReady.push(id);

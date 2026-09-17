@@ -386,6 +386,58 @@ describe("ObligationRepository", () => {
         expect(announced).toEqual([]);
       });
 
+      it("persists an unchanged ready head's responsive escalation for idempotent boot replay", () => {
+        repository.create({ title: "hotfix", id: "hotfix", ownerId: "actor-a" });
+
+        repository.markResponsive("hotfix", "system:mesh");
+
+        // The same previous-head identity used by the live listener is durable,
+        // so boot reconciliation derives the identical inbox key instead of a
+        // second wake with stale transition state.
+        expect(repository.readyHeadTransitions()).toEqual([
+          { ownerId: "actor-a", headId: "hotfix", previousHeadId: "hotfix", sequence: 2 },
+        ]);
+        const reloaded = new ObligationRepository(
+          db,
+          (id) => id === "actor-a",
+          () => now++
+        );
+        expect(reloaded.readyHeadTransitions()).toEqual([
+          { ownerId: "actor-a", headId: "hotfix", previousHeadId: "hotfix", sequence: 2 },
+        ]);
+      });
+
+      it("announces a direct scheduled-to-ready recurrence update behind an existing head", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({
+          title: "hotfix",
+          id: "hotfix",
+          ownerId: "actor-a",
+          priority: 2,
+          responsive: true,
+        });
+        announced = [];
+        repository.setRecurrence(
+          "hotfix",
+          { policy: "completion_interval", intervalSeconds: 1 },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("hotfix", "done", null, null, "system:mesh");
+        expect(repository.require("hotfix").status).toBe("scheduled");
+
+        // Changing the interval after its stored completion is already due
+        // takes setRecurrence's direct scheduled→ready path.
+        now += 1_000;
+        repository.setRecurrence(
+          "hotfix",
+          { policy: "completion_interval", intervalSeconds: 1 },
+          "system:mesh"
+        );
+
+        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyCount: 2 });
+        expect(announced).toEqual([{ id: "hotfix", actingPrincipal: "system:mesh" }]);
+      });
+
       it("retries a failed delivery with the original acting principal, not a later mutation's", () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         let fail = true;
@@ -427,10 +479,10 @@ describe("ObligationRepository", () => {
           blockedBy: ["gate"],
           responsive: true,
         });
-        expect(repository.require("hotfix").readyEpisode).toBe(0);
+        expect(repository.require("hotfix").readyCount).toBe(0);
 
         repository.setTerminalStatus("gate", "done", null, null, "system:mesh");
-        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyEpisode: 1 });
+        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyCount: 1 });
 
         // A waiting→ready cycle (child filed, then completed) starts a new
         // episode — the episode counter is what keeps repeated episodes
@@ -438,7 +490,7 @@ describe("ObligationRepository", () => {
         repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
         expect(repository.require("hotfix").status).toBe("waiting");
         repository.setTerminalStatus("child", "done", null, null, "system:mesh");
-        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyEpisode: 2 });
+        expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyCount: 2 });
       });
     });
   });

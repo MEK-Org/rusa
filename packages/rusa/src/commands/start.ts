@@ -2874,7 +2874,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
       obligation.ownerId,
-      { id: obligation.id, intent: obligation.intent, readyEpisode: obligation.readyEpisode },
+      { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
       actingPrincipal === obligation.ownerId
     );
   };

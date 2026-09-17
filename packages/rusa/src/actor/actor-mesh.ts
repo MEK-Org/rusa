@@ -1724,12 +1724,12 @@ export class ActorMesh {
    * re-armed behind a persistent head, or a non-recurring one cycling
    * waiting→ready more than once, would re-arm into a key the owner already
    * handled and never be announced again. Keying on the obligation's
-   * `readyEpisode` makes every new episode a distinct entry; a replay of the
+   * `readyCount` makes every new episode a distinct entry; a replay of the
    * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
    */
   deliverResponsiveReadyAttention(
     ownerId: string,
-    obligation: { id: string; intent: string | null; readyEpisode?: number },
+    obligation: { id: string; intent: string | null; readyCount?: number },
     /**
      * The owner made its own obligation ready mid-run: it is already running
      * and will see the obligation in its queue, so a normal follow-up nudge
@@ -1742,7 +1742,7 @@ export class ActorMesh {
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    const episodeKey = obligation.readyEpisode !== undefined ? `:${obligation.readyEpisode}` : "";
+    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
     const entryId = deduplicatedInboxEntryId(
       `obligation-ready-responsive:${obligation.id}${episodeKey}`,
       actorId
@@ -1782,7 +1782,7 @@ export class ActorMesh {
       id: string;
       ownerId: string;
       intent: string | null;
-      readyEpisode?: number;
+      readyCount?: number;
     }>;
   }): void {
     if (!this.inboxStore) return;
@@ -1797,7 +1797,7 @@ export class ActorMesh {
         if (!record || record.status !== "active") continue;
         this.deliverResponsiveReadyAttention(
           obligation.ownerId,
-          obligation as { id: string; intent: string | null; readyEpisode?: number }
+          obligation as { id: string; intent: string | null; readyCount?: number }
         );
       }
     } catch (err) {

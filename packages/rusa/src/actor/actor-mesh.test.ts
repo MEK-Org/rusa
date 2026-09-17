@@ -1495,7 +1495,7 @@ describe("ActorMesh", () => {
       mesh.deliverResponsiveReadyAttention("root", {
         id: "ob-9",
         intent: "hotfix behind the head",
-        readyEpisode: 1,
+        readyCount: 1,
       })
     ).toBe(true);
     await tick();
@@ -1505,7 +1505,7 @@ describe("ActorMesh", () => {
     // is silent.
     mesh.reconcileResponsiveReadyAttention({
       listResponsiveReadyAttention: () => [
-        { id: "ob-9", ownerId: "root", intent: "hotfix behind the head", readyEpisode: 1 },
+        { id: "ob-9", ownerId: "root", intent: "hotfix behind the head", readyCount: 1 },
       ],
     });
     await tick();
@@ -1517,7 +1517,7 @@ describe("ActorMesh", () => {
       mesh.deliverResponsiveReadyAttention("root", {
         id: "ob-9",
         intent: "hotfix behind the head",
-        readyEpisode: 2,
+        readyCount: 2,
       })
     ).toBe(true);
     await tick();

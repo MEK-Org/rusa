@@ -5,7 +5,7 @@ import { obligationPriority } from "./0017_obligation_priority.js";
 import { obligationResponsive } from "./0049_obligation_responsive.js";
 
 describe("0049_obligation_responsive", () => {
-  it("adds nullable responsive and ready_episode columns with their CHECKs", () => {
+  it("adds nullable responsive and ready_count columns with their CHECKs", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     obligations.up(db);
@@ -15,21 +15,21 @@ describe("0049_obligation_responsive", () => {
 
     const columns = db.prepare("PRAGMA table_info(obligations)").all() as Array<{ name: string }>;
     expect(columns.map(({ name }) => name)).toEqual(
-      expect.arrayContaining(["responsive", "ready_episode"])
+      expect.arrayContaining(["responsive", "ready_count"])
     );
 
     const insert = db.prepare(
       `INSERT INTO obligations
-         (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority, responsive, ready_episode)
+         (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority, responsive, ready_count)
        VALUES (?, ?, 'actor', 'actor-a', NULL, NULL, 'ready', 1, ?, ?)`
     );
     insert.run("explicit", null, 1, 1);
     insert.run("inherited", null, null, 0);
     expect(
-      db.prepare("SELECT id, responsive, ready_episode FROM obligations ORDER BY id").all()
+      db.prepare("SELECT id, responsive, ready_count FROM obligations ORDER BY id").all()
     ).toEqual([
-      { id: "explicit", responsive: 1, ready_episode: 1 },
-      { id: "inherited", responsive: null, ready_episode: 0 },
+      { id: "explicit", responsive: 1, ready_count: 1 },
+      { id: "inherited", responsive: null, ready_count: 0 },
     ]);
 
     expect(() => insert.run("bad", null, 0, 0)).toThrow(/CHECK/);

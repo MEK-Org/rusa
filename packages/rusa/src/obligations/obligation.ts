@@ -76,7 +76,7 @@ export interface Obligation {
    * non-recurring one cycling waiting→ready more than once, announces once per
    * episode instead of being swallowed by the previous episode's dedupe key.
    */
-  readyEpisode: number;
+  readyCount: number;
   /**
    * When this obligation was created (ISO-8601). `null` only for rows that
    * predate the timestamp columns and have no recoverable creation time —
