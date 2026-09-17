@@ -109,11 +109,11 @@ export interface CreateObligationInput {
   /** Explicit finite priority. Defaults to creation time when omitted/null. */
   priority?: number | null;
   /**
-   * Explicit responsive override (#531); null/omitted inherits from ancestry.
-   * Descendants inherit the resolved value dynamically, so a row filed under a
-   * responsive obligation is responsive without carrying its own value.
+   * Marks this obligation and its descendants responsive (#531). Null leaves
+   * the ancestry-derived value intact; urgency never opts a descendant out of
+   * a responsive ancestor.
    */
-  responsive?: boolean | null;
+  responsive?: true | null;
   /**
    * The entity raising this obligation, bound by the calling server — never
    * taken from model-supplied payload (#1671 trust boundary). Omitted only by
@@ -180,7 +180,7 @@ export interface OwnedObligationPageOptions extends ObligationPageOptions {
   status?: ObligationStatus;
 }
 
-/** An actor gained a ready head it did not previously have. */
+/** An actor gained a ready head or its existing head became responsive. */
 export interface ReadyHeadChange {
   ownerId: EntityId;
   /**
@@ -197,6 +197,7 @@ export interface ReadyHeadChange {
   head: Obligation | null;
   /**
    * The head this one displaced, or `null` when the owner had no ready head.
+   * Equals `head.id` when the existing head became responsive without moving.
    *
    * Carried because `head` alone cannot tell "this obligation reached the head
    * for the first time" from "it reached the head again after being displaced",
@@ -228,7 +229,7 @@ const EFFECTIVE_PRIORITY_CTE = `
     SELECT child.id,
            COALESCE(child.priority, parent.effective_priority),
            CASE WHEN child.priority IS NULL THEN parent.priority_source_id ELSE child.id END,
-           COALESCE(child.responsive, parent.effective_responsive)
+           MAX(parent.effective_responsive, COALESCE(child.responsive, 0))
     FROM obligations child
     JOIN effective_priority parent ON parent.id = child.parent_id
   )
@@ -719,6 +720,30 @@ export class ObligationRepository {
   }
 
   /**
+   * Mark a live obligation responsive. This is deliberately one-way in v1:
+   * #531 says every descendant of responsive work is responsive, so there is
+   * no subtree opt-out that can weaken that invariant. Ready members whose
+   * resolved value flips need the same immediate attention as reparenting.
+   */
+  markResponsive(id: string, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError("terminal obligations cannot be marked responsive");
+      }
+
+      const subtreeBefore = this.responsiveSubtree(id);
+      if (!obligation.responsive) {
+        this.db
+          .prepare("UPDATE obligations SET responsive = 1, updated_at = ? WHERE id = ?")
+          .run(this.stamp(), id);
+      }
+      this.enqueueNewlyResponsiveReadyMembers(subtreeBefore);
+      return this.require(id);
+    });
+  }
+
+  /**
    * Every live ready responsive actor-owned obligation that is not its owner's
    * current ready head — the set the responsive-ready listener announces.
    * Derived fresh from persisted state (status, ancestry-resolved
@@ -866,6 +891,10 @@ export class ObligationRepository {
     this.installHistoryCapture();
     const result = this.db.transaction(() => {
       const before = this.readyHeads();
+      const beforeHeadResponsive = new Map<string, boolean>();
+      for (const [ownerId, headId] of before) {
+        beforeHeadResponsive.set(ownerId, this.isEffectivelyResponsive(headId));
+      }
 
       // A tracked-column write outside mutate() is an audited-seam violation.
       // Assert the delta table is empty rather than silently discarding leftover
@@ -941,6 +970,34 @@ export class ObligationRepository {
         const sequence = seqRow?.sequence ?? 1;
 
         changes.push({ ownerId, head, previousHeadId, sequence });
+      }
+
+      // A ready head that stays in place would ordinarily produce no head
+      // transition. But marking it responsive (or reparenting it under a
+      // responsive ancestor) is itself an escalation request: surface a new
+      // responsive ready-head entry immediately instead of silently waiting
+      // for some future queue movement.
+      for (const [ownerId, headId] of after) {
+        if (before.get(ownerId) !== headId || beforeHeadResponsive.get(ownerId)) continue;
+        if (!this.isActorOwner(ownerId)) continue;
+        if (!this.isEffectivelyResponsive(headId)) continue;
+        const head = this.get(headId);
+        if (!head) continue;
+
+        const now = this.stamp();
+        this.db
+          .prepare(
+            `UPDATE obligation_ready_heads
+             SET sequence = sequence + 1,
+                 updated_at = ?
+             WHERE owner_id = ?`
+          )
+          .run(now, ownerId);
+        const seqRow = this.db
+          .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
+          .get(ownerId) as { sequence: number } | undefined;
+        const sequence = seqRow?.sequence ?? 1;
+        changes.push({ ownerId, head, previousHeadId: headId, sequence });
       }
 
       return res;
@@ -1324,7 +1381,7 @@ export class ObligationRepository {
             externalRef,
             initialStatus,
             priority,
-            input.responsive == null ? null : input.responsive ? 1 : 0,
+            input.responsive === true ? 1 : null,
             initialStatus === "ready" ? 1 : 0,
             stampedAt,
             stampedAt,
@@ -2673,22 +2730,7 @@ export class ObligationRepository {
       // ready members that flipped to responsive — a projection-only change
       // that fires neither a status transition nor a head change, and would
       // otherwise stay silent until a boot sweep (#531).
-      const subtreeBefore = new Map<string, boolean>();
-      const subtreeRows = this.db
-        .prepare(
-          `WITH RECURSIVE subtree(id) AS (
-             SELECT id FROM obligations WHERE id = ?
-             UNION ALL
-             SELECT child.id
-             FROM obligations child
-             JOIN subtree parent ON child.parent_id = parent.id
-           )
-           SELECT id FROM subtree`
-        )
-        .all(id) as Array<{ id: string }>;
-      for (const row of subtreeRows) {
-        subtreeBefore.set(row.id, this.require(row.id).effectiveResponsive);
-      }
+      const subtreeBefore = this.responsiveSubtree(id);
 
       if (newParentId === null && obligation.priority === null) {
         this.db
@@ -2714,15 +2756,55 @@ export class ObligationRepository {
         this.tryRelease(oldParentId);
       }
 
-      for (const [memberId, wasResponsive] of subtreeBefore) {
-        if (wasResponsive) continue;
-        const member = this.get(memberId);
-        if (!member || member.status !== "ready" || !member.effectiveResponsive) continue;
-        this.pendingResponsiveReady.push(memberId);
-      }
+      this.enqueueNewlyResponsiveReadyMembers(subtreeBefore);
 
       return this.require(id);
     });
+  }
+
+  private responsiveSubtree(id: string): Map<string, boolean> {
+    const subtreeBefore = new Map<string, boolean>();
+    const subtreeRows = this.db
+      .prepare(
+        `WITH RECURSIVE subtree(id) AS (
+           SELECT id FROM obligations WHERE id = ?
+           UNION ALL
+           SELECT child.id
+           FROM obligations child
+           JOIN subtree parent ON child.parent_id = parent.id
+         )
+         SELECT id FROM subtree`
+      )
+      .all(id) as Array<{ id: string }>;
+    for (const row of subtreeRows) {
+      subtreeBefore.set(row.id, this.require(row.id).effectiveResponsive);
+    }
+    return subtreeBefore;
+  }
+
+  /**
+   * Read just the responsive projection without materializing an obligation.
+   * Some legacy migration tests intentionally retain malformed historical
+   * priority rows that `toObligation` rejects; observing a head's urgency must
+   * not broaden that validation boundary.
+   */
+  private isEffectivelyResponsive(id: string): boolean {
+    const row = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE}
+         SELECT effective_responsive FROM effective_priority WHERE id = ?`
+      )
+      .get(id) as { effective_responsive: number } | undefined;
+    return row?.effective_responsive === 1;
+  }
+
+  private enqueueNewlyResponsiveReadyMembers(subtreeBefore: Map<string, boolean>): void {
+    for (const [memberId, wasResponsive] of subtreeBefore) {
+      if (wasResponsive) continue;
+      const member = this.get(memberId);
+      if (!member || member.status !== "ready" || !member.effectiveResponsive) continue;
+      this.pendingResponsiveReady.push(memberId);
+    }
   }
 
   reorder(

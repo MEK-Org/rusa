@@ -56,9 +56,8 @@ export interface Obligation {
   /** Obligation whose explicit priority supplies effectivePriority. */
   prioritySourceId: string;
   /**
-   * Explicit responsive override (#531): `true` or `false` set on this row,
-   * `null` to inherit from the nearest ancestor with an explicit value. A
-   * responsive obligation is one whose `effectiveResponsive` resolves true.
+   * Locally marks this row responsive (#531). Null does not override ancestry:
+   * a descendant of responsive work stays responsive.
    */
   responsive: boolean | null;
   /**

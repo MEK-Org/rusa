@@ -98,7 +98,7 @@ describe("ObligationRepository", () => {
   });
 
   describe("responsive obligations (#531)", () => {
-    it("inherits responsiveness through ancestry and honors an explicit override", () => {
+    it("inherits responsiveness through ancestry", () => {
       repository.create({
         title: "root",
         id: "root",
@@ -117,21 +117,12 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         parentId: "child",
       });
-      const optedOut = repository.create({
-        title: "opted out",
-        id: "opted-out",
-        ownerId: "actor-a",
-        parentId: "root",
-        responsive: false,
-      });
-
       expect(repository.require("root")).toMatchObject({
         responsive: true,
         effectiveResponsive: true,
       });
       expect(child).toMatchObject({ responsive: null, effectiveResponsive: true });
       expect(grandchild.effectiveResponsive).toBe(true);
-      expect(optedOut).toMatchObject({ responsive: false, effectiveResponsive: false });
     });
 
     it("resolves responsiveness dynamically on reparenting, with no row rewrite", () => {
@@ -354,6 +345,45 @@ describe("ObligationRepository", () => {
           { id: "r-root", actingPrincipal: "system:mesh" },
           { id: "moving-child", actingPrincipal: "system:mesh" },
         ]);
+      });
+
+      it("announces ready subtree members when existing work is marked responsive", () => {
+        repository.create({ title: "head", id: "head", ownerId: "actor-a", priority: 1 });
+        repository.create({ title: "hotfix", id: "hotfix", ownerId: "actor-a", priority: 2 });
+        repository.create({
+          title: "child",
+          id: "child",
+          ownerId: "actor-a",
+          parentId: "hotfix",
+          priority: 3,
+        });
+
+        repository.markResponsive("hotfix", "system:mesh");
+
+        expect(repository.require("hotfix").effectiveResponsive).toBe(true);
+        expect(repository.require("child").effectiveResponsive).toBe(true);
+        // The child makes its parent wait; the ready child behind the
+        // unchanged head gets the immediate responsive announcement.
+        expect(announced).toEqual([{ id: "child", actingPrincipal: "system:mesh" }]);
+      });
+
+      it("reannounces an unchanged ready head when it is marked responsive", () => {
+        const heads: Array<{ id: string; previousHeadId: string | null; responsive: boolean }> = [];
+        repository.setReadyHeadListener((change) => {
+          if (!change.head) return;
+          heads.push({
+            id: change.head.id,
+            previousHeadId: change.previousHeadId,
+            responsive: change.head.effectiveResponsive,
+          });
+        });
+        repository.create({ title: "hotfix", id: "hotfix", ownerId: "actor-a" });
+        heads.length = 0;
+
+        repository.markResponsive("hotfix", "system:mesh");
+
+        expect(heads).toEqual([{ id: "hotfix", previousHeadId: "hotfix", responsive: true }]);
+        expect(announced).toEqual([]);
       });
 
       it("retries a failed delivery with the original acting principal, not a later mutation's", () => {

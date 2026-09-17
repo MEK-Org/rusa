@@ -32,7 +32,7 @@ describe("0049_obligation_responsive", () => {
       { id: "inherited", responsive: null, ready_episode: 0 },
     ]);
 
-    expect(() => insert.run("bad", null, 2, 0)).toThrow(/CHECK/);
+    expect(() => insert.run("bad", null, 0, 0)).toThrow(/CHECK/);
     expect(() => insert.run("bad-episode", null, null, -1)).toThrow(/CHECK/);
   });
 });
