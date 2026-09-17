@@ -874,6 +874,57 @@ export class ObligationRepository {
   }
 
   /**
+   * Per-owner durable occurrence watermark for boot repair of ready-head
+   * attention (#513).
+   *
+   * Boot-repair inbox entries are permanent (epoch-free) so repeated boots
+   * over an unchanged head stay silent, but a permanent id alone cannot
+   * distinguish "the head never changed" from "the head recurred after a
+   * transition whose attention append was lost while the earlier repair entry
+   * for that head was already handled". The repair id therefore includes the
+   * maximum `obligation_history` id over the owner's ready-head influence
+   * cone — the owner's obligations plus their ancestors, because effective
+   * priority is inherited and a head change can be caused by a tracked-column
+   * write to either. Terminal rows stay in the cone: the recurrence X -> H is
+   * often X's own terminal write, which must still move the watermark.
+   *
+   * This is a single watermark read over the existing audit trail, not a
+   * replacement ready-head ledger and not an event replay. Every committed
+   * head change writes at least one history row in the same transaction —
+   * status, priority, owner, or parent writes; the insert of a new
+   * higher-ranked obligation is the only head change with no history row, and
+   * it can only displace a head, never restore one. So an unchanged watermark
+   * proves no transition can have been missed (suppression is safe), while a
+   * moved watermark gives the recurrence a distinct repair id. Unrelated
+   * churn in the cone can cost the operator-accepted at-most-one duplicate
+   * attention entry per restart; it can never lose a wake.
+   */
+  readyHeadRepairWatermarks(): Map<string, number> {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE ready_owner(owner_id) AS (
+           SELECT DISTINCT owner_id FROM obligations WHERE status = 'ready'
+         ),
+         cone(owner_id, id) AS (
+           SELECT obligation.owner_id, obligation.id
+           FROM obligations obligation
+           JOIN ready_owner ON ready_owner.owner_id = obligation.owner_id
+           UNION
+           SELECT cone.owner_id, parent.id
+           FROM cone
+           JOIN obligations child ON child.id = cone.id
+           JOIN obligations parent ON parent.id = child.parent_id
+         )
+         SELECT cone.owner_id AS owner_id, MAX(history.id) AS watermark
+         FROM cone
+         JOIN obligation_history history ON history.obligation_id = cone.id
+         GROUP BY cone.owner_id`
+      )
+      .all() as Array<{ owner_id: string; watermark: number }>;
+    return new Map(rows.map((row) => [row.owner_id, row.watermark]));
+  }
+
+  /**
    * The single mutation seam: one transaction, with ready-head tracking around it.
    *
    * Every state-changing repository method routes through here, so a new

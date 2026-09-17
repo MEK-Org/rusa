@@ -1297,12 +1297,19 @@ export class ActorMesh {
    * Boot recovery for ready-head inbox attention (#1645).
    *
    * Verifies that every active actor with a ready head has durable attention in
-   * its inbox. Entries are keyed by exact transition fact with no epoch, so the
-   * repair entry is permanent: the first pass delivers at most one entry per
-   * fact and repeated boots over unchanged heads stay silent. Live transitions
-   * delivered through {@link deliverReadyHeadAttention} are epoch-scoped
-   * instead (#513), so a genuine transition recurring after a restart always
-   * reaches the inbox even when it collides with a handled entry here.
+   * its inbox. Boot-repair entries are epoch-free so repeated boots over an
+   * unchanged head stay silent after a single repair entry. The
+   * `readyHeads()` path additionally keys each repair id on the owner's
+   * durable occurrence watermark, supplied alongside `readyHeads()` by the
+   * repository as `readyHeadRepairWatermarks()`: a head that
+   * recurred after a transition whose attention append was lost gets a
+   * distinct id instead of colliding with the already-handled repair entry
+   * for the same head, at the cost of at most the operator-accepted one
+   * duplicate entry when the owner's cone churned without a head change
+   * (#513). Live transitions delivered through
+   * {@link deliverReadyHeadAttention} are epoch-scoped instead, so a genuine
+   * transition recurring after a restart always reaches the inbox even when
+   * it collides with a handled entry here.
    */
   reconcileReadyHeads(obligations: {
     readyHeadTransitions?(): Iterable<{
@@ -1312,6 +1319,7 @@ export class ActorMesh {
       sequence: number;
     }>;
     readyHeads?(): Iterable<[string, string]>;
+    readyHeadRepairWatermarks?(): Map<string, number>;
     get(id: string): { id: string; intent: string | null; effectiveResponsive?: boolean } | null;
   }): void {
     if (!this.inboxStore) return;
@@ -1338,6 +1346,10 @@ export class ActorMesh {
           );
         }
       } else if (typeof obligations.readyHeads === "function") {
+        const watermarks =
+          typeof obligations.readyHeadRepairWatermarks === "function"
+            ? obligations.readyHeadRepairWatermarks()
+            : null;
         for (const [ownerId, headId] of obligations.readyHeads()) {
           if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
           const actorId = this.resolveThreadId(ownerId);
@@ -1350,7 +1362,8 @@ export class ActorMesh {
             { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
             null,
             null,
-            null
+            null,
+            watermarks ? (watermarks.get(ownerId) ?? null) : null
           );
         }
       }
@@ -1683,7 +1696,10 @@ export class ActorMesh {
    * duplicate attention entry when a committed transition is replayed across
    * a restart. Boot reconciliation in {@link reconcileReadyHeads} deliberately
    * uses a permanent, epoch-free id instead, so repeated boots over unchanged
-   * heads stay silent after a single repair entry.
+   * heads stay silent after a single repair entry — and keys that id on the
+   * owner's durable occurrence watermark, so a head that recurred after its
+   * transition's append was lost does not collide with the already-handled
+   * repair entry for the same head.
    */
   deliverReadyHeadAttention(
     actorId: string,
@@ -1711,7 +1727,13 @@ export class ActorMesh {
     previousHeadId: string | null,
     sequence: number | null = null,
     /** Null for epoch-free permanent ids used by boot reconciliation. */
-    epoch: string | null = null
+    epoch: string | null = null,
+    /**
+     * Durable occurrence watermark for epoch-free boot-repair ids. Lets a
+     * repair id distinguish a head that recurred after a lost attention append
+     * from the unchanged head an earlier handled repair entry covered (#513).
+     */
+    occurrence: number | null = null
   ): boolean {
     if (!this.inboxStore) return false;
     const record = this.actors.get(actorId);
@@ -1719,11 +1741,15 @@ export class ActorMesh {
     // Live transitions are keyed on (epoch, transition, sequence): exactly-once
     // within a process, and never silently suppressed across a restart even
     // though the repository's sequence restarts at 1 (#513). Reconcile passes
-    // no epoch, keeping its repair entry permanent per (transition, sequence).
+    // no epoch, keeping its repair entry permanent per (transition, sequence);
+    // the readyHeads() reconcile path adds the durable occurrence watermark so
+    // a recurrence after a lost append does not collide with the handled
+    // repair entry for the same head.
     const epochKey = epoch !== null ? `${epoch}:` : "";
     const seqKey = sequence !== null ? `:${sequence}` : "";
+    const occurrenceKey = occurrence !== null ? `:${occurrence}` : "";
     const entryId = deduplicatedInboxEntryId(
-      `obligation-head:${epochKey}${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
+      `obligation-head:${epochKey}${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}${occurrenceKey}`,
       actorId
     );
     const responsive = head.responsive === true;
