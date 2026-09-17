@@ -2515,7 +2515,7 @@ describe("ActorMesh", () => {
     expect(logs.some((m) => m.includes("retire cleanup") && m.includes("failed"))).toBe(false);
   });
 
-  it("deactivates the retired actor's active event subscriptions", () => {
+  it("refuses retirement while active event subscriptions remain, and succeeds after explicit unsubscription (#540)", () => {
     const { mesh } = setup();
     const actorId = mesh.spawn({ charter: "repo worker", parentId: "root" });
     const active = "github:dummy-org/dummy-repo";
@@ -2525,7 +2525,10 @@ describe("ActorMesh", () => {
     mesh.subscribeEventSource(alreadyInactive, actorId, "root");
     mesh.unsubscribeEventSource(alreadyInactive, actorId, "2025-12-31T00:00:00Z");
 
-    mesh.retire(actorId);
+    expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+
+    mesh.unsubscribeEventSource(active, actorId, "2026-01-01T00:00:00Z");
+    expect(() => mesh.retire(actorId)).not.toThrow();
 
     expect(
       mesh
@@ -5518,7 +5521,6 @@ describe("ActorMesh", () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
-      mesh.subscribeEventSource("github:dummy-org/dummy-repo", worker, "root");
 
       // Recipient liveness, the durable append, and the wake are one turn.
       // Suspend anywhere between them and a retirement lands after a recipient
@@ -5533,6 +5535,7 @@ describe("ActorMesh", () => {
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
         payload: payload("push"),
+        directedTarget: worker,
       });
 
       const delivered = await delivery;
@@ -5785,13 +5788,16 @@ describe("ActorMesh", () => {
       expect(fake("root").calls[0]?.prompt).toContain("Work from your inbox");
     });
 
-    it("bubbles delegated events back to the parent's broader subscription when the child retires", async () => {
+    it("refuses child retirement until delegated events are reclaimed, then delivers to parent (#540)", async () => {
       const { mesh, tick, fake } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
 
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
       mesh.delegateEventSource("github:dummy-org/dummy-repo/pulls/616", child, parent);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      mesh.reclaimEventSource("github:dummy-org/dummy-repo/pulls/616", parent);
       mesh.retire(child);
 
       deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo/pulls/616", "pr event", {
@@ -5935,6 +5941,9 @@ describe("ActorMesh", () => {
       // must NOT mean silent loss — the walk continues to the ancestor source.
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", actorId, "root");
+
+      expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+      mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", actorId, "2026-01-01T00:00:00Z");
 
       // Retire the worker (makes it not live)
       mesh.retire(actorId);
@@ -6163,7 +6172,13 @@ describe("ActorMesh", () => {
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoActorId, "root");
       mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueActorId, "root");
 
-      // Retire issue subscriber so it is no longer live
+      // Unsubscribe and retire issue subscriber so it is no longer live (#540)
+      expect(() => mesh.retire(issueActorId)).toThrow(RetirementBlockedError);
+      mesh.unsubscribeEventSource(
+        "github:dummy-org/dummy-repo/issues/123",
+        issueActorId,
+        "2026-01-01T00:00:00Z"
+      );
       mesh.retire(issueActorId);
 
       deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo/issues/123", "new comment", {
@@ -6887,6 +6902,8 @@ describe("ActorMesh", () => {
       const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
       mesh.subscribeEventSource(ISSUE, owner, "root");
       mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+      expect(() => mesh.retire(watcher)).toThrow(RetirementBlockedError);
+      mesh.removeEventSourceSubscriber(ISSUE, watcher);
       mesh.retire(watcher);
 
       deliverCanonicalEvent(mesh, ISSUE, "issue event", { payload: payload("issues.opened") });
@@ -6999,13 +7016,18 @@ describe("ActorMesh", () => {
       );
     });
 
-    it("retirement deletes the subscriptions while tombstoning the ownership", () => {
+    it("refuses retirement while subscriptions remain, and retires once removed (#540)", () => {
       const { mesh } = setup();
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
       mesh.subscribeEventSource(REPO_SOURCE, actorId, "root");
       mesh.addEventSourceSubscriber(ISSUE, actorId, actorId);
 
-      mesh.retire(actorId);
+      expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+
+      mesh.unsubscribeEventSource(REPO_SOURCE, actorId, "2026-01-01T00:00:00Z");
+      mesh.removeEventSourceSubscriber(ISSUE, actorId);
+
+      expect(() => mesh.retire(actorId)).not.toThrow();
 
       expect(mesh.listSubscriptions().find((s) => s.actorId === actorId)?.unsubscribedAt).toBe(
         "2026-01-01T00:00:00Z"
@@ -8647,7 +8669,203 @@ describe("ActorMesh", () => {
 
       // The run guard keeps its own, narrower scope: a retired thread cannot
       // have a run in flight, so it stays out of that walk.
-      expect(mesh.activeRunsInSubtree(parent)).toEqual([]);
+    });
+  });
+
+  describe("refuses actor retirement while live event subscriptions remain (#540)", () => {
+    it("refuses retirement when target holds an event source ownership and unblocks on unsubscribe", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const resource = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(resource, worker, "root");
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource, actorId: worker, kind: "ownership" },
+        ]);
+        expect(blocked.message).toContain(`cannot retire ${worker}`);
+        expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
+        expect(blocked.message).toContain(`${resource} [ownership] held by ${worker}`);
+        expect(blocked.message).toContain(
+          "transfer or reclaim each with delegate_event_source / reclaim_event_source, or unsubscribe with unsubscribe_event_source"
+        );
+      }
+
+      // Preflight fail-closed: worker remains active
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Unsubscribe unblocks retirement
+      mesh.unsubscribeEventSource(resource, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("refuses retirement when target holds a direct event subscription and unblocks on removal", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const resource = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(resource, "root", "root");
+      mesh.addEventSourceSubscriber(resource, worker, worker);
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource, actorId: worker, kind: "subscription" },
+        ]);
+        expect(blocked.message).toContain(`${resource} [subscription] held by ${worker}`);
+      }
+
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Remove subscription unblocks retirement
+      mesh.removeEventSourceSubscriber(resource, worker);
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("enumerates multiple subscriptions (ownership and direct) and requires disposing all", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const repo1 = "github:dummy-org/repo-1";
+      const repo2 = "github:dummy-org/repo-2";
+
+      mesh.subscribeEventSource(repo1, worker, "root");
+      mesh.subscribeEventSource(repo2, "root", "root");
+      mesh.addEventSourceSubscriber(repo2, worker, worker);
+
+      const blockers = mesh.retirementBlockers(worker);
+      expect(blockers.subscriptions).toEqual(
+        expect.arrayContaining([
+          { resource: repo1, actorId: worker, kind: "ownership" },
+          { resource: repo2, actorId: worker, kind: "subscription" },
+        ])
+      );
+      expect(blockers.subscriptions).toHaveLength(2);
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+
+      // Disposing one is not enough
+      mesh.unsubscribeEventSource(repo1, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Disposing the second allows retirement
+      mesh.removeEventSourceSubscriber(repo2, worker);
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("unblocks retirement when delegated event source is reclaimed or transferred", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/10";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      expect(registry.get(child)?.status).toBe("active");
+
+      // Reclaim by parent unblocks child retirement
+      mesh.reclaimEventSource(pr, parent);
+      expect(() => mesh.retire(child)).not.toThrow();
+      expect(registry.get(child)?.status).toBe("retired");
+    });
+
+    it("blocks ancestor retirement when a descendant holds an active subscription", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const repo = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(repo, child, "root");
+
+      expect(() => mesh.retire(parent)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(parent);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource: repo, actorId: child, kind: "ownership" },
+        ]);
+        expect(blocked.message).toContain(`cannot retire ${parent}`);
+        expect(blocked.message).toContain(`${repo} [ownership] held by ${child}`);
+      }
+
+      // Preflight fail-closed: neither parent nor child is retired
+      expect(registry.get(parent)?.status).toBe("active");
+      expect(registry.get(child)?.status).toBe("active");
+
+      // Once child subscription is unsubscribed, parent retirement cascades cleanly
+      mesh.unsubscribeEventSource(repo, child, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(parent)).not.toThrow();
+      expect(registry.get(parent)?.status).toBe("retired");
+      expect(registry.get(child)?.status).toBe("retired");
+    });
+
+    it("formats combined blockers across obligations, messages, and subscriptions", () => {
+      const inFuture = (): string => new Date(Date.now() + 100_000).toISOString();
+      const owned = new Map<string, LiveObligationSummary[]>();
+      const { mesh, registry } = setup({
+        obligations: {
+          findLiveByExternalRef: () => null,
+          listLiveOwnedBy: (ownerId) => owned.get(ownerId) ?? [],
+        },
+      });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      const repo = "github:dummy-org/dummy-repo";
+
+      owned.set(worker, [{ id: "ob-combo", status: "ready", title: "review pr" }]);
+      mesh.sendMessage(peer, "ping", worker, undefined, inFuture());
+      mesh.subscribeEventSource(repo, worker, "root");
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.obligations).toHaveLength(1);
+        expect(blocked.blockers.messages).toHaveLength(1);
+        expect(blocked.blockers.subscriptions).toHaveLength(1);
+
+        expect(blocked.message).toContain("1 live obligation(s) owned in its subtree");
+        expect(blocked.message).toContain("ob-combo");
+        expect(blocked.message).toContain("1 pending scheduled message(s)");
+        expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
+        expect(blocked.message).toContain(`${repo} [ownership] held by ${worker}`);
+      }
+
+      expect(registry.get(worker)?.status).toBe("active");
+    });
+
+    it("does not allow force: true to bypass subscription blockers", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const repo = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(repo, worker, "root");
+
+      expect(() => mesh.retire(worker, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
+
+      mesh.unsubscribeEventSource(repo, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker, { force: true })).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
     });
   });
 

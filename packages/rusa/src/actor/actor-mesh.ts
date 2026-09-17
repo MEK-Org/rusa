@@ -279,10 +279,18 @@ export interface MessageRetirementBlocker {
   direction: "incoming" | "outgoing" | "internal";
 }
 
+/** One live event subscription owned inside a retiring subtree (#540). */
+export interface SubscriptionRetirementBlocker {
+  resource: string;
+  actorId: string;
+  kind: "ownership" | "subscription";
+}
+
 /** Everything a subtree must dispose of before it can retire — see {@link ActorMesh.retirementBlockers}. */
 export interface RetirementBlockers {
   obligations: ObligationRetirementBlocker[];
   messages: MessageRetirementBlocker[];
+  subscriptions: SubscriptionRetirementBlocker[];
 }
 
 /**
@@ -385,6 +393,18 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
       ...listWithOverflow(
         blockers.messages,
         (m) => `  ${m.messageId} [${m.direction}] ${m.fromId} -> ${m.toId} at ${m.deliverAt}`
+      )
+    );
+  }
+  if (blockers.subscriptions.length > 0) {
+    lines.push(
+      `${blockers.subscriptions.length} live event subscription(s) owned in its subtree — ` +
+        "transfer or reclaim each with delegate_event_source / reclaim_event_source, or unsubscribe with unsubscribe_event_source:"
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.subscriptions,
+        (s) => `  ${s.resource}${s.kind ? ` [${s.kind}]` : ""} held by ${s.actorId}`
       )
     );
   }
@@ -3218,18 +3238,19 @@ export class ActorMesh {
    * only the *queued*-run refusal.
    *
    * **Also refuses while the subtree still holds undisposed work** — a live
-   * obligation, or a scheduled message in either direction (#191). That refusal
-   * names every blocker so the retirer can reassign, finish, or cancel each one
-   * and retry; nothing is dropped mechanically as a fallback, because a dropped
-   * delivery is a decision nobody made. **No flag passes it**, `force` included:
-   * the two refusals answer different questions, and overriding "someone is still
-   * working" was never a licence to destroy the work itself. The subtree cascade
-   * skips it by going through {@link retireUnchecked} instead — the entry call
-   * already cleared the whole subtree, and re-asking mid-teardown would only
-   * re-answer the same question against a tree that is already coming apart.
+   * obligation, a scheduled message in either direction (#191), or a live event
+   * subscription (#540). That refusal names every blocker so the retirer can
+   * reassign, finish, cancel, transfer, or unsubscribe each one and retry; nothing
+   * is dropped mechanically as a fallback, because a dropped delivery is a decision
+   * nobody made. **No flag passes it**, `force` included: the two refusals answer
+   * different questions, and overriding "someone is still working" was never a licence
+   * to destroy the work itself. The subtree cascade skips it by going through
+   * {@link retireUnchecked} instead — the entry call already cleared the whole subtree,
+   * and re-asking mid-teardown would only re-answer the same question against a tree
+   * that is already coming apart.
    *
    * @throws when the subtree has running runs (or queued runs without `force`/`forceQueued`).
-   * @throws {RetirementBlockedError} when the subtree holds live obligations or pending messages.
+   * @throws {RetirementBlockedError} when the subtree holds live obligations, pending messages, or live event subscriptions.
    */
   retire(id: string, opts: RetireOptions = {}): void {
     id = this.resolveThreadId(id);
@@ -3256,7 +3277,11 @@ export class ActorMesh {
     }
     // Outside the `force` branch on purpose: see the doc comment above.
     const blockers = this.retirementBlockers(id);
-    if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
+    if (
+      blockers.obligations.length > 0 ||
+      blockers.messages.length > 0 ||
+      blockers.subscriptions.length > 0
+    ) {
       throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
     }
     this.retireUnchecked(id);
@@ -3489,8 +3514,8 @@ export class ActorMesh {
 
   /**
    * Everything in `id`'s subtree that needs an explicit decision before it can
-   * retire: live obligations owned anywhere in it, and pending scheduled
-   * messages with either endpoint in it.
+   * retire: live obligations owned anywhere in it, pending scheduled
+   * messages with either endpoint in it, and live event subscriptions held in it (#540).
    *
    * Both message directions block by decision (#191). Inbound alone is the
    * narrower rule, but it leaves a retired actor able to speak later with no
@@ -3534,7 +3559,26 @@ export class ActorMesh {
         direction: incoming && outgoing ? "internal" : incoming ? "incoming" : "outgoing",
       });
     }
-    return { obligations, messages };
+    const subscriptions: SubscriptionRetirementBlocker[] = [];
+    for (const sub of this.eventSourceOwners.list()) {
+      if (subtree.has(sub.actorId) && !sub.unsubscribedAt) {
+        subscriptions.push({
+          resource: sub.resource,
+          actorId: sub.actorId,
+          kind: "ownership",
+        });
+      }
+    }
+    for (const sub of this.eventSourceSubscriptions.list()) {
+      if (subtree.has(sub.actorId)) {
+        subscriptions.push({
+          resource: sub.resource,
+          actorId: sub.actorId,
+          kind: "subscription",
+        });
+      }
+    }
+    return { obligations, messages, subscriptions };
   }
 
   /**

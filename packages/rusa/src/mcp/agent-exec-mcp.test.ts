@@ -966,6 +966,70 @@ describe("agent-execution MCP server", () => {
       expect(retired.isError).toBeFalsy();
       expect(registry.get(worker)?.status).toBe("retired");
     });
+
+    it("retire_thread refuses while the subtree holds live event subscriptions, and succeeds after disposition (#540)", async () => {
+      const scheduledMessages = new FakeScheduledMessages();
+      const { mesh, registry } = setup({
+        scheduledMessages,
+        configuredEventSources: ["github:test-org/test-repo"],
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      mesh.delegateEventSource("github:test-org/test-repo/issues/10", worker, "root");
+      const subRes = (await workerClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: "github:test-org/test-repo" },
+      })) as CallToolResult;
+      expect(subRes.isError).toBeFalsy();
+
+      const refused = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+
+      expect(refused.isError).toBe(true);
+      const message = String(dataOf(refused));
+      expect(message).toContain("2 live event subscription(s) owned in its subtree");
+      expect(message).toContain("github:test-org/test-repo/issues/10 [ownership]");
+      expect(message).toContain("github:test-org/test-repo [subscription]");
+      expect(message).toContain("delegate_event_source / reclaim_event_source");
+      expect(message).toContain("unsubscribe_event_source");
+      expect(registry.get(worker)?.status).toBe("active");
+
+      const reclaimed = (await client.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "github:test-org/test-repo/issues/10" },
+      })) as CallToolResult;
+      expect(reclaimed.isError).toBeFalsy();
+
+      const stillBlocked = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(stillBlocked.isError).toBe(true);
+      expect(String(dataOf(stillBlocked))).toContain("1 live event subscription(s)");
+      expect(String(dataOf(stillBlocked))).toContain("github:test-org/test-repo [subscription]");
+
+      const unsubscribed = (await workerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo" },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+
+      const retired = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
   });
 
   it("retire_thread refuses a queued report without force, but retires with force: true ", async () => {

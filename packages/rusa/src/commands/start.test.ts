@@ -3868,7 +3868,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     mesh.subscribeEventSource("github:dummy-org", "root", "root");
     mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
-    // Retire worker (no longer live)
+    // Retire worker (no longer live) - with #540, event source is explicitly unsubscribed first
+    mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", workerId, "2026-01-01T00:00:00Z");
     mesh.retire(workerId);
 
     // Emit event. The conclusion has to be one that wakes somebody: this test

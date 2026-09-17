@@ -610,10 +610,12 @@ export function createAgentExecMcpServer(
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
         "Check run_state in list_threads, or just wait for the thread's yield. " +
-        "Also refused while the subtree still owns a live obligation or has a scheduled " +
-        "message pending in either direction; the refusal names each one, and nothing is " +
-        "retired until you have reassigned or finished those obligations and cancelled " +
-        "(cancel_scheduled_message) or re-sent those messages.",
+        "Also refused while the subtree still owns a live obligation, has a scheduled " +
+        "message pending in either direction, or holds a live event subscription; the " +
+        "refusal names each one, and nothing is retired until you have reassigned or finished " +
+        "those obligations, cancelled (cancel_scheduled_message) or re-sent those messages, " +
+        "and transferred/reclaimed (delegate_event_source/reclaim_event_source) or " +
+        "unsubscribed (unsubscribe_event_source) those event subscriptions.",
       inputSchema: {
         thread_id: z.string().describe("The descendant thread to retire."),
         force: z
@@ -622,7 +624,7 @@ export function createAgentExecMcpServer(
           .describe(
             "Retire even if the thread or a descendant has a queued run (cancelling the queued run). " +
               "Still refused if any thread in the subtree has an active run in flight, and it does " +
-              "not bypass the obligation/message refusal above — that work is disposed of by name, " +
+              "not bypass the obligation/message/subscription refusal above — that work is disposed of by name, " +
               "never overridden by a flag."
           ),
       },
