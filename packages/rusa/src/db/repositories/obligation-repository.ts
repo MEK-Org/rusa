@@ -885,8 +885,11 @@ export class ObligationRepository {
    * maximum `obligation_history` id over the owner's ready-head influence
    * cone — the owner's obligations plus their ancestors, because effective
    * priority is inherited and a head change can be caused by a tracked-column
-   * write to either. Terminal rows stay in the cone: the recurrence X -> H is
-   * often X's own terminal write, which must still move the watermark.
+   * write to either. Reassignment rows also belong to both their before and
+   * after owner: an X -> H recurrence caused by reassigning X from A to B
+   * must still move A's watermark after X leaves A's current cone. Terminal
+   * rows stay in the cone: the recurrence X -> H is often X's own terminal
+   * write, which must still move the watermark.
    *
    * This is a single watermark read over the existing audit trail, not a
    * replacement ready-head ledger and not an event replay. Every committed
@@ -914,11 +917,28 @@ export class ObligationRepository {
            FROM cone
            JOIN obligations child ON child.id = cone.id
            JOIN obligations parent ON parent.id = child.parent_id
+         ),
+         historical_owner(owner_id, history_id) AS (
+           SELECT json_extract(payload, '$.before.ownerId'), id
+           FROM obligation_history
+           WHERE mutation_kind = 'reassign' AND json_valid(payload)
+           UNION ALL
+           SELECT json_extract(payload, '$.after.ownerId'), id
+           FROM obligation_history
+           WHERE mutation_kind = 'reassign' AND json_valid(payload)
+         ),
+         evidence(owner_id, history_id) AS (
+           SELECT cone.owner_id, history.id
+           FROM cone
+           JOIN obligation_history history ON history.obligation_id = cone.id
+           UNION
+           SELECT ready_owner.owner_id, historical_owner.history_id
+           FROM ready_owner
+           JOIN historical_owner ON historical_owner.owner_id = ready_owner.owner_id
          )
-         SELECT cone.owner_id AS owner_id, MAX(history.id) AS watermark
-         FROM cone
-         JOIN obligation_history history ON history.obligation_id = cone.id
-         GROUP BY cone.owner_id`
+         SELECT owner_id, MAX(history_id) AS watermark
+         FROM evidence
+         GROUP BY owner_id`
       )
       .all() as Array<{ owner_id: string; watermark: number }>;
     return new Map(rows.map((row) => [row.owner_id, row.watermark]));

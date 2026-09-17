@@ -1715,7 +1715,7 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(callsBeforePass2);
   });
 
-  it("recovers a missed H recurrence after a handled boot repair, through production readyHeads() reconciliation (#513)", () => {
+  it("recovers a lost reassignment that returns H after a handled boot repair, through production readyHeads() reconciliation (#513)", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const inboxStore = createMemoryInboxStore();
@@ -1756,18 +1756,20 @@ describe("ActorMesh", () => {
     expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
     inboxStore.markHandled("root", [headEntries()[1].id]);
 
-    // The recurrence X -> H commits, but its attention append is lost — a
-    // listener failure, or the process dies between commit and append. The
-    // terminal write on X is the recurrence's durable trace. Pre-fix, boot
-    // reconciliation retried the already-handled permanent none->H id, the
-    // conflict clause swallowed it, and the actor lost the wake entirely.
+    // Reassigning X from root to actor-b returns H to root, but its attention
+    // append is lost — a listener failure, or the process dies between commit
+    // and append. The reassign history row is X's durable trace, but X no
+    // longer belongs to root. Pre-fix, root's current-owner cone excluded X,
+    // so boot reconciliation retried the already-handled permanent none->H
+    // id, the conflict clause swallowed it, and the actor lost the wake.
     repo1.setReadyHeadListener(undefined);
-    repo1.setTerminalStatus("ob-x", "cancelled", "superseded", null, "root");
+    repo1.reassign("ob-x", "actor-b", "root");
 
     // Process 2 (restart): fresh repository and mesh over the same database
     // and inbox. Boot reconciliation reads readyHeads() plus the durable
-    // occurrence watermark; the recurrence moved the watermark, so the repair
-    // id differs from the handled one and the recovery wake lands.
+    // occurrence watermark. Its owner-history evidence keeps root's
+    // reassignment in the watermark even though X now belongs to actor-b, so
+    // the repair id differs from the handled one and the recovery wake lands.
     const repo2 = new ObligationRepository(db);
     const mesh2 = setup({ inboxStore, actors });
     mesh2.mesh.reconcileReadyHeads(repo2);
