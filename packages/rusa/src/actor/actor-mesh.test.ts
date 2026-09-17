@@ -1715,6 +1715,70 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(callsBeforePass2);
   });
 
+  it("recovers a missed H->X->H recurrence after a handled boot repair, through production readyHeads() reconciliation (#513)", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    // Process 1, boot: H is the derived head. Boot reconciliation over the
+    // production readyHeads() path appends the repair entry for this process;
+    // the actor handles it, and a second reconcile pass over the unchanged head
+    // within the same process stays silent.
+    const repo1 = new ObligationRepository(db);
+    const mesh1 = setup({ inboxStore, actors });
+    repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
+    mesh1.mesh.reconcileReadyHeads(repo1);
+    expect(headEntries()).toHaveLength(1);
+    expect(headEntries()[0].payload).toMatchObject({ obligationId: "ob-h" });
+    inboxStore.markHandled("root", [headEntries()[0].id]);
+    mesh1.mesh.reconcileReadyHeads(repo1);
+    expect(headEntries()).toHaveLength(1);
+
+    // Same generation, live path: X displaces H and the epoch-scoped live
+    // entry delivers; the actor handles it too.
+    repo1.setReadyHeadListener(({ ownerId, head, previousHeadId, sequence }) =>
+      mesh1.mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null ? null : { id: head.id, intent: head.intent },
+        previousHeadId,
+        sequence
+      )
+    );
+    repo1.create({ id: "ob-x", title: "Displacer", ownerId: "root", priority: 0 });
+    expect(headEntries()).toHaveLength(2);
+    expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-x" });
+    inboxStore.markHandled("root", [headEntries()[1].id]);
+
+    // X completes, returning H to root, but its live attention append is lost
+    // (e.g. listener unwired, or process crashes between commit and append).
+    repo1.setReadyHeadListener(undefined);
+    repo1.setTerminalStatus("ob-x", "done", null, null, "root");
+
+    // Process 2 (restart): fresh repository and mesh over the same database
+    // and inbox. Boot reconciliation reads readyHeads() and scopes the repair
+    // entry to the new process epoch. The repair id is distinct from Process 1's
+    // handled repair id, so the recovery wake lands.
+    const repo2 = new ObligationRepository(db);
+    const mesh2 = setup({ inboxStore, actors });
+    mesh2.mesh.reconcileReadyHeads(repo2);
+    expect(headEntries()).toHaveLength(3);
+    expect(headEntries()[2].id).not.toBe(headEntries()[0].id);
+    expect(headEntries()[2].payload).toMatchObject({ obligationId: "ob-h" });
+
+    // Repeated boots within Process 2 over the now-unchanged head stay silent.
+    mesh2.mesh.reconcileReadyHeads(repo2);
+    expect(headEntries()).toHaveLength(3);
+
+    db.close();
+  });
+
   it("recovers a lost reassignment that returns H after a handled boot repair, through production readyHeads() reconciliation (#513)", () => {
     const db = new Database(":memory:");
     runMigrations(db);
@@ -1728,8 +1792,8 @@ describe("ActorMesh", () => {
       );
 
     // Process 1, boot: H is the derived head. Boot reconciliation over the
-    // production readyHeads() path appends the permanent repair entry; the
-    // actor handles it, and a second reconcile pass over the unchanged head
+    // production readyHeads() path appends the repair entry for this process;
+    // the actor handles it, and a second reconcile pass over the unchanged head
     // stays silent.
     const repo1 = new ObligationRepository(db);
     const mesh1 = setup({ inboxStore, actors });
@@ -1758,18 +1822,14 @@ describe("ActorMesh", () => {
 
     // Reassigning X from root to actor-b returns H to root, but its attention
     // append is lost — a listener failure, or the process dies between commit
-    // and append. The reassign history row is X's durable trace, but X no
-    // longer belongs to root. Pre-fix, root's current-owner cone excluded X,
-    // so boot reconciliation retried the already-handled permanent none->H
-    // id, the conflict clause swallowed it, and the actor lost the wake.
+    // and append.
     repo1.setReadyHeadListener(undefined);
     repo1.reassign("ob-x", "actor-b", "root");
 
     // Process 2 (restart): fresh repository and mesh over the same database
-    // and inbox. Boot reconciliation reads readyHeads() plus the durable
-    // occurrence watermark. Its owner-history evidence keeps root's
-    // reassignment in the watermark even though X now belongs to actor-b, so
-    // the repair id differs from the handled one and the recovery wake lands.
+    // and inbox. Boot reconciliation reads readyHeads() and scopes the repair
+    // entry to the new process epoch, ensuring the repair id differs from the
+    // pre-restart handled entry and the recovery wake lands.
     const repo2 = new ObligationRepository(db);
     const mesh2 = setup({ inboxStore, actors });
     mesh2.mesh.reconcileReadyHeads(repo2);
@@ -1780,6 +1840,48 @@ describe("ActorMesh", () => {
     // Repeated boots over the now-unchanged head stay silent again.
     mesh2.mesh.reconcileReadyHeads(repo2);
     expect(headEntries()).toHaveLength(3);
+
+    db.close();
+  });
+
+  it("delivers at most one duplicate ready-head attention entry per restart when heads are unchanged, through production readyHeads() reconciliation (#513)", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    // Process 1, boot: H is the derived head. Boot reconciliation appends
+    // the initial repair entry; the actor handles it.
+    const repo1 = new ObligationRepository(db);
+    const mesh1 = setup({ inboxStore, actors });
+    repo1.create({ id: "ob-h", title: "Head task", ownerId: "root", priority: 1 });
+    mesh1.mesh.reconcileReadyHeads(repo1);
+    expect(headEntries()).toHaveLength(1);
+    inboxStore.markHandled("root", [headEntries()[0].id]);
+
+    // Repeated reconcile in Process 1 is silent.
+    mesh1.mesh.reconcileReadyHeads(repo1);
+    expect(headEntries()).toHaveLength(1);
+
+    // Process 2 (restart): H is unchanged across restart. In-memory state is
+    // empty, so the owner receives at most one duplicate entry per the #513
+    // operator ruling.
+    const repo2 = new ObligationRepository(db);
+    const mesh2 = setup({ inboxStore, actors });
+    mesh2.mesh.reconcileReadyHeads(repo2);
+    expect(headEntries()).toHaveLength(2);
+    expect(headEntries()[1].payload).toMatchObject({ obligationId: "ob-h" });
+
+    // Subsequent reconcile passes in Process 2 remain silent (deduplicated
+    // within the process).
+    mesh2.mesh.reconcileReadyHeads(repo2);
+    expect(headEntries()).toHaveLength(2);
 
     db.close();
   });
