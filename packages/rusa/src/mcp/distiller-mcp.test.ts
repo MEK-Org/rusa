@@ -5,7 +5,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { DistillerState } from "../understanding/distiller-cursor.js";
 import { iuReportPaths } from "../understanding/persistence-utils.js";
 import {
@@ -35,6 +38,7 @@ function createMemoryStore(opts?: {
   seedSource?: DistillerSeedSource;
   count?: number;
   unsyncedCount?: number;
+  events?: MeshEventRepository;
 }): DistillerMcpStore {
   let state: DistillerState = {
     lastDistilled: null,
@@ -53,7 +57,16 @@ function createMemoryStore(opts?: {
     countSubstantiveEvents: () => opts?.count ?? 0,
     resolveSeed: async () => opts?.seedSource ?? { seed: SEED, reason: "glass-goals-latest-op" },
     unsyncedCount: () => opts?.unsyncedCount ?? 0,
+    listEvents: (window) =>
+      opts?.events?.listEventsWindow(window) ?? { events: [], hasMore: false, nextCursor: null },
   };
+}
+
+/** A real repository over an in-memory mesh.db, so the tool is exercised end to end. */
+function createEventRepository(): MeshEventRepository {
+  const db = new Database(":memory:");
+  runMigrations(db);
+  return new MeshEventRepository(db);
 }
 
 describe("distiller MCP", () => {
@@ -71,6 +84,7 @@ describe("distiller MCP", () => {
       "distill_seed",
       "distill_advance",
       "distill_status",
+      "distill_read_events",
       "distill_journal_append",
       "distill_report_render",
     ]);
@@ -271,6 +285,126 @@ describe("distiller MCP", () => {
     expect(result.chatSpaces.spaces).toEqual(["spaces/AAA"]);
     expect(result.chatSpaces.note).toContain("does NOT know its chat read set");
     expect(result.chatSpaces.error).toContain("page ceiling");
+  });
+});
+
+describe("distiller MCP — distill_read_events (#537)", () => {
+  const stamp = (n: number) => `2026-09-16T03:12:${String(n).padStart(2, "0")}.000Z`;
+  type Page = {
+    since: string;
+    until: string | null;
+    events: { detail: string | null; actorId: string | null }[];
+    hasMore: boolean;
+    nextCursor: string | null;
+  };
+
+  async function read(client: Client, args: Record<string, unknown>): Promise<Page> {
+    const result = (await client.callTool({
+      name: "distill_read_events",
+      arguments: args,
+    })) as CallToolResult;
+    expect(result.isError).toBeFalsy();
+    return dataOf(result) as Page;
+  }
+
+  it("replays every actor's events in [since, until), oldest first", async () => {
+    const events = createEventRepository();
+    events.record({ kind: "run_start", actorId: "actor-a", detail: "before", ts: stamp(0) });
+    events.record({ kind: "run_end", actorId: "actor-b", detail: "first", ts: stamp(1) });
+    events.record({ kind: "message_sent", actorId: "actor-c", detail: "second", ts: stamp(2) });
+    events.record({ kind: "run_start", actorId: "actor-a", detail: "at-until", ts: stamp(3) });
+    const client = await connect(createDistillerServer({ store: createMemoryStore({ events }) }));
+
+    const page = await read(client, { since: stamp(1), until: stamp(3) });
+    expect(page.since).toBe(stamp(1));
+    expect(page.until).toBe(stamp(3));
+    expect(page.events.map((e) => [e.actorId, e.detail])).toEqual([
+      ["actor-b", "first"],
+      ["actor-c", "second"],
+    ]);
+    expect(page.hasMore).toBe(false);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("walks a window larger than one page with a stable cursor, without gaps or repeats", async () => {
+    const events = createEventRepository();
+    // Two events share stamp(2): the page edge lands between them.
+    const details = ["0", "1", "2a", "2b", "3", "4"];
+    const stamps = [0, 1, 2, 2, 3, 4];
+    for (const [i, detail] of details.entries()) {
+      events.record({ kind: "run_start", actorId: "actor", detail, ts: stamp(stamps[i]) });
+    }
+    const client = await connect(createDistillerServer({ store: createMemoryStore({ events }) }));
+
+    const seen: (string | null)[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page: Page = await read(client, {
+        since: stamp(0),
+        until: stamp(5),
+        limit: 3,
+        ...(cursor === null ? {} : { cursor }),
+      });
+      pages += 1;
+      seen.push(...page.events.map((e) => e.detail));
+      expect(page.hasMore).toBe(page.nextCursor !== null);
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    expect(pages).toBe(2);
+    expect(seen).toEqual(details);
+  });
+
+  it("canonicalises second-precision bounds so they compare like stored stamps", async () => {
+    const events = createEventRepository();
+    events.record({ kind: "run_start", actorId: "actor", detail: "on-the-second", ts: stamp(1) });
+    const client = await connect(createDistillerServer({ store: createMemoryStore({ events }) }));
+
+    // `…:01Z` sorts after `…:01.000Z` as text; as a bound it must still admit it.
+    const page = await read(client, {
+      since: "2026-09-16T03:12:01Z",
+      until: "2026-09-16T03:12:02Z",
+    });
+    expect(page.since).toBe(stamp(1));
+    expect(page.until).toBe(stamp(2));
+    expect(page.events.map((e) => e.detail)).toEqual(["on-the-second"]);
+  });
+
+  it("reads nothing when the window is empty and never mutates the log", async () => {
+    const events = createEventRepository();
+    events.record({ kind: "run_start", actorId: "actor", detail: "only", ts: stamp(1) });
+    const client = await connect(createDistillerServer({ store: createMemoryStore({ events }) }));
+
+    const page = await read(client, { since: stamp(2) });
+    expect(page).toEqual({
+      since: stamp(2),
+      until: null,
+      events: [],
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(events.list().map((e) => e.detail)).toEqual(["only"]);
+  });
+
+  it("rejects an inverted window, an out-of-range limit, and a malformed cursor", async () => {
+    const client = await connect(
+      createDistillerServer({ store: createMemoryStore({ events: createEventRepository() }) })
+    );
+    const errorOf = async (args: Record<string, unknown>) => {
+      const result = (await client.callTool({
+        name: "distill_read_events",
+        arguments: args,
+      })) as CallToolResult;
+      expect(result.isError).toBe(true);
+      const first = result.content[0];
+      return first && first.type === "text" ? first.text : "";
+    };
+
+    expect(await errorOf({ since: stamp(2), until: stamp(1) })).toContain("must be later than");
+    expect(await errorOf({ since: stamp(0), limit: 0 })).toContain("limit");
+    expect(await errorOf({ since: stamp(0), limit: 201 })).toContain("limit");
+    expect(await errorOf({ since: "yesterday" })).toContain("since");
+    expect(await errorOf({ since: stamp(0), cursor: "junk" })).toContain("malformed event cursor");
   });
 });
 

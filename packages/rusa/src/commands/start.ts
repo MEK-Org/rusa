@@ -1151,6 +1151,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return resolveSeed(client !== null, client ? latestOpCreatedAt(client) : null);
     },
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
+    // The distiller's replay read (#537) crosses the capability boundary here
+    // and nowhere else: the dashboard's `/api/mesh/events` stays a human-only
+    // Firebase-session route with no machine principal behind it.
+    listEvents: (opts) => getRepositories().meshEvents.listEventsWindow(opts),
   };
   const actors = getRepositories().actors;
   // The obligation store's actor guard is only real once it can see the
