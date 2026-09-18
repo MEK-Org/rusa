@@ -211,13 +211,6 @@ interface LlmQuotaWindow {
   usedPercent?: number;
   resetAtIso?: string;
   resetInIso?: string;
-  /**
-   * The window's reset text exactly as the source printed it (e.g. "08:49 on
-   * 19 Sep"). Copying is the LLM's job; turning it into an instant is code's
-   * (`parseWallClockResetText`), so a panel whose printed date the model
-   * declines to resolve still yields a reset.
-   */
-  resetText?: string;
   placeholder?: boolean;
   scope?: "provider";
   /**
@@ -283,12 +276,14 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     resetAtIso: {
       type: Type.STRING,
       description:
-        "ISO-8601 instant (with UTC offset) this window resets at, ONLY when you can confidently " +
-        "resolve one from an absolute wall-clock/calendar reading (e.g. '23:32', '12:34 on 14 Jul', " +
-        "'Jul 7th, 2026 12:25 PM') using the current local time given below. Leave this empty for a " +
-        "pure relative duration (e.g. '70h 13m', '3h 10m', '2 days, 22 hours') — that is resolved " +
-        "deterministically downstream, do not compute it yourself. Also leave it empty whenever the " +
-        "date, year, or timezone is genuinely ambiguous — never guess an instant.",
+        "ISO-8601 instant (with UTC offset) this window resets at, assembled from an absolute " +
+        "wall-clock/calendar reading (e.g. '23:32', '12:34 on 14 Jul', 'Jul 7th, 2026 12:25 PM') " +
+        "using the current local date, time, and UTC offset given below. A reading that omits the " +
+        "year or the timezone is NOT ambiguous: take the year from the current local date and the " +
+        "offset from the current local time below. Leave this empty for a pure relative duration " +
+        "(e.g. '70h 13m', '3h 10m', '2 days, 22 hours') — that is resolved deterministically " +
+        "downstream, do not compute it yourself — and when the row prints no reset at all. " +
+        "A window below 100% left must carry exactly one of resetAtIso or resetInIso.",
     },
     resetInIso: {
       type: Type.STRING,
@@ -296,18 +291,8 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "ISO-8601 duration until this window resets, ONLY when the source gives a pure relative " +
         "duration (e.g. '70h 13m' -> 'PT70H13M', '3h 10m' -> 'PT3H10M', " +
         "'2 days, 22 hours' -> 'P2DT22H'). Leave this empty for absolute/wall-clock/calendar " +
-        "readings, ambiguous text, or when no reset duration is present.",
-    },
-    resetText: {
-      type: Type.STRING,
-      description:
-        "This window's reset text copied VERBATIM from the row, with no reformatting, " +
-        "arithmetic, or timezone conversion — e.g. 'resets 08:49 on 19 Sep' -> '08:49 on 19 Sep', " +
-        "'resets 16:20' -> '16:20', 'resets in 70h 13m' -> '70h 13m'. Emit it whenever the row " +
-        "prints any reset text, INCLUDING when you also filled resetAtIso or resetInIso, and " +
-        "ESPECIALLY when you left both empty because the date, year, or timezone looked " +
-        "ambiguous: code resolves the printed text against the current local time given below. " +
-        "Empty string when the row prints no reset text at all.",
+        "readings (those go in resetAtIso) or when no reset duration is present. Must be a valid " +
+        "ISO-8601 duration, never the source text verbatim.",
     },
     placeholder: {
       type: Type.BOOLEAN,
@@ -330,7 +315,7 @@ const LLM_WINDOW_ITEM_SCHEMA = {
       },
     },
   },
-  required: ["label", "kind", "placeholder", "scope", "resetText"],
+  required: ["label", "kind", "placeholder", "scope"],
 };
 
 /**
@@ -349,6 +334,54 @@ function formatLocalIsoWithOffset(ms: number): string {
     `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
     `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
     `${sign}${pad(Math.floor(absMin / 60))}:${pad(absMin % 60)}`
+  );
+}
+
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+const WEEKDAY_NAMES = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+
+/**
+ * The scrape instant as the prompt's "now", spelled out component by component
+ * — calendar date, year, clock time and UTC offset — in the host's local zone,
+ * the zone a TUI prints its clock in. A panel that prints `08:49 on 19 Sep`
+ * omits exactly the year and the zone; handing both to the model as plain
+ * numbers lets it assemble the instant instead of declining the arithmetic
+ * (#517). Parsing the printed text stays the model's job: the TUI's wording
+ * drifts, and code that pattern-matches it is the brittleness the LLM parse
+ * replaced.
+ */
+function describeLocalNow(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const iso = formatLocalIsoWithOffset(ms);
+  const offset = iso.slice(-6);
+  return (
+    "The current local time — in the SAME timezone the TUI's clock is printed in — " +
+    `is ${iso}. Its components: today is ${WEEKDAY_NAMES[d.getDay()]} ${d.getDate()} ` +
+    `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}; the current year is ${d.getFullYear()}; ` +
+    `the current local clock time is ${pad(d.getHours())}:${pad(d.getMinutes())}; ` +
+    `the UTC offset is ${offset}. `
   );
 }
 
@@ -384,106 +417,11 @@ function parseIsoDuration(duration: string | undefined): number | undefined {
   );
 }
 
-const MONTH_ABBREVIATIONS = [
-  "jan",
-  "feb",
-  "mar",
-  "apr",
-  "may",
-  "jun",
-  "jul",
-  "aug",
-  "sep",
-  "oct",
-  "nov",
-  "dec",
-];
-
-/**
- * Resolve a printed wall-clock reset — codex's `16:20` and `08:49 on 19 Sep`
- * forms — into an instant, in the host's local zone (the zone the TUI's clock
- * is printed in) and relative to the scrape instant.
- *
- * The LLM copies the text; the arithmetic belongs here (#517). A model asked to
- * resolve "08:49 on 19 Sep" must supply a year and a timezone the panel never
- * prints, and it is right to leave `resetAtIso` empty when it finds that
- * ambiguous — but the partially-consumed provider window then fails its reset
- * gate, and an otherwise complete panel is discarded. Read against the scrape
- * instant the same text is unambiguous, so resolving it deterministically
- * reports what the panel displayed instead of inventing a reset or losing one.
- *
- * Anything that is not one of those two shapes returns undefined and falls
- * through to the existing fail-loud gate — a wrong instant is worse than none.
- */
-function parseWallClockResetText(
-  resetText: string | undefined,
-  generatedAtMs: number
-): string | undefined {
-  const text = resetText
-    ?.trim()
-    .replace(/^resets\s+/i, "")
-    .replace(/[.,]+$/, "")
-    .trim();
-  if (!text) return undefined;
-
-  const match = /^(\d{1,2}):(\d{2})(?:\s+on\s+(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?)?$/.exec(
-    text
-  );
-  if (!match) return undefined;
-
-  const [, hourRaw, minuteRaw, dayRaw, monthRaw, yearRaw] = match;
-  const hour = Number(hourRaw);
-  const minute = Number(minuteRaw);
-  if (hour > 23 || minute > 59) return undefined;
-
-  const now = new Date(generatedAtMs);
-  const nowFlooredMs = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    now.getHours(),
-    now.getMinutes(),
-    0,
-    0
-  ).getTime();
-  if (dayRaw === undefined) {
-    // Time only: the next occurrence of that clock time at or after the scrape.
-    const sameDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
-    const resolved =
-      sameDay.getTime() >= nowFlooredMs
-        ? sameDay
-        : new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, hour, minute, 0, 0);
-    return resolved.toISOString();
-  }
-
-  const month = MONTH_ABBREVIATIONS.indexOf(monthRaw.slice(0, 3).toLowerCase());
-  if (month < 0) return undefined;
-  const day = Number(dayRaw);
-  const build = (year: number): Date | undefined => {
-    const candidate = new Date(year, month, day, hour, minute, 0, 0);
-    // Reject a date the calendar rolled over (e.g. "31 Feb") rather than
-    // reporting the instant it silently became.
-    return candidate.getMonth() === month && candidate.getDate() === day ? candidate : undefined;
-  };
-  if (yearRaw !== undefined) return build(Number(yearRaw))?.toISOString();
-  // No printed year: the panel means the next such date at or after the scrape.
-  const thisYear = build(now.getFullYear());
-  if (thisYear && thisYear.getTime() >= nowFlooredMs) return thisYear.toISOString();
-  return build(now.getFullYear() + 1)?.toISOString();
-}
-
 function resolveResetAtIso(
   resetAtIso: string | undefined,
   resetInIso: string | undefined,
-  resetText: string | undefined,
   generatedAtMs: number
 ): string | undefined {
-  // Verbatim printed wall-clock text ("HH:MM", "HH:MM on D Mon") resolved
-  // deterministically against the scrape instant takes precedence over model
-  // arithmetic, avoiding hallucinated years or zone offsets (#517).
-  const wallClockIso = parseWallClockResetText(resetText, generatedAtMs);
-  if (wallClockIso !== undefined) return wallClockIso;
-
   if (resetAtIso?.trim()) return resetAtIso;
 
   const durationMs = parseIsoDuration(resetInIso);
@@ -614,24 +552,30 @@ async function parseQuotaWithLlm(
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
     "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
     "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text, preserve all printed decimal precision, and never infer a value from progress-bar artwork. If the source reports USED, copy it exactly. If it reports LEFT or REMAINING, calculate usedPercent = 100 - N exactly.\n" +
-    "RESET TEXT REQUIREMENT: whenever a window prints reset text, copy it VERBATIM into `resetText` — " +
-    "no reformatting, no arithmetic, no timezone conversion — both when you also fill resetAtIso or " +
-    "resetInIso and, above all, when you leave those empty because the date, year, or timezone looks " +
-    "ambiguous. Code resolves the printed text against the current local time given below, so a " +
-    "faithful copy of an ambiguous-looking reset is always better than a guess and never worse than " +
-    "an omission.\n" +
     providerClause +
     configuredModelClause +
-    "The current local time — in the SAME timezone the TUI's clock is printed in (its " +
-    `offset is included below) — is ${formatLocalIsoWithOffset(generatedAtMs)}. ` +
-    "Use it to resolve wall-clock/calendar reset text (e.g. '23:32' means the next " +
-    "occurrence of that time at or after now; '12:34 on 14 Jul' or 'resets 02:10 on 27 Aug' or '15:11 on 1 Sep' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
-    "such date at or after now) into resetAtIso, assuming the same UTC offset unless " +
-    "the source states otherwise. If the timezone, date, or year is genuinely ambiguous, " +
-    "leave resetAtIso empty rather than guess — a wrong instant is worse than a missing one. " +
+    describeLocalNow(generatedAtMs) +
+    "Use those components to assemble resetAtIso from wall-clock/calendar reset text. This is " +
+    "copying numbers into an ISO-8601 instant, not date arithmetic: a bare clock time such as " +
+    "'23:32' or 'resets 16:20' is that time today if it is still ahead of the current local time, " +
+    "otherwise that time tomorrow; a day-and-month such as '12:34 on 14 Jul', 'resets 02:10 on " +
+    "27 Aug' or '15:11 on 1 Sep' is that day and month at that time in the CURRENT YEAR given " +
+    "above, or in the next year only if that date has already passed this year; a full date such " +
+    "as 'Jul 7th, 2026 12:25 PM' carries its own year. Always write the UTC offset given above " +
+    "unless the source states another zone. A printed reset that omits the year or the timezone " +
+    "is NOT ambiguous — the year and the offset come from the current local date and time above — " +
+    "so fill resetAtIso for it rather than leaving it empty. Leave resetAtIso empty only when the " +
+    "text cannot be read as a clock time or calendar date at all. " +
     "For pure relative reset durations (e.g. '70h 13m', '3h 10m', '2 days, 22 hours', 'in 4 hours 12 minutes'), do not compute resetAtIso; instead extract the " +
     "duration into resetInIso as a normalized ISO-8601 duration such as PT70H13M, " +
-    "PT3H10M, PT4H12M, or P2DT22H.";
+    "PT3H10M, PT4H12M, or P2DT22H.\n" +
+    "RESET CONTRACT: every non-placeholder window that is below 100% left MUST carry exactly " +
+    "one of resetAtIso (a valid ISO-8601 instant with UTC offset) or resetInIso (a valid " +
+    "ISO-8601 duration). Never emit both for one window, and never emit prose, a bare clock " +
+    "time, or a partial date in either field. A window below 100% left with neither field, or " +
+    "with a value that is not valid ISO-8601, fails validation and the whole parse is retried on " +
+    "a stronger model, so always fill the field rather than declining because the year or " +
+    "timezone was not printed.";
 
   const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
@@ -709,7 +653,16 @@ async function parseQuotaWithLlm(
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
       const percentLeft = 100 - usedPercent;
-      const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, w.resetText, generatedAtMs);
+      // A duration the model did emit but that is not ISO-8601 is a bad read,
+      // not a missing one: fail here so the stronger-model retry sees it,
+      // rather than letting it degrade into "no reset" and, for a 100%-left
+      // window, into an assumed reset downstream.
+      if (w.resetInIso?.trim() && parseIsoDuration(w.resetInIso) === undefined) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid reset duration '${w.resetInIso}'`
+        );
+      }
+      const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
       if (resetAtIso && !Number.isFinite(Date.parse(resetAtIso))) {
         throw new Error(
@@ -797,17 +750,17 @@ async function parseQuotaWithLlm(
     return await executeOnce("gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
-      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.8-flash`
     );
     try {
-      const result = await executeOnce("gemini-3.5-flash");
+      const result = await executeOnce("gemini-3.8-flash");
       console.info(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded`
       );
       return result;
     } catch (secondErr) {
       console.error(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
       );
       return {
         status: "unknown",
