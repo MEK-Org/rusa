@@ -44,7 +44,6 @@ describe("DiskUsageAlert", () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: "system.disk",
-      priority: "responsive",
       freePercent: 5,
       thresholdPercent: 10,
       volume: "/",

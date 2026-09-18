@@ -490,19 +490,11 @@ interface CanonicalEventOptions {
  * suppression, durable append and recipient ordering exactly as production
  * reaches them, without re-deriving GitHub wire shapes here.
  *
- * `priority` is stated rather than left out: an unstated raw priority means
- * "responsive" to the timer normalizer, and these tests want ordinary work
- * unless they say otherwise. A `"normal"` raw priority leaves the prepared
- * payload untouched and wakes identically to an unset one
- * (`isResponsiveNudge` reads only `"responsive"`). Making the field required
- * would put that reasoning in front of whoever adds the next characterization
- * instead of in this paragraph, at the cost of `priority: "normal"` on ~60
- * call sites that do not care; the default is the trade, and this docblock is
- * the part that has to carry it.
- *
- * That the normalizer's default lands in the persisted payload while the wake
- * reads the raw priority is a real divergence, latent because the only
- * production timer caller states its priority — #477.
+ * `priority` passes through as given. An unstated raw priority is ordinary
+ * work on both sides of the ingress — the persisted row and the wake read the
+ * same explicit `"responsive"` and nothing else (#477) — so a characterization
+ * that wants responsive scheduling says so, and every other one leaves the
+ * field out exactly as a production caller would.
  */
 const deliverCanonicalEvent = (
   mesh: ActorMesh,
@@ -514,7 +506,7 @@ const deliverCanonicalEvent = (
     sourceType: "timer",
     rawResource: resource,
     rawPayload: opts.payload,
-    priority: opts.priority ?? "normal",
+    priority: opts.priority,
     idempotencyKey: opts.dedupeKey,
     receivedAt: opts.deliveredAt,
     directedTarget: opts.directedTarget,
@@ -6285,12 +6277,12 @@ describe("ActorMesh", () => {
       mesh.subscribeEventSource(haltedResource, halted, "root");
       mesh.subscribeEventSource(availableResource, available, "root");
 
+      // Responsive is stated on the raw event, the one field the row and the
+      // wake both read (#477); a `priority` inside the payload alone no longer
+      // reaches the persisted row.
       await deliverCanonicalEvent(mesh, haltedResource, "halted comment", {
-        payload: {
-          type: "issue_comment.created",
-          commentId: 1288,
-          priority: "responsive",
-        },
+        payload: { type: "issue_comment.created", commentId: 1288 },
+        priority: "responsive",
       });
       await deliverCanonicalEvent(mesh, availableResource, "available comment", {
         payload: { type: "issue_comment.created", commentId: 1291 },
@@ -7068,6 +7060,45 @@ describe("ActorMesh", () => {
 
         expect(t.runs.get(watcher)).toBe(1);
         expect(t.preemptions()).toEqual([owner]);
+      });
+
+      it("treats an unstated timer priority as normal on the row and in the wake alike", async () => {
+        // The persisted copy and the nudge that carries it must agree about
+        // the same event. An unstated priority once persisted as responsive
+        // while waking as normal (#477); now neither side is responsive.
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        const { priority: _unstated, ...unstatedIssueEvent } = responsiveIssueEvent;
+        const delivery = await t.mesh.deliverExternalEvent(unstatedIssueEvent);
+
+        // Persisted as ordinary work for every recipient.
+        expect(delivery.entries).toHaveLength(2);
+        for (const entry of delivery.entries) {
+          expect(entry.payload.priority).toBeUndefined();
+        }
+        expect(t.unhandledResponsive(owner)).toHaveLength(0);
+        expect(t.unhandledResponsive(watcher)).toHaveLength(0);
+
+        // Woken as ordinary work: the owner's active run is not replaced.
+        expect(t.signals.get(owner)?.aborted).toBe(false);
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([]);
+
+        // The follow-up run each recipient earns is admitted as normal work,
+        // as the durable row says it should be.
+        t.resolvers.get(owner)?.({ success: true, exitCode: 0, output: "finished normally" });
+        t.resolvers.get(watcher)?.({ success: true, exitCode: 0, output: "finished normally" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.runs.get(owner)).toBe(2);
+        expect(t.runs.get(watcher)).toBe(2);
+        expect(t.admissions.get(owner)).toEqual([false, false]);
+        expect(t.admissions.get(watcher)).toEqual([false, false]);
       });
     });
 
