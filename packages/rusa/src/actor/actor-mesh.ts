@@ -1783,7 +1783,7 @@ export class ActorMesh {
    * is a silent no-op.
    */
   reconcileResponsiveReadyAttention(obligations: {
-    listResponsiveReadyAttention?(): Iterable<{
+    listResponsiveReadyAttention(): Iterable<{
       id: string;
       ownerId: string;
       intent: string | null;
@@ -1792,7 +1792,6 @@ export class ActorMesh {
   }): void {
     if (!this.inboxStore) return;
     try {
-      if (typeof obligations.listResponsiveReadyAttention !== "function") return;
       for (const obligation of obligations.listResponsiveReadyAttention()) {
         if (obligation.ownerId.startsWith("human:") || obligation.ownerId.startsWith("system:")) {
           continue;
@@ -1800,10 +1799,7 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(obligation.ownerId);
         const record = this.actors.get(actorId);
         if (!record || record.status !== "active") continue;
-        this.deliverResponsiveReadyAttention(
-          obligation.ownerId,
-          obligation as { id: string; intent: string | null; readyCount?: number }
-        );
+        this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
       }
     } catch (err) {
       this.log(
