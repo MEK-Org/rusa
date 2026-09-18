@@ -5,34 +5,57 @@ import 'package:rusa_dashboard/widgets/header.dart';
 import 'fakes.dart';
 
 void main() {
-  for (final width in [390.0, 1100.0]) {
-    testWidgets(
-      'profile stays upper-right at width $width and is hidden without auth',
-      (tester) async {
-        await tester.binding.setSurfaceSize(Size(width, 800));
-        addTearDown(() => tester.binding.setSurfaceSize(null));
-        final store = DashboardStore(api: FakeApi(), stream: FakeStream());
-        addTearDown(store.dispose);
-        Widget header(VoidCallback? onLogout) => MaterialApp(
+  testWidgets(
+    'profile stays upper-right on desktop (width 1100) and is hidden without auth',
+    (tester) async {
+      const width = 1100.0;
+      await tester.binding.setSurfaceSize(const Size(width, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final store = DashboardStore(api: FakeApi(), stream: FakeStream());
+      addTearDown(store.dispose);
+      Widget header(VoidCallback? onLogout) => MaterialApp(
+        home: Scaffold(
+          body: MeshHeader(
+            store: store,
+            onLogout: onLogout,
+          ),
+        ),
+      );
+      await tester.pumpWidget(header(() {}));
+      await tester.pump();
+      final center = tester.getCenter(find.byType(ProfileMenu));
+      expect(center.dx, greaterThan(width - 70));
+      expect(center.dy, lessThan(56));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(header(null));
+      expect(find.byType(ProfileMenu), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'mobile header omits ProfileMenu when drawerNav is active (#516)',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(390, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final store = DashboardStore(api: FakeApi(), stream: FakeStream());
+      addTearDown(store.dispose);
+      await tester.pumpWidget(
+        MaterialApp(
           home: Scaffold(
             body: MeshHeader(
               store: store,
-              onLogout: onLogout,
-              onMenuTap: width < 520 ? () {} : null,
+              onLogout: () {},
+              onMenuTap: () {},
             ),
           ),
-        );
-        await tester.pumpWidget(header(() {}));
-        await tester.pump();
-        final center = tester.getCenter(find.byType(ProfileMenu));
-        expect(center.dx, greaterThan(width - 70));
-        expect(center.dy, lessThan(56));
-        expect(tester.takeException(), isNull);
-        await tester.pumpWidget(header(null));
-        expect(find.byType(ProfileMenu), findsNothing);
-      },
-    );
-  }
+        ),
+      );
+      await tester.pump();
+      // On mobile with drawer navigation, ProfileMenu is omitted from the header
+      // (it is relocated to the drawer Account row to avoid header duplication).
+      expect(find.byType(ProfileMenu), findsNothing);
+    },
+  );
   testWidgets(
     'profile opens a dismissible menu and only logs out on selection',
     (tester) async {
