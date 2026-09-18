@@ -41,7 +41,13 @@ import type {
 } from "./actor-mesh.js";
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
+import {
+  ADMINISTRATIVE_CAPABILITIES,
+  CAPABILITY_ADMIN_CAPABILITY,
+  seedConfiguredActorGrants,
+} from "./administrative-capabilities.js";
 import type { AtIo } from "./at-queue.js";
+import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
@@ -232,6 +238,13 @@ function setup(
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
+    /**
+     * Seed the configured actor with the bootstrap administrative grants the
+     * way `start.ts` does at boot (#549). Defaults on so these suites keep
+     * exercising the configured actor's preserved access; false models a
+     * parentless actor that holds no grants.
+     */
+    seedRootGrants?: boolean;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     onModelSet?: ActorMeshOptions["onModelSet"];
@@ -279,10 +292,12 @@ function setup(
     resolver: eventSourceResolver,
     log: (m) => logs.push(m),
   });
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
   mesh = new ActorMesh({
     supportedVoices: opts.supportedVoices,
     actors: registry,
     rootId: opts.rootId ?? "root",
+    capabilityGrants,
     handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
@@ -306,7 +321,10 @@ function setup(
     scheduledMessages,
     withTransaction: opts.withTransaction,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
-    grantableCapabilities: opts.grantableCapabilities,
+    grantableCapabilities: new Set([
+      ...(opts.grantableCapabilities ?? []),
+      ...ADMINISTRATIVE_CAPABILITIES,
+    ]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: opts.idgen ?? (() => `t${++seq}`),
     onYield: opts.onYield,
@@ -416,6 +434,9 @@ function setup(
     },
     root
   );
+  if (opts.seedRootGrants !== false) {
+    seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
+  }
 
   const rawSpawn = mesh.spawn.bind(mesh);
   const testMesh = mesh as unknown as ActorMesh & {
@@ -439,7 +460,20 @@ function setup(
     tick,
     fake,
     scheduledMessages,
+    capabilityGrants,
   };
+}
+
+/** A grant store in which only `actorId` holds `capability-admin` (#549). */
+function capabilityAdminFor(actorId: string): InMemoryCapabilityGrantStore {
+  const store = new InMemoryCapabilityGrantStore();
+  store.grant({
+    actorId,
+    capability: CAPABILITY_ADMIN_CAPABILITY,
+    grantedBy: "test",
+    grantedAt: "2026-01-01T00:00:00Z",
+  });
+  return store;
 }
 
 class FakeScheduledMessageScheduler implements ScheduledMessageScheduler {
@@ -3141,6 +3175,7 @@ describe("ActorMesh", () => {
     });
     const mesh = new ActorMesh({
       actors: registry,
+      capabilityGrants: capabilityAdminFor("root"),
       createActor: () => ({}) as unknown as Actor,
       onCapabilityRevoked: (actorId, capability) => {
         revoked.push([actorId, capability]);
@@ -3173,6 +3208,7 @@ describe("ActorMesh", () => {
     let mesh!: ActorMesh;
     mesh = new ActorMesh({
       actors: registry,
+      capabilityGrants: capabilityAdminFor("root"),
       createActor: () => ({}) as unknown as Actor,
       grantableCapabilities: new Set(["understanding-write"]),
       onCapabilityGranted: (actorId, capability) => {
@@ -3464,7 +3500,7 @@ describe("ActorMesh", () => {
         "secret:",
       ]) {
         expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
-          /only the root may grant|bare secret grant/
+          /only a capability-admin holder may grant|bare secret grant/
         );
       }
       expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
@@ -3472,15 +3508,15 @@ describe("ActorMesh", () => {
       // The refusal is the same whether or not the guessed file exists: a
       // non-root grantor gets no existence oracle over the secrets directory.
       expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
-        /only the root may grant secret:webhook-secret/
+        /only a capability-admin holder may grant secret:webhook-secret/
       );
       expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
-        /only the root may grant secret:no-such-file/
+        /only a capability-admin holder may grant secret:no-such-file/
       );
       // Nor may the parent strip such a grant that root made.
       mesh.grantCapability(child, "secret:webhook-secret", "root");
       await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
-        /only the root may revoke/
+        /only a capability-admin holder may revoke/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
 
@@ -3567,11 +3603,11 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent });
 
     expect(() => mesh.grantCapability(child, "understanding-write", parent)).toThrow(
-      /only the root may grant/
+      /only a capability-admin holder may grant/
     );
     expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
     await expect(mesh.revokeCapability(child, "understanding-write", parent)).rejects.toThrow(
-      /only the root may revoke/
+      /only a capability-admin holder may revoke/
     );
   });
 
@@ -3587,7 +3623,7 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ghost")).toThrow(
-      /only the root may grant/
+      /only a capability-admin holder may grant/
     );
   });
 
@@ -3626,20 +3662,20 @@ describe("ActorMesh", () => {
 
     // ab-rig-holder (parentId: null, isRoot: false) is refused grant & revoke authority
     expect(() => mesh.grantCapability("iu-thread", "understanding-write", "ab-rig-holder")).toThrow(
-      /only the root may grant/
+      /only a capability-admin holder may grant/
     );
     await expect(
       mesh.revokeCapability("iu-thread", "understanding-write", "ab-rig-holder")
-    ).rejects.toThrow(/only the root may revoke/);
+    ).rejects.toThrow(/only a capability-admin holder may revoke/);
 
     // Legacy parentless record without explicit isRoot (defaults falsy) is also refused
     expect(() =>
       mesh.grantCapability("iu-thread", "understanding-write", "legacy-parentless")
-    ).toThrow(/only the root may grant/);
+    ).toThrow(/only a capability-admin holder may grant/);
   });
 
-  it("scopes a root's capability authority to its own subtree ", () => {
-    const { mesh, registry } = setup({
+  it("scopes a capability-admin holder's authority to its own subtree; a second parentless root holds none until granted (#549)", () => {
+    const { mesh, registry, capabilityGrants } = setup({
       grantableCapabilities: new Set(["understanding-write"]),
     });
     registry.upsert({
@@ -3661,6 +3697,17 @@ describe("ActorMesh", () => {
     expect(() => mesh.grantCapability("account-b-child", "understanding-write", "root")).toThrow(
       /own subtree/
     );
+    // Being parentless/isRoot confers nothing: the other tree's root is refused
+    // until it holds capability-admin itself (a row, not a topology inference).
+    expect(() =>
+      mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
+    ).toThrow(/only a capability-admin holder may grant/);
+    capabilityGrants.grant({
+      actorId: "account-b-root",
+      capability: CAPABILITY_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
     expect(() =>
       mesh.grantCapability("account-b-child", "understanding-write", "account-b-root")
     ).not.toThrow();

@@ -21,6 +21,11 @@ import {
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
+import {
+  ADMINISTRATIVE_CAPABILITIES,
+  bootstrapCapabilitiesFor,
+  seedConfiguredActorGrants,
+} from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
@@ -156,11 +161,7 @@ import { McpHttpServer } from "../mcp/http-server.js";
 import { createInboxMcpServer, INBOX_MCP_NAME } from "../mcp/inbox-mcp.js";
 import { createMeshChatMcpServer, MESH_CHAT_MCP_NAME } from "../mcp/mesh-chat-mcp.js";
 import { createObligationsMcpServer, OBLIGATIONS_MCP_NAME } from "../mcp/obligations-mcp.js";
-import {
-  createPnpmHardlinksMcpServer,
-  PNPM_HARDLINKS_MCP_NAME,
-  type PnpmHardlinksToolDeps,
-} from "../mcp/pnpm-hardlinks-mcp.js";
+import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
 import { createPnpmInstallMcpServer, PNPM_INSTALL_MCP_NAME } from "../mcp/pnpm-install-mcp.js";
 import { createQuotaMcpServer, createQuotaService, QUOTA_MCP_NAME } from "../mcp/quota-mcp.js";
 import { createRepoMcpServer, REPO_MCP_NAME } from "../mcp/repo-mcp.js";
@@ -175,7 +176,7 @@ import {
   createUnderstandingSyncClientProvider,
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
-import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
+import type { UpdateToolDeps } from "../mcp/update-mcp.js";
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
@@ -1700,6 +1701,86 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // The one live attribution source: populated only for an actual provider
   // attempt (including fallbacks), and cleared by every terminal run hook.
   const activeRunSelections = new Map<string, RawProviderModelConfig>();
+  // ── Host-maintenance tools (#549) ── `update` and `pnpm-hardlinks` used to be
+  // mounted on the configured root's tool set by id. They are now ordinary
+  // grantable capabilities (named after their servers) registered through
+  // `buildGrantableServers`, so a grant row — seeded for the configured actor
+  // at boot, grantable/revocable like any other — is what puts them on an
+  // endpoint; the handlers re-check the grant live. The `update` tool is
+  // best-effort: if the deploy checkout can't be resolved, the mesh still boots
+  // without it. Its drainer self-excludes the CALLER's run (whoever holds the
+  // grant), not a fixed root id.
+  let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
+  try {
+    const repoRoot = resolveRepoRoot();
+    const packageDir = join(repoRoot, "packages", "rusa");
+    const errorChatSpace = config.chat?.errorChat;
+    const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
+    if (!errorChatSpace) {
+      console.warn("[update] no errorChat configured — lifecycle pings disabled");
+    } else if (!chatClient) {
+      console.warn("[update] chat client unavailable — lifecycle pings disabled");
+    }
+    const updateChatClient = chatClient;
+    updateToolDepsFor = (selfId) => ({
+      plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
+      hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
+      deps: {
+        git: new GitRunner(repoRoot),
+        build: new BuildRunner(
+          packageDir,
+          { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
+          (m) => console.log(m)
+        ),
+        drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        notify:
+          updateChatClient && errorChatSpace
+            ? {
+                notify: (text) => updateChatClient.send(errorChatSpace, text).then(() => {}),
+              }
+            : undefined,
+        // Chat-independent durable marker for the worst states (e.g. a failed
+        // rollback) — same file the boot-flap alert appends to.
+        alertMarker: (text: string) => {
+          try {
+            mkdirSync(join(mcHome, "alerts"), { recursive: true });
+            appendFileSync(
+              join(mcHome, "alerts", "last-failure.txt"),
+              `[${new Date().toISOString()}] ${text}\n`,
+              "utf8"
+            );
+          } catch {
+            /* best-effort marker */
+          }
+        },
+        recordAction: (text: string) => {
+          mkdirSync(join(mcHome, "audit"), { recursive: true });
+          appendFileSync(
+            join(mcHome, "audit", "update.log"),
+            `[${new Date().toISOString()}] ${text}\n`,
+            "utf8"
+          );
+        },
+        // A successful self-update is a mesh shutdown even though it exits from
+        // inside the update tool instead of the SIGTERM shutdown path.
+        exit: (code) => {
+          e2eInstance.stopForMeshShutdown();
+          process.exit(code);
+        },
+        log: (m) => console.log(m),
+      },
+    });
+  } catch (err) {
+    console.warn(
+      `[update] self-update tool not mounted: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const pnpmHardlinksDeps: PnpmHardlinksToolDeps = {
+    hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
+    workersDir,
+    actors,
+    runningThreadIds: () => mesh.activeRunThreadIds(),
+  };
   const grantableServers = buildGrantableServers({
     // The nightly-report producer  writes the run-journal / rendered reports /
     // index.json instance-side under <mcHome>/iu-distiller/reports/ — colocated with the
@@ -1773,6 +1854,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     actorRootFor: (actorId) =>
       actorId === rootId ? join(mcHome, "root-agent") : join(workersDir, actorId),
     driveClients,
+    hostMaintenance: { updateToolDepsFor, pnpmHardlinks: pnpmHardlinksDeps },
     onDriveRead: (actorId, observation) =>
       meshEvents({
         kind: "drive_read",
@@ -2102,7 +2184,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // set. Secrets deliberately have NO server factory: the
     // `grantableServers.get(cap)` loop in createActor skips them safely, and the
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
-    grantableCapabilities: new Set([...grantableServers.keys(), SECRET_CAPABILITY_BASE]),
+    // #549: the administrative capabilities gate the management tools on the
+    // agent-exec endpoint itself, so they have no server factory either; the
+    // mesh and the endpoint both consult the grant rows directly. The
+    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`)
+    // are stripped by the mesh: it never grants one, and only the seed below
+    // creates their rows.
+    grantableCapabilities: new Set([
+      ...grantableServers.keys(),
+      SECRET_CAPABILITY_BASE,
+      ...ADMINISTRATIVE_CAPABILITIES,
+    ]),
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
@@ -2295,12 +2387,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       try {
         const isFenced = () => mesh.isYielded(id);
         // A per-actor agent-execution endpoint, with this actor's identity baked in.
+        // The management deps are wired on every endpoint; the endpoint mounts
+        // the corresponding tools only for an actor holding the administrative
+        // capability (#549), so an ungranted worker sees none of them.
         const meshUrl = mcpHttp.addServer(id, () =>
-          createAgentExecMcpServer(mesh, id, rootId, undefined, {
+          createAgentExecMcpServer(mesh, id, rootId, osScheduler, {
             onWrite: () => {
               mesh.markUnkillable(id);
             },
             isFenced,
+            modelClasses,
+            validateModelClass: (input) =>
+              validateModelConfigPool(config, input, { portable: true }),
             getFollowers: () => (followerHub ? followerHub.list() : []),
           })
         );
@@ -2983,95 +3081,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
   refreshLiveActorMcp(rootId);
 
-  // ── Self-update tool — ROOT-ONLY . The agent asks `update` to redeploy:
-  // pull + build IN PLACE (mesh stays live), and only on a green build engage the
-  // in-memory gracefulShutdown brake (a direct call — no HTTP), drain the OTHER
-  // actors (self-excluding), and exit(0) so systemd restarts onto the fresh code.
-  // Mounted ONLY on root's set here, never the worker set (like chat); the handler
-  // also asserts selfId===rootId. Best-effort: if the deploy checkout can't be
-  // resolved, the mesh still boots without the tool.
-  try {
-    const repoRoot = resolveRepoRoot();
-    const packageDir = join(repoRoot, "packages", "rusa");
-    const errorChatSpace = config.chat?.errorChat;
-    const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
-    if (!errorChatSpace) {
-      console.warn("[update] no errorChat configured — lifecycle pings disabled");
-    } else if (!chatClient) {
-      console.warn("[update] chat client unavailable — lifecycle pings disabled");
-    }
-    const updateToolDeps: UpdateToolDeps = {
-      plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
-      rootId: rootId,
-      deps: {
-        git: new GitRunner(repoRoot),
-        build: new BuildRunner(
-          packageDir,
-          { installMs: UPDATE_INSTALL_TIMEOUT_MS, buildMs: UPDATE_BUILD_TIMEOUT_MS },
-          (m) => console.log(m)
-        ),
-        drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), rootId),
-        notify:
-          chatClient && errorChatSpace
-            ? { notify: (text) => chatClient.send(errorChatSpace, text).then(() => {}) }
-            : undefined,
-        // Chat-independent durable marker for the worst states (e.g. a failed
-        // rollback) — same file the boot-flap alert appends to.
-        alertMarker: (text: string) => {
-          try {
-            mkdirSync(join(mcHome, "alerts"), { recursive: true });
-            appendFileSync(
-              join(mcHome, "alerts", "last-failure.txt"),
-              `[${new Date().toISOString()}] ${text}\n`,
-              "utf8"
-            );
-          } catch {
-            /* best-effort marker */
-          }
-        },
-        recordAction: (text: string) => {
-          mkdirSync(join(mcHome, "audit"), { recursive: true });
-          appendFileSync(
-            join(mcHome, "audit", "update.log"),
-            `[${new Date().toISOString()}] ${text}\n`,
-            "utf8"
-          );
-        },
-        // A successful self-update is a mesh shutdown even though it exits from
-        // inside the update tool instead of the SIGTERM shutdown path.
-        exit: (code) => {
-          e2eInstance.stopForMeshShutdown();
-          process.exit(code);
-        },
-        log: (m) => console.log(m),
-      },
-    };
-    const updateUrl = mcpHttp.addServer(
-      UPDATE_MCP_NAME,
-      () => createUpdateMcpServer(updateToolDeps, rootId),
-      // A host service, not an actor mount: this name is safe to log.
-      { logLabel: UPDATE_MCP_NAME }
-    );
-    rootMcp.push({ name: UPDATE_MCP_NAME, url: updateUrl });
-  } catch (err) {
-    console.warn(
-      `[update] self-update tool not mounted: ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
-
-  const pnpmHardlinksDeps: PnpmHardlinksToolDeps = {
-    rootId: rootId,
-    workersDir,
-    actors,
-    runningThreadIds: () => mesh.activeRunThreadIds(),
-  };
-  const pnpmHardlinksUrl = mcpHttp.addServer(
-    PNPM_HARDLINKS_MCP_NAME,
-    () => createPnpmHardlinksMcpServer(pnpmHardlinksDeps, rootId),
-    { logLabel: PNPM_HARDLINKS_MCP_NAME }
-  );
-  rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
-
   const externalRoot =
     opts?.e2e?.rootDriver === "external"
       ? new ExternalRootDriver(rootId, undefined, (state) =>
@@ -3332,6 +3341,25 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     createdAt: actors.get(rootId)?.createdAt ?? new Date().toISOString(),
   };
   mesh.adopt(rootRecord, root);
+  // ── Compatibility seeding (#549) ── The configured actor's former implicit
+  // authority becomes explicit grant rows, seeded ONCE per (actor, capability):
+  // a pair with any existing row — active or revoked — is left alone, so a
+  // revocation survives restarts and topology never re-derives authority. This
+  // is the single remaining place the configured id feeds authority, and it
+  // runs after adoption because grants are keyed on the actor row. Only the
+  // host-maintenance servers this boot actually built are seeded (a host
+  // without a resolvable deploy checkout has no `update` server); a later boot
+  // that can mount one seeds that pair then.
+  const seededGrants = seedConfiguredActorGrants(
+    capabilityGrants,
+    rootId,
+    undefined,
+    bootstrapCapabilitiesFor(new Set(grantableServers.keys()))
+  );
+  if (seededGrants.length > 0) {
+    log.info("bootstrap_capabilities_seeded", { actorId: rootId, capabilities: seededGrants });
+    refreshLiveActorMcp(rootId);
+  }
   if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
   const scheduleHaltExpiry = (until?: string) => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);

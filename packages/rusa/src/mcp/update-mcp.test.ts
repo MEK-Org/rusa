@@ -6,7 +6,7 @@ import type {
   UpdateDeps,
   UpdatePlan,
 } from "../update/orchestrator.js";
-import { runUpdateTool, type UpdateToolDeps } from "./update-mcp.js";
+import { runUpdateTool, UPDATE_MCP_NAME, type UpdateToolDeps } from "./update-mcp.js";
 
 /** Records every side effect so we can assert a rejected caller touches nothing. */
 function trackingDeps() {
@@ -56,15 +56,21 @@ function trackingDeps() {
 
 const plan: UpdatePlan = { branch: "master", drainTimeoutMs: 1000 };
 
-describe("runUpdateTool — root-only guard (elder fix #3)", () => {
+/** Only the actor named `granted` holds the `update` capability. */
+const holderOnly =
+  (granted: string) =>
+  (actorId: string, capability: string): boolean =>
+    actorId === granted && capability === UPDATE_MCP_NAME;
+
+describe("runUpdateTool — capability guard (#549)", () => {
   it("REFUSES a worker caller and performs ZERO side effects", async () => {
     const { deps, touched } = trackingDeps();
-    const toolDeps: UpdateToolDeps = { plan, deps, rootId: "root" };
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: holderOnly("root") };
 
     const outcome = await runUpdateTool(toolDeps, "worker-7");
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toMatch(/root-only/);
+    expect(outcome.message).toMatch(/requires the 'update' capability/);
     // The security-critical assertion: nothing happened — no pull, build, drain, exit.
     expect(touched).toEqual({
       fetched: false,
@@ -76,11 +82,15 @@ describe("runUpdateTool — root-only guard (elder fix #3)", () => {
     expect(outcome.result).toBeUndefined();
   });
 
-  it("RUNS for root (reaches the orchestrator → builds + restarts)", async () => {
+  it("RUNS for a granted opaque-id actor (reaches the orchestrator → builds + restarts)", async () => {
     const { deps, touched } = trackingDeps();
-    const toolDeps: UpdateToolDeps = { plan, deps, rootId: "root" };
+    const toolDeps: UpdateToolDeps = {
+      plan,
+      deps,
+      hasCapability: holderOnly("0b2c3d4e-steward"),
+    };
 
-    const outcome = await runUpdateTool(toolDeps, "root");
+    const outcome = await runUpdateTool(toolDeps, "0b2c3d4e-steward");
 
     expect(outcome.ok).toBe(true);
     expect(touched.built).toBe(true);
@@ -88,14 +98,26 @@ describe("runUpdateTool — root-only guard (elder fix #3)", () => {
     expect(outcome.result?.restarting).toBe(true);
   });
 
-  it("surfaces a build failure to root (not ok) without restarting", async () => {
+  it("REFUSES a parentless caller that holds no grant (topology is not authority)", async () => {
+    const { deps, touched } = trackingDeps();
+    const toolDeps: UpdateToolDeps = { plan, deps, hasCapability: () => false };
+
+    const outcome = await runUpdateTool(toolDeps, "root");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/requires the 'update' capability/);
+    expect(touched.built).toBe(false);
+    expect(touched.exited).toBe(false);
+  });
+
+  it("surfaces a build failure to the caller (not ok) without restarting", async () => {
     const { deps, touched } = trackingDeps();
     deps.build = {
       async build() {
         throw new Error("build broke");
       },
     };
-    const outcome = await runUpdateTool({ plan, deps, rootId: "root" }, "root");
+    const outcome = await runUpdateTool({ plan, deps, hasCapability: holderOnly("root") }, "root");
     expect(outcome.ok).toBe(false);
     expect(outcome.message).toContain("update failed");
     expect(touched.exited).toBe(false); // never restart onto a broken build

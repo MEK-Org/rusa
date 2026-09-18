@@ -16,7 +16,11 @@ import { createMcpServer } from "./strict-server.js";
 export const PNPM_HARDLINKS_MCP_NAME = "pnpm-hardlinks";
 
 export interface PnpmHardlinksToolDeps {
-  rootId: string;
+  /**
+   * Whether `actorId` currently holds `capability` as an active grant; the tool
+   * runs only for a holder of {@link PNPM_HARDLINKS_MCP_NAME}.
+   */
+  hasCapability: (actorId: string, capability: string) => boolean;
   workersDir: string;
   actors: ActorRepository;
   runningThreadIds: () => Iterable<string>;
@@ -137,7 +141,7 @@ export function createPnpmHardlinksMcpServer(
     {
       title: "Relink idle worker pnpm package files",
       description:
-        "Root-only maintenance: host-side relink of idle worker node_modules package files to the shared pnpm store. Skips workers with active runs; defaults to dry-run.",
+        "Host maintenance (requires the 'pnpm-hardlinks' capability): host-side relink of idle worker node_modules package files to the shared pnpm store. Skips workers with active runs; defaults to dry-run.",
       inputSchema: {
         dry_run: z
           .boolean()
@@ -151,9 +155,9 @@ export function createPnpmHardlinksMcpServer(
     },
     async ({ dry_run, include_orphans }) => {
       try {
-        if (selfId !== deps.rootId) {
+        if (!deps.hasCapability(selfId, PNPM_HARDLINKS_MCP_NAME)) {
           return toolError(
-            `'${PNPM_HARDLINKS_MCP_NAME}' is a root-only tool — refusing to run it for '${selfId}'.`
+            `'${PNPM_HARDLINKS_MCP_NAME}' requires the '${PNPM_HARDLINKS_MCP_NAME}' capability — refusing to run it for '${selfId}'.`
           );
         }
         return toolOk(

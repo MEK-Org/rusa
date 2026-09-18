@@ -40,8 +40,9 @@ export const PARENT_GRANTABLE_SECRET_FILENAMES: readonly string[] = [
  * Capabilities a NON-root parent may grant to / revoke from its DIRECT children:
  * exactly the `secret:<filename>` capabilities for
  * {@link PARENT_GRANTABLE_SECRET_FILENAMES}. Everything else — every other
- * secret file and every MCP-server capability — stays root-only. Matched by the
- * FULL capability name (never by the `secret` prefix), and enforced in the mesh
+ * secret file and every MCP-server capability — needs a `capability-admin`
+ * holder (#549). Matched by the FULL capability name (never by the `secret`
+ * prefix), and enforced in the mesh
  * (`ActorMesh.grantCapability`/`revokeCapability`), not just the tool layer, so
  * the invariant holds for any caller.
  */
@@ -58,9 +59,10 @@ export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set(
  * Grants attach to the grantee's **actor id** (its stable thread id). The IU
  * steward is a single long-running actor that root wakes, so its id is stable for
  * its lifetime — no indirection needed. If it is ever retired and re-spawned with
- * a new id, root simply re-grants (the permanent-actor model). Only the root
- * grants, and grants are drawn from an allow-list — both enforced one layer up
- * (the mesh + the root-only grant tools); this module is pure persistence.
+ * a new id, a `capability-admin` holder simply re-grants (the permanent-actor
+ * model). Grant authority is itself a grant (#549), and grants are drawn from
+ * an allow-list — both enforced one layer up (the mesh + the grant tools);
+ * this module is pure persistence.
  */
 export interface CapabilityGrant {
   /** The grantee's actor id (stable thread id). */

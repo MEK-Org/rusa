@@ -26,9 +26,9 @@
  *   force so an active enrollment reads back deterministically. The mesh
  *   events (`experiment_enrolled`/`experiment_unenrolled`) are best-effort
  *   observability, not a record anything depends on.
- * - **Administration is root-only and ungrantable.** Enforced in
- *   {@link ActorMesh}, one layer up from this module, which is pure registry
- *   plus persistence.
+ * - **Administration requires the `experiment-admin` capability** (#549),
+ *   scoped to the holder's own subtree. Enforced in {@link ActorMesh}, one
+ *   layer up from this module, which is pure registry plus persistence.
  */
 
 /** One entry in the hard-coded registry. */

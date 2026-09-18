@@ -32,10 +32,16 @@ import {
 import { createEmailSendMcpServer, EMAIL_SEND_MCP_NAME } from "./email-mcp.js";
 import { createHostJobsServer, HOST_JOBS_MCP_NAME, type HostJobsMcpDeps } from "./host-jobs-mcp.js";
 import {
+  createPnpmHardlinksMcpServer,
+  PNPM_HARDLINKS_MCP_NAME,
+  type PnpmHardlinksToolDeps,
+} from "./pnpm-hardlinks-mcp.js";
+import {
   createUnderstandingWriteServer,
   UNDERSTANDING_WRITE_MCP_NAME,
   type UnderstandingMcpDeps,
 } from "./understanding-mcp.js";
+import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "./update-mcp.js";
 
 /**
  * Factory for a grantable per-actor MCP server. The wiring calls it with the
@@ -68,6 +74,24 @@ export interface GrantableServerDeps {
   actorRootFor?: (actorId: string) => string;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
+  /**
+   * Host-maintenance servers (#549). Formerly mounted on the configured root's
+   * tool set by id; now capabilities named after their servers (`update`,
+   * `pnpm-hardlinks`), so a grant row — not topology — is what puts them on
+   * an actor's endpoint. They are host-global: the mesh never grants one (see
+   * `HOST_GLOBAL_CAPABILITIES`); only the bootstrap seed creates the row. Each
+   * is registered only when its deps are wired (the update tool is
+   * best-effort: it needs a resolvable deploy checkout).
+   */
+  hostMaintenance?: {
+    /**
+     * Builds the update tool's deps for a grantee. Takes the grantee's
+     * unspoofable `selfId` so the drainer self-excludes the caller's own run
+     * while waiting for the rest of the mesh to quiesce.
+     */
+    updateToolDepsFor?: (selfId: string) => UpdateToolDeps;
+    pnpmHardlinks?: PnpmHardlinksToolDeps;
+  };
 }
 
 /**
@@ -90,7 +114,9 @@ export interface GrantableServerDeps {
  * a per-actor grantable host-plane job runner. ISSUE_NUM adds `chat-write`, a space-scoped
  * outbound chat capability. ISSUE_NUM adds `calendar-read`, scoped to explicit
  * calendar IDs; ISSUE_NUM adds its identity-verified whole-account form. ISSUE_NUM
- * adds `email-send`, scoped to explicit recipients.
+ * adds `email-send`, scoped to explicit recipients. #549 adds the host-maintenance
+ * servers `update` and `pnpm-hardlinks` (when their deps are wired) so root's
+ * former by-id mounts become grant-derived like everything else.
  */
 export function buildGrantableServers(
   deps: GrantableServerDeps
@@ -177,6 +203,16 @@ export function buildGrantableServers(
         ...(workDir ? { workDir } : {}),
       });
     });
+  }
+  const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;
+  if (updateToolDepsFor) {
+    map.set(UPDATE_MCP_NAME, (selfId) => createUpdateMcpServer(updateToolDepsFor(selfId), selfId));
+  }
+  const pnpmHardlinks = deps.hostMaintenance?.pnpmHardlinks;
+  if (pnpmHardlinks) {
+    map.set(PNPM_HARDLINKS_MCP_NAME, (selfId) =>
+      createPnpmHardlinksMcpServer(pnpmHardlinks, selfId)
+    );
   }
   return map;
 }
