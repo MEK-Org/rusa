@@ -630,19 +630,12 @@ Future<void> confirmAndSetObligationStatus(
   String status, {
   VoidCallback? onUpdated,
 }) async {
-  final isCancelled = status == 'cancelled';
   final isDone = status == 'done';
-  final actionTitle = isDone
-      ? 'Mark Done Obligation?'
-      : isCancelled
-          ? 'Cancel Obligation?'
-          : '$status Obligation?';
-  final dismissLabel = isCancelled ? 'Dismiss' : 'Cancel';
-  final confirmLabel = isCancelled
-      ? 'Confirm cancellation'
-      : isDone
-          ? 'Mark Done'
-          : status;
+  final actionTitle = isDone ? 'Mark Done Obligation?' : 'Cancel Obligation?';
+  // "Cancel" is clear beside "Mark Done"; cancellation needs "Dismiss" to
+  // distinguish closing the dialog from confirming the destructive action.
+  final dismissLabel = isDone ? 'Cancel' : 'Dismiss';
+  final confirmLabel = isDone ? 'Mark Done' : 'Confirm cancellation';
   // The note is the only record of *why* this transition happened. For a
   // cancellation it is the only trace the intent ever existed, and for a
   // human-owned decision child it is the answer itself, so it is offered on
@@ -719,7 +712,6 @@ Future<void> confirmAndSetObligationStatus(
   );
 
   if (confirmed != true || !context.mounted) return;
-
 
   try {
     // Blank stays null all the way down: "no reason given" has one

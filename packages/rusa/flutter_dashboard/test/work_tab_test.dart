@@ -246,7 +246,11 @@ void main() {
 
         // A two-line title moves the controls to a start-aligned run. The
         // controls themselves can wrap instead of overflowing the pane.
-        expect(narrowTitleRect.height, greaterThan(50));
+        expect(
+          narrowTitleRect.height,
+          closeTo(62, 1),
+          reason: 'long title should grow to exactly two visible lines',
+        );
         expect(narrowActionsRect.top, greaterThan(narrowTitleRect.bottom));
         expect(narrowActionsRect.left, closeTo(narrowTitleRect.left, 0.1));
         expect(narrowActionsRect.right, lessThanOrEqualTo(400));
