@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify as toYaml } from "yaml";
 import { loadConfig, type RusaConfig } from "../config/index.js";
+import { filterConfiguredVoices } from "../voice/voice-catalog.js";
 
 /**
  * Harness-neutral provisioning + teardown for a self-contained e2e instance.
@@ -63,6 +64,20 @@ export function buildE2EConfig(opts: {
   chat?: RusaConfig["chat"];
 }): RusaConfig {
   const base = opts.baseConfig ?? null;
+  const e2eValidVoices = filterConfiguredVoices(base?.voice?.supportedVoices, {
+    availableProviders: ["google"],
+  });
+  const e2eSupportedVoices =
+    e2eValidVoices && e2eValidVoices.length > 0 ? structuredClone(e2eValidVoices) : undefined;
+  const e2eTranscriptionProvider: "google" | undefined =
+    base?.voice?.transcriptionProvider === "google" ? "google" : undefined;
+  const e2eVoice =
+    e2eSupportedVoices || e2eTranscriptionProvider
+      ? {
+          ...(e2eTranscriptionProvider ? { transcriptionProvider: e2eTranscriptionProvider } : {}),
+          ...(e2eSupportedVoices ? { supportedVoices: e2eSupportedVoices } : {}),
+        }
+      : undefined;
   return {
     rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
@@ -72,6 +87,7 @@ export function buildE2EConfig(opts: {
       fake: { cliCommand: "fake" },
     },
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
+    ...(e2eVoice ? { voice: e2eVoice } : {}),
     // Required by the schema; the e2e instance never starts a webhook server.
     webhook: { port: 0, secret: "" },
     dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
@@ -160,7 +176,7 @@ export function provisionE2EInstance(opts: {
     rootActor: opts.rootActor,
     chat: opts.chat,
   });
-  writeFileSync(join(home, "config.yaml"), toYaml(config), "utf8");
+  writeFileSync(join(home, "config.yaml"), toYaml(config), { encoding: "utf8", mode: 0o600 });
 
   return { root, home, remotePath, scratchPath, config, repo: E2E_REPO };
 }

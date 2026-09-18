@@ -156,6 +156,7 @@ export interface DashboardMeshRefs {
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
+  supportedVoices?: DashboardDataDeps["supportedVoices"];
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   issueClient?: DashboardDataDeps["issueClient"];
@@ -201,7 +202,7 @@ export interface DashboardServerBaseOptions {
   dashboardConfig?: Pick<DashboardConfig, "quotaProviders">;
   /**
    * Walkie-talkie mode, server half . When supplied (requires a bound
-   * mesh AND a configured geminiApiKey), the dashboard serves the voice-memo /
+   * mesh AND configured voice credentials), the dashboard serves the voice-memo /
    * voice-SSE / backlog / ack / audio routes and renders reply TTS for actors
    * with walkie presence. Absent → those routes 503 with a clear error.
    */
@@ -394,7 +395,7 @@ export function createDashboardRequestHandler(
 
       // Walkie-talkie voice routes . Must run BEFORE the general mesh
       // handler, which owns every other `/api/mesh/*` path. 503s when voice is
-      // unconfigured (no geminiApiKey) or no mesh is bound.
+      // unconfigured (no voice credentials configured) or no mesh is bound.
       if (handleVoiceApiRequest(req, res, requestUrl, voiceDeps)) return;
 
       // Live mesh Data API + SSE. Owns every `/api/mesh/*` path (503s if no mesh
@@ -610,6 +611,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           selectedObligationForActor: options.mesh.selectedObligationForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
+          supportedVoices: options.mesh.supportedVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           issueClient: options.mesh.issueClient,
@@ -617,7 +619,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
         }
       : null;
   // Walkie-talkie deps : routes need the registry/mesh/hub either way so
-  // an unconfigured instance answers 503 with the "no geminiApiKey" error
+  // an unconfigured instance answers 503 with the voice-unavailable error
   // rather than falling through to the generic mesh 404.
   const voiceDeps: VoiceApiDeps | null =
     options.mesh && sseHub

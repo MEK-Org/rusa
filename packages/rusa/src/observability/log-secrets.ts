@@ -65,6 +65,7 @@ export function collectEnvSecrets(env: NodeJS.ProcessEnv = process.env): string[
 export function collectConfigSecretEntries(config: RusaConfig): SecretSource[] {
   const entries: SecretSource[] = [];
   push(entries, "geminiApiKey", config.geminiApiKey);
+  push(entries, "elevenlabsApiKey", config.elevenlabsApiKey);
   push(entries, "mistralApiKey", config.mistralApiKey);
   push(entries, "webhook.secret", config.webhook?.secret);
   return entries;

@@ -18,6 +18,8 @@ export const GEMINI_API_KEY_SECRET_FILENAME = "gemini-api-key";
 export const MISTRAL_API_KEY_SECRET_FILENAME = "mistral-api-key";
 /** Secret file consumed into `config.webhook.secret` (wins over the inline value). */
 export const WEBHOOK_SECRET_FILENAME = "webhook-secret";
+/** Secret file consumed into `config.elevenlabsApiKey` (wins over the inline key). */
+export const ELEVENLABS_API_KEY_SECRET_FILENAME = "elevenlabs-api-key";
 /** Secret file replacing the `.env` `GLASS_GOALS_PASSWORD` (file preferred, env fallback). */
 export const GLASS_GOALS_PASSWORD_SECRET_FILENAME = "glass-goals-password";
 
