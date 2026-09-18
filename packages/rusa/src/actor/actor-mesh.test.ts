@@ -3488,7 +3488,7 @@ describe("ActorMesh", () => {
         "secret:",
       ]) {
         expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
-          /only the root may grant|bare secret grant/
+          /only a capability-admin holder may grant|bare secret grant/
         );
       }
       expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
@@ -3496,15 +3496,15 @@ describe("ActorMesh", () => {
       // The refusal is the same whether or not the guessed file exists: a
       // non-root grantor gets no existence oracle over the secrets directory.
       expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
-        /only the root may grant secret:webhook-secret/
+        /only a capability-admin holder may grant secret:webhook-secret/
       );
       expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
-        /only the root may grant secret:no-such-file/
+        /only a capability-admin holder may grant secret:no-such-file/
       );
       // Nor may the parent strip such a grant that root made.
       mesh.grantCapability(child, "secret:webhook-secret", "root");
       await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
-        /only the root may revoke/
+        /only a capability-admin holder may revoke/
       );
       expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
 

@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { ActorMesh } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
@@ -21,7 +24,15 @@ import { STRICT_OBLIGATION_HANDLING_EXPERIMENT } from "./experiments.js";
  * address without a grant may not; revocation withdraws authority immediately.
  */
 
-const GRANTABLE = new Set(["understanding-write", "secret:gemini-api-key"]);
+// The generic `secret` base is grantable (#542); the parent-grantable path
+// below needs the named key file to pass containment, so stage one.
+const GRANTABLE = new Set(["understanding-write", "secret"]);
+const secretsDir = mkdtempSync(join(tmpdir(), "rusa-actor-mesh-administration-secrets-"));
+writeFileSync(join(secretsDir, "gemini-api-key"), "synthetic-gemini-value");
+
+afterAll(() => {
+  rmSync(secretsDir, { recursive: true, force: true });
+});
 
 function record(
   id: string,
@@ -45,6 +56,7 @@ function setup() {
     actors,
     rootId: "configured",
     capabilityGrants: grants,
+    secretsDir,
     grantableCapabilities: new Set([
       ...GRANTABLE,
       ...ADMINISTRATIVE_CAPABILITIES,

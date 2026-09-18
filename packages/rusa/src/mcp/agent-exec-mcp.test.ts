@@ -194,7 +194,11 @@ function setup(
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
     capabilityGrants,
-    grantableCapabilities: new Set(["understanding-write", "secret", ...ADMINISTRATIVE_CAPABILITIES]),
+    grantableCapabilities: new Set([
+      "understanding-write",
+      "secret",
+      ...ADMINISTRATIVE_CAPABILITIES,
+    ]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
@@ -1794,7 +1798,7 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(res.isError).toBe(true);
       expect(dataOf(res)).toBe(
-        `only the root may grant ${guessed}; a non-root parent may only grant: secret:gemini-api-key, secret:mistral-api-key`
+        `only a capability-admin holder may grant ${guessed}; a parent without it may only grant: secret:gemini-api-key, secret:mistral-api-key`
       );
     }
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
