@@ -135,6 +135,18 @@ describe("assertSecretContainment", () => {
     const home = makeHome();
     const secretsDir = join(home, "nonexistent-dir");
     expect(() => assertSecretContainment("gemini-api-key", secretsDir)).toThrow(
+      /secret file does not exist: "gemini-api-key" \(secrets directory not found/
+    );
+  });
+
+  it("the traversal rule is exactly 'a plain basename': dots INSIDE a name are an ordinary filename", () => {
+    // `foo..bar` has no `..` component and no separator, so it cannot leave the
+    // directory; the check must not confuse it with traversal.
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    const secretPath = writeHostSecret("synthetic..dotted-key", "synthetic-dotted-value", home);
+    expect(assertSecretContainment("synthetic..dotted-key", secretsDir)).toBe(secretPath);
+    expect(() => assertSecretContainment("synthetic..missing-key", secretsDir)).toThrow(
       /secret file does not exist/
     );
   });

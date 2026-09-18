@@ -22,10 +22,7 @@ import {
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import {
-  PARENT_GRANTABLE_CAPABILITIES,
-  SECRET_CAPABILITY_BASE,
-} from "../actor/capability-grants.js";
+import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -214,7 +211,11 @@ import {
   type QuotaThrottleProvider,
   resolveProvider,
 } from "../providers/registry.js";
-import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
+import {
+  assertBwrapAvailable,
+  setSandboxLogger,
+  teardownFlutterOverlay,
+} from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
 import {
   applyThrottleStatusToPacer,
@@ -881,6 +882,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     secrets: readSecrets,
     context: { component: "start" },
   });
+
+  // The sandbox layer has no logger of its own (it is built per spawn by the
+  // providers); hand it this one so its host-side records — e.g. a granted
+  // secret refused at spawn — carry the same scrubbing and level.
+  setSandboxLogger(log.child({ component: "sandbox" }));
 
   // A credential too short to scrub is the one gap value redaction has; say so
   // by name while it is still cheap to lengthen, and never by value.
@@ -2058,18 +2064,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }),
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
-    // Grantable = every registered MCP-server capability PLUS the secret
-    // capabilities (#542): the generic `secret` base lets ROOT grant any
-    // contained `secret:<filename>`, while the explicit parent-grantable names
-    // are what a non-root parent may delegate. Secrets deliberately have NO
-    // server factory: the `grantableServers.get(cap)` loop in createActor skips
-    // them safely, and the sandbox honors them instead (see injectSecretsMasking
-    // in sandbox.ts).
-    grantableCapabilities: new Set([
-      ...grantableServers.keys(),
-      SECRET_CAPABILITY_BASE,
-      ...PARENT_GRANTABLE_CAPABILITIES,
-    ]),
+    // Grantable = every registered MCP-server capability PLUS the generic
+    // `secret` base (#542), under which ROOT grants any contained
+    // `secret:<filename>`; which of those a non-root parent may delegate is
+    // decided by PARENT_GRANTABLE_CAPABILITIES inside the mesh, not by this
+    // set. Secrets deliberately have NO server factory: the
+    // `grantableServers.get(cap)` loop in createActor skips them safely, and the
+    // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
+    grantableCapabilities: new Set([...grantableServers.keys(), SECRET_CAPABILITY_BASE]),
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {

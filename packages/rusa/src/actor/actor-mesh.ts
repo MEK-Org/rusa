@@ -2164,7 +2164,10 @@ export class ActorMesh {
         `bare secret grant is not allowed; must specify a secret filename (e.g. secret:gemini-api-key)`
       );
     }
-    if (!this.grantable.has(baseCapability) && !this.grantable.has(capability)) {
+    // One rule: the BASE must be grantable (`secret` for every `secret:<file>`).
+    // Per-name authority — which secret files a non-root parent may delegate —
+    // lives in assertGrantAuthority, not here.
+    if (!this.grantable.has(baseCapability)) {
       throw new Error(
         `not a grantable capability: ${capability} (grantable: ${[...this.grantable].join(", ") || "none"})`
       );

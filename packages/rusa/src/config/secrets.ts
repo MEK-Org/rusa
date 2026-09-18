@@ -1,12 +1,4 @@
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
@@ -103,28 +95,27 @@ export function assertSecretContainment(filename: string, secretsDir: string): s
   if (isAbsolute(filename) || filename.startsWith("/") || filename.startsWith("\\")) {
     throw new Error(`secret filename must not be an absolute path: "${filename}"`);
   }
-  if (
-    filename === "." ||
-    filename === ".." ||
-    filename.includes("..") ||
-    filename.includes("/") ||
-    filename.includes("\\")
-  ) {
+  // The rule is exactly "a plain basename": no `.`/`..` component and no
+  // separator, which is what makes traversal impossible. (Two dots INSIDE a
+  // name, e.g. `foo..bar`, are an ordinary filename and are allowed.)
+  if (filename === "." || filename === ".." || filename.includes("/") || filename.includes("\\")) {
     throw new Error(`path traversal is not allowed in secret filename: "${filename}"`);
   }
   if (basename(filename) !== filename) {
     throw new Error(`secret filename must be directly inside the secrets directory: "${filename}"`);
   }
 
-  if (!existsSync(secretsDir)) {
-    throw new Error(`secret file does not exist: "${filename}"`);
-  }
-
+  // One syscall decides whether the directory is there: `realpathSync` throws
+  // for a missing (or unreadable) directory, and that is reported as the
+  // secret file not existing — the caller asked about a file, not about the
+  // directory layout.
   let realSecretsDir: string;
   try {
     realSecretsDir = realpathSync(secretsDir);
   } catch {
-    throw new Error(`secrets directory does not exist: "${secretsDir}"`);
+    throw new Error(
+      `secret file does not exist: "${filename}" (secrets directory not found: "${secretsDir}")`
+    );
   }
 
   const filePath = join(realSecretsDir, filename);

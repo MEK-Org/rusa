@@ -2,9 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -15,7 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { SECRETS_DIRNAME } from "../config/secrets.js";
+import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
@@ -27,6 +25,7 @@ import {
   setupFlutterOverlay,
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
+import { PARENT_GRANTABLE_SECRET_FILENAMES } from "./capability-grants.js";
 
 export const E2E_INSTANCE_UNIT_NAME = "rusa-e2e-instance";
 const E2E_INSTANCE_PORT = 8083 as const;
@@ -452,27 +451,25 @@ export class E2EInstanceManager {
     if (hasBaseConfig) {
       ensureMountTarget(configSource, configTarget);
       args.push("--ro-bind", realpathIfExists(configSource), configTarget);
+      // Carry exactly the LLM keys the nested instance always received — the
+      // parent-grantable allow-list (#542) — never the whole secrets directory:
+      // webhook secrets and service passwords stay on the host. Each key passes
+      // the same containment check a grant does, and the bind source is the
+      // canonical path that check resolved. A key that is missing is simply not
+      // bound, as before; one that fails containment (a directory, an escaping
+      // symlink) is refused rather than bound.
       const secretsSourceDir = join(this.opts.mcHome, SECRETS_DIRNAME);
-      if (existsSync(secretsSourceDir)) {
-        const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
+      const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
+      for (const filename of PARENT_GRANTABLE_SECRET_FILENAMES) {
+        let realSecretSource: string;
         try {
-          for (const entry of readdirSync(secretsSourceDir)) {
-            const entrySource = join(secretsSourceDir, entry);
-            const entryTarget = join(secretsTargetDir, entry);
-            let st: ReturnType<typeof lstatSync>;
-            try {
-              st = lstatSync(entrySource);
-            } catch {
-              continue;
-            }
-            if (st.isFile() || (st.isSymbolicLink() && statSync(entrySource).isFile())) {
-              ensureMountTarget(entrySource, entryTarget);
-              args.push("--ro-bind", realpathIfExists(entrySource), entryTarget);
-            }
-          }
+          realSecretSource = assertSecretContainment(filename, secretsSourceDir);
         } catch {
-          // Best effort if secrets directory is unreadable
+          continue;
         }
+        const secretTarget = join(secretsTargetDir, filename);
+        ensureMountTarget(realSecretSource, secretTarget);
+        args.push("--ro-bind", realSecretSource, secretTarget);
       }
     }
 

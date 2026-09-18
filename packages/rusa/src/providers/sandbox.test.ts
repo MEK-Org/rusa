@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { Logger } from "../observability/logger.js";
 
 const execSyncMock = vi.fn();
 const execFileSyncMock = vi.fn();
@@ -1190,12 +1191,45 @@ describe("sandbox bwrap args", () => {
         return { ...home, geminiKeyPath };
       }
 
+      // A refused bind is silent INSIDE the sandbox (the file is simply absent,
+      // as after a revoke) but must be visible on the HOST: the spawn records
+      // `secret_grant_skipped_at_spawn` naming the actor and the file, so an
+      // operator can tell "granted, then the host file went bad" from "never
+      // granted". The recorder is installed on the same module instance the
+      // spawn uses (vi.resetModules gives every test a fresh one).
+      type SkipRecord = { level: string; event: string; fields?: Record<string, unknown> };
       async function spawnArgs(actorDir: string) {
         const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-        const { buildActorBwrapArgs } = await import("./sandbox.js");
-        const result = buildActorBwrapArgs(actorDir, "antigravity");
-        warnSpy.mockRestore();
-        return result;
+        const { buildActorBwrapArgs, setSandboxLogger } = await import("./sandbox.js");
+        const records: SkipRecord[] = [];
+        const record = (level: string) => (event: string, fields?: Record<string, unknown>) =>
+          void records.push({ level, event, fields });
+        const recorder: Logger = {
+          debug: record("debug"),
+          info: record("info"),
+          warn: record("warn"),
+          error: record("error"),
+          child: () => recorder,
+        };
+        setSandboxLogger(recorder);
+        try {
+          return { ...buildActorBwrapArgs(actorDir, "antigravity"), records };
+        } finally {
+          setSandboxLogger(undefined);
+          warnSpy.mockRestore();
+        }
+      }
+
+      function expectSkipRecorded(records: SkipRecord[], filename: string, reason: RegExp) {
+        const skips = records.filter((r) => r.event === "secret_grant_skipped_at_spawn");
+        expect(skips).toHaveLength(1);
+        expect(skips[0]).toMatchObject({
+          level: "warn",
+          fields: { actorId: ACTOR_ID, filename },
+        });
+        expect((skips[0].fields?.err as Error).message).toMatch(reason);
+        // The record names the file, never its content.
+        expect(JSON.stringify(records)).not.toContain("synthetic-gemini-value");
       }
 
       function expectMaskedOnly(
@@ -1223,7 +1257,7 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(outsideFile, geminiKeyPath);
 
-        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
         expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
         // The escape target must not be bound anywhere either.
         for (let i = 0; i < args.length; i += 1) {
@@ -1231,6 +1265,7 @@ describe("sandbox bwrap args", () => {
             expect(args[i + 1]).not.toBe(outsideFile);
           }
         }
+        expectSkipRecorded(records, "gemini-api-key", /symlink escapes secrets directory/);
       });
 
       it("file → directory: not bound, mask holds", async () => {
@@ -1239,8 +1274,9 @@ describe("sandbox bwrap args", () => {
         mkdirSync(geminiKeyPath);
         writeFileSync(join(geminiKeyPath, "nested"), "nested-content\n");
 
-        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
         expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /must resolve to a regular file/);
       });
 
       it("file → dangling symlink: not bound, mask holds", async () => {
@@ -1248,8 +1284,18 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(join(secretsDir, "does-not-exist"), geminiKeyPath);
 
-        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
         expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /broken symlink/);
+      });
+
+      it("file deleted after the grant: not bound, and the refusal is recorded (unlike a revoke, which has no grant row)", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /secret file does not exist/);
       });
 
       it("file → symlink to a sibling regular file INSIDE the secrets dir: bound from the resolved path", async () => {
@@ -1259,7 +1305,7 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         symlinkSync(siblingPath, geminiKeyPath);
 
-        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
         const bind = args.findIndex(
           (a, i) =>
             a === "--ro-bind" &&
@@ -1268,6 +1314,7 @@ describe("sandbox bwrap args", () => {
         );
         expect(bind).toBeGreaterThan(-1);
         expect(commandPrefix).toContain("rusa-secrets-entrypoint");
+        expect(records.filter((r) => r.event === "secret_grant_skipped_at_spawn")).toEqual([]);
       });
 
       it("one swapped grant does not stop a still-valid grant from binding", async () => {
@@ -1285,12 +1332,14 @@ describe("sandbox bwrap args", () => {
         rmSync(geminiKeyPath);
         mkdirSync(geminiKeyPath);
 
-        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
         for (let i = 0; i < args.length; i += 1) {
           if (args[i] === "--bind" || args[i] === "--ro-bind") {
             expect(args[i + 2]).not.toBe(geminiKeyPath);
           }
         }
+        // Exactly the swapped grant is reported; the healthy one is not.
+        expectSkipRecorded(records, "gemini-api-key", /must resolve to a regular file/);
         expect(
           args.findIndex(
             (a, i) =>

@@ -22,8 +22,26 @@ import { hostJobAuditArtifactDir } from "../actor/host-job-audit-artifact.js";
 import { loadConfig } from "../config/loader.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
+
+/**
+ * Host-side diagnostics from the sandbox layer. The layer is built per spawn
+ * by the providers, which carry no logger, so the composition root installs
+ * the service logger with {@link setSandboxLogger} (its secret scrubbing then
+ * applies here too); until it does — and under test — a plain module logger is
+ * built on first use. Nothing recorded here is a secret VALUE: this layer
+ * resolves paths and never reads a secret's content.
+ */
+let _sandboxLogger: Logger | undefined;
+export function setSandboxLogger(logger: Logger | undefined): void {
+  _sandboxLogger = logger;
+}
+function sandboxLog(): Logger {
+  _sandboxLogger ??= createLogger({ context: { component: "sandbox" } });
+  return _sandboxLogger;
+}
 
 export interface ActorBwrapResult {
   args: string[];
@@ -538,11 +556,16 @@ function injectSecretsMasking(
     // tmpfs mask — rather than letting bwrap follow whatever is there now.
     // Same discipline as the grant-store read above: a failed check means "no
     // bind" for this one file (the actor sees it absent, exactly as if the
-    // host file had been deleted), never a bind of something unchecked.
+    // host file had been deleted), never a bind of something unchecked. The
+    // refusal is recorded on the host, so an operator can tell "granted, then
+    // the host file went bad" from "never granted" (the revoke case looks the
+    // same from inside the sandbox). The record names the file, never its
+    // content.
     let realSecretPath: string;
     try {
       realSecretPath = assertSecretContainment(secretName, secretsDir);
-    } catch {
+    } catch (err) {
+      sandboxLog().warn("secret_grant_skipped_at_spawn", { actorId, filename: secretName, err });
       continue;
     }
     const secretPath = join(secretsDir, secretName);

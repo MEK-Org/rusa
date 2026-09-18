@@ -173,12 +173,7 @@ function setup(
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
-    grantableCapabilities: new Set([
-      "understanding-write",
-      "secret",
-      "secret:gemini-api-key",
-      "secret:mistral-api-key",
-    ]),
+    grantableCapabilities: new Set(["understanding-write", "secret"]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",

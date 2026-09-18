@@ -972,6 +972,44 @@ describe("E2EInstanceManager", () => {
     });
   });
 
+  it("carries exactly the parent-grantable LLM keys into the nested instance's base config — never the whole secrets directory, and never an escaping symlink (#542)", async () => {
+    // The nested instance always received gemini/mistral. The generic secret
+    // mechanism must not widen that to every file an operator keeps under
+    // $RUSA_HOME/secrets (webhook secrets, service passwords), and each key it
+    // does carry passes the same containment check a grant does.
+    const secretsDir = join(mcHome, "secrets");
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(secretsDir, "gemini-api-key"), "synthetic-gemini-value\n", { mode: 0o600 });
+    writeFileSync(join(secretsDir, "webhook-secret"), "synthetic-webhook-value\n", {
+      mode: 0o600,
+    });
+    const outsideFile = join(root, "host-only-file");
+    writeFileSync(outsideFile, "host-only-content\n", { mode: 0o600 });
+    symlinkSync(outsideFile, join(secretsDir, "mistral-api-key"));
+
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    const args = launch?.args ?? [];
+    const baseSecretsDir = join(mcHome, "e2e-instance", "runtime", "base-config", "secrets");
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "--ro-bind",
+        realpathSync(join(secretsDir, "gemini-api-key")),
+        join(baseSecretsDir, "gemini-api-key"),
+      ])
+    );
+    // Not in the allow-list → stays on the host.
+    expect(args).not.toContain(join(baseSecretsDir, "webhook-secret"));
+    expect(args).not.toContain(join(secretsDir, "webhook-secret"));
+    // In the allow-list but fails containment → refused, not bound.
+    expect(args).not.toContain(join(baseSecretsDir, "mistral-api-key"));
+    expect(args).not.toContain(outsideFile);
+    // Never a blanket bind of the directory itself.
+    expect(args).not.toContain(baseSecretsDir);
+  });
+
   it("projects Kimi credentials/oauth writable but config.toml read-only, never the whole ~/.kimi-code tree, on a clean up()", async () => {
     // Deliberately NOT a stale-runtime scenario (that's #224's territory) — a plain
     // first `up()` against a clean managed instance already hit issue #225's EROFS,

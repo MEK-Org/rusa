@@ -41,7 +41,6 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import type { AtIo } from "./at-queue.js";
-import { PARENT_GRANTABLE_CAPABILITIES } from "./capability-grants.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
@@ -3180,7 +3179,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh, registry } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     registry.upsert({
       id: "iu-thread",
@@ -3318,7 +3317,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -3338,7 +3337,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a secret to a non-child (sibling, grandchild, or itself)", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
@@ -3440,7 +3439,7 @@ describe("ActorMesh", () => {
       const { mesh } = setup({
         events: (e) => events.push(e),
         secretsDir: customSecretsDir,
-        grantableCapabilities: new Set(["secret", ...PARENT_GRANTABLE_CAPABILITIES]),
+        grantableCapabilities: new Set(["secret"]),
       });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -3494,7 +3493,7 @@ describe("ActorMesh", () => {
 
       const { mesh } = setup({
         secretsDir: customSecretsDir,
-        grantableCapabilities: new Set(["secret", ...PARENT_GRANTABLE_CAPABILITIES]),
+        grantableCapabilities: new Set(["secret"]),
       });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -3538,7 +3537,7 @@ describe("ActorMesh", () => {
 
   it("root grant and revoke on an unknown grantee throw unknown thread id error ", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     expect(() => mesh.grantCapability("ghost-grantee", "understanding-write", "root")).toThrow(
       "unknown thread id: ghost-grantee"
@@ -3550,7 +3549,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
