@@ -1302,10 +1302,13 @@ class _NavItem extends StatelessWidget {
       onPressed: () => onSelect(destination.targetFrom(selected)),
       style: TextButton.styleFrom(
         foregroundColor: active ? MeshColors.accent : MeshColors.textSecondary,
-        // Derive from the theme's label style so the nav inherits the app
-        // font family instead of the engine default (which the headless
-        // screenshot harness renders as box glyphs).
-        textStyle: Theme.of(context).textTheme.labelLarge?.copyWith(
+        // Take only the font family from the theme so the nav renders with
+        // the app font instead of the engine default (which the headless
+        // screenshot harness draws as box glyphs). Copying the whole
+        // `labelLarge` style would also pull in Material 3's line-height
+        // multiplier and grow the label's line box past the font size.
+        textStyle: TextStyle(
+          fontFamily: Theme.of(context).textTheme.labelLarge?.fontFamily,
           fontSize: 16,
           fontWeight: active ? FontWeight.w700 : FontWeight.w500,
         ),

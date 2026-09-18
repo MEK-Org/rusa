@@ -687,8 +687,10 @@ class _InboxTabState extends State<InboxTab> {
                         const SizedBox(height: 4),
                     ],
                     if (e['handledNote']?.toString().trim().isNotEmpty == true)
-                      RichText(
-                        text: TextSpan(
+                      // Text.rich (not RichText) so the note inherits the
+                      // theme font family like the rest of the card.
+                      Text.rich(
+                        TextSpan(
                           style: const TextStyle(
                             color: Color(0xFFC8DED7),
                             fontSize: 12.5,

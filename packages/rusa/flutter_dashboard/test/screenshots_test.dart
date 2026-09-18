@@ -32,6 +32,7 @@ import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
+import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 
@@ -138,6 +139,58 @@ void main() {
         }
         expect(find.text('Charter'), findsOneWidget);
         await _capture(key, '$_outDir/detail_info_tab.png');
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    "renders an actor's inbox page (signals + obligations, two columns)",
+    (tester) async {
+      await tester.runAsync(() async {
+        final ids = _seedIds();
+        HttpOverrides.global = _FakeImageHttpOverrides(await _portraits(ids));
+        addTearDown(() => HttpOverrides.global = null);
+
+        const worker = '11111111-1111-4111-8111-111111111111';
+        final api = FakeApi()
+          ..threadsResult = _seedThreads()
+          ..eventPages = [EventPage(events: _seedEvents(), nextCursor: null)]
+          ..inboxResultsByStatus['unhandled'] = {
+            'entries': _seedInboxUnhandled(),
+          }
+          ..inboxResultsByStatus['handled'] = {'entries': _seedInboxHandled()}
+          ..obligationsResult = _seedInboxObligations(worker);
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.clickActor(worker);
+
+        // Tall enough that both columns fit without scrolling, so the shot
+        // shows every seeded row rather than a cropped list.
+        await tester.binding.setSurfaceSize(const Size(1360, 1220));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(_app(store, key));
+        await tester.tap(find.text('Actors'));
+        await tester.pump();
+        await _settleImages(tester, _portraitUrls(ids));
+        expect(find.byType(ActorTree), findsOneWidget);
+
+        await tester.ensureVisible(find.text('Inbox'));
+        await tester.tap(find.text('Inbox'));
+        // Let the tab animate in and the inbox FutureBuilder resolve.
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 50));
+        }
+        expect(find.byType(InboxTab), findsOneWidget);
+        expect(find.text('Outstanding inbox signals'), findsOneWidget);
+        expect(find.text('Recently resolved signals'), findsOneWidget);
+        expect(find.text('Ready Obligations'), findsOneWidget);
+        expect(find.text('Waiting Obligations'), findsOneWidget);
+        await _capture(key, '$_outDir/actor_inbox.png');
+        expect(tester.takeException(), isNull);
 
         await store.dispose();
       });
@@ -495,6 +548,140 @@ ThreadDto _thread(
   createdAt: created,
   runState: run,
 );
+
+/// Two outstanding signals for the selected worker: a GitHub review comment
+/// on a PR it owns, and a Google Chat message. Shaped like the dashboard's
+/// `/api/mesh/inbox` rows, including the resolved `reference` the server
+/// attaches for GitHub sources.
+List<Map<String, dynamic>> _seedInboxUnhandled() => [
+  {
+    'id': 'inbox-1',
+    'source': 'github:example-org/widgets/pulls/42',
+    'deliveredAt': '2026-06-26T08:52:00Z',
+    'handledAt': null,
+    'payload': {'type': 'pull_request_review_comment.created'},
+    'reference': {
+      'ref': 'github:example-org/widgets/pulls/42',
+      'scheme': 'github',
+      'title': 'Retry the sync worker with backoff',
+      'url': 'https://github.com/example-org/widgets/pull/42',
+      'author': 'reviewer',
+      'entity': {
+        'type': 'github_comment',
+        'body':
+            'A fixed 5s sleep will still pile up under load. Could this back '
+            'off exponentially and cap at a minute?',
+      },
+    },
+  },
+  {
+    'id': 'inbox-2',
+    'source': 'gchat:spaces/AAAAexample',
+    'deliveredAt': '2026-06-26T08:40:00Z',
+    'handledAt': null,
+    // A chat event routes by space, so it carries no per-message reference
+    // and the card shows the raw payload.
+    'payload': {
+      'type': 'gchat.message',
+      'messageName': 'spaces/AAAAexample/messages/BBBBexample',
+      'spaceName': 'spaces/AAAAexample',
+      'senderName': 'users/000000000000',
+      'priority': 'responsive',
+    },
+  },
+];
+
+/// Two recently resolved signals, each with the note the actor left when it
+/// marked the entry handled.
+List<Map<String, dynamic>> _seedInboxHandled() => [
+  {
+    'id': 'inbox-3',
+    'source': 'github:example-org/widgets/issues/17',
+    'deliveredAt': '2026-06-25T16:10:00Z',
+    'handledAt': '2026-06-25T16:31:00Z',
+    'handledNote':
+        'Reproduced the drop with a full queue, replied on the issue with the '
+        'steps, and opened the retry PR.',
+    'payload': {'type': 'issue_comment.created'},
+    'reference': {
+      'ref': 'github:example-org/widgets/issues/17',
+      'scheme': 'github',
+      'title': 'Sync worker drops events when the queue is full',
+      'url': 'https://github.com/example-org/widgets/issues/17',
+      'entity': {
+        'type': 'github_issue',
+        'title': 'Sync worker drops events when the queue is full',
+        'description':
+            'Under sustained load the worker silently discards events once '
+            'its queue hits the cap.',
+      },
+    },
+  },
+  {
+    'id': 'inbox-4',
+    'source': 'operator:dashboard',
+    'deliveredAt': '2026-06-25T09:00:00Z',
+    'handledAt': '2026-06-25T09:02:00Z',
+    'handledNote': 'Ran once by hand; nothing new was waiting in the queue.',
+    'payload': {'type': 'operator.run_now', 'priority': 'responsive'},
+  },
+];
+
+const _subWorker = '33333333-3333-4333-8333-333333333333';
+
+/// The selected worker's obligations: two ready, two waiting on children
+/// (one child is the worker's own ready row, the others belong to a
+/// sub-worker and to the operator, so they surface only as blockers).
+List<ObligationDto> _seedInboxObligations(String owner) => [
+  makeObligation(
+    'ob-release',
+    ownerId: owner,
+    status: 'waiting',
+    title: 'Ship the 0.4 release',
+    intent:
+        'Cut the tag once the retry fix has landed and a fresh install '
+        'upgrades cleanly.',
+  ),
+  makeObligation(
+    'ob-retry-pr',
+    ownerId: owner,
+    parentId: 'ob-release',
+    title: 'Land the sync-worker retry PR',
+    intent: 'Land the sync-worker retry PR',
+    externalRef: 'github:example-org/widgets/pulls/42',
+  ),
+  makeObligation(
+    'ob-upgrade-check',
+    ownerId: _subWorker,
+    parentId: 'ob-release',
+    title: 'Verify the upgrade path on a fresh install',
+    intent: 'Verify the upgrade path on a fresh install',
+  ),
+  makeObligation(
+    'ob-release-notes',
+    ownerId: owner,
+    title: 'Write the 0.4 release notes',
+    intent: 'Highlights, the config rename, and the upgrade note.',
+    checkpoint:
+        'Highlights drafted. Still need the upgrade note for the config '
+        'rename.',
+    checkpointAt: '2026-06-26T08:15:00Z',
+  ),
+  makeObligation(
+    'ob-poller',
+    ownerId: owner,
+    status: 'waiting',
+    title: 'Retire the legacy poller',
+    intent: 'Remove the polling fallback once nothing depends on it.',
+  ),
+  makeObligation(
+    'ob-poller-check',
+    ownerId: 'human:operator',
+    parentId: 'ob-poller',
+    title: 'Confirm no instance still depends on polling',
+    intent: 'Confirm no instance still depends on polling',
+  ),
+];
 
 /// Newest-first events for the selected worker, including a run that both
 /// yielded and ended (coalesced into one row) plus a standalone run_end.

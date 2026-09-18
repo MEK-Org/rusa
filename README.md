@@ -5,15 +5,15 @@ complex tasks. It integrates with various tools and knowledge sources to provide
 a virtual assistant that can do just about anything a human with a computer
 could do.
 
-![The Rusa dashboard: the actor tree on the left, one actor's chat on the right](packages/rusa/flutter_dashboard/screenshots/dashboard_overview.png)
+![An actor's inbox page: outstanding and resolved inbox signals on the left, ready and waiting obligations on the right](packages/rusa/flutter_dashboard/screenshots/actor_inbox.png)
 
-*The dashboard's Actors view, rendered from dummy data by the screenshot
-harness in `packages/rusa/flutter_dashboard/test/screenshots_test.dart`.*
+*An actor's inbox page. This is a high-level overview of the work on an
+actor's plate.*
 
 - New here? Start with the [Quick Start](docs/quickstart.md): it builds and
   boots a local Docker instance and walks you through provider sign-in.
-- Working on the code? Read [`agent.md`](agent.md) and the
-  [Getting Started](#getting-started) section below.
+- Working on the code? Read [`agent.md`](agent.md) for the repo conventions
+  and quality gates, and [Contributing](#contributing) below.
 
 ## Vision
 
@@ -33,10 +33,7 @@ There's a few different aspects to our approach that I'll break down separately:
 - [Providers and Models](#providers-and-models)
 - [Quota](#quota)
 - [Obligations](#obligations)
-
-The [Dashboard](#dashboard) section describes the web UI that sits over all of
-these, and [Getting Started](#getting-started) covers running and developing
-Rusa.
+- [Dashboard](#dashboard)
 
 ## Actors
 
@@ -103,6 +100,8 @@ Per-actor work is serialized by each actor's trigger runner (debounce,
 single-flight, dirty bit), and cross-actor capacity is bounded by one shared
 [`ConcurrencyLimiter`](packages/rusa/src/actor/concurrency-limiter.ts), so the
 whole mesh respects one global concurrency cap however many actors are live.
+Actor runs are sandboxed with **bubblewrap** (`apt install bubblewrap` on a
+host install); `rusa start` fails fast if the host can't sandbox.
 
 ### Memory
 
@@ -172,7 +171,9 @@ the source grammar.
 
 The "provider" corresponds with the CLI that is used to run the actor. The
 supported providers are Claude Code, Codex, Antigravity, and Kimi. Others may be
-added if necessary. Every actor created in the system must explicitly specify
+added if necessary. Each enabled provider's vendor CLI is installed on the host
+and signed in with its own login flow; Rusa never stores provider API keys.
+Every actor created in the system must explicitly specify
 both a provider and a model. The system supports switching models within a
 provider, but, by default, it does not support switching providers. The reason
 for this relates to the preservation of context. By default, actors' context is
@@ -267,64 +268,10 @@ The dashboard can be limited to admitted Google accounts; see
 [Dashboard authentication](docs/dashboard-auth.md). The `rusa dashboard`
 command opens it against a configured instance's persisted state.
 
-## Getting Started
-
-The fastest way to try Rusa is the containerized
-[Quick Start](docs/quickstart.md) (`rusa quickstart`). For a host install, the
-runtime needs:
-
-- Node.js 20.19 or newer and pnpm (the workspace pins its pnpm version in
-  `package.json`).
-- **bubblewrap** (`apt install bubblewrap`): actor runs are sandboxed, and
-  `rusa start` fails fast if the host can't sandbox.
-- The vendor CLI for each provider you enable, signed in with its own login
-  flow. Rusa never stores provider API keys.
-- Optionally `cron` and `at` for host scheduling (see above).
-
-### Development
-
-Run from the repo root (pnpm workspace):
-
-```bash
-pnpm install          # install workspace dependencies
-pnpm build            # build all packages (includes the Flutter dashboard)
-pnpm test             # run the test suites
-pnpm typecheck        # type-check all packages
-pnpm lint             # Biome lint
-pnpm format           # Biome format (write)
-pnpm cli <args>       # build + run the rusa CLI against a test home
-```
-
-Dashboard changes also need the Flutter gates, run inside `packages/rusa`:
-
-```bash
-pnpm run analyze:dashboard-ui
-pnpm run test:dashboard-ui
-```
-
-Key CLI commands (`rusa --help` lists them all): `init` and `configure` for
-instance setup, `start` to boot the root actor over the live edge, `dev` for a
-watch loop, `status`, `logs`, `dashboard`, `install-service` to run under
-systemd, `forward-webhooks` for local GitHub delivery, and the
-`quota-coordinator` family.
-
-### End-to-end runner
-
-Because every edge the actors touch is an MCP server, the difference between
-production and end-to-end testing is which MCP implementations are wired. The
-self-contained runner boots a disposable instance with real providers and fake
-GitHub and chat edges:
-
-```bash
-pnpm e2e am-up                                  # provision and run a disposable mesh
-pnpm e2e am-up --root-driver external           # boot without a root run, for scripted scenarios
-pnpm e2e hydrate --scenario dashboard-basic     # seed actors, chat, and an issue into it
-pnpm e2e down --root <path>                     # stop it and remove its state
-```
-
 ## Repository layout
 
-This is a pnpm workspace. The agent itself lives in `packages/rusa`.
+This is a pnpm workspace (Node.js 20.19 or newer; the pnpm version is pinned
+in `package.json`). The agent itself lives in `packages/rusa`.
 
 ```
 rusa/
@@ -351,11 +298,27 @@ rusa/
 The boot path worth reading first is
 [`commands/start.ts`](packages/rusa/src/commands/start.ts): it wires the MCP
 servers, builds the mesh, creates the root actor, attaches the inbound edges,
-and starts the lifecycle loop.
+and starts the lifecycle loop. `rusa --help` lists the CLI commands: `init`
+and `configure` for instance setup, `start` to boot the root actor over the
+live edge, `dev` for a watch loop, `status`, `logs`, `dashboard`,
+`install-service` to run under systemd, `forward-webhooks` for local GitHub
+delivery, and the `quota-coordinator` family.
 
 ## Contributing
 
 This repo is built largely by Rusa's own actors, so the working conventions
-live in [`agent.md`](agent.md): quality gates, PR description requirements,
-branch and merge rules, and the hygiene expected in a public repository. Longer
-design material lives under [`docs/`](docs/).
+live in [`agent.md`](agent.md): the `pnpm` and Flutter quality gates, PR
+description requirements, branch and merge rules, and the hygiene expected in
+a public repository. Longer design material lives under [`docs/`](docs/).
+
+Because every edge the actors touch is an MCP server, the difference between
+production and end-to-end testing is which MCP implementations are wired. The
+self-contained runner boots a disposable instance with real providers and fake
+GitHub and chat edges:
+
+```bash
+pnpm e2e am-up                                  # provision and run a disposable mesh
+pnpm e2e am-up --root-driver external           # boot without a root run, for scripted scenarios
+pnpm e2e hydrate --scenario dashboard-basic     # seed actors, chat, and an issue into it
+pnpm e2e down --root <path>                     # stop it and remove its state
+```
