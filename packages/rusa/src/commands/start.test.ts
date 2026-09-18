@@ -732,6 +732,153 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(mesh?.get("root")).toBe(externalRoot);
   });
 
+  it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const observedAt = new Date().toISOString();
+    const resetAtIso = new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString();
+    const weeklyBucket = (provider: string, percentLeft: number) => ({
+      key: `${provider}:weekly`,
+      percentLeft,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 300,
+      observedAt,
+      resetAtIso,
+    });
+    // Unpaced lanes keep both candidates immediately available for the second
+    // gate below, so it proves the retained admission observation is used.
+    const throttleStatus = (provider: string, percentLeft: number, intervalSeconds = 0) => ({
+      provider,
+      intervalSeconds,
+      uncappedIntervalSeconds: intervalSeconds,
+      governingBucketKey: `${provider}:weekly`,
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: observedAt,
+      buckets: [weeklyBucket(provider, percentLeft)],
+      freshness: {
+        ageMs: 0,
+        buckets: { [`${provider}:weekly`]: 0 },
+        stale: false,
+        hardStale: false,
+      },
+    });
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test",
+      serverTime: observedAt,
+    };
+    let codexCold = false;
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname !== "/v1/throttle") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          service,
+          providers: {
+            // A changed claude interval lets the test observe that the production
+            // client completed this cold collection, not just that the server sent it.
+            claude: throttleStatus("claude", 20, codexCold ? 1 : 0),
+            // A cold lane is a 200 not_ready entry in the collection (§5.5, #480).
+            codex: codexCold
+              ? { error: { code: "not_ready", message: "cold", retryable: true } }
+              : throttleStatus("codex", 80),
+          },
+        })
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: {
+          coordinator: { socketPath },
+          throttle: { enabled: true, tickSeconds: 1 },
+        },
+      }),
+      "utf8"
+    );
+
+    try {
+      let mesh: ActorMesh | undefined;
+      let coordinatorAppliedInterval: ((provider: string) => number | undefined) | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              coordinatorAppliedInterval = handles.coordinatorAppliedInterval;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+
+      const selected = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
+      const gate = mesh.gateRun(
+        selected,
+        [
+          { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+          { provider: "codex", model: "gpt-5.6", effort: "high" },
+        ],
+        true,
+        "root"
+      );
+
+      await expect(gate.result).resolves.toBe("codex");
+      expect(selected).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+
+      // The coordinator now reports codex cold. A changed claude interval is
+      // applied only after the production client's collection read completes;
+      // waiting for it proves this same cold response was consumed. Codex's last
+      // trustworthy weekly observation remains fresh, so the production gate
+      // keeps selecting it without opening a local quota database.
+      codexCold = true;
+      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(1), {
+        timeout: 5_000,
+      });
+      const afterCold = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
+      const coldGate = mesh.gateRun(
+        afterCold,
+        [
+          { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+          { provider: "codex", model: "gpt-5.6", effort: "high" },
+        ],
+        true,
+        "root"
+      );
+      await expect(coldGate.result).resolves.toBe("codex");
+      expect(afterCold).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+    } finally {
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
   it("tells and gates a root-enrolled worker across the live MCP boundary while an unenrolled control is untouched", async () => {
     let mesh: ActorMesh | undefined;
     let root: Actor | undefined;
