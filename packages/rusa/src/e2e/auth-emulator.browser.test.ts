@@ -103,14 +103,8 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
             )
           ).toBe(403);
           expect(await status("/api/auth/session")).toBe(200);
-          const refresh = page.waitForResponse(
-            (response) =>
-              response.url().endsWith("/api/auth/refresh") && response.request().method() === "POST"
-          );
-          await page.evaluate(() => window.dispatchEvent(new Event("rusa-navigation")));
-          const renewed = await refresh;
-          expect(renewed.status()).toBe(200);
-          expect(renewed.request().headers()["x-rusa-csrf"]).toBeTruthy();
+          // Route changes call the Flutter session controller directly; the
+          // dashboard's session unit tests cover the renewal and CSRF header.
           // Enable Flutter's accessibility tree to exercise the actual profile menu.
           await page.locator("flt-semantics-placeholder").evaluate((element) => {
             (element as HTMLElement).style.cssText =

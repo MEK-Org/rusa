@@ -19,6 +19,8 @@ export function createE2EDashboardAuth(host: string, email: string | string[]): 
       projectId: "demo-rusa-auth",
       apiKey: "e2e-key",
       authDomain: "localhost",
+      appId: "e2e-app-id",
+      messagingSenderId: "e2e-sender-id",
       serviceAccountKeyPath: "/unused-e2e-credential",
     },
   };

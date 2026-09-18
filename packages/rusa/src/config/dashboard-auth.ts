@@ -35,7 +35,14 @@ export function validateDashboardAuth(
       throw new Error("config.yaml: duplicate auth.allowedEmails entry");
     value.allowedEmails = emails;
   }
-  const fields = ["projectId", "apiKey", "authDomain", "serviceAccountKeyPath"];
+  const fields = [
+    "projectId",
+    "apiKey",
+    "authDomain",
+    "appId",
+    "messagingSenderId",
+    "serviceAccountKeyPath",
+  ];
   if (Object.keys(value.firebase).some((key) => !fields.includes(key))) {
     throw new Error("config.yaml: unknown auth.firebase field");
   }

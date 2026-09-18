@@ -265,7 +265,9 @@ by the runtime. Its main views:
 - **Work**: the obligations forest.
 
 The dashboard can be limited to admitted Google accounts; see
-[Dashboard authentication](docs/dashboard-auth.md). The `rusa dashboard`
+[Dashboard authentication](docs/dashboard-auth.md). Its FlutterFire web
+configuration is read at runtime from the operator's `auth.firebase` settings;
+never commit generated Firebase options or a project configuration file. The `rusa dashboard`
 command opens it against a configured instance's persisted state.
 
 ## Repository layout

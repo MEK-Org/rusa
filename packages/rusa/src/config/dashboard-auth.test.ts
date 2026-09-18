@@ -8,6 +8,8 @@ describe("optional shared-human auth config", () => {
       projectId: "project",
       apiKey: "key",
       authDomain: "project.firebaseapp.com",
+      appId: "app-id",
+      messagingSenderId: "sender-id",
       serviceAccountKeyPath: "/keys/admin.json",
     },
   });

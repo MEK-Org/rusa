@@ -1,28 +1,21 @@
 import 'dart:js_interop';
+
+import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 
-void requireAuthentication() =>
-    web.window.dispatchEvent(web.Event('rusa-auth-required'));
-void notifyNavigation() =>
-    web.window.dispatchEvent(web.Event('rusa-navigation'));
-void logout() => web.window.dispatchEvent(web.Event('rusa-logout'));
-bool get authenticationEnabled =>
-    web.document.documentElement?.getAttribute('data-rusa-auth') == 'enabled';
-String? get profilePhotoUrl =>
-    web.document.documentElement?.getAttribute('data-rusa-profile-photo');
-bool needsCsrf(Uri url) =>
-    authenticationEnabled &&
-    Uri.base.resolveUri(url).origin == web.window.location.origin;
-String? get csrfToken {
-  final cookies = web.document.cookie
-      .split(';')
-      .map((part) => part.trim())
-      .where((part) => part.startsWith('__Host-rusa_csrf='))
-      .toList();
-  return cookies.length == 1
-      ? cookies.single.substring('__Host-rusa_csrf='.length)
-      : null;
-}
+import 'session.dart';
+
+DashboardSession? _session;
+
+/// The web entrypoint installs the one session owner before it mounts a page.
+/// URL changes, API failures, and SSE events call it directly rather than
+/// translating auth state through DOM custom events.
+void installDashboardSession(DashboardSession session) => _session = session;
+void requireAuthentication() => _session?.requireAuthentication();
+void notifyNavigation() => _session?.visit();
+Future<void> logout() => _session?.signOut() ?? Future.value();
+bool get authenticationEnabled => _session?.authenticationEnabled ?? false;
+String? get profilePhotoUrl => _session?.profilePhotoUrl;
 
 /// Owns reconnects so an idle EventSource cannot silently reopen itself.
 /// Navigation renews the cookie before reconnecting either mesh or voice streams.
@@ -33,28 +26,30 @@ String? get csrfToken {
 /// closed; that case is settled by asking `/api/auth/session` directly, so a
 /// dead stream never waits for the next poll to notice.
 ///
-/// `data-rusa-session-idle` belongs to the login controller (auth-browser.ts):
-/// its inactivity timer sets it and a successful renewal clears it. A server
-/// `session_idle` frame only disconnects; it is the backstop for a throttled
-/// tab whose timer never fired, and the next renewal reconnects as usual.
+/// A server `session_idle` frame only disconnects; the session controller's
+/// inactivity timer is the normal path, and a successful visit reconnects.
 class SessionEventSource {
   SessionEventSource(this.url) {
-    _active = ((web.Event _) => _connect()).toJS;
-    _idle = ((web.Event _) => _disconnect()).toJS;
-    web.window.addEventListener('rusa-session-active', _active);
-    web.window.addEventListener('rusa-session-idle', _idle);
+    _sessionListener = _onSessionChanged;
+    _session?.addListener(_sessionListener);
     _connect();
   }
   final String url;
   final Map<String, List<web.EventListener>> _listeners = {};
-  late final web.EventListener _active;
-  late final web.EventListener _idle;
+  late final VoidCallback _sessionListener;
   web.EventSource? _source;
+
+  void _onSessionChanged() {
+    if (_session?.isIdle ?? false) {
+      _disconnect();
+    } else {
+      _connect();
+    }
+  }
 
   void _connect() {
     _disconnect();
-    if (web.document.documentElement?.getAttribute('data-rusa-session-idle') ==
-        'true') {
+    if (_session?.isIdle ?? false) {
       return;
     }
     final source = web.EventSource(url);
@@ -111,8 +106,7 @@ class SessionEventSource {
 
   void close() {
     _disconnect();
-    web.window.removeEventListener('rusa-session-active', _active);
-    web.window.removeEventListener('rusa-session-idle', _idle);
+    _session?.removeListener(_sessionListener);
     _listeners.clear();
   }
 }

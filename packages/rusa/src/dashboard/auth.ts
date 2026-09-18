@@ -126,10 +126,10 @@ export class DashboardAuth {
   }
 
   clientConfig(): object {
-    const { projectId, apiKey, authDomain } = this.config.firebase;
+    const { projectId, apiKey, authDomain, appId, messagingSenderId } = this.config.firebase;
     return {
       enabled: true,
-      firebase: { projectId, apiKey, authDomain },
+      firebase: { projectId, apiKey, authDomain, appId, messagingSenderId },
       ...(this.emulatorUrl ? { emulatorUrl: this.emulatorUrl } : {}),
     };
   }
