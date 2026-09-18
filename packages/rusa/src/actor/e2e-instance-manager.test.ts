@@ -1410,7 +1410,6 @@ describe.skipIf(!BWRAP_CAPABLE)(
         mcHome,
         workersDir,
         hostHome: root,
-        toolchainPath: "/usr/local/bin:/usr/bin:/bin",
         corepackPath: "/bin/true",
         flutterRoot: "",
         providerExecutables: {},
