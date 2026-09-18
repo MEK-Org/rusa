@@ -41,6 +41,7 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<String?>? _checkpointSub;
+  StreamSubscription<String?>? _principalSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
 
@@ -237,12 +238,23 @@ class _WorkTabState extends State<WorkTab> {
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
       _loadRoots();
     });
+    // Owner/creator labels read the viewing principal off the dashboard
+    // config, which lands after init returns; a tree drawn before then would
+    // name the person "Unknown actor" until something else rebuilt it (#538).
+    _principalSub = widget.store.dashboardConfig
+        .map((c) => c?.userPrincipalId)
+        .distinct()
+        .skip(1)
+        .listen((_) {
+          if (mounted) setState(() {});
+        });
   }
 
   @override
   void dispose() {
     _focusSub?.cancel();
     _checkpointSub?.cancel();
+    _principalSub?.cancel();
     super.dispose();
   }
 

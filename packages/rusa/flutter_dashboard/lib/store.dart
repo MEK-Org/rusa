@@ -381,6 +381,9 @@ class DashboardStore {
   List<ActorViewState> get runningActors => _actorStates.value.runningActors;
   List<ActorViewState> get queuedActors => _actorStates.value.queuedActors;
 
+  /// The viewing person's durable principal id, as `/api/dashboard/config`
+  /// resolved it. That route is the single source: the threads snapshot also
+  /// carries the field, but reading it there too would let the two disagree.
   String? get userPrincipalId => _dashboardConfig.value?.userPrincipalId;
 
   /// Whether [id] names a human operator — either the legacy alias, any
@@ -393,6 +396,13 @@ class DashboardStore {
         (i) => actor(i)?.handle,
         isHuman,
       );
+
+  /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
+  /// dialog), which keep showing the raw id for an actor the mesh view does
+  /// not know rather than "Unknown actor" — that fallback predates #538 and
+  /// is what the overview's blocker line is pinned to.
+  String ownerLabel(String id) =>
+      isHuman(id) ? 'Operator' : (actor(id)?.handle ?? id);
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
@@ -1425,21 +1435,6 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
-      if (snap.userPrincipalId != null &&
-          _dashboardConfig.value?.userPrincipalId != snap.userPrincipalId) {
-        final cur = _dashboardConfig.value;
-        _dashboardConfig.add(
-          cur == null
-              ? DashboardConfigDto(
-                  quotaProviders: const {},
-                  userPrincipalId: snap.userPrincipalId,
-                )
-              : DashboardConfigDto(
-                  quotaProviders: cur.quotaProviders,
-                  userPrincipalId: snap.userPrincipalId,
-                ),
-        );
-      }
       _updateActorStatesFromThreads(snap.threads);
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree

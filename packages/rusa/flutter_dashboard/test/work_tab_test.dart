@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/obligation_status.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
@@ -172,6 +173,70 @@ void main() {
         expect(find.text('Operator'), findsOneWidget);
         expect(find.text('Unknown actor'), findsNothing);
         expect(find.text(durableUser), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'ObligationRow names a durable-principal owner, checkpoint author and '
+    'blocker owner as "Operator" (#538)',
+    (tester) async {
+      await tester.runAsync(() async {
+        const durableUser = '9f1c2e58-0000-4000-8000-00000000abcd';
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: durableUser,
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        // A stateless row reads the principal at build; wait for the config
+        // route (which init does not await) so the fixture is deterministic.
+        await store.dashboardConfig.firstWhere(
+          (c) => c?.userPrincipalId == durableUser,
+        );
+
+        final blocker = makeObligation(
+          'ob-blocker',
+          ownerId: durableUser,
+          intent: 'Approve the schema',
+        );
+        final ob = makeObligation(
+          'ob-durable-row',
+          ownerId: durableUser,
+          status: 'waiting',
+          intent: 'Land the migration',
+          checkpoint: 'head abc123; waiting on approval',
+          checkpointAt: '2026-09-07T11:00:00.000Z',
+          checkpointBy: durableUser,
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SingleChildScrollView(
+                child: ObligationRow(
+                  obligation: ob,
+                  store: store,
+                  blockers: [blocker],
+                  showOwner: true,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text('Owner: Operator'), findsOneWidget);
+        expect(
+          find.textContaining('Approve the schema (Operator)'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Operator · '), findsOneWidget);
+        expect(find.textContaining(durableUser), findsNothing);
+        expect(find.textContaining('Unknown actor'), findsNothing);
 
         await store.dispose();
       });

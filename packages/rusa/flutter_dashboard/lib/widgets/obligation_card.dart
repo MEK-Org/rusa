@@ -70,7 +70,7 @@ class ObligationRow extends StatelessWidget {
         if (showOwner) ...[
           const SizedBox(height: 2),
           Text(
-            'Owner: ${store.isHuman(obligation.ownerId) ? 'Operator' : (store.actor(obligation.ownerId)?.handle ?? obligation.ownerId)}',
+            'Owner: ${store.ownerLabel(obligation.ownerId)}',
             style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
           ),
         ],
@@ -315,7 +315,7 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${store.isHuman(blocker.ownerId) ? 'Operator' : (store.actor(blocker.ownerId)?.handle ?? blocker.ownerId)})',
+                          '• ${blocker.intent ?? blocker.id} (${store.ownerLabel(blocker.ownerId)})',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,

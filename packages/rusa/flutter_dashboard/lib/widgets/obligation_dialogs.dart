@@ -432,7 +432,7 @@ Future<void> showReassignObligationDialog(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  'Current owner: ${store.isHuman(obligation.ownerId) ? 'Operator' : (store.actor(obligation.ownerId)?.handle ?? obligation.ownerId)}',
+                  'Current owner: ${store.ownerLabel(obligation.ownerId)}',
                   style: const TextStyle(color: MeshColors.textMuted, fontFamily: kMonoFontFamily),
                 ),
                 const SizedBox(height: 16),
