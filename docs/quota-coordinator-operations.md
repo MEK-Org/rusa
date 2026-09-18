@@ -103,8 +103,13 @@ and [#503](https://github.com/MEK-Org/rusa/issues/503)); neither was executed by
 #499.
 
 Instead, #499 used a separate staging coordinator with a fresh staging database
-and its normal probe loop to prove probing outside the instance, then exercised
-the ordinary production client under real staging traffic. Before the
+and its normal probe loop to prove probing outside the instance, then restarted
+the staging instance on the ordinary production client path and observed it
+connect (`/api/health` reported `quota_client_service_connected: 1`;
+[#499 comment 5695348753](https://github.com/MEK-Org/rusa/issues/499#issuecomment-5695348753)).
+That record does not include an observation of launches being paced from the
+publication under traffic; the paced-launch check is the post-flip
+verification in step 7 below, not recorded staging history. Before the
 synchronized stage-3 flip, verify that `/v1/readyz` reports `ready: true` and
 that each configured provider lane in `scrapes[provider]` has `status: "ok"`.
 The pre-flip gate requires all four quota lanes (`claude`, `codex`, `agy`, and
@@ -156,11 +161,20 @@ opaque outside the operator space; this section and
 
 1. **Stop and fence old instance writers:** Stop production instances to ensure
    no new transactions are written to the legacy SQLite database.
-2. **Take and verify legacy backup:** Take and verify a self-contained backup of
-   the stopped legacy database using the shipped command:
+2. **Take the legacy backup:** Take a self-contained backup of the stopped
+   legacy database using the shipped command:
    ```bash
    rusa quota-backup --database /path/to/legacy/quota.db
    ```
+   `backupQuotaDatabase()` runs `VACUUM INTO` on a read-only connection,
+   renames the result into place and reports its size; it does not run
+   `PRAGMA integrity_check` or the schema guard. Those checks
+   (`assertRestorableDatabase`) run inside `rusa quota-restore` before it
+   writes anything, so a damaged backup fails the restore rather than being
+   restored. There is no shipped pre-handoff verification command; an operator
+   who wants the integrity check before archiving the legacy file in step 4 can
+   open the backup read-only with the `sqlite3` CLI, if present, and run
+   `PRAGMA integrity_check` by hand.
 3. **Preserve coordinator DB:** Leave the live coordinator database untouched.
    The copied DB already serving the shared coordinator remains authoritative.
    Do not reconcile or replace it from legacy production.
@@ -220,23 +234,28 @@ If the flip must be rolled back:
    ```bash
    systemctl --user stop <basename>-quota-coordinator.service
    ```
-   This ensures the coordinator socket is no longer listening. Staging
-   instances connected to this socket fall back to cached throttle pacing or
-   local fallback during this window (or should be stopped if reverting staging
-   concurrently).
+   This ensures the coordinator socket is no longer listening. A staging
+   instance still pointed at this socket does not resume in-process scraping —
+   v1 has no local fallback source. Its client keeps each provider's last
+   applied interval, and once `hardStaleAfterMs` (default 1 hour) has passed
+   since the last successful read it widens that lane to `maxIntervalSeconds`
+   (default 3600) on its own (`getLastAppliedInterval`,
+   `packages/rusa/src/quota/coordinator-client.ts`; design §5.7 rules 0 and
+   2). Stop staging instead if reverting staging concurrently.
 4. **Remove path fence:** Remove the empty directory path fence at the legacy
    database path:
    ```bash
    rmdir /path/to/legacy/quota.db
    ```
-5. **Restore legacy database:** Restore the legacy database from the verified
-   backup taken in step 2:
+5. **Restore legacy database:** Restore the legacy database from the backup
+   taken in handoff step 2:
    ```bash
    rusa quota-restore --database /path/to/legacy/quota.db --from /path/to/backup.db
    ```
    *Note:* Restoring via `rusa quota-restore` is preferred over moving the
-   unverified archived files because `quota-restore` executes preflight integrity
-   checks (`assertRestorableDatabase`) and explicitly verifies that the coordinator
+   archived files back because `quota-restore` is where the backup is verified:
+   it runs `PRAGMA integrity_check` and the schema guard on the backup
+   (`assertRestorableDatabase`) before writing, and explicitly checks that the coordinator
    socket is stopped or unreachable (`isCoordinatorListening` returns false),
    ensuring no active coordinator writer conflicts with the restore. The
    coordinator database is preserved untouched for post-mortem inspection,

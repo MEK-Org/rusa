@@ -1417,13 +1417,16 @@ ships.
 | 0 | **Planned, not shipped** ([#502](https://github.com/MEK-Org/rusa/issues/502)): install the unit; service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `healthz`/`readyz`, `GET /v1/throttle` matches what the file says and carries the expected `service.protocolMajor`, backups run, metrics appear | Stop and remove the unit. Nothing touched. |
 | 1 | Enable the probe loop, still against the copy. Instances still scraping. | **The probe works outside an instance process** — bwrap, tmux, provider CLI auth, LLM parse (A5, A5a). Compare the copy's observations against the live file's for the same slots. | Disable the probe loop, or stop the unit. |
 | 2 | **Planned, not shipped** ([#503](https://github.com/MEK-Org/rusa/issues/503)): point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
-| 3 | **Revised stage-3 flip** (A6; the copied-database shape, provenance in §8.1 and the runbook — when no coordinator database exists yet, the designed `rusa quota-coordinator --relocate` rename of §8.2 applies instead): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from verified backup (`rusa quota-restore`); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
+| 3 | **Revised stage-3 flip** (A6; the copied-database shape, provenance in §8.1 and the runbook — when no coordinator database exists yet, the designed `rusa quota-coordinator --relocate` rename of §8.2 applies instead): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from backup (`rusa quota-restore`, which verifies it); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
 
 The #499 staging proof substituted for the two absent modes. It started a
 separate staging coordinator with a fresh staging database and its normal probe
-loop, proving that probing works outside an instance. It then ran the ordinary
-production client path against that coordinator under real staging traffic. That
-client applies the published result; it was not a compare-only canary.
+loop, proving that probing works outside an instance. It then restarted the
+staging instance on the ordinary production client path and observed it connect
+(`quota_client_service_connected: 1`,
+[#499 comment 5695348753](https://github.com/MEK-Org/rusa/issues/499#issuecomment-5695348753));
+paced launches under traffic were not separately recorded. That client applies
+the published result; it was not a compare-only canary.
 
 Before the synchronized stage-3 flip, capture `/v1/readyz` with `ready: true`
 and verify each configured provider lane in `scrapes[provider]` has `status: "ok"`.
@@ -1452,36 +1455,23 @@ before the flip`), a safety interlock rather than a prohibition. Instead, old
 instances are quiesced, the legacy database is backed up and archived, and the
 path fence is created directly at the legacy path.
 
-The final handoff sequence for the copied-database shape:
-1. Stop old instance writers to quiesce legacy database activity.
-2. Take and verify a self-contained backup of the stopped legacy database with
-   the shipped command: `rusa quota-backup --database <legacy-path>`.
-3. Preserve the live coordinator database untouched (the copied DB already
-   serving the shared coordinator remains authoritative; do not reconcile or
-   replace it from legacy production).
-4. Archive the legacy `quota.db` plus any WAL/SHM files recoverably.
-5. Create the exact empty mode-0700 directory at the legacy path (`quota.db`) as
-   the path fence (`mkdir -m 0700 <legacy-path>`).
-6. Switch production configuration to the already-running shared socket
-   (`socketPath`, omitting `databasePath` for instance writers) and verify
-   `/v1/readyz`, `/v1/throttle`, and client operation under real traffic.
-7. Repoint staging to the production socket, and remove the temporary staging
-   coordinator unit and its instance ordering (`After=`/`Wants=`). The end
-   state is one coordinator per pool, not a dormant staging collector.
-
-Rollback preserves the live coordinator database:
-1. Stop the production client instances.
-2. Stop the shared coordinator unit so its socket is no longer listening
-   (staging instances enter fallback/cached pacing during this downtime).
-3. Remove the empty directory path fence at the legacy database path (`rmdir <legacy-path>`).
-4. Restore the legacy database from the verified backup with
-   `rusa quota-restore --database <legacy> --from <backup>` while the
-   coordinator socket is stopped or unreachable as required by `quota-restore`.
-5. Restore legacy instance configuration (re-enabling `databasePath` and clearing
-   `socketPath`).
-6. Restart production instances.
-7. If staging remains on the coordinator, restart the coordinator unit;
-   otherwise reconfigure staging if reverting the whole pool.
+The runnable procedure for the copied-database shape — quiesce the old
+writers, back up the stopped legacy database with `rusa quota-backup` (verified
+later by `rusa quota-restore`, not at backup time), leave the coordinator
+database untouched, archive the legacy file plus WAL/SHM, `mkdir -m 0700` the
+fence at the legacy path, switch instances to `socketPath` with no
+`databasePath`, then repoint staging and remove its temporary coordinator unit
+and ordering so the end state is one coordinator per pool — and its rollback
+(stop instances, stop the coordinator so `quota-restore`'s socket check passes,
+`rmdir` the fence, `rusa quota-restore`, restore instance config, restart) live
+only in the operations runbook
+([`quota-coordinator-operations.md`](./quota-coordinator-operations.md),
+"#499 staging proof and the stage-3 handoff"). That document is authoritative
+for step order and commands; this section deliberately carries no second copy,
+so there is one procedure to keep current. Note for the rollback window: a staging instance still
+pointed at the stopped socket does not resume local scraping; it keeps its last
+applied interval and widens to `maxIntervalSeconds` after `hardStaleAfterMs`
+(§5.7).
 
 Two things about stage 1, the first of which is settled:
 
