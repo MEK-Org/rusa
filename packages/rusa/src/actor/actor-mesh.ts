@@ -397,19 +397,23 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
     );
   }
   if (blockers.subscriptions.length > 0) {
-    // Each kind names the tool that actually clears it. Ownership is only ever
+    // Each kind names the tool that actually clears it, and each kind has an
+    // exit the retirer can take without the holder's cooperation — a wedged
+    // holder must not make its subtree unretirable. Ownership is only ever
     // reached by delegation (root owns the configured roots; nothing else mints
     // it), so it leaves the same way: the holder delegates it onward — its
     // parent included — or the owner above it reclaims it. A direct
-    // subscription belongs to its holder alone, and only the holder can drop
-    // it. `unsubscribe_event_source` is deliberately not an ownership release:
-    // ownership with no receiver would route by whichever ancestor happens to
-    // be live, which is the implicit fallback #540 refuses to add.
+    // subscription is dropped by its holder, or by any ancestor naming the
+    // holder (the same authority that retires it). `unsubscribe_event_source`
+    // is deliberately not an ownership release: ownership with no receiver
+    // would route by whichever ancestor happens to be live, which is the
+    // implicit fallback #540 refuses to add.
     lines.push(
       `${blockers.subscriptions.length} live event subscription(s) owned in its subtree — ` +
         "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
         "or the owner above it reclaims it (reclaim_event_source); " +
-        "[subscription]: the holder unsubscribes (unsubscribe_event_source):"
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+        "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder):"
     );
     lines.push(
       ...listWithOverflow(
@@ -2632,14 +2636,38 @@ export class ActorMesh {
     });
   }
 
-  /** Remove a direct subscriber from an event source. Records an audit event. */
-  removeEventSourceSubscriber(resource: EventResource, actorId: string): void {
+  /**
+   * Remove a direct subscriber from an event source. Records an audit event
+   * naming who removed it.
+   *
+   * The holder may always drop its own subscription. An ancestor may drop a
+   * descendant's, and nobody else may: this is the parent-side exit the
+   * retirement guard (#540) needs, because every actor that opens a PR or
+   * issue is mechanically subscribed to it, and a holder that has wedged will
+   * never unsubscribe itself. Ancestor scope is the same authority that
+   * retires the holder, so whoever can retire a subtree can also dispose of
+   * what blocks that retirement — explicitly, by naming the resource and the
+   * holder, never as a side effect of `retire()` or of any flag.
+   */
+  removeEventSourceSubscriber(
+    resource: EventResource,
+    actorId: string,
+    removedBy: string = actorId
+  ): void {
     actorId = this.resolveThreadId(actorId);
+    removedBy = this.resolveThreadId(removedBy);
+    if (removedBy !== actorId && !this.isAncestorOf(removedBy, actorId)) {
+      throw new Error(
+        `actor ${removedBy} may only unsubscribe itself or its descendants from ` +
+          `${resourceKey(resource)} (cannot unsubscribe ${actorId})`
+      );
+    }
     this.eventSourceSubscriptions.unsubscribe(resource, actorId);
     this.recordEvent({
       kind: "event_source_subscriber_removed",
       actorId,
       detail: resourceKey(resource),
+      payload: JSON.stringify({ removedBy }),
     });
   }
 

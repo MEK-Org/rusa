@@ -7024,8 +7024,49 @@ describe("ActorMesh", () => {
           kind: "event_source_subscriber_removed",
           actorId: watcher,
           detail: ISSUE,
+          payload: JSON.stringify({ removedBy: watcher }),
         }),
       ]);
+    });
+
+    // The parent-side exit for a direct subscription (#540): whoever can retire
+    // the holder can also drop what blocks that retirement, and the audit row
+    // names them rather than the holder.
+    it("lets an ancestor remove a descendant's subscription, naming the remover in the audit event", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      mesh.addEventSourceSubscriber(ISSUE, child, child);
+
+      mesh.removeEventSourceSubscriber(ISSUE, child, "root");
+
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+      expect(events.filter((e) => e.kind === "event_source_subscriber_removed")).toEqual([
+        expect.objectContaining({
+          actorId: child,
+          detail: ISSUE,
+          payload: JSON.stringify({ removedBy: "root" }),
+        }),
+      ]);
+    });
+
+    it("refuses to let a non-ancestor remove another actor's subscription", () => {
+      const { mesh } = setup();
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: watcher });
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      // A sibling has no authority over the holder…
+      expect(() => mesh.removeEventSourceSubscriber(ISSUE, watcher, peer)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      // …and neither does the holder's own child: authority runs down the tree only.
+      expect(() => mesh.removeEventSourceSubscriber(ISSUE, watcher, child)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.actorId)).toEqual([watcher]);
     });
 
     it("stops delivering once the subscription is removed", async () => {
@@ -8728,7 +8769,8 @@ describe("ActorMesh", () => {
             "or the owner above it reclaims it (reclaim_event_source)"
         );
         expect(blocked.message).toContain(
-          "[subscription]: the holder unsubscribes (unsubscribe_event_source)"
+          "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+            "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder)"
         );
       }
 
@@ -8767,6 +8809,36 @@ describe("ActorMesh", () => {
       mesh.removeEventSourceSubscriber(resource, worker);
       expect(() => mesh.retire(worker)).not.toThrow();
       expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The wedged-holder case that motivated the ancestor path: a child that
+    // opened a PR is mechanically subscribed to it and will never unsubscribe
+    // itself if it has stopped responding. Its parent must still be able to
+    // retire it — explicitly, by disposing of the subscription first, never by
+    // a flag or as a side effect of retire().
+    it("lets the parent dispose of a wedged child's direct subscription, then retire it (#540)", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/12";
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", "root", "root");
+      mesh.addEventSourceSubscriber(pr, child, child);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      expect(() => mesh.retire(child, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(child)?.status).toBe("active");
+
+      // A peer of the parent has no say over the child's subscription.
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      expect(() => mesh.removeEventSourceSubscriber(pr, child, peer)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+
+      mesh.removeEventSourceSubscriber(pr, child, parent);
+      expect(mesh.retirementBlockers(child).subscriptions).toEqual([]);
+      expect(() => mesh.retire(child)).not.toThrow();
+      expect(registry.get(child)?.status).toBe("retired");
     });
 
     it("enumerates multiple subscriptions (ownership and direct) and requires disposing all", () => {

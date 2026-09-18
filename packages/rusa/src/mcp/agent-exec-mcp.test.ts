@@ -1004,7 +1004,8 @@ describe("agent-execution MCP server", () => {
           "or the owner above it reclaims it (reclaim_event_source)"
       );
       expect(message).toContain(
-        "[subscription]: the holder unsubscribes (unsubscribe_event_source)"
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+          "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder)"
       );
       expect(registry.get(worker)?.status).toBe("active");
 
@@ -1094,6 +1095,94 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(retired.isError).toBeFalsy();
       expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The parent-side disposition for a [subscription] blocker: a child that
+    // opened a PR holds a mechanical direct subscription to it, and if the
+    // child has wedged nobody else could clear it. Its ancestor names the
+    // holder in `thread_id`; a non-ancestor is refused; nothing is retired
+    // until the disposition has happened.
+    it("retire_thread succeeds after the parent unsubscribes a wedged child's direct subscription by thread_id (#540)", async () => {
+      const { mesh, registry } = setup({ configuredEventSources: ["github:test-org/test-repo"] });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const peer = mesh.spawn({
+        charter: "peer",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, "root"));
+      const peerClient = await connect(createAgentExecMcpServer(mesh, peer, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      // What mechanicallySubscribeCreatedResource leaves behind when the child opens a PR.
+      mesh.addEventSourceSubscriber("github:test-org/test-repo/pulls/12", child, child);
+
+      const refused = (await parentClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: child, force: true },
+      })) as CallToolResult;
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain(
+        `github:test-org/test-repo/pulls/12 [subscription] held by ${child}`
+      );
+      expect(String(dataOf(refused))).toContain(
+        "unsubscribe_event_source with thread_id set to the holder"
+      );
+
+      // A non-ancestor cannot dispose of it.
+      const peerRefused = (await peerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: child },
+      })) as CallToolResult;
+      expect(peerRefused.isError).toBe(true);
+      expect(String(dataOf(peerRefused))).toContain(
+        "you can only unsubscribe yourself or your own descendant threads"
+      );
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.actorId)).toEqual([child]);
+
+      // Nor can anyone name a thread that does not exist.
+      const unknown = (await parentClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: "ghost" },
+      })) as CallToolResult;
+      expect(unknown.isError).toBe(true);
+      expect(String(dataOf(unknown))).toContain("unknown thread id: ghost");
+
+      const disposed = (await parentClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: child },
+      })) as CallToolResult;
+      expect(disposed.isError).toBeFalsy();
+      expect(String(dataOf(disposed))).toBe(
+        `unsubscribed ${child} from github:test-org/test-repo/pulls/12`
+      );
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+
+      const retired = (await parentClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: child },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(child)?.status).toBe("retired");
+
+      // The grandparent's authority reaches the same subtree; the root's own
+      // subscriptions are untouched by any of this.
+      expect(registry.get(parent)?.status).toBe("active");
+      const rootRetired = (await rootClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: parent },
+      })) as CallToolResult;
+      expect(rootRetired.isError).toBeFalsy();
     });
   });
 
