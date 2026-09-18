@@ -71,10 +71,14 @@ export interface DiskUsageAlertDeps {
   now: () => number;
 }
 
+/**
+ * The disk sensor's inbox payload. Scheduling priority is not part of it: the
+ * host wiring states `priority: "responsive"` on the raw timer event, which is
+ * the only field the row and the wake read.
+ */
 export interface SystemDiskEvent {
   [key: string]: unknown;
   type: "system.disk";
-  priority: "responsive";
   volume: string;
   freeBytes: number;
   freePercent: number;
@@ -135,7 +139,6 @@ export class DiskUsageAlert {
         const message = `⚠️ **Disk Usage Alert** ⚠️\nVolume \`${volume}\` is running low on space.\n- Free Space: ${freeGb} GB (${freePercent.toFixed(1)}%)\n- Threshold: ${thresholdStr}`;
         await this.emit({
           type: "system.disk",
-          priority: "responsive",
           volume,
           freeBytes,
           freePercent,

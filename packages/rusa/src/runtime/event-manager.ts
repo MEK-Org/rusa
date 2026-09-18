@@ -107,6 +107,10 @@ export interface RawChatIntegrationEvent extends RawEventMetadata {
 /** Timer ingress already owns a canonical payload; EventManager adds routing and durability. */
 export interface RawTimerIntegrationEvent extends RawEventMetadata {
   sourceType: "timer";
+  /**
+   * The row's payload. Scheduling metadata lives on the raw event, not here:
+   * a `priority` inside this object is dropped by normalization.
+   */
   rawPayload: InboxPayload;
 }
 
