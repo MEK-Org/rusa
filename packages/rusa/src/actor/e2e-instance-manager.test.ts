@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -208,6 +209,52 @@ describe("E2EInstanceManager", () => {
     expect(existsSync(flutterToolState)).toBe(false);
     if (launch?.args.includes("/run/user")) {
       expect(launch.args).toEqual(expect.arrayContaining(["--tmpfs", "/run/user"]));
+    }
+  });
+
+  it("projects the configured coordinator socket into the one E2E instance", async () => {
+    const socketPath = join(root, "rusa-quota-coordinator.sock");
+    const coordinatorDatabasePath = join(root, "rusa-quota-coordinator.db");
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(coordinatorDatabasePath, "coordinator-owned database");
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        `    databasePath: ${coordinatorDatabasePath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await manager().up("actor-a", actorWorktree);
+      const launch = calls.find((call) => call.file === "systemd-run");
+      expect(launch?.args).toEqual(expect.arrayContaining(["--ro-bind", socketPath, socketPath]));
+      expect(launch?.args).not.toContain(coordinatorDatabasePath);
+    } finally {
+      manager().down("actor-a");
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 

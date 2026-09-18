@@ -24,6 +24,7 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import { ProviderPacer } from "../actor/provider-pacer.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
@@ -39,6 +40,8 @@ import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
+import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
+import { SharedQuotaStore } from "../quota/shared-store.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
@@ -708,6 +711,92 @@ describe("runStart webhook event routing (Phase 4)", () => {
       startDashboardServerSpy.mockRestore();
       getHistorySpy.mockRestore();
       getQuotaSpy.mockRestore();
+    }
+  });
+
+  it("criterion 12a: the single E2E instance boots and applies the coordinator interval to its real pacer", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const store = new SharedQuotaStore(join(homeDir, "coordinator.db"));
+    const scrapedAt = new Date().toISOString();
+    const resetAtIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+    const state = {
+      provider: "claude",
+      status: "available" as const,
+      scrapedAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly" as const,
+          percentLeft: 50,
+          resetAtIso,
+          scope: { provider: "claude" },
+        },
+      ],
+    };
+    store.configureController({ maxIntervalSeconds: 3600 });
+    const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+    store.recordParsed(id, state, state);
+    store.advancePendingController({ maxIntervalSeconds: 3600 });
+    const publishedInterval = store.getProviderThrottle("claude")?.intervalSeconds;
+    if (publishedInterval === undefined) throw new Error("expected a published claude interval");
+
+    const coordinator = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+    const pacers = new Set<ProviderPacer>();
+    const originalSetInterval = ProviderPacer.prototype.setInterval;
+    const setInterval = vi
+      .spyOn(ProviderPacer.prototype, "setInterval")
+      .mockImplementation(function (this: ProviderPacer, intervalMs: number) {
+        pacers.add(this);
+        originalSetInterval.call(this, intervalMs);
+      });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { claude: { cliCommand: "claude" } },
+        rootActor: { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: {
+          coordinator: { socketPath },
+          throttle: { enabled: true },
+        },
+      }),
+      "utf8"
+    );
+
+    try {
+      await coordinator.start();
+      let appliedInterval: number | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              appliedInterval = handles.coordinatorAppliedInterval("claude");
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      expect(appliedInterval).toBe(publishedInterval);
+      expect(pacers).toHaveLength(1);
+      expect([...pacers][0]?.interval).toBe(publishedInterval * 1_000);
+      expect(setInterval).toHaveBeenCalledWith(publishedInterval * 1_000);
+
+      // This is deliberately not a spacing test. The single-home E2E path proves
+      // publication reaches one instance; v1 leaves launch clocks per process.
+      // Do not assert a union of start timestamps against this interval (§1.5, §11).
+    } finally {
+      setInterval.mockRestore();
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await coordinator.stop();
+      store.close();
     }
   });
 

@@ -114,6 +114,28 @@ describe("buildE2EConfig", () => {
     expect(config.voice).toBeUndefined();
   });
 
+  it("carries only the coordinator client settings into one E2E instance", () => {
+    const base = {
+      quota: {
+        databasePath: "/tmp/rusa-e2e-fixture/legacy-quota.db",
+        coordinator: {
+          socketPath: "/run/user/1000/rusa-quota-coordinator.sock",
+          databasePath: "/tmp/rusa-e2e-fixture/coordinator-owned.db",
+        },
+        throttle: { enabled: true, maxIntervalSeconds: 1800, tickSeconds: 30 },
+      },
+    } as unknown as RusaConfig;
+
+    const config = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: base });
+
+    expect(config.quota).toEqual({
+      coordinator: { socketPath: "/run/user/1000/rusa-quota-coordinator.sock" },
+      throttle: { enabled: true, maxIntervalSeconds: 1800, tickSeconds: 30 },
+    });
+    expect(config.quota).not.toHaveProperty("databasePath");
+    expect(config.quota?.coordinator).not.toHaveProperty("databasePath");
+  });
+
   it("retains credential-valid Google voice config while omitting disabled ElevenLabs provider config", () => {
     const googleVoice = {
       label: "Puck",

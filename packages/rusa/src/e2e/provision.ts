@@ -92,6 +92,17 @@ export function buildE2EConfig(opts: {
     webhook: { port: 0, secret: "" },
     dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
     understanding: { rootNodeId: E2E_IU_ROOT_NODE_ID },
+    // An E2E instance is a coordinator client, never a second database owner.
+    // Keep the one socket and pacing settings it needs, while excluding both
+    // the legacy and coordinator-owned database paths from its configuration.
+    ...(base?.quota?.coordinator?.socketPath
+      ? {
+          quota: {
+            coordinator: { socketPath: base.quota.coordinator.socketPath },
+            ...(base.quota.throttle ? { throttle: base.quota.throttle } : {}),
+          },
+        }
+      : {}),
     // Capture full prompts/transcripts so an agent can inspect what happened.
     invocationDebug: { enabled: true },
   };

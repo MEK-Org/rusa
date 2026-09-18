@@ -13,6 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { loadConfig } from "../config/index.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
@@ -89,6 +90,23 @@ function ensureMountTarget(source: string, target: string): void {
   }
   mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   if (!existsSync(target)) writeFileSync(target, "", { mode: 0o600 });
+}
+
+function configuredCoordinatorSocketPath(configPath: string): string | undefined {
+  try {
+    const socketPath = loadConfig(dirname(configPath)).quota?.coordinator?.socketPath;
+    return socketPath && isAbsolute(socketPath) ? socketPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isSocket(path: string): boolean {
+  try {
+    return statSync(path).isSocket();
+  } catch {
+    return false;
+  }
 }
 
 function parseSystemdStatus(output: string): E2EInstanceLiveStatus {
@@ -451,6 +469,15 @@ export class E2EInstanceManager {
     if (hasBaseConfig) {
       ensureMountTarget(configSource, configTarget);
       args.push("--ro-bind", realpathIfExists(configSource), configTarget);
+      // The disposable instance receives the parent configuration as a client.
+      // Project only its configured coordinator socket back through the masked
+      // runtime tree; its databases remain host-only and are deliberately not
+      // part of the E2E instance's view.
+      const coordinatorSocketPath = configuredCoordinatorSocketPath(configSource);
+      if (coordinatorSocketPath && isSocket(coordinatorSocketPath)) {
+        ensureTargetParentDirs(args, coordinatorSocketPath);
+        args.push("--ro-bind", realpathIfExists(coordinatorSocketPath), coordinatorSocketPath);
+      }
       // Carry exactly the LLM keys the nested instance always received — the
       // parent-grantable allow-list (#542) — never the whole secrets directory:
       // webhook secrets and service passwords stay on the host. Each key passes
