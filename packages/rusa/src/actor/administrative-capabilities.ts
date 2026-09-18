@@ -10,9 +10,11 @@ import type { CapabilityGrantStore } from "./capability-grants.js";
  * others. Topology (`parentId === null`), the `isRoot` record flag, and the
  * literal `root` address grant none of these.
  *
- * Every capability below is scoped to the holder's own subtree (itself
- * included) wherever the operation names a target actor; the mesh enforces that
- * boundary, not the tool layer alone.
+ * Every operation that names a target actor is scoped to the holder's own
+ * subtree (itself included); the mesh enforces that boundary, not the tool
+ * layer alone. The few surfaces with no subtree to scope to — the daemon
+ * itself and the mesh-global model-class registry — are host-global and are
+ * never granted through the mesh (see {@link HOST_GLOBAL_CAPABILITIES}).
  */
 
 /** Grant or revoke any grantable capability within the holder's subtree, and inspect the grant ledger. */
@@ -22,15 +24,19 @@ export const CAPABILITY_ADMIN_CAPABILITY = "capability-admin";
 export const EXPERIMENT_ADMIN_CAPABILITY = "experiment-admin";
 
 /**
- * Replace the model pool of any actor in the holder's subtree (the holder
- * itself included) and manage the runtime model-class registry.
+ * Administer the host's model policy: the runtime model-class registry, which
+ * is mesh-global (a class edit reaches every future spawn or model change on
+ * the host), plus replacing the model pool of any actor in the holder's
+ * subtree, itself included. The registry half is what makes this host-global
+ * (see {@link HOST_GLOBAL_CAPABILITIES}); the per-actor half adds only "self"
+ * over the parent path every ancestor already has.
  */
 export const MODEL_ADMIN_CAPABILITY = "model-admin";
 
 /**
  * Lifecycle management of actors in the holder's subtree — revive, re-title,
- * re-charter, reparent — plus the mesh-wide inspection and wake-schedule tools
- * that have no per-actor target.
+ * re-charter, reparent, schedule wakes — plus the inspection reads over that
+ * same subtree (wakes, event-source ownership and subscriptions).
  */
 export const ACTOR_ADMIN_CAPABILITY = "actor-admin";
 
@@ -47,16 +53,28 @@ export const ADMINISTRATIVE_CAPABILITIES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Host/process maintenance is a grantable MCP server like any other: the
+ * Host/process maintenance is an MCP server like any other grantable one: the
  * capability name is the server name, and the composition point mounts the
- * server for whichever actor holds the grant. Unlike the administrative
- * capabilities it is NOT delegable — it acts on the whole daemon, so the
- * subtree boundary cannot bound it; the mesh lets a holder hold, revoke and
- * restore it on itself but never grant it to another actor.
+ * server for whichever actor holds the row. Both are host-global (below).
  */
 export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
   UPDATE_MCP_NAME,
   PNPM_HARDLINKS_MCP_NAME,
+]);
+
+/**
+ * Capabilities that act on the whole host rather than on a subtree of actors:
+ * restarting or relinking the daemon, and editing the mesh-global model-class
+ * registry. The subtree boundary that bounds every other delegation cannot
+ * bound these, so the mesh never grants one — not downward, and not to the
+ * grantor itself, which is the path by which a delegated `capability-admin`
+ * holder would otherwise widen into host authority. Only the bootstrap seed
+ * (or a direct row) creates one; a holder may revoke it from itself, and that
+ * revocation is deliberately one-way from inside the mesh.
+ */
+export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
+  MODEL_ADMIN_CAPABILITY,
+  ...HOST_MAINTENANCE_CAPABILITIES,
 ]);
 
 /**
@@ -70,11 +88,14 @@ export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
 ];
 
 /**
- * The bootstrap set this boot can actually stand behind: every administrative
- * capability (they gate tools on the agent-exec endpoint, which always exists)
- * plus only those host-maintenance servers the wiring managed to build. A host
- * whose deploy checkout can't be resolved boots without `update`, and a seeded
- * grant with no server behind it would read as authority that does nothing.
+ * The subset of the bootstrap set whose FIRST insertion this boot should
+ * perform: every administrative capability (they gate tools on the agent-exec
+ * endpoint, which always exists) plus only those host-maintenance servers the
+ * wiring managed to build, so a host whose deploy checkout can't be resolved
+ * never gets an `update` row written on its behalf. This governs insertion
+ * only. Seeding is non-destructive by design, so a row seeded by an earlier
+ * boot stays active on a later boot that cannot mount its server; that row is
+ * inert until the server is mountable again.
  */
 export function bootstrapCapabilitiesFor(mountable: ReadonlySet<string>): string[] {
   return CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.filter(

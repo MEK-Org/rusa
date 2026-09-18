@@ -10,6 +10,7 @@ import {
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
+  HOST_GLOBAL_CAPABILITIES,
   HOST_MAINTENANCE_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
@@ -164,24 +165,39 @@ describe("capability administration is grant-derived", () => {
     expect(mesh.hasActiveCapability("steward-child", EXPERIMENT_ADMIN_CAPABILITY)).toBe(false);
   });
 
-  // Host maintenance (`update`, `pnpm-hardlinks`) acts on the whole daemon, so
-  // the subtree boundary that bounds every other delegation cannot bound it. A
-  // holder may hold, revoke and re-grant it to itself; it may not hand it down.
-  it("refuses to delegate a host-maintenance capability below the holder", async () => {
+  // Host-global capabilities (`update`, `pnpm-hardlinks`, `model-admin`) act on
+  // the whole daemon, so the subtree boundary that bounds every other
+  // delegation cannot bound them. The mesh never grants one — not downward,
+  // and not to the grantor itself — so a delegated `capability-admin` holder
+  // cannot widen itself into host authority; only the bootstrap seed (or a
+  // direct row) creates one, and a revocation is deliberately one-way.
+  it("never grants a host-global capability through the mesh, even to a capability-admin holder itself", async () => {
     const { grants, mesh } = setup();
     seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
-    for (const capability of HOST_MAINTENANCE_CAPABILITIES) {
+    mesh.grantCapability("0b2c3d4e-steward", CAPABILITY_ADMIN_CAPABILITY, "configured");
+    for (const capability of HOST_GLOBAL_CAPABILITIES) {
+      // Downward from the seeded holder.
       expect(() => mesh.grantCapability("0b2c3d4e-steward", capability, "configured")).toThrow(
-        /not delegable/
+        /host-global/
       );
+      // The delegated holder granting to itself — the escalation path.
+      expect(() =>
+        mesh.grantCapability("0b2c3d4e-steward", capability, "0b2c3d4e-steward")
+      ).toThrow(/host-global/);
       expect(mesh.hasActiveCapability("0b2c3d4e-steward", capability)).toBe(false);
+      // A holder revoking from itself works, and cannot re-grant afterwards.
+      expect(mesh.hasActiveCapability("configured", capability)).toBe(true);
+      await mesh.revokeCapability("configured", capability, "configured");
+      expect(mesh.hasActiveCapability("configured", capability)).toBe(false);
+      expect(() => mesh.grantCapability("configured", capability, "configured")).toThrow(
+        /host-global/
+      );
     }
-    // Revoking from itself and restoring to itself stays possible, so a
-    // revocation is not a one-way door that only a database edit reopens.
-    await mesh.revokeCapability("configured", "update", "configured");
-    expect(mesh.hasActiveCapability("configured", "update")).toBe(false);
-    expect(() => mesh.grantCapability("configured", "update", "configured")).not.toThrow();
-    expect(mesh.hasActiveCapability("configured", "update")).toBe(true);
+    // A wiring that lists a host-global name as grantable does not widen this:
+    // the mesh strips it, so the allow-list it reports never advertises one.
+    expect(() =>
+      mesh.grantCapability("steward-child", "understanding-write", "0b2c3d4e-steward")
+    ).not.toThrow();
   });
 });
 

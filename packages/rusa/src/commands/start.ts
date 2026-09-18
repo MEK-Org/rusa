@@ -2156,7 +2156,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     // #549: the administrative capabilities gate the management tools on the
     // agent-exec endpoint itself, so they have no server factory either; the
-    // mesh and the endpoint both consult the grant rows directly.
+    // mesh and the endpoint both consult the grant rows directly. The
+    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`)
+    // are stripped by the mesh: it never grants one, and only the seed below
+    // creates their rows.
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,

@@ -865,11 +865,14 @@ export function createAgentExecMcpServer(
   // a revocation fails closed on an already-open session. Topology (`isRoot`,
   // a null parent, the configured root id) plays no part: a capable opaque-id
   // actor gets exactly the same tools, and an ungranted parentless actor gets
-  // none. Every tool below is further confined to the caller's own subtree
-  // (self included): a write naming a target actor is refused outside it, and
-  // an inspection read returns only the rows whose actor lies inside it — the
-  // same scoping the mesh applies to grants, experiments and model changes, so
-  // delegating a capability down a tree never widens what its holder can see.
+  // none. Every tool below that touches actors is further confined to the
+  // caller's own subtree (self included): a write naming a target actor is
+  // refused outside it, and an inspection read returns only the rows whose
+  // actor lies inside it — the same scoping the mesh applies to grants,
+  // experiments and model changes, so delegating a capability down a tree
+  // never widens what its holder can see. The model-class registry has no
+  // subtree to scope to; that is why `model-admin` is host-global and never
+  // granted through the mesh (see HOST_GLOBAL_CAPABILITIES).
   const holds = (capability: string) => mesh.hasActiveCapability(selfId, capability);
   const assertCapability = (capability: string) =>
     holds(capability)
@@ -1243,6 +1246,17 @@ export function createAgentExecMcpServer(
           if (hasResource) {
             const resource = parseEventResource(args, "inspection");
             const effectiveRoute = mesh.resolveEffectiveRoute(resource);
+            // The route names the governing principal. An actor outside the
+            // caller's subtree is refused, not projected, so probing sources
+            // one by one cannot recover what the row lists above withhold. A
+            // non-actor principal (a human obligation owner) or an uncovered
+            // source is not subtree state and stays answerable.
+            const { principal } = effectiveRoute;
+            if (principal && mesh.actors.get(principal) && !inSubtree(principal)) {
+              throw new Error(
+                `${selfId} may only inspect routes governed inside its own subtree (${resourceKey(resource)} is governed outside it; ${ACTOR_ADMIN_CAPABILITY} is subtree-scoped)`
+              );
+            }
             return toolOk({
               owners,
               subscribers,

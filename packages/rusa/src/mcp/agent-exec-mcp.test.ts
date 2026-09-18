@@ -526,6 +526,17 @@ describe("administrative capability gating of management tools (#549)", () => {
     }
     mesh.subscribeEventSource("github:inside-org", "steward-child", "0b2c3d4e-steward");
     mesh.subscribeEventSource("github:outside-org", "sibling", "root");
+    // Live subscribers, so the resource-specific route below resolves to a
+    // governing principal (a dead subscription yields to uncovered).
+    const modelConfig = { provider: "claude", model: "claude-sonnet-5" };
+    const liveInside = mesh.spawn({
+      charter: "live inside",
+      parentId: "0b2c3d4e-steward",
+      modelConfig,
+    });
+    const liveOutside = mesh.spawn({ charter: "live outside", parentId: "sibling", modelConfig });
+    mesh.subscribeEventSource("github:inside-org/live", liveInside, "0b2c3d4e-steward");
+    mesh.subscribeEventSource("github:outside-org/live", liveOutside, "root");
     const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
 
     const grants = dataOf(
@@ -551,8 +562,34 @@ describe("administrative capability gating of management tools (#549)", () => {
     const subscriptions = dataOf(
       (await client.callTool({ name: "list_subscriptions", arguments: {} })) as CallToolResult
     ) as { owners: { actorId: string }[]; subscribers: { actorId: string }[] };
-    expect(subscriptions.owners.map((o) => o.actorId)).toEqual(["steward-child"]);
+    expect(subscriptions.owners.map((o) => o.actorId)).toEqual(["steward-child", liveInside]);
     expect(subscriptions.subscribers.every((s) => s.actorId !== "sibling")).toBe(true);
+
+    // The resource-specific route is the same lens: a source whose governing
+    // principal lies inside the subtree is projected; one governed outside it
+    // is refused rather than naming the outside principal.
+    const insideRoute = dataOf(
+      (await client.callTool({
+        name: "list_subscriptions",
+        arguments: { source: "github:inside-org/live" },
+      })) as CallToolResult
+    ) as { effectiveRoute: { principal: string | null } };
+    expect(insideRoute.effectiveRoute.principal).toBe(liveInside);
+    const outsideRoute = (await client.callTool({
+      name: "list_subscriptions",
+      arguments: { source: "github:outside-org/live" },
+    })) as CallToolResult;
+    expect(outsideRoute.isError).toBe(true);
+    expect(dataOf(outsideRoute)).toMatch(/subtree/);
+    expect(dataOf(outsideRoute)).not.toMatch(liveOutside);
+    // An uncovered source has no principal to protect and is still answerable.
+    const uncovered = dataOf(
+      (await client.callTool({
+        name: "list_subscriptions",
+        arguments: { source: "github:nobody-org" },
+      })) as CallToolResult
+    ) as { effectiveRoute: { principal: string | null } };
+    expect(uncovered.effectiveRoute.principal).toBeNull();
   });
 
   it("a second boot leaves a revoked seed revoked and mounts none of its tools", async () => {

@@ -76,11 +76,12 @@ export interface GrantableServerDeps {
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
   /**
    * Host-maintenance servers (#549). Formerly mounted on the configured root's
-   * tool set by id; now ordinary grantable capabilities named after their
-   * servers (`update`, `pnpm-hardlinks`), so a grant row — not topology — is
-   * what puts them on an actor's endpoint. Each is registered only when its
-   * deps are wired (the update tool is best-effort: it needs a resolvable
-   * deploy checkout).
+   * tool set by id; now capabilities named after their servers (`update`,
+   * `pnpm-hardlinks`), so a grant row — not topology — is what puts them on
+   * an actor's endpoint. They are host-global: the mesh never grants one (see
+   * `HOST_GLOBAL_CAPABILITIES`); only the bootstrap seed creates the row. Each
+   * is registered only when its deps are wired (the update tool is
+   * best-effort: it needs a resolvable deploy checkout).
    */
   hostMaintenance?: {
     /**

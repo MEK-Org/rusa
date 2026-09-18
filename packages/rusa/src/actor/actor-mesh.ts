@@ -45,7 +45,7 @@ import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./act
 import {
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
-  HOST_MAINTENANCE_CAPABILITIES,
+  HOST_GLOBAL_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
 } from "./administrative-capabilities.js";
 import {
@@ -918,7 +918,12 @@ export class ActorMesh {
     this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
-    this.grantable = opts.grantableCapabilities ?? new Set();
+    // A host-global capability is never grantable through the mesh (#549), so
+    // a wiring that lists one — the maintenance servers are registered like
+    // any other grantable server — neither advertises nor grants it here.
+    this.grantable = new Set(
+      [...(opts.grantableCapabilities ?? [])].filter((cap) => !HOST_GLOBAL_CAPABILITIES.has(cap))
+    );
     this.secretsDir = opts.secretsDir ?? secretsDirPath();
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
@@ -2067,7 +2072,8 @@ export class ActorMesh {
   /**
    * Grantor authorization for {@link grantCapability}/{@link revokeCapability}.
    * A `capability-admin` holder may grant/revoke anything grantable within its
-   * own subtree (itself included). Any other grantor may only touch
+   * own subtree (itself included); a host-global capability is refused before
+   * this runs, for every grantor. Any other grantor may only touch
    * capabilities in {@link PARENT_GRANTABLE_CAPABILITIES} and only where the
    * grantee is its DIRECT child (the repository's `parentId` edge). Enforced
    * HERE — the mesh layer — not just at the tool layer, so the invariant holds
@@ -2087,18 +2093,6 @@ export class ActorMesh {
       if (!this.isAncestorOf(grantorId, granteeId)) {
         throw new Error(
           `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
-        );
-      }
-      // Host maintenance acts on the whole daemon, so the subtree boundary that
-      // bounds every other delegation cannot bound it: a holder may hold it
-      // (and revoke/restore it on itself) but never hand it to another actor.
-      if (
-        verb === "grant" &&
-        HOST_MAINTENANCE_CAPABILITIES.has(capability) &&
-        grantorId !== granteeId
-      ) {
-        throw new Error(
-          `${capability} is not delegable: it acts on the whole host, so ${grantorId} may hold it but not grant it to ${granteeId}`
         );
       }
       return;
@@ -2185,6 +2179,16 @@ export class ActorMesh {
     if (capability === "secret" || capability === "secret:") {
       throw new Error(
         `bare secret grant is not allowed; must specify a secret filename (e.g. secret:gemini-api-key)`
+      );
+    }
+    // A host-global capability (`update`, `pnpm-hardlinks`, `model-admin`)
+    // acts on the whole daemon, so no subtree bound can contain a grant of it:
+    // refused for every grantor, the grantee itself included — the self-grant
+    // is exactly how a delegated capability-admin holder would otherwise widen
+    // into host authority. Only the bootstrap seed creates such a row (#549).
+    if (HOST_GLOBAL_CAPABILITIES.has(capability)) {
+      throw new Error(
+        `${capability} is host-global and is never granted through the mesh; only the bootstrap seed creates it, and a revocation is one-way`
       );
     }
     // One rule: the BASE must be grantable (`secret` for every `secret:<file>`).
