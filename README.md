@@ -1,322 +1,324 @@
-# rusa
+# Rusa
 
-> An autonomous coding colleague — **one identity, many threads**.
+Rusa is an open-source autonomous agent system designed to handle high-level
+complex tasks. It integrates with various tools and knowledge sources to provide
+a virtual assistant that can do just about anything a human with a computer
+could do.
 
-rusa is a single, persistent engineering agent that lives alongside your
-repositories. You talk to it the way you'd talk to a teammate — over GitHub
-(issues, PRs, review comments) and Google Chat — and it triages, reasons, writes
-code, and reports back in its own voice. Behind that single identity, work is
-**sharded across a self-similar mesh of actor threads** so the system can run
-many tasks concurrently without ever blowing a single context window or
-serializing everything through one session.
+![An actor's inbox page: outstanding and resolved inbox signals on the left, ready and waiting obligations on the right](packages/rusa/flutter_dashboard/screenshots/actor_inbox.png)
 
-The guiding idea: **identity is singular; execution is sharded.** You always talk
-to "rusa," but under the hood a thin *root* actor handles conversation and
-triage and delegates heavy or parallel work to *worker* actors — each its own
-focused process with its own working memory and tools.
+*An actor's inbox page. This is a high-level overview of the work on an
+actor's plate.*
 
-The full rationale and target shape live in
-[`devlog/2026-06-15-actor-mesh/design.md`](devlog/2026-06-15-actor-mesh/design.md).
+- New here? Start with the [Quick Start](docs/quickstart.md): it builds and
+  boots a local Docker instance and walks you through provider sign-in.
+- Working on the code? Read [`agent.md`](agent.md) for the repo conventions
+  and quality gates, and [Contributing](#contributing) below.
 
-For a guide to running and configuring a local Docker quickstart container, see the [Quick Start Guide](docs/quickstart.md).
+## Vision
 
-For optional Google login through Firebase with shared human access, see [Dashboard authentication](docs/dashboard-auth.md).
+The vision for Rusa is that it should feel like working with a super-human
+colleague. You should be able to interact with it in all of the surfaces that
+you would normally with a human (gChat, GitHub, email, etc). You don't create new
+separate chats, you just have a DM with them (You can if you want though!). You
+don't have to worry about context, the system has enough context from your chats
+to determine how to effectively split that up.
 
----
+## Approach
 
-## Core Architecture
+There's a few different aspects to our approach that I'll break down separately:
 
-Everything the agent touches is exposed as an **MCP server**, and every thread —
-root or worker — is the same `Actor` class differing only in configuration. This
-self-similarity is what makes the mesh easy to reason about: there is no special
-"orchestrator → worker" machinery, only actors messaging actors.
+- [Actors](#actors)
+- [Inbox and Event Sources](#event-sources-and-actor-inboxes)
+- [Providers and Models](#providers-and-models)
+- [Quota](#quota)
+- [Obligations](#obligations)
+- [Dashboard](#dashboard)
 
-```
-   Humans (GitHub webhooks / Google Chat)        ← the root's "parent"
-        │  inbound messages wake the root
-        ▼
-   ┌──────────────┐   working memory: one continued, compacting session
-   │  ROOT actor  │   voice + triage + routing (thin, cheap model by default)
-   └──────┬───────┘
-          │ mesh MCP: spawn_thread / send_message
-   ┌──────┼───────────────┬───────────────────┐
-   ▼      ▼               ▼                     ▼
- worker  worker         worker   …            worker   ← each: deep + narrow,
- (charter A)            (charter B)                       its own session + tools
-          │ (a worker may spawn its own sub-workers — same primitive)
-          ▼
-        sub-worker
+## Actors
 
-   Shared, orthogonal to the tree:
-     • tracker-MCP (gh) / chat-MCP (gchat)  — the facts, re-derived each wake
-     • actor repository (durable, SQLite)   — the org chart of live actors
-     • firehose                             — every actor's raw streamed output
-```
+The fundamental building block of Rusa is the agents, which we refer to as
+"actors". We intentionally use this word to distinguish it from agents because
+they're different from traditional ideas of agents in a few important ways. But
+first let's talk generally about what an actor is.
 
-### Root Actor
+At bottom, an actor is just one continuous thread of conversation with a coding
+CLI (Codex, Claude Code, etc) and a workspace. The CLI is invoked in headless
+mode and is given a prompt. One "run" is the CLI running to completion and
+producing a specific output. The next time the CLI is invoked, the previous
+session is reused so the actor maintains its local context across restarts.
 
-The **root** is the single human-facing identity. It is deliberately *thin and
-cheap*: its job is conversation, triage, and routing — not swinging the hammer.
+The most important difference between traditional ideas of agents and Rusa's
+actors is identity. Every actor is given a human-facing handle (by default we
+use the actor's UUID to generate a random adjective and animal (e.g.
+cloudy-porpoise), and we generate an actor's image to match). We've found that
+the typical experience of coding with a CLI can be frustrating because it's easy
+to lose track of what part of the code was implemented in which coding session.
+By establishing a strong concept of actor identity, you retain the ability to
+know which actor implemented which feature and ask it to explain why it went
+about something in a specific way.
 
-- It **wakes on inbound events** — a GitHub webhook or a Google Chat
-  message/@mention — and is told only *why* it woke, never handed the raw
-  payload. It re-derives current state from its tools every time.
-- It runs a **continued, compacting provider session** as working memory, so it
-  keeps situational awareness across wakes without an ever-growing context. The
-  session is a *losable cache* — lose it and the root re-derives from the facts
-  (tracker/chat) and its long-term library.
-- It either **does light work itself** (real `git`/`gh`) or **delegates** to
-  worker actors via the mesh MCP, then narrates what's happening.
-- An **hourly safety-net sweep** wakes it to catch anything missed between
-  events. **Self-authored events are suppressed** so the bot never triggers
-  itself into a loop.
+A Rusa instance starts with a single actor which we refer to as the "root"
+actor. As you start to use the system more, you may find certain, well-defined
+topics that you are talking to your root actor about. At that point it may be
+beneficial to create new actors underneath the root actor so you can keep the
+responsibilities of your actors clear and your actors can start to specialize in
+a particular domain.
 
-The root's behavior is shaped by its **charter** (see
-[`root-prompt.ts`](packages/rusa/src/actor/root-prompt.ts)), which an
-instance can override via `rootActor.charter` in config.
+### The actor tree
 
-### Worker Threads
+Actors form a tree. Every actor except the root has a parent, and every actor is
+backed by a durable **actor repository record** (charter, parent, provider and
+model, session handle, status). That record is the one piece of state that
+can't be re-derived from the humans' tools, and it is what lets the mesh
+reconstitute "who's working on what" after a restart. See
+[`actor-repository.ts`](packages/rusa/src/repositories/actor-repository.ts) and
+[`actor-record.ts`](packages/rusa/src/actor/actor-record.ts).
 
-A **worker** is spawned by the root (or by another worker) to own a specific
-**charter** — an authored brief, not a GitHub object. Scope is whatever the
-parent decides to delegate: "answer this one chat question," or "drive the auth
-refactor across these PRs."
-
-Workers are the **same `Actor` loop as the root** — they differ only in
-configuration:
-
-- **Their own working-memory session**, tools, and (optionally) coding
-  **provider/model** — so the root can route a hard coding task to a stronger
-  harness while staying cheap itself.
-- They get the **tracker** and their **own mesh endpoint**, but *not* chat — only
-  the root talks to humans (conversation flows along tree edges).
-- They **report to their parent, not to humans.** Completion is the *parent's*
-  judgment: a worker may *propose* it's done, but the parent owns retirement
-  (and retiring a thread retires its whole subtree).
-Every actor is backed by a durable **actor repository record** (charter, parent,
-session handle, status) — the one piece of state that *can't* be
-re-derived from the humans' tools, and what lets the root reconstitute "who's
-working on what" after a restart. See
-[`actor-repository.ts`](packages/rusa/src/repositories/actor-repository.ts).
-
-### Concurrency Limiter
-
-Per-actor work is already serialized by each actor's **trigger runner**
-(debounce → single-flight → dirty-bit, ported from the proven ccbot loop). The
-only thing left to bound is *cross-actor* capacity, and that's the
-[`ConcurrencyLimiter`](packages/rusa/src/actor/concurrency-limiter.ts): a
-FIFO gate that lets at most `N` provider runs execute at once and queues the
-rest, starting them as slots free. Each actor wraps its provider run in this
-shared gate, so the whole mesh respects one global concurrency cap regardless of
-how many threads are live.
-
-### Host Scheduling
-
-One host scheduling subsystem owns every cron and `at` mutation. Recurring
-actor wakes live directly in the user's crontab. Obligation recurrence policy
-remains durable in SQLite and is reconciled into cron jobs or one-shot `at`
-activations. Scheduled sends are different: the complete, versioned message
-payload lives in the `at` job, so `atq` is the pending-message authority and
-there is no application pending-message table or restart re-arming pass.
-
-Host callbacks use the loopback MCP HTTP server and a file-backed bearer token.
-Scheduled-message callbacks retry for up to ten minutes and re-read the current
-ephemeral port on every attempt. Cron-backed features require `crontab` plus a
-running cron daemon; one-shot obligations and scheduled sends additionally
-require `at`, `atq`, `atrm`, and a running `atd`. Startup and the dashboard
-surface degraded prerequisites without preventing cron-only work from running.
-
----
-
-## Mesh Communication Primitives
-
-The entire mesh is built on **one primitive: "send a message to a thread."** It
-subsumes three things that would otherwise be separate verbs — `dispatch`,
-`postComment`, and `report` — into routing. These primitives are exposed to every
-actor as the **agent-execution ("mesh") MCP server**
-([`agent-exec-mcp.ts`](packages/rusa/src/mcp/agent-exec-mcp.ts)), with one
-server instance per actor and that actor's identity *baked in* — so "who is
-acting" is the unspoofable endpoint, not a tool argument the model fills in.
+Actors talk to the mesh through an in-process MCP server with the actor's
+identity baked in ([`agent-exec-mcp.ts`](packages/rusa/src/mcp/agent-exec-mcp.ts)),
+so "who is acting" is the endpoint, never a tool argument the model fills in.
+The core primitives:
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `model_config` is required and picks the harness/tier — one `{provider, model, effort?}` object, an ordered pool of them for a portable (`ledger`/`tail`) child tried earliest-available first, or `{class: "<name>"}` naming a [model class](#named-model-classes). There is no default model; the parent chooses. |
-| `send_message(thread_id, body)` | Deliver a message to a thread's inbox (parent, child, or an introduced peer). The recipient wakes, sees who it came from, and may reply *later* as a new message. **Always async.** |
-| `introduce(holder, target, role?)` | Grant `holder` a handle to `target` so it can message it directly (e.g. let a coder reach a reviewer). The id *is* the capability (object-capability style). |
-| `list_threads()` | List the children you've spawned, with charter summaries and status — your org chart for deciding what to follow up on or retire. |
-| `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. You may only retire your own descendants — completion is the parent's judgment. |
+| `spawn_thread(charter, model_config, …)` | Create a child actor with its own charter and session. You become its parent. Non-blocking: the child runs asynchronously. `model_config` is required; there is no default model. |
+| `send_message(thread_id, body)` | Deliver a message to another actor's inbox (parent, child, or an introduced peer). The recipient wakes on its own schedule and replies later as a new message. |
+| `introduce(holder, target, role?)` | Grant one actor a handle to another so they can message directly (for example, let a coder reach a reviewer). The id is the capability. |
+| `list_threads()` | List the actors you have spawned, with charter summaries and status. |
+| `retire_thread(thread_id)` | Mark a descendant (and its subtree) done and stop it. Only a parent can retire its descendants. |
+| `set_actor_model(actor_id, model_config)` | Replace a child's provider/model pool in place (parent or root only). Provider changes and multi-entry pools are only allowed for portable-context actors. |
 
-**Two rules make the mesh safe:**
+Two rules keep the mesh safe:
 
-1. **Ownership is a tree; messaging is a graph.** The `parentId` edge decides who
-   can retire whom. Communication follows *handles*, which can reach beyond the
-   parent.
-2. **Delegation is asynchronous.** A parent must *never block* waiting on a child
-   — it would waste a run and can deadlock the mesh. You fire a message and end
-   your turn; the reply arrives as a fresh wake.
+1. **Ownership is a tree; messaging is a graph.** The parent edge decides who can
+   retire whom. Messages follow handles, which can reach beyond the parent.
+2. **Delegation is asynchronous.** A parent never blocks waiting on a child. It
+   sends a message, ends its run, and the reply arrives as a fresh wake.
+
+Per-actor work is serialized by each actor's trigger runner (debounce,
+single-flight, dirty bit), and cross-actor capacity is bounded by one shared
+[`ConcurrencyLimiter`](packages/rusa/src/actor/concurrency-limiter.ts), so the
+whole mesh respects one global concurrency cap however many actors are live.
+Actor runs are sandboxed with **bubblewrap** (`apt install bubblewrap` on a
+host install); `rusa start` fails fast if the host can't sandbox.
+
+### Memory
+
+Rusa keeps three tiers of memory, deliberately separated:
+
+| Tier | Mechanism | Persistence |
+| --- | --- | --- |
+| **Working memory** | each actor's continued, compacting provider session | a losable cache |
+| **Long-term memory** | the understanding library (durable judgment and decisions) | durable, authoritative |
+| **Facts** | GitHub, Google Chat, and the other event sources | not ours; re-read each wake |
+
+Sessions are reconstructable. The only state Rusa durably owns is the
+long-term library, the actor repository, and the obligations described below.
+
+### Scheduling on the host
+
+Recurring actor wakes and obligation recurrence are reconciled into the host's
+`cron` and one-shot `at` jobs, and scheduled messages live entirely in the `at`
+queue. Host callbacks come back over the loopback MCP HTTP server with a
+file-backed bearer token. Cron-backed features need `crontab` and a running
+cron daemon; one-shot obligations and scheduled sends additionally need `at`,
+`atq`, `atrm`, and `atd`. Startup and the dashboard surface missing
+prerequisites without blocking cron-only work.
+
+## Event Sources and Actor Inboxes
+
+So we've described the concept of a "Run" but we haven't discussed the
+circumstances under which a run occurs. The system that governs actor runs is
+the actor's Inbox. It's really more of a notification system, than an inbox in
+the traditional sense. When an item comes into an actor's inbox that enqueues a
+run for that actor.
+
+Inbox items can come from several different places, including but not limited:
+
+- GitHub
+- gChat
+- Mesh Chat (the internal system for actors to message one another)
+
+For example, an actor can be subscribed to the event source:
+`github_issue:repo_owner/repo#1233`. If someone comments on that github issue,
+the actor will get an inbox item regarding that comment.
+
+Additionally, event sources are hierarchical. This means that an actor can be
+subscribed to `github_repo:repo_owner/repo`, or even `github_org:repo_owner`.
+Then (for specific events) if there is no actor subscribed to the specific
+issue, an actor subscribed to the github_repo would get that inbox item. That
+dovetails with the concept of "delegation" which means that if an actor owns a
+github_repo event source, they can assign ownership of a child event source,
+e.g. a github_issue, to another actor. It's worth calling out that the actor
+receiving the event source need not be a direct child or even a descendant of
+the delegating actor. In other words, an actor can delegate a child event
+source to a sibling or even a parent.
+
+In certain circumstances, an actor can automatically be delegated an event
+source, for example, an actor that opens a PR or an issue, is automatically
+delegated the corresponding event source.
+
+Pull requests have their own `github_pr:` sources, and Google Chat spaces are
+subscribed the same way (`gchat:spaces/…`). Inbox entries are durable: an actor
+reads them with the inbox MCP tools, marks them handled when it has acted, and
+unhandled entries survive restarts. GitHub events arrive over a webhook
+listener; there is no polling fallback. See
+[`event-subscriptions.ts`](packages/rusa/src/actor/event-subscriptions.ts) for
+the source grammar.
+
+## Providers and Models
+
+The "provider" corresponds with the CLI that is used to run the actor. The
+supported providers are Claude Code, Codex, Antigravity, and Kimi. Others may be
+added if necessary. Each enabled provider's vendor CLI is installed on the host
+and signed in with its own login flow; Rusa never stores provider API keys.
+Every actor created in the system must explicitly specify
+both a provider and a model. The system supports switching models within a
+provider, but, by default, it does not support switching providers. The reason
+for this relates to the preservation of context. By default, actors' context is
+managed by the provider's native session system. When switching models within a
+provider, context is preserved, but when switching across a provider, that
+context would be lost which violates the expectation of a continuous context
+across sessions.
+
+The exception to that rule is with "Portable Context" actors. This is still an
+experimental feature (let's be real, this whole project is one big experimental
+feature) but it involves the system itself managing the context. This means
+that the actor is not relying on the native session storage so it supports
+switching providers in addition to models.
+
+In code these are the actor's context modes: `native` (the provider's own
+session), and the portable `ledger` and `tail` modes. Only portable actors may
+carry a **pool** of `{provider, model, effort?}` entries, tried
+earliest-available first, or be moved across providers with `set_actor_model`.
 
 ### Named model classes
 
-Spelling out `{provider, model, effort}` at every `spawn_thread` couples every
-caller to specific model slugs. A **model class** gives an operator-chosen name
-to one ordered provider/model pool. Definitions live in the `model_classes`
-table in `data/mesh.db`, not in `config.yaml`: editing a class is a root-only
-runtime operation and the next selection sees the committed row without a mesh
-restart.
-
-An actor then references a class as the **whole** `model_config` value:
+Spelling out `{provider, model, effort}` at every spawn couples every caller to
+specific model slugs. A **model class** gives an operator-chosen name to one
+provider/model selection (a single tuple or an ordered pool):
 
 ```json
 { "charter": "fix the flaky test in packages/rusa", "model_config": { "class": "coder" } }
 ```
 
-Both `spawn_thread` and `set_actor_model` accept it. The rules:
+Classes are managed at runtime by the root actor with `set_model_class`,
+`list_model_classes`, and `delete_model_class`; they live in the `model_classes`
+table of the mesh database, not in `config.yaml`. A class reference is the whole
+`model_config` value (it cannot nest inside a pool or another class), every
+entry must name a configured provider and an explicit model, an unknown class is
+an error, and a multi-entry class still requires a portable actor. Selection
+snapshots the resolved pool onto the actor, so editing a class only affects
+later spawns; move an existing actor with `set_actor_model`.
 
-- **Use the root-only management surface.** `set_model_class(name,
-  model_config)` creates or wholly replaces a class, `list_model_classes()`
-  inspects the current rows, and `delete_model_class(name)` removes one. A
-  definition is one concrete tuple or an ordered pool, exactly like an inline
-  selection; it is never a patch and cannot reference another class.
-- **Every entry must name a configured provider and an explicit model.** The
-  runtime validates the whole concrete pool through the same provider/model/
-  effort, size, and duplicate checks a selection uses. Invalid definitions
-  commit nothing.
-- **A class reference is the whole value**, not one entry inside a pool, and it
-  cannot nest inside another class. `{"class": "coder"}` is valid;
-  `[{"class": "coder"}, {...}]` and `{"class": "coder", "provider": "codex"}` are
-  both rejected at the tool boundary — a mixed shape is a mistake, never a
-  tuple with the class quietly ignored.
-- **A reference still isn't a default.** Omitting `model_config` remains an
-  error, an unknown class name is an error, and an empty definition cannot be
-  committed — nothing silently falls back to a provider default.
-- **Multi-entry classes follow the pool rule**: a class that resolves to more
-  than one entry requires a portable (`ledger`/`tail`) actor.
-- **Selection snapshots the pool.** The class is resolved once, at the moment of
-  the spawn or the `set_actor_model`, and the resolved provider/model/effort
-  entries are what get validated and persisted on the actor. **Editing a class
-  never retro-applies to actors that already resolved it** — it only changes
-  what later selections resolve to. Move an existing actor onto the new
-  definition with `set_actor_model` if that's what you want.
+## Quota
 
-Migration `0041_model_classes` adds the durable store. Its `definition_json`
-is a versioned blob validated by its TypeScript consumer; it uses neither SQLite
-`json_*` functions nor `CHECK` validators.
+One of the core value propositions of the system is that it allows users to
+take full advantage of their quota while always remaining available for new
+requests. It's obviously trivial to take full advantage of your quota by burning
+through your weekly quota in a day.
 
----
+This aspect is predicated on the idea that it's better for the system to remain
+able to make forward progress throughout the whole time so it's preferable for
+the system to slow down rather than burn through all of the quota and become
+completely unresponsive.
 
-## Codebase Structure
+To that end, the system seeks to throttle runs such that quota usage remains
+evenly paced throughout the period. The CLIs don't all have a consistent API so
+for some of the CLIs we scrape the TUI and have an LLM extract the remaining
+quota and the period expiration time.
 
-This is a pnpm workspace. The agent itself lives in `packages/rusa`.
+The dashboard's Overview charts each provider's quota headroom and the current
+throttle period. For running several Rusa instances against one set of provider
+accounts, see the shared quota coordinator
+[design](docs/quota-coordinator-design.md) and
+[operations](docs/quota-coordinator-operations.md) docs.
+
+## Obligations
+
+Obligations are the system's way to track who is supposed to do what and to
+maintain a well organized and prioritized backlog. Obligations are a
+hierarchical system for tracking work and dependencies. Obligations can
+correspond with external entities such as GitHub issues or PRs. Obligations are
+the latest addition to the system so the system is still being refined but the
+intention is that all non-trivial work is tracked in the obligations system.
+
+Each obligation has an owner (an actor, or `human:operator` for questions that
+need a person), an optional parent, prerequisites that gate when it becomes
+ready, an external reference, attached artifacts, and a checkpoint the owner
+keeps current so a fresh run can pick the work back up. Recurring obligations
+are scheduled through the host cron/`at` integration described above. Actors
+manage them through the obligations MCP tools, and humans see and edit them in
+the dashboard's Work view.
+
+## Dashboard
+
+Rusa ships a Flutter web dashboard (`packages/rusa/flutter_dashboard`) served
+by the runtime. Its main views:
+
+- **Overview**: your queue of ready obligations, quota pacing charts, and the
+  actors running right now.
+- **Actors**: the actor tree with each actor's chat, events log, live provider
+  output, configuration, and inbox. This is where you DM an actor, spawn a
+  child, or change its model.
+- **Work**: the obligations forest.
+
+The dashboard can be limited to admitted Google accounts; see
+[Dashboard authentication](docs/dashboard-auth.md). The `rusa dashboard`
+command opens it against a configured instance's persisted state.
+
+## Repository layout
+
+This is a pnpm workspace (Node.js 20.19 or newer; the pnpm version is pinned
+in `package.json`). The agent itself lives in `packages/rusa`.
 
 ```
 rusa/
 ├── packages/rusa/              # the rusa CLI + runtime
-│   └── src/
-│       ├── actor/              # the mesh core
-│       │   ├── actor.ts                # the Actor unit (inbox + session + tools)
-│       │   ├── actor-mesh.ts           # scheduler: spawn / sendMessage / retire
-│       │   ├── concurrency-limiter.ts  # cross-actor capacity gate
-│       │   ├── actor-record.ts         # ActorRecord: the actor's persisted shape (charter, parent, status, …)
-│       │   ├── trigger-runner.ts       # per-actor debounce/single-flight loop
-│       │   ├── root-prompt.ts          # the default root charter + per-wake prompt
-│       │   └── worker-prompt.ts        # worker scaffold + delegation discipline
-│       ├── mcp/                # in-process MCP servers over a loopback HTTP endpoint
-│       │   ├── agent-exec-mcp.ts       # the mesh primitives (spawn/send/introduce/…)
-│       │   ├── tracker-mcp.ts          # GitHub facts (issues / PRs / comments)
-│       │   └── chat-mcp.ts             # Google Chat facts
-│       ├── chat/               # Google Chat client, OAuth, Pub/Sub + Workspace Events source
-│       ├── commands/           # CLI subcommands (start, init, dashboard, e2e, service, …)
-│       ├── config/             # config loading + docs
-│       ├── repositories/       # actor-repository.ts: the ActorRepository persistence contract
-│       ├── db/                 # SQLite schema, migrations, repositories
-│       ├── gitops/             # git + the IssueClient (gh) seam
-│       ├── providers/          # coding harnesses: claude, codex, antigravity, gemini, copilot, kimi
-│       ├── webhook/            # GitHub webhook + dashboard HTTP servers
-│       ├── e2e/                # self-contained end-to-end runner (fakes the GitHub edge only)
-│       ├── dashboard/          # observability dashboard backend
-│       ├── orchestrator/       # retained v2 orchestrator (no longer wired)
-│       └── understanding/      # long-term memory / Glass Goals integration
-├── devlog/                     # dated design docs & handoffs — one folder per feature
-├── principles/                 # engineering principles
+│   ├── src/
+│   │   ├── actor/              # the mesh core: actors, scheduling, event subscriptions, context modes
+│   │   ├── mcp/                # in-process MCP servers over a loopback HTTP endpoint
+│   │   ├── providers/          # coding harnesses: claude, codex, antigravity, kimi (+ quota scrapers)
+│   │   ├── obligations/        # the obligations model
+│   │   ├── quota/              # quota pacing and the shared coordinator
+│   │   ├── chat/ github/ email/ calendar/ drive/   # human-facing edges
+│   │   ├── webhook/            # GitHub webhook + dashboard HTTP servers
+│   │   ├── dashboard/          # dashboard backend
+│   │   ├── principals/         # durable identities for actors and admitted users
+│   │   ├── db/ repositories/   # SQLite schema, migrations, persistence contracts
+│   │   ├── commands/           # CLI subcommands (start, init, quickstart, dashboard, e2e, …)
+│   │   ├── e2e/                # self-contained end-to-end runner
+│   │   └── understanding/      # long-term memory
+│   └── flutter_dashboard/      # the Flutter web dashboard (+ screenshot harness)
+├── docs/                       # quickstart, dashboard auth, principals, logging, quota coordinator
 └── agent.md / CLAUDE.md        # repo conventions for agents working here
 ```
 
 The boot path worth reading first is
-[`commands/start.ts`](packages/rusa/src/commands/start.ts): it wires the
-MCP servers, builds the `ActorMesh`, creates the root, attaches the inbound edges
-(webhook + chat), and starts the lifecycle/sweep loop.
+[`commands/start.ts`](packages/rusa/src/commands/start.ts): it wires the MCP
+servers, builds the mesh, creates the root actor, attaches the inbound edges,
+and starts the lifecycle loop. `rusa --help` lists the CLI commands: `init`
+and `configure` for instance setup, `start` to boot the root actor over the
+live edge, `dev` for a watch loop, `status`, `logs`, `dashboard`,
+`install-service` to run under systemd, `forward-webhooks` for local GitHub
+delivery, and the `quota-coordinator` family.
 
-### The MCP boundary & the e2e seam
+## Contributing
 
-Because **everything the agent touches is an MCP server**, the difference between
-production and end-to-end testing is *just which MCP implementations you wire* —
-real `gh`/Chat versus fakes. The self-contained runner (`src/e2e`, `pnpm e2e up`)
-boots a complete disposable instance against a throwaway repo and a local bare
-git "remote," swapping **only the GitHub edge** so everything above it is the real
-production code. See
-[`devlog/2026-06-07-self-contained-runner/`](devlog/2026-06-07-self-contained-runner/).
+This repo is built largely by Rusa's own actors, so the working conventions
+live in [`agent.md`](agent.md): the `pnpm` and Flutter quality gates, PR
+description requirements, branch and merge rules, and the hygiene expected in
+a public repository. Longer design material lives under [`docs/`](docs/).
 
----
-
-## Development & Workflows
-
-### Common commands
-
-Run from the repo root (pnpm workspace):
+Because every edge the actors touch is an MCP server, the difference between
+production and end-to-end testing is which MCP implementations are wired. The
+self-contained runner boots a disposable instance with real providers and fake
+GitHub and chat edges:
 
 ```bash
-pnpm install          # install workspace dependencies
-pnpm build            # build all packages
-pnpm test             # run the test suites
-pnpm typecheck        # type-check all packages
-pnpm lint             # Biome lint
-pnpm format           # Biome format (write)
+pnpm e2e am-up                                  # provision and run a disposable mesh
+pnpm e2e am-up --root-driver external           # boot without a root run, for scripted scenarios
+pnpm e2e hydrate --scenario dashboard-basic     # seed actors, chat, and an issue into it
+pnpm e2e down --root <path>                     # stop it and remove its state
 ```
-
-The rusa CLI itself lives in `packages/rusa`:
-
-```bash
-pnpm cli <args>                       # build + run the CLI against a test home
-# inside packages/rusa:
-rusa start                            # boot as the root actor over the live edge
-rusa init                             # interactive instance setup
-pnpm e2e up                           # boot a disposable end-to-end instance
-```
-
-> **Prerequisite:** worker/coding runs are sandboxed with **bubblewrap**
-> (`apt install bubblewrap`); `rusa start` fails fast if the host can't
-> sandbox.
-
-### Design docs & devlogs
-
-This repo is built *by* agents, so the working conventions live in
-[`agent.md`](agent.md) and are worth following:
-
-> **When working on a sizeable feature, always create a new folder under
-> `devlog/` and create a `design.md` file.**
-
-Each feature gets a dated folder under [`devlog/`](devlog/) (e.g.
-`2026-06-15-actor-mesh/`) holding its `design.md` — the rationale, target shape,
-open questions, and build order — alongside any handoff notes. Reading the most
-recent devlogs is the fastest way to understand *why* the system looks the way it
-does and where it's heading. Notable recent ones:
-
-- [`2026-06-15-actor-mesh/`](devlog/2026-06-15-actor-mesh/) — the actor-mesh
-  architecture this README describes.
-- [`2026-06-09-v2-rebuild/`](devlog/2026-06-09-v2-rebuild/) — the clean
-  thread-model core the mesh was layered onto.
-- [`2026-06-07-self-contained-runner/`](devlog/2026-06-07-self-contained-runner/)
-  — the agent-drivable end-to-end runner.
-
-### Memory model
-
-The system keeps three tiers of memory, deliberately separated:
-
-| Tier | Mechanism | Persistence |
-| --- | --- | --- |
-| **Working memory** | each actor's continued, compacting session | a *losable cache* |
-| **Long-term memory** | the understanding library (durable judgment & decisions) | durable, authoritative |
-| **Facts** | tracker-MCP / chat-MCP (issues, PRs, chat) | not ours — re-derived each wake |
-
-Sessions are reconstructable; the only state rusa durably *owns* is its
-long-term library plus the actor repository (the org chart of live actors).

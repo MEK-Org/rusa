@@ -463,8 +463,8 @@ class _DetailPanelState extends State<DetailPanel>
     return const [];
   }
 
-  Widget _meta(String label, String value) => RichText(
-    text: TextSpan(
+  Widget _meta(String label, String value) => Text.rich(
+    TextSpan(
       children: [
         TextSpan(
           text: '$label: ',
@@ -690,8 +690,8 @@ class _InfoViewState extends State<_InfoView> {
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
 
-  Widget _meta(String label, String value) => RichText(
-    text: TextSpan(
+  Widget _meta(String label, String value) => Text.rich(
+    TextSpan(
       children: [
         TextSpan(
           text: '$label: ',
