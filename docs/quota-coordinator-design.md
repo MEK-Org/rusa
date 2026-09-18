@@ -1319,14 +1319,20 @@ coordinator and legacy production accumulate separate scrapes and observations,
 diverging as noted in §8.3 ("the two files' controller histories diverge the
 instant they fork").
 
-Under the operator's rollout decision (reconciled in [#501](https://github.com/MEK-Org/rusa/issues/501)),
-the live database already serving the shared coordinator during canary remains
-authoritative at cutover, accepting this divergence without reconciling or
-replacing it from legacy production. Legacy writers are quiesced, the legacy DB
+When a coordinator is already serving such a copy at cutover — the shape the
+2026-09-16 production rollout executed — that database remains authoritative,
+accepting this divergence without reconciling or replacing it from legacy
+production. That is the operator's ruling in operator chat on 2026-09-16
+(`gchat:spaces/hPHAPyAAAAE/messages/Z5DKKROCBtM.Z5DKKROCBtM`, following the
+clone-seed-then-switch sequence in
+`gchat:spaces/hPHAPyAAAAE/messages/8MFfz0Uu4EQ.8MFfz0Uu4EQ`); the runbook
+(`docs/quota-coordinator-operations.md`, "#499 staging proof and the stage-3
+handoff") carries the rollout record. Legacy writers are quiesced, the legacy DB
 is backed up and archived, and the old path is fenced with an empty mode-0700
-directory. When both files already exist, `--relocate` is not run because its
-safety check in `packages/rusa/src/quota/relocate.ts` refuses when the target file
-exists.
+directory. `--relocate` is not run when both files already exist because its
+safety check in `packages/rusa/src/quota/relocate.ts` refuses in that state.
+When no coordinator database exists yet, the rename above is still the designed
+flip and keeps controller memory.
 
 One asymmetry to record for the rollback path: while the service owns the file it
 sets `PRAGMA user_version`, which a pre-service build never reads. Rolling back
@@ -1411,7 +1417,7 @@ ships.
 | 0 | **Planned, not shipped** ([#502](https://github.com/MEK-Org/rusa/issues/502)): install the unit; service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `healthz`/`readyz`, `GET /v1/throttle` matches what the file says and carries the expected `service.protocolMajor`, backups run, metrics appear | Stop and remove the unit. Nothing touched. |
 | 1 | Enable the probe loop, still against the copy. Instances still scraping. | **The probe works outside an instance process** — bwrap, tmux, provider CLI auth, LLM parse (A5, A5a). Compare the copy's observations against the live file's for the same slots. | Disable the probe loop, or stop the unit. |
 | 2 | **Planned, not shipped** ([#503](https://github.com/MEK-Org/rusa/issues/503)): point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
-| 3 | **Revised stage-3 flip** (A6; reconciled in [#501](https://github.com/MEK-Org/rusa/issues/501)): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from verified backup (`rusa quota-restore`); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
+| 3 | **Revised stage-3 flip** (A6; the copied-database shape, provenance in §8.1 and the runbook — when no coordinator database exists yet, the designed `rusa quota-coordinator --relocate` rename of §8.2 applies instead): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from verified backup (`rusa quota-restore`); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
 
 The #499 staging proof substituted for the two absent modes. It started a
 separate staging coordinator with a fresh staging database and its normal probe
@@ -1432,18 +1438,21 @@ coordinator's collection loop includes `kimi` in `QUOTA_THROTTLE_PROVIDERS` via
 `QuotaService` / `scrapeKimiUsage`; if kimi is unconfigured or failing, the gate
 does not pass.)
 
-The operator's rollout decision for #501 (documented in PR #504) supersedes the
-stage-3 legacy-DB relocation: the copied database already serving the shared
-coordinator becomes authoritative during canary. Accept divergence between legacy
-production and the coordinator database; do not reconcile or replace it from
-legacy production. When both the legacy database and the coordinator database exist
-simultaneously during canary, running `--relocate` is avoided: `relocateQuotaDatabase`
-(`packages/rusa/src/quota/relocate.ts`) enforces a safety interlock that explicitly
-refuses if the target database already exists (`Target database path already exists`).
-Instead, old instances are quiesced, the legacy database is backed up and archived,
-and the path fence is created directly at the legacy path.
+Which stage-3 shape applies depends on the state at the bless boundary. If no
+coordinator database exists yet, run the designed flip
+(`rusa quota-coordinator --relocate`): it renames the legacy file into service
+ownership and fences the old path. If a coordinator is already serving a copied
+database — the shape the 2026-09-16 production rollout executed, under the
+operator's ruling cited in §8.1 — that database stays authoritative: accept
+divergence between legacy production and the coordinator database, and do not
+reconcile or replace it from legacy production. `--relocate` is not run in that
+state because `relocateQuotaDatabase` (`packages/rusa/src/quota/relocate.ts`)
+refuses when both files exist (`both ... exist; decide which is authoritative
+before the flip`), a safety interlock rather than a prohibition. Instead, old
+instances are quiesced, the legacy database is backed up and archived, and the
+path fence is created directly at the legacy path.
 
-The final handoff sequence:
+The final handoff sequence for the copied-database shape:
 1. Stop old instance writers to quiesce legacy database activity.
 2. Take and verify a self-contained backup of the stopped legacy database with
    the shipped command: `rusa quota-backup --database <legacy-path>`.

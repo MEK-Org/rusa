@@ -117,19 +117,42 @@ auth-mutation concerns in `config/types.ts:188`, the coordinator's collection lo
 includes `kimi` in `QUOTA_THROTTLE_PROVIDERS` via `QuotaService` /
 `scrapeKimiUsage`; if kimi is unconfigured or failing, the gate does not pass.)
 
-The operator's rollout decision for #501 (documented in PR #504) supersedes the
-stage-3 legacy-DB relocation: the copied database already serving the shared
-coordinator becomes authoritative during canary. Accept divergence between
-legacy production and the coordinator database; do not reconcile or replace it
-from legacy production. When both the legacy database and the coordinator
-database exist simultaneously during canary, running `--relocate` is avoided:
-`relocateQuotaDatabase` (`packages/rusa/src/quota/relocate.ts`) enforces a safety
-interlock that explicitly refuses if the target database already exists
-(`Target database path already exists`). Instead, old instances are quiesced, the
-legacy database is backed up and archived, and the path fence is created
-directly at the legacy path.
+The stage-3 handoff takes one of two shapes; pick by the state found at the
+bless boundary:
 
-#### Final handoff procedure
+- **No coordinator database exists yet** (the service-owned target path is
+  absent): run the designed flip, `rusa quota-coordinator --relocate`.
+  `relocateQuotaDatabase` (`packages/rusa/src/quota/relocate.ts`) checkpoints
+  and atomically renames the stopped legacy `quota.db` into service ownership,
+  keeping controller memory byte-for-byte, and creates the path fence itself.
+  Its rollback is the inverse by hand: stop the service, `rmdir` the fence,
+  rename the file back (design §8.2, §8.3).
+- **A coordinator is already serving a copied database** (the shape the
+  2026-09-16 production rollout executed): that database stays authoritative.
+  Accept divergence between legacy production and the coordinator database; do
+  not reconcile or replace it from legacy production. `--relocate` is not run
+  here because `relocateQuotaDatabase` refuses when both files exist (`both ...
+  exist; decide which is authoritative before the flip`) — a safety interlock,
+  not a prohibition. Instead, old instances are quiesced, the legacy database
+  is backed up and archived, and the path fence is created directly at the
+  legacy path, as in the procedure below.
+
+Provenance for the second shape: the operator (repository maintainer) set the
+sequence in operator chat on 2026-09-16 — bring the shared coordinator up from
+a clone of the shared quota database, point staging at it, confirm health, then
+switch production (`gchat:spaces/hPHAPyAAAAE/messages/8MFfz0Uu4EQ.8MFfz0Uu4EQ`)
+— and ruled that divergence between the old and new databases is accepted and
+the legacy history is not reconciled once the shared coordinator is up
+(`gchat:spaces/hPHAPyAAAAE/messages/Z5DKKROCBtM.Z5DKKROCBtM`). The rollout
+reports in the same space record the pool coordinator running from that seeded
+copy with staging switched to it
+(`gchat:spaces/hPHAPyAAAAE/messages/Fv6ZIvPB9Ew.Fv6ZIvPB9Ew`) and production
+switched with the legacy database backed up, archived and fenced
+(`gchat:spaces/hPHAPyAAAAE/messages/eBoU0jHVVNk.eBoU0jHVVNk`). The ids are
+opaque outside the operator space; this section and
+[#501](https://github.com/MEK-Org/rusa/issues/501) are the public record.
+
+#### Final handoff procedure (copied-database shape)
 
 1. **Stop and fence old instance writers:** Stop production instances to ensure
    no new transactions are written to the legacy SQLite database.
