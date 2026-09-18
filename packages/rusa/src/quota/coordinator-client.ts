@@ -138,7 +138,7 @@ function isValidCollectionThrottlePayload(body: unknown): boolean {
     return false;
   }
   const providers = obj.providers as Record<string, unknown>;
-  for (const status of Object.values(providers)) {
+  for (const [provider, status] of Object.entries(providers)) {
     if (typeof status !== "object" || status === null) {
       return false;
     }
@@ -148,6 +148,12 @@ function isValidCollectionThrottlePayload(body: unknown): boolean {
       typeof (status as { intervalSeconds?: unknown }).intervalSeconds === "number" &&
       Number.isFinite((status as { intervalSeconds: number }).intervalSeconds)
     ) {
+      // Collection keys identify the lane the client caches and paces. Do not
+      // accept a warm body for another provider under this key: it would make
+      // a malformed response attribute one provider's evidence to another.
+      if ((status as { provider?: unknown }).provider !== provider) {
+        return false;
+      }
       continue;
     }
     // ...or a cold lane carrying the not_ready envelope (§5.5, #480)

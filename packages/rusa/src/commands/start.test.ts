@@ -730,6 +730,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(externalRoot).not.toBeNull();
     expect(root).toBe(externalRoot);
     expect(mesh?.get("root")).toBe(externalRoot);
+  });
+
   it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
     const socketPath = join(homeDir, "coordinator.sock");
     const observedAt = new Date().toISOString();
@@ -818,13 +820,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     try {
       let mesh: ActorMesh | undefined;
-      let quotaCoordinatorClient: QuotaCoordinatorClient | null = null;
+      let coordinatorAppliedInterval: ((provider: string) => number | undefined) | undefined;
       await new Promise<void>((resolve) => {
         void runStart({
           e2e: {
             onReady: (handles) => {
               mesh = handles.mesh;
-              quotaCoordinatorClient = handles.quotaCoordinatorClient;
+              coordinatorAppliedInterval = handles.coordinatorAppliedInterval;
               shutdownFn = handles.shutdown;
               resolve();
             },
@@ -853,10 +855,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // trustworthy weekly observation remains fresh, so the production gate
       // keeps selecting it without opening a local quota database.
       codexCold = true;
-      await vi.waitFor(
-        () => expect(quotaCoordinatorClient?.getLastAppliedInterval("claude")).toBe(1),
-        { timeout: 5_000 }
-      );
+      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(1), {
+        timeout: 5_000,
+      });
       const afterCold = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
       const coldGate = mesh.gateRun(
         afterCold,

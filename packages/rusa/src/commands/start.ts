@@ -555,8 +555,8 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
-  /** The production coordinator client, exposed only to in-process E2E drivers. */
-  quotaCoordinatorClient: QuotaCoordinatorClient | null;
+  /** Read-only synchronization signal for the production coordinator client. */
+  coordinatorAppliedInterval: (provider: string) => number | undefined;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -4053,7 +4053,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // runner live handles so it can inject events and tear down deterministically.
   opts?.e2e?.onReady?.({
     mesh,
-    quotaCoordinatorClient,
+    coordinatorAppliedInterval: (provider) =>
+      quotaCoordinatorClient?.getLastAppliedInterval(provider),
     root,
     rootControl,
     externalRoot,

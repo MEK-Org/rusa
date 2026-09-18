@@ -374,6 +374,26 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
   });
 
+  it("rejects a collection whose warm body disagrees with its provider key", async () => {
+    root = mkdtempSync(join(tmpdir(), "quota-client-collection-provider-key-"));
+    const socketPath = join(root, "coordinator.sock");
+    const client = new QuotaCoordinatorClient({ socketPath, maxIntervalSeconds: 3600 });
+
+    await listen(socketPath, (_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          service: serviceInfo(),
+          providers: { codex: providerStatus(450, "claude") },
+        })
+      );
+    });
+
+    await expect(client.getThrottle()).resolves.toBeNull();
+    expect(client.getHealth()).toEqual({ quota_client_service_connected: 0 });
+    expect(client.getLastAppliedInterval("codex")).toBe(3600);
+  });
+
   it("applies warm intervals and skips cold entries in a mixed collection read (#480)", async () => {
     root = mkdtempSync(join(tmpdir(), "quota-client-collection-mixed-"));
     const socketPath = join(root, "coordinator.sock");
