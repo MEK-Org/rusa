@@ -14,8 +14,12 @@ export const UPDATE_MCP_NAME = "update";
 export interface UpdateToolDeps {
   plan: UpdatePlan;
   deps: UpdateDeps;
-  /** The id that is allowed to run `update` — root, and only root. */
-  rootId: string;
+  /**
+   * Whether `actorId` currently holds `capability` as an active grant. The
+   * `update` tool runs only for a holder of the capability named after this
+   * server ({@link UPDATE_MCP_NAME}); no actor id or topology stands in for it.
+   */
+  hasCapability: (actorId: string, capability: string) => boolean;
 }
 
 export interface UpdateToolOutcome {
@@ -25,24 +29,26 @@ export interface UpdateToolOutcome {
 }
 
 /**
- * The `update` tool body, factored out so the root-only guard + orchestration are
- * unit-testable without the MCP transport.
+ * The `update` tool body, factored out so the capability guard + orchestration
+ * are unit-testable without the MCP transport.
  *
- * Root-only (elder fix #3): self-update bounces the whole daemon, so only the
- * human-facing root may trigger it. The server is mounted ONLY on root's tool set
- * in `start.ts` (never the worker set, exactly like chat); this `selfId === rootId`
- * check is the belt-and-suspenders second layer, matching the per-endpoint identity
- * model — `selfId` is the unspoofable endpoint identity, not a tool argument. A
- * worker that somehow reached this endpoint is refused before any side effect.
+ * Grant-gated (#549): self-update bounces the whole daemon, so only an actor
+ * holding the `update` capability may trigger it. The server is mounted through
+ * the grantable-server composition for exactly the actors that hold that grant;
+ * this live check is the belt-and-suspenders second layer, matching the
+ * per-endpoint identity model — `selfId` is the unspoofable endpoint identity,
+ * not a tool argument — and it is what makes a revocation fail closed on an
+ * already-open session. A caller without the grant is refused before any side
+ * effect.
  */
 export async function runUpdateTool(
   toolDeps: UpdateToolDeps,
   selfId: string
 ): Promise<UpdateToolOutcome> {
-  if (selfId !== toolDeps.rootId) {
+  if (!toolDeps.hasCapability(selfId, UPDATE_MCP_NAME)) {
     return {
       ok: false,
-      message: `'update' is a root-only tool — refusing to run it for '${selfId}'.`,
+      message: `'update' requires the '${UPDATE_MCP_NAME}' capability — refusing to run it for '${selfId}'.`,
     };
   }
   const result = await executeUpdate(toolDeps.plan, toolDeps.deps);
@@ -64,8 +70,8 @@ export async function runUpdateTool(
 
 /**
  * In-process MCP server exposing the self-update as a single `update` tool.
- * **One instance, mounted only on root's tool set**, with `selfId` baked into the
- * endpoint (like every mesh endpoint), so "who is acting" is unspoofable.
+ * **One instance per granted actor**, with `selfId` baked into the endpoint
+ * (like every mesh endpoint), so "who is acting" is unspoofable.
  */
 export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string): McpServer {
   const server = createMcpServer({ name: UPDATE_MCP_NAME, version: "0.1.0" });
@@ -74,7 +80,7 @@ export function createUpdateMcpServer(toolDeps: UpdateToolDeps, selfId: string):
     "update",
     {
       title: `Update & restart onto the latest ${toolDeps.plan.branch}`,
-      description: `Redeploy this running system to the latest origin/${toolDeps.plan.branch}: pull, install, and build IN PLACE (the mesh stays live and responsive throughout), and ONLY if the build is fully green, drain in-flight runs and restart onto the fresh code. A failed or hung build aborts safely and leaves the current build running — you get the error back. Use this to make a freshly-merged change go live. Root-only. Authorized by the master merge.`,
+      description: `Redeploy this running system to the latest origin/${toolDeps.plan.branch}: pull, install, and build IN PLACE (the mesh stays live and responsive throughout), and ONLY if the build is fully green, drain in-flight runs and restart onto the fresh code. A failed or hung build aborts safely and leaves the current build running — you get the error back. Use this to make a freshly-merged change go live. Requires the 'update' capability. Authorized by the master merge.`,
       inputSchema: {},
     },
     async () => {

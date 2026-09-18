@@ -15,7 +15,18 @@ import {
   type SpawnRequest,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
-import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
+import {
+  ACTOR_ADMIN_CAPABILITY,
+  ADMINISTRATIVE_CAPABILITIES,
+  CAPABILITY_ADMIN_CAPABILITY,
+  EXPERIMENT_ADMIN_CAPABILITY,
+  MODEL_ADMIN_CAPABILITY,
+  seedConfiguredActorGrants,
+} from "../actor/administrative-capabilities.js";
+import {
+  InMemoryCapabilityGrantStore,
+  PARENT_GRANTABLE_CAPABILITIES,
+} from "../actor/capability-grants.js";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
@@ -122,9 +133,17 @@ function setup(
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
+    /**
+     * Seed the configured actor with the bootstrap administrative grants, as
+     * `start.ts` does at boot (#549). Defaults on so the existing suites keep
+     * exercising the configured actor's access; pass false to model a
+     * parentless actor that holds no grants.
+     */
+    seedRootGrants?: boolean;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
   const events: {
     kind: string;
     actorId?: string;
@@ -173,7 +192,8 @@ function setup(
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
-    grantableCapabilities: new Set(["understanding-write", "secret"]),
+    capabilityGrants,
+    grantableCapabilities: new Set(["understanding-write", "secret", ...ADMINISTRATIVE_CAPABILITIES]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
@@ -218,8 +238,213 @@ function setup(
     },
     root
   );
-  return { registry, mesh, events, inboxStore, rootId };
+  if (opts.seedRootGrants !== false) {
+    seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
+  }
+  return { registry, mesh, events, inboxStore, rootId, capabilityGrants };
 }
+
+/** Tools that exist only for a holder of an administrative capability. */
+const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
+  [CAPABILITY_ADMIN_CAPABILITY]: ["list_grants"],
+  [EXPERIMENT_ADMIN_CAPABILITY]: [
+    "enroll_actor_experiment",
+    "unenroll_actor_experiment",
+    "list_actor_experiments",
+  ],
+  [MODEL_ADMIN_CAPABILITY]: ["list_model_classes", "set_model_class", "delete_model_class"],
+  [ACTOR_ADMIN_CAPABILITY]: [
+    "revive_thread",
+    "set_thread_title",
+    "set_thread_charter",
+    "reparent_thread",
+    "list_subscriptions",
+  ],
+};
+const ALL_MANAGEMENT_TOOLS = Object.values(MANAGEMENT_TOOLS).flat();
+
+describe("administrative capability gating of management tools (#549)", () => {
+  const config = {
+    providers: { claude: { cliCommand: "claude" } },
+  } as unknown as RusaConfig;
+
+  function modelClassDeps() {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const modelClasses = new ModelClassRepository(db);
+    return {
+      modelClasses,
+      validateModelClass: (input: ModelConfigInput) =>
+        validateModelConfigPool(config, input, { portable: true }),
+    };
+  }
+
+  async function toolNames(client: Client): Promise<string[]> {
+    const { tools } = await client.listTools();
+    return tools.map((t) => t.name);
+  }
+
+  it("shows no management tool on an ungranted parentless (isRoot) endpoint", async () => {
+    const { mesh } = setup({ seedRootGrants: false });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
+    );
+    const names = await toolNames(client);
+    for (const tool of ALL_MANAGEMENT_TOOLS) expect(names).not.toContain(tool);
+    // The per-actor primitives (mesh-enforced) remain.
+    expect(names).toEqual(expect.arrayContaining(["grant_capability", "spawn_thread"]));
+  });
+
+  it("shows exactly the tools each administrative capability unlocks on a capable opaque-id worker", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    for (const [capability, tools] of Object.entries(MANAGEMENT_TOOLS)) {
+      capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      const client = await connect(
+        createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, modelClassDeps())
+      );
+      const names = await toolNames(client);
+      for (const tool of ALL_MANAGEMENT_TOOLS) {
+        expect(names.includes(tool), `${tool} after granting ${capability}`).toBe(
+          tools.includes(tool)
+        );
+      }
+      capabilityGrants.revoke("0b2c3d4e-steward", capability, "2026-01-01T00:00:01Z");
+    }
+  });
+
+  it("a capable opaque-id actor administers its own subtree and is refused outside it", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: ACTOR_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+
+    const ok = (await client.callTool({
+      name: "set_thread_title",
+      arguments: { thread_id: "steward-child", title: "Child" },
+    })) as CallToolResult;
+    expect(ok.isError).toBeFalsy();
+    expect(registry.get("steward-child")?.title).toBe("Child");
+
+    const refused = (await client.callTool({
+      name: "set_thread_title",
+      arguments: { thread_id: "sibling", title: "Nope" },
+    })) as CallToolResult;
+    expect(refused.isError).toBe(true);
+    expect(dataOf(refused)).toMatch(/subtree/);
+    expect(registry.get("sibling")?.title).toBeUndefined();
+
+    const charterRefused = (await client.callTool({
+      name: "set_thread_charter",
+      arguments: { thread_id: "root", charter: "hijack" },
+    })) as CallToolResult;
+    expect(charterRefused.isError).toBe(true);
+    expect(registry.get("root")?.charter).toBe("root");
+  });
+
+  it("revoking the capability denies an already-open session's handler immediately", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: EXPERIMENT_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+    const before = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: {},
+    })) as CallToolResult;
+    expect(before.isError).toBeFalsy();
+
+    capabilityGrants.revoke(
+      "0b2c3d4e-steward",
+      EXPERIMENT_ADMIN_CAPABILITY,
+      "2026-01-01T00:00:01Z"
+    );
+
+    const after = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: {},
+    })) as CallToolResult;
+    expect(after.isError).toBe(true);
+    expect(dataOf(after)).toMatch(/experiment-admin/);
+  });
+
+  it("the seeded configured actor keeps every management tool (preserved access)", async () => {
+    const { mesh } = setup();
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
+    );
+    const names = await toolNames(client);
+    expect(names).toEqual(expect.arrayContaining(ALL_MANAGEMENT_TOOLS));
+  });
+
+  it("model-admin attributes model class events to the acting endpoint, not a fixed root", async () => {
+    const { mesh, registry, capabilityGrants, events } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: MODEL_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, modelClassDeps())
+    );
+    const result = (await client.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(result.isError).toBeFalsy();
+    const event = events.find((e) => e.detail?.includes("set_model_class"));
+    expect(event?.actorId).toBe("0b2c3d4e-steward");
+  });
+});
 
 describe("agent-execution MCP server", () => {
   it("exposes the mesh primitives as tools (root also gets the grant tools)", async () => {
@@ -1261,9 +1486,11 @@ describe("agent-execution MCP server", () => {
       name: "grant_capability",
       arguments: { actor_id: "iu-thread", capability: "understanding-write" },
     });
-    const grants = dataOf(
-      (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
-    ) as Array<{ actorId: string; capability: string; grantedBy: string }>;
+    const grants = (
+      dataOf(
+        (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
+      ) as Array<{ actorId: string; capability: string; grantedBy: string }>
+    ).filter((grant) => grant.grantedBy !== "system:bootstrap");
     expect(grants).toHaveLength(1);
     expect(grants[0]).toMatchObject({
       actorId: "iu-thread",

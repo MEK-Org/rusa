@@ -43,6 +43,11 @@ import {
 } from "./actor-lifecycle.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
+  CAPABILITY_ADMIN_CAPABILITY,
+  EXPERIMENT_ADMIN_CAPABILITY,
+  MODEL_ADMIN_CAPABILITY,
+} from "./administrative-capabilities.js";
+import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
@@ -651,17 +656,18 @@ export interface ActorMeshOptions {
   }) => string;
   /**
    * Durable store of per-actor capability grants (ISSUE_NUM, phase 1a). Defaults to an
-   * in-memory store; the wiring supplies a file-backed one. Only the root grants
-   * (enforced at the tool layer), and only allow-listed capabilities can be
-   * granted (see {@link grantableCapabilities}).
+   * in-memory store; the wiring supplies the SQLite-backed one. It is also the
+   * sole source of administrative authority (#549): a `capability-admin`
+   * holder grants, and only allow-listed capabilities can be granted (see
+   * {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
   /**
    * Durable store of per-actor experiment enrollments (#394). Defaults to an
    * in-memory store; the wiring supplies the SQLite-backed one, which is what
-   * makes an enrollment survive a restart. Only the root administers
-   * enrollments and only registered experiment names are accepted — both
-   * enforced here in the mesh, never in the store.
+   * makes an enrollment survive a restart. Only an `experiment-admin` holder
+   * administers enrollments and only registered experiment names are accepted
+   * — both enforced here in the mesh, never in the store.
    */
   experimentEnrollments?: ExperimentEnrollmentStore;
   eventSourceOwners?: EventSourceOwnerStore;
@@ -2042,12 +2048,14 @@ export class ActorMesh {
   }
 
   /**
-   * Whether `actorId` is the mesh's root — explicit `isRoot` flag .
-   * Decoupled from `parentId == null` (which represents top-level topology).
+   * Whether `actorId` currently holds `capability` as an active grant (#549).
+   * This is the only source of administrative authority: a parentless record,
+   * the `isRoot` flag, and the literal `root` address confer nothing on their
+   * own. Fail-closed — an unknown or unaddressed actor holds nothing.
    */
-  private isRootActor(actorId: string): boolean {
-    const record = this.actors.get(actorId);
-    return record?.isRoot === true;
+  hasActiveCapability(actorId: string | undefined, capability: string): boolean {
+    if (!actorId) return false;
+    return this.grants.activeFor(this.resolveThreadId(actorId)).includes(capability);
   }
 
   /** Resolve the legacy root address without making the literal id an authority signal. */
@@ -2056,13 +2064,13 @@ export class ActorMesh {
   }
 
   /**
-   * Grantor authorization for {@link grantCapability}/{@link revokeCapability}
-   * . Root may grant/revoke anything grantable, as before. A non-root
-   * grantor may only touch capabilities in {@link PARENT_GRANTABLE_CAPABILITIES}
-   * and only where the grantee is its DIRECT child (the repository's `parentId`
-   * edge). Enforced HERE — the mesh layer — not just at the tool layer, so the
-   * invariant holds for any future caller. Fail-closed: an unknown grantor is
-   * never root.
+   * Grantor authorization for {@link grantCapability}/{@link revokeCapability}.
+   * A `capability-admin` holder may grant/revoke anything grantable within its
+   * own subtree (itself included). Any other grantor may only touch
+   * capabilities in {@link PARENT_GRANTABLE_CAPABILITIES} and only where the
+   * grantee is its DIRECT child (the repository's `parentId` edge). Enforced
+   * HERE — the mesh layer — not just at the tool layer, so the invariant holds
+   * for any future caller. Fail-closed: an unknown grantor holds nothing.
    */
   private assertGrantAuthority(
     grantorId: string,
@@ -2074,10 +2082,10 @@ export class ActorMesh {
     if (!grantee) {
       throw new Error(`unknown thread id: ${granteeId}`);
     }
-    if (this.isRootActor(grantorId)) {
-      if (grantorId === granteeId || this.isAncestorOf(grantorId, granteeId)) return;
+    if (this.hasActiveCapability(grantorId, CAPABILITY_ADMIN_CAPABILITY)) {
+      if (this.isAncestorOf(grantorId, granteeId)) return;
       throw new Error(
-        `root ${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
+        `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
       );
     }
     let baseCapability = capability;
@@ -2098,14 +2106,14 @@ export class ActorMesh {
     // guessed infrastructure filename never rides through on the prefix.
     if (!PARENT_GRANTABLE_CAPABILITIES.has(baseCapability)) {
       throw new Error(
-        `only the root may ${verb} ${capability}; a non-root parent may only ${verb}: ${
+        `only a ${CAPABILITY_ADMIN_CAPABILITY} holder may ${verb} ${capability}; a parent without it may only ${verb}: ${
           [...PARENT_GRANTABLE_CAPABILITIES].join(", ") || "none"
         }`
       );
     }
     if (grantee.parentId !== grantorId) {
       throw new Error(
-        `a non-root actor may only ${verb} ${capability} to/from its direct children; ${granteeId} is not a child of ${grantorId}`
+        `without ${CAPABILITY_ADMIN_CAPABILITY}, an actor may only ${verb} ${capability} to/from its direct children; ${granteeId} is not a child of ${grantorId}`
       );
     }
   }
@@ -2113,10 +2121,10 @@ export class ActorMesh {
   /**
    * Grant an extra `capability` to a specific actor by id (ISSUE_NUM, phase 1a).
    * We enforce the allow-list so the primitive can never hand out a capability
-   * the wiring didn't mark grantable, plus grantor authorization : root
-   * may grant anything grantable; a non-root grantor only a
-   * {@link PARENT_GRANTABLE_CAPABILITIES} capability, and only to its direct
-   * children. Idempotent per (actorId, capability). MCP-server grants take effect
+   * the wiring didn't mark grantable, plus grantor authorization: a
+   * `capability-admin` holder may grant anything grantable in its subtree; any
+   * other grantor only a {@link PARENT_GRANTABLE_CAPABILITIES} capability, and
+   * only to its direct children. Idempotent per (actorId, capability). MCP-server grants take effect
    * on a live actor's next run; secrets are rebound by its next sandboxed run.
    * Throws if the capability isn't grantable or the grantor lacks authority.
    */
@@ -2195,9 +2203,9 @@ export class ActorMesh {
 
   /**
    * Revoke a previously-granted `capability` from `actorId`, subject to the same
-   * grantor authorization as {@link grantCapability} : root revokes
-   * anything; a non-root `revokedBy` only a parent-grantable capability from a
-   * direct child. No-op on the store if not active, but the unmount hook still
+   * grantor authorization as {@link grantCapability}: a `capability-admin`
+   * holder revokes anything in its subtree; any other `revokedBy` only a
+   * parent-grantable capability from a direct child. No-op on the store if not active, but the unmount hook still
    * fires so a stale mounted endpoint is torn down idempotently. Revocation takes
    * effect immediately via {@link ActorMeshOptions.onCapabilityRevoked} (the
    * wiring unmounts the granted endpoint → a 404), not only at the actor's next
@@ -2223,9 +2231,8 @@ export class ActorMesh {
    * that keeps "try this on a few actors first" from becoming a permanent
    * column on `actors`.
    *
-   * Root-only and ungrantable: administering a rollout is not a capability the
-   * mesh can hand out, so the check is `isRootActor` here rather than an
-   * allow-list anywhere. Enrollment is strictly post-spawn — the actor must
+   * Authorized by the `experiment-admin` capability over the caller's own
+   * subtree (see {@link assertExperimentAuthority}). Enrollment is strictly post-spawn — the actor must
    * already exist — and a retired actor is refused, matching
    * {@link setActorModel}: enrolling a thread that is not going to run again
    * records an intent nothing will ever read.
@@ -2235,7 +2242,7 @@ export class ActorMesh {
    * the enrollment is keyed on (a legacy `"root"` address resolves), so a
    * caller can correlate the response with {@link listExperimentEnrollments}.
    * Only a real change records an event. Throws if the experiment is not
-   * registered, the actor is unknown or retired, or the caller is not root.
+   * registered, the actor is unknown or retired, or the caller lacks authority.
    */
   enrollActorInExperiment(
     actorId: string,
@@ -2266,8 +2273,8 @@ export class ActorMesh {
   }
 
   /**
-   * Remove an actor's enrollment, subject to the same root-only authority as
-   * {@link enrollActorInExperiment}. Idempotent: `changed` is true when a real
+   * Remove an actor's enrollment, subject to the same `experiment-admin`
+   * authority as {@link enrollActorInExperiment}. Idempotent: `changed` is true when a real
    * enrollment was removed, false when there was nothing to remove, and only a
    * real change records an event.
    *
@@ -2315,7 +2322,7 @@ export class ActorMesh {
     return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
   }
 
-  /** Every current enrollment in (actorId, experiment) order — the root's readback view. */
+  /** Every current enrollment in (actorId, experiment) order — the administrator's readback view. */
   listExperimentEnrollments(actorId?: string): ExperimentEnrollment[] {
     const enrollments = this.experiments.list();
     if (!actorId) return enrollments;
@@ -2324,10 +2331,10 @@ export class ActorMesh {
   }
 
   /**
-   * Authority for experiment administration (#394): root only, over its own
-   * subtree (itself included), and only for an actor that exists. Fail-closed —
-   * an unknown caller is never root — and enforced HERE rather than only at the
-   * tool layer, so the "ungrantable, root-only" boundary holds for any future
+   * Authority for experiment administration (#394, #549): an `experiment-admin`
+   * holder, over its own subtree (itself included), and only for an actor that
+   * exists. Fail-closed — an unknown caller holds nothing — and enforced HERE
+   * rather than only at the tool layer, so the boundary holds for any future
    * caller. Returns the target's record, which both callers need next.
    */
   private assertExperimentAuthority(
@@ -2336,25 +2343,26 @@ export class ActorMesh {
     verb: "enroll" | "unenroll"
   ): ActorRecord {
     const preposition = verb === "enroll" ? "in" : "from";
-    if (!this.isRootActor(callerId)) {
-      throw new Error(`only the root may ${verb} an actor ${preposition} an experiment`);
+    if (!this.hasActiveCapability(callerId, EXPERIMENT_ADMIN_CAPABILITY)) {
+      throw new Error(
+        `only an ${EXPERIMENT_ADMIN_CAPABILITY} holder may ${verb} an actor ${preposition} an experiment`
+      );
     }
     const record = this.actors.get(actorId);
     if (!record) {
       throw new Error(`unknown thread id: ${actorId}`);
     }
-    // Not redundant with the root check above: `isRoot` is decoupled from
-    // top-level topology, so another root's subtree is a legal shape that this
-    // root must not reach into. `isAncestorOf` admits the root itself.
+    // Holding the capability is not reach: another top-level tree is a legal
+    // shape this holder must not administer. `isAncestorOf` admits the holder itself.
     if (!this.isAncestorOf(callerId, actorId)) {
       throw new Error(
-        `root ${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
+        `${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
       );
     }
     return record;
   }
 
-  /** Every grant, active and revoked — for the root's `list_grants` tool + audit. */
+  /** Every grant, active and revoked — for the `list_grants` tool + audit. */
   listGrants(): ReturnType<CapabilityGrantStore["list"]> {
     return this.grants.list();
   }
@@ -3883,10 +3891,9 @@ export class ActorMesh {
 
   /**
    * Stage a full replacement of an existing actor's declared modelConfig pool.
-   * Root or parent-gated: root may set the model for any thread in its subtree;
-   * root may also set its own model;
-   * a non-root parent may only set the model for its own descendants (and never
-   * raise its own tier).
+   * Capability- or parent-gated: a `model-admin` holder may set the model for
+   * any thread in its subtree, itself included; any other caller may only set
+   * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
    * portable (ledger/tail) actor — a native provider session can't move.
    * The replacement is atomic (the whole pool or nothing). Takes effect at the
@@ -3904,8 +3911,13 @@ export class ActorMesh {
     if (record.status === "retired") {
       throw new Error(`Cannot set model on retired thread: ${id}`);
     }
-    const isRoot = this.isRootActor(requestedBy);
-    if (!isRoot) {
+    if (this.hasActiveCapability(requestedBy, MODEL_ADMIN_CAPABILITY)) {
+      if (!this.isAncestorOf(requestedBy, id)) {
+        throw new Error(
+          `Cannot set model on thread ${id}: ${requestedBy} may only set models in its own subtree`
+        );
+      }
+    } else {
       if (requestedBy === id) {
         throw new Error(`Cannot set model: an actor cannot set its own model (${id})`);
       }

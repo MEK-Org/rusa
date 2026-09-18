@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
+import { EXPERIMENT_ADMIN_CAPABILITY } from "./administrative-capabilities.js";
+import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
 import {
   InMemoryExperimentEnrollmentStore,
   STRICT_OBLIGATION_HANDLING_EXPERIMENT,
@@ -13,7 +15,9 @@ const EXPERIMENT = STRICT_OBLIGATION_HANDLING_EXPERIMENT;
 /**
  * A mesh over a fixed topology: root, a worker, the worker's parent, and a
  * sibling of the worker. Records are written straight to the repository so the
- * suite exercises enrollment authority rather than the run machinery.
+ * suite exercises enrollment authority rather than the run machinery. The
+ * configured root holds `experiment-admin` as a grant row (#549) — the same
+ * shape `start.ts` seeds at boot — because topology confers no authority.
  */
 function setup(
   opts: {
@@ -55,15 +59,27 @@ function setup(
     createdAt: "2026-09-10T00:00:00Z",
   });
   const enrollments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
+  grantExperimentAdmin(capabilityGrants, rootId);
   const mesh = new ActorMesh({
     actors: registry,
     rootId,
+    capabilityGrants,
     createActor: () => ({}) as unknown as Actor,
     experimentEnrollments: enrollments,
     events: opts.events,
     now: () => "2026-09-10T00:00:00Z",
   });
-  return { mesh, registry, enrollments };
+  return { mesh, registry, enrollments, capabilityGrants };
+}
+
+function grantExperimentAdmin(store: InMemoryCapabilityGrantStore, actorId: string): void {
+  store.grant({
+    actorId,
+    capability: EXPERIMENT_ADMIN_CAPABILITY,
+    grantedBy: "test",
+    grantedAt: "2026-09-10T00:00:00Z",
+  });
 }
 
 describe("actor experiment enrollment", () => {
@@ -192,11 +208,11 @@ describe("actor experiment enrollment", () => {
     ]);
   });
 
-  it("admits only root: the actor itself, its parent, and a sibling are all refused", () => {
+  it("admits only an experiment-admin holder: the actor itself, its parent, and a sibling are all refused", () => {
     const { mesh, enrollments } = setup();
     for (const caller of ["worker", "parent", "sibling", "ghost-caller"]) {
       expect(() => mesh.enrollActorInExperiment("worker", EXPERIMENT, caller)).toThrow(
-        "only the root may enroll an actor in an experiment"
+        "only an experiment-admin holder may enroll an actor in an experiment"
       );
     }
     expect(enrollments.list()).toEqual([]);
@@ -205,14 +221,14 @@ describe("actor experiment enrollment", () => {
     mesh.enrollActorInExperiment("worker", EXPERIMENT, "root");
     for (const caller of ["worker", "parent", "sibling", "ghost-caller"]) {
       expect(() => mesh.unenrollActorFromExperiment("worker", EXPERIMENT, caller)).toThrow(
-        "only the root may unenroll an actor from an experiment"
+        "only an experiment-admin holder may unenroll an actor from an experiment"
       );
     }
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(true);
   });
 
-  it("scopes root's authority to its own subtree, like capability grants", () => {
-    const { mesh, registry, enrollments } = setup();
+  it("scopes an experiment-admin holder's authority to its own subtree, like capability grants", () => {
+    const { mesh, registry, enrollments, capabilityGrants } = setup();
     // The root flag is decoupled from top-level topology, so a second root
     // with its own subtree is a legal shape — and off-limits to this root.
     registry.upsert({
@@ -234,7 +250,13 @@ describe("actor experiment enrollment", () => {
       /own subtree/
     );
     expect(enrollments.list()).toEqual([]);
-    // Its own root may, and a root may enroll itself.
+    // The other tree's root is refused until it holds the grant itself (#549):
+    // parentless/isRoot is topology, not authority.
+    expect(() =>
+      mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "account-b-root")
+    ).toThrow(/experiment-admin/);
+    grantExperimentAdmin(capabilityGrants, "account-b-root");
+    // Its own granted root may, and may enroll itself.
     expect(
       mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "account-b-root").changed
     ).toBe(true);
@@ -299,9 +321,12 @@ describe("actor experiment enrollment", () => {
       status: "active",
       createdAt: "2026-09-10T00:00:00Z",
     });
+    const capabilityGrants = new InMemoryCapabilityGrantStore();
+    grantExperimentAdmin(capabilityGrants, "root");
     const mesh = new ActorMesh({
       actors: registry,
       rootId: "root",
+      capabilityGrants,
       createActor: () => ({}) as unknown as Actor,
     });
     expect(mesh.enrollActorInExperiment("root", EXPERIMENT, "root").changed).toBe(true);

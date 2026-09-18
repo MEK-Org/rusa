@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { DistillerState } from "../understanding/distiller-cursor.js";
 import {
   buildGrantableServers,
@@ -8,6 +9,7 @@ import {
   handleCapabilityRevoked,
   mountGrantedServers,
 } from "./grantable-servers.js";
+import type { UpdateToolDeps } from "./update-mcp.js";
 
 let distillerState: DistillerState = {
   lastDistilled: null,
@@ -103,6 +105,43 @@ describe("grantable capabilities allow-list ", () => {
       "calendar-write",
       "drive-read",
     ]);
+  });
+
+  it("registers the host-maintenance servers only when their deps are wired (#549)", () => {
+    const updateDepsFor = vi.fn<(selfId: string) => UpdateToolDeps>(() => ({
+      plan: { branch: "master", drainTimeoutMs: 1 },
+      deps: {} as UpdateToolDeps["deps"],
+      hasCapability: () => true,
+    }));
+    const servers = buildGrantableServers({
+      ...STUB_DEPS,
+      hostMaintenance: {
+        updateToolDepsFor: updateDepsFor,
+        pnpmHardlinks: {
+          hasCapability: () => true,
+          workersDir: "/tmp/grantable-servers-test-workers",
+          actors: new InMemoryActorRepository(),
+          runningThreadIds: () => [],
+        },
+      },
+    });
+    expect([...servers.keys()]).toEqual([
+      "distiller",
+      "understanding-write",
+      "host-jobs",
+      "e2e-instance",
+      "email-send",
+      "calendar-read",
+      "calendar-write",
+      "drive-read",
+      "update",
+      "pnpm-hardlinks",
+    ]);
+    // The update factory is invoked with the grantee's unspoofable id so the
+    // drainer can self-exclude the caller rather than a fixed root id.
+    servers.get("update")?.("0b2c3d4e-steward", []);
+    expect(updateDepsFor).toHaveBeenCalledWith("0b2c3d4e-steward");
+    expect(() => servers.get("pnpm-hardlinks")?.("0b2c3d4e-steward", [])).not.toThrow();
   });
 
   it("aggregates parameterized grants when mounting and replaces the live factory", () => {
