@@ -16,6 +16,7 @@ import { runActorLogs, runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
 import { runQuotaBackup, runQuotaBackupList, runQuotaRestore } from "./commands/quota-backup.js";
 import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
+import { runQuotaPacingReset } from "./commands/quota-pacing-reset.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
@@ -441,6 +442,22 @@ program
       });
     }
   );
+
+program
+  .command("quota-pacing-reset")
+  .description(
+    "Hard-reset one provider's quota pacing controller: clear its integral and derivative history and restart pacing from zero (safe against a running coordinator)"
+  )
+  .requiredOption("--provider <name>", "Provider lane to reset (claude, codex, agy, kimi)")
+  .option("--home <path>", "Override RUSA_HOME")
+  .option("--database <path>", "Override quota database path")
+  .action((opts: { provider: string; home?: string; database?: string }) => {
+    runQuotaPacingReset({
+      provider: opts.provider,
+      home: opts.home,
+      databasePath: opts.database,
+    });
+  });
 
 const understanding = program
   .command("understanding")

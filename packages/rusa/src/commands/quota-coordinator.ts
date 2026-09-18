@@ -120,6 +120,32 @@ export function resolveCoordinatorDatabasePaths(
 }
 
 /**
+ * The quota database an operator command acts on: an explicit override, else
+ * the service-owned file, else the pre-service file an instance still opens
+ * directly. Shared by every command that touches the file from its own
+ * process (`quota-backup`, `quota-restore`, `quota-pacing-reset`) so they
+ * cannot resolve different databases from the same config. It lives beside
+ * {@link resolveCoordinatorDatabasePaths} so that no operator command has to
+ * import another for a path helper.
+ */
+export function resolveOperatorQuotaDatabasePath(
+  opts: { databasePath?: string },
+  config: RusaConfig,
+  mcHome: string
+): string {
+  const configuredDb =
+    opts.databasePath?.trim() ||
+    config.quota?.coordinator?.databasePath?.trim() ||
+    config.quota?.databasePath?.trim();
+  if (!configuredDb) {
+    throw new Error(
+      "No quota database configured: set quota.coordinator.databasePath (or quota.databasePath), or pass --database"
+    );
+  }
+  return resolveQuotaDatabasePath(configuredDb, mcHome);
+}
+
+/**
  * Where the coordinator listens: an explicit override, else the configured
  * `quota.coordinator.socketPath`, else the host default. One resolution shared by the
  * service that binds the socket and every client that dials it, so that two callers
