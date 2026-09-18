@@ -5532,6 +5532,10 @@ describe("ActorMesh", () => {
       // point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
+      // Under #540, an actor cannot retire while holding a live event subscription.
+      // A directed target targets the worker without a subscription blocker on worker,
+      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
         payload: payload("push"),
@@ -5801,6 +5805,33 @@ describe("ActorMesh", () => {
       mesh.retire(child);
 
       deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo/pulls/616", "pr event", {
+        payload: payload("pull_request.opened"),
+      });
+      await tick();
+
+      expect(fake(child).calls).toHaveLength(0);
+      expect(fake(parent).calls).toHaveLength(1);
+      expect(fake(parent).calls[0]?.prompt).toContain("Work from your inbox");
+    });
+
+    it("bubbles delegated events back to the parent's broader subscription when the child unregisters and retires (#540)", async () => {
+      const { mesh, tick, fake } = setup();
+      const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
+      const child = mesh.spawn({ charter: "pr worker", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      // Child cannot retire while delegation is active
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+
+      // Child unregisters the delegation; now child can retire
+      mesh.unsubscribeEventSource(pr, child, "2026-01-01T00:00:00Z");
+      mesh.retire(child);
+
+      // Sub-resource event now bubbles up to parent's broader repo subscription
+      deliverCanonicalEvent(mesh, pr, "pr event", {
         payload: payload("pull_request.opened"),
       });
       await tick();

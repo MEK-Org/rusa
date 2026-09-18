@@ -404,7 +404,7 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
     lines.push(
       ...listWithOverflow(
         blockers.subscriptions,
-        (s) => `  ${s.resource}${s.kind ? ` [${s.kind}]` : ""} held by ${s.actorId}`
+        (s) => `  ${s.resource} [${s.kind}] held by ${s.actorId}`
       )
     );
   }
@@ -3826,6 +3826,15 @@ export class ActorMesh {
     );
   }
 
+  /**
+   * Safety net cleanup: removes any lingering event subscriptions or ownerships
+   * for the retiring actor.
+   *
+   * Under standard {@link retire}, this is unreachable because `retirementBlockers`
+   * refuses retirement if any active event subscription or ownership remains in the
+   * subtree. It is preserved here as a defense-in-depth safety net during teardown
+   * so that no active routing records can survive an actor's retirement.
+   */
   private retireEventSubscriptions(record: ActorRecord): void {
     const at = this.now();
     for (const subscription of this.eventSourceOwners.list()) {
