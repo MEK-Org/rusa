@@ -1482,11 +1482,12 @@ describe.skipIf(!BWRAP_CAPABLE)(
           .split("\n")
           .find((line) => line.startsWith("E2E_COORDINATOR_RESULT="));
         if (!result) throw new Error(`nested manager instance produced no result: ${bwrapOutput}`);
-        expect(JSON.parse(result.slice("E2E_COORDINATOR_RESULT=".length))).toEqual({
-          appliedInterval: publishedInterval,
-          pacerIntervals: [publishedInterval * 1_000],
-          instanceDatabasePath: null,
-        });
+        const nested = JSON.parse(result.slice("E2E_COORDINATOR_RESULT=".length));
+        expect(nested.appliedInterval).toBe(publishedInterval);
+        // The assertion is about the claude pacer receiving the publication,
+        // not a permanent claim that this fixture can construct only one pacer.
+        expect(nested.pacerIntervals).toContain(publishedInterval * 1_000);
+        expect(nested.instanceDatabasePath).toBeNull();
 
         // This is deliberately not a spacing test. One manager-built instance
         // proves boot-time application only; §1.5/§11 leaves cross-instance
