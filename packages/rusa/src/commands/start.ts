@@ -114,6 +114,7 @@ import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
 import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
@@ -2059,6 +2060,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // `grantableServers.get(cap)` loop in createActor skips them safely, and the
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
+    secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
       const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {

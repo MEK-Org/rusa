@@ -7,15 +7,12 @@ import {
   FileCapabilityGrantStore,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
-  SECRET_GEMINI_API_KEY_CAPABILITY,
-  SECRET_MISTRAL_API_KEY_CAPABILITY,
+  SECRET_CAPABILITY_BASE,
 } from "./capability-grants.js";
 
 describe("parent-grantable capabilities", () => {
-  it("includes both file-backed API-key secrets", () => {
-    expect(PARENT_GRANTABLE_CAPABILITIES).toEqual(
-      new Set([SECRET_GEMINI_API_KEY_CAPABILITY, SECRET_MISTRAL_API_KEY_CAPABILITY])
-    );
+  it("includes generic secret capability", () => {
+    expect(PARENT_GRANTABLE_CAPABILITIES).toEqual(new Set([SECRET_CAPABILITY_BASE]));
   });
 });
 

@@ -743,22 +743,20 @@ export function createAgentExecMcpServer(
     }
   );
 
-  // ── Capability grants (ISSUE_NUM phase 1a, relaxed for parent-grantable secrets in
-  // ISSUE_NUM) ── Registered on EVERY endpoint: root can grant any grantable
+  // ── Capability grants (ISSUE_NUM phase 1a, generalized for secret grants in
+  // #542) ── Registered on EVERY endpoint: root can grant any grantable
   // capability to any actor (as before), and a non-root actor can grant/revoke
-  // capabilities in the parent-grantable allow-list (currently
-  // 'secret:gemini-api-key' and 'secret:mistral-api-key') to/from its DIRECT
-  // children. Authorization is enforced in the mesh (grantCapability/
-  // revokeCapability take the grantor into account), with the caller's identity
-  // baked into this endpoint — so a grantee
-  // still cannot re-grant sideways or upward, and non-secret capabilities stay
-  // root-only.
+  // capabilities in the parent-grantable allow-list (generic secret grants
+  // 'secret:<filename>') to/from its DIRECT children. Authorization is enforced in
+  // the mesh (grantCapability/revokeCapability take the grantor into account), with
+  // the caller's identity baked into this endpoint — so a grantee still cannot
+  // re-grant sideways or upward, and non-secret capabilities stay root-only.
   server.registerTool(
     "grant_capability",
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only parent-grantable secrets (currently 'secret:gemini-api-key' and 'secret:mistral-api-key') and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; the Mistral grant also exports MISTRAL_API_KEY. Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only parent-grantable secrets ('secret:<filename>') and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -781,7 +779,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only parent-grantable secrets (currently 'secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
+        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only parent-grantable secrets ('secret:<filename>') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),

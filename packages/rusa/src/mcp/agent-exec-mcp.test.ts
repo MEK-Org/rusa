@@ -1,9 +1,12 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
 import {
   ActorMesh,
@@ -94,6 +97,14 @@ class FakeScheduledMessages implements ScheduledMessageScheduler {
   }
 }
 
+const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-mcp-test-secrets-"));
+writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
+writeFileSync(join(defaultTestSecretsDir, "mistral-api-key"), "test-mistral-key");
+
+afterAll(() => {
+  rmSync(defaultTestSecretsDir, { recursive: true, force: true });
+});
+
 function setup(
   opts: {
     childResponder?: () => Promise<Partial<RunResult>>;
@@ -110,6 +121,7 @@ function setup(
     useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
+    secretsDir?: string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -163,9 +175,11 @@ function setup(
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",
+      "secret",
       "secret:gemini-api-key",
       "secret:mistral-api-key",
     ]),
+    secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
@@ -1394,6 +1408,34 @@ describe("agent-execution MCP server", () => {
     })) as CallToolResult;
     expect(unknownRevoke.isError).toBe(true);
     expect(dataOf(unknownRevoke)).toBe("unknown thread id: ghost");
+  });
+
+  it("grant_capability rejects secret traversal, missing file, and bare secret", async () => {
+    const { mesh } = setup();
+    const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { thread_id: childId } = dataOf(
+      (await rootSrv.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+
+    for (const badCap of [
+      "secret",
+      "secret:",
+      "secret:../outside",
+      "secret:/etc/passwd",
+      "secret:nonexistent-file",
+    ]) {
+      const res = (await rootSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: badCap },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    }
   });
 
   it("revive_thread (root) revives a retired thread and audits it", async () => {

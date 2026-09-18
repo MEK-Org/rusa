@@ -2,7 +2,9 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -13,6 +15,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
@@ -449,17 +452,27 @@ export class E2EInstanceManager {
     if (hasBaseConfig) {
       ensureMountTarget(configSource, configTarget);
       args.push("--ro-bind", realpathIfExists(configSource), configTarget);
-      const geminiKeySource = join(this.opts.mcHome, "secrets", "gemini-api-key");
-      if (existsSync(geminiKeySource)) {
-        const geminiKeyTarget = join(baseConfigHome, "secrets", "gemini-api-key");
-        ensureMountTarget(geminiKeySource, geminiKeyTarget);
-        args.push("--ro-bind", realpathIfExists(geminiKeySource), geminiKeyTarget);
-      }
-      const mistralKeySource = join(this.opts.mcHome, "secrets", "mistral-api-key");
-      if (existsSync(mistralKeySource)) {
-        const mistralKeyTarget = join(baseConfigHome, "secrets", "mistral-api-key");
-        ensureMountTarget(mistralKeySource, mistralKeyTarget);
-        args.push("--ro-bind", realpathIfExists(mistralKeySource), mistralKeyTarget);
+      const secretsSourceDir = join(this.opts.mcHome, SECRETS_DIRNAME);
+      if (existsSync(secretsSourceDir)) {
+        const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
+        try {
+          for (const entry of readdirSync(secretsSourceDir)) {
+            const entrySource = join(secretsSourceDir, entry);
+            const entryTarget = join(secretsTargetDir, entry);
+            let st: ReturnType<typeof lstatSync>;
+            try {
+              st = lstatSync(entrySource);
+            } catch {
+              continue;
+            }
+            if (st.isFile() || (st.isSymbolicLink() && statSync(entrySource).isFile())) {
+              ensureMountTarget(entrySource, entryTarget);
+              args.push("--ro-bind", realpathIfExists(entrySource), entryTarget);
+            }
+          }
+        } catch {
+          // Best effort if secrets directory is unreadable
+        }
       }
     }
 

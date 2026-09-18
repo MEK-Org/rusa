@@ -241,9 +241,14 @@ export async function handleCapabilityRevoked(
 ): Promise<void> {
   const currentLock = revokeMutexes.get(actorId) ?? Promise.resolve();
   const nextLock = currentLock.then(async () => {
-    if (capability.startsWith("chat-read:") || capability === "chat-read") {
-      // Chat reads are implicit and unscoped for all actors; read-grant revocation
-      // never modifies or tears down the default chat-read endpoint.
+    if (
+      capability.startsWith("chat-read:") ||
+      capability === "chat-read" ||
+      capability.startsWith("secret:") ||
+      capability === "secret"
+    ) {
+      // Chat reads and secrets are not MCP servers; secret revocation takes effect
+      // on the actor's next sandboxed spawn via the secrets tmpfs mask.
       return;
     }
     let baseCapability = capability;

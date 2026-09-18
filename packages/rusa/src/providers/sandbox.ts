@@ -453,15 +453,15 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * dir is worker-legitimate by default — and `GLASS_GOALS_PASSWORD` is scrubbed
  * from the environment (defense against a stale `EnvironmentFile=` on the unit).
  *
- * When the spawning actor holds an ACTIVE `secret:gemini-api-key` grant, the
- * real `secrets/gemini-api-key` file is `--ro-bind`-ed back OVER its masked path
+ * When the spawning actor holds an ACTIVE `secret:<filename>` grant, the
+ * real `secrets/<filename>` file is `--ro-bind`-ed back OVER its masked path
  * (the bind must come AFTER the `--tmpfs` of the directory — bwrap applies
  * mounts in argument order), so the grantee reads the key at the same well-known
- * path as on the host. `secret:mistral-api-key` does the same for
- * `secrets/mistral-api-key` and also exports the OCR tool's required
- * `MISTRAL_API_KEY`. Grants are read straight from the `capability_grants`
- * table in `$RUSA_HOME/data/mesh.db` through a short-lived readonly
- * connection (the sandbox layer never imports the mesh — same discipline
+ * path as on the host. Kebab-case secret names also export an environment
+ * variable (e.g. `secret:mistral-api-key` exports `MISTRAL_API_KEY`,
+ * `secret:gemini-api-key` exports `GEMINI_API_KEY`). Grants are read straight from
+ * the `capability_grants` table in `$RUSA_HOME/data/mesh.db` through a short-lived
+ * readonly connection (the sandbox layer never imports the mesh — same discipline
  * as `loadConfig()` in {@link injectWorkerGithubCredential}), keyed by the actor
  * id (= the worker dir's basename, see start.ts `join(workersDir, actorId)`).
  * Evaluated per-spawn, so grant/revoke takes effect on the actor's next run.
@@ -530,11 +530,13 @@ function injectSecretsMasking(
   for (const secretName of secretGrants) {
     const secretPath = join(secretsDir, secretName);
     if (existsSync(secretPath)) {
-      const varName = deriveSecretEnvVar(secretName);
       // ORDER MATTERS: after the `--tmpfs` above, so the single-file bind punches
       // the real key back through the directory mask.
       args.push("--ro-bind", secretPath, secretPath);
-      grantedSecretPaths.push({ name: secretName, path: secretPath, varName });
+      if (/^[a-z0-9]+(-[a-z0-9]+)*$/.test(secretName)) {
+        const varName = deriveSecretEnvVar(secretName);
+        grantedSecretPaths.push({ name: secretName, path: secretPath, varName });
+      }
     }
   }
 

@@ -1,6 +1,14 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 /**
  * The host secrets directory: `$RUSA_HOME/secrets/` (0700), one file per
@@ -72,4 +80,76 @@ export function resolveGlassGoalsPassword(mcHome?: string): string | undefined {
     readHostSecret(GLASS_GOALS_PASSWORD_SECRET_FILENAME, mcHome) ??
     (process.env.GLASS_GOALS_PASSWORD || undefined)
   );
+}
+
+/**
+ * Containment validation for generic read-only secret capability grants (issue #542).
+ *
+ * Requirements:
+ * 1. The filename must resolve to a regular file directly inside the secrets directory.
+ * 2. Reject path traversal (e.g. "..", path separators).
+ * 3. Reject absolute paths.
+ * 4. Reject missing or unknown files (fail loudly at grant time).
+ * 5. Reject symlinks that escape the secrets directory.
+ * 6. Reject non-regular files (directories, sockets, devices, fifos).
+ *
+ * Throws an Error with an actionable message on any containment failure.
+ * Returns the resolved canonical path to the regular file.
+ */
+export function assertSecretContainment(filename: string, secretsDir: string): string {
+  if (!filename || typeof filename !== "string" || !filename.trim()) {
+    throw new Error("secret filename is required");
+  }
+  if (isAbsolute(filename) || filename.startsWith("/") || filename.startsWith("\\")) {
+    throw new Error(`secret filename must not be an absolute path: "${filename}"`);
+  }
+  if (
+    filename === "." ||
+    filename === ".." ||
+    filename.includes("..") ||
+    filename.includes("/") ||
+    filename.includes("\\")
+  ) {
+    throw new Error(`path traversal is not allowed in secret filename: "${filename}"`);
+  }
+  if (basename(filename) !== filename) {
+    throw new Error(`secret filename must be directly inside the secrets directory: "${filename}"`);
+  }
+
+  if (!existsSync(secretsDir)) {
+    throw new Error(`secret file does not exist: "${filename}"`);
+  }
+
+  let realSecretsDir: string;
+  try {
+    realSecretsDir = realpathSync(secretsDir);
+  } catch {
+    throw new Error(`secrets directory does not exist: "${secretsDir}"`);
+  }
+
+  const filePath = join(realSecretsDir, filename);
+
+  try {
+    lstatSync(filePath);
+  } catch {
+    throw new Error(`secret file does not exist: "${filename}"`);
+  }
+
+  let realFilePath: string;
+  try {
+    realFilePath = realpathSync(filePath);
+  } catch {
+    throw new Error(`secret file does not exist or broken symlink: "${filename}"`);
+  }
+
+  if (dirname(realFilePath) !== realSecretsDir) {
+    throw new Error(`secret symlink escapes secrets directory: "${filename}" -> "${realFilePath}"`);
+  }
+
+  const st = statSync(realFilePath);
+  if (!st.isFile()) {
+    throw new Error(`secret must resolve to a regular file: "${filename}"`);
+  }
+
+  return realFilePath;
 }
