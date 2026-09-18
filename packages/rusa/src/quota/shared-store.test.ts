@@ -631,18 +631,20 @@ describe("Quota coordinator multi-process reads", () => {
     const databasePath = join(root, "quota.db");
     const socketPath = join(root, "coordinator.sock");
     const store = new SharedQuotaStore(databasePath);
-    store.configureController({ maxIntervalSeconds: 3600 });
     const scrapedAt = new Date().toISOString();
     const resetAtIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
     try {
-      recordObservation(store, "claude", scrapedAt, 50, resetAtIso);
-      store.advancePendingController({ maxIntervalSeconds: 3600 });
-      const publishedInterval = store.getProviderThrottle("claude")?.intervalSeconds;
-      if (publishedInterval === undefined) throw new Error("expected a published claude interval");
-
-      const scrape = vi.fn().mockResolvedValue({
-        state: { provider: "claude", status: "available" },
-        didProbe: true,
+      store.configureController({ maxIntervalSeconds: 3600 });
+      // The pool begins cold. The observation below is owned by the one
+      // service probe; the collection tick advances it into the value both
+      // independently-running clients receive.
+      expect(store.getProviderThrottle("claude")).toBeNull();
+      const scrape = vi.fn().mockImplementation(async () => {
+        recordObservation(store, "claude", scrapedAt, 50, resetAtIso);
+        return {
+          state: store.getLatestSnapshot("claude"),
+          didProbe: true,
+        };
       });
       const collection = new QuotaCollectionLoop({
         store,
@@ -661,6 +663,9 @@ describe("Quota coordinator multi-process reads", () => {
       try {
         await collection.tick();
         expect(scrape).toHaveBeenCalledTimes(1);
+        const publishedInterval = store.getProviderThrottle("claude")?.intervalSeconds;
+        if (publishedInterval === undefined)
+          throw new Error("expected a published claude interval");
 
         const localClient = new QuotaCoordinatorClient({
           socketPath,

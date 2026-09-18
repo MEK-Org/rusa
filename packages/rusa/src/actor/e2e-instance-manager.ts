@@ -92,21 +92,37 @@ function ensureMountTarget(source: string, target: string): void {
   if (!existsSync(target)) writeFileSync(target, "", { mode: 0o600 });
 }
 
-function configuredCoordinatorSocketPath(configPath: string): string | undefined {
-  try {
-    const socketPath = loadConfig(dirname(configPath)).quota?.coordinator?.socketPath;
-    return socketPath && isAbsolute(socketPath) ? socketPath : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function isSocket(path: string): boolean {
   try {
     return statSync(path).isSocket();
   } catch {
     return false;
   }
+}
+
+function configuredCoordinatorSocketDirectory(configPath: string): string | undefined {
+  // Most manager tests and legacy minimal configurations intentionally provide
+  // only `providers: {}`. They have no coordinator boundary to project, so do
+  // not turn their incomplete service config into a new launch requirement.
+  // Once a coordinator block is present, however, load and validate it fully
+  // rather than silently omitting a requested client connection.
+  if (!/^\s*coordinator\s*:/m.test(readFileSync(configPath, "utf8"))) return undefined;
+  // Config validation makes socketPath absolute. Do not swallow a malformed
+  // config here: an E2E instance with its coordinator omitted would boot into a
+  // misleading local fallback rather than reporting the bad client boundary.
+  const socketPath = loadConfig(dirname(configPath)).quota?.coordinator?.socketPath;
+  if (!socketPath) return undefined;
+  if (!isAbsolute(socketPath)) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket must be absolute for projection: ${socketPath}`
+    );
+  }
+  if (!isSocket(socketPath)) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket is unavailable or not a Unix socket: ${socketPath}`
+    );
+  }
+  return dirname(socketPath);
 }
 
 function parseSystemdStatus(output: string): E2EInstanceLiveStatus {
@@ -470,13 +486,19 @@ export class E2EInstanceManager {
       ensureMountTarget(configSource, configTarget);
       args.push("--ro-bind", realpathIfExists(configSource), configTarget);
       // The disposable instance receives the parent configuration as a client.
-      // Project only its configured coordinator socket back through the masked
-      // runtime tree; its databases remain host-only and are deliberately not
-      // part of the E2E instance's view.
-      const coordinatorSocketPath = configuredCoordinatorSocketPath(configSource);
-      if (coordinatorSocketPath && isSocket(coordinatorSocketPath)) {
-        ensureTargetParentDirs(args, coordinatorSocketPath);
-        args.push("--ro-bind", realpathIfExists(coordinatorSocketPath), coordinatorSocketPath);
+      // Project the coordinator's dedicated socket directory rather than the
+      // listener inode. The service recreates a Unix socket on restart; a
+      // read-only directory bind lets the client observe that replacement while
+      // still keeping coordinator databases outside the E2E instance.
+      const coordinatorSocketDirectory = configuredCoordinatorSocketDirectory(configSource);
+      if (coordinatorSocketDirectory) {
+        ensureTargetParentDirs(args, coordinatorSocketDirectory);
+        args.push("--dir", coordinatorSocketDirectory);
+        args.push(
+          "--ro-bind",
+          realpathIfExists(coordinatorSocketDirectory),
+          coordinatorSocketDirectory
+        );
       }
       // Carry exactly the LLM keys the nested instance always received — the
       // parent-grantable allow-list (#542) — never the whole secrets directory:
@@ -670,6 +692,8 @@ export class E2EInstanceManager {
       );
     }
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
+    const configSource = join(this.opts.mcHome, "config.yaml");
+    if (existsSync(configSource)) configuredCoordinatorSocketDirectory(configSource);
     this.prepareWorktree(worktree);
     // No valid holder record and no live unit: any surviving runtime directory
     // or preserved run root is an orphan (its owning record is gone), not
@@ -726,6 +750,8 @@ export class E2EInstanceManager {
 
     const resumeRoot = this.validateResumableRoot(requestedRoot, existing.resumableRoot);
     const worktree = this.validateOwnedWorktree(actorId, existing.worktree);
+    const configSource = join(this.opts.mcHome, "config.yaml");
+    if (existsSync(configSource)) configuredCoordinatorSocketDirectory(configSource);
     const record: E2EInstanceRecord = {
       actorId,
       actorHandle: existing.actorHandle,
