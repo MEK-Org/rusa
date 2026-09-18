@@ -219,6 +219,42 @@ describe("collection metrics", () => {
     }
   });
 
+  it("retains an unknown reading's own message where readiness can read it", async () => {
+    // The probe path reports a failed scrape or parse as data, not a throw. Its
+    // message is the only thing that distinguishes "the codex TUI never
+    // launched" from "the panel would not parse" (#517), so readiness must
+    // report it instead of the generic unknown-reading phrase.
+    const store = new SharedQuotaStore(join(makeRoot("rusa-quota-metrics-"), "quota.db"));
+    try {
+      const loop = new QuotaCollectionLoop({
+        store,
+        quotaService: {
+          getQuotaProbeOutcome: vi.fn().mockResolvedValue({
+            state: {
+              provider: "codex",
+              status: "unknown",
+              message:
+                "codex /status scrape failed: codex /status scrape failed with exit code 1: " +
+                "ERROR: /status panel never rendered in Codex session",
+            },
+            didProbe: true,
+          }),
+          hydrate: vi.fn(),
+        } as unknown as QuotaService,
+        providers: ["codex"],
+      });
+
+      await loop.tick();
+
+      const stats = loop.getAllStats().codex;
+      expect(stats.lastOutcome).toBe("failure");
+      expect(stats.lastError).toContain("panel never rendered");
+      expect(stats.lastError).not.toContain("probe returned an unknown reading");
+    } finally {
+      store.close();
+    }
+  });
+
   it("retains the failing probe's message where readiness can read it", async () => {
     const store = new SharedQuotaStore(join(makeRoot("rusa-quota-metrics-"), "quota.db"));
     try {

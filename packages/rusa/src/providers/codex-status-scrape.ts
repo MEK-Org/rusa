@@ -231,6 +231,20 @@ function assertSharedAuthSymlink(codexHome: string, hostCodexDir: string): void 
   throw new Error("codex /status scrape replaced the required shared auth symlink");
 }
 
+/**
+ * A bounded, single-line tail of the scrape script's stderr, for the exit-code
+ * error message. The script already explains its own failures there ("ERROR:
+ * /status panel never rendered in Codex session"), but a bare exit code reached
+ * the coordinator as an unqualified unknown reading, so hours of identical
+ * failures said nothing about which stage broke (#517). Bounded because this
+ * text ends up in readiness output and durable failure messages.
+ */
+function stderrTail(chunks: readonly string[]): string {
+  const text = chunks.join("").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return `: ${text.length > 300 ? `\u2026${text.slice(-300)}` : text}`;
+}
+
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
@@ -277,6 +291,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   try {
     return await new Promise<string>((resolve, reject) => {
       const chunks: string[] = [];
+      const errChunks: string[] = [];
       // `detached: true` makes the child its own process-group leader so we can
       // signal the whole group with `process.kill(-pid, ...)`.
       const child = spawn("bash", ["-c", script], {
@@ -325,10 +340,18 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
       );
       opts.signal?.addEventListener("abort", onAbort);
       child.stdout.on("data", (d: Buffer) => chunks.push(d.toString()));
+      child.stderr.on("data", (d: Buffer) => {
+        errChunks.push(d.toString());
+        // Keep only a recent window: a wedged tmux could otherwise stream
+        // unbounded warnings into memory for the whole 90s budget.
+        if (errChunks.length > 16) errChunks.shift();
+      });
       child.on("error", (err) => settle(err));
       child.on("close", (code) => {
         if (code !== 0 && code !== null) {
-          settle(new Error(`codex /status scrape failed with exit code ${code}`));
+          settle(
+            new Error(`codex /status scrape failed with exit code ${code}${stderrTail(errChunks)}`)
+          );
         } else {
           settle();
         }

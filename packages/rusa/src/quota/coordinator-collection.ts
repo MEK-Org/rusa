@@ -1,4 +1,4 @@
-import type { QuotaLlmProvider, QuotaService } from "../mcp/quota-mcp.js";
+import type { QuotaLlmProvider, QuotaProbeOutcome, QuotaService } from "../mcp/quota-mcp.js";
 import {
   nullQuotaMetrics,
   QUOTA_SERVICE_METRICS,
@@ -86,6 +86,23 @@ export interface QuotaCollectionLoopOptions {
 function describeProbeError(error: unknown): string {
   if (error === undefined || error === null) return "probe returned an unknown reading";
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The failure message for a probe that returned rather than threw. The probe
+ * path reports scrape and parse failures as data — an `unknown` snapshot whose
+ * `message` names the cause — so reading only `outcome.error` reduced every one
+ * of them to the bare "probe returned an unknown reading" (#517). A codex lane
+ * failing every probe for hours then looked identical whether the TUI never
+ * launched or the panel failed to parse, which is the one thing readiness most
+ * needs to tell apart.
+ */
+function describeProbeFailure(outcome: QuotaProbeOutcome): string {
+  if (outcome.error !== undefined && outcome.error !== null) {
+    return describeProbeError(outcome.error);
+  }
+  const message = outcome.state?.message?.trim();
+  return message || describeProbeError(undefined);
 }
 
 export class QuotaCollectionLoop {
@@ -205,7 +222,7 @@ export class QuotaCollectionLoop {
         if (outcome.error || outcome.state?.status === "unknown") {
           stat.failures += 1;
           stat.lastOutcome = "failure";
-          stat.lastError = describeProbeError(outcome.error);
+          stat.lastError = describeProbeFailure(outcome);
           this.metrics.counter(QUOTA_SERVICE_METRICS.scrapesTotal, {
             provider,
             outcome: "failure",

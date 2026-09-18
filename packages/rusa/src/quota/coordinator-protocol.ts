@@ -189,22 +189,40 @@ export function calculateFreshness(
   const hardStaleAfterMs = options?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
 
   const buckets: Record<string, number> = {};
+  const currentAges: number[] = [];
   if (stored.buckets && stored.buckets.length > 0) {
     for (const b of stored.buckets) {
       const observedMs = Date.parse(b.observedAt);
-      buckets[b.key] = Number.isFinite(observedMs)
+      const ageMs = Number.isFinite(observedMs)
         ? Math.max(0, nowMs - observedMs)
         : Number.POSITIVE_INFINITY;
+      buckets[b.key] = ageMs;
+      // Lane freshness is keyed on the buckets present in the newest scrape, or
+      // the governing bucket, rather than on every unexpired historical bucket
+      // (§5.5). A bucket that was not emitted by the newest scrape and is not
+      // governing does not age the lane.
+      //
+      // Membership is exact string equality with `updatedAt`, the newest
+      // `observed_at` across kinds: `SharedQuotaStore.insertObservations` stamps
+      // every row of one snapshot with the single `scrapedAt` string, so the rows
+      // of one scrape never disagree, and a row stamped even 1 ms earlier belongs
+      // to an earlier scrape.
+      const isNewestScrape = b.observedAt === stored.updatedAt;
+      const isGoverning =
+        stored.governingBucketKey !== null &&
+        stored.governingBucketKey !== undefined &&
+        b.key === stored.governingBucketKey;
+      if (!isNewestScrape && !isGoverning) continue;
+      currentAges.push(ageMs);
     }
   }
 
-  const bucketAges = Object.values(buckets);
   const updatedParsed = Date.parse(stored.updatedAt);
   const updatedAge = Number.isFinite(updatedParsed)
     ? Math.max(0, nowMs - updatedParsed)
     : Number.POSITIVE_INFINITY;
 
-  const ageMs = bucketAges.length > 0 ? Math.max(...bucketAges) : updatedAge;
+  const ageMs = currentAges.length > 0 ? Math.max(...currentAges) : updatedAge;
 
   const stale = ageMs > staleAfterMs;
   const hardStale = ageMs > hardStaleAfterMs;
