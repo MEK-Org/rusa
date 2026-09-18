@@ -662,11 +662,14 @@ export class EventManager {
 
   private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
     const resource = raw.rawResource ?? "system:events";
-    // An unstated raw priority is normal, on the same condition the wake in
-    // `ActorMesh.deliverExternalEvent` reads and the GitHub normalizer already
-    // applies. Defaulting to responsive here once persisted a responsive row
-    // behind a normal nudge for the same event (#477).
-    const payload: InboxPayload = { ...raw.rawPayload };
+    // `raw.priority` is the only field that decides the persisted row's
+    // priority: it is the field the wake in `ActorMesh.deliverExternalEvent`
+    // reads, on the same condition the GitHub normalizer applies, and an
+    // unstated value is normal. A `priority` carried inside `rawPayload` is
+    // dropped rather than honoured, so the row and the wake cannot disagree
+    // about one event through either door (#477).
+    const { priority: _payloadCarried, ...rest } = raw.rawPayload;
+    const payload: InboxPayload = { ...rest };
     if (raw.priority === "responsive") payload.priority = "responsive";
 
     return {

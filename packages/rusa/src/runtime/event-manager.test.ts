@@ -299,6 +299,44 @@ describe("EventManager", () => {
       expect(entries[0].payload.priority).toBe("responsive");
     });
 
+    it("reads the row's priority from the raw event, never from the payload", async () => {
+      // `rawPayload.priority` is the other door the row/wake split could walk
+      // through: the wake reads only `raw.priority`, so a payload-carried
+      // "responsive" with an unstated raw priority must not stamp the row
+      // (#477). The disk alert states both, and keeps its responsive row.
+      const inbox = new FakeInboxStore();
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-timer"],
+          subscriberIds: [],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+      const carried = { type: "system.disk", priority: "responsive" as const, message: "low" };
+
+      const unstated = await em.handleExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: carried,
+        idempotencyKey: "timer-3",
+      });
+      expect(unstated.entries.length).toBe(1);
+      expect(unstated.entries[0].payload.priority).toBeUndefined();
+      expect(unstated.entries[0].payload.message).toBe("low");
+
+      const stated = await em.handleExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: carried,
+        priority: "responsive",
+        idempotencyKey: "timer-4",
+      });
+      expect(stated.entries.length).toBe(1);
+      expect(stated.entries[0].payload.priority).toBe("responsive");
+    });
+
     it("normalizes timer ingress shapes preserving payload contents", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {

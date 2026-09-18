@@ -6044,12 +6044,12 @@ describe("ActorMesh", () => {
       mesh.subscribeEventSource(haltedResource, halted, "root");
       mesh.subscribeEventSource(availableResource, available, "root");
 
+      // Responsive is stated on the raw event, the one field the row and the
+      // wake both read (#477); a `priority` inside the payload alone no longer
+      // reaches the persisted row.
       await deliverCanonicalEvent(mesh, haltedResource, "halted comment", {
-        payload: {
-          type: "issue_comment.created",
-          commentId: 1288,
-          priority: "responsive",
-        },
+        payload: { type: "issue_comment.created", commentId: 1288 },
+        priority: "responsive",
       });
       await deliverCanonicalEvent(mesh, availableResource, "available comment", {
         payload: { type: "issue_comment.created", commentId: 1291 },
