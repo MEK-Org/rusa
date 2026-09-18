@@ -350,7 +350,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.freshness).toEqual(expected.freshness);
   });
 
-  it("criteria 5 and 5a: the oldest bucket governs freshness even when a narrower bucket refreshes updatedAt", () => {
+  it("criteria 5 and 5a: the governing bucket ages the lane even when a narrower bucket refreshes updatedAt", () => {
     const nowMs = Date.parse("2040-01-01T02:00:00.000Z");
     const status: PersistedQuotaProviderStatus = {
       provider: "claude",
@@ -466,16 +466,19 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
         .intervalSeconds
     ).toBe(36_000);
 
-    // Two buckets written in the same scrape differing by 1 ms are both treated as
-    // present in the newest scrape.
-    const sameScrapeBucket = {
+    // Same-scrape membership is exact: `insertObservations` stamps every row of
+    // one snapshot with the single `scrapedAt` string, so a non-governing row
+    // stamped even 1 ms before `updatedAt` came from an earlier scrape and does
+    // not age the lane.
+    const oneMsEarlierBucket = {
       ...olderUnexpiredFiveHour,
       observedAt: new Date(Date.parse(weeklyObservedAt) - 1).toISOString(),
     };
     expect(
-      calculateFreshness({ ...status, buckets: [status.buckets[0], sameScrapeBucket] }, options)
+      calculateFreshness({ ...status, buckets: [status.buckets[0], oneMsEarlierBucket] }, options)
     ).toMatchObject({
-      ageMs: 2 * 60_000 + 1,
+      ageMs: 2 * 60_000,
+      buckets: { "codex:weekly": 2 * 60_000, "codex:five_hour": 2 * 60_000 + 1 },
       stale: false,
       hardStale: false,
     });

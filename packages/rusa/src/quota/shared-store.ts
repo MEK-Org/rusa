@@ -689,15 +689,23 @@ export class SharedQuotaStore {
         .map((row) => row.observedAt)
         .sort()
         .at(-1) ?? new Date(0).toISOString();
-    const updatedAtMs = Date.parse(updatedAt);
-    const isCurrentScrape = (observedAtStr?: string) => {
-      if (!observedAtStr) return false;
-      const ms = Date.parse(observedAtStr);
-      return Number.isFinite(ms) && Math.abs(ms - updatedAtMs) <= 1000;
-    };
-    const currentScrapeReasoned = reasoned.filter((row) =>
-      isCurrentScrape(currentByKind.get(row.kind)?.observedAt ?? row.observedAt)
+    // The governing bucket is elected from the kinds the newest scrape emitted
+    // (§5.5). `insertObservations` stamps every row of one snapshot with the one
+    // `scrapedAt` string, so same-scrape membership is exact equality with
+    // `updatedAt`.
+    const currentScrapeReasoned = reasoned.filter(
+      (row) => (currentByKind.get(row.kind)?.observedAt ?? row.observedAt) === updatedAt
     );
+    // The newest scrape can have no reasoned row: its rows are inserted in
+    // `recordParsed` but only reasoned when the collection tick reaches
+    // `advancePendingController` after the remaining providers' probes, so a
+    // `/v1/throttle` read served in between sees `interval_seconds` NULL; and
+    // `advanceObservation` marks a row processed without an interval when it has
+    // no usable reset or no quota left. Fall back to the last reasoned bucket so
+    // the lane keeps its last-good interval rather than publishing 0. Freshness
+    // then ages the lane by that bucket (it is governing), which is the slower
+    // direction (§5.7) and lasts until the controller reasons the newest rows or
+    // the next scrape lands.
     const eligibleReasoned = currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned;
     eligibleReasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
     const governing = eligibleReasoned[0];

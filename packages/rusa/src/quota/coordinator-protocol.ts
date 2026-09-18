@@ -191,13 +191,6 @@ export function calculateFreshness(
   const buckets: Record<string, number> = {};
   const currentAges: number[] = [];
   if (stored.buckets && stored.buckets.length > 0) {
-    // `updatedAt` is the newest `observed_at` across kinds, i.e. the instant of
-    // the newest scrape; a bucket observed before it was not emitted by that
-    // scrape (§5.5).
-    const newestObservedMs = Math.max(
-      Date.parse(stored.updatedAt),
-      ...stored.buckets.map((b) => Date.parse(b.observedAt)).filter(Number.isFinite)
-    );
     for (const b of stored.buckets) {
       const observedMs = Date.parse(b.observedAt);
       const ageMs = Number.isFinite(observedMs)
@@ -208,9 +201,13 @@ export function calculateFreshness(
       // the governing bucket, rather than on every unexpired historical bucket
       // (§5.5). A bucket that was not emitted by the newest scrape and is not
       // governing does not age the lane.
-      const isNewestScrape =
-        Number.isFinite(observedMs) &&
-        (observedMs >= newestObservedMs - 1000 || b.observedAt === stored.updatedAt);
+      //
+      // Membership is exact string equality with `updatedAt`, the newest
+      // `observed_at` across kinds: `SharedQuotaStore.insertObservations` stamps
+      // every row of one snapshot with the single `scrapedAt` string, so the rows
+      // of one scrape never disagree, and a row stamped even 1 ms earlier belongs
+      // to an earlier scrape.
+      const isNewestScrape = b.observedAt === stored.updatedAt;
       const isGoverning =
         stored.governingBucketKey !== null &&
         stored.governingBucketKey !== undefined &&

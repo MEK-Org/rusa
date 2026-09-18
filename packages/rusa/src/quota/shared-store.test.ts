@@ -926,4 +926,77 @@ describe("SharedQuotaStore PID integral term", () => {
       store.close();
     }
   });
+
+  it("stamps every row of one snapshot with the single scrapedAt, so same-scrape membership is exact equality", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-same-scrape-stamp-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      const scrapedAt = "2030-01-01T00:00:00.000Z";
+      const state: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits: [
+          {
+            label: "session",
+            kind: "session",
+            scope: "provider",
+            percentLeft: 80,
+            resetAtIso: "2030-01-01T05:00:00.000Z",
+          },
+          {
+            label: "weekly",
+            kind: "weekly",
+            scope: "provider",
+            percentLeft: 40,
+            resetAtIso: "2030-01-08T00:00:00.000Z",
+          },
+        ],
+      };
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" });
+      store.recordParsed(id, state, state);
+
+      const throttle = store.getProviderThrottle("claude");
+      expect(throttle?.updatedAt).toBe(scrapedAt);
+      // Both rows carry the exact `scrapedAt` string: no per-row clock, no skew.
+      expect(throttle?.buckets.map((b) => b.observedAt)).toEqual([scrapedAt, scrapedAt]);
+      // The widest required interval governs, as before, from within that scrape.
+      expect(throttle?.governingBucketKey).toBe("claude:weekly");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps the last reasoned bucket governing when the newest scrape's rows are not yet reasoned", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-unreasoned-newest-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const t1 = "2030-01-01T00:00:00.000Z";
+      const t2 = "2030-01-01T00:05:00.000Z";
+      // A reasoned five_hour row from the previous tick.
+      recordObservation(store, "codex", t1, 50, "2030-01-01T05:00:00.000Z", "five_hour");
+      store.advancePendingController({ maxIntervalSeconds: 3600 });
+      const reasoned = store.getProviderThrottle("codex");
+      expect(reasoned?.governingBucketKey).toBe("codex:five_hour");
+      expect(reasoned?.intervalSeconds).toBeGreaterThan(0);
+
+      // The newest scrape's weekly row is inserted but the collection tick has
+      // not yet reached advancePendingController: interval_seconds is NULL.
+      recordObservation(store, "codex", t2, 95, "2030-01-08T00:00:00.000Z", "weekly");
+      const between = store.getProviderThrottle("codex");
+      expect(between?.updatedAt).toBe(t2);
+      // Last-good pacing is kept rather than publishing a null governing / 0 s.
+      expect(between?.governingBucketKey).toBe("codex:five_hour");
+      expect(between?.intervalSeconds).toBe(reasoned?.intervalSeconds);
+
+      // Once reasoned, the newest scrape's bucket governs.
+      store.advancePendingController({ maxIntervalSeconds: 3600 });
+      expect(store.getProviderThrottle("codex")?.governingBucketKey).toBe("codex:weekly");
+    } finally {
+      store.close();
+    }
+  });
 });

@@ -833,20 +833,19 @@ Notes on the shape, because the shape is the point:
 - `exhaustedUntil` is included and is not optional. It is what drives
   `pacer.deferUntil` when the window is expired (`start.ts:1289-1293`), and a
   publication that omitted it would silently drop the exhaustion gate.
-- **`freshness.ageMs` is the age of the *oldest* current bucket, not of the
-  newest observation.** A provider has several independently stored windows —
-  session and weekly for Claude, 5h and Weekly for Codex — each its own
-  `(provider, kind)` row, and a parse that omits one window leaves that kind's
-  previous row in place. `updatedAt` cannot carry this weight: it is computed as
-  the **newest** `observed_at` across kinds (`shared-store.ts:625-631`), so a
-  provider whose session window refreshes every tick would report itself fresh
-  indefinitely while its weekly window — possibly the governing one, since the
-  governing bucket is the widest required interval (`shared-store.ts:622-623`) —
-  went hours without an update. Defining provider freshness from the oldest
-  bucket makes staleness degrade toward slower (§5.7) in exactly the case that
-  should. The per-bucket map is published alongside so a reader can see *which*
-  window is old rather than only that one is; `updatedAt` keeps its current
-  **Lane freshness is keyed on the buckets present in the newest scrape, or the
+- **`freshness.ageMs` is the age of the oldest bucket the newest scrape
+  emitted, or of the governing bucket, not of the newest observation.** A
+  provider has several independently stored windows — session and weekly for
+  Claude, 5h and Weekly for Codex — each its own `(provider, kind)` row, and a
+  parse that omits one window leaves that kind's previous row in place.
+  `updatedAt` cannot carry this weight alone: it is computed as the **newest**
+  `observed_at` across kinds (`shared-store.ts:625-631`), so a provider whose
+  session window refreshes every tick would report itself fresh while a
+  governing weekly window went hours without an update. The per-bucket map is
+  published alongside so a reader can see *which* window is old rather than
+  only that one is; `updatedAt` keeps its current meaning and is display-only.
+  Criterion 5a is the failure test.
+- **Lane freshness is keyed on the buckets present in the newest scrape, or the
   governing bucket, rather than on every unexpired historical bucket.** When a
   provider's newest scrape emits only a subset of kinds — for instance, Codex
   emitting only a weekly row while a previously observed 5h row remains in
@@ -856,9 +855,31 @@ Notes on the shape, because the shape is the point:
   while the governing weekly bucket was fresh (#517). Such a bucket stays in
   the per-bucket map at its true age so the reader can still see it, but it does
   not contribute to `ageMs`. If an aged bucket *is* the governing bucket, it
-  continues to age the lane (5a holds). Furthermore, `getProviderThrottle`
-  elects the governing bucket from the buckets present in the newest scrape, so
-  an omitted historical bucket cannot govern the lane's interval.
+  continues to age the lane (5a holds). `getProviderThrottle` elects the
+  governing bucket from the reasoned buckets present in the newest scrape, so an
+  omitted historical bucket cannot govern the lane's interval; when the newest
+  scrape has no reasoned row yet (its rows are inserted before the tick's
+  controller step, or were marked processed without an interval for lack of a
+  usable reset), the last reasoned bucket keeps governing so the lane holds its
+  last-good interval rather than publishing zero, and it ages the lane until the
+  controller reasons the newest rows. Same-scrape membership is exact
+  `observed_at` equality: `insertObservations` stamps every row of one snapshot
+  with the single `scrapedAt`.
+
+  **The trade-off, stated out loud.** This rule chooses the observed failure
+  over the anticipated one. Earlier text keyed freshness on the *oldest* bucket
+  so that a window the parser silently dropped would age the lane toward
+  `maxIntervalSeconds` (§5.7). Under the newest-scrape rule a live window the
+  parser stops emitting no longer ages the lane — the lane's safety now depends
+  on the parser emitting every live window each scrape. That is the class of
+  bug #517 fixed for the GPT-5.3-Codex-Spark reserve block, and the live cost
+  of the old rule was a lane pinned at 36000 s for as long as an idle 5h row
+  went unrendered. A parser regression that drops a window is therefore a
+  **freshness risk**, not only a parsing bug: it is visible as a bucket in
+  `freshness.buckets` whose age keeps growing while `ageMs` does not, and as
+  `quota_service_observations_total{result="rejected"}` when the window is parsed but
+  not provider-scoped. Treat either as a signal to look at the parser, not at
+  the lane.
 - **`stale` and `hardStale` are published rather than left to the client, and
   that is deliberate.** A client could compute both from `ageMs` — but only
   against `staleAfterMs` and `hardStaleAfterMs`, which are *service*
@@ -1704,19 +1725,16 @@ right foundation for 1 and 8.
 5. **Staleness degrades one way.** With observations aged past
    `hardStaleAfterMs`, the published interval is `maxIntervalSeconds` — never the
    last reasoned interval, never faster.
-   **5a. Freshness follows the oldest bucket, not the newest stamp.** Persist two
-   kinds for one provider, then re-observe only the narrow one repeatedly while
-   the wide one ages past `hardStaleAfterMs`. Assert that `freshness.ageMs` and
-   `freshness.buckets[governingBucketKey]` both reflect the **aged** bucket, that
-   `hardStale` is true, and that the published interval is `maxIntervalSeconds`.
-   This is the criterion that would fail today's shape:
-   `getProviderThrottle.updatedAt` is the newest `observed_at` across kinds
-   (`shared-store.ts:625-631`) while the governing interval comes from the widest
-   window (`:622-623`), so a provider whose narrow bucket keeps refreshing would
-   report fresh indefinitely with a stale governing bucket underneath. Assert on
-   `freshness`, and separately assert that `updatedAt` still carries its current
-   newest-stamp meaning, so the display field and the safety field cannot be
-   confused for each other.
+   **5a. Freshness follows the governing bucket, not the newest stamp.** Persist
+   two kinds for one provider with the wide one governing, then let the wide one
+   age past `hardStaleAfterMs` while the narrow one refreshes `updatedAt`.
+   Assert that `freshness.ageMs` and `freshness.buckets[governingBucketKey]`
+   both reflect the **aged** governing bucket, that `hardStale` is true, and
+   that the published interval is `maxIntervalSeconds`. Separately assert that a
+   wide bucket the newest scrape did not emit and which is *not* governing shows
+   its true age in `freshness.buckets` but does not set `ageMs` (§5.5, #517),
+   and that `updatedAt` still carries its current newest-stamp meaning, so the
+   display field and the safety field cannot be confused for each other.
 6. **Unavailability changes nothing dangerous.** Remove the socket. Assert:
    clients keep launching, normal and responsive alike; each client's applied
    interval is unchanged until `hardStaleAfterMs` since its own last successful
@@ -1954,8 +1972,8 @@ approved — that is a human decision, not a mesh one.
    a floor (`quota-mcp.ts:834-855`); the single `prevState`, **hydrated at boot
    from the latest persisted `parsed_state`** (`shared-store.ts:318-333`);
    `geminiApiKey` on the service; controller advancement moved out of the
-   instance tick; freshness computed from the oldest current bucket rather than
-   the newest stamp. Covers 1, 4, 5, 5a, 11 and 13.
+   instance tick; freshness computed from the newest scrape's buckets or the
+   governing bucket rather than the newest stamp. Covers 1, 4, 5, 5a, 11 and 13.
 3. **Client read mode in the instance.** `quota.coordinator.socketPath`; the tick
    body loses its probe and its controller step and keeps its apply
    (`start.ts:1355-1360`); `SharedQuotaStore` construction goes away
