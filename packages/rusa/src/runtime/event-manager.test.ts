@@ -247,7 +247,7 @@ describe("EventManager", () => {
       expect(entries[0].id).toBe(deduplicatedInboxEntryId("spaces/AAA/messages/BBB", "actor-chat"));
     });
 
-    it("normalizes timer events with responsive priority by default", async () => {
+    it("persists an unstated timer priority as normal work", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
@@ -270,8 +270,33 @@ describe("EventManager", () => {
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("system:events");
       expect(entries[0].payload.type).toBe("timer.wake");
-      expect(entries[0].payload.priority).toBe("responsive");
+      // The row must agree with the wake, which reads only an explicit
+      // "responsive" from the raw event (#477).
+      expect(entries[0].payload.priority).toBeUndefined();
       expect(entries[0].payload.reminder).toBe("check build");
+    });
+
+    it("stamps an explicit responsive timer priority into the persisted row", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-timer"],
+          subscriberIds: [],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      const { entries } = await em.handleExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: { type: "timer.wake", reminder: "check build" },
+        priority: "responsive",
+        idempotencyKey: "timer-2",
+      });
+      expect(entries.length).toBe(1);
+      expect(entries[0].payload.priority).toBe("responsive");
     });
 
     it("normalizes timer ingress shapes preserving payload contents", async () => {

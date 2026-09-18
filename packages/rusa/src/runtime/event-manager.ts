@@ -662,11 +662,12 @@ export class EventManager {
 
   private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
     const resource = raw.rawResource ?? "system:events";
-    const priority = raw.priority ?? "responsive";
-    const payload: InboxPayload = {
-      ...raw.rawPayload,
-      ...(priority === "responsive" ? { priority: "responsive" } : {}),
-    };
+    // An unstated raw priority is normal, on the same condition the wake in
+    // `ActorMesh.deliverExternalEvent` reads and the GitHub normalizer already
+    // applies. Defaulting to responsive here once persisted a responsive row
+    // behind a normal nudge for the same event (#477).
+    const payload: InboxPayload = { ...raw.rawPayload };
+    if (raw.priority === "responsive") payload.priority = "responsive";
 
     return {
       resource,
