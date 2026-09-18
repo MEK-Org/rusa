@@ -34,6 +34,8 @@ ThreadDto makeThread(
   int? queuePosition,
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
+  InboxEntryDto? selectedInboxItem,
+  int? moreInboxItemsCount,
   String? voiceName,
   int? pacingIntervalMs,
 }) => ThreadDto(
@@ -61,10 +63,38 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
+<<<<<<< HEAD
   voiceConfig: voiceName == null
       ? null
       : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
+=======
+  selectedInboxItem: selectedInboxItem,
+  moreInboxItemsCount: moreInboxItemsCount,
+  voiceName: voiceName,
+>>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
   pacingIntervalMs: pacingIntervalMs,
+);
+
+InboxEntryDto makeInboxEntry(
+  String id, {
+  String actorId = 'actor-1',
+  String source = 'chat',
+  String deliveredAt = '2026-09-01T10:00:00.000Z',
+  String type = 'message',
+  String? content,
+  String? priority,
+  ReferenceDto? reference,
+}) => InboxEntryDto(
+  id: id,
+  actorId: actorId,
+  source: source,
+  deliveredAt: deliveredAt,
+  payload: {
+    'type': type,
+    'priority': ?priority,
+    'content': ?content,
+  },
+  reference: reference,
 );
 
 MeshEvent makeEvent(

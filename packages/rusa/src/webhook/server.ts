@@ -152,6 +152,10 @@ export interface DashboardMeshRefs {
   providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
   /** Active-run inbox focus projection; see `DashboardDataDeps`. */
   selectedObligationForActor?: DashboardDataDeps["selectedObligationForActor"];
+  /** Active-run selected inbox items projection; see `DashboardDataDeps`. */
+  selectedInboxItemsForActor?: DashboardDataDeps["selectedInboxItemsForActor"];
+  /** Direct selected inbox item resolver; see `DashboardDataDeps`. */
+  selectedInboxItemForActor?: DashboardDataDeps["selectedInboxItemForActor"];
   /** This instance's configured root identity ; see `DashboardDataDeps`. */
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
@@ -609,6 +613,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           queuedThreadIds: options.mesh.queuedThreadIds,
           providerQueueSnapshots: options.mesh.providerQueueSnapshots,
           selectedObligationForActor: options.mesh.selectedObligationForActor,
+          selectedInboxItemsForActor: options.mesh.selectedInboxItemsForActor,
+          selectedInboxItemForActor: options.mesh.selectedInboxItemForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
           supportedVoices: options.mesh.supportedVoices,

@@ -4,7 +4,7 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
+import type { InboxEntry, InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -27,7 +27,7 @@ import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
-import { resolveReferenceSync } from "../references/resolve.js";
+import { type ResolvedReference, resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
@@ -37,6 +37,7 @@ import {
   voiceConfigSchema,
 } from "../voice/voice-config.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
+import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -106,6 +107,18 @@ export interface DashboardDataDeps {
    * returns null as soon as the run that selected it completes.
    */
   selectedObligationForActor?: (actorId: string) => Obligation | null;
+  /**
+   * Selected inbox items for an actor's active run. When no obligation is selected,
+   * the dashboard selects one of these items using responsive-first then earliest order.
+   */
+  selectedInboxItemsForActor?: (actorId: string) => InboxEntry[] | null;
+  /**
+   * Optional direct resolver for the selected inbox item and more count.
+   */
+  selectedInboxItemForActor?: (
+    actorId: string,
+    runState: "running" | "queued" | "winding_down" | "idle"
+  ) => { item: InboxEntry; moreCount?: number } | null;
   /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
@@ -193,6 +206,18 @@ function charterPreview(charter: string): string {
   return `${points.slice(0, CHARTER_PREVIEW_CHARS).join("").trimEnd()}\u2026`;
 }
 
+export interface ResolvedInboxEntry {
+  id: string;
+  actorId: string;
+  source: string;
+  deliveredAt: string;
+  seenAt: string | null;
+  handledAt: string | null;
+  handledNote: string | null;
+  payload: InboxPayload;
+  reference?: ResolvedReference;
+}
+
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
   id: string;
@@ -234,6 +259,14 @@ interface ThreadDto {
   eligibleAt?: number | null;
   /** The active run's selected inbox-focus obligation, when one exists. */
   selectedObligation?: Obligation;
+  /**
+   * For a running actor with selected inbox items but no selected obligation,
+   * or a queued actor with unhandled inbox items: the top inbox item chosen
+   * responsive-first then earliest.
+   */
+  selectedInboxItem?: ResolvedInboxEntry;
+  /** Additional inbox items beyond the one shown, when more exist. */
+  moreInboxItemsCount?: number;
   /**
    * The actor's persisted walkie-talkie voice, or null when it follows the
    * instance-wide default (every actor without a stored `voice_config`).
@@ -458,6 +491,40 @@ function parsePositiveInt(url: URL, name: string): number | undefined {
 function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
   return Math.min(requested, maxLimit);
+}
+
+function resolveInboxEntrySync(entry: InboxEntry, deps: DashboardDataDeps): ResolvedInboxEntry {
+  const { messageId, ...payload } = entry.payload as InboxPayload & {
+    messageId?: unknown;
+  };
+  let reference: ResolvedReference | undefined;
+  if (typeof messageId === "string") {
+    reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+      meshChat: deps.meshChat,
+    });
+  } else if (entry.source.startsWith("github:") || entry.source.startsWith("mesh:")) {
+    reference = resolveReferenceSync(entry.source, {
+      meshChat: deps.meshChat,
+    });
+  }
+  const content =
+    reference?.body !== null && reference?.body !== undefined ? reference.body : payload.content;
+
+  return {
+    id: entry.id,
+    actorId: entry.actorId,
+    source: entry.source,
+    deliveredAt:
+      entry.deliveredAt instanceof Date
+        ? entry.deliveredAt.toISOString()
+        : String(entry.deliveredAt),
+    seenAt: entry.seenAt instanceof Date ? entry.seenAt.toISOString() : (entry.seenAt ?? null),
+    handledAt:
+      entry.handledAt instanceof Date ? entry.handledAt.toISOString() : (entry.handledAt ?? null),
+    handledNote: entry.handledNote ?? null,
+    payload: content !== undefined ? { ...payload, content } : payload,
+    ...(reference ? { reference } : {}),
+  };
 }
 
 /**
@@ -1524,6 +1591,38 @@ export async function handleMeshApiRequest(
         runState === "running" || runState === "winding_down"
           ? (deps.selectedObligationForActor?.(r.id) ?? null)
           : null;
+
+      let inboxSelection: { item: InboxEntry; moreCount?: number } | null = null;
+      if (runState === "running" || runState === "winding_down") {
+        if (!selectedObligation) {
+          if (deps.selectedInboxItemForActor) {
+            inboxSelection = deps.selectedInboxItemForActor(r.id, runState);
+          } else if (deps.selectedInboxItemsForActor) {
+            const items = deps.selectedInboxItemsForActor(r.id);
+            if (items && items.length > 0) {
+              inboxSelection = selectPrioritizedInboxItem(items);
+            }
+          }
+        }
+      } else if (runState === "queued") {
+        if (deps.selectedInboxItemForActor) {
+          inboxSelection = deps.selectedInboxItemForActor(r.id, runState);
+        } else if (deps.inbox) {
+          const page = deps.inbox.list(r.id, { status: "unhandled", limit: 100 });
+          if (page.entries.length > 0) {
+            inboxSelection = selectPrioritizedInboxItem(page.entries, page.unhandledCount);
+          }
+        }
+      }
+
+      const selectedInboxItem = inboxSelection
+        ? resolveInboxEntrySync(inboxSelection.item, deps)
+        : null;
+      const moreInboxItemsCount =
+        inboxSelection && inboxSelection.moreCount !== undefined && inboxSelection.moreCount > 0
+          ? inboxSelection.moreCount
+          : undefined;
+
       return {
         id: r.id,
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
@@ -1558,6 +1657,9 @@ export async function handleMeshApiRequest(
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
         voiceConfig: r.voiceConfig ?? null,
+        ...(selectedInboxItem ? { selectedInboxItem } : {}),
+        ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
+        voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();

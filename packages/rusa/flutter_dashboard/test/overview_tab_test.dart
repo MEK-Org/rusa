@@ -766,4 +766,113 @@ void main() {
       });
     },
   );
+
+  testWidgets(
+    'OverviewTab renders selected inbox items with (+N more) and single-item cases',
+    (tester) async {
+      await tester.runAsync(() async {
+        final runningInboxItem = makeInboxEntry(
+          'item-running',
+          content: 'Working on critical task',
+          type: 'message',
+          priority: 'responsive',
+        );
+        final queuedSingleItem = makeInboxEntry(
+          'item-queued-single',
+          content: 'Single queued item task',
+          type: 'obligation.ready_head',
+        );
+        final queuedMultiItem = makeInboxEntry(
+          'item-queued-multi',
+          content: 'Multi queued item task',
+          type: 'message',
+          priority: 'responsive',
+        );
+        final runningWithObligationItem = makeInboxEntry(
+          'item-ignored',
+          content: 'Should be ignored because obligation is present',
+        );
+        final obligation = makeObligation(
+          'ob-1',
+          title: 'Active obligation work',
+        );
+
+        final api = FakeApi()
+          ..runtimeCursor = const RuntimeCursor(streamId: 's', revision: 0)
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            // 1. Running actor with inbox item and multiple items -> shows item and (+2 more)
+            makeThread(
+              'running-inbox',
+              parent: 'root',
+              title: 'Running Actor',
+              runState: RunState.running,
+              selectedInboxItem: runningInboxItem,
+              moreInboxItemsCount: 2,
+            ),
+            // 2. Queued actor single-item case -> shows item and NO (+N more)
+            makeThread(
+              'queued-single',
+              parent: 'root',
+              title: 'Queued Single',
+              runState: RunState.queued,
+              queuePosition: 0,
+              selectedInboxItem: queuedSingleItem,
+              moreInboxItemsCount: 0,
+            ),
+            // 3. Queued actor with multiple items -> shows item and (+10 more)
+            makeThread(
+              'queued-multi',
+              parent: 'root',
+              title: 'Queued Multi',
+              runState: RunState.queued,
+              queuePosition: 1,
+              selectedInboxItem: queuedMultiItem,
+              moreInboxItemsCount: 10,
+            ),
+            // 4. Running actor with both obligation and inbox item -> shows obligation only
+            makeThread(
+              'running-ob',
+              parent: 'root',
+              title: 'Running with Obligation',
+              runState: RunState.running,
+              selectedObligation: obligation,
+              selectedInboxItem: runningWithObligationItem,
+            ),
+          ];
+
+        final stream = FakeStream();
+        final store = DashboardStore(api: api, stream: stream);
+        await store.init();
+
+        await tester.binding.setSurfaceSize(const Size(600, 1000));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        // 1. Running actor with inbox item and moreCount = 2
+        expect(find.text('Working on critical task'), findsOneWidget);
+        expect(find.text('(+2 more)'), findsOneWidget);
+
+        // 2. Queued actor with single item
+        expect(find.text('Single queued item task'), findsOneWidget);
+        // No (+0 more) or (+N more) for queued-single
+        expect(find.text('(+0 more)'), findsNothing);
+
+        // 3. Queued actor with multi item and moreCount = 10
+        expect(find.text('Multi queued item task'), findsOneWidget);
+        expect(find.text('(+10 more)'), findsOneWidget);
+
+        // 4. Running actor with obligation renders obligation, not inbox item
+        expect(find.text('Active obligation work'), findsOneWidget);
+        expect(
+          find.text('Should be ignored because obligation is present'),
+          findsNothing,
+        );
+
+        await store.dispose();
+      });
+    },
+  );
 }
