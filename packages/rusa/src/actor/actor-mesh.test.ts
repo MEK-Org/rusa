@@ -41,6 +41,7 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import type { AtIo } from "./at-queue.js";
+import { PARENT_GRANTABLE_CAPABILITIES } from "./capability-grants.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import { type CrontabIo, CrontabMutator } from "./crontab.js";
 import {
@@ -3424,6 +3425,89 @@ describe("ActorMesh", () => {
 
       rmSync(customSecretsDir, { recursive: true, force: true });
       rmSync(outsideDir, { recursive: true, force: true });
+    });
+
+    it("a non-root parent cannot delegate a secret outside the explicit allow-list, even to a direct child and even when the file exists", async () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      // Every one of these is a real regular file inside the directory: the
+      // refusal must come from AUTHORIZATION, not from containment.
+      writeFileSync(join(customSecretsDir, "gemini-api-key"), "synthetic-gemini-value");
+      writeFileSync(join(customSecretsDir, "mistral-api-key"), "synthetic-mistral-value");
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+      writeFileSync(join(customSecretsDir, "glass-goals-password"), "synthetic-password");
+
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({
+        events: (e) => events.push(e),
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret", ...PARENT_GRANTABLE_CAPABILITIES]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      for (const guessed of [
+        "secret:webhook-secret",
+        "secret:glass-goals-password",
+        "secret:no-such-file",
+        "secret",
+        "secret:",
+      ]) {
+        expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
+          /only the root may grant|bare secret grant/
+        );
+      }
+      expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
+      expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
+      // The refusal is the same whether or not the guessed file exists: a
+      // non-root grantor gets no existence oracle over the secrets directory.
+      expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
+        /only the root may grant secret:webhook-secret/
+      );
+      expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
+        /only the root may grant secret:no-such-file/
+      );
+      // Nor may the parent strip such a grant that root made.
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
+        /only the root may revoke/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      // The allow-listed LLM keys still delegate exactly as before #542.
+      mesh.grantCapability(child, "secret:gemini-api-key", parent);
+      mesh.grantCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child).sort()).toEqual([
+        "secret:gemini-api-key",
+        "secret:mistral-api-key",
+        "secret:webhook-secret",
+      ]);
+      await mesh.revokeCapability(child, "secret:gemini-api-key", parent);
+      await mesh.revokeCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+
+    it("root may grant any contained secret, and a delegated LLM-key grant still fails containment when the file is missing", () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret", ...PARENT_GRANTABLE_CAPABILITIES]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+      // Authorized name, but no such file on this host: containment still gates it.
+      expect(() => mesh.grantCapability(child, "secret:gemini-api-key", parent)).toThrow(
+        /secret file does not exist/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
     });
 
     it("revocation succeeds even if host secret file was deleted after grant", async () => {

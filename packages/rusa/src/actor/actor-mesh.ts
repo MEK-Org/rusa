@@ -2091,13 +2091,12 @@ export class ActorMesh {
       baseCapability = "email-send";
     } else if (capability.startsWith("drive-read:")) {
       baseCapability = "drive-read";
-    } else if (capability.startsWith("secret:")) {
-      baseCapability = "secret";
     }
-    if (
-      !PARENT_GRANTABLE_CAPABILITIES.has(baseCapability) &&
-      !PARENT_GRANTABLE_CAPABILITIES.has(capability)
-    ) {
+    // Secret capabilities are deliberately NOT reduced to their `secret` base
+    // here: a non-root parent may delegate only the exact
+    // `secret:<filename>` names in the allow-list (#542 security review), so a
+    // guessed infrastructure filename never rides through on the prefix.
+    if (!PARENT_GRANTABLE_CAPABILITIES.has(baseCapability)) {
       throw new Error(
         `only the root may ${verb} ${capability}; a non-root parent may only ${verb}: ${
           [...PARENT_GRANTABLE_CAPABILITIES].join(", ") || "none"

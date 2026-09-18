@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -111,5 +111,66 @@ describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant entrypoint (real
     ]);
     const out2 = execFileSync("bwrap", argv2, { encoding: "utf8" });
     expect(out2).toBe("revoked");
+  });
+
+  it("a granted file swapped for an escaping symlink or a directory after the grant is unreadable at the next spawn", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "mc-synthetic-bwrap-swap-"));
+    fixtureRoots.push(fixtureRoot);
+    process.env.HOME = fixtureRoot;
+
+    const actorId = "worker-synthetic-test";
+    const mcHome = join(fixtureRoot, ".rusa");
+    const actorDir = join(mcHome, "workers", actorId);
+    const secretsDir = join(mcHome, "secrets");
+    const grantedPath = join(secretsDir, "synthetic-swap-secret");
+    const hostOnlyPath = join(fixtureRoot, "host-only-file");
+    const hostOnlyValue = "host-only-dummy-value-24680";
+
+    mkdirSync(actorDir, { recursive: true });
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(grantedPath, "synthetic-dummy-value-13579\n", { mode: 0o600 });
+    writeFileSync(hostOnlyPath, `${hostOnlyValue}\n`, { mode: 0o600 });
+
+    const dataDir = join(mcHome, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const db = new Database(join(dataDir, "mesh.db"));
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-06-27T00:00:00Z')"
+    ).run();
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-06-27T00:00:00Z')"
+    ).run(actorId);
+    // Granted while it was a legitimate regular file (as the mesh would have checked).
+    db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, 'secret:synthetic-swap-secret', 'parent-test', '2026-08-12T00:00:00Z', NULL)`
+    ).run(actorId);
+    db.close();
+
+    // Grant is still active, but the host entry is now a symlink escaping the
+    // secrets dir: the spawn must leave the path masked, and the escape target's
+    // content must not be reachable at the granted path.
+    rmSync(grantedPath);
+    symlinkSync(hostOnlyPath, grantedPath);
+    const swappedToLink = buildActorBwrapArgs(actorDir, "antigravity");
+    const argvLink = buildActorBwrapCommand(swappedToLink, "/bin/sh", [
+      "-c",
+      'test ! -e "$HOME/.rusa/secrets/synthetic-swap-secret" && [ -z "$SYNTHETIC_SWAP_SECRET" ] && printf "%s" "masked"',
+    ]);
+    expect(argvLink.join("\0")).not.toContain(hostOnlyValue);
+    expect(execFileSync("bwrap", argvLink, { encoding: "utf8" })).toBe("masked");
+
+    // Same with a directory in its place.
+    rmSync(grantedPath);
+    mkdirSync(grantedPath);
+    writeFileSync(join(grantedPath, "nested"), "nested-dummy-value\n");
+    const swappedToDir = buildActorBwrapArgs(actorDir, "antigravity");
+    const argvDir = buildActorBwrapCommand(swappedToDir, "/bin/sh", [
+      "-c",
+      'test ! -e "$HOME/.rusa/secrets/synthetic-swap-secret" && printf "%s" "masked"',
+    ]);
+    expect(execFileSync("bwrap", argvDir, { encoding: "utf8" })).toBe("masked");
   });
 });

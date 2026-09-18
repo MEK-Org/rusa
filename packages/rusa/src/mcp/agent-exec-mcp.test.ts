@@ -1394,6 +1394,36 @@ describe("agent-execution MCP server", () => {
     expect(nonSecret.isError).toBe(true);
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
 
+    // A generic secret OUTSIDE the parent-grantable allow-list → rejected for a
+    // direct child too, whether or not the guessed file exists (#542 security
+    // review): the authority check runs before containment, so the error is the
+    // same either way and a non-root parent gets no existence oracle.
+    writeFileSync(join(defaultTestSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+    for (const guessed of ["secret:webhook-secret", "secret:no-such-file"]) {
+      const res = (await parentSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: guessed },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toBe(
+        `only the root may grant ${guessed}; a non-root parent may only grant: secret:gemini-api-key, secret:mistral-api-key`
+      );
+    }
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
+    // Root may grant it; the parent may not then revoke it.
+    const rootGrant = (await rootSrv.callTool({
+      name: "grant_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(rootGrant.isError).toBeFalsy();
+    const parentRevoke = (await parentSrv.callTool({
+      name: "revoke_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(parentRevoke.isError).toBe(true);
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual(["secret:webhook-secret"]);
+    rmSync(join(defaultTestSecretsDir, "webhook-secret"), { force: true });
+
     // Unknown grantee → returns unknown thread id error .
     const unknownGrantee = (await parentSrv.callTool({
       name: "grant_capability",

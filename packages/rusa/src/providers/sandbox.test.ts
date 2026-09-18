@@ -1175,6 +1175,141 @@ describe("sandbox bwrap args", () => {
       warnSpy.mockRestore();
     });
 
+    describe("re-validates containment at spawn, immediately before the bind (post-grant swap → fail closed)", () => {
+      // A grant row proves only that the file passed containment WHEN GRANTED.
+      // These cases swap the host entry after the grant and expect the spawn to
+      // leave the path under the tmpfs mask: no `--ro-bind` of the secret, no
+      // entrypoint exporting it. `withGrantedGemini` seeds the grant while the
+      // file is still a legitimate regular file, like the mesh would.
+      function withGrantedGemini() {
+        const home = makeWorkerHome();
+        mkdirSync(home.secretsDir, { recursive: true, mode: 0o700 });
+        const geminiKeyPath = join(home.secretsDir, "gemini-api-key");
+        writeFileSync(geminiKeyPath, "synthetic-gemini-value\n", { mode: 0o600 });
+        seedGrant(home.mcHome, ACTOR_ID, "secret:gemini-api-key");
+        return { ...home, geminiKeyPath };
+      }
+
+      async function spawnArgs(actorDir: string) {
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const { buildActorBwrapArgs } = await import("./sandbox.js");
+        const result = buildActorBwrapArgs(actorDir, "antigravity");
+        warnSpy.mockRestore();
+        return result;
+      }
+
+      function expectMaskedOnly(
+        args: string[],
+        commandPrefix: string[],
+        secretsDir: string,
+        geminiKeyPath: string
+      ) {
+        expect(args.filter((_, i) => args[i - 1] === "--tmpfs")).toContain(secretsDir);
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 2]).not.toBe(geminiKeyPath);
+            expect(args[i + 2]).not.toContain(secretsDir);
+          }
+        }
+        expect(commandPrefix).not.toContain("rusa-secrets-entrypoint");
+      }
+
+      it("file → symlink escaping the secrets dir: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const outside = mkdtempSync(join(tmpdir(), "mc-outside-"));
+        tempDirs.push(outside);
+        const outsideFile = join(outside, "host-file");
+        writeFileSync(outsideFile, "host-only-content\n", { mode: 0o600 });
+        rmSync(geminiKeyPath);
+        symlinkSync(outsideFile, geminiKeyPath);
+
+        const { args, commandPrefix } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        // The escape target must not be bound anywhere either.
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 1]).not.toBe(outsideFile);
+          }
+        }
+      });
+
+      it("file → directory: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+        mkdirSync(geminiKeyPath);
+        writeFileSync(join(geminiKeyPath, "nested"), "nested-content\n");
+
+        const { args, commandPrefix } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+      });
+
+      it("file → dangling symlink: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+        symlinkSync(join(secretsDir, "does-not-exist"), geminiKeyPath);
+
+        const { args, commandPrefix } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+      });
+
+      it("file → symlink to a sibling regular file INSIDE the secrets dir: bound from the resolved path", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const siblingPath = join(secretsDir, "rotated-gemini-api-key");
+        writeFileSync(siblingPath, "synthetic-rotated-value\n", { mode: 0o600 });
+        rmSync(geminiKeyPath);
+        symlinkSync(siblingPath, geminiKeyPath);
+
+        const { args, commandPrefix } = await spawnArgs(actorDir);
+        const bind = args.findIndex(
+          (a, i) =>
+            a === "--ro-bind" &&
+            args[i + 1] === realpathSync(siblingPath) &&
+            args[i + 2] === geminiKeyPath
+        );
+        expect(bind).toBeGreaterThan(-1);
+        expect(commandPrefix).toContain("rusa-secrets-entrypoint");
+      });
+
+      it("one swapped grant does not stop a still-valid grant from binding", async () => {
+        const { mcHome, actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const mistralKeyPath = join(secretsDir, "mistral-api-key");
+        writeFileSync(mistralKeyPath, "synthetic-mistral-value\n", { mode: 0o600 });
+        // seedGrant resets the store; seed both rows, then swap gemini.
+        seedGrant(mcHome, ACTOR_ID, "secret:gemini-api-key");
+        const db = new Database(join(mcHome, "data", "mesh.db"));
+        db.prepare(
+          `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+           VALUES (?, 'secret:mistral-api-key', 'parent-1', '2026-07-17T00:00:00Z', NULL)`
+        ).run(ACTOR_ID);
+        db.close();
+        rmSync(geminiKeyPath);
+        mkdirSync(geminiKeyPath);
+
+        const { args, commandPrefix } = await spawnArgs(actorDir);
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 2]).not.toBe(geminiKeyPath);
+          }
+        }
+        expect(
+          args.findIndex(
+            (a, i) =>
+              a === "--ro-bind" &&
+              args[i + 1] === realpathSync(mistralKeyPath) &&
+              args[i + 2] === mistralKeyPath
+          )
+        ).toBeGreaterThan(-1);
+        expect(commandPrefix).toEqual([
+          "/bin/sh",
+          "-c",
+          expect.stringContaining('MISTRAL_API_KEY=$(/bin/cat -- "$1")'),
+          "rusa-secrets-entrypoint",
+          mistralKeyPath,
+        ]);
+        expect(commandPrefix.join("\0")).not.toContain("GEMINI_API_KEY");
+      });
+    });
+
     it("does not mask the secrets dir for the E2E root-agent double (workers-only guard)", async () => {
       const home = mkdtempSync(join(tmpdir(), "mc-home-"));
       tempDirs.push(home);

@@ -22,7 +22,10 @@ import {
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
+import {
+  PARENT_GRANTABLE_CAPABILITIES,
+  SECRET_CAPABILITY_BASE,
+} from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -2056,10 +2059,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
     // Grantable = every registered MCP-server capability PLUS the secret
-    // capabilities . Secrets deliberately have NO server factory: the
-    // `grantableServers.get(cap)` loop in createActor skips them safely, and the
-    // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
-    grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
+    // capabilities (#542): the generic `secret` base lets ROOT grant any
+    // contained `secret:<filename>`, while the explicit parent-grantable names
+    // are what a non-root parent may delegate. Secrets deliberately have NO
+    // server factory: the `grantableServers.get(cap)` loop in createActor skips
+    // them safely, and the sandbox honors them instead (see injectSecretsMasking
+    // in sandbox.ts).
+    grantableCapabilities: new Set([
+      ...grantableServers.keys(),
+      SECRET_CAPABILITY_BASE,
+      ...PARENT_GRANTABLE_CAPABILITIES,
+    ]),
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {

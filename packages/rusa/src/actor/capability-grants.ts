@@ -22,13 +22,32 @@ export const SECRET_CAPABILITY_PREFIX = "secret:";
 export const SECRET_CAPABILITY_BASE = "secret";
 
 /**
- * Capabilities a NON-root parent may grant to / revoke from its DIRECT children.
- * A non-root parent may grant any valid secret (`secret:<filename>`) to its direct children.
- * Everything else stays root-only. Enforced in the mesh
+ * Secret filenames a NON-root parent may delegate to its DIRECT children — the
+ * LLM API keys that were parent-grantable before #542 generalized the secret
+ * capability. The list is deliberately explicit: a generic `secret:<filename>`
+ * outside it (webhook secrets, service passwords, anything an operator drops
+ * into the directory later) stays root-only, so a compromised worker cannot
+ * exfiltrate an infrastructure secret by guessing its filename and granting it
+ * to a sub-worker. Extending parent delegation to another file is a deliberate
+ * edit here, never a side effect of creating the file.
+ */
+export const PARENT_GRANTABLE_SECRET_FILENAMES: readonly string[] = [
+  "gemini-api-key",
+  "mistral-api-key",
+];
+
+/**
+ * Capabilities a NON-root parent may grant to / revoke from its DIRECT children:
+ * exactly the `secret:<filename>` capabilities for
+ * {@link PARENT_GRANTABLE_SECRET_FILENAMES}. Everything else — every other
+ * secret file and every MCP-server capability — stays root-only. Matched by the
+ * FULL capability name (never by the `secret` prefix), and enforced in the mesh
  * (`ActorMesh.grantCapability`/`revokeCapability`), not just the tool layer, so
  * the invariant holds for any caller.
  */
-export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set([SECRET_CAPABILITY_BASE]);
+export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set(
+  PARENT_GRANTABLE_SECRET_FILENAMES.map((filename) => `${SECRET_CAPABILITY_PREFIX}${filename}`)
+);
 
 /**
  * A grant of an extra MCP capability to a specific actor, beyond the default
