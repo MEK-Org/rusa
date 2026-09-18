@@ -614,8 +614,10 @@ export function createAgentExecMcpServer(
         "message pending in either direction, or holds a live event subscription; the " +
         "refusal names each one, and nothing is retired until you have reassigned or finished " +
         "those obligations, cancelled (cancel_scheduled_message) or re-sent those messages, " +
-        "and transferred/reclaimed (delegate_event_source/reclaim_event_source) or " +
-        "unsubscribed (unsubscribe_event_source) those event subscriptions.",
+        "and disposed of those event subscriptions — an ownership is delegated onward by its " +
+        "holder (delegate_event_source, its parent included) or reclaimed by the owner above it " +
+        "(reclaim_event_source); a direct subscription is dropped by its holder " +
+        "(unsubscribe_event_source).",
       inputSchema: {
         thread_id: z.string().describe("The descendant thread to retire."),
         force: z

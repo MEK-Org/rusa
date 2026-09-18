@@ -8724,7 +8724,11 @@ describe("ActorMesh", () => {
         expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
         expect(blocked.message).toContain(`${resource} [ownership] held by ${worker}`);
         expect(blocked.message).toContain(
-          "transfer or reclaim each with delegate_event_source / reclaim_event_source, or unsubscribe with unsubscribe_event_source"
+          "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+            "or the owner above it reclaims it (reclaim_event_source)"
+        );
+        expect(blocked.message).toContain(
+          "[subscription]: the holder unsubscribes (unsubscribe_event_source)"
         );
       }
 

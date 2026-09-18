@@ -397,9 +397,19 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
     );
   }
   if (blockers.subscriptions.length > 0) {
+    // Each kind names the tool that actually clears it. Ownership is only ever
+    // reached by delegation (root owns the configured roots; nothing else mints
+    // it), so it leaves the same way: the holder delegates it onward — its
+    // parent included — or the owner above it reclaims it. A direct
+    // subscription belongs to its holder alone, and only the holder can drop
+    // it. `unsubscribe_event_source` is deliberately not an ownership release:
+    // ownership with no receiver would route by whichever ancestor happens to
+    // be live, which is the implicit fallback #540 refuses to add.
     lines.push(
       `${blockers.subscriptions.length} live event subscription(s) owned in its subtree — ` +
-        "transfer or reclaim each with delegate_event_source / reclaim_event_source, or unsubscribe with unsubscribe_event_source:"
+        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+        "or the owner above it reclaims it (reclaim_event_source); " +
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source):"
     );
     lines.push(
       ...listWithOverflow(

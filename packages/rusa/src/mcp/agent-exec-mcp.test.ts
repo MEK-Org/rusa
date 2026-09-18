@@ -999,8 +999,13 @@ describe("agent-execution MCP server", () => {
       expect(message).toContain("2 live event subscription(s) owned in its subtree");
       expect(message).toContain("github:test-org/test-repo/issues/10 [ownership]");
       expect(message).toContain("github:test-org/test-repo [subscription]");
-      expect(message).toContain("delegate_event_source / reclaim_event_source");
-      expect(message).toContain("unsubscribe_event_source");
+      expect(message).toContain(
+        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+          "or the owner above it reclaims it (reclaim_event_source)"
+      );
+      expect(message).toContain(
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source)"
+      );
       expect(registry.get(worker)?.status).toBe("active");
 
       const reclaimed = (await client.callTool({
@@ -1022,6 +1027,66 @@ describe("agent-execution MCP server", () => {
         arguments: { source: "github:test-org/test-repo" },
       })) as CallToolResult;
       expect(unsubscribed.isError).toBeFalsy();
+
+      const retired = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The holder-side disposition the refusal names: an [ownership] blocker
+    // clears when the holder delegates it back to its parent through the same
+    // tool that handed it down. No new tool and no ownership release without a
+    // receiver — the source is owned by someone live at every step.
+    it("retire_thread succeeds after the holder delegates its ownership back to its parent (#540)", async () => {
+      const { mesh, registry } = setup({ configuredEventSources: ["github:test-org/test-repo"] });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      mesh.delegateEventSource("github:test-org/test-repo/pulls/11", worker, "root");
+
+      const refused = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain(
+        `github:test-org/test-repo/pulls/11 [ownership] held by ${worker}`
+      );
+
+      // `unsubscribe_event_source` is direct-subscription only: it does not
+      // touch ownership, so the blocker stands.
+      const unsubscribed = (await workerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/11" },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+      const stillBlocked = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(stillBlocked.isError).toBe(true);
+      expect(String(dataOf(stillBlocked))).toContain("1 live event subscription(s)");
+
+      const handedBack = (await workerClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "root", source: "github:test-org/test-repo/pulls/11" },
+      })) as CallToolResult;
+      expect(handedBack.isError).toBeFalsy();
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === "github:test-org/test-repo/pulls/11" && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual(["root"]);
 
       const retired = (await client.callTool({
         name: "retire_thread",
