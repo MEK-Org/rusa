@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -195,6 +195,14 @@ function deferredProvider() {
   };
 }
 
+const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-actor-mesh-test-secrets-"));
+writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
+writeFileSync(join(defaultTestSecretsDir, "mistral-api-key"), "test-mistral-key");
+
+afterAll(() => {
+  rmSync(defaultTestSecretsDir, { recursive: true, force: true });
+});
+
 function setup(
   opts: {
     maxConcurrent?: number;
@@ -238,6 +246,7 @@ function setup(
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
+    secretsDir?: string;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -295,6 +304,7 @@ function setup(
     withTransaction: opts.withTransaction,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
     grantableCapabilities: opts.grantableCapabilities,
+    secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: opts.idgen ?? (() => `t${++seq}`),
     onYield: opts.onYield,
     recordRunYield: opts.recordRunYield,
@@ -3169,7 +3179,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh, registry } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     registry.upsert({
       id: "iu-thread",
@@ -3307,7 +3317,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -3327,7 +3337,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a secret to a non-child (sibling, grandchild, or itself)", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
@@ -3359,9 +3369,175 @@ describe("ActorMesh", () => {
     ).rejects.toThrow("unknown thread id: ghost-grantee");
   });
 
+  describe("generic secret capability containment and grant rules", () => {
+    it("rejects bare secret and bare secret: grants", () => {
+      const { mesh } = setup({
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+      expect(() => mesh.grantCapability(child, "secret", "root")).toThrow(
+        /bare secret grant is not allowed/
+      );
+      expect(() => mesh.grantCapability(child, "secret:", "root")).toThrow(
+        /bare secret grant is not allowed/
+      );
+    });
+
+    it("rejects path traversal, absolute paths, missing files, symlink escapes, and directories", () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      const outsideDir = mkdtempSync(join(tmpdir(), "rusa-outside-"));
+      writeFileSync(join(outsideDir, "outside-secret"), "outside");
+      symlinkSync(join(outsideDir, "outside-secret"), join(customSecretsDir, "escape-link"));
+      mkdirSync(join(customSecretsDir, "nested-dir"));
+      writeFileSync(join(customSecretsDir, "valid-secret"), "hello");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+      // Path traversal
+      expect(() => mesh.grantCapability(child, "secret:../outside", "root")).toThrow(
+        /path traversal/
+      );
+      // Absolute path
+      expect(() => mesh.grantCapability(child, "secret:/etc/passwd", "root")).toThrow(
+        /absolute path/
+      );
+      // Missing file
+      expect(() => mesh.grantCapability(child, "secret:missing-secret", "root")).toThrow(
+        /secret file does not exist/
+      );
+      // Symlink escape
+      expect(() => mesh.grantCapability(child, "secret:escape-link", "root")).toThrow(
+        /escapes secrets directory/
+      );
+      // Non-regular file (directory)
+      expect(() => mesh.grantCapability(child, "secret:nested-dir", "root")).toThrow(
+        /regular file/
+      );
+
+      // Valid regular file succeeds
+      expect(() => mesh.grantCapability(child, "secret:valid-secret", "root")).not.toThrow();
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:valid-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    });
+
+    it("a non-root parent cannot delegate a secret outside the explicit allow-list, even to a direct child and even when the file exists", async () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      // Every one of these is a real regular file inside the directory: the
+      // refusal must come from AUTHORIZATION, not from containment.
+      writeFileSync(join(customSecretsDir, "gemini-api-key"), "synthetic-gemini-value");
+      writeFileSync(join(customSecretsDir, "mistral-api-key"), "synthetic-mistral-value");
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+      writeFileSync(join(customSecretsDir, "glass-goals-password"), "synthetic-password");
+
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({
+        events: (e) => events.push(e),
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      for (const guessed of [
+        "secret:webhook-secret",
+        "secret:glass-goals-password",
+        "secret:no-such-file",
+        "secret",
+        "secret:",
+      ]) {
+        expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
+          /only the root may grant|bare secret grant/
+        );
+      }
+      expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
+      expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
+      // The refusal is the same whether or not the guessed file exists: a
+      // non-root grantor gets no existence oracle over the secrets directory.
+      expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
+        /only the root may grant secret:webhook-secret/
+      );
+      expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
+        /only the root may grant secret:no-such-file/
+      );
+      // Nor may the parent strip such a grant that root made.
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
+        /only the root may revoke/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      // The allow-listed LLM keys still delegate exactly as before #542.
+      mesh.grantCapability(child, "secret:gemini-api-key", parent);
+      mesh.grantCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child).sort()).toEqual([
+        "secret:gemini-api-key",
+        "secret:mistral-api-key",
+        "secret:webhook-secret",
+      ]);
+      await mesh.revokeCapability(child, "secret:gemini-api-key", parent);
+      await mesh.revokeCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+
+    it("root may grant any contained secret, and a delegated LLM-key grant still fails containment when the file is missing", () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+      // Authorized name, but no such file on this host: containment still gates it.
+      expect(() => mesh.grantCapability(child, "secret:gemini-api-key", parent)).toThrow(
+        /secret file does not exist/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+
+    it("revocation succeeds even if host secret file was deleted after grant", async () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      writeFileSync(join(customSecretsDir, "ephemeral-secret"), "hello");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+      mesh.grantCapability(child, "secret:ephemeral-secret", "root");
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:ephemeral-secret"]);
+
+      // Delete file on host
+      rmSync(join(customSecretsDir, "ephemeral-secret"));
+
+      // Revocation must still succeed
+      await expect(
+        mesh.revokeCapability(child, "secret:ephemeral-secret", "root")
+      ).resolves.toBeUndefined();
+      expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+  });
+
   it("root grant and revoke on an unknown grantee throw unknown thread id error ", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     expect(() => mesh.grantCapability("ghost-grantee", "understanding-write", "root")).toThrow(
       "unknown thread id: ghost-grantee"
@@ -3373,7 +3549,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });

@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  assertSecretContainment,
   GLASS_GOALS_PASSWORD_SECRET_FILENAME,
   readHostSecret,
   resolveGlassGoalsPassword,
@@ -78,5 +79,136 @@ describe("resolveGlassGoalsPassword", () => {
   it("returns undefined when neither the file nor the env var is set", () => {
     delete process.env.GLASS_GOALS_PASSWORD;
     expect(resolveGlassGoalsPassword(makeHome())).toBeUndefined();
+  });
+});
+
+describe("assertSecretContainment", () => {
+  it("rejects empty or whitespace filename", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    expect(() => assertSecretContainment("", secretsDir)).toThrow("secret filename is required");
+    expect(() => assertSecretContainment("   ", secretsDir)).toThrow("secret filename is required");
+  });
+
+  it("rejects absolute paths (absolute path containment rule)", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    expect(() => assertSecretContainment("/etc/passwd", secretsDir)).toThrow(
+      /must not be an absolute path/
+    );
+    expect(() => assertSecretContainment("/tmp/secret", secretsDir)).toThrow(
+      /must not be an absolute path/
+    );
+  });
+
+  it("rejects path traversal (traversal containment rule)", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    expect(() => assertSecretContainment("../etc/passwd", secretsDir)).toThrow(
+      /path traversal is not allowed/
+    );
+    expect(() => assertSecretContainment("..", secretsDir)).toThrow(
+      /path traversal is not allowed/
+    );
+    expect(() => assertSecretContainment(".", secretsDir)).toThrow(/path traversal is not allowed/);
+    expect(() => assertSecretContainment("sub/../../escape", secretsDir)).toThrow(
+      /path traversal is not allowed/
+    );
+    expect(() => assertSecretContainment("sub/secret", secretsDir)).toThrow(
+      /path traversal is not allowed/
+    );
+  });
+
+  it("rejects missing or unknown secret files (fail loudly at grant time)", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    expect(() => assertSecretContainment("nonexistent-key", secretsDir)).toThrow(
+      /secret file does not exist/
+    );
+  });
+
+  it("rejects when secrets directory does not exist", () => {
+    const home = makeHome();
+    const secretsDir = join(home, "nonexistent-dir");
+    expect(() => assertSecretContainment("gemini-api-key", secretsDir)).toThrow(
+      /secret file does not exist: "gemini-api-key" \(secrets directory not found/
+    );
+  });
+
+  it("the traversal rule is exactly 'a plain basename': dots INSIDE a name are an ordinary filename", () => {
+    // `foo..bar` has no `..` component and no separator, so it cannot leave the
+    // directory; the check must not confuse it with traversal.
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    const secretPath = writeHostSecret("synthetic..dotted-key", "synthetic-dotted-value", home);
+    expect(assertSecretContainment("synthetic..dotted-key", secretsDir)).toBe(secretPath);
+    expect(() => assertSecretContainment("synthetic..missing-key", secretsDir)).toThrow(
+      /secret file does not exist/
+    );
+  });
+
+  it("rejects symlinks that escape the secrets directory (symlink escape rule)", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+
+    const outsideFile = join(home, "outside-secret.txt");
+    writeFileSync(outsideFile, "outside-secret-data\n");
+
+    const symlinkPath = join(secretsDir, "escaping-link");
+    symlinkSync(outsideFile, symlinkPath);
+
+    expect(() => assertSecretContainment("escaping-link", secretsDir)).toThrow(
+      /secret symlink escapes secrets directory/
+    );
+  });
+
+  it("rejects broken symlinks", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+
+    const brokenLinkPath = join(secretsDir, "broken-link");
+    symlinkSync(join(secretsDir, "does-not-exist"), brokenLinkPath);
+
+    expect(() => assertSecretContainment("broken-link", secretsDir)).toThrow(
+      /secret file does not exist or broken symlink/
+    );
+  });
+
+  it("rejects non-regular files such as subdirectories (non-regular file rule)", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    const subDir = join(secretsDir, "nested-directory");
+    mkdirSync(subDir, { recursive: true, mode: 0o700 });
+
+    expect(() => assertSecretContainment("nested-directory", secretsDir)).toThrow(
+      /secret must resolve to a regular file/
+    );
+  });
+
+  it("accepts a regular file directly inside secrets directory and returns canonical path", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    const secretPath = writeHostSecret("synthetic-api-key", "synthetic-secret-value", home);
+
+    const resolved = assertSecretContainment("synthetic-api-key", secretsDir);
+    expect(resolved).toBe(secretPath);
+  });
+
+  it("accepts a symlink pointing to a regular file directly inside secrets directory", () => {
+    const home = makeHome();
+    const secretsDir = secretsDirPath(home);
+    const secretPath = writeHostSecret("target-key", "secret-content", home);
+
+    const internalLink = join(secretsDir, "internal-link");
+    symlinkSync(secretPath, internalLink);
+
+    const resolved = assertSecretContainment("internal-link", secretsDir);
+    expect(resolved).toBe(secretPath);
   });
 });

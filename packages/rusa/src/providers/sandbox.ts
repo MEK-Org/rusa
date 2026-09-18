@@ -20,10 +20,28 @@ import Database from "better-sqlite3";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { hostJobAuditArtifactDir } from "../actor/host-job-audit-artifact.js";
 import { loadConfig } from "../config/loader.js";
-import { SECRETS_DIRNAME } from "../config/secrets.js";
+import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
+
+/**
+ * Host-side diagnostics from the sandbox layer. The layer is built per spawn
+ * by the providers, which carry no logger, so the composition root installs
+ * the service logger with {@link setSandboxLogger} (its secret scrubbing then
+ * applies here too); until it does — and under test — a plain module logger is
+ * built on first use. Nothing recorded here is a secret VALUE: this layer
+ * resolves paths and never reads a secret's content.
+ */
+let _sandboxLogger: Logger | undefined;
+export function setSandboxLogger(logger: Logger | undefined): void {
+  _sandboxLogger = logger;
+}
+function sandboxLog(): Logger {
+  _sandboxLogger ??= createLogger({ context: { component: "sandbox" } });
+  return _sandboxLogger;
+}
 
 export interface ActorBwrapResult {
   args: string[];
@@ -453,19 +471,21 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * dir is worker-legitimate by default — and `GLASS_GOALS_PASSWORD` is scrubbed
  * from the environment (defense against a stale `EnvironmentFile=` on the unit).
  *
- * When the spawning actor holds an ACTIVE `secret:gemini-api-key` grant, the
- * real `secrets/gemini-api-key` file is `--ro-bind`-ed back OVER its masked path
+ * When the spawning actor holds an ACTIVE `secret:<filename>` grant, the
+ * real `secrets/<filename>` file is `--ro-bind`-ed back OVER its masked path
  * (the bind must come AFTER the `--tmpfs` of the directory — bwrap applies
  * mounts in argument order), so the grantee reads the key at the same well-known
- * path as on the host. `secret:mistral-api-key` does the same for
- * `secrets/mistral-api-key` and also exports the OCR tool's required
- * `MISTRAL_API_KEY`. Grants are read straight from the `capability_grants`
- * table in `$RUSA_HOME/data/mesh.db` through a short-lived readonly
- * connection (the sandbox layer never imports the mesh — same discipline
+ * path as on the host. Kebab-case secret names also export an environment
+ * variable (e.g. `secret:mistral-api-key` exports `MISTRAL_API_KEY`,
+ * `secret:gemini-api-key` exports `GEMINI_API_KEY`). Grants are read straight from
+ * the `capability_grants` table in `$RUSA_HOME/data/mesh.db` through a short-lived
+ * readonly connection (the sandbox layer never imports the mesh — same discipline
  * as `loadConfig()` in {@link injectWorkerGithubCredential}), keyed by the actor
  * id (= the worker dir's basename, see start.ts `join(workersDir, actorId)`).
  * Evaluated per-spawn, so grant/revoke takes effect on the actor's next run.
- * Fail-closed to MASKED: any open/read error means "no grant", never "leaked".
+ * Fail-closed to MASKED: any open/read error means "no grant", never "leaked",
+ * and every granted filename is re-checked for containment (regular file,
+ * directly inside the directory, no escaping symlink) right before its bind.
  */
 export function deriveSecretEnvVar(filename: string): string {
   if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(filename)) {
@@ -528,12 +548,34 @@ function injectSecretsMasking(
   const grantedSecretPaths: { name: string; path: string; varName: string }[] = [];
 
   for (const secretName of secretGrants) {
+    // Re-run the FULL grant-time containment check immediately before the bind
+    // (#542 security review): the grant row only proves the file was a regular
+    // file inside the secrets dir when it was granted. If the host entry has
+    // since been swapped for a directory, a special file, or a symlink that
+    // resolves outside the directory, fail closed — the path stays under the
+    // tmpfs mask — rather than letting bwrap follow whatever is there now.
+    // Same discipline as the grant-store read above: a failed check means "no
+    // bind" for this one file (the actor sees it absent, exactly as if the
+    // host file had been deleted), never a bind of something unchecked. The
+    // refusal is recorded on the host, so an operator can tell "granted, then
+    // the host file went bad" from "never granted" (the revoke case looks the
+    // same from inside the sandbox). The record names the file, never its
+    // content.
+    let realSecretPath: string;
+    try {
+      realSecretPath = assertSecretContainment(secretName, secretsDir);
+    } catch (err) {
+      sandboxLog().warn("secret_grant_skipped_at_spawn", { actorId, filename: secretName, err });
+      continue;
+    }
     const secretPath = join(secretsDir, secretName);
-    if (existsSync(secretPath)) {
+    // ORDER MATTERS: after the `--tmpfs` above, so the single-file bind punches
+    // the real key back through the directory mask. The bind SOURCE is the
+    // canonical path the check just resolved (never the un-resolved entry), so
+    // the mount is of the file that passed containment.
+    args.push("--ro-bind", realSecretPath, secretPath);
+    if (/^[a-z0-9]+(-[a-z0-9]+)*$/.test(secretName)) {
       const varName = deriveSecretEnvVar(secretName);
-      // ORDER MATTERS: after the `--tmpfs` above, so the single-file bind punches
-      // the real key back through the directory mask.
-      args.push("--ro-bind", secretPath, secretPath);
       grantedSecretPaths.push({ name: secretName, path: secretPath, varName });
     }
   }

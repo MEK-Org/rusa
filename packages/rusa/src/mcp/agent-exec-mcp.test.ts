@@ -1,9 +1,12 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
 import {
   ActorMesh,
@@ -94,6 +97,14 @@ class FakeScheduledMessages implements ScheduledMessageScheduler {
   }
 }
 
+const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-mcp-test-secrets-"));
+writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
+writeFileSync(join(defaultTestSecretsDir, "mistral-api-key"), "test-mistral-key");
+
+afterAll(() => {
+  rmSync(defaultTestSecretsDir, { recursive: true, force: true });
+});
+
 function setup(
   opts: {
     childResponder?: () => Promise<Partial<RunResult>>;
@@ -110,6 +121,7 @@ function setup(
     useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
+    secretsDir?: string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -161,11 +173,8 @@ function setup(
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
-    grantableCapabilities: new Set([
-      "understanding-write",
-      "secret:gemini-api-key",
-      "secret:mistral-api-key",
-    ]),
+    grantableCapabilities: new Set(["understanding-write", "secret"]),
+    secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
@@ -1380,6 +1389,36 @@ describe("agent-execution MCP server", () => {
     expect(nonSecret.isError).toBe(true);
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
 
+    // A generic secret OUTSIDE the parent-grantable allow-list → rejected for a
+    // direct child too, whether or not the guessed file exists (#542 security
+    // review): the authority check runs before containment, so the error is the
+    // same either way and a non-root parent gets no existence oracle.
+    writeFileSync(join(defaultTestSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+    for (const guessed of ["secret:webhook-secret", "secret:no-such-file"]) {
+      const res = (await parentSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: guessed },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toBe(
+        `only the root may grant ${guessed}; a non-root parent may only grant: secret:gemini-api-key, secret:mistral-api-key`
+      );
+    }
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
+    // Root may grant it; the parent may not then revoke it.
+    const rootGrant = (await rootSrv.callTool({
+      name: "grant_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(rootGrant.isError).toBeFalsy();
+    const parentRevoke = (await parentSrv.callTool({
+      name: "revoke_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(parentRevoke.isError).toBe(true);
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual(["secret:webhook-secret"]);
+    rmSync(join(defaultTestSecretsDir, "webhook-secret"), { force: true });
+
     // Unknown grantee → returns unknown thread id error .
     const unknownGrantee = (await parentSrv.callTool({
       name: "grant_capability",
@@ -1394,6 +1433,34 @@ describe("agent-execution MCP server", () => {
     })) as CallToolResult;
     expect(unknownRevoke.isError).toBe(true);
     expect(dataOf(unknownRevoke)).toBe("unknown thread id: ghost");
+  });
+
+  it("grant_capability rejects secret traversal, missing file, and bare secret", async () => {
+    const { mesh } = setup();
+    const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { thread_id: childId } = dataOf(
+      (await rootSrv.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+
+    for (const badCap of [
+      "secret",
+      "secret:",
+      "secret:../outside",
+      "secret:/etc/passwd",
+      "secret:nonexistent-file",
+    ]) {
+      const res = (await rootSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: badCap },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    }
   });
 
   it("revive_thread (root) revives a retired thread and audits it", async () => {

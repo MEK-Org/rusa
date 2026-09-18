@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
@@ -717,6 +718,8 @@ export interface ActorMeshOptions {
   withTransaction?: (fn: () => void) => void;
   /** Structured lifecycle records for the host-owned voice transfer boundary. */
   voiceTransferLogger?: Logger;
+  /** Host secrets directory for containment checks on generic secret grants. Defaults to secretsDirPath(). */
+  secretsDir?: string;
   log?: (msg: string) => void;
 }
 
@@ -842,6 +845,7 @@ export class ActorMesh {
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
+  private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
   private readonly voiceTransferLog: Logger;
   private scheduledMessages?: ScheduledMessageScheduler;
@@ -908,6 +912,7 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.grantable = opts.grantableCapabilities ?? new Set();
+    this.secretsDir = opts.secretsDir ?? secretsDirPath();
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
       opts.providerGate ??
@@ -2087,6 +2092,10 @@ export class ActorMesh {
     } else if (capability.startsWith("drive-read:")) {
       baseCapability = "drive-read";
     }
+    // Secret capabilities are deliberately NOT reduced to their `secret` base
+    // here: a non-root parent may delegate only the exact
+    // `secret:<filename>` names in the allow-list (#542 security review), so a
+    // guessed infrastructure filename never rides through on the prefix.
     if (!PARENT_GRANTABLE_CAPABILITIES.has(baseCapability)) {
       throw new Error(
         `only the root may ${verb} ${capability}; a non-root parent may only ${verb}: ${
@@ -2126,6 +2135,8 @@ export class ActorMesh {
       baseCapability = "email-send";
     } else if (capability.startsWith("drive-read:")) {
       baseCapability = "drive-read";
+    } else if (capability.startsWith("secret:")) {
+      baseCapability = "secret";
     }
     if (capability === "chat-write" || capability === "chat-write:") {
       throw new Error(
@@ -2148,12 +2159,24 @@ export class ActorMesh {
         `bare email-send grant is not allowed; must specify a recipient (e.g. email-send:person@example.com)`
       );
     }
+    if (capability === "secret" || capability === "secret:") {
+      throw new Error(
+        `bare secret grant is not allowed; must specify a secret filename (e.g. secret:gemini-api-key)`
+      );
+    }
+    // One rule: the BASE must be grantable (`secret` for every `secret:<file>`).
+    // Per-name authority — which secret files a non-root parent may delegate —
+    // lives in assertGrantAuthority, not here.
     if (!this.grantable.has(baseCapability)) {
       throw new Error(
         `not a grantable capability: ${capability} (grantable: ${[...this.grantable].join(", ") || "none"})`
       );
     }
     this.assertGrantAuthority(grantedBy, actorId, capability, "grant");
+    if (baseCapability === "secret") {
+      const secretFilename = capability.slice("secret:".length);
+      assertSecretContainment(secretFilename, this.secretsDir);
+    }
     this.grants.grant({ actorId, capability, grantedBy, grantedAt: this.now() });
     this.recordEvent({
       kind: "capability_granted",
