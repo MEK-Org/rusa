@@ -45,3 +45,17 @@ bool isOperatorOwnerText(String text, String? userPrincipalId) {
       t == kOperatorDisplayHandle ||
       isViewerPrincipal(t, userPrincipalId);
 }
+
+/// Whether `id` names a human principal — either the legacy alias, any
+/// `human:*` prefix, or the server-resolved durable user principal.
+///
+/// Scope: the only durable id the dashboard can name is the *viewer's*, because
+/// that is the only one the server reports (`/api/dashboard/config`). A second
+/// user's durable id is not enumerable client-side today, so their rows still
+/// resolve as an unknown actor — lifting that needs the server to expose the
+/// user list (or an owner kind on the obligation), not a wider match here.
+bool isHumanPrincipal(String? id, String? userPrincipalId) {
+  if (id == null) return false;
+  if (id.startsWith('human:')) return true;
+  return isViewerPrincipal(id, userPrincipalId);
+}
