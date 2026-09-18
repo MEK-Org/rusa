@@ -3,8 +3,9 @@
 Design-only proposal for #543. It describes the design for tracking a Kimi monthly quota
 period locally from observed token usage in the rusa quota coordinator and exposing it
 as an additional quota period for pacing, model-class selection, and dashboard
-observability. Nothing here is implemented. No runtime code changes, schema migrations,
-or quota storage changes are made with this document.
+observability. Nothing here is implemented. No runtime code changes or schema migrations
+are made with this document; the proposed future implementation includes the isolated
+accounting ledger described in §4.2.
 
 Every source citation below is against `origin/staging` at `106a432`. Paths are
 repository-relative; line numbers are that commit's.
@@ -16,16 +17,16 @@ repository-relative; line numbers are that commit's.
 **A synthetic, locally tracked monthly quota window.** Kimi enforces a monthly usage
 ceiling on its service, but its CLI `/usage` display (`packages/rusa/src/providers/kimi-usage-scrape.ts`)
 reports only short-window buckets (`5h limit` and `Weekly limit`), omitting monthly
-usage and remaining quota entirely. On 2026-09-17, the provider returned an unannounced
-HTTP 403 monthly limit error that abruptly halted every Kimi-selected actor. This proposal
-defines a synthetic `kimi:monthly` quota bucket in the quota coordinator
-(`packages/rusa/src/quota/shared-store.ts`), anchored to an operator-configured instant
-and timezone, accumulated from per-run token usage records
-(`packages/rusa/src/providers/token-accounting.ts`), and reasoned about by the existing
-closed-loop PID controller (`shared-store.ts:426-608`). This synthetic window enters
-`getProviderThrottle` alongside native scraped windows, providing smooth backpressure,
-early diversion of model-class pools (`packages/rusa/src/actor/provider-pacer.ts:391-419`),
-and honest dashboard visibility before a hard provider lockout occurs.
+usage and remaining quota entirely. An observed monthly-exhaustion response showed that
+short-window headroom alone cannot prevent a monthly lockout. This proposal defines a
+locally derived `kimi:monthly` window, anchored to an operator-configured instant and
+timezone, accumulated from per-run token usage records
+(`packages/rusa/src/providers/token-accounting.ts`), and reasoned about by a sibling of
+the existing closed-loop PID controller (`shared-store.ts:426-608`). The derived window is
+combined with, but is not inserted into, native scrape observations. It provides smooth
+backpressure, early diversion of model-class pools
+(`packages/rusa/src/actor/provider-pacer.ts:391-419`), and honest dashboard visibility
+before a hard provider lockout occurs.
 
 ---
 
@@ -51,20 +52,18 @@ This display is separate from Open Platform API quotas.
 See fixture `packages/rusa/src/mcp/fixtures/kimi-usage-expected.txt`. The provider panel
 provides no monthly usage figure, no monthly token ceiling, and no billing cycle indicator.
 
-### 2.2 The 2026-09-17 exhaustion incident
+### 2.2 Observed monthly exhaustion
 
-On 2026-09-17, active Kimi-selected actor runs failed with the provider error:
-
-```text
-error: failed to run prompt: provider.auth_error: 403 You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota
-```
+An observed provider response classified as a monthly-exhaustion response supplied the
+single initial calibration point. The public design deliberately omits account-specific
+timestamps, usage totals, and provider-account details; those are not needed to specify
+the mechanism.
 
 Because the quota coordinator had visibility only into Kimi's `five_hour` and `weekly`
 buckets (`packages/rusa/src/quota/shared-store.ts:644-729`), the closed-loop controller
 reported healthy headroom on both short windows. Pacing did not slow down launches, and
 multi-provider candidate selection in `selectPoolLane` (`packages/rusa/src/actor/provider-pacer.ts:391`)
-continued directing traffic to Kimi until all concurrent actors encountered the 403
-rejection simultaneously.
+continued directing traffic to Kimi until a monthly lockout was encountered.
 
 ### 2.3 Proposed architecture
 
@@ -74,15 +73,16 @@ locally. The proposed architecture consists of four cooperating mechanisms:
 1. **Configured period definition**: An operator-configured anchor instant and IANA
    timezone in `config.yaml` defining the monthly cycle boundary, evaluated using civil
    calendar arithmetic across daylight-saving transitions and varying month lengths.
-2. **Local token accumulation**: Ingesting per-run token usage from `run_token_records`
-   (`packages/rusa/src/db/migrations/0010_run_token_records.ts`) into the shared quota
-   store, preserving input, output, and cache read splits with cross-instance deduplication.
+2. **Local token accumulation**: Ingesting immutable source records from
+   `run_token_records` (`packages/rusa/src/db/migrations/0010_run_token_records.ts`) into
+   a dedicated shared accounting ledger, preserving input, output, and cache-read splits
+   with cross-instance deduplication.
 3. **Limit estimation and confidence rating**: Estimating the monthly token ceiling from
    exhaustion events, expressed with an explicit confidence level and safety margin to
    prevent over-trusting a single data point.
-4. **Coordinator integration**: Exposing the synthetic monthly bucket through
-   `calculateFreshness`, `getProviderThrottle`, `ProviderPacer`, `selectPoolLane`, and
-   the dashboard API as an estimated quota window.
+4. **Coordinator integration**: Keeping native scrape freshness in `calculateFreshness`,
+   then combining a separately derived monthly result with `getProviderThrottle`,
+   `ProviderPacer`, `selectPoolLane`, and the dashboard API as an estimated window.
 
 ---
 
@@ -105,8 +105,8 @@ quota:
 
 The configuration requires two values:
 - `instant`: A reference instant representing the configured anchor instant (ISO-8601).
-- `timezone`: An IANA timezone identifier (e.g. `UTC`, `America/New_York`, etc.) defining the civil
-  clock against which the provider's billing cycle is presumed to operate.
+- `timezone`: An IANA timezone identifier defining the civil clock against which the
+  provider's billing cycle is presumed to operate.
 
 If `monthlyAnchor` is omitted, synthetic monthly tracking remains disabled and Kimi
 operates with standard 5h and weekly scraping only.
@@ -158,11 +158,15 @@ function of `(monthlyAnchor, nowMs)`.
 
 On coordinator boot:
 1. `QuotaService` reads the configured anchor and calculates $[T_{\text{start}}, T_{\text{reset}})$.
-2. The coordinator queries stored token records spanning $[T_{\text{start}}, \text{now})$.
-3. The cumulative usage is materialized in memory and synced to the synthetic observation
-   in `SharedQuotaStore`.
-No historical accumulators need to be persisted in singleton state tables; the period
-is deterministically reconstructed from immutable configuration and durable run logs.
+2. The coordinator queries the dedicated accounting ledger for source records spanning
+   $[T_{\text{start}}, \text{now})$.
+3. It derives cumulative usage from those immutable splits; it does **not** create a
+   `quota_observations` row or advance a synthetic scrape timestamp.
+4. If active pacing is enabled, it restores the small, cycle-keyed monthly controller
+   state separately from the native-observation controller state.
+The active-period total is therefore reconstructed from immutable configuration and
+durable accounting records, while controller memory remains isolated and disposable at
+a cycle boundary.
 
 ---
 
@@ -189,35 +193,62 @@ versus uncached generation. Standard industry conventions include:
 - **Raw token sum**: $T_{\text{raw}} = \text{uncachedInput} + \text{cacheRead} + \text{output}$
 - **Discounted cache sum**: $T_{\text{weighted}} = 1.0 \times \text{uncachedInput} + 0.1 \times \text{cacheRead} + 1.0 \times \text{output}$
 
-In the observed Kimi data for rusa, `cache_read` constitutes **94.4%** of all recorded
-tokens (2,530,048 of 2,680,480 raw tokens). If the provider counts cache reads at 1:1,
-the monthly ceiling is governed almost entirely by cache reads. If the provider discounts
-cache reads by 90% (a 0.1x multiplier), the effective usage is roughly 403,000 tokens.
+The available local history is dominated by `cache_read` tokens. If the provider counts
+cache reads at 1:1, the monthly ceiling is governed almost entirely by cache reads. If the
+provider applies a substantial cache-read discount, the same raw history can imply a much
+larger raw-token ceiling. This uncertainty is material: it rules out active monthly gating
+until the calibration plan in §7.2 has produced evidence for a weight tuple.
 
 #### 4.1.2 Storage contract
 To remain robust against unannounced provider accounting changes:
-1. **Durable storage retains raw splits**: The shared store retains raw integer counts
-   for `uncached_input`, `cache_read`, and `output`. Raw values are never pre-multiplied
-   before insertion.
+1. **Durable storage retains raw splits**: A new shared accounting ledger retains raw
+   integer counts for `uncached_input`, `cache_read`, and `output`. Raw values are never
+   pre-multiplied before insertion. The existing `run_token_records` table remains source
+   evidence; it is not repurposed as the coordinator's mutable state.
 2. **Configurable evaluation formula**: Effective tokens are calculated at evaluation
-   time using an operator-configurable or calibrated weight tuple:
+   time using a calibrated weight tuple:
    $$U = w_{\text{uncached}} \cdot \text{uncachedInput} + w_{\text{cache}} \cdot \text{cacheRead} + w_{\text{output}} \cdot \text{output}$$
-   Default weights in v1 are $(1.0, 1.0, 1.0)$ (raw tokens), with support for an
-   operator override `quota.providers.kimi.tokenWeights: [1.0, 0.1, 1.0]` once provider
-   billing documentation or repeated exhaustions confirm the tariff.
+   Before calibration, the raw tuple $(1.0, 1.0, 1.0)$ is a diagnostic baseline only;
+   shadow mode does not use it to gate a lane. A configured override remains possible
+   after it is backed by provider documentation or the observed calibration evidence.
 
-### 4.2 Deduplication across coordinator instances and retries
+### 4.2 Source identity, aggregation, and deduplication
 
-#### 4.2.1 Deduplication authority
-In multi-process or multi-instance rusa deployments sharing one quota coordinator, token
-records must be ingested idempotently.
-- Every invocation in `packages/rusa/src/actor/actor-mesh.ts:4300-4330` carries a unique
-  UUID `runId`.
-- Ingestion into the shared store is keyed by `(run_id, provider)`. If multiple instances
-  report the completion of a shared task or retry an insertion, the operation uses an
-  `INSERT OR IGNORE` transaction, ensuring each run is accounted exactly once.
+#### 4.2.1 Existing source-record semantics
+`run_token_records` is an observability source, not a per-run uniqueness constraint.
+Its primary key is `id`; `run_id` has a non-unique index, and `provider` is an ordinary
+column (`packages/rusa/src/db/migrations/0010_run_token_records.ts:9-30`). Today
+`ActorMesh.accountRun` is called at a terminal run result and writes a token total once
+for that result (`packages/rusa/src/actor/actor-mesh.ts:1092-1097, 4299-4328`), but the
+schema permits more than one source record for a run. The proposal must preserve that
+distinction.
 
-#### 4.2.2 Failed runs and retries
+#### 4.2.2 Proposed shared ledger and idempotency key
+The future implementation adds a dedicated, append-only accounting ledger in the shared
+coordinator database. Each imported event carries:
+
+```text
+(source_instance_id, source_record_id, run_id, provider, measured_at,
+ uncached_input, cache_read, output, measurement_kind)
+```
+
+- `source_record_id` is the existing `run_token_records.id`, not `run_id`.
+- `(source_instance_id, source_record_id)` is the ledger's unique key. The collector uses
+  `INSERT OR IGNORE` on that pair, so retrying delivery or two coordinator connections
+  cannot double-count a source record.
+- `source_instance_id` distinguishes otherwise independent instance databases. It is a
+  local stable identifier and is not displayed in the dashboard or public diagnostics.
+- The ledger is a proposed future schema; this design-only PR makes no schema change.
+
+For the present terminal-result writer, `measurement_kind = final_total`: the imported
+splits are the total for that source record. If future instrumentation emits multiple
+records for a long-running `run_id`, it must choose one explicit contract before import:
+either monotonic `snapshot_total` records with a sequence number (the collector retains
+the greatest sequence), or `delta` records (the collector sums each distinct source
+record). It must never sum multiple cumulative snapshots. A source record that lacks this
+contract is reported as unattributed rather than guessed.
+
+#### 4.2.3 Failed runs and retries
 When an actor run fails (for example, due to a tool failure, linter rejection, or provider
 timeout), the LLM tokens emitted during the attempt were still processed and charged by
 the provider.
@@ -226,7 +257,7 @@ the provider.
 - **Exclusion**: Aborted connections where zero wire records were written produce null
   usage (`unattributedTokenUsage`) and add 0 tokens.
 
-#### 4.2.3 Unattributed usage handling
+#### 4.2.4 Unattributed usage handling
 If a run completes without parseable token usage (e.g. an unhandled crash or a legacy session
 format), `run_token_records` records NULLs.
 - Attributed runs represent ground truth.
@@ -243,19 +274,15 @@ format), `run_token_records` records NULLs.
 
 ### 5.1 Estimation from a single exhaustion event
 
-As of 2026-09-18, the system has observed exactly **one** exhaustion event:
-- **Timestamp**: 2026-09-17 20:56:45Z
-- **Error**: HTTP 403 `monthly usage limit for this billing cycle`
-- **Observed usage in active cycle** (from the configured anchor through the 2026-09-17 exhaustion):
-  - 187 attributed runs
-  - `uncached_input`: 140,137
-  - `cache_read`: 2,530,048
-  - `output`: 10,295
-  - Total raw tokens: 2,680,480 (~2.68M tokens)
+One classified monthly-exhaustion event supplies one calibration sample. At the event,
+the ledger holds its raw split vector $(u_1, c_1, o_1)$ for the active configured period.
+For an already calibrated weight tuple $w$, the first candidate limit is:
+$$\hat{L}_1 = w_u u_1 + w_c c_1 + w_o o_1$$
 
-Because $N = 1$, this observation establishes an initial candidate limit:
-$$\hat{L}_{\text{raw}} \approx 2,680,000 \text{ tokens}$$
-or $\hat{L}_{\text{discounted}} \approx 403,000 \text{ tokens}$ under a 0.1x cache read discount.
+The public document intentionally does not publish the account-specific event timestamp,
+run count, or token totals. They are inputs to the local estimator, not design facts.
+Until the weighting calibration is credible, this first sample is shown as a diagnostic
+range in shadow mode and is not used to reduce Kimi dispatch capacity.
 
 ### 5.2 Confidence expression and safety margins
 
@@ -277,16 +304,15 @@ an explicit **Confidence Model**:
 The effective limit used for PID pacing calculation is scaled by the safety factor:
 $$L_{\text{effective}} = \alpha(C) \times \hat{L}$$
 
-Under the initial $N=1$ estimate ($\hat{L} = 2.68\text{M}$, $\alpha = 0.80$):
-$$L_{\text{effective}} \approx 2,144,000 \text{ raw tokens}$$
-
-By pacing toward 80% of the single observed ceiling, the controller begins introducing
-gradual spacing before the true limit is reached, preventing an abrupt 403 lockout.
+After weighting calibration and an explicit promotion out of shadow mode, pacing toward
+the safety-adjusted first estimate introduces gradual spacing before the hypothesized
+ceiling. The safety factor protects against an overestimate; shadow mode and tariff
+calibration protect against wasting capacity through an underestimate.
 
 ### 5.3 Refinement across subsequent cycles
 
 #### 5.3.1 Subsequent exhaustion ($N \ge 2$)
-When a subsequent exhaustion event is observed at usage $U_k$:
+When a subsequent exhaustion event is observed at weighted usage $U_k$:
 1. If the token split $(u_k, c_k, o_k)$ matches previous ratios, $\hat{L}$ is refined using
    an exponentially weighted or running average:
    $$\hat{L}_{k} = \frac{1}{k} \sum_{i=1}^k U_i$$
@@ -312,15 +338,19 @@ $U_{\text{peak}}$:
 ### 6.1 Freshness evaluation and `calculateFreshness`
 
 `calculateFreshness` in `packages/rusa/src/quota/coordinator-protocol.ts:183-218` assesses
-staleness across provider buckets. In staging commit `106a432` (and PR #524), lane
-freshness is keyed strictly on the **buckets present in the newest scrape, or the
-governing bucket**:
+staleness across provider buckets. At the cited `origin/staging` baseline, its age is the
+oldest represented bucket age:
 ```ts
-const bucketAges = Object.values(freshness.buckets);
+const bucketAges = Object.values(buckets);
 const ageMs = bucketAges.length > 0 ? Math.max(...bucketAges) : updatedAge;
 const stale = ageMs > staleAfterMs;
 const hardStale = ageMs > hardStaleAfterMs;
 ```
+
+The newer native-scrape design keys lane freshness and governing election to the newest
+scrape's members. That makes a tick-stamped synthetic row especially unsafe: it could
+become the newest member, hide aged native rows from freshness, and become the sole
+eligible governor. The monthly design must not change either native rule.
 
 #### 6.1.1 The synthetic staleness hazard
 For native scraped windows (`five_hour`, `weekly`), `observedAt` represents the instant
@@ -329,70 +359,81 @@ a PTY scrape queried the provider CLI. If no scrape occurs for >15 minutes
 it is `hardStale`, causing `publishedThrottle` (`coordinator-protocol.ts:227-229`) to widen
 the interval to `maxIntervalSeconds` (36,000 s).
 
-If a synthetic `kimi:monthly` bucket stamped its `observedAt` only when an actor ran, an
-idle system (e.g. overnight with no Kimi runs for 2 hours) would allow the monthly bucket
-to age past 1 hour. This would mark Kimi `hardStale` and clamp its interval to 10 hours,
-even though nothing was wrong!
+If a synthetic `kimi:monthly` bucket were inserted into `quota_observations`, its
+accounting timestamp would be mistaken for a scrape timestamp. Stamping it on an actor
+run would make ordinary idle time look hard-stale; stamping it every coordinator tick
+would instead distort newest-scrape membership. Neither is correct.
 
 #### 6.1.2 Resolution
-The synthetic monthly bucket must distinguish **PTY scrape freshness** from **accounting
-engine freshness**:
-1. `observedAt` for `kimi:monthly` is stamped by the **coordinator tick**
-   (`SharedQuotaStore.advancePendingController` or the aggregation loop), not by run
-   completion timestamps.
-2. During idle periods with no actor runs, token usage remains constant, the calendar
-   advances deterministically, and the coordinator tick refreshes `observedAt` to `nowMs`.
-3. Consequently, `kimi:monthly` remains fresh as long as the coordinator process itself
-   is alive and ticking, avoiding spurious `hardStale` throttling.
+The derived monthly window is outside `quota_observations`, `quota_scrapes`, and the
+native `calculateFreshness` input. A composition step after native `publishedThrottle`
+combines it with the native result. Monthly accounting health is separately reported from
+the last successful ledger ingestion or scan; it never refreshes native scrape freshness.
+If accounting health is stale, the dashboard marks the monthly estimate unavailable and
+active monthly pacing holds its last safe state according to an explicit fail-safe policy.
 
 ### 6.2 Closed-loop pacing and `SharedQuotaStore.getProviderThrottle`
 
-In `packages/rusa/src/quota/shared-store.ts:644-729`, `getProviderThrottle` evaluates all
-reasoned observations for a provider and elects the bucket with the largest required
-interval as the governing bucket:
+In `packages/rusa/src/quota/shared-store.ts:644-729`, `getProviderThrottle` evaluates
+reasoned **native** observations and elects a native governing bucket. The proposed
+`deriveKimiMonthlyWindow(now, ledger, config)` is called alongside that read, rather than
+being persisted as a native observation. This preserves native retention, history,
+`quota-pacing-reset`, scrape membership, and dashboard history semantics.
 
 ```ts
 reasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
 const governing = reasoned[0];
 ```
 
-#### 6.2.1 Synthetic observation generation
-Every coordinator tick (or upon run token ingestion), the store computes:
+#### 6.2.1 Derived window and isolated controller state
+At throttle publication time, and after ledger ingestion, the monthly derivation computes:
 1. $usedTokens$: Cumulative effective tokens in $[T_{\text{start}}, \text{now})$.
 2. $percentLeft$:
    $$\text{percentLeft} = \max\left(0, \min\left(100, \left(1 - \frac{usedTokens}{L_{\text{effective}}}\right) \times 100\right)\right)$$
 3. $timeRemainingPct$:
    $$\text{timeRemainingPct} = \max\left(0, \min\left(100, \frac{T_{\text{reset}} - \text{nowMs}}{\text{durationMs}} \times 100\right)\right)$$
-4. $error$:
-   $$\text{error} = \text{percentLeft} - \text{timeRemainingPct}$$
-   - When $\text{error} > 0$: Quota remaining exceeds time remaining (consumption is slow;
-     no throttling needed).
-   - When $\text{error} < 0$: Quota is being burned faster than even pacing (controller
-     calculates non-zero `requiredIntervalSeconds`).
+4. $error$ (matching `advanceObservation`):
+   $$\text{error} = \text{timeRemainingPct} - \text{percentLeft}$$
+   - When $\text{error} > 0$: Quota is being burned faster than even pacing; the
+     controller calculates a non-zero interval.
+   - When $\text{error} \le 0$: Remaining quota meets or exceeds the calendar schedule.
 
-This observation is stored in `quota_observations` with `kind: "monthly"`.
+The result is returned as `DerivedQuotaWindow { estimated: true, confidence, ... }`.
+It is not stored as a `quota_observations` row. A small `monthly_controller_state` keyed
+by provider and active period may retain PID integral/derivative state after active
+pacing is promoted; raw evidence and dashboard history remain in their own stores.
 
 #### 6.2.2 PID controller step
 The existing controller logic in `advancePendingController` (`shared-store.ts:426-608`)
-reasons about `kimi:monthly` using the standard gains:
+is the reference for a new `advanceMonthlyController` over the derived value and isolated
+monthly controller state. It uses the same gains initially:
 - `QUOTA_KP_SECONDS_PER_POINT = 120`
 - `QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800`
 - `QUOTA_KI_SECONDS_PER_POINT_SECOND = 120 / 3600 = 0.0333`
 
-When monthly consumption surges ahead of the calendar schedule, the PID step widens
-`uncappedIntervalSeconds` and `intervalSeconds` for `kimi:monthly`.
+When monthly consumption surges ahead of the calendar schedule, that step widens the
+derived monthly interval. It neither writes a synthetic raw observation nor participates
+in native scrape election.
 
 #### 6.2.3 Governing election and hard exhaustion
-In `getProviderThrottle`:
-- If `kimi:monthly` uncapped interval exceeds `five_hour` and `weekly`, `governingBucketKey`
-  becomes `kimi:monthly`.
-- When $usedTokens \ge L_{\text{effective}}$ or when the provider emits an actual 403
-  monthly exhaustion error:
+At the composition boundary:
+- If the derived monthly interval exceeds the native interval, the published result uses
+  that interval and identifies `kimi:monthly` as the composite governing source; native
+  `getProviderThrottle` still elects only among native buckets.
+- When $usedTokens \ge L_{\text{effective}}$:
   - `percentLeft = 0`
   - `resetAtIso = T_{\text{reset}}`
-  - `getExhaustedUntil` (`shared-store.ts:620-642`) resolves `exhaustedUntil = T_{\text{reset}}`.
   - `pacer.deferUntil(T_{\text{reset}})` defers all non-responsive launches on the Kimi
     lane until the next billing cycle reset.
+
+An actual monthly-exhaustion response uses an explicit new path, not an implied existing
+one: the terminal run-result handler adjacent to `ActorMesh.accountRun`
+(`packages/rusa/src/actor/actor-mesh.ts:1092-1097, 4299-4328`) classifies the provider
+outcome, then reports a deduplicated exhaustion event to the coordinator. The report is
+keyed by the source run result and records only the classification and event time. The
+monthly derivation consumes it to set known exhaustion until $T_{\text{reset}}$.
+`getExhaustedUntil` (`shared-store.ts:620-642`) remains a native-scrape mechanism and is
+not claimed to observe actor failures.
 
 ### 6.3 Model-class selection (`selectPoolLane`)
 
@@ -459,9 +500,9 @@ In the Flutter dashboard (`packages/rusa/flutter_dashboard`):
      - An `"EST"` badge indicator beside the label.
      - Tooltip detail showing:
        ```text
-       Monthly limit: ~2.68M tokens (Estimated, Low confidence)
-       Used: 1.42M tokens (53%)
-       Resets: in 14 days (at the configured anchor)
+       Monthly limit: estimated (Low confidence)
+       Used: locally tracked (estimated)
+       Resets: at the configured anchor
        ```
 2. **Quota history chart** (`widgets/quota_history_chart.dart:59-71`):
    - Allow toggling or plotting the `monthly` series alongside `weekly` headroom and
@@ -480,8 +521,8 @@ The hypothesis states that Kimi's monthly usage resets at the configured anchor 
 and recurs on that day-of-month and time in the configured timezone.
 
 1. **Pre-reset probe ($T_{\text{reset}} - 5\text{m}$)**:
-   - When the provider is in a monthly-exhausted state (as observed on 2026-09-17), run an
-     instrumented test prompt 5 minutes before the hypothesized reset instant.
+   - When the provider is in a monthly-exhausted state, run an instrumented test prompt
+     5 minutes before the hypothesized reset instant.
    - Confirm that the provider continues returning HTTP 403 monthly limit.
 2. **At-reset probe ($T_{\text{reset}} + 1\text{m}$)**:
    - Run a minimal prompt 1 minute after the hypothesized reset instant.
@@ -495,15 +536,19 @@ and recurs on that day-of-month and time in the configured timezone.
 ### 7.2 Phase 2: Shadow tracking (observe-only)
 
 Before allowing `kimi:monthly` to gate launches or throttle pacers:
-1. Deploy token accumulation and synthetic observation generation with `gating: false`
-   (shadow mode).
-2. The coordinator calculates $usedTokens$, $percentLeft$, $error$, and required intervals,
-   logging them to the database and exposing them to the dashboard with `estimated: true`.
-3. Pacing and `getProviderThrottle` continue to use only scraped `five_hour` and `weekly`
-   buckets.
-4. Over a full 30-day billing cycle, compare the observed consumption curve against any
-   warnings or exhaustions. Verify that the controller's projected exhaustion matches
-   reality.
+1. Deploy ledger ingestion and derived-window calculation with `gating: false` (shadow
+   mode).
+2. At each pair of consecutive trustworthy native `five_hour` or `weekly` scrapes, align
+   the provider-reported percentage-point delta with ledger increments over the same
+   interval. Compare candidate raw and cache-discounted weight tuples, and record fit,
+   residuals, coverage, and the influence of unattributed or external activity.
+3. Promote a calibrated tuple only after enough independent scrape intervals agree within
+   a predeclared tolerance. A low-coverage or conflicting result remains an explicit
+   unknown; it cannot become an active gating policy.
+4. The coordinator exposes the derived value with `estimated: true`, while native pacing
+   continues to use only scraped `five_hour` and `weekly` buckets.
+5. Over a complete billing period, compare the projected curve with observed reset and
+   any exhaustion event before active closed-loop pacing.
 
 ### 7.3 Phase 3: Active closed-loop pacing
 
@@ -517,41 +562,36 @@ Before allowing `kimi:monthly` to gate launches or throttle pacers:
 
 ## 8. Data-coverage statement
 
-This section lists the exact stored evidence available in existing rusa databases as of
-2026-09-18 that would feed the initial monthly estimate.
+This section lists the stored evidence classes that can feed a local initial estimate.
+It intentionally omits account-specific record counts, dates, event times, and token
+totals from the public repository.
 
 ### 8.1 Inventory of stored observations
 
-| Data Source | Location | Scope / Provider | Record Count | Time Span | Relevant Fields |
-|:---|:---|:---|:---|:---|:---|
-| `run_token_records` | Instance database (`mesh.db`) | `provider = 'kimi'` | **232 rows** | 2026-08-11 to 2026-09-17 | `uncached_input`, `cache_read`, `output`, `scraped_at`, `run_id` |
-| `actor_runs` | Instance database (`mesh.db`) | All actors | 10,000+ rows | Full history | `id`, `started_at`, `ended_at`, `success`, `output` |
-| `quota_observations` | Shared coordinator DB (`quota-coordinator.db`) | `provider = 'kimi'`, kinds `five_hour`, `weekly` | **12,781 rows** (6,398 5h, 6,383 weekly) | 2026-08-19 to 2026-09-18 | `observed_at`, `percent_left`, `reset_at_iso`, `interval_seconds` |
-| `quota_scrapes` | Shared coordinator DB (`quota-coordinator.db`) | `provider = 'kimi'` | 6,400+ raw captures | 2026-08-19 to 2026-09-18 | `raw_output`, `parsed_state`, `scraped_at` |
+| Data Source | Location | Scope / Provider | Relevant Fields | Contribution |
+|:---|:---|:---|:---|:---|
+| `run_token_records` | Instance database (`mesh.db`) | `provider = 'kimi'` | `id`, `run_id`, `uncached_input`, `cache_read`, `output`, `scraped_at` | Raw split source records; `id` is the import identity. |
+| `actor_runs` | Instance database (`mesh.db`) | Kimi terminal results | `id`, `started_at`, `ended_at`, `success`, `output` | Locates terminal outcomes and supports exhaustion classification. |
+| `quota_observations` | Shared coordinator DB (`quota-coordinator.db`) | `provider = 'kimi'`, kinds `five_hour`, `weekly` | `observed_at`, `percent_left`, `reset_at_iso`, `interval_seconds` | Native short-window pacing and the calibration comparator; never a monthly derived-row store. |
+| `quota_scrapes` | Shared coordinator DB (`quota-coordinator.db`) | `provider = 'kimi'` | `raw_output`, `parsed_state`, `scraped_at` | Audits parser provenance and identifies trustworthy native scrape pairs. |
 
-### 8.2 Breakdown of Kimi token evidence across periods
+### 8.2 Period attribution rules
 
-- **Total Kimi token records**: 232 rows.
-- **Pre-anchor period** (prior to the configured anchor):
-  - 45 rows (2026-08-11 up to the configured anchor).
-  - All 45 rows have `uncached_input = NULL`, `cache_read = NULL`, `output = NULL`
-    (generated prior to wire token accounting instrumentation).
-- **Active cycle period** (from the configured anchor through exhaustion 2026-09-17):
-  - **187 attributed rows** (all non-null).
-  - Cumulative `uncached_input`: **140,137** tokens.
-  - Cumulative `cache_read`: **2,530,048** tokens.
-  - Cumulative `output`: **10,295** tokens.
-  - **Total raw tokens**: **2,680,480** tokens (~2.68M).
-- **Exhaustion event**:
-  - Run ID on 2026-09-17 20:56:45Z failed with `provider.auth_error: 403 You've reached your monthly usage limit for this billing cycle.`
+- The estimator selects Kimi source records whose `scraped_at` lies in the active
+  configured period. It retains each non-null raw split and counts null splits as
+  unattributed coverage, not zero usage.
+- Source records before the configured period may validate ingestion behavior but do not
+  contribute to the active-period estimate.
+- A classified monthly-exhaustion event is joined to the active-period ledger only through
+  its internal source identity. Public diagnostics show its confidence implication, not
+  the source run identifier, timestamp, or account-level aggregate.
 
 ### 8.3 Data gaps and coverage limitations
 
-1. **Single exhaustion point ($N = 1$)**: The system has witnessed only one billing
-   cutoff. The true ceiling cannot be definitively distinguished between 2.5M, 3.0M, or
-   a round billing quota without further cycles.
-2. **Missing token splits for legacy runs**: The 45 pre-anchor runs lack token counts,
-   preventing retroactive verification of the earlier billing cycle.
+1. **Single exhaustion point ($N = 1$)**: Only one billing cutoff has been observed.
+   The true ceiling and its tariff basis remain indeterminate without future cycles.
+2. **Missing token splits for legacy runs**: Some source records can lack token splits,
+   preventing retroactive verification of an earlier period.
 3. **Unmetered host activity**: Token records in `run_token_records` capture only runs
    dispatched by rusa actors. Any manual CLI sessions executed by the operator directly
    on the host bypass rusa's database, which would cause rusa's local count to
@@ -566,18 +606,17 @@ This section lists the exact stored evidence available in existing rusa database
 
 The following architectural and operational questions are left open for review:
 
-1. **Token weighting policy**: Should the initial implementation assume strict 1:1 raw
-   token counting, or should prompt cache reads be discounted (e.g. 0.1x) given their
-   94.4% dominance in the workload?
-   *Recommendation*: Default to raw 1:1 counting with the low-confidence safety factor
-   ($\alpha = 0.80$). This fails closed against quota cliffs.
+1. **Token weighting policy**: What minimum scrape-pair coverage, residual tolerance, and
+   stability are sufficient to promote a raw or cache-discounted tuple from shadow-only to
+   active pacing?
+   *Recommendation*: Keep the raw tuple diagnostic-only until this calibration criterion
+   is met; do not sacrifice capacity based on a single uncalibrated weighting hypothesis.
 2. **Storage location for token telemetry**: `run_token_records` is currently an instance
-   table in `mesh.db`. Should token events be pushed to the coordinator over its socket
-   (`POST /v1/tokens` or similar), or should `quota-coordinator.db` directly host a shared
-   token ledger written by actor runs?
-   *Tradeoff*: Adding a write endpoint to the coordinator breaks its read-only GET contract
-   (design §5.2); having actor instances write directly to `quota-coordinator.db` preserves
-   coordinator simplicity but couples actors to SQLite write locks.
+   table in `mesh.db`. Should a collector receive idempotent source events over the
+   coordinator socket, or should `quota-coordinator.db` host the shared ledger written by
+   actor instances?
+   *Tradeoff*: A collector gives one writer and clear delivery acknowledgements; direct
+   database access avoids a new endpoint but couples actors to SQLite write locks.
 3. **Safety factor tuning**: Is an 80% safety margin ($\alpha = 0.80$) sufficiently
    conservative for $N=1$, or should Kimi begin soft pacing earlier (e.g. at 70% of estimated
    budget)?
