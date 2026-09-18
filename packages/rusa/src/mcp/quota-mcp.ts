@@ -478,6 +478,12 @@ function resolveResetAtIso(
   resetText: string | undefined,
   generatedAtMs: number
 ): string | undefined {
+  // Verbatim printed wall-clock text ("HH:MM", "HH:MM on D Mon") resolved
+  // deterministically against the scrape instant takes precedence over model
+  // arithmetic, avoiding hallucinated years or zone offsets (#517).
+  const wallClockIso = parseWallClockResetText(resetText, generatedAtMs);
+  if (wallClockIso !== undefined) return wallClockIso;
+
   if (resetAtIso?.trim()) return resetAtIso;
 
   const durationMs = parseIsoDuration(resetInIso);
@@ -485,7 +491,7 @@ function resolveResetAtIso(
     return new Date(generatedAtMs + durationMs).toISOString();
   }
 
-  return parseWallClockResetText(resetText, generatedAtMs);
+  return undefined;
 }
 
 async function parseQuotaWithLlm(

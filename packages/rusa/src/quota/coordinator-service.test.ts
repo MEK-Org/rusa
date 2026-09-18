@@ -393,23 +393,23 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     });
   });
 
-  it("criterion 5b: a bucket whose reset has passed and which the newest scrape no longer emits cannot keep the lane hard-stale", () => {
+  it("criterion 5: a provider whose newest scrape carries only a weekly row while an older, still-unexpired five_hour row exists does not age the lane to hard-stale", () => {
     // Root's live #517 evidence: the newest native codex scrape emitted only a
-    // weekly row, while shared-store assembly kept an old codex:five_hour row
-    // whose resetAt had already passed. Oldest-bucket freshness then stayed
-    // hard-stale indefinitely and the throttle widened to maxIntervalSeconds.
+    // weekly row, while shared-store assembly kept an older codex:five_hour row.
+    // Lane freshness is keyed on the buckets present in the newest scrape, or
+    // the governing bucket, rather than on every unexpired historical bucket (§5.5).
     const nowMs = Date.parse("2040-01-01T12:00:00.000Z");
     const weeklyObservedAt = new Date(nowMs - 2 * 60_000).toISOString();
-    const expiredFiveHour = {
+    const olderUnexpiredFiveHour = {
       key: "codex:five_hour",
       percentLeft: 60,
       timeRemainingPct: 50,
       error: 0,
       derivative: 0,
       requiredIntervalSeconds: 120,
-      // Reset instant is in the past relative to now, and this row was last
-      // observed well before the newest (weekly-only) scrape.
-      resetAtIso: new Date(nowMs - 3 * 60 * 60_000).toISOString(),
+      // Reset instant is STILL IN THE FUTURE relative to nowMs, but this row was
+      // last observed well before the newest (weekly-only) scrape.
+      resetAtIso: new Date(nowMs + 60 * 60_000).toISOString(),
       observedAt: new Date(nowMs - 10 * 60 * 60_000).toISOString(),
     };
     const status: PersistedQuotaProviderStatus = {
@@ -432,13 +432,13 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
           resetAtIso: new Date(nowMs + 6 * 24 * 60 * 60_000).toISOString(),
           observedAt: weeklyObservedAt,
         },
-        expiredFiveHour,
+        olderUnexpiredFiveHour,
       ],
     };
     const options = { nowMs, staleAfterMs: 15 * 60_000, hardStaleAfterMs: 60 * 60_000 };
 
-    // The expired, no-longer-emitted bucket still shows its true age in the
-    // per-bucket map, but it no longer governs the provider's freshness.
+    // The older unexpired, omitted bucket still shows its true age in the
+    // per-bucket map, but it does not govern the provider's freshness.
     expect(calculateFreshness(status, options)).toEqual({
       ageMs: 2 * 60_000,
       buckets: { "codex:weekly": 2 * 60_000, "codex:five_hour": 10 * 60 * 60_000 },
@@ -449,22 +449,36 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       publishedThrottle(status, { ...options, maxIntervalSeconds: 36_000 }).intervalSeconds
     ).toBe(223);
 
-    // Criterion 5a is untouched: an old bucket whose reset is still ahead is a
-    // live window the newest scrape failed to refresh, and it keeps aging the lane.
-    const liveFiveHour = {
-      ...expiredFiveHour,
-      resetAtIso: new Date(nowMs + 60 * 60_000).toISOString(),
+    // If the older bucket WAS the governing bucket, it DOES age the lane (5a holds).
+    const governingOlderStatus: PersistedQuotaProviderStatus = {
+      ...status,
+      governingBucketKey: "codex:five_hour",
+      intervalSeconds: 120,
+      uncappedIntervalSeconds: 120,
+    };
+    expect(calculateFreshness(governingOlderStatus, options)).toMatchObject({
+      ageMs: 10 * 60 * 60_000,
+      stale: true,
+      hardStale: true,
+    });
+    expect(
+      publishedThrottle(governingOlderStatus, { ...options, maxIntervalSeconds: 36_000 })
+        .intervalSeconds
+    ).toBe(36_000);
+
+    // Two buckets written in the same scrape differing by 1 ms are both treated as
+    // present in the newest scrape.
+    const sameScrapeBucket = {
+      ...olderUnexpiredFiveHour,
+      observedAt: new Date(Date.parse(weeklyObservedAt) - 1).toISOString(),
     };
     expect(
-      calculateFreshness({ ...status, buckets: [status.buckets[0], liveFiveHour] }, options)
-    ).toMatchObject({ ageMs: 10 * 60 * 60_000, stale: true, hardStale: true });
-
-    // And an expired bucket the newest scrape *did* emit is the scrape's own
-    // reading of the window, not a leftover, so it is not excluded either.
-    const reEmittedExpired = { ...expiredFiveHour, observedAt: weeklyObservedAt };
-    expect(
-      calculateFreshness({ ...status, buckets: [status.buckets[0], reEmittedExpired] }, options)
-    ).toMatchObject({ ageMs: 2 * 60_000, stale: false, hardStale: false });
+      calculateFreshness({ ...status, buckets: [status.buckets[0], sameScrapeBucket] }, options)
+    ).toMatchObject({
+      ageMs: 2 * 60_000 + 1,
+      stale: false,
+      hardStale: false,
+    });
   });
 
   // Criterion 16: Collection form is byte-identical to single form without service block.

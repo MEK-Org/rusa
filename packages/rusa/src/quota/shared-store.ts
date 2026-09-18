@@ -683,14 +683,24 @@ export class SharedQuotaStore {
       observedAt: string;
     }>;
     if (current.length === 0) return null;
-    reasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
-    const governing = reasoned[0];
     const currentByKind = new Map(current.map((row) => [row.kind, row]));
     const updatedAt =
       current
         .map((row) => row.observedAt)
         .sort()
         .at(-1) ?? new Date(0).toISOString();
+    const updatedAtMs = Date.parse(updatedAt);
+    const isCurrentScrape = (observedAtStr?: string) => {
+      if (!observedAtStr) return false;
+      const ms = Date.parse(observedAtStr);
+      return Number.isFinite(ms) && Math.abs(ms - updatedAtMs) <= 1000;
+    };
+    const currentScrapeReasoned = reasoned.filter((row) =>
+      isCurrentScrape(currentByKind.get(row.kind)?.observedAt ?? row.observedAt)
+    );
+    const eligibleReasoned = currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned;
+    eligibleReasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
+    const governing = eligibleReasoned[0];
     const exhaustedUntil = this.getExhaustedUntil(provider);
     return {
       provider,

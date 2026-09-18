@@ -204,14 +204,18 @@ export function calculateFreshness(
         ? Math.max(0, nowMs - observedMs)
         : Number.POSITIVE_INFINITY;
       buckets[b.key] = ageMs;
-      // A bucket whose reset instant has passed and which the newest scrape no
-      // longer emits is a leftover of a window that has since rolled over, not a
-      // current window that went unrefreshed. It stays visible in the per-bucket
-      // map but does not age the provider (§5.5, criterion 5b).
-      const resetMs = b.resetAtIso ? Date.parse(b.resetAtIso) : Number.NaN;
-      const expired = Number.isFinite(resetMs) && resetMs <= nowMs;
-      const omittedByNewestScrape = Number.isFinite(observedMs) && observedMs < newestObservedMs;
-      if (expired && omittedByNewestScrape) continue;
+      // Lane freshness is keyed on the buckets present in the newest scrape, or
+      // the governing bucket, rather than on every unexpired historical bucket
+      // (§5.5). A bucket that was not emitted by the newest scrape and is not
+      // governing does not age the lane.
+      const isNewestScrape =
+        Number.isFinite(observedMs) &&
+        (observedMs >= newestObservedMs - 1000 || b.observedAt === stored.updatedAt);
+      const isGoverning =
+        stored.governingBucketKey !== null &&
+        stored.governingBucketKey !== undefined &&
+        b.key === stored.governingBucketKey;
+      if (!isNewestScrape && !isGoverning) continue;
       currentAges.push(ageMs);
     }
   }

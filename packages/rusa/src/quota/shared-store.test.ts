@@ -896,4 +896,34 @@ describe("SharedQuotaStore PID integral term", () => {
       store.close();
     }
   }, 15_000);
+
+  it("elects the governing bucket from the newest scrape, preventing an older omitted bucket from governing", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-governing-bucket-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      const t1 = "2030-01-01T00:00:00.000Z";
+      const t2 = "2030-01-01T03:00:00.000Z";
+
+      // At t1, an older scrape produced a five_hour observation with high throttle.
+      recordObservation(store, "codex", t1, 50, "2030-01-01T05:00:00.000Z", "five_hour");
+
+      // At t2, the newest scrape emitted ONLY weekly with lower throttle.
+      recordObservation(store, "codex", t2, 95, "2030-01-08T00:00:00.000Z", "weekly");
+
+      const throttle = store.getProviderThrottle("codex");
+      expect(throttle).not.toBeNull();
+      // Governing bucket must be elected from the newest scrape (weekly), not the omitted five_hour bucket
+      expect(throttle?.governingBucketKey).toBe("codex:weekly");
+      expect(throttle?.updatedAt).toBe(t2);
+      // Both buckets remain visible in the per-bucket map
+      expect(throttle?.buckets.map((b) => b.key).sort()).toEqual([
+        "codex:five_hour",
+        "codex:weekly",
+      ]);
+    } finally {
+      store.close();
+    }
+  });
 });
