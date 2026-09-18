@@ -750,17 +750,17 @@ async function parseQuotaWithLlm(
     return await executeOnce("gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
-      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.8-flash`
     );
     try {
-      const result = await executeOnce("gemini-3.5-flash");
+      const result = await executeOnce("gemini-3.8-flash");
       console.info(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded`
       );
       return result;
     } catch (secondErr) {
       console.error(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
       );
       return {
         status: "unknown",

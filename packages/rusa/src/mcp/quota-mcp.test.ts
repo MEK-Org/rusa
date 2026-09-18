@@ -1245,7 +1245,7 @@ describe("quota MCP server", () => {
       );
       expect(mockGenerateContent).toHaveBeenCalledTimes(2);
       expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
-        "gemini-3.5-flash"
+        "gemini-3.8-flash"
       );
       expect(parsed.status).toBe("available");
       expect(parsed.limits?.[0]?.resetAtIso).toBe("2026-07-16T22:13:00.000Z");
@@ -1360,7 +1360,7 @@ describe("quota MCP server", () => {
       ]);
     });
 
-    it("attempt-level logging: escalates gemini-3.5-flash-lite → gemini-3.5-flash on attempt 1 failure, logs warn then info on attempt 2 success ", async () => {
+    it("attempt-level logging: escalates gemini-3.5-flash-lite → gemini-3.8-flash on attempt 1 failure, logs warn then info on attempt 2 success ", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
 
@@ -1393,7 +1393,7 @@ describe("quota MCP server", () => {
         "gemini-3.5-flash-lite"
       );
       expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
-        "gemini-3.5-flash"
+        "gemini-3.8-flash"
       );
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toEqual([
@@ -1411,14 +1411,14 @@ describe("quota MCP server", () => {
         )
       );
       expect(infoSpy).toHaveBeenCalledWith(
-        "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded"
+        "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded"
       );
 
       warnSpy.mockRestore();
       infoSpy.mockRestore();
     });
 
-    it("attempt-level logging: escalates gemini-3.5-flash-lite → gemini-3.5-flash on attempt 1 failure, logs warn then error when attempt 2 also fails ", async () => {
+    it("attempt-level logging: escalates gemini-3.5-flash-lite → gemini-3.8-flash on attempt 1 failure, logs warn then error when attempt 2 also fails ", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -1436,7 +1436,7 @@ describe("quota MCP server", () => {
         "gemini-3.5-flash-lite"
       );
       expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
-        "gemini-3.5-flash"
+        "gemini-3.8-flash"
       );
       expect(parsed.status).toBe("unknown");
       expect(parsed.message).toContain("percentLeft < 100");
@@ -1447,7 +1447,7 @@ describe("quota MCP server", () => {
       );
       expect(errorSpy).toHaveBeenCalledWith(
         expect.stringContaining(
-          "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.5-flash) failed: Quota parse failed: window 'Weekly' has percentLeft < 100 (90%) but no resolvable reset ISO"
+          "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.8-flash) failed: Quota parse failed: window 'Weekly' has percentLeft < 100 (90%) but no resolvable reset ISO"
         )
       );
 
@@ -1804,7 +1804,7 @@ describe("quota MCP server", () => {
 
         expect(mockGenerateContent).toHaveBeenCalledTimes(2);
         expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
-          "gemini-3.5-flash"
+          "gemini-3.8-flash"
         );
         expect(parsed.limits).toEqual([
           {
