@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Actor, type ActorOptions } from "../actor/actor.js";
+import type { ActorOptions } from "../actor/actor.js";
 import {
   type ActorFactoryContext,
   ActorMesh,
@@ -225,6 +225,7 @@ import {
 } from "../quota/coordinator-protocol.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
   type DurableEventDelivery,
   EventManager,
@@ -2652,9 +2653,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
-        const actor: MeshActor = createWorkerActor
-          ? createWorkerActor(ctx, actorOptions)
-          : new Actor(actorOptions);
+        const actor = constructActorFromInvocation({
+          actorOptions,
+          driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
+        });
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -3150,122 +3152,124 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
   });
   let root: MeshActor;
-  root =
-    externalRoot ??
-    new Actor({
-      id: rootId,
-      cwd: rootAgentDir,
-      // Root's declared pool is whatever its record carries: the persisted
-      // ordered pool after a restart, or the configured tuple on first boot
-      // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
-      // so resolution reads the live entry rather than freezing the
-      // boot-time pool. `fallback` below is its own, separate degrade path.
-      modelConfig: [...rootBootModelConfig.modelConfig],
-      resolveProvider: (selected) =>
-        resolveProvider(config, selected.provider, selected.model, selected.effort),
-      mcpServers: rootMcp,
-      addDirs,
-      sandbox: Boolean(opts?.e2e),
-      isE2eRoot: Boolean(opts?.e2e),
-      loadSessionId: () =>
-        actors.get(rootId)?.context?.type === "portable"
-          ? undefined
-          : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-      saveSessionId: (id) => {
-        if (actors.get(rootId)?.context?.type === "portable") return;
-        actors.patch(rootId, { sessionId: id });
-      },
-      buildPrompt: () => {
-        const record = actors.get(rootId);
-        if (!record) return { prompt: "No active root thread record." };
-        const injection = assembleConfiguredPortableInjection(
-          record,
-          portableContextApiKey,
-          portableContextStore
-        );
-        return {
-          prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
-          injectRecord: injection?.injectRecord,
-        };
-      },
-      lifecycle: rootLifecycle,
-      fallback: fallbackModels
-        ? {
-            models: fallbackModels,
-            // `runWithFallback` only calls this after `onRunStart` captures the
-            // entry that actually launched. Resolve the fallback under that
-            // provider and effort, rather than the scalar file tuple which may
-            // no longer be root's durable pool after a restart. An unsupported
-            // fallback model then throws explicitly instead of silently moving
-            // recovery onto the stale file provider.
-            resolveProvider: (model) =>
-              resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
-            classify: classifyExhaustion,
-          }
-        : undefined,
-      // Responsive human wakes bypass normal pacing/concurrency; background root
-      // wakes use the same normal scheduling path as workers.
-      beforeRun: ({ mode }): boolean => {
-        // Same dispatch-time apply as the worker beforeRun (#199, extended to
-        // pools): a pool staged while root was queued/idle must land before
-        // this run's own gate()/admission and run_start, not at the end of
-        // the run after. Root's declared pool may hold several ordered
-        // entries (see the `modelConfig` comment on root's Actor construction
-        // above); the halt gate reads the first, the entry that launches first.
-        mesh.applyPendingModel(rootId);
-        const rootRecord = actors.get(rootId);
-        const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
-        if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
-          return false;
+  const rootActorOptions: ActorOptions = {
+    id: rootId,
+    cwd: rootAgentDir,
+    // Root's declared pool is whatever its record carries: the persisted
+    // ordered pool after a restart, or the configured tuple on first boot
+    // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
+    // so resolution reads the live entry rather than freezing the
+    // boot-time pool. `fallback` below is its own, separate degrade path.
+    modelConfig: [...rootBootModelConfig.modelConfig],
+    resolveProvider: (selected) =>
+      resolveProvider(config, selected.provider, selected.model, selected.effort),
+    mcpServers: rootMcp,
+    addDirs,
+    sandbox: Boolean(opts?.e2e),
+    isE2eRoot: Boolean(opts?.e2e),
+    loadSessionId: () =>
+      actors.get(rootId)?.context?.type === "portable"
+        ? undefined
+        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
+    saveSessionId: (id) => {
+      if (actors.get(rootId)?.context?.type === "portable") return;
+      actors.patch(rootId, { sessionId: id });
+    },
+    buildPrompt: () => {
+      const record = actors.get(rootId);
+      if (!record) return { prompt: "No active root thread record." };
+      const injection = assembleConfiguredPortableInjection(
+        record,
+        portableContextApiKey,
+        portableContextStore
+      );
+      return {
+        prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
+        injectRecord: injection?.injectRecord,
+      };
+    },
+    lifecycle: rootLifecycle,
+    fallback: fallbackModels
+      ? {
+          models: fallbackModels,
+          // `runWithFallback` only calls this after `onRunStart` captures the
+          // entry that actually launched. Resolve the fallback under that
+          // provider and effort, rather than the scalar file tuple which may
+          // no longer be root's durable pool after a restart. An unsupported
+          // fallback model then throws explicitly instead of silently moving
+          // recovery onto the stale file provider.
+          resolveProvider: (model) =>
+            resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
+          classify: classifyExhaustion,
         }
-        if (mode === "yield-elicitation") return true;
-        const watermark = root.getInterruptedWatermark?.();
-        if (watermark) {
-          const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
-          return entries.some((e) => e.deliveredAt > watermark);
-        }
-        return inboxStore.countUnhandled(rootId) > 0;
-      },
-      admitRun: ({ responsive, mode }): boolean =>
-        responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
-      gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
-      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
-      onContinue: (n) =>
-        mesh.recordEvent({
-          kind: "run_continued",
-          actorId: rootId,
-          detail: `yield-elicitation ${n}/1`,
-        }),
-      onContinuationCapped: (n) => {
-        mesh.recordEvent({
-          kind: "continuation_capped",
-          actorId: rootId,
-          detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
-        });
-        routeContinuationCapped(failureSink, rootId, n);
-      },
-      onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onProviderAttempt: (attempt) => {
-        activeRunSelections.set(rootId, {
-          provider: attempt.providerName,
-          model: attempt.model,
-          effort: attempt.effort,
-        });
-      },
-      onFirstChunk: () =>
-        mesh.recordEvent({
-          kind: "run_first_chunk",
-          actorId: rootId,
-        }),
-      onCoalesceAborted: (count, ageMs) => {
-        mesh.recordEvent({
-          kind: "run_coalesced",
-          actorId: rootId,
-          detail: `count=${count} age=${ageMs}ms`,
-        });
-      },
-      log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
-    });
+      : undefined,
+    // Responsive human wakes bypass normal pacing/concurrency; background root
+    // wakes use the same normal scheduling path as workers.
+    beforeRun: ({ mode }): boolean => {
+      // Same dispatch-time apply as the worker beforeRun (#199, extended to
+      // pools): a pool staged while root was queued/idle must land before
+      // this run's own gate()/admission and run_start, not at the end of
+      // the run after. Root's declared pool may hold several ordered
+      // entries (see the `modelConfig` comment on root's Actor construction
+      // above); the halt gate reads the first, the entry that launches first.
+      mesh.applyPendingModel(rootId);
+      const rootRecord = actors.get(rootId);
+      const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
+      if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
+        return false;
+      }
+      if (mode === "yield-elicitation") return true;
+      const watermark = root.getInterruptedWatermark?.();
+      if (watermark) {
+        const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
+        return entries.some((e) => e.deliveredAt > watermark);
+      }
+      return inboxStore.countUnhandled(rootId) > 0;
+    },
+    admitRun: ({ responsive, mode }): boolean =>
+      responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
+    gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+    onQueuedRunCancelled: () => mesh.clearSelection(rootId),
+    onContinue: (n) =>
+      mesh.recordEvent({
+        kind: "run_continued",
+        actorId: rootId,
+        detail: `yield-elicitation ${n}/1`,
+      }),
+    onContinuationCapped: (n) => {
+      mesh.recordEvent({
+        kind: "continuation_capped",
+        actorId: rootId,
+        detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
+      });
+      routeContinuationCapped(failureSink, rootId, n);
+    },
+    onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
+    onProviderAttempt: (attempt) => {
+      activeRunSelections.set(rootId, {
+        provider: attempt.providerName,
+        model: attempt.model,
+        effort: attempt.effort,
+      });
+    },
+    onFirstChunk: () =>
+      mesh.recordEvent({
+        kind: "run_first_chunk",
+        actorId: rootId,
+      }),
+    onCoalesceAborted: (count, ageMs) => {
+      mesh.recordEvent({
+        kind: "run_coalesced",
+        actorId: rootId,
+        detail: `count=${count} age=${ageMs}ms`,
+      });
+    },
+    log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
+  };
+  root = constructActorFromInvocation({
+    actorOptions: rootActorOptions,
+    driver: externalRoot ? () => externalRoot : undefined,
+  });
   const rootRecord: ActorRecord = {
     id: rootId,
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
