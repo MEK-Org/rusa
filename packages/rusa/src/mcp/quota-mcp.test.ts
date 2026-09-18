@@ -1566,10 +1566,13 @@ describe("quota MCP server", () => {
         readFileSync(join(__dirname, "fixtures", "codex-status-refresh-pending.txt"), "utf-8");
       // The scrape instant of the captured production panel this fixture came from.
       const scrapedAtMs = Date.parse("2026-09-16T11:20:19.523Z");
-      // codex prints wall-clock reset text with no timezone, so the panel's
-      // "08:49 on 19 Sep" resolves in the host's local zone — the same zone the
-      // prompt hands the model as "now".
-      const displayedWeeklyReset = new Date(2026, 8, 19, 8, 49, 0, 0).toISOString();
+      // codex prints wall-clock reset text with no year and no timezone. The
+      // model assembles the instant from the current local date, year and UTC
+      // offset the prompt supplies (#517); the parser passes that instant
+      // through untouched, so these are the instants the mocked model emits.
+      const displayedWeeklyReset = "2026-09-19T08:49:00.000Z";
+      const sparkFiveHourReset = "2026-09-16T16:20:00.000Z";
+      const sparkWeeklyReset = "2026-09-23T11:20:00.000Z";
 
       /** The completed panel as the model reads it: one provider weekly + a Spark reserve block. */
       const reservePanelResponse = {
@@ -1579,7 +1582,7 @@ describe("quota MCP server", () => {
             label: "Weekly limit",
             kind: "weekly",
             usedPercent: 61,
-            resetText: "08:49 on 19 Sep",
+            resetAtIso: displayedWeeklyReset,
             placeholder: false,
             scope: "provider",
           },
@@ -1587,7 +1590,7 @@ describe("quota MCP server", () => {
             label: "5h limit",
             kind: "five_hour",
             usedPercent: 0,
-            resetText: "16:20",
+            resetAtIso: sparkFiveHourReset,
             placeholder: false,
             scope: "provider",
             models: ["gpt-5.3-codex-spark"],
@@ -1596,7 +1599,7 @@ describe("quota MCP server", () => {
             label: "Weekly limit",
             kind: "weekly",
             usedPercent: 0,
-            resetText: "11:20 on 23 Sep",
+            resetAtIso: sparkWeeklyReset,
             placeholder: false,
             scope: "provider",
             models: ["gpt-5.3-codex-spark"],
@@ -1621,7 +1624,7 @@ describe("quota MCP server", () => {
         expect(contents).not.toContain("usage limit resets available");
       });
 
-      it("resolves the displayed weekly reset deterministically instead of failing the trust gate", async () => {
+      it("publishes the weekly reset the model assembled from the printed date", async () => {
         mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(reservePanelResponse) });
 
         const parsed = await parseCodexQuota(
@@ -1631,13 +1634,13 @@ describe("quota MCP server", () => {
           codexCatalog
         );
 
-        // One attempt: the reset arithmetic is code's job, so the model has no
-        // wall-clock judgment left to hesitate over and no reason to escalate.
+        // One attempt: the model filled resetAtIso from the printed "08:49 on
+        // 19 Sep" plus the supplied current date, so the partially consumed
+        // weekly passes its reset gate and nothing escalates. The parser
+        // reports the instant the model assembled from the displayed date and
+        // never invents an override of its own.
         expect(mockGenerateContent).toHaveBeenCalledTimes(1);
         expect(parsed.status).toBe("available");
-        // The panel's printed date is reported as printed. A manual reset can
-        // make that displayed date an unverified effective reset, but the parser
-        // reports the display and never invents an override of its own.
         expect(parsed.limits).toEqual([
           {
             label: "Weekly limit",
@@ -1649,108 +1652,45 @@ describe("quota MCP server", () => {
         ]);
       });
 
-      it("yields the post-reset weekly reset ISO deterministically from the printed text", async () => {
-        // Production evidence (2026-09-16 19:14Z): after a manual weekly reset
-        // the completed panel read `Weekly limit: 98% left (resets 15:28 on 23
-        // Sep)` and both native scrapers resolved it only intermittently — the
-        // model sometimes declined the date arithmetic and left resetAtIso
-        // empty. With the printed text copied verbatim the reset is code's
-        // arithmetic, so the same panel yields the same instant every time: the
-        // date as displayed, with no override invented for the manual reset.
-        const postResetPanel = twoPanelCapture()
-          .replace("39% left (resets 08:49 on 19 Sep)", "98% left (resets 15:28 on 23 Sep)")
-          .replace("[████████░░░░░░░░░░░░]", "[████████████████████]");
+      it("hands the model the current local date, year and offset instead of a verbatim reset field", async () => {
         mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: "available",
-              windows: [
-                {
-                  label: "Weekly limit",
-                  kind: "weekly",
-                  usedPercent: 2,
-                  resetText: "15:28 on 23 Sep",
-                  placeholder: false,
-                  scope: "provider",
-                },
-                {
-                  label: "5h limit",
-                  kind: "five_hour",
-                  usedPercent: 0,
-                  resetText: "16:20",
-                  placeholder: false,
-                  scope: "provider",
-                  models: ["gpt-5.3-codex-spark"],
-                },
-                {
-                  label: "Weekly limit",
-                  kind: "weekly",
-                  usedPercent: 0,
-                  resetText: "11:20 on 23 Sep",
-                  placeholder: false,
-                  scope: "provider",
-                  models: ["gpt-5.3-codex-spark"],
-                },
-              ],
-            }),
+          text: () => JSON.stringify({ status: "unknown", windows: [] }),
         });
 
-        const scrapedAt19_14 = Date.parse("2026-09-16T19:14:00.000Z");
-        const first = await parseCodexQuota(
-          postResetPanel,
-          "test-key",
-          scrapedAt19_14,
-          codexCatalog
+        await parseCodexQuota(pendingOnlyCapture(), "test-key", scrapedAtMs, codexCatalog);
+
+        // The panel prints "08:49 on 19 Sep": no year, no zone. Those are the
+        // two things the prompt must supply as plain components so the model
+        // can shuffle them into an ISO instant rather than decline the
+        // arithmetic. Parsing the printed text is the model's job, not code's.
+        const now = new Date(scrapedAtMs);
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const systemInstruction = lastSystemInstruction();
+        expect(systemInstruction).toContain(
+          `today is ${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][now.getDay()]} ${now.getDate()} Sep ${now.getFullYear()}`
         );
-        const second = await parseCodexQuota(
-          postResetPanel,
-          "test-key",
-          scrapedAt19_14,
-          codexCatalog
+        expect(systemInstruction).toContain(`the current year is ${now.getFullYear()}`);
+        expect(systemInstruction).toContain(
+          `the current local clock time is ${pad(now.getHours())}:${pad(now.getMinutes())}`
         );
-
-        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
-        const expected = [
-          {
-            label: "Weekly limit",
-            kind: "weekly",
-            percentLeft: 98,
-            resetAtIso: new Date(2026, 8, 23, 15, 28, 0, 0).toISOString(),
-            scope: { provider: "codex" },
-          },
-        ];
-        expect(first.status).toBe("available");
-        expect(first.limits).toEqual(expected);
-        expect(second.limits).toEqual(expected);
-      });
-
-      it("prefers an explicit reset ISO or duration over the printed reset text", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: "available",
-              windows: [
-                {
-                  label: "Weekly limit",
-                  kind: "weekly",
-                  usedPercent: 61,
-                  resetAtIso: "2026-09-19T08:49:00.000Z",
-                  resetText: "08:49 on 19 Sep",
-                  placeholder: false,
-                  scope: "provider",
-                },
-              ],
-            }),
-        });
-
-        const parsed = await parseCodexQuota(
-          twoPanelCapture(),
-          "test-key",
-          scrapedAtMs,
-          codexCatalog
+        expect(systemInstruction).toMatch(/the UTC offset is [+-]\d{2}:\d{2}\./);
+        expect(systemInstruction).toContain(
+          "A printed reset that omits the year or the timezone is NOT ambiguous"
         );
-
-        expect(parsed.limits?.[0].resetAtIso).toBe("2026-09-19T08:49:00.000Z");
+        expect(systemInstruction).not.toContain("resetText");
+        const { config } = mockGenerateContent.mock.calls[0][0] as {
+          config: {
+            responseSchema: {
+              properties: {
+                windows: { items: { required: string[]; properties: Record<string, unknown> } };
+              };
+            };
+          };
+        };
+        expect(config.responseSchema.properties.windows.items.required).not.toContain("resetText");
+        expect(config.responseSchema.properties.windows.items.properties).not.toHaveProperty(
+          "resetText"
+        );
       });
 
       it("rejects a reserve block read as a second provider-wide window of the same kind", async () => {
@@ -1769,7 +1709,7 @@ describe("quota MCP server", () => {
                     label: "Weekly limit",
                     kind: "weekly",
                     usedPercent: 61,
-                    resetText: "08:49 on 19 Sep",
+                    resetAtIso: displayedWeeklyReset,
                     placeholder: false,
                     scope: "provider",
                   },
@@ -1777,7 +1717,7 @@ describe("quota MCP server", () => {
                     label: "Weekly limit",
                     kind: "weekly",
                     usedPercent: 0,
-                    resetText: "11:20 on 23 Sep",
+                    resetAtIso: sparkWeeklyReset,
                     placeholder: false,
                     scope: "provider",
                   },
@@ -1806,26 +1746,6 @@ describe("quota MCP server", () => {
             scope: { provider: "codex" },
           },
         ]);
-      });
-
-      it("instructs the model to copy the printed reset text verbatim", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () => JSON.stringify({ status: "unknown", windows: [] }),
-        });
-
-        await parseCodexQuota(pendingOnlyCapture(), "test-key", scrapedAtMs, codexCatalog);
-
-        const systemInstruction = lastSystemInstruction();
-        expect(systemInstruction).toContain("RESET TEXT REQUIREMENT");
-        expect(systemInstruction).toContain("copy it VERBATIM into `resetText`");
-        const { config } = mockGenerateContent.mock.calls[0][0] as {
-          config: {
-            responseSchema: {
-              properties: { windows: { items: { required: string[] } } };
-            };
-          };
-        };
-        expect(config.responseSchema.properties.windows.items.required).toContain("resetText");
       });
 
       it("instructs the model that GPT-5.3-Codex-Spark limit is a heading and all rows beneath it are scoped only to gpt-5.3-codex-spark", async () => {
@@ -1869,58 +1789,17 @@ describe("quota MCP server", () => {
             label: "5h limit",
             kind: "five_hour",
             percentLeft: 100,
-            resetAtIso: new Date(2026, 8, 16, 16, 20, 0, 0).toISOString(),
+            resetAtIso: sparkFiveHourReset,
             scope: { provider: "codex", models: ["gpt-5.3-codex-spark"] },
           },
           {
             label: "Weekly limit",
             kind: "weekly",
             percentLeft: 100,
-            resetAtIso: new Date(2026, 8, 23, 11, 20, 0, 0).toISOString(),
+            resetAtIso: sparkWeeklyReset,
             scope: { provider: "codex", models: ["gpt-5.3-codex-spark"] },
           },
         ]);
-      });
-
-      it("resolves printed minute without rolling over 24 hours when scrape occurs mid-minute", async () => {
-        // Scrape at 16:20:30 reading "16:20" must resolve to today 16:20:00, not tomorrow.
-        const now = new Date(scrapedAtMs);
-        const midMinuteScrapeMs = new Date(
-          now.getFullYear(),
-          now.getMonth(),
-          now.getDate(),
-          16,
-          20,
-          30,
-          0
-        ).getTime();
-        mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: "available",
-              windows: [
-                {
-                  label: "5h limit",
-                  kind: "five_hour",
-                  usedPercent: 0,
-                  resetText: "16:20",
-                  placeholder: false,
-                  scope: "provider",
-                },
-              ],
-            }),
-        });
-
-        const parsed = await parseCodexQuota(
-          twoPanelCapture(),
-          "test-key",
-          midMinuteScrapeMs,
-          codexCatalog
-        );
-
-        expect(parsed.limits?.[0].resetAtIso).toBe(
-          new Date(now.getFullYear(), now.getMonth(), now.getDate(), 16, 20, 0, 0).toISOString()
-        );
       });
 
       it("publishes the completed panel's provider weekly and drops the reserve block end to end", async () => {
