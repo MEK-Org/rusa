@@ -153,6 +153,8 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("every window carries scope='provider'");
       expect(systemInstruction).toContain("Current Week (Fable)");
       expect(systemInstruction).toContain("The current local time");
+      expect(systemInstruction).toContain("RESET CONTRACT: every non-placeholder window");
+      expect(systemInstruction).toContain("exactly one of resetAtIso");
       expect(systemInstruction).not.toContain("For Codex:");
       expect(systemInstruction).not.toContain("For agy:");
       expect(systemInstruction).not.toContain("refresh requested");
@@ -1208,6 +1210,73 @@ describe("quota MCP server", () => {
       const parsed = await parseCodexQuota("Weekly: 10% used, resets soon", "test-key");
       expect(parsed.status).toBe("unknown");
       expect(parsed.message).toContain("percentLeft < 100");
+    });
+
+    it("reset contract: a malformed resetInIso is a hard parse failure that escalates to the stronger model", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              // Source text copied verbatim instead of an ISO-8601 duration.
+              windows: [
+                { label: "Weekly", kind: "weekly", usedPercent: 10, resetInIso: "70h 13m" },
+              ],
+            }),
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                { label: "Weekly", kind: "weekly", usedPercent: 10, resetInIso: "PT70H13M" },
+              ],
+            }),
+        });
+
+      const generatedAtMs = Date.parse("2026-07-14T00:00:00.000Z");
+      const parsed = await parseCodexQuota(
+        "Weekly: 10% used (resets in 70h 13m)",
+        "test-key",
+        generatedAtMs
+      );
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash"
+      );
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits?.[0]?.resetAtIso).toBe("2026-07-16T22:13:00.000Z");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "attempt 1 (gemini-3.5-flash-lite) failed: Quota parse failed: window 'Weekly' has invalid reset duration '70h 13m'"
+        )
+      );
+
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    });
+
+    it("reset contract: a malformed resetInIso on a 100%-left window still fails instead of degrading to an assumed reset", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: 0, resetInIso: "next week" }],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("Weekly: 100% left (resets next week)", "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain("invalid reset duration 'next week'");
+
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
     });
 
     it("drops a model-scoped window before validating provider reset times", async () => {

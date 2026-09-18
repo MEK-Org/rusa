@@ -282,7 +282,8 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "year or the timezone is NOT ambiguous: take the year from the current local date and the " +
         "offset from the current local time below. Leave this empty for a pure relative duration " +
         "(e.g. '70h 13m', '3h 10m', '2 days, 22 hours') — that is resolved deterministically " +
-        "downstream, do not compute it yourself — and when the row prints no reset at all.",
+        "downstream, do not compute it yourself — and when the row prints no reset at all. " +
+        "A window below 100% left must carry exactly one of resetAtIso or resetInIso.",
     },
     resetInIso: {
       type: Type.STRING,
@@ -290,7 +291,8 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "ISO-8601 duration until this window resets, ONLY when the source gives a pure relative " +
         "duration (e.g. '70h 13m' -> 'PT70H13M', '3h 10m' -> 'PT3H10M', " +
         "'2 days, 22 hours' -> 'P2DT22H'). Leave this empty for absolute/wall-clock/calendar " +
-        "readings, ambiguous text, or when no reset duration is present.",
+        "readings (those go in resetAtIso) or when no reset duration is present. Must be a valid " +
+        "ISO-8601 duration, never the source text verbatim.",
     },
     placeholder: {
       type: Type.BOOLEAN,
@@ -566,7 +568,14 @@ async function parseQuotaWithLlm(
     "text cannot be read as a clock time or calendar date at all. " +
     "For pure relative reset durations (e.g. '70h 13m', '3h 10m', '2 days, 22 hours', 'in 4 hours 12 minutes'), do not compute resetAtIso; instead extract the " +
     "duration into resetInIso as a normalized ISO-8601 duration such as PT70H13M, " +
-    "PT3H10M, PT4H12M, or P2DT22H.";
+    "PT3H10M, PT4H12M, or P2DT22H.\n" +
+    "RESET CONTRACT: every non-placeholder window that is below 100% left MUST carry exactly " +
+    "one of resetAtIso (a valid ISO-8601 instant with UTC offset) or resetInIso (a valid " +
+    "ISO-8601 duration). Never emit both for one window, and never emit prose, a bare clock " +
+    "time, or a partial date in either field. A window below 100% left with neither field, or " +
+    "with a value that is not valid ISO-8601, fails validation and the whole parse is retried on " +
+    "a stronger model, so always fill the field rather than declining because the year or " +
+    "timezone was not printed.";
 
   const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
@@ -644,6 +653,15 @@ async function parseQuotaWithLlm(
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
       const percentLeft = 100 - usedPercent;
+      // A duration the model did emit but that is not ISO-8601 is a bad read,
+      // not a missing one: fail here so the stronger-model retry sees it,
+      // rather than letting it degrade into "no reset" and, for a 100%-left
+      // window, into an assumed reset downstream.
+      if (w.resetInIso?.trim() && parseIsoDuration(w.resetInIso) === undefined) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid reset duration '${w.resetInIso}'`
+        );
+      }
       const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
       if (resetAtIso && !Number.isFinite(Date.parse(resetAtIso))) {
