@@ -8,8 +8,10 @@ import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.j
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
+import { parseVoiceDefinitions } from "../voice/voice-catalog.js";
 import { validateDashboardAuth } from "./dashboard-auth.js";
 import {
+  ELEVENLABS_API_KEY_SECRET_FILENAME,
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
   readHostSecret,
@@ -19,6 +21,7 @@ import {
 } from "./secrets.js";
 import {
   DEFAULT_DEPLOY_BRANCH,
+  type GitHubConfig,
   type GitHubOrgConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
@@ -53,7 +56,7 @@ export interface LoadConfigOptions {
 
 export const QUICKSTART_PROFILE = {
   // No separate single-user config toggle exists today; the current root/operator shape is structural.
-  github: { ingestionMode: "poll", account: "quickstart-user" },
+  github: { account: "quickstart-user" },
   sandbox: "container-boundary",
   dashboard: { port: 8080, bindHost: "0.0.0.0" },
   gitBridge: true,
@@ -134,26 +137,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (parsed.github && !parsed.github.account) {
     parsed.github.account = "quickstart-user";
   }
-  if (
-    parsed.github.ingestionMode !== undefined &&
-    parsed.github.ingestionMode !== "webhook" &&
-    parsed.github.ingestionMode !== "poll"
-  ) {
-    throw new Error('config.yaml: github.ingestionMode must be "webhook" or "poll" when set');
-  }
-  // Validate-when-set rather than default-when-absent: the absent case is already
-  // handled at the poller, and defaulting here too would make that guard look
-  // unreachable to a later reader — which is how the key came to be treated as
-  // deletable in the first place . What the poller's `??` cannot catch is a
-  // key that IS set to something non-numeric, so that is what this rejects.
-  if (parsed.github.pollIntervalSeconds !== undefined) {
-    const interval = parsed.github.pollIntervalSeconds;
-    if (typeof interval !== "number" || !Number.isFinite(interval) || interval <= 0) {
-      throw new Error(
-        "config.yaml: github.pollIntervalSeconds must be a positive number of seconds when set"
-      );
-    }
-  }
+  rejectRemovedGitHubPollingKeys(parsed.github);
   if (parsed.github.workerTokenPath !== undefined) {
     if (
       typeof parsed.github.workerTokenPath !== "string" ||
@@ -602,14 +586,39 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.gitBridgePort = 8085;
   }
 
-  // Walkie-talkie voice tuning  — optional, additive; the feature is
-  // gated on geminiApiKey elsewhere, so an unset section is always valid.
+  // Optional voice tuning; startup checks the selected transcription provider key.
+  if (
+    parsed.elevenlabsApiKey !== undefined &&
+    (typeof parsed.elevenlabsApiKey !== "string" || !parsed.elevenlabsApiKey.trim())
+  ) {
+    throw new Error("config.yaml: elevenlabsApiKey must be a non-empty string when set");
+  }
   const voice = parsed.voice;
   if (voice !== undefined) {
     if (typeof voice !== "object" || voice === null || Array.isArray(voice)) {
       throw new Error("config.yaml: voice must be a mapping when set");
     }
-    for (const key of ["transcriptionModel", "ttsModel", "voiceName"] as const) {
+    if (
+      voice.transcriptionProvider !== undefined &&
+      !["google", "elevenlabs"].includes(voice.transcriptionProvider)
+    ) {
+      throw new Error("config.yaml: voice.transcriptionProvider must be google or elevenlabs");
+    }
+    if (voice.supportedVoices !== undefined) {
+      try {
+        voice.supportedVoices = parseVoiceDefinitions(voice.supportedVoices);
+      } catch (error) {
+        throw new Error(
+          `config.yaml: voice.supportedVoices: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    for (const key of [
+      "transcriptionModel",
+      "ttsModel",
+      "voiceName",
+      "elevenlabsTtsModel",
+    ] as const) {
       const value = voice[key];
       if (value !== undefined) {
         if (typeof value !== "string" || !value.trim()) {
@@ -683,13 +692,24 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
  * quickstart). Warns — without ever logging a value — when both are set, as a
  * migration nudge to remove the inline copy.
  */
+function warnDuplicateSecret(inlineName: string, secretFilename: string, term = "key"): void {
+  console.warn(
+    `[config] ${inlineName} is set inline in config.yaml AND ${SECRETS_DIRNAME}/${secretFilename} exists — the secrets file wins. Remove the inline ${term}.`
+  );
+}
+
 function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
+  const fileElevenLabsKey = readHostSecret(ELEVENLABS_API_KEY_SECRET_FILENAME, mcHome);
+  if (fileElevenLabsKey) {
+    if (parsed.elevenlabsApiKey) {
+      warnDuplicateSecret("elevenlabsApiKey", ELEVENLABS_API_KEY_SECRET_FILENAME);
+    }
+    parsed.elevenlabsApiKey = fileElevenLabsKey;
+  }
   const fileGeminiKey = readHostSecret(GEMINI_API_KEY_SECRET_FILENAME, mcHome);
   if (fileGeminiKey) {
     if (parsed.geminiApiKey) {
-      console.warn(
-        `[config] geminiApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${GEMINI_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
-      );
+      warnDuplicateSecret("geminiApiKey", GEMINI_API_KEY_SECRET_FILENAME);
     }
     parsed.geminiApiKey = fileGeminiKey;
   }
@@ -697,9 +717,7 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
   const fileMistralKey = readHostSecret(MISTRAL_API_KEY_SECRET_FILENAME, mcHome);
   if (fileMistralKey) {
     if (parsed.mistralApiKey) {
-      console.warn(
-        `[config] mistralApiKey is set inline in config.yaml AND ${SECRETS_DIRNAME}/${MISTRAL_API_KEY_SECRET_FILENAME} exists — the secrets file wins. Remove the inline key.`
-      );
+      warnDuplicateSecret("mistralApiKey", MISTRAL_API_KEY_SECRET_FILENAME);
     }
     parsed.mistralApiKey = fileMistralKey;
   }
@@ -707,11 +725,28 @@ function applySecretFiles(parsed: RusaConfig, mcHome: string): void {
   const fileWebhookSecret = readHostSecret(WEBHOOK_SECRET_FILENAME, mcHome);
   if (fileWebhookSecret && parsed.webhook) {
     if (parsed.webhook.secret) {
-      console.warn(
-        `[config] webhook.secret is set inline in config.yaml AND ${SECRETS_DIRNAME}/${WEBHOOK_SECRET_FILENAME} exists — the secrets file wins. Remove the inline value.`
-      );
+      warnDuplicateSecret("webhook.secret", WEBHOOK_SECRET_FILENAME, "value");
     }
     parsed.webhook.secret = fileWebhookSecret;
+  }
+}
+
+/**
+ * GitHub polling was removed; webhooks are the only ingestion edge. A config
+ * that still carries a polling key is refused rather than ignored, because a
+ * key that used to change how events arrive going silent is exactly how a
+ * stale install would run in a mode its operator never chose. `in` rather than
+ * `!== undefined` so an explicit null still names the removal.
+ */
+const REMOVED_GITHUB_POLLING_KEYS = ["ingestionMode", "pollIntervalSeconds"] as const;
+
+function rejectRemovedGitHubPollingKeys(github: GitHubConfig): void {
+  for (const key of REMOVED_GITHUB_POLLING_KEYS) {
+    if (key in github) {
+      throw new Error(
+        `config.yaml: github.${key} was removed along with GitHub polling; GitHub events now arrive only through the webhook listener (webhook.port). Delete the key from config.yaml.`
+      );
+    }
   }
 }
 

@@ -1,9 +1,12 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
 import {
   ActorMesh,
@@ -94,6 +97,14 @@ class FakeScheduledMessages implements ScheduledMessageScheduler {
   }
 }
 
+const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-mcp-test-secrets-"));
+writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
+writeFileSync(join(defaultTestSecretsDir, "mistral-api-key"), "test-mistral-key");
+
+afterAll(() => {
+  rmSync(defaultTestSecretsDir, { recursive: true, force: true });
+});
+
 function setup(
   opts: {
     childResponder?: () => Promise<Partial<RunResult>>;
@@ -110,6 +121,7 @@ function setup(
     useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
+    secretsDir?: string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -161,11 +173,8 @@ function setup(
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
-    grantableCapabilities: new Set([
-      "understanding-write",
-      "secret:gemini-api-key",
-      "secret:mistral-api-key",
-    ]),
+    grantableCapabilities: new Set(["understanding-write", "secret"]),
+    secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
@@ -966,6 +975,224 @@ describe("agent-execution MCP server", () => {
       expect(retired.isError).toBeFalsy();
       expect(registry.get(worker)?.status).toBe("retired");
     });
+
+    it("retire_thread refuses while the subtree holds live event subscriptions, and succeeds after disposition (#540)", async () => {
+      const scheduledMessages = new FakeScheduledMessages();
+      const { mesh, registry } = setup({
+        scheduledMessages,
+        configuredEventSources: ["github:test-org/test-repo"],
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      mesh.delegateEventSource("github:test-org/test-repo/issues/10", worker, "root");
+      const subRes = (await workerClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: "github:test-org/test-repo" },
+      })) as CallToolResult;
+      expect(subRes.isError).toBeFalsy();
+
+      const refused = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+
+      expect(refused.isError).toBe(true);
+      const message = String(dataOf(refused));
+      expect(message).toContain("2 live event subscription(s) owned in its subtree");
+      expect(message).toContain("github:test-org/test-repo/issues/10 [ownership]");
+      expect(message).toContain("github:test-org/test-repo [subscription]");
+      expect(message).toContain(
+        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+          "or the owner above it reclaims it (reclaim_event_source)"
+      );
+      expect(message).toContain(
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+          "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder)"
+      );
+      expect(registry.get(worker)?.status).toBe("active");
+
+      const reclaimed = (await client.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "github:test-org/test-repo/issues/10" },
+      })) as CallToolResult;
+      expect(reclaimed.isError).toBeFalsy();
+
+      const stillBlocked = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(stillBlocked.isError).toBe(true);
+      expect(String(dataOf(stillBlocked))).toContain("1 live event subscription(s)");
+      expect(String(dataOf(stillBlocked))).toContain("github:test-org/test-repo [subscription]");
+
+      const unsubscribed = (await workerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo" },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+
+      const retired = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The holder-side disposition the refusal names: an [ownership] blocker
+    // clears when the holder delegates it back to its parent through the same
+    // tool that handed it down. No new tool and no ownership release without a
+    // receiver — the source is owned by someone live at every step.
+    it("retire_thread succeeds after the holder delegates its ownership back to its parent (#540)", async () => {
+      const { mesh, registry } = setup({ configuredEventSources: ["github:test-org/test-repo"] });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      mesh.delegateEventSource("github:test-org/test-repo/pulls/11", worker, "root");
+
+      const refused = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain(
+        `github:test-org/test-repo/pulls/11 [ownership] held by ${worker}`
+      );
+
+      // `unsubscribe_event_source` is direct-subscription only: it does not
+      // touch ownership, so the blocker stands.
+      const unsubscribed = (await workerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/11" },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+      const stillBlocked = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(stillBlocked.isError).toBe(true);
+      expect(String(dataOf(stillBlocked))).toContain("1 live event subscription(s)");
+
+      const handedBack = (await workerClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "root", source: "github:test-org/test-repo/pulls/11" },
+      })) as CallToolResult;
+      expect(handedBack.isError).toBeFalsy();
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === "github:test-org/test-repo/pulls/11" && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual(["root"]);
+
+      const retired = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The parent-side disposition for a [subscription] blocker: a child that
+    // opened a PR holds a mechanical direct subscription to it, and if the
+    // child has wedged nobody else could clear it. Its ancestor names the
+    // holder in `thread_id`; a non-ancestor is refused; nothing is retired
+    // until the disposition has happened.
+    it("retire_thread succeeds after the parent unsubscribes a wedged child's direct subscription by thread_id (#540)", async () => {
+      const { mesh, registry } = setup({ configuredEventSources: ["github:test-org/test-repo"] });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const peer = mesh.spawn({
+        charter: "peer",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, "root"));
+      const peerClient = await connect(createAgentExecMcpServer(mesh, peer, "root"));
+
+      mesh.subscribeEventSource("github:test-org/test-repo", "root", "root");
+      // What mechanicallySubscribeCreatedResource leaves behind when the child opens a PR.
+      mesh.addEventSourceSubscriber("github:test-org/test-repo/pulls/12", child, child);
+
+      const refused = (await parentClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: child, force: true },
+      })) as CallToolResult;
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain(
+        `github:test-org/test-repo/pulls/12 [subscription] held by ${child}`
+      );
+      expect(String(dataOf(refused))).toContain(
+        "unsubscribe_event_source with thread_id set to the holder"
+      );
+
+      // A non-ancestor cannot dispose of it.
+      const peerRefused = (await peerClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: child },
+      })) as CallToolResult;
+      expect(peerRefused.isError).toBe(true);
+      expect(String(dataOf(peerRefused))).toContain(
+        "you can only unsubscribe yourself or your own descendant threads"
+      );
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.actorId)).toEqual([child]);
+
+      // Nor can anyone name a thread that does not exist.
+      const unknown = (await parentClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: "ghost" },
+      })) as CallToolResult;
+      expect(unknown.isError).toBe(true);
+      expect(String(dataOf(unknown))).toContain("unknown thread id: ghost");
+
+      const disposed = (await parentClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/12", thread_id: child },
+      })) as CallToolResult;
+      expect(disposed.isError).toBeFalsy();
+      expect(String(dataOf(disposed))).toBe(
+        `unsubscribed ${child} from github:test-org/test-repo/pulls/12`
+      );
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+
+      const retired = (await parentClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: child },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(child)?.status).toBe("retired");
+
+      // The grandparent's authority reaches the same subtree; the root's own
+      // subscriptions are untouched by any of this.
+      expect(registry.get(parent)?.status).toBe("active");
+      const rootRetired = (await rootClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: parent },
+      })) as CallToolResult;
+      expect(rootRetired.isError).toBeFalsy();
+    });
   });
 
   it("retire_thread refuses a queued report without force, but retires with force: true ", async () => {
@@ -1380,6 +1607,36 @@ describe("agent-execution MCP server", () => {
     expect(nonSecret.isError).toBe(true);
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
 
+    // A generic secret OUTSIDE the parent-grantable allow-list → rejected for a
+    // direct child too, whether or not the guessed file exists (#542 security
+    // review): the authority check runs before containment, so the error is the
+    // same either way and a non-root parent gets no existence oracle.
+    writeFileSync(join(defaultTestSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+    for (const guessed of ["secret:webhook-secret", "secret:no-such-file"]) {
+      const res = (await parentSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: guessed },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toBe(
+        `only the root may grant ${guessed}; a non-root parent may only grant: secret:gemini-api-key, secret:mistral-api-key`
+      );
+    }
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
+    // Root may grant it; the parent may not then revoke it.
+    const rootGrant = (await rootSrv.callTool({
+      name: "grant_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(rootGrant.isError).toBeFalsy();
+    const parentRevoke = (await parentSrv.callTool({
+      name: "revoke_capability",
+      arguments: { actor_id: childId, capability: "secret:webhook-secret" },
+    })) as CallToolResult;
+    expect(parentRevoke.isError).toBe(true);
+    expect(mesh.activeCapabilitiesFor(childId)).toEqual(["secret:webhook-secret"]);
+    rmSync(join(defaultTestSecretsDir, "webhook-secret"), { force: true });
+
     // Unknown grantee → returns unknown thread id error .
     const unknownGrantee = (await parentSrv.callTool({
       name: "grant_capability",
@@ -1394,6 +1651,34 @@ describe("agent-execution MCP server", () => {
     })) as CallToolResult;
     expect(unknownRevoke.isError).toBe(true);
     expect(dataOf(unknownRevoke)).toBe("unknown thread id: ghost");
+  });
+
+  it("grant_capability rejects secret traversal, missing file, and bare secret", async () => {
+    const { mesh } = setup();
+    const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { thread_id: childId } = dataOf(
+      (await rootSrv.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      })) as CallToolResult
+    ) as { thread_id: string };
+
+    for (const badCap of [
+      "secret",
+      "secret:",
+      "secret:../outside",
+      "secret:/etc/passwd",
+      "secret:nonexistent-file",
+    ]) {
+      const res = (await rootSrv.callTool({
+        name: "grant_capability",
+        arguments: { actor_id: childId, capability: badCap },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    }
   });
 
   it("revive_thread (root) revives a retired thread and audits it", async () => {

@@ -76,7 +76,7 @@ afterEach(() => {
 
 function makeConfig(): RusaConfig {
   return {
-    github: { account: "rusa-bot", pollIntervalSeconds: 300 },
+    github: { account: "rusa-bot" },
     providers: {
       codex: { cliCommand: "codex" },
       gemini: { cliCommand: "agy" },

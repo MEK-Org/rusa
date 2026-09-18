@@ -610,10 +610,15 @@ export function createAgentExecMcpServer(
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
         "Check run_state in list_threads, or just wait for the thread's yield. " +
-        "Also refused while the subtree still owns a live obligation or has a scheduled " +
-        "message pending in either direction; the refusal names each one, and nothing is " +
-        "retired until you have reassigned or finished those obligations and cancelled " +
-        "(cancel_scheduled_message) or re-sent those messages.",
+        "Also refused while the subtree still owns a live obligation, has a scheduled " +
+        "message pending in either direction, or holds a live event subscription; the " +
+        "refusal names each one, and nothing is retired until you have reassigned or finished " +
+        "those obligations, cancelled (cancel_scheduled_message) or re-sent those messages, " +
+        "and disposed of those event subscriptions — an ownership is delegated onward by its " +
+        "holder (delegate_event_source, its parent included) or reclaimed by the owner above it " +
+        "(reclaim_event_source); a direct subscription is dropped by its holder " +
+        "(unsubscribe_event_source) or by you as its ancestor (unsubscribe_event_source with " +
+        "thread_id set to the holder).",
       inputSchema: {
         thread_id: z.string().describe("The descendant thread to retire."),
         force: z
@@ -622,7 +627,7 @@ export function createAgentExecMcpServer(
           .describe(
             "Retire even if the thread or a descendant has a queued run (cancelling the queued run). " +
               "Still refused if any thread in the subtree has an active run in flight, and it does " +
-              "not bypass the obligation/message refusal above — that work is disposed of by name, " +
+              "not bypass the obligation/message/subscription refusal above — that work is disposed of by name, " +
               "never overridden by a flag."
           ),
       },
@@ -721,44 +726,76 @@ export function createAgentExecMcpServer(
     }
   );
 
+  // Removal is wider than addition: you may drop your own subscription or a
+  // descendant's (by naming it in `thread_id`), never a peer's or an
+  // ancestor's. The asymmetry is deliberate. Subscribing another actor would
+  // push work sideways; unsubscribing a descendant only ever removes work
+  // from a subtree you already own — and it is the one explicit disposition
+  // that clears a [subscription] retirement blocker (#540) when the holder is
+  // wedged and cannot clear it itself.
   server.registerTool(
     "unsubscribe_event_source",
     {
-      title: "Unsubscribe yourself from an event source",
+      title: "Unsubscribe yourself or a descendant from an event source",
       description:
-        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you.",
-      inputSchema: eventResourceInputSchema,
+        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you. " +
+        "Pass thread_id to drop a descendant's direct subscription instead of your own — the explicit parent-side disposition for a [subscription] retirement blocker whose holder will not clear it. " +
+        "Refused for any thread that is not your descendant.",
+      inputSchema: {
+        ...eventResourceInputSchema,
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            "A descendant thread whose direct subscription to drop. Omit to unsubscribe yourself."
+          ),
+      },
     },
-    async ({ source, kind, org, repo, number, ref, space }) => {
+    async ({ source, kind, org, repo, number, ref, space, thread_id }) => {
       try {
         const resource = parseEventResource(
           { source, kind, org, repo, number, ref, space },
           "subscription"
         );
-        mesh.removeEventSourceSubscriber(resource, selfId);
-        return toolOk(`unsubscribed from ${resourceKey(resource)}`);
+        const holder = thread_id ?? selfId;
+        if (holder !== selfId) {
+          if (!mesh.actors.get(holder)) {
+            return toolError(new Error(`unknown thread id: ${holder}`));
+          }
+          if (!mesh.isAncestorOf(selfId, holder)) {
+            return toolError(
+              new Error("you can only unsubscribe yourself or your own descendant threads")
+            );
+          }
+        }
+        mesh.removeEventSourceSubscriber(resource, holder, selfId);
+        return toolOk(
+          holder === selfId
+            ? `unsubscribed from ${resourceKey(resource)}`
+            : `unsubscribed ${holder} from ${resourceKey(resource)}`
+        );
       } catch (err) {
         return toolError(err);
       }
     }
   );
 
-  // ── Capability grants (ISSUE_NUM phase 1a, relaxed for parent-grantable secrets in
-  // ISSUE_NUM) ── Registered on EVERY endpoint: root can grant any grantable
+  // ── Capability grants (ISSUE_NUM phase 1a, generalized for secret grants in
+  // #542) ── Registered on EVERY endpoint: root can grant any grantable
   // capability to any actor (as before), and a non-root actor can grant/revoke
-  // capabilities in the parent-grantable allow-list (currently
-  // 'secret:gemini-api-key' and 'secret:mistral-api-key') to/from its DIRECT
-  // children. Authorization is enforced in the mesh (grantCapability/
-  // revokeCapability take the grantor into account), with the caller's identity
-  // baked into this endpoint — so a grantee
-  // still cannot re-grant sideways or upward, and non-secret capabilities stay
-  // root-only.
+  // capabilities in the parent-grantable allow-list (exactly the
+  // PARENT_GRANTABLE_CAPABILITIES secret names — 'secret:gemini-api-key' and
+  // 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) to/from
+  // its DIRECT children. Authorization is enforced in the mesh
+  // (grantCapability/revokeCapability take the grantor into account), with the
+  // caller's identity baked into this endpoint — so a grantee still cannot
+  // re-grant sideways or upward, and non-secret capabilities stay root-only.
   server.registerTool(
     "grant_capability",
     {
       title: "Grant a capability to an actor",
       description:
-        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only parent-grantable secrets (currently 'secret:gemini-api-key' and 'secret:mistral-api-key') and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; the Mistral grant also exports MISTRAL_API_KEY. Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable or you lack authority over the grantee.",
+        "Grant an allow-listed capability to a specific actor by its thread id. As root you may grant any grantable capability (e.g. 'understanding-write'); as a non-root actor you may grant only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) and only to your DIRECT children. Granted secret files become readable inside the grantee's sandbox at their well-known $RUSA_HOME/secrets paths; kebab-case secret names also export an environment variable (e.g. 'secret:mistral-api-key' exports MISTRAL_API_KEY). Idempotent. Takes effect on a live grantee's next run, or when a retired grantee is next revived. Rejected if the capability isn't grantable, fails containment checks, or you lack authority over the grantee.",
       inputSchema: {
         actor_id: z.string().describe("The grantee actor's thread id."),
         capability: z
@@ -781,7 +818,7 @@ export function createAgentExecMcpServer(
     {
       title: "Revoke a capability from an actor",
       description:
-        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only parent-grantable secrets (currently 'secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
+        "Revoke a previously-granted capability from an actor by its thread id. As root you may revoke any grant; as a non-root actor you may revoke only the parent-grantable secrets ('secret:gemini-api-key' and 'secret:mistral-api-key') and only from your DIRECT children. No-op if the grant isn't active. Takes effect on the actor's next run/(re)construction.",
       inputSchema: {
         actor_id: z.string().describe("The actor's thread id to revoke from."),
         capability: z.string().describe("The capability to revoke."),

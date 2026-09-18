@@ -276,12 +276,14 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     resetAtIso: {
       type: Type.STRING,
       description:
-        "ISO-8601 instant (with UTC offset) this window resets at, ONLY when you can confidently " +
-        "resolve one from an absolute wall-clock/calendar reading (e.g. '23:32', '12:34 on 14 Jul', " +
-        "'Jul 7th, 2026 12:25 PM') using the current local time given below. Leave this empty for a " +
-        "pure relative duration (e.g. '70h 13m', '3h 10m', '2 days, 22 hours') — that is resolved " +
-        "deterministically downstream, do not compute it yourself. Also leave it empty whenever the " +
-        "date, year, or timezone is genuinely ambiguous — never guess an instant.",
+        "ISO-8601 instant (with UTC offset) this window resets at, assembled from an absolute " +
+        "wall-clock/calendar reading (e.g. '23:32', '12:34 on 14 Jul', 'Jul 7th, 2026 12:25 PM') " +
+        "using the current local date, time, and UTC offset given below. A reading that omits the " +
+        "year or the timezone is NOT ambiguous: take the year from the current local date and the " +
+        "offset from the current local time below. Leave this empty for a pure relative duration " +
+        "(e.g. '70h 13m', '3h 10m', '2 days, 22 hours') — that is resolved deterministically " +
+        "downstream, do not compute it yourself — and when the row prints no reset at all. " +
+        "A window below 100% left must carry exactly one of resetAtIso or resetInIso.",
     },
     resetInIso: {
       type: Type.STRING,
@@ -289,7 +291,8 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "ISO-8601 duration until this window resets, ONLY when the source gives a pure relative " +
         "duration (e.g. '70h 13m' -> 'PT70H13M', '3h 10m' -> 'PT3H10M', " +
         "'2 days, 22 hours' -> 'P2DT22H'). Leave this empty for absolute/wall-clock/calendar " +
-        "readings, ambiguous text, or when no reset duration is present.",
+        "readings (those go in resetAtIso) or when no reset duration is present. Must be a valid " +
+        "ISO-8601 duration, never the source text verbatim.",
     },
     placeholder: {
       type: Type.BOOLEAN,
@@ -331,6 +334,54 @@ function formatLocalIsoWithOffset(ms: number): string {
     `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
     `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
     `${sign}${pad(Math.floor(absMin / 60))}:${pad(absMin % 60)}`
+  );
+}
+
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+const WEEKDAY_NAMES = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+
+/**
+ * The scrape instant as the prompt's "now", spelled out component by component
+ * — calendar date, year, clock time and UTC offset — in the host's local zone,
+ * the zone a TUI prints its clock in. A panel that prints `08:49 on 19 Sep`
+ * omits exactly the year and the zone; handing both to the model as plain
+ * numbers lets it assemble the instant instead of declining the arithmetic
+ * (#517). Parsing the printed text stays the model's job: the TUI's wording
+ * drifts, and code that pattern-matches it is the brittleness the LLM parse
+ * replaced.
+ */
+function describeLocalNow(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const iso = formatLocalIsoWithOffset(ms);
+  const offset = iso.slice(-6);
+  return (
+    "The current local time — in the SAME timezone the TUI's clock is printed in — " +
+    `is ${iso}. Its components: today is ${WEEKDAY_NAMES[d.getDay()]} ${d.getDate()} ` +
+    `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}; the current year is ${d.getFullYear()}; ` +
+    `the current local clock time is ${pad(d.getHours())}:${pad(d.getMinutes())}; ` +
+    `the UTC offset is ${offset}. `
   );
 }
 
@@ -435,8 +486,9 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
-          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' are provider-wide: emit them with no `models`; they alone determine status. " +
-          "Named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), and any 5h or Weekly rows beneath a standalone '<model name> limit:' heading (for example beneath a Codex Spark heading). " +
+          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' appearing above any model heading are provider-wide account rows: emit them with no `models`; they alone determine status. " +
+          "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
+          "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
           "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
           "Codex percentages say LEFT. Convert the printed N% left to usedPercent = 100 - N exactly. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
@@ -481,7 +533,8 @@ async function parseQuotaWithLlm(
           .join(", ") +
         ".\n"
       : `No configured model list was supplied for ${provider}: emit NO model-specific windows — ` +
-        "provider-wide windows remain eligible.\n";
+        "omit those rows entirely and NEVER re-label one as provider-wide. " +
+        "Provider-wide windows remain eligible.\n";
   const systemInstruction =
     "You are a precise quota parser. Analyze the raw CLI or TUI output of a provider's " +
     "usage/status check and extract the quota state.\n" +
@@ -501,16 +554,28 @@ async function parseQuotaWithLlm(
     "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text, preserve all printed decimal precision, and never infer a value from progress-bar artwork. If the source reports USED, copy it exactly. If it reports LEFT or REMAINING, calculate usedPercent = 100 - N exactly.\n" +
     providerClause +
     configuredModelClause +
-    "The current local time — in the SAME timezone the TUI's clock is printed in (its " +
-    `offset is included below) — is ${formatLocalIsoWithOffset(generatedAtMs)}. ` +
-    "Use it to resolve wall-clock/calendar reset text (e.g. '23:32' means the next " +
-    "occurrence of that time at or after now; '12:34 on 14 Jul' or 'resets 02:10 on 27 Aug' or '15:11 on 1 Sep' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
-    "such date at or after now) into resetAtIso, assuming the same UTC offset unless " +
-    "the source states otherwise. If the timezone, date, or year is genuinely ambiguous, " +
-    "leave resetAtIso empty rather than guess — a wrong instant is worse than a missing one. " +
+    describeLocalNow(generatedAtMs) +
+    "Use those components to assemble resetAtIso from wall-clock/calendar reset text. This is " +
+    "copying numbers into an ISO-8601 instant, not date arithmetic: a bare clock time such as " +
+    "'23:32' or 'resets 16:20' is that time today if it is still ahead of the current local time, " +
+    "otherwise that time tomorrow; a day-and-month such as '12:34 on 14 Jul', 'resets 02:10 on " +
+    "27 Aug' or '15:11 on 1 Sep' is that day and month at that time in the CURRENT YEAR given " +
+    "above, or in the next year only if that date has already passed this year; a full date such " +
+    "as 'Jul 7th, 2026 12:25 PM' carries its own year. Always write the UTC offset given above " +
+    "unless the source states another zone. A printed reset that omits the year or the timezone " +
+    "is NOT ambiguous — the year and the offset come from the current local date and time above — " +
+    "so fill resetAtIso for it rather than leaving it empty. Leave resetAtIso empty only when the " +
+    "text cannot be read as a clock time or calendar date at all. " +
     "For pure relative reset durations (e.g. '70h 13m', '3h 10m', '2 days, 22 hours', 'in 4 hours 12 minutes'), do not compute resetAtIso; instead extract the " +
     "duration into resetInIso as a normalized ISO-8601 duration such as PT70H13M, " +
-    "PT3H10M, PT4H12M, or P2DT22H.";
+    "PT3H10M, PT4H12M, or P2DT22H.\n" +
+    "RESET CONTRACT: every non-placeholder window that is below 100% left MUST carry exactly " +
+    "one of resetAtIso (a valid ISO-8601 instant with UTC offset) or resetInIso (a valid " +
+    "ISO-8601 duration). Never emit both for one window, and never emit prose, a bare clock " +
+    "time, or a partial date in either field. A window below 100% left with neither field, or " +
+    "with a value that is not valid ISO-8601, fails validation and the whole parse is retried on " +
+    "a stronger model, so always fill the field rather than declining because the year or " +
+    "timezone was not printed.";
 
   const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
@@ -588,6 +653,15 @@ async function parseQuotaWithLlm(
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
       const percentLeft = 100 - usedPercent;
+      // A duration the model did emit but that is not ISO-8601 is a bad read,
+      // not a missing one: fail here so the stronger-model retry sees it,
+      // rather than letting it degrade into "no reset" and, for a 100%-left
+      // window, into an assumed reset downstream.
+      if (w.resetInIso?.trim() && parseIsoDuration(w.resetInIso) === undefined) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid reset duration '${w.resetInIso}'`
+        );
+      }
       const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
       if (resetAtIso && !Number.isFinite(Date.parse(resetAtIso))) {
@@ -620,6 +694,27 @@ async function parseQuotaWithLlm(
     // masquerade as provider evidence (and a model-only response must not
     // count as a successful provider read).
     const providerWindows = limits.filter(isProviderScopedWindow);
+    // A model reserve block read as provider-wide surfaces as a second
+    // provider window of the same kind — the #517 contamination, where a Spark
+    // reserve weekly stood beside the account's own weekly and downstream had
+    // no way to tell which reset was the provider's. No provider prints two
+    // account-wide windows of one kind, so fail the parse: the stronger-model
+    // retry gets a chance to scope it correctly, and a second failure carries
+    // the last good reading forward rather than publishing an ambiguous panel.
+    const providerKindCounts = new Map<QuotaWindowKind, number>();
+    for (const window of providerWindows) {
+      // Every window pushed above carries a validated kind; the field is
+      // optional on the shared DTO, so skip rather than count an absent one.
+      if (!window.kind) continue;
+      providerKindCounts.set(window.kind, (providerKindCounts.get(window.kind) ?? 0) + 1);
+    }
+    const duplicatedKind = [...providerKindCounts].find(([, count]) => count > 1);
+    if (duplicatedKind) {
+      throw new Error(
+        `Quota parse failed: ${provider} returned ${duplicatedKind[1]} provider-wide ` +
+          `'${duplicatedKind[0]}' windows — a model-specific block was read as provider-wide`
+      );
+    }
     if (providerWindows.length === 0 && parsed.status === "available") {
       throw new Error(
         `Quota parse failed: ${provider} status is available but no provider window was returned`
@@ -655,17 +750,17 @@ async function parseQuotaWithLlm(
     return await executeOnce("gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
-      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.8-flash`
     );
     try {
-      const result = await executeOnce("gemini-3.5-flash");
+      const result = await executeOnce("gemini-3.8-flash");
       console.info(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded`
       );
       return result;
     } catch (secondErr) {
       console.error(
-        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
       );
       return {
         status: "unknown",
@@ -691,6 +786,55 @@ export async function parseClaudeQuota(
   };
 }
 
+/** codex renders `/status` inside a box-drawn panel; these are its corners. */
+const CODEX_PANEL_TOP = "\u256d";
+const CODEX_PANEL_BOTTOM = "\u2570";
+/** A rendered limit row (`5h limit:`), as opposed to the `Limits:` summary line. */
+const CODEX_LIMIT_ROW = /\blimit:/i;
+const CODEX_EXHAUSTION = /hit your usage limit/i;
+
+/**
+ * Narrow a codex `/status` capture to the completed panel (#517).
+ *
+ * The scrape harness re-issues `/status` in-session on codex's "refresh
+ * requested; run /status again shortly" answer, so a successful capture holds
+ * BOTH the refresh-pending panel and the completed one, plus notes printed
+ * between them ("You have 2 usage limit resets available"). Only the completed
+ * panel is a reading. Handing the whole capture to the parser asks it to pick,
+ * on every scrape, between a pending panel and a real one and to ignore notes
+ * that cast doubt on the numbers — a choice with no upside, since the pending
+ * panel carries nothing the completed panel lacks.
+ *
+ * Deterministic and conservative: when no panel carries a rendered limit row
+ * (pending-only, or nothing rendered at all) the capture is passed through
+ * untouched so the parser still classifies the pending state honestly. An
+ * exhaustion banner is also passed through whole — codex prints it outside the
+ * panel, and dropping exhaustion evidence would fail open. The durable scrape
+ * row always keeps the full capture; this only shapes what the parser reads.
+ */
+function selectRenderedCodexPanel(output: string): string {
+  if (CODEX_EXHAUSTION.test(output)) return output;
+
+  const lines = output.split("\n");
+  const panels: { start: number; end: number }[] = [];
+  let start = -1;
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith(CODEX_PANEL_TOP)) {
+      start = index;
+    } else if (trimmed.startsWith(CODEX_PANEL_BOTTOM) && start >= 0) {
+      panels.push({ start, end: index });
+      start = -1;
+    }
+  }
+
+  for (const panel of panels.reverse()) {
+    const block = lines.slice(panel.start, panel.end + 1);
+    if (block.some((line) => CODEX_LIMIT_ROW.test(line))) return block.join("\n");
+  }
+  return output;
+}
+
 export async function parseCodexQuota(
   output: string,
   apiKey?: string,
@@ -699,7 +843,13 @@ export async function parseCodexQuota(
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "codex", generatedAtMs, configuredModels);
+    return parseQuotaWithLlm(
+      selectRenderedCodexPanel(output),
+      apiKey,
+      "codex",
+      generatedAtMs,
+      configuredModels
+    );
   }
   return {
     status: "unknown",

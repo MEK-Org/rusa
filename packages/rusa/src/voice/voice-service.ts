@@ -128,13 +128,11 @@ export interface VoiceServiceOptions {
   home: string;
   speech: SpeechClient;
   /**
-   * Resolve the voice to synthesize this actor's replies with — the per-actor
-   * voice selection, looked up fresh before every render. Return undefined to
-   * use the speech client's instance-wide default (actors with no persisted
-   * voice setting, and every pre-migration actor). Transcription never consults
+   * Resolve the speech client and voice to synthesize this actor's replies with —
+   * looked up fresh before every render. Return undefined to use the default
+   * speech client and its instance-wide default voice. Transcription never consults
    * this: it stays instance-wide.
    */
-  voiceNameFor?: (actorId: string) => string | undefined;
   /**
    * Whether a message recipient is a human the walkie should speak for. The
    * legacy `human:operator` alias always is; after the #460 cutover replies
@@ -142,6 +140,7 @@ export interface VoiceServiceOptions {
    * recognize. Absent → only the legacy alias is spoken.
    */
   isHumanRecipient?: (principalId: string) => boolean;
+  speechFor?: (actorId: string) => { speech: SpeechClient; voiceName?: string } | undefined;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
   /**
@@ -174,6 +173,7 @@ interface VoiceSession {
 }
 
 export class VoiceService {
+  private readonly speechFor: VoiceServiceOptions["speechFor"];
   private readonly home: string;
   private readonly speech: SpeechClient;
   private readonly now: () => number;
@@ -190,7 +190,6 @@ export class VoiceService {
   private readonly maxAnnouncements: number;
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
-  private readonly voiceNameFor: ((actorId: string) => string | undefined) | undefined;
   private readonly isHumanRecipient: (principalId: string) => boolean;
   private readonly log: Logger;
 
@@ -210,6 +209,7 @@ export class VoiceService {
   private readonly pendingTransferControls = new Map<string, Promise<void>>();
 
   constructor(options: VoiceServiceOptions) {
+    this.speechFor = options.speechFor;
     this.home = options.home;
     this.speech = options.speech;
     this.now = options.now ?? Date.now;
@@ -223,7 +223,6 @@ export class VoiceService {
     if (!Number.isFinite(this.sessionLeaseMs) || this.sessionLeaseMs <= 0) {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
-    this.voiceNameFor = options.voiceNameFor;
     this.isHumanRecipient = options.isHumanRecipient ?? (() => false);
     this.onSessionEnded = options.onSessionEnded;
     this.log = options.logger ?? nullLogger;
@@ -529,10 +528,12 @@ export class VoiceService {
       // — an actor whose voice the operator just changed speaks with the new one
       // on the very next reply. No persisted setting → undefined → the speech
       // client's instance-wide default, which is the pre-existing behavior.
-      const voiceName = this.voiceNameFor?.(senderId);
-
       const streamRequestedAt = this.now();
-      const streamInfo = await this.speech.streamSynthesize(text, voiceName);
+      const selected = this.speechFor?.(senderId);
+      const streamInfo = await (selected?.speech ?? this.speech).streamSynthesize(
+        text,
+        selected?.voiceName
+      );
       const dir = join(this.home, "voice", "outbox");
       await mkdir(dir, { recursive: true });
       const id = randomUUID();

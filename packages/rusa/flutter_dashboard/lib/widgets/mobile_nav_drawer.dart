@@ -17,6 +17,8 @@ class MobileNavDrawer extends StatelessWidget {
     required this.selected,
     required this.onSelect,
     this.quotaProviders = kDefaultQuotaProviders,
+    this.onLogout,
+    this.profilePhotoUrl,
   });
 
   final DashboardStore store;
@@ -28,6 +30,8 @@ class MobileNavDrawer extends StatelessWidget {
   final ValueChanged<DashboardView> onSelect;
 
   final Map<String, QuotaProviderConfig> quotaProviders;
+  final VoidCallback? onLogout;
+  final String? profilePhotoUrl;
 
   @override
   Widget build(BuildContext context) {
@@ -78,37 +82,53 @@ class MobileNavDrawer extends StatelessWidget {
             ),
             SliverFillRemaining(
               hasScrollBody: false,
-              // Quota rides the bottom of whatever height is left over. The slot
-              // goes away entirely until there is a reading to put in it, rather
-              // than pinning an empty strip below the nav.
+              // Quota and account ride the bottom of whatever height is left over.
+              // When quota hasn't loaded and auth is disabled, the slot goes away
+              // entirely rather than pinning an empty strip below the nav (#516).
               child: Align(
                 alignment: Alignment.bottomCenter,
                 child: StreamBuilder<QuotaSnapshotDto?>(
                   stream: store.quota,
                   initialData: store.quota.valueOrNull,
-                  builder: (_, snap) => snap.data == null
-                      ? const SizedBox.shrink()
-                      : Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            const Divider(height: 1, color: MeshColors.border),
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(
-                                20,
-                                16,
-                                20,
-                                20,
-                              ),
-                              child: QuotaIndicators(
-                                key: const ValueKey('drawer-quota'),
-                                store: store,
-                                quotaProviders: quotaProviders,
-                                axis: Axis.vertical,
-                              ),
+                  builder: (_, snap) {
+                    final hasQuota = snap.data != null;
+                    final hasAccount = onLogout != null;
+                    if (!hasQuota && !hasAccount) {
+                      return const SizedBox.shrink();
+                    }
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (hasQuota) ...[
+                          const Divider(height: 1, color: MeshColors.border),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(
+                              20,
+                              16,
+                              20,
+                              20,
                             ),
-                          ],
-                        ),
+                            child: QuotaIndicators(
+                              key: const ValueKey('drawer-quota'),
+                              store: store,
+                              quotaProviders: quotaProviders,
+                              axis: Axis.vertical,
+                            ),
+                          ),
+                        ],
+                        if (hasAccount) ...[
+                          const Divider(height: 1, color: MeshColors.border),
+                          ProfileMenu(
+                            key: const ValueKey('drawer-account'),
+                            photoUrl: profilePhotoUrl,
+                            onLogout: onLogout!,
+                            showLabel: true,
+                          ),
+                        ],
+                      ],
+                    );
+                  },
                 ),
               ),
             ),

@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
-import type { ActorMesh } from "../actor/actor-mesh.js";
+import { type ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -26,10 +26,12 @@ import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
+import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { buildE2EConfig } from "../e2e/provision.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
-import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
+import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
@@ -38,6 +40,7 @@ import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/m
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
@@ -131,20 +134,6 @@ vi.mock("./service-instance.js", async (importActual) => {
   };
 });
 
-const pollerMock = vi.hoisted(() => ({
-  startGitHubEventPoller: vi.fn(() => ({
-    close: vi.fn(),
-  })),
-}));
-
-vi.mock("../github/poller.js", async (importActual) => {
-  const actual = await importActual<typeof import("../github/poller.js")>();
-  return {
-    ...actual,
-    startGitHubEventPoller: pollerMock.startGitHubEventPoller,
-  };
-});
-
 const gitHttpServerMock = vi.hoisted(() => {
   const servers: {
     close: ReturnType<typeof vi.fn>;
@@ -222,7 +211,7 @@ import {
   warnMissingConfiguredEventSubscriptionsAtBoot,
 } from "./start.js";
 
-class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient> {
+class MockIssueClient implements Partial<IssueClient> {
   reactionsAdded: { repo: string; subject: number; reaction: string }[] = [];
   commentReactionsAdded: { repo: string; commentId: number; reaction: string; scope?: string }[] =
     [];
@@ -239,14 +228,6 @@ class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient>
     scope?: string
   ): Promise<void> {
     this.commentReactionsAdded.push({ repo, commentId, reaction, scope });
-  }
-
-  async listUpdatedIssuesAndPullRequests(): Promise<[]> {
-    return [];
-  }
-
-  async listUpdatedIssueComments(): Promise<[]> {
-    return [];
   }
 
   async createIssue(opts: {
@@ -436,11 +417,9 @@ describe("start command tests", () => {
     expect(warn.mock.calls[0]?.[0]).toContain("(+2 more)");
   });
 
-  it("binds the webhook server only in webhook ingestion mode outside e2e", () => {
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: undefined })).toBe(true);
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: "webhook" })).toBe(true);
-    expect(shouldBindWebhookServer({ e2eMode: false, ingestionMode: "poll" })).toBe(false);
-    expect(shouldBindWebhookServer({ e2eMode: true, ingestionMode: "webhook" })).toBe(false);
+  it("binds the webhook server whenever the runner is not driving events in-process", () => {
+    expect(shouldBindWebhookServer({ e2eMode: false })).toBe(true);
+    expect(shouldBindWebhookServer({ e2eMode: true })).toBe(false);
   });
 
   it("binds the dashboard in e2e only when explicitly enabled", () => {
@@ -503,7 +482,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
     modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockClear();
-    pollerMock.startGitHubEventPoller.mockClear();
     for (const method of Object.values(e2eInstanceManagerMock)) method.mockClear();
     serviceInstanceMock.resolveRepoRoot.mockImplementation(
       serviceInstanceMock.actualResolveRepoRoot
@@ -730,6 +708,177 @@ describe("runStart webhook event routing (Phase 4)", () => {
       startDashboardServerSpy.mockRestore();
       getHistorySpy.mockRestore();
       getQuotaSpy.mockRestore();
+    }
+  });
+
+  it("adopts the external E2E root through the configured-root construction path", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: unknown;
+    let externalRoot: unknown;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          rootDriver: "external",
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root;
+            externalRoot = handles.externalRoot;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(externalRoot).not.toBeNull();
+    expect(root).toBe(externalRoot);
+    expect(mesh?.get("root")).toBe(externalRoot);
+  });
+
+  it("#367 selects greater weekly headroom through the live runStart provider gate and retains fresh evidence through a cold response", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const observedAt = new Date().toISOString();
+    const resetAtIso = new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString();
+    const weeklyBucket = (provider: string, percentLeft: number) => ({
+      key: `${provider}:weekly`,
+      percentLeft,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 300,
+      observedAt,
+      resetAtIso,
+    });
+    // Unpaced lanes keep both candidates immediately available for the second
+    // gate below, so it proves the retained admission observation is used.
+    const throttleStatus = (provider: string, percentLeft: number, intervalSeconds = 0) => ({
+      provider,
+      intervalSeconds,
+      uncappedIntervalSeconds: intervalSeconds,
+      governingBucketKey: `${provider}:weekly`,
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: observedAt,
+      buckets: [weeklyBucket(provider, percentLeft)],
+      freshness: {
+        ageMs: 0,
+        buckets: { [`${provider}:weekly`]: 0 },
+        stale: false,
+        hardStale: false,
+      },
+    });
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test",
+      serverTime: observedAt,
+    };
+    let codexCold = false;
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname !== "/v1/throttle") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          service,
+          providers: {
+            // A changed claude interval lets the test observe that the production
+            // client completed this cold collection, not just that the server sent it.
+            claude: throttleStatus("claude", 20, codexCold ? 1 : 0),
+            // A cold lane is a 200 not_ready entry in the collection (§5.5, #480).
+            codex: codexCold
+              ? { error: { code: "not_ready", message: "cold", retryable: true } }
+              : throttleStatus("codex", 80),
+          },
+        })
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: {
+          coordinator: { socketPath },
+          throttle: { enabled: true, tickSeconds: 1 },
+        },
+      }),
+      "utf8"
+    );
+
+    try {
+      let mesh: ActorMesh | undefined;
+      let coordinatorAppliedInterval: ((provider: string) => number | undefined) | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              coordinatorAppliedInterval = handles.coordinatorAppliedInterval;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+
+      const selected = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
+      const gate = mesh.gateRun(
+        selected,
+        [
+          { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+          { provider: "codex", model: "gpt-5.6", effort: "high" },
+        ],
+        true,
+        "root"
+      );
+
+      await expect(gate.result).resolves.toBe("codex");
+      expect(selected).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+
+      // The coordinator now reports codex cold. A changed claude interval is
+      // applied only after the production client's collection read completes;
+      // waiting for it proves this same cold response was consumed. Codex's last
+      // trustworthy weekly observation remains fresh, so the production gate
+      // keeps selecting it without opening a local quota database.
+      codexCold = true;
+      await vi.waitFor(() => expect(coordinatorAppliedInterval?.("claude")).toBe(1), {
+        timeout: 5_000,
+      });
+      const afterCold = vi.fn(async (candidate: RawProviderModelConfig) => candidate.provider);
+      const coldGate = mesh.gateRun(
+        afterCold,
+        [
+          { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+          { provider: "codex", model: "gpt-5.6", effort: "high" },
+        ],
+        true,
+        "root"
+      );
+      await expect(coldGate.result).resolves.toBe("codex");
+      expect(afterCold).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+    } finally {
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 
@@ -2743,15 +2892,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
-  async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      if (predicate()) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    throw new Error(message);
-  }
-
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
     const config = {
@@ -3170,198 +3310,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const recordsAfterNoUsage = rootTokenRecords();
     expect(recordsAfterNoUsage).toHaveLength(2);
-  });
-
-  it("does not infer polling scope from git remote when github config has no scope", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify poller was NOT started
-      expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  });
-
-  it("uses github.repos if configured, starting the poller even if resolveRepoRoot throws", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    // Mock resolveRepoRoot to throw
-    serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
-      throw new Error("Quickstart container simulation: no git repository found");
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["custom-owner/custom-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify that startGitHubEventPoller was started with the custom repo
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["custom-owner/custom-repo"] })
-      );
-
-      // Verify that we logged the repoRoot resolve error, but NOT a repoName error
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Could not infer the git repository root")
-      );
-      expect(errorSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("Could not determine the repository name")
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
-  });
-
-  it("ignores git remote identity and polls only explicitly configured github.repos", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/primary-org/primary-repo.git");
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["extra-org/extra-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["extra-org/extra-repo"] })
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
-    }
-  });
-
-  it("does not start poller when poll mode has neither github.repos nor github.orgs", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-
-    // Mock resolveRepoRoot to throw (no git)
-    serviceInstanceMock.resolveRepoRoot.mockImplementation(() => {
-      throw new Error("Quickstart container simulation: no git repository found");
-    });
-
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      // Verify that startGitHubEventPoller was NOT called
-      expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
-
-      expect(errorSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("Could not determine the primary repository")
-      );
-
-      sigintListener?.("SIGINT");
-      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
-    } finally {
-      processOnSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
   });
 
   it("syncs configured root event sources on boot", async () => {
@@ -4083,7 +4031,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
 
-    const workerId = mesh.spawn({
+    const activeMesh = mesh;
+    const workerId = activeMesh.spawn({
       charter: "worker tasks",
       parentId: "root",
       modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
@@ -4091,10 +4040,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource("github:dummy-org", "root", "root");
-    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
+    activeMesh.subscribeEventSource("github:dummy-org", "root", "root");
+    activeMesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
-    // Retire worker (no longer live)
+    // Under #540, worker cannot be retired while holding a live subscription on its delegated slice.
+    expect(() => activeMesh.retire(workerId)).toThrow(RetirementBlockedError);
+
+    // After explicit unsubscription, worker retires cleanly and webhook events continue
+    // to bubble up to root's covering org subscription through the full runStart pipeline.
+    mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", workerId, "2026-01-01T00:00:00Z");
     mesh.retire(workerId);
 
     // Emit event. The conclusion has to be one that wakes somebody: this test
@@ -6163,5 +6117,210 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(joined).toBeDefined();
     expect(joined?.run_id).toBe(payload.runId);
     expect(joined?.actor_id).toBe(workerId);
+  });
+
+  it("fails startup when configured supportedVoices has no entries matching configured provider credentials", async () => {
+    let ready = false;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        elevenlabsApiKey: "fake-elevenlabs-key",
+        voice: {
+          supportedVoices: [
+            {
+              label: "Puck",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "google",
+                config: { voiceName: "Puck" },
+              },
+            },
+          ],
+        },
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      })
+    ).rejects.toThrow(
+      "voice.supportedVoices has no entries matching configured provider credentials"
+    );
+    expect(ready).toBe(false);
+  });
+
+  it("preserves default Google random voice assignment when supportedVoices is omitted", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const workerId = mesh.spawn({
+      charter: "omitted voice roster worker",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const record = getRepositories().actors.get(workerId);
+    expect(record?.voiceConfig?.provider).toBe("google");
+    expect(record?.voiceConfig?.schemaVersion).toBe(1);
+    if (record?.voiceConfig?.provider === "google") {
+      expect(SUPPORTED_TTS_VOICES).toContain(record.voiceConfig.config.voiceName);
+    }
+  });
+
+  it("starts an e2e instance provisioned from an ElevenLabs-only base config without credential-mismatch failure", async () => {
+    let ready = false;
+    const baseConfig = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash",
+        effort: "high",
+      },
+      geminiApiKey: "fake-gemini-key",
+      elevenlabsApiKey: "fake-elevenlabs-key",
+      voice: {
+        transcriptionProvider: "elevenlabs",
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "synthetic-voice-id-1" },
+            },
+          },
+        ],
+      },
+    } as unknown as RusaConfig;
+
+    const e2eConfig = buildE2EConfig({
+      scratchPath: join(homeDir, "scratch"),
+      baseConfig,
+    });
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(e2eConfig), "utf8");
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(ready).toBe(true);
+  });
+
+  it("warns when configured supportedVoices entries are excluded due to missing provider credentials", async () => {
+    logCapture.lines.length = 0;
+    let ready = false;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          model: "Gemini 3.7 Flash",
+          effort: "high",
+        },
+        geminiApiKey: "fake-gemini-key",
+        voice: {
+          supportedVoices: [
+            {
+              label: "Puck",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "google",
+                config: { voiceName: "Puck" },
+              },
+            },
+            {
+              label: "Christopher",
+              voiceConfig: {
+                schemaVersion: 1,
+                provider: "elevenlabs",
+                config: { voiceId: "synthetic-voice-id-1" },
+              },
+            },
+          ],
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    expect(ready).toBe(true);
+    const warningRecords = logCapture.lines
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((record) => record?.msg === "voice_supported_voices_excluded");
+    expect(warningRecords).toHaveLength(1);
+    expect(warningRecords[0]).toMatchObject({
+      level: "warn",
+      msg: "voice_supported_voices_excluded",
+      excludedCount: 1,
+      configuredCount: 2,
+      activeCount: 1,
+    });
   });
 });

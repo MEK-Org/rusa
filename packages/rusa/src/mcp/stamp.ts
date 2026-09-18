@@ -163,17 +163,14 @@ export interface VerificationResult {
  * write path guaranteed.
  *
  * That guarantee is only as wide as an actual BODY edit, so `edited` alone is not enough
- * to lean on it. `edited` is broader than "the body changed" from two directions:
- * GitHub fires it for a title-only edit, and the poller (github/poller.ts) synthesizes
- * `action: "edited"` for ANY updatedAt bump — a label, a close, a new comment — carrying no
- * `changes` object and a `sender` set to the ARTIFACT AUTHOR rather than whoever acted.
- * Reading the untouched body in either case attributes the event to the original author and
+ * to lean on it. `edited` is broader than "the body changed": GitHub fires it for a
+ * title-only edit, and an `edited` payload that arrives with no `changes` object at all
+ * (a replayed or hand-built delivery) proves nothing about the body either. Reading the
+ * untouched body in either case attributes the event to the original author and
  * suppresses it for them: the bodiless-event failure above, wearing an `edited` label.
  *
  * Hence the `changes.body` gate. A native webhook proves a body edit by sending that key;
- * anything that cannot prove it — every synthetic poller payload, since it has no `changes`
- * at all — falls through to null and is delivered. Revisit only if the poller starts
- * carrying the prior body or the change kind.
+ * anything that cannot prove it falls through to null and is delivered.
  *
  * That guarantee is exactly as wide as update_body, which is why comment edits stay
  * excluded:
@@ -199,7 +196,7 @@ export function authorStampBodyForWebhookPayload(
   };
 
   // Affirmative proof that THIS edit touched the body. Absent proof we deliver, so a
-  // title-only edit or a synthetic poller "edited" can never suppress the wrong actor.
+  // title-only edit or a `changes`-less "edited" can never suppress the wrong actor.
   const bodyWasEdited = (): boolean => {
     const changes = payload.changes;
     return typeof changes === "object" && changes !== null && "body" in changes;
@@ -355,11 +352,12 @@ function verifySignedStamp(opts: {
   // Check freshness
   const now = Date.now();
   const ageMs = now - issuedAt;
-  // Must comfortably EXCEED the GitHub poll interval (default pollIntervalSeconds=300 / 5min).
-  // issuedAt is set at post-time but the stamp is verified at poll-time, so a legit self-post can
-  // age up to ~one poll interval (plus a missed cycle) before it is seen. A window <= the poll
-  // cadence expires legit self-stamps and leaks self-echoes as delivered. 15min = 3x the default
-  // cadence, surviving a missed cycle + propagation. If pollIntervalSeconds is raised, raise this.
+  // issuedAt is set at post-time but the stamp is verified when the webhook delivery is
+  // processed, so a legit self-post can age by GitHub's delivery latency plus any queueing on
+  // our side before it is seen. A window shorter than that expires legit self-stamps and leaks
+  // self-echoes as delivered; 15min covers the expected delivery/queue delay. A webhook manually
+  // redelivered later than that carries an expired stamp and is intentionally fail-open: the
+  // event is delivered and the expiry is reported as an anomaly (see resolveStampedAuthor below).
   const FRESHNESS_WINDOW_MS = 15 * 60 * 1000;
   if (Math.abs(ageMs) > FRESHNESS_WINDOW_MS) {
     return {

@@ -5,6 +5,7 @@ import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'actor_tree.dart';
 import 'avatar.dart';
 import 'brand_mark.dart';
 
@@ -193,24 +194,25 @@ class MeshHeader extends StatelessWidget {
         if (walkieActive && height < kShortViewportHeight) {
           return const SizedBox.shrink();
         }
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20),
-          decoration: const BoxDecoration(
-            color: MeshColors.bgSecondary,
-            border: Border(bottom: BorderSide(color: MeshColors.border)),
-          ),
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final compact = constraints.maxWidth < 520;
-              // Phone shape: navigation and quota both live in the drawer, so
-              // the header keeps to its single brand row.
-              final drawerNav = onMenuTap != null || onBack != null;
-              final twoTier = !drawerNav && constraints.maxWidth < 850;
-              final detail = drawerNav ? detailActor : null;
-              final detailActions = detail == null
-                  ? const <_ActorHeaderAction>[]
-                  : _actorHeaderActions(store: store, actor: detail);
-              return Column(
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 520;
+            final compactControls = constraints.maxWidth < 350;
+            // Phone shape: navigation and quota both live in the drawer, so
+            // the header keeps to its single brand row.
+            final drawerNav = onMenuTap != null || onBack != null;
+            final twoTier = !drawerNav && constraints.maxWidth < 850;
+            final detail = drawerNav ? detailActor : null;
+            final detailActions = detail == null
+                ? const <_ActorHeaderAction>[]
+                : _actorHeaderActions(store: store, actor: detail);
+            return Container(
+              padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 20),
+              decoration: const BoxDecoration(
+                color: MeshColors.bgSecondary,
+                border: Border(bottom: BorderSide(color: MeshColors.border)),
+              ),
+              child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   // 70px: #423 asked for ~25% over the original 56px.
@@ -225,7 +227,7 @@ class MeshHeader extends StatelessWidget {
                                 onMenuTap: onMenuTap,
                                 onBack: onBack,
                               ),
-                              const SizedBox(width: 10),
+                              SizedBox(width: compact ? 6 : 10),
                               // Phone identity (issue #462): the page — or the
                               // open actor — takes the wordmark's slot. The
                               // desktop shape keeps the brand untouched.
@@ -249,6 +251,20 @@ class MeshHeader extends StatelessWidget {
                                     ),
                                   ),
                                 )
+                              else if (drawerNav)
+                                const Flexible(
+                                  child: Text(
+                                    'RUSA',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: MeshColors.textPrimary,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 16,
+                                      letterSpacing: 0.5,
+                                    ),
+                                  ),
+                                )
                               else
                                 const Text(
                                   'RUSA',
@@ -260,7 +276,7 @@ class MeshHeader extends StatelessWidget {
                                     letterSpacing: 0.5,
                                   ),
                                 ),
-                              const SizedBox(width: 10),
+                              if (!compact) const SizedBox(width: 10),
                               StreamBuilder<bool>(
                                 stream: store.halted,
                                 initialData: store.halted.valueOrNull ?? false,
@@ -285,6 +301,22 @@ class MeshHeader extends StatelessWidget {
                                   );
                                 },
                               ),
+                              if (drawerNav &&
+                                  selected == DashboardView.actors &&
+                                  detail == null)
+                                StreamBuilder<bool>(
+                                  stream: store.actorsStale,
+                                  initialData:
+                                      store.actorsStale.valueOrNull ?? false,
+                                  builder: (_, snap) => (snap.data == true)
+                                      ? Padding(
+                                          padding: const EdgeInsets.only(left: 6),
+                                          child: CachedHierarchyBadge(
+                                            compact: compact,
+                                          ),
+                                        )
+                                      : const SizedBox.shrink(),
+                                ),
                               if (!compact) ...[const SizedBox(width: 6)],
                               if (onSelect != null && !drawerNav)
                                 Expanded(
@@ -315,10 +347,19 @@ class MeshHeader extends StatelessWidget {
                           ),
                         ],
                         if (detailActions.isNotEmpty) ...[
-                          const SizedBox(width: 10),
+                          SizedBox(width: compact ? 6 : 10),
                           _ActorActionMenu(actions: detailActions),
                         ],
-                        if (onLogout != null) ...[
+                        if (drawerNav &&
+                            selected == DashboardView.actors &&
+                            detail == null) ...[
+                          SizedBox(width: compact ? 6 : 10),
+                          ActorTreeControls(
+                            store: store,
+                            compact: compactControls,
+                          ),
+                        ],
+                        if (!drawerNav && onLogout != null) ...[
                           const SizedBox(width: 10),
                           ProfileMenu(
                             photoUrl: profilePhotoUrl,
@@ -346,9 +387,9 @@ class MeshHeader extends StatelessWidget {
                       ),
                     ),
                 ],
-              );
-            },
-          ),
+              ),
+            );
+          },
         );
       },
     );
@@ -357,16 +398,80 @@ class MeshHeader extends StatelessWidget {
 
 /// Authenticated operator menu; omitted entirely in auth-disabled mode.
 class ProfileMenu extends StatelessWidget {
-  const ProfileMenu({super.key, this.photoUrl, required this.onLogout});
+  const ProfileMenu({
+    super.key,
+    this.photoUrl,
+    required this.onLogout,
+    this.showLabel = false,
+    this.tooltip,
+  });
 
   final String? photoUrl;
   final VoidCallback onLogout;
+  final bool showLabel;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
-    const fallback = Icon(Icons.person_outline, size: 22);
+    final avatarRadius = showLabel ? 14.0 : 16.0;
+    final fallback = Icon(Icons.person_outline, size: showLabel ? 18 : 22);
+    final avatar = CircleAvatar(
+      radius: avatarRadius,
+      backgroundColor: MeshColors.border,
+      foregroundColor: MeshColors.textPrimary,
+      child: photoUrl == null || photoUrl!.isEmpty
+          ? fallback
+          : ClipOval(
+              child: Image.network(
+                photoUrl!,
+                width: avatarRadius * 2,
+                height: avatarRadius * 2,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => fallback,
+              ),
+            ),
+    );
+
+    if (showLabel) {
+      return PopupMenuButton<String>(
+        tooltip: tooltip ?? 'Account menu',
+        position: PopupMenuPosition.over,
+        onSelected: (_) => onLogout(),
+        itemBuilder: (_) => const [
+          PopupMenuItem(
+            value: 'logout',
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.logout, size: 18),
+                SizedBox(width: 10),
+                Text('Log out'),
+              ],
+            ),
+          ),
+        ],
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Row(
+            children: [
+              avatar,
+              const SizedBox(width: 12),
+              const Text(
+                'Account',
+                style: TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return PopupMenuButton<String>(
-      tooltip: 'Profile menu',
+      tooltip: tooltip ?? 'Profile menu',
       position: PopupMenuPosition.under,
       onSelected: (_) => onLogout(),
       itemBuilder: (_) => const [
@@ -382,22 +487,7 @@ class ProfileMenu extends StatelessWidget {
           ),
         ),
       ],
-      icon: CircleAvatar(
-        radius: 16,
-        backgroundColor: MeshColors.border,
-        foregroundColor: MeshColors.textPrimary,
-        child: photoUrl == null || photoUrl!.isEmpty
-            ? fallback
-            : ClipOval(
-                child: Image.network(
-                  photoUrl!,
-                  width: 32,
-                  height: 32,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) => fallback,
-                ),
-              ),
-      ),
+      icon: avatar,
     );
   }
 }
@@ -1100,7 +1190,7 @@ class _HaltedBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
       decoration: BoxDecoration(
         color: MeshColors.statusHalted.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(4),
@@ -1148,7 +1238,7 @@ class _SchedulerWarningBadge extends StatelessWidget {
     return Tooltip(
       message: 'Scheduler unavailable:\n${issues.join('\n')}',
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
         decoration: BoxDecoration(
           color: MeshColors.statusIdle.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(4),
@@ -1212,7 +1302,13 @@ class _NavItem extends StatelessWidget {
       onPressed: () => onSelect(destination.targetFrom(selected)),
       style: TextButton.styleFrom(
         foregroundColor: active ? MeshColors.accent : MeshColors.textSecondary,
+        // Take only the font family from the theme so the nav renders with
+        // the app font instead of the engine default (which the headless
+        // screenshot harness draws as box glyphs). Copying the whole
+        // `labelLarge` style would also pull in Material 3's line-height
+        // multiplier and grow the label's line box past the font size.
         textStyle: TextStyle(
+          fontFamily: Theme.of(context).textTheme.labelLarge?.fontFamily,
           fontSize: 16,
           fontWeight: active ? FontWeight.w700 : FontWeight.w500,
         ),

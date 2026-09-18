@@ -14,6 +14,7 @@ import type { PrincipalRepository } from "../db/repositories/principal-repositor
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Logger } from "../observability/logger.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { createElevenLabsSpeechClient } from "./elevenlabs-speech.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "./voice-api.js";
 import { VOICE_MEMO_PREFIX, VOICE_SESSION_LEASE_MS, VoiceService } from "./voice-service.js";
@@ -404,6 +405,34 @@ describe("handleVoiceApiRequest", () => {
       expect(body.audioSaved).toBe(true);
       expect(body.error).toContain("model unavailable");
       expect(readdirSync(join(home, "voice", "inbox"))).toHaveLength(1);
+      expect(sendHumanMessage).not.toHaveBeenCalled();
+    });
+
+    it("502s when ElevenLabs transcription returns empty or whitespace-only text", async () => {
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(Response.json({ text: "   \n\t " }));
+      const elevenlabsClient = createElevenLabsSpeechClient({ apiKey: "test-key", fetchImpl });
+      const voiceService = new VoiceService({
+        home,
+        speech: elevenlabsClient,
+        isHumanRecipient: () => true,
+      });
+      const depsWithEleven = {
+        ...deps,
+        service: voiceService,
+      };
+
+      const { res } = call(depsWithEleven, "POST", `/api/mesh/actors/${UUID_A}/voice-memo`, {
+        body: Buffer.from("precious-audio"),
+        contentType: "audio/webm",
+      });
+      await settled(res);
+
+      expect(res.statusCode).toBe(502);
+      const body = JSON.parse(res.body);
+      expect(body.audioSaved).toBe(true);
+      expect(body.error).toContain("ElevenLabs STT returned no transcript text");
       expect(sendHumanMessage).not.toHaveBeenCalled();
     });
   });

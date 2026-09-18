@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -24,8 +24,13 @@ import {
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import {
+  type DurableEventDelivery,
+  EventManager,
+  HierarchicalEventSourceResolver,
+} from "../runtime/event-manager.js";
 import { isSupportedVoiceName } from "../voice/tts-voices.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -191,8 +196,17 @@ function deferredProvider() {
   };
 }
 
+const defaultTestSecretsDir = mkdtempSync(join(tmpdir(), "rusa-actor-mesh-test-secrets-"));
+writeFileSync(join(defaultTestSecretsDir, "gemini-api-key"), "test-gemini-key");
+writeFileSync(join(defaultTestSecretsDir, "mistral-api-key"), "test-mistral-key");
+
+afterAll(() => {
+  rmSync(defaultTestSecretsDir, { recursive: true, force: true });
+});
+
 function setup(
   opts: {
+    supportedVoices?: VoiceDefinition[];
     maxConcurrent?: number;
     sharedProvider?: CodingProvider;
     onRetire?: (record: { id: string }) => void;
@@ -234,6 +248,7 @@ function setup(
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
+    secretsDir?: string;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -265,6 +280,7 @@ function setup(
     log: (m) => logs.push(m),
   });
   mesh = new ActorMesh({
+    supportedVoices: opts.supportedVoices,
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -291,6 +307,7 @@ function setup(
     withTransaction: opts.withTransaction,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
     grantableCapabilities: opts.grantableCapabilities,
+    secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: opts.idgen ?? (() => `t${++seq}`),
     onYield: opts.onYield,
     recordRunYield: opts.recordRunYield,
@@ -487,13 +504,13 @@ interface CanonicalEventOptions {
  * reads the raw priority is a real divergence, latent because the only
  * production timer caller states its priority — #477.
  */
-const deliverCanonicalEvent = async (
+const deliverCanonicalEvent = (
   mesh: ActorMesh,
   resource: EventResource | string,
   eventSummary: string,
   opts: CanonicalEventOptions
-): Promise<void> => {
-  await mesh.deliverExternalEvent({
+): Promise<DurableEventDelivery> =>
+  mesh.deliverExternalEvent({
     sourceType: "timer",
     rawResource: resource,
     rawPayload: opts.payload,
@@ -505,7 +522,6 @@ const deliverCanonicalEvent = async (
     instanceId: opts.instanceId,
     eventSummary,
   });
-};
 
 describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -525,6 +541,19 @@ describe("ActorMesh", () => {
     expect(canWrite(descendant)).toBe(false);
   });
 
+  it.each([
+    "google",
+    "elevenlabs",
+  ] as const)("assigns a configured %s voice through the shared pool", (provider) => {
+    const voiceConfig: VoiceDefinition["voiceConfig"] =
+      provider === "google"
+        ? { schemaVersion: 1, provider, config: { voiceName: "Puck" } }
+        : { schemaVersion: 1, provider, config: { voiceId: "synthetic-voice-id-1" } };
+    const { mesh, registry } = setup({ supportedVoices: [{ label: "Voice", voiceConfig }] });
+    const id = mesh.spawn({ charter: "Speak", parentId: "root" });
+    expect(registry.get(id)?.voiceConfig).toEqual(voiceConfig);
+  });
+
   it("randomizes a supported voice for every newly spawned actor", () => {
     const { mesh, registry } = setup();
     const voices = new Set<string>();
@@ -533,6 +562,7 @@ describe("ActorMesh", () => {
       const voiceConfig = registry.get(id)?.voiceConfig;
       expect(voiceConfig?.schemaVersion).toBe(1);
       expect(voiceConfig?.provider).toBe("google");
+      if (voiceConfig?.provider !== "google") throw new Error("expected Google spawn voice");
       expect(voiceConfig?.config.voiceName).toBeDefined();
       expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
       voices.add(voiceConfig?.config.voiceName ?? "");
@@ -2512,7 +2542,7 @@ describe("ActorMesh", () => {
     expect(logs.some((m) => m.includes("retire cleanup") && m.includes("failed"))).toBe(false);
   });
 
-  it("deactivates the retired actor's active event subscriptions", () => {
+  it("refuses retirement while active event subscriptions remain, and succeeds after explicit unsubscription (#540)", () => {
     const { mesh } = setup();
     const actorId = mesh.spawn({ charter: "repo worker", parentId: "root" });
     const active = "github:dummy-org/dummy-repo";
@@ -2522,7 +2552,10 @@ describe("ActorMesh", () => {
     mesh.subscribeEventSource(alreadyInactive, actorId, "root");
     mesh.unsubscribeEventSource(alreadyInactive, actorId, "2025-12-31T00:00:00Z");
 
-    mesh.retire(actorId);
+    expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+
+    mesh.unsubscribeEventSource(active, actorId, "2026-01-01T00:00:00Z");
+    expect(() => mesh.retire(actorId)).not.toThrow();
 
     expect(
       mesh
@@ -3166,7 +3199,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh, registry } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     registry.upsert({
       id: "iu-thread",
@@ -3304,7 +3337,7 @@ describe("ActorMesh", () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
       events: (e) => events.push(e),
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -3324,7 +3357,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a secret to a non-child (sibling, grandchild, or itself)", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
@@ -3356,9 +3389,175 @@ describe("ActorMesh", () => {
     ).rejects.toThrow("unknown thread id: ghost-grantee");
   });
 
+  describe("generic secret capability containment and grant rules", () => {
+    it("rejects bare secret and bare secret: grants", () => {
+      const { mesh } = setup({
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+      expect(() => mesh.grantCapability(child, "secret", "root")).toThrow(
+        /bare secret grant is not allowed/
+      );
+      expect(() => mesh.grantCapability(child, "secret:", "root")).toThrow(
+        /bare secret grant is not allowed/
+      );
+    });
+
+    it("rejects path traversal, absolute paths, missing files, symlink escapes, and directories", () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      const outsideDir = mkdtempSync(join(tmpdir(), "rusa-outside-"));
+      writeFileSync(join(outsideDir, "outside-secret"), "outside");
+      symlinkSync(join(outsideDir, "outside-secret"), join(customSecretsDir, "escape-link"));
+      mkdirSync(join(customSecretsDir, "nested-dir"));
+      writeFileSync(join(customSecretsDir, "valid-secret"), "hello");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+      // Path traversal
+      expect(() => mesh.grantCapability(child, "secret:../outside", "root")).toThrow(
+        /path traversal/
+      );
+      // Absolute path
+      expect(() => mesh.grantCapability(child, "secret:/etc/passwd", "root")).toThrow(
+        /absolute path/
+      );
+      // Missing file
+      expect(() => mesh.grantCapability(child, "secret:missing-secret", "root")).toThrow(
+        /secret file does not exist/
+      );
+      // Symlink escape
+      expect(() => mesh.grantCapability(child, "secret:escape-link", "root")).toThrow(
+        /escapes secrets directory/
+      );
+      // Non-regular file (directory)
+      expect(() => mesh.grantCapability(child, "secret:nested-dir", "root")).toThrow(
+        /regular file/
+      );
+
+      // Valid regular file succeeds
+      expect(() => mesh.grantCapability(child, "secret:valid-secret", "root")).not.toThrow();
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:valid-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
+    });
+
+    it("a non-root parent cannot delegate a secret outside the explicit allow-list, even to a direct child and even when the file exists", async () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      // Every one of these is a real regular file inside the directory: the
+      // refusal must come from AUTHORIZATION, not from containment.
+      writeFileSync(join(customSecretsDir, "gemini-api-key"), "synthetic-gemini-value");
+      writeFileSync(join(customSecretsDir, "mistral-api-key"), "synthetic-mistral-value");
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+      writeFileSync(join(customSecretsDir, "glass-goals-password"), "synthetic-password");
+
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({
+        events: (e) => events.push(e),
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      for (const guessed of [
+        "secret:webhook-secret",
+        "secret:glass-goals-password",
+        "secret:no-such-file",
+        "secret",
+        "secret:",
+      ]) {
+        expect(() => mesh.grantCapability(child, guessed, parent)).toThrow(
+          /only the root may grant|bare secret grant/
+        );
+      }
+      expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
+      expect(events.filter((e) => e.kind === "capability_granted")).toEqual([]);
+      // The refusal is the same whether or not the guessed file exists: a
+      // non-root grantor gets no existence oracle over the secrets directory.
+      expect(() => mesh.grantCapability(child, "secret:webhook-secret", parent)).toThrow(
+        /only the root may grant secret:webhook-secret/
+      );
+      expect(() => mesh.grantCapability(child, "secret:no-such-file", parent)).toThrow(
+        /only the root may grant secret:no-such-file/
+      );
+      // Nor may the parent strip such a grant that root made.
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      await expect(mesh.revokeCapability(child, "secret:webhook-secret", parent)).rejects.toThrow(
+        /only the root may revoke/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      // The allow-listed LLM keys still delegate exactly as before #542.
+      mesh.grantCapability(child, "secret:gemini-api-key", parent);
+      mesh.grantCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child).sort()).toEqual([
+        "secret:gemini-api-key",
+        "secret:mistral-api-key",
+        "secret:webhook-secret",
+      ]);
+      await mesh.revokeCapability(child, "secret:gemini-api-key", parent);
+      await mesh.revokeCapability(child, "secret:mistral-api-key", parent);
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+
+    it("root may grant any contained secret, and a delegated LLM-key grant still fails containment when the file is missing", () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      writeFileSync(join(customSecretsDir, "webhook-secret"), "synthetic-webhook-value");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+
+      mesh.grantCapability(child, "secret:webhook-secret", "root");
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+      // Authorized name, but no such file on this host: containment still gates it.
+      expect(() => mesh.grantCapability(child, "secret:gemini-api-key", parent)).toThrow(
+        /secret file does not exist/
+      );
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:webhook-secret"]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+
+    it("revocation succeeds even if host secret file was deleted after grant", async () => {
+      const customSecretsDir = mkdtempSync(join(tmpdir(), "rusa-custom-secrets-"));
+      writeFileSync(join(customSecretsDir, "ephemeral-secret"), "hello");
+
+      const { mesh } = setup({
+        secretsDir: customSecretsDir,
+        grantableCapabilities: new Set(["secret"]),
+      });
+      const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+      mesh.grantCapability(child, "secret:ephemeral-secret", "root");
+      expect(mesh.activeCapabilitiesFor(child)).toEqual(["secret:ephemeral-secret"]);
+
+      // Delete file on host
+      rmSync(join(customSecretsDir, "ephemeral-secret"));
+
+      // Revocation must still succeed
+      await expect(
+        mesh.revokeCapability(child, "secret:ephemeral-secret", "root")
+      ).resolves.toBeUndefined();
+      expect(mesh.activeCapabilitiesFor(child)).toEqual([]);
+
+      rmSync(customSecretsDir, { recursive: true, force: true });
+    });
+  });
+
   it("root grant and revoke on an unknown grantee throw unknown thread id error ", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     expect(() => mesh.grantCapability("ghost-grantee", "understanding-write", "root")).toThrow(
       "unknown thread id: ghost-grantee"
@@ -3370,7 +3569,7 @@ describe("ActorMesh", () => {
 
   it("a parent cannot grant a non-allow-listed capability, even to its direct child", async () => {
     const { mesh } = setup({
-      grantableCapabilities: new Set(["understanding-write", "secret:gemini-api-key"]),
+      grantableCapabilities: new Set(["understanding-write", "secret"]),
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root" });
     const child = mesh.spawn({ charter: "child", parentId: parent });
@@ -5511,11 +5710,10 @@ describe("ActorMesh", () => {
       expect(mesh).toBeDefined();
     });
 
-    it.skip("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
+    it("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
-      mesh.subscribeEventSource("github:dummy-org/dummy-repo", worker, "root");
 
       // Recipient liveness, the durable append, and the wake are one turn.
       // Suspend anywhere between them and a retirement lands after a recipient
@@ -5527,15 +5725,25 @@ describe("ActorMesh", () => {
       // point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
+      // Under #540, an actor cannot retire while holding a live event subscription.
+      // A directed target targets the worker without a subscription blocker on worker,
+      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
         payload: payload("push"),
+        directedTarget: worker,
       });
 
-      await expect(delivery).resolves.toBeUndefined();
+      const delivered = await delivery;
       await retirement;
 
-      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+      // The resolved value is the durable result itself (#481), so the row
+      // the store holds and the row the caller was told about are the same.
+      expect(delivered.entries.map((entry) => entry.actorId)).toEqual([worker]);
+      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toEqual(
+        delivered.entries
+      );
     });
 
     it("canonicalizes a legacy resource once for both routing and durable inbox source", async () => {
@@ -5777,16 +5985,46 @@ describe("ActorMesh", () => {
       expect(fake("root").calls[0]?.prompt).toContain("Work from your inbox");
     });
 
-    it("bubbles delegated events back to the parent's broader subscription when the child retires", async () => {
+    it("refuses child retirement until delegated events are reclaimed, then delivers to parent (#540)", async () => {
       const { mesh, tick, fake } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
 
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
       mesh.delegateEventSource("github:dummy-org/dummy-repo/pulls/616", child, parent);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      mesh.reclaimEventSource("github:dummy-org/dummy-repo/pulls/616", parent);
       mesh.retire(child);
 
       deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo/pulls/616", "pr event", {
+        payload: payload("pull_request.opened"),
+      });
+      await tick();
+
+      expect(fake(child).calls).toHaveLength(0);
+      expect(fake(parent).calls).toHaveLength(1);
+      expect(fake(parent).calls[0]?.prompt).toContain("Work from your inbox");
+    });
+
+    it("bubbles delegated events back to the parent's broader subscription when the child unregisters and retires (#540)", async () => {
+      const { mesh, tick, fake } = setup();
+      const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
+      const child = mesh.spawn({ charter: "pr worker", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      // Child cannot retire while delegation is active
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+
+      // Child unregisters the delegation; now child can retire
+      mesh.unsubscribeEventSource(pr, child, "2026-01-01T00:00:00Z");
+      mesh.retire(child);
+
+      // Sub-resource event now bubbles up to parent's broader repo subscription
+      deliverCanonicalEvent(mesh, pr, "pr event", {
         payload: payload("pull_request.opened"),
       });
       await tick();
@@ -5927,6 +6165,9 @@ describe("ActorMesh", () => {
       // must NOT mean silent loss — the walk continues to the ancestor source.
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", actorId, "root");
+
+      expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+      mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", actorId, "2026-01-01T00:00:00Z");
 
       // Retire the worker (makes it not live)
       mesh.retire(actorId);
@@ -6155,7 +6396,13 @@ describe("ActorMesh", () => {
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoActorId, "root");
       mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueActorId, "root");
 
-      // Retire issue subscriber so it is no longer live
+      // Unsubscribe and retire issue subscriber so it is no longer live (#540)
+      expect(() => mesh.retire(issueActorId)).toThrow(RetirementBlockedError);
+      mesh.unsubscribeEventSource(
+        "github:dummy-org/dummy-repo/issues/123",
+        issueActorId,
+        "2026-01-01T00:00:00Z"
+      );
       mesh.retire(issueActorId);
 
       deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo/issues/123", "new comment", {
@@ -6879,6 +7126,8 @@ describe("ActorMesh", () => {
       const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
       mesh.subscribeEventSource(ISSUE, owner, "root");
       mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+      expect(() => mesh.retire(watcher)).toThrow(RetirementBlockedError);
+      mesh.removeEventSourceSubscriber(ISSUE, watcher);
       mesh.retire(watcher);
 
       deliverCanonicalEvent(mesh, ISSUE, "issue event", { payload: payload("issues.opened") });
@@ -6968,8 +7217,49 @@ describe("ActorMesh", () => {
           kind: "event_source_subscriber_removed",
           actorId: watcher,
           detail: ISSUE,
+          payload: JSON.stringify({ removedBy: watcher }),
         }),
       ]);
+    });
+
+    // The parent-side exit for a direct subscription (#540): whoever can retire
+    // the holder can also drop what blocks that retirement, and the audit row
+    // names them rather than the holder.
+    it("lets an ancestor remove a descendant's subscription, naming the remover in the audit event", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      mesh.addEventSourceSubscriber(ISSUE, child, child);
+
+      mesh.removeEventSourceSubscriber(ISSUE, child, "root");
+
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+      expect(events.filter((e) => e.kind === "event_source_subscriber_removed")).toEqual([
+        expect.objectContaining({
+          actorId: child,
+          detail: ISSUE,
+          payload: JSON.stringify({ removedBy: "root" }),
+        }),
+      ]);
+    });
+
+    it("refuses to let a non-ancestor remove another actor's subscription", () => {
+      const { mesh } = setup();
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: watcher });
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      // A sibling has no authority over the holder…
+      expect(() => mesh.removeEventSourceSubscriber(ISSUE, watcher, peer)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      // …and neither does the holder's own child: authority runs down the tree only.
+      expect(() => mesh.removeEventSourceSubscriber(ISSUE, watcher, child)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.actorId)).toEqual([watcher]);
     });
 
     it("stops delivering once the subscription is removed", async () => {
@@ -6991,13 +7281,18 @@ describe("ActorMesh", () => {
       );
     });
 
-    it("retirement deletes the subscriptions while tombstoning the ownership", () => {
+    it("refuses retirement while subscriptions remain, and retires once removed (#540)", () => {
       const { mesh } = setup();
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
       mesh.subscribeEventSource(REPO_SOURCE, actorId, "root");
       mesh.addEventSourceSubscriber(ISSUE, actorId, actorId);
 
-      mesh.retire(actorId);
+      expect(() => mesh.retire(actorId)).toThrow(RetirementBlockedError);
+
+      mesh.unsubscribeEventSource(REPO_SOURCE, actorId, "2026-01-01T00:00:00Z");
+      mesh.removeEventSourceSubscriber(ISSUE, actorId);
+
+      expect(() => mesh.retire(actorId)).not.toThrow();
 
       expect(mesh.listSubscriptions().find((s) => s.actorId === actorId)?.unsubscribedAt).toBe(
         "2026-01-01T00:00:00Z"
@@ -8639,7 +8934,238 @@ describe("ActorMesh", () => {
 
       // The run guard keeps its own, narrower scope: a retired thread cannot
       // have a run in flight, so it stays out of that walk.
-      expect(mesh.activeRunsInSubtree(parent)).toEqual([]);
+    });
+  });
+
+  describe("refuses actor retirement while live event subscriptions remain (#540)", () => {
+    it("refuses retirement when target holds an event source ownership and unblocks on unsubscribe", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const resource = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(resource, worker, "root");
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource, actorId: worker, kind: "ownership" },
+        ]);
+        expect(blocked.message).toContain(`cannot retire ${worker}`);
+        expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
+        expect(blocked.message).toContain(`${resource} [ownership] held by ${worker}`);
+        expect(blocked.message).toContain(
+          "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+            "or the owner above it reclaims it (reclaim_event_source)"
+        );
+        expect(blocked.message).toContain(
+          "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+            "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder)"
+        );
+      }
+
+      // Preflight fail-closed: worker remains active
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Unsubscribe unblocks retirement
+      mesh.unsubscribeEventSource(resource, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("refuses retirement when target holds a direct event subscription and unblocks on removal", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const resource = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(resource, "root", "root");
+      mesh.addEventSourceSubscriber(resource, worker, worker);
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource, actorId: worker, kind: "subscription" },
+        ]);
+        expect(blocked.message).toContain(`${resource} [subscription] held by ${worker}`);
+      }
+
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Remove subscription unblocks retirement
+      mesh.removeEventSourceSubscriber(resource, worker);
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    // The wedged-holder case that motivated the ancestor path: a child that
+    // opened a PR is mechanically subscribed to it and will never unsubscribe
+    // itself if it has stopped responding. Its parent must still be able to
+    // retire it — explicitly, by disposing of the subscription first, never by
+    // a flag or as a side effect of retire().
+    it("lets the parent dispose of a wedged child's direct subscription, then retire it (#540)", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/12";
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", "root", "root");
+      mesh.addEventSourceSubscriber(pr, child, child);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      expect(() => mesh.retire(child, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(child)?.status).toBe("active");
+
+      // A peer of the parent has no say over the child's subscription.
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      expect(() => mesh.removeEventSourceSubscriber(pr, child, peer)).toThrow(
+        /may only unsubscribe itself or its descendants/
+      );
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+
+      mesh.removeEventSourceSubscriber(pr, child, parent);
+      expect(mesh.retirementBlockers(child).subscriptions).toEqual([]);
+      expect(() => mesh.retire(child)).not.toThrow();
+      expect(registry.get(child)?.status).toBe("retired");
+    });
+
+    it("enumerates multiple subscriptions (ownership and direct) and requires disposing all", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const repo1 = "github:dummy-org/repo-1";
+      const repo2 = "github:dummy-org/repo-2";
+
+      mesh.subscribeEventSource(repo1, worker, "root");
+      mesh.subscribeEventSource(repo2, "root", "root");
+      mesh.addEventSourceSubscriber(repo2, worker, worker);
+
+      const blockers = mesh.retirementBlockers(worker);
+      expect(blockers.subscriptions).toEqual(
+        expect.arrayContaining([
+          { resource: repo1, actorId: worker, kind: "ownership" },
+          { resource: repo2, actorId: worker, kind: "subscription" },
+        ])
+      );
+      expect(blockers.subscriptions).toHaveLength(2);
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+
+      // Disposing one is not enough
+      mesh.unsubscribeEventSource(repo1, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
+
+      // Disposing the second allows retirement
+      mesh.removeEventSourceSubscriber(repo2, worker);
+      expect(() => mesh.retire(worker)).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("unblocks retirement when delegated event source is reclaimed or transferred", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/10";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      expect(() => mesh.retire(child)).toThrow(RetirementBlockedError);
+      expect(registry.get(child)?.status).toBe("active");
+
+      // Reclaim by parent unblocks child retirement
+      mesh.reclaimEventSource(pr, parent);
+      expect(() => mesh.retire(child)).not.toThrow();
+      expect(registry.get(child)?.status).toBe("retired");
+    });
+
+    it("blocks ancestor retirement when a descendant holds an active subscription", () => {
+      const { mesh, registry } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const repo = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(repo, child, "root");
+
+      expect(() => mesh.retire(parent)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(parent);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.subscriptions).toEqual([
+          { resource: repo, actorId: child, kind: "ownership" },
+        ]);
+        expect(blocked.message).toContain(`cannot retire ${parent}`);
+        expect(blocked.message).toContain(`${repo} [ownership] held by ${child}`);
+      }
+
+      // Preflight fail-closed: neither parent nor child is retired
+      expect(registry.get(parent)?.status).toBe("active");
+      expect(registry.get(child)?.status).toBe("active");
+
+      // Once child subscription is unsubscribed, parent retirement cascades cleanly
+      mesh.unsubscribeEventSource(repo, child, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(parent)).not.toThrow();
+      expect(registry.get(parent)?.status).toBe("retired");
+      expect(registry.get(child)?.status).toBe("retired");
+    });
+
+    it("formats combined blockers across obligations, messages, and subscriptions", () => {
+      const inFuture = (): string => new Date(Date.now() + 100_000).toISOString();
+      const owned = new Map<string, LiveObligationSummary[]>();
+      const { mesh, registry } = setup({
+        obligations: {
+          findLiveByExternalRef: () => null,
+          listLiveOwnedBy: (ownerId) => owned.get(ownerId) ?? [],
+        },
+      });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      const repo = "github:dummy-org/dummy-repo";
+
+      owned.set(worker, [{ id: "ob-combo", status: "ready", title: "review pr" }]);
+      mesh.sendMessage(peer, "ping", worker, undefined, inFuture());
+      mesh.subscribeEventSource(repo, worker, "root");
+
+      expect(() => mesh.retire(worker)).toThrow(RetirementBlockedError);
+      try {
+        mesh.retire(worker);
+      } catch (err) {
+        expect(err).toBeInstanceOf(RetirementBlockedError);
+        const blocked = err as RetirementBlockedError;
+        expect(blocked.blockers.obligations).toHaveLength(1);
+        expect(blocked.blockers.messages).toHaveLength(1);
+        expect(blocked.blockers.subscriptions).toHaveLength(1);
+
+        expect(blocked.message).toContain("1 live obligation(s) owned in its subtree");
+        expect(blocked.message).toContain("ob-combo");
+        expect(blocked.message).toContain("1 pending scheduled message(s)");
+        expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
+        expect(blocked.message).toContain(`${repo} [ownership] held by ${worker}`);
+      }
+
+      expect(registry.get(worker)?.status).toBe("active");
+    });
+
+    it("does not allow force: true to bypass subscription blockers", () => {
+      const { mesh, registry } = setup();
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      const repo = "github:dummy-org/dummy-repo";
+
+      mesh.subscribeEventSource(repo, worker, "root");
+
+      expect(() => mesh.retire(worker, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
+
+      mesh.unsubscribeEventSource(repo, worker, "2026-01-01T00:00:00Z");
+      expect(() => mesh.retire(worker, { force: true })).not.toThrow();
+      expect(registry.get(worker)?.status).toBe("retired");
     });
   });
 

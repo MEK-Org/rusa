@@ -15,8 +15,6 @@ Minimal example:
 
   github:
     account: CodeChopsBot
-    pollIntervalSeconds: 300
-    # ingestionMode: poll  # webhook (default) or poll
     repos:
       - example-org/example-repo
     # orgs:
@@ -80,10 +78,23 @@ Minimal example:
       agy:
         primaryWindow: weekly
 
-  # Walkie-talkie voice tuning . Optional; the feature itself is gated on
-  # geminiApiKey being set. Defaults shown.
+  # Optional walkie-talkie voice tuning.
+  # Configure the selected provider key. Google defaults shown.
   # voice:
-  #   transcriptionModel: gemini-2.5-flash
+  #   transcriptionProvider: google # or elevenlabs (defaults to scribe_v2)
+  #   transcriptionModel: gemini-2.5-flash # omit to use the provider default
+  #   elevenlabsTtsModel: eleven_multilingual_v2
+  #   supportedVoices:
+  #     - label: Christopher
+  #       voiceConfig:
+  #         schemaVersion: 1
+  #         provider: elevenlabs
+  #         config: { voiceId: YOUR_VOICE_ID_1 }
+  #     - label: Valentino
+  #       voiceConfig:
+  #         schemaVersion: 1
+  #         provider: elevenlabs
+  #         config: { voiceId: YOUR_VOICE_ID_2 }
   #   ttsModel: gemini-3.1-flash-tts-preview
   #   voiceName: Laomedeia
 
@@ -107,20 +118,21 @@ Minimal example:
 Top-level fields:
 
   profile                  Optional. Named config profile. "quickstart" enables local git bridge delivery
-                           and GitHub poll ingestion unless explicitly overridden.
-  github                   Required. GitHub polling and bot identity.
+                           and a container-boundary sandbox unless explicitly overridden.
+  github                   Required. GitHub bot identity and webhook-subscribed repositories.
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
-  geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
+  geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill, Google speech); each skips gracefully when absent.
+  elevenlabsApiKey         Optional. Enables ElevenLabs walkie-talkie transcription and actor speech.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
   rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
                            root-actor.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
-  voice                    Optional. Walkie-talkie transcription/TTS model and voice overrides .
-                           The feature is enabled by geminiApiKey; this section only tunes it.
+  voice                    Optional. Walkie-talkie transcription and actor speech settings.
+                           Enabled by geminiApiKey (for Google) or elevenlabsApiKey (for ElevenLabs).
   invocationDebug          Optional. Full invocation artifact capture controls.
   observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).
@@ -130,10 +142,8 @@ Top-level fields:
 github:
 
   account                  GitHub username used by this Rusa instance, for example CodeChopsBot.
-  pollIntervalSeconds      Optional. GitHub poll interval in seconds when ingestionMode is poll; defaults to 300. Must be a positive number when set.
-  ingestionMode            Optional. "webhook" (default) binds the webhook listener; "poll" fetches GitHub updates without binding it.
-  repos                    Optional list. GitHub repositories in owner/name format to subscribe to and poll. The poller also watches deployBranch head changes for these explicit repositories.
-  orgs                     Optional list of objects. Each requires org and may include excludedRepos. Organization repositories are subscribed to and polled; exclusions are suppressed at webhook and poll ingestion.
+  repos                    Optional list. GitHub repositories in owner/name format to subscribe to. Events arrive only through the webhook listener.
+  orgs                     Optional list of objects. Each requires org and may include excludedRepos. Organization repositories are subscribed to; exclusions are suppressed at webhook ingestion.
   workerTokenPath          Optional. Path to read-mostly fine-grained GitHub PAT file visible to sandboxed workers.
 
 providers:

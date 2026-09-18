@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { Logger } from "../observability/logger.js";
 
 const execSyncMock = vi.fn();
 const execFileSyncMock = vi.fn();
@@ -1173,6 +1174,189 @@ describe("sandbox bwrap args", () => {
       expectMasked();
 
       warnSpy.mockRestore();
+    });
+
+    describe("re-validates containment at spawn, immediately before the bind (post-grant swap → fail closed)", () => {
+      // A grant row proves only that the file passed containment WHEN GRANTED.
+      // These cases swap the host entry after the grant and expect the spawn to
+      // leave the path under the tmpfs mask: no `--ro-bind` of the secret, no
+      // entrypoint exporting it. `withGrantedGemini` seeds the grant while the
+      // file is still a legitimate regular file, like the mesh would.
+      function withGrantedGemini() {
+        const home = makeWorkerHome();
+        mkdirSync(home.secretsDir, { recursive: true, mode: 0o700 });
+        const geminiKeyPath = join(home.secretsDir, "gemini-api-key");
+        writeFileSync(geminiKeyPath, "synthetic-gemini-value\n", { mode: 0o600 });
+        seedGrant(home.mcHome, ACTOR_ID, "secret:gemini-api-key");
+        return { ...home, geminiKeyPath };
+      }
+
+      // A refused bind is silent INSIDE the sandbox (the file is simply absent,
+      // as after a revoke) but must be visible on the HOST: the spawn records
+      // `secret_grant_skipped_at_spawn` naming the actor and the file, so an
+      // operator can tell "granted, then the host file went bad" from "never
+      // granted". The recorder is installed on the same module instance the
+      // spawn uses (vi.resetModules gives every test a fresh one).
+      type SkipRecord = { level: string; event: string; fields?: Record<string, unknown> };
+      async function spawnArgs(actorDir: string) {
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const { buildActorBwrapArgs, setSandboxLogger } = await import("./sandbox.js");
+        const records: SkipRecord[] = [];
+        const record = (level: string) => (event: string, fields?: Record<string, unknown>) =>
+          void records.push({ level, event, fields });
+        const recorder: Logger = {
+          debug: record("debug"),
+          info: record("info"),
+          warn: record("warn"),
+          error: record("error"),
+          child: () => recorder,
+        };
+        setSandboxLogger(recorder);
+        try {
+          return { ...buildActorBwrapArgs(actorDir, "antigravity"), records };
+        } finally {
+          setSandboxLogger(undefined);
+          warnSpy.mockRestore();
+        }
+      }
+
+      function expectSkipRecorded(records: SkipRecord[], filename: string, reason: RegExp) {
+        const skips = records.filter((r) => r.event === "secret_grant_skipped_at_spawn");
+        expect(skips).toHaveLength(1);
+        expect(skips[0]).toMatchObject({
+          level: "warn",
+          fields: { actorId: ACTOR_ID, filename },
+        });
+        expect((skips[0].fields?.err as Error).message).toMatch(reason);
+        // The record names the file, never its content.
+        expect(JSON.stringify(records)).not.toContain("synthetic-gemini-value");
+      }
+
+      function expectMaskedOnly(
+        args: string[],
+        commandPrefix: string[],
+        secretsDir: string,
+        geminiKeyPath: string
+      ) {
+        expect(args.filter((_, i) => args[i - 1] === "--tmpfs")).toContain(secretsDir);
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 2]).not.toBe(geminiKeyPath);
+            expect(args[i + 2]).not.toContain(secretsDir);
+          }
+        }
+        expect(commandPrefix).not.toContain("rusa-secrets-entrypoint");
+      }
+
+      it("file → symlink escaping the secrets dir: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const outside = mkdtempSync(join(tmpdir(), "mc-outside-"));
+        tempDirs.push(outside);
+        const outsideFile = join(outside, "host-file");
+        writeFileSync(outsideFile, "host-only-content\n", { mode: 0o600 });
+        rmSync(geminiKeyPath);
+        symlinkSync(outsideFile, geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        // The escape target must not be bound anywhere either.
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 1]).not.toBe(outsideFile);
+          }
+        }
+        expectSkipRecorded(records, "gemini-api-key", /symlink escapes secrets directory/);
+      });
+
+      it("file → directory: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+        mkdirSync(geminiKeyPath);
+        writeFileSync(join(geminiKeyPath, "nested"), "nested-content\n");
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /must resolve to a regular file/);
+      });
+
+      it("file → dangling symlink: not bound, mask holds", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+        symlinkSync(join(secretsDir, "does-not-exist"), geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /broken symlink/);
+      });
+
+      it("file deleted after the grant: not bound, and the refusal is recorded (unlike a revoke, which has no grant row)", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        rmSync(geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        expectMaskedOnly(args, commandPrefix, secretsDir, geminiKeyPath);
+        expectSkipRecorded(records, "gemini-api-key", /secret file does not exist/);
+      });
+
+      it("file → symlink to a sibling regular file INSIDE the secrets dir: bound from the resolved path", async () => {
+        const { actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const siblingPath = join(secretsDir, "rotated-gemini-api-key");
+        writeFileSync(siblingPath, "synthetic-rotated-value\n", { mode: 0o600 });
+        rmSync(geminiKeyPath);
+        symlinkSync(siblingPath, geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        const bind = args.findIndex(
+          (a, i) =>
+            a === "--ro-bind" &&
+            args[i + 1] === realpathSync(siblingPath) &&
+            args[i + 2] === geminiKeyPath
+        );
+        expect(bind).toBeGreaterThan(-1);
+        expect(commandPrefix).toContain("rusa-secrets-entrypoint");
+        expect(records.filter((r) => r.event === "secret_grant_skipped_at_spawn")).toEqual([]);
+      });
+
+      it("one swapped grant does not stop a still-valid grant from binding", async () => {
+        const { mcHome, actorDir, secretsDir, geminiKeyPath } = withGrantedGemini();
+        const mistralKeyPath = join(secretsDir, "mistral-api-key");
+        writeFileSync(mistralKeyPath, "synthetic-mistral-value\n", { mode: 0o600 });
+        // seedGrant resets the store; seed both rows, then swap gemini.
+        seedGrant(mcHome, ACTOR_ID, "secret:gemini-api-key");
+        const db = new Database(join(mcHome, "data", "mesh.db"));
+        db.prepare(
+          `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+           VALUES (?, 'secret:mistral-api-key', 'parent-1', '2026-07-17T00:00:00Z', NULL)`
+        ).run(ACTOR_ID);
+        db.close();
+        rmSync(geminiKeyPath);
+        mkdirSync(geminiKeyPath);
+
+        const { args, commandPrefix, records } = await spawnArgs(actorDir);
+        for (let i = 0; i < args.length; i += 1) {
+          if (args[i] === "--bind" || args[i] === "--ro-bind") {
+            expect(args[i + 2]).not.toBe(geminiKeyPath);
+          }
+        }
+        // Exactly the swapped grant is reported; the healthy one is not.
+        expectSkipRecorded(records, "gemini-api-key", /must resolve to a regular file/);
+        expect(
+          args.findIndex(
+            (a, i) =>
+              a === "--ro-bind" &&
+              args[i + 1] === realpathSync(mistralKeyPath) &&
+              args[i + 2] === mistralKeyPath
+          )
+        ).toBeGreaterThan(-1);
+        expect(commandPrefix).toEqual([
+          "/bin/sh",
+          "-c",
+          expect.stringContaining('MISTRAL_API_KEY=$(/bin/cat -- "$1")'),
+          "rusa-secrets-entrypoint",
+          mistralKeyPath,
+        ]);
+        expect(commandPrefix.join("\0")).not.toContain("GEMINI_API_KEY");
+      });
     });
 
     it("does not mask the secrets dir for the E2E root-agent double (workers-only guard)", async () => {

@@ -61,7 +61,9 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
-  voiceName: voiceName,
+  voiceConfig: voiceName == null
+      ? null
+      : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
   pacingIntervalMs: pacingIntervalMs,
 );
 
@@ -159,7 +161,7 @@ ObligationDto makeObligation(
 class FakeApi extends DashboardApi {
   FakeApi() : super();
   List<ThreadDto> threadsResult = [];
-  List<String> supportedVoices = const [];
+  List<SupportedVoiceDto> supportedVoices = const [];
   QuotaSnapshotDto? quotaResult;
   QuotaHistoryDto? quotaHistoryResult;
   Object? quotaError;
@@ -214,16 +216,21 @@ class FakeApi extends DashboardApi {
     );
   }
 
-  final actorVoiceUpdates = <({String actorId, String? voiceName})>[];
+  final actorVoiceUpdates = <({String actorId, VoiceConfigDto? voiceConfig})>[];
 
   @override
-  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
-    actorVoiceUpdates.add((actorId: actorId, voiceName: voiceName));
+  Future<VoiceConfigDto?> updateActorVoice(
+    String actorId,
+    VoiceConfigDto? voiceConfig,
+  ) async {
+    actorVoiceUpdates.add((actorId: actorId, voiceConfig: voiceConfig));
     threadsResult = [
       for (final thread in threadsResult)
-        thread.id == actorId ? thread.copyWith(voiceName: voiceName) : thread,
+        thread.id == actorId
+            ? thread.copyWith(voiceConfig: voiceConfig)
+            : thread,
     ];
-    return voiceName;
+    return voiceConfig;
   }
 
   @override

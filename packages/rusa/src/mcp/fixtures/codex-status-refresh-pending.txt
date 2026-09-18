@@ -1,0 +1,44 @@
+/status
+
+╭──────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.154.0)                                          │
+│                                                                      │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date        │
+│ information on rate limits and credits                               │
+│                                                                      │
+│  Model:                gpt-5.6-sol (reasoning low, summaries auto)   │
+│  Model provider:       openai                                        │
+│  Directory:            ~/.rusa/workers/quota-probe-codex             │
+│  Permissions:          Workspace (Ask for approval)                  │
+│  Agents.md:            <none>                                        │
+│  Account:              codex-user@example.com (Pro)                  │
+│  Collaboration mode:   Default                                       │
+│  Session:              019f3e18-c426-7323-a5c1-636e9ff6657a          │
+│                                                                      │
+│  Limits:               refresh requested; run /status again shortly. │
+╰──────────────────────────────────────────────────────────────────────╯
+
+/status
+
+╭──────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.154.0)                                          │
+│                                                                      │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date        │
+│ information on rate limits and credits                               │
+│                                                                      │
+│  Model:                gpt-5.6-sol (reasoning low, summaries auto)   │
+│  Model provider:       openai                                        │
+│  Directory:            ~/.rusa/workers/quota-probe-codex             │
+│  Permissions:          Workspace (Ask for approval)                  │
+│  Agents.md:            <none>                                        │
+│  Account:              codex-user@example.com (Pro)                  │
+│  Collaboration mode:   Default                                       │
+│  Session:              019f3e18-c426-7323-a5c1-636e9ff6657a          │
+│                                                                      │
+│  Limits:               refresh requested; run /status again shortly. │
+╰──────────────────────────────────────────────────────────────────────╯
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol low · ~/.rusa/workers/quota-probe-codex

@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Actor, type ActorOptions } from "../actor/actor.js";
+import type { ActorOptions } from "../actor/actor.js";
 import {
   type ActorFactoryContext,
   ActorMesh,
@@ -22,7 +22,7 @@ import {
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
+import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -114,6 +114,7 @@ import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
 import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
@@ -135,14 +136,8 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import { startGitHubEventPoller } from "../github/poller.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
-import {
-  GitBridgeIssueClient,
-  type GitHubPollingIssueClient,
-  getIssueClient,
-  type IssueClient,
-} from "../gitops/issue-client.js";
+import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
@@ -216,7 +211,11 @@ import {
   type QuotaThrottleProvider,
   resolveProvider,
 } from "../providers/registry.js";
-import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
+import {
+  assertBwrapAvailable,
+  setSandboxLogger,
+  teardownFlutterOverlay,
+} from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
 import {
   applyThrottleStatusToPacer,
@@ -228,9 +227,11 @@ import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   HISTORY_WINDOW_MS,
   type PublishedThrottleProviderStatus,
+  weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
 import {
   type DurableEventDelivery,
   EventManager,
@@ -259,7 +260,7 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
-import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
+import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
@@ -559,6 +560,8 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
+  /** Read-only synchronization signal for the production coordinator client. */
+  coordinatorAppliedInterval: (provider: string) => number | undefined;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -606,11 +609,12 @@ export interface RunStartOptions {
   e2e?: RunStartE2EHooks;
 }
 
-export function shouldBindWebhookServer(params: {
-  e2eMode: boolean;
-  ingestionMode: string | undefined;
-}): boolean {
-  return !params.e2eMode && (params.ingestionMode ?? "webhook") === "webhook";
+/**
+ * Webhooks are the only GitHub ingestion edge, so the listener binds whenever
+ * the runner is not driving events in-process (e2e mode).
+ */
+export function shouldBindWebhookServer(params: { e2eMode: boolean }): boolean {
+  return !params.e2eMode;
 }
 
 export function shouldBindDashboardServer(params: {
@@ -883,6 +887,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     context: { component: "start" },
   });
 
+  // The sandbox layer has no logger of its own (it is built per spawn by the
+  // providers); hand it this one so its host-side records — e.g. a granted
+  // secret refused at spawn — carry the same scrubbing and level.
+  setSandboxLogger(log.child({ component: "sandbox" }));
+
   // A credential too short to scrub is the one gap value redaction has; say so
   // by name while it is still cheap to lengthen, and never by value.
   for (const { source, length } of unscrubbableSecretSources([
@@ -1102,11 +1111,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const gitBridgeServer = config.gitBridge
     ? startGitHttpServer(mcHome, gitBridgePort, { bindHost: gitBridgeBindHost })
     : null;
-  const issueClient: IssueClient & GitHubPollingIssueClient = config.gitBridge
-    ? new GitBridgeIssueClient(baseIssueClient as IssueClient & GitHubPollingIssueClient, {
-        port: gitBridgePort,
-      })
-    : (baseIssueClient as IssueClient & GitHubPollingIssueClient);
+  const issueClient: IssueClient = config.gitBridge
+    ? new GitBridgeIssueClient(baseIssueClient, { port: gitBridgePort })
+    : baseIssueClient;
   const gitBridgeDeliverables = new Map<string, string>();
   // ONE local-first would-be-graph client (ISSUE_NUM 2b) backs BOTH the read and write
   // understanding servers (no module-global state — Operator's DI review of ISSUE_NUM): a normal
@@ -1435,22 +1442,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
     return pacer;
   };
-  // Admission only reads the canonical provider-wide weekly observation that
-  // already feeds quota pacing. No quota probe is initiated on a run path;
-  // absent or stale evidence is deliberately left for submitPoolGate's
-  // declared-order fallback.
-  const weeklyQuotaFor = (providerName: string) => {
-    const published = quotaCoordinatorClient?.getLastPublishedStatus(providerName);
-    const bucket = published?.buckets.find(
-      (candidate) => candidate.key === `${providerName}:weekly`
-    );
-    if (!bucket?.resetAtIso) return undefined;
-    return {
-      percentLeft: bucket.percentLeft,
-      observedAt: bucket.observedAt,
-      resetAtIso: bucket.resetAtIso,
-    };
-  };
+  // Admission projects the existing cached coordinator bucket representation.
+  // It starts no quota read: missing, stale, invalid, and tied evidence leaves
+  // selection in declared order, while a still-fresh trusted observation stays
+  // usable through a transient cold, unavailable, or incompatible response.
+  const weeklyQuotaFor = (providerName: string) =>
+    weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1937,8 +1934,45 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log: emitMeshRoutingLog,
   });
 
+  const e2eMode = Boolean(opts?.e2e?.onReady);
+  const geminiApiKey = config.geminiApiKey?.trim();
+  const elevenlabsApiKey = config.elevenlabsApiKey?.trim();
+  const availableVoiceProviders: Array<"google" | "elevenlabs"> = [
+    ...(geminiApiKey ? ["google" as const] : []),
+    ...(elevenlabsApiKey ? ["elevenlabs" as const] : []),
+  ];
+  const credentialValidSupportedVoices = filterConfiguredVoices(config.voice?.supportedVoices, {
+    availableProviders: availableVoiceProviders,
+  });
+  if (
+    config.voice?.supportedVoices !== undefined &&
+    credentialValidSupportedVoices !== undefined &&
+    credentialValidSupportedVoices.length === 0
+  ) {
+    throw new Error(
+      "voice.supportedVoices has no entries matching configured provider credentials"
+    );
+  }
+  if (
+    config.voice?.supportedVoices &&
+    credentialValidSupportedVoices &&
+    credentialValidSupportedVoices.length < config.voice.supportedVoices.length
+  ) {
+    const excludedCount =
+      config.voice.supportedVoices.length - credentialValidSupportedVoices.length;
+    log.warn("voice_supported_voices_excluded", {
+      excludedCount,
+      configuredCount: config.voice.supportedVoices.length,
+      activeCount: credentialValidSupportedVoices.length,
+    });
+  }
+  const supportedVoiceCatalog = buildSupportedVoiceCatalog(credentialValidSupportedVoices, {
+    availableProviders: availableVoiceProviders,
+  });
+
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
+    supportedVoices: credentialValidSupportedVoices,
     actors,
     principals: getRepositories().principals,
     rootId,
@@ -2061,11 +2095,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }),
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
-    // Grantable = every registered MCP-server capability PLUS the secret
-    // capabilities . Secrets deliberately have NO server factory: the
+    // Grantable = every registered MCP-server capability PLUS the generic
+    // `secret` base (#542), under which ROOT grants any contained
+    // `secret:<filename>`; which of those a non-root parent may delegate is
+    // decided by PARENT_GRANTABLE_CAPABILITIES inside the mesh, not by this
+    // set. Secrets deliberately have NO server factory: the
     // `grantableServers.get(cap)` loop in createActor skips them safely, and the
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
-    grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
+    grantableCapabilities: new Set([...grantableServers.keys(), SECRET_CAPABILITY_BASE]),
+    secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
       const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
@@ -2659,9 +2697,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
-        const actor: MeshActor = createWorkerActor
-          ? createWorkerActor(ctx, actorOptions)
-          : new Actor(actorOptions);
+        const actor = constructActorFromInvocation({
+          actorOptions,
+          driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
+        });
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -3157,122 +3196,124 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
   });
   let root: MeshActor;
-  root =
-    externalRoot ??
-    new Actor({
-      id: rootId,
-      cwd: rootAgentDir,
-      // Root's declared pool is whatever its record carries: the persisted
-      // ordered pool after a restart, or the configured tuple on first boot
-      // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
-      // so resolution reads the live entry rather than freezing the
-      // boot-time pool. `fallback` below is its own, separate degrade path.
-      modelConfig: [...rootBootModelConfig.modelConfig],
-      resolveProvider: (selected) =>
-        resolveProvider(config, selected.provider, selected.model, selected.effort),
-      mcpServers: rootMcp,
-      addDirs,
-      sandbox: Boolean(opts?.e2e),
-      isE2eRoot: Boolean(opts?.e2e),
-      loadSessionId: () =>
-        actors.get(rootId)?.context?.type === "portable"
-          ? undefined
-          : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-      saveSessionId: (id) => {
-        if (actors.get(rootId)?.context?.type === "portable") return;
-        actors.patch(rootId, { sessionId: id });
-      },
-      buildPrompt: () => {
-        const record = actors.get(rootId);
-        if (!record) return { prompt: "No active root thread record." };
-        const injection = assembleConfiguredPortableInjection(
-          record,
-          portableContextApiKey,
-          portableContextStore
-        );
-        return {
-          prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
-          injectRecord: injection?.injectRecord,
-        };
-      },
-      lifecycle: rootLifecycle,
-      fallback: fallbackModels
-        ? {
-            models: fallbackModels,
-            // `runWithFallback` only calls this after `onRunStart` captures the
-            // entry that actually launched. Resolve the fallback under that
-            // provider and effort, rather than the scalar file tuple which may
-            // no longer be root's durable pool after a restart. An unsupported
-            // fallback model then throws explicitly instead of silently moving
-            // recovery onto the stale file provider.
-            resolveProvider: (model) =>
-              resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
-            classify: classifyExhaustion,
-          }
-        : undefined,
-      // Responsive human wakes bypass normal pacing/concurrency; background root
-      // wakes use the same normal scheduling path as workers.
-      beforeRun: ({ mode }): boolean => {
-        // Same dispatch-time apply as the worker beforeRun (#199, extended to
-        // pools): a pool staged while root was queued/idle must land before
-        // this run's own gate()/admission and run_start, not at the end of
-        // the run after. Root's declared pool may hold several ordered
-        // entries (see the `modelConfig` comment on root's Actor construction
-        // above); the halt gate reads the first, the entry that launches first.
-        mesh.applyPendingModel(rootId);
-        const rootRecord = actors.get(rootId);
-        const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
-        if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
-          return false;
+  const rootActorOptions: ActorOptions = {
+    id: rootId,
+    cwd: rootAgentDir,
+    // Root's declared pool is whatever its record carries: the persisted
+    // ordered pool after a restart, or the configured tuple on first boot
+    // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
+    // so resolution reads the live entry rather than freezing the
+    // boot-time pool. `fallback` below is its own, separate degrade path.
+    modelConfig: [...rootBootModelConfig.modelConfig],
+    resolveProvider: (selected) =>
+      resolveProvider(config, selected.provider, selected.model, selected.effort),
+    mcpServers: rootMcp,
+    addDirs,
+    sandbox: Boolean(opts?.e2e),
+    isE2eRoot: Boolean(opts?.e2e),
+    loadSessionId: () =>
+      actors.get(rootId)?.context?.type === "portable"
+        ? undefined
+        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
+    saveSessionId: (id) => {
+      if (actors.get(rootId)?.context?.type === "portable") return;
+      actors.patch(rootId, { sessionId: id });
+    },
+    buildPrompt: () => {
+      const record = actors.get(rootId);
+      if (!record) return { prompt: "No active root thread record." };
+      const injection = assembleConfiguredPortableInjection(
+        record,
+        portableContextApiKey,
+        portableContextStore
+      );
+      return {
+        prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
+        injectRecord: injection?.injectRecord,
+      };
+    },
+    lifecycle: rootLifecycle,
+    fallback: fallbackModels
+      ? {
+          models: fallbackModels,
+          // `runWithFallback` only calls this after `onRunStart` captures the
+          // entry that actually launched. Resolve the fallback under that
+          // provider and effort, rather than the scalar file tuple which may
+          // no longer be root's durable pool after a restart. An unsupported
+          // fallback model then throws explicitly instead of silently moving
+          // recovery onto the stale file provider.
+          resolveProvider: (model) =>
+            resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
+          classify: classifyExhaustion,
         }
-        if (mode === "yield-elicitation") return true;
-        const watermark = root.getInterruptedWatermark?.();
-        if (watermark) {
-          const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
-          return entries.some((e) => e.deliveredAt > watermark);
-        }
-        return inboxStore.countUnhandled(rootId) > 0;
-      },
-      admitRun: ({ responsive, mode }): boolean =>
-        responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
-      gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
-      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
-      onContinue: (n) =>
-        mesh.recordEvent({
-          kind: "run_continued",
-          actorId: rootId,
-          detail: `yield-elicitation ${n}/1`,
-        }),
-      onContinuationCapped: (n) => {
-        mesh.recordEvent({
-          kind: "continuation_capped",
-          actorId: rootId,
-          detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
-        });
-        routeContinuationCapped(failureSink, rootId, n);
-      },
-      onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onProviderAttempt: (attempt) => {
-        activeRunSelections.set(rootId, {
-          provider: attempt.providerName,
-          model: attempt.model,
-          effort: attempt.effort,
-        });
-      },
-      onFirstChunk: () =>
-        mesh.recordEvent({
-          kind: "run_first_chunk",
-          actorId: rootId,
-        }),
-      onCoalesceAborted: (count, ageMs) => {
-        mesh.recordEvent({
-          kind: "run_coalesced",
-          actorId: rootId,
-          detail: `count=${count} age=${ageMs}ms`,
-        });
-      },
-      log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
-    });
+      : undefined,
+    // Responsive human wakes bypass normal pacing/concurrency; background root
+    // wakes use the same normal scheduling path as workers.
+    beforeRun: ({ mode }): boolean => {
+      // Same dispatch-time apply as the worker beforeRun (#199, extended to
+      // pools): a pool staged while root was queued/idle must land before
+      // this run's own gate()/admission and run_start, not at the end of
+      // the run after. Root's declared pool may hold several ordered
+      // entries (see the `modelConfig` comment on root's Actor construction
+      // above); the halt gate reads the first, the entry that launches first.
+      mesh.applyPendingModel(rootId);
+      const rootRecord = actors.get(rootId);
+      const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
+      if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
+        return false;
+      }
+      if (mode === "yield-elicitation") return true;
+      const watermark = root.getInterruptedWatermark?.();
+      if (watermark) {
+        const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
+        return entries.some((e) => e.deliveredAt > watermark);
+      }
+      return inboxStore.countUnhandled(rootId) > 0;
+    },
+    admitRun: ({ responsive, mode }): boolean =>
+      responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
+    gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+    onQueuedRunCancelled: () => mesh.clearSelection(rootId),
+    onContinue: (n) =>
+      mesh.recordEvent({
+        kind: "run_continued",
+        actorId: rootId,
+        detail: `yield-elicitation ${n}/1`,
+      }),
+    onContinuationCapped: (n) => {
+      mesh.recordEvent({
+        kind: "continuation_capped",
+        actorId: rootId,
+        detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
+      });
+      routeContinuationCapped(failureSink, rootId, n);
+    },
+    onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
+    onProviderAttempt: (attempt) => {
+      activeRunSelections.set(rootId, {
+        provider: attempt.providerName,
+        model: attempt.model,
+        effort: attempt.effort,
+      });
+    },
+    onFirstChunk: () =>
+      mesh.recordEvent({
+        kind: "run_first_chunk",
+        actorId: rootId,
+      }),
+    onCoalesceAborted: (count, ageMs) => {
+      mesh.recordEvent({
+        kind: "run_coalesced",
+        actorId: rootId,
+        detail: `count=${count} age=${ageMs}ms`,
+      });
+    },
+    log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
+  };
+  root = constructActorFromInvocation({
+    actorOptions: rootActorOptions,
+    driver: externalRoot ? () => externalRoot : undefined,
+  });
   const rootRecord: ActorRecord = {
     id: rootId,
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
@@ -3519,10 +3560,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // In e2e mode the runner drives GitHub events in-process via the onReady
   // handle, so we don't bind the real webhook/dashboard servers (avoids port
   // collisions and the need to sign synthetic webhook payloads).
-  const e2eMode = Boolean(opts?.e2e?.onReady);
   const noDashboardServer = opts?.noDashboardServer ?? false;
-  const ingestionMode = config.github.ingestionMode ?? "webhook";
-  const webhookServer = shouldBindWebhookServer({ e2eMode, ingestionMode })
+  const webhookServer = shouldBindWebhookServer({ e2eMode })
     ? await startWebhookServer({
         secret: webhookSecret,
         onEvent,
@@ -3533,47 +3572,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           : undefined,
       })
     : null;
-  const githubPoller =
+  // Walkie-talkie routes require the selected transcription provider key.
+  // Speech provider keys stay on the host. Actor TTS is selected per reply.
+  voiceService =
     !e2eMode &&
-    ingestionMode === "poll" &&
-    ((config.github.repos?.length ?? 0) > 0 || (config.github.orgs?.length ?? 0) > 0)
-      ? startGitHubEventPoller({
-          repos: config.github.repos ?? [],
-          orgs: config.github.orgs ?? [],
-          deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
-          intervalSeconds: config.github.pollIntervalSeconds,
+    (config.voice?.transcriptionProvider === "elevenlabs"
+      ? config.elevenlabsApiKey?.trim()
+      : geminiApiKey)
+      ? createVoiceService({
           home: mcHome,
-          issueClient,
-          onEvent,
+          apiKey: geminiApiKey ?? "",
+          elevenlabsApiKey: config.elevenlabsApiKey,
+          voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
+          voice: config.voice,
+          // Post-#460 replies target the durable user principal, not the legacy
+          // alias; principal storage is what says a recipient is a person.
+          isHumanRecipient: (principalId) =>
+            getRepositories().principals.getUser(principalId) !== undefined,
+          onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
+          logger: log.child({ component: "voice-session" }),
         })
       : null;
-  // Walkie-talkie mode, server half : gated on geminiApiKey (transcription
-  // and TTS are host-side Gemini calls — the key never reaches workers). When
-  // absent the voice routes 503 with a clear error and nothing else changes.
-  const geminiApiKey = config.geminiApiKey?.trim();
-  voiceService = geminiApiKey
-    ? createVoiceService({
-        home: mcHome,
-        apiKey: geminiApiKey,
-        voice: config.voice,
-        // Per-actor voice for reply TTS: the actor's persisted voice_config,
-        // validated against the supported catalog, else the instance-wide
-        // default. Resolved fresh per reply so a dashboard edit takes effect
-        // on the actor's very next spoken reply.
-        voiceNameFor: (actorId) => {
-          const voiceConfig = actors.get(actorId)?.voiceConfig;
-          const voiceName =
-            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
-          return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
-        },
-        // Post-#460 replies target the durable user principal, not the legacy
-        // alias; principal storage is what says a recipient is a person.
-        isHumanRecipient: (principalId) =>
-          getRepositories().principals.getUser(principalId) !== undefined,
-        onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
-        logger: log.child({ component: "voice-session" }),
-      })
-    : null;
   const dashboardServer = shouldBindDashboardServer({
     e2eMode,
     e2eDashboard: opts?.e2e?.dashboard === true,
@@ -3648,6 +3667,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
+          supportedVoices: supportedVoiceCatalog,
           getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
@@ -3684,7 +3704,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         iuReportsApi: { mcHome },
         dashboardConfig: { quotaProviders: config.dashboard?.quotaProviders },
         // Walkie-talkie voice routes + reply-TTS hook ; undefined when
-        // no geminiApiKey is configured (routes then 503).
+        // voice credentials are unconfigured (routes then 503).
         voice: voiceService ? { service: voiceService } : undefined,
       })
     : null;
@@ -3900,7 +3920,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     }
     try {
-      githubPoller?.close();
       await webhookServer?.close();
     } catch {
       /* already closed */
@@ -4079,6 +4098,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // runner live handles so it can inject events and tear down deterministically.
   opts?.e2e?.onReady?.({
     mesh,
+    coordinatorAppliedInterval: (provider) =>
+      quotaCoordinatorClient?.getLastAppliedInterval(provider),
     root,
     rootControl,
     externalRoot,

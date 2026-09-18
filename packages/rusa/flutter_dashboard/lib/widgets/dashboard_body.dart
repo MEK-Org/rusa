@@ -167,6 +167,8 @@ class _DashboardBodyState extends State<DashboardBody> {
                 quotaProviders: _quotaProviders(
                   widget.store.dashboardConfig.valueOrNull,
                 ),
+                onLogout: widget.onLogout,
+                profilePhotoUrl: widget.profilePhotoUrl,
               ),
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),

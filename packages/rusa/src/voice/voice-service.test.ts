@@ -8,7 +8,11 @@ import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Logger } from "../observability/logger.js";
 import type { SpeechClient } from "./gemini-speech.js";
-import { VOICE_PRESENCE_GRACE_MS, VoiceService } from "./voice-service.js";
+import {
+  VOICE_PRESENCE_GRACE_MS,
+  VoiceService,
+  type VoiceServiceOptions,
+} from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
 
 const ACTOR = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -35,8 +39,8 @@ function makeService(
     max?: number;
     sessionLeaseMs?: number;
     onSessionEnded?: (actorId: string) => void;
-    voiceNameFor?: (actorId: string) => string | undefined;
     isHumanRecipient?: (principalId: string) => boolean;
+    speechFor?: VoiceServiceOptions["speechFor"];
     logger?: Logger;
   } = {}
 ) {
@@ -48,8 +52,8 @@ function makeService(
     maxAnnouncements: opts.max,
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
-    voiceNameFor: opts.voiceNameFor,
     isHumanRecipient: opts.isHumanRecipient,
+    speechFor: opts.speechFor,
     logger: opts.logger,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
@@ -341,22 +345,23 @@ describe("VoiceService per-actor voice selection", () => {
       sampleRate: 24_000,
       pcmStream: (async function* () {})(),
     }));
-    const voiceNameFor = vi.fn((actorId: string): string | undefined =>
-      actorId === ACTOR ? "Charon" : undefined
+    const speech = fakeSpeech({ streamSynthesize });
+    const speechFor = vi.fn((actorId: string) =>
+      actorId === ACTOR ? { speech, voiceName: "Charon" } : undefined
     );
     const { service } = makeService({
-      speech: fakeSpeech({ streamSynthesize }),
-      voiceNameFor,
+      speech,
+      speechFor,
     });
     service.presenceConnect([ACTOR]);
 
     await service.handleMeshEvent(replyEvent());
     expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", "Charon");
-    expect(voiceNameFor).toHaveBeenCalledWith(ACTOR);
+    expect(speechFor).toHaveBeenCalledWith(ACTOR);
 
     // Resolved again for the next reply, so a mid-conversation voice change
     // takes effect immediately.
-    voiceNameFor.mockReturnValue("Kore");
+    speechFor.mockReturnValue({ speech, voiceName: "Kore" });
     await service.handleMeshEvent(replyEvent({ body: "Second reply." }));
     expect(streamSynthesize).toHaveBeenLastCalledWith("Second reply.", "Kore");
   });
@@ -368,7 +373,7 @@ describe("VoiceService per-actor voice selection", () => {
     }));
     const { service } = makeService({
       speech: fakeSpeech({ streamSynthesize }),
-      voiceNameFor: () => undefined,
+      speechFor: () => undefined,
     });
     service.presenceConnect([ACTOR]);
 
@@ -388,12 +393,12 @@ describe("VoiceService per-actor voice selection", () => {
     expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
   });
 
-  it("never consults the voice resolver for a non-reply event", async () => {
-    const voiceNameFor = vi.fn(() => "Charon");
-    const { service } = makeService({ voiceNameFor });
+  it("never consults the speech resolver for a non-reply event", async () => {
+    const speechFor = vi.fn(() => ({ speech: fakeSpeech(), voiceName: "Charon" }));
+    const { service } = makeService({ speechFor });
     service.presenceConnect([ACTOR]);
     expect(await service.handleMeshEvent(replyEvent({ kind: "run_start" }))).toBeNull();
-    expect(voiceNameFor).not.toHaveBeenCalled();
+    expect(speechFor).not.toHaveBeenCalled();
   });
 });
 

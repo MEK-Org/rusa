@@ -3,7 +3,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ProviderPacer } from "../actor/provider-pacer.js";
+import { ProviderPacer, selectPoolLane } from "../actor/provider-pacer.js";
 import {
   applyThrottleStatusToPacer,
   initialPacerIntervalSeconds,
@@ -17,6 +17,7 @@ import {
   type PublishedHistoryRecord,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
+  weeklyAdmissionObservation,
 } from "./coordinator-protocol.js";
 
 function serviceInfo(protocolMajor: number = COORDINATOR_PROTOCOL_MAJOR) {
@@ -373,6 +374,26 @@ describe("QuotaCoordinatorClient unavailability (#359, design §5.7/§6.3–6.4,
     expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
   });
 
+  it("rejects a collection whose warm body disagrees with its provider key", async () => {
+    root = mkdtempSync(join(tmpdir(), "quota-client-collection-provider-key-"));
+    const socketPath = join(root, "coordinator.sock");
+    const client = new QuotaCoordinatorClient({ socketPath, maxIntervalSeconds: 3600 });
+
+    await listen(socketPath, (_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          service: serviceInfo(),
+          providers: { codex: providerStatus(450, "claude") },
+        })
+      );
+    });
+
+    await expect(client.getThrottle()).resolves.toBeNull();
+    expect(client.getHealth()).toEqual({ quota_client_service_connected: 0 });
+    expect(client.getLastAppliedInterval("codex")).toBe(3600);
+  });
+
   it("applies warm intervals and skips cold entries in a mixed collection read (#480)", async () => {
     root = mkdtempSync(join(tmpdir(), "quota-client-collection-mixed-"));
     const socketPath = join(root, "coordinator.sock");
@@ -611,6 +632,137 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       }
 
       expect(pacer.interval).toBe(500 * 1000);
+    });
+  });
+
+  describe("#367: cached weekly admission buckets", () => {
+    const weeklyStatus = (
+      provider: string,
+      percentLeft: number,
+      observedAt: string,
+      resetAtIso: string
+    ) => ({
+      ...providerStatus(300, provider),
+      buckets: [
+        {
+          key: `${provider}:weekly`,
+          percentLeft,
+          timeRemainingPct: 50,
+          error: 0,
+          derivative: 0,
+          requiredIntervalSeconds: 300,
+          observedAt,
+          resetAtIso,
+        },
+      ],
+    });
+
+    const selectFromClient = (
+      client: QuotaCoordinatorClient,
+      nowMs: number,
+      names: readonly string[] = ["claude", "codex"]
+    ) => {
+      const candidates = names.map((name) => ({
+        config: name,
+        lane: name,
+        pacer: new ProviderPacer(0, () => nowMs),
+        // The same projection start.ts composes into weeklyQuotaFor.
+        weeklyQuota: weeklyAdmissionObservation(client.getLastPublishedStatus(name)),
+      }));
+      return selectPoolLane(candidates, nowMs)?.config;
+    };
+
+    const warmedClient = (nowMs: number) => {
+      const client = new QuotaCoordinatorClient({ socketPath: "/not-opened/coordinator.sock" });
+      const observedAt = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      expect(
+        client.applyResponse("claude", {
+          service: serviceInfo(),
+          ...weeklyStatus("claude", 20, observedAt, resetAtIso),
+        })
+      ).toBe(true);
+      expect(
+        client.applyResponse("codex", {
+          service: serviceInfo(),
+          ...weeklyStatus("codex", 80, observedAt, resetAtIso),
+        })
+      ).toBe(true);
+      return client;
+    };
+
+    it("uses the existing cached weekly bucket to choose greater headroom without a quota read", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const client = warmedClient(nowMs);
+
+      expect(selectFromClient(client, nowMs)).toBe("codex");
+      expect(client.getHealth()).toEqual({ quota_client_service_connected: 1 });
+    });
+
+    // These four outcomes are decided by selectPoolLane at the merge base (the
+    // 30-minute age guard and its finite/tied checks); they document #349
+    // semantics surviving the coordinator adapter, not cache retention.
+    it("retains declared order for missing, stale, invalid, and tied buckets", () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const fresh = new Date(nowMs).toISOString();
+      const resetAtIso = new Date(nowMs + 4 * 24 * 60 * 60 * 1_000).toISOString();
+      const client = new QuotaCoordinatorClient({ socketPath: "/not-opened/coordinator.sock" });
+      const apply = (provider: string, status: object) =>
+        client.applyResponse(provider, {
+          service: serviceInfo(),
+          ...status,
+        });
+
+      apply("claude", weeklyStatus("claude", 40, fresh, resetAtIso));
+      apply("codex", providerStatus(300, "codex"));
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // missing
+
+      apply(
+        "codex",
+        weeklyStatus("codex", 90, new Date(nowMs - 30 * 60 * 1_000 - 1).toISOString(), resetAtIso)
+      );
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // stale
+
+      apply("codex", weeklyStatus("codex", Number.NaN, fresh, resetAtIso));
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // invalid
+
+      apply("codex", weeklyStatus("codex", 40, fresh, resetAtIso));
+      expect(selectFromClient(client, nowMs)).toBe("claude"); // tied
+    });
+
+    it("retains a fresh winning cache through cold, unavailable, and incompatible responses, then falls back once it is stale", async () => {
+      const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+      const staleNowMs = nowMs + 30 * 60 * 1_000 + 1;
+
+      const coldClient = warmedClient(nowMs);
+      expect(
+        coldClient.applyResponse("codex", {
+          service: serviceInfo(),
+          error: { code: "not_ready" },
+        })
+      ).toBe(false);
+      expect(coldClient.getLastPublishedStatus("codex")).toBeDefined();
+      expect(selectFromClient(coldClient, nowMs)).toBe("codex");
+      expect(selectFromClient(coldClient, staleNowMs)).toBe("claude");
+
+      const unavailableClient = warmedClient(nowMs);
+      await expect(unavailableClient.getThrottle()).resolves.toBeNull();
+      expect(unavailableClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
+      expect(unavailableClient.getLastPublishedStatus("codex")).toBeDefined();
+      expect(selectFromClient(unavailableClient, nowMs)).toBe("codex");
+      expect(selectFromClient(unavailableClient, staleNowMs)).toBe("claude");
+
+      const incompatibleClient = warmedClient(nowMs);
+      expect(
+        incompatibleClient.applyResponse("codex", {
+          service: serviceInfo(COORDINATOR_PROTOCOL_MAJOR + 1),
+          ...providerStatus(300, "codex"),
+        })
+      ).toBe(false);
+      expect(incompatibleClient.getHealth()).toEqual({ quota_client_service_connected: 0 });
+      expect(incompatibleClient.getLastPublishedStatus("codex")).toBeDefined();
+      expect(selectFromClient(incompatibleClient, nowMs)).toBe("codex");
+      expect(selectFromClient(incompatibleClient, staleNowMs)).toBe("claude");
     });
   });
 

@@ -371,12 +371,13 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     })
   ).trim();
 
+  // Quickstart is meant to run against a local repository through the Git
+  // bridge; nothing here subscribes to GitHub. The webhook stanza below is the
+  // only GitHub ingestion edge, and it stays idle until an operator adds
+  // `github.repos` and points a reachable webhook at it (docs/quickstart.md).
   const config: RusaConfig = {
     profile: "quickstart",
-    github: {
-      pollIntervalSeconds: 30,
-      ingestionMode: "poll",
-    },
+    github: {},
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),

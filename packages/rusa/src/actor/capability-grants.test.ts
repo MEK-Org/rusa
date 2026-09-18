@@ -7,15 +7,26 @@ import {
   FileCapabilityGrantStore,
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
-  SECRET_GEMINI_API_KEY_CAPABILITY,
-  SECRET_MISTRAL_API_KEY_CAPABILITY,
+  PARENT_GRANTABLE_SECRET_FILENAMES,
+  SECRET_CAPABILITY_BASE,
+  SECRET_CAPABILITY_PREFIX,
 } from "./capability-grants.js";
 
 describe("parent-grantable capabilities", () => {
-  it("includes both file-backed API-key secrets", () => {
+  it("is exactly the two file-backed LLM API-key secrets, by FULL capability name", () => {
+    expect(PARENT_GRANTABLE_SECRET_FILENAMES).toEqual(["gemini-api-key", "mistral-api-key"]);
     expect(PARENT_GRANTABLE_CAPABILITIES).toEqual(
-      new Set([SECRET_GEMINI_API_KEY_CAPABILITY, SECRET_MISTRAL_API_KEY_CAPABILITY])
+      new Set(["secret:gemini-api-key", "secret:mistral-api-key"])
     );
+  });
+
+  it("never contains the generic secret base or prefix (that would delegate every file)", () => {
+    expect(PARENT_GRANTABLE_CAPABILITIES.has(SECRET_CAPABILITY_BASE)).toBe(false);
+    expect(PARENT_GRANTABLE_CAPABILITIES.has(SECRET_CAPABILITY_PREFIX)).toBe(false);
+    for (const cap of PARENT_GRANTABLE_CAPABILITIES) {
+      expect(cap.startsWith(SECRET_CAPABILITY_PREFIX)).toBe(true);
+      expect(cap.length).toBeGreaterThan(SECRET_CAPABILITY_PREFIX.length);
+    }
   });
 });
 

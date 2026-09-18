@@ -1521,6 +1521,7 @@ class _DetailViewState extends State<_DetailView> {
         Expanded(
           child: SelectableText(
             o.heading,
+            minLines: 1,
             maxLines: 2,
             style: titleStyle,
           ),
@@ -1542,6 +1543,7 @@ class _DetailViewState extends State<_DetailView> {
           child: SelectableText(
             o.heading,
             key: const ValueKey('obligation-detail-title'),
+            minLines: 1,
             maxLines: 2,
             style: titleStyle,
             textWidthBasis: TextWidthBasis.longestLine,

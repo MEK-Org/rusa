@@ -9,31 +9,45 @@ import { readFileSync, writeFileSync } from "node:fs";
 export const CAPABILITY_GRANTS_FILENAME = "capability-grants.json";
 
 /**
- * The grantable secret capability for the host's Gemini API key . Unlike
- * MCP-server capabilities it mounts no server: the sandbox honors an active
- * grant by ro-binding `$RUSA_HOME/secrets/gemini-api-key` back over the
- * secrets-dir tmpfs mask, so the grantee reads the key at that well-known path.
- * Evaluated per-spawn; fail-closed to masked.
+ * Prefix for generic read-only secret capability grants (issue #542).
+ * Secret capabilities take the form `secret:<filename>`, exposing any single regular
+ * file directly inside `$RUSA_HOME/secrets/` to the grantee by ro-binding it back
+ * over the secrets-directory tmpfs mask. Evaluated per-spawn; fail-closed to masked.
  */
-export const SECRET_GEMINI_API_KEY_CAPABILITY = "secret:gemini-api-key";
+export const SECRET_CAPABILITY_PREFIX = "secret:";
 
 /**
- * The grantable secret capability for the host's Mistral API key .
- * Mirrors {@link SECRET_GEMINI_API_KEY_CAPABILITY}: the sandbox re-binds the
- * single key file over the secrets-directory mask for an actively granted actor.
+ * Base capability name for secret grants.
  */
-export const SECRET_MISTRAL_API_KEY_CAPABILITY = "secret:mistral-api-key";
+export const SECRET_CAPABILITY_BASE = "secret";
 
 /**
- * Capabilities a NON-root parent may grant to / revoke from its DIRECT children
- * . Everything else stays root-only. Enforced in the mesh
+ * Secret filenames a NON-root parent may delegate to its DIRECT children — the
+ * LLM API keys that were parent-grantable before #542 generalized the secret
+ * capability. The list is deliberately explicit: a generic `secret:<filename>`
+ * outside it (webhook secrets, service passwords, anything an operator drops
+ * into the directory later) stays root-only, so a compromised worker cannot
+ * exfiltrate an infrastructure secret by guessing its filename and granting it
+ * to a sub-worker. Extending parent delegation to another file is a deliberate
+ * edit here, never a side effect of creating the file.
+ */
+export const PARENT_GRANTABLE_SECRET_FILENAMES: readonly string[] = [
+  "gemini-api-key",
+  "mistral-api-key",
+];
+
+/**
+ * Capabilities a NON-root parent may grant to / revoke from its DIRECT children:
+ * exactly the `secret:<filename>` capabilities for
+ * {@link PARENT_GRANTABLE_SECRET_FILENAMES}. Everything else — every other
+ * secret file and every MCP-server capability — stays root-only. Matched by the
+ * FULL capability name (never by the `secret` prefix), and enforced in the mesh
  * (`ActorMesh.grantCapability`/`revokeCapability`), not just the tool layer, so
  * the invariant holds for any caller.
  */
-export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set([
-  SECRET_GEMINI_API_KEY_CAPABILITY,
-  SECRET_MISTRAL_API_KEY_CAPABILITY,
-]);
+export const PARENT_GRANTABLE_CAPABILITIES: ReadonlySet<string> = new Set(
+  PARENT_GRANTABLE_SECRET_FILENAMES.map((filename) => `${SECRET_CAPABILITY_PREFIX}${filename}`)
+);
 
 /**
  * A grant of an extra MCP capability to a specific actor, beyond the default

@@ -13,6 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
@@ -24,6 +25,7 @@ import {
   setupFlutterOverlay,
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
+import { PARENT_GRANTABLE_SECRET_FILENAMES } from "./capability-grants.js";
 
 export const E2E_INSTANCE_UNIT_NAME = "rusa-e2e-instance";
 const E2E_INSTANCE_PORT = 8083 as const;
@@ -449,17 +451,25 @@ export class E2EInstanceManager {
     if (hasBaseConfig) {
       ensureMountTarget(configSource, configTarget);
       args.push("--ro-bind", realpathIfExists(configSource), configTarget);
-      const geminiKeySource = join(this.opts.mcHome, "secrets", "gemini-api-key");
-      if (existsSync(geminiKeySource)) {
-        const geminiKeyTarget = join(baseConfigHome, "secrets", "gemini-api-key");
-        ensureMountTarget(geminiKeySource, geminiKeyTarget);
-        args.push("--ro-bind", realpathIfExists(geminiKeySource), geminiKeyTarget);
-      }
-      const mistralKeySource = join(this.opts.mcHome, "secrets", "mistral-api-key");
-      if (existsSync(mistralKeySource)) {
-        const mistralKeyTarget = join(baseConfigHome, "secrets", "mistral-api-key");
-        ensureMountTarget(mistralKeySource, mistralKeyTarget);
-        args.push("--ro-bind", realpathIfExists(mistralKeySource), mistralKeyTarget);
+      // Carry exactly the LLM keys the nested instance always received — the
+      // parent-grantable allow-list (#542) — never the whole secrets directory:
+      // webhook secrets and service passwords stay on the host. Each key passes
+      // the same containment check a grant does, and the bind source is the
+      // canonical path that check resolved. A key that is missing is simply not
+      // bound, as before; one that fails containment (a directory, an escaping
+      // symlink) is refused rather than bound.
+      const secretsSourceDir = join(this.opts.mcHome, SECRETS_DIRNAME);
+      const secretsTargetDir = join(baseConfigHome, SECRETS_DIRNAME);
+      for (const filename of PARENT_GRANTABLE_SECRET_FILENAMES) {
+        let realSecretSource: string;
+        try {
+          realSecretSource = assertSecretContainment(filename, secretsSourceDir);
+        } catch {
+          continue;
+        }
+        const secretTarget = join(secretsTargetDir, filename);
+        ensureMountTarget(realSecretSource, secretTarget);
+        args.push("--ro-bind", realSecretSource, secretTarget);
       }
     }
 

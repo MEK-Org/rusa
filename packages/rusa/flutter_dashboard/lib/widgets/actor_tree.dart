@@ -10,7 +10,7 @@ import 'avatar.dart';
 import 'hierarchy_drag_drop.dart';
 import 'status_dot.dart';
 
-/// Left sidebar: "Active Hierarchy" header + Show-Retired toggle + the alive
+/// Left sidebar: Show-Retired toggle + the alive
 /// actor tree. Selection honors click / ctrl·cmd-click (toggle) / shift-click
 /// (range), driven by the store's state machine.
 class ActorTree extends StatelessWidget {
@@ -42,8 +42,10 @@ class ActorTree extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _header(context),
-          const Divider(height: 1, color: MeshColors.border),
+          if (!touchTargets) ...[
+            _header(context),
+            const Divider(height: 1, color: MeshColors.border),
+          ],
           Expanded(
             child: StreamBuilder<List<Object?>>(
               stream: Rx.combineLatestList<Object?>([
@@ -143,92 +145,21 @@ class ActorTree extends StatelessWidget {
   }
 
   Widget _header(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
+    padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
     child: Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Flexible(
-          // While the tree is painted from the persisted cache the heading says
-          // so, so a restored hierarchy is never mistaken for confirmed server
-          // truth (#273). The suffix disappears on the first successful sync.
-          child: StreamBuilder<bool>(
-            stream: store.actorsStale,
-            initialData: store.actorsStale.valueOrNull ?? false,
-            builder: (_, snap) => Text(
-              snap.data == true
-                  ? 'Active Hierarchy · cached'
-                  : 'Active Hierarchy',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: MeshColors.textSecondary,
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0.8,
-              ),
-            ),
-          ),
+        StreamBuilder<bool>(
+          stream: store.actorsStale,
+          initialData: store.actorsStale.valueOrNull ?? false,
+          builder: (_, snap) => (snap.data == true)
+              ? const CachedHierarchyBadge()
+              : const SizedBox.shrink(),
         ),
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            IconButton(
-              tooltip: 'Spawn actor',
-              visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.add, size: 19),
-              onPressed: () => _showSpawnDialog(context),
-            ),
-            StreamBuilder<bool>(
-              stream: store.showRetired,
-              initialData: false,
-              builder: (_, snap) => Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    'Retired',
-                    style: TextStyle(color: MeshColors.textMuted, fontSize: 12),
-                  ),
-                  const SizedBox(width: 4),
-                  Transform.scale(
-                    scale: 0.8,
-                    child: Switch(
-                      value: snap.data ?? false,
-                      activeThumbColor: MeshColors.accent,
-                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      onChanged: store.setShowRetired,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
+        ActorTreeControls(store: store),
       ],
     ),
   );
-
-  Future<void> _showSpawnDialog(BuildContext context) async {
-    try {
-      final providers = await store.fetchRootControlProviders();
-      if (!context.mounted) return;
-      final request = await showDialog<_SpawnRequest>(
-        context: context,
-        builder: (_) => _SpawnActorDialog(providers: providers),
-      );
-      if (request == null || !context.mounted) return;
-      await store.spawnRootChild(
-        charter: request.charter,
-        title: request.title,
-        provider: request.provider,
-        model: request.model,
-      );
-    } catch (err) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Could not spawn actor: $err')));
-    }
-  }
 
   void _select(String id) {
     final keys = HardwareKeyboard.instance.logicalKeysPressed;
@@ -263,6 +194,140 @@ class ActorTree extends StatelessWidget {
     }
 
     return {for (final t in all) t.id: depthOf(t.id)};
+  }
+}
+
+/// Badge shown while the tree is painted from the persisted cache (#273),
+/// alerting operators that hierarchy state is awaiting server sync.
+class CachedHierarchyBadge extends StatelessWidget {
+  const CachedHierarchyBadge({super.key, this.compact = false});
+
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Actor hierarchy restored from cache; awaiting server sync',
+      child: Container(
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 6 : 8,
+          vertical: compact ? 2 : 3,
+        ),
+        decoration: BoxDecoration(
+          color: MeshColors.textMuted.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(
+            color: MeshColors.textMuted.withValues(alpha: 0.35),
+          ),
+        ),
+        child: const Text(
+          'cached',
+          style: TextStyle(
+            color: MeshColors.textSecondary,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.6,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The right-side actor tree controls: Spawn actor button + Show-Retired toggle.
+/// Displayed in the tree's header row on desktop, and relocated to the app-level
+/// header on mobile (#516).
+class ActorTreeControls extends StatelessWidget {
+  const ActorTreeControls({
+    super.key,
+    required this.store,
+    this.compact = false,
+  });
+
+  final DashboardStore store;
+  final bool compact;
+
+  Future<void> _showSpawnDialog(BuildContext context) async {
+    try {
+      final providers = await store.fetchRootControlProviders();
+      if (!context.mounted) return;
+      final request = await showDialog<_SpawnRequest>(
+        context: context,
+        builder: (_) => _SpawnActorDialog(providers: providers),
+      );
+      if (request == null || !context.mounted) return;
+      await store.spawnRootChild(
+        charter: request.charter,
+        title: request.title,
+        provider: request.provider,
+        model: request.model,
+      );
+    } catch (err) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not spawn actor: $err')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: 'Spawn actor',
+          constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+          icon: const Icon(Icons.add, size: 20),
+          onPressed: () => _showSpawnDialog(context),
+        ),
+        StreamBuilder<bool>(
+          stream: store.showRetired,
+          initialData: false,
+          builder: (_, snap) {
+            final active = snap.data ?? false;
+            final switchWidget = Tooltip(
+              message: active ? 'Hide retired actors' : 'Show retired actors',
+              child: Semantics(
+                label: 'Show retired actors',
+                toggled: active,
+                child: Switch(
+                  value: active,
+                  activeThumbColor: MeshColors.accent,
+                  onChanged: store.setShowRetired,
+                ),
+              ),
+            );
+
+            if (compact) {
+              return switchWidget;
+            }
+
+            return InkWell(
+              borderRadius: BorderRadius.circular(4),
+              onTap: () => store.setShowRetired(!active),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Retired',
+                      style: TextStyle(
+                        color: MeshColors.textMuted,
+                        fontSize: 12,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    switchWidget,
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
   }
 }
 

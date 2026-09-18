@@ -126,7 +126,6 @@ describe("runInit", () => {
       "test-user",
       "Test User",
       "test@example.com",
-      "300",
       "9742",
       "",
       "8080",
@@ -161,7 +160,7 @@ describe("runInit", () => {
 
   it("preserves an existing copilot provider config when re-running init", async () => {
     const existingConfig: RusaConfig = {
-      github: { account: "existing-user", pollIntervalSeconds: 300 },
+      github: { account: "existing-user" },
       providers: {
         copilot: { cliCommand: "copilot" },
         gemini: { cliCommand: "agy", dailyCap: "$50" },
@@ -178,7 +177,6 @@ describe("runInit", () => {
       "existing-user",
       "Test User",
       "test@example.com",
-      "300",
       "9742",
       "",
       "8080",
@@ -229,7 +227,7 @@ describe("runInit", () => {
   it("does not auto-create provider model entries for configured providers (an issue)", async () => {
     // Pre-populate config with providers that have no corresponding models in the database
     const existingConfig: RusaConfig = {
-      github: { account: "test-user", pollIntervalSeconds: 300 },
+      github: { account: "test-user" },
       providers: {
         // copilot is configured but should NOT auto-create a provider_model entry
         copilot: { cliCommand: "copilot" },
@@ -259,7 +257,7 @@ describe("runInit", () => {
   it("supports non-interactive mode with seeded config file for CI automation", async () => {
     // Create a custom config file to use as seed
     const customConfig: RusaConfig = {
-      github: { account: "ci-user", pollIntervalSeconds: 300 },
+      github: { account: "ci-user" },
       providers: {
         gemini: { cliCommand: "agy", dailyCap: "$25" },
       },
@@ -301,7 +299,6 @@ describe("runInit", () => {
       "test-user",
       "Test User",
       "test@example.com",
-      "300",
       "gg-user@example.com",
       "/path/to/firebase-key.json",
       "9742",

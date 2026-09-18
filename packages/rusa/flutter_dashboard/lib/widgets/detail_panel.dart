@@ -463,8 +463,8 @@ class _DetailPanelState extends State<DetailPanel>
     return const [];
   }
 
-  Widget _meta(String label, String value) => RichText(
-    text: TextSpan(
+  Widget _meta(String label, String value) => Text.rich(
+    TextSpan(
       children: [
         TextSpan(
           text: '$label: ',
@@ -690,8 +690,8 @@ class _InfoViewState extends State<_InfoView> {
   /// fetch degrades to less text, not to "No charter."
   String get charter => _charter ?? widget.actor.charterPreview;
 
-  Widget _meta(String label, String value) => RichText(
-    text: TextSpan(
+  Widget _meta(String label, String value) => Text.rich(
+    TextSpan(
       children: [
         TextSpan(
           text: '$label: ',
@@ -878,7 +878,7 @@ class _InfoViewState extends State<_InfoView> {
 }
 
 /// The actor's walkie-talkie voice picker on the Info tab: a dropdown of the
-/// supported Google TTS voices plus an "Instance default" entry that clears
+/// Google voices and configured ElevenLabs IDs, plus an "Instance default" entry that clears
 /// the persisted setting. The catalog comes from the threads snapshot the
 /// store already polls, so the picker populates without an extra fetch.
 class _VoicePicker extends StatelessWidget {
@@ -889,14 +889,28 @@ class _VoicePicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final supported = store.supportedVoices.value;
-    if (supported.isEmpty) {
-      return const SizedBox.shrink();
+    final voices = {
+      for (final voice in store.supportedVoices.value) voice.voiceConfig: voice,
+    };
+    final selected = actor.voiceConfig;
+    if (selected != null && !voices.containsKey(selected)) {
+      // Keep persisted selections usable even after removal from the catalog.
+      final sameProvider = voices.values.where(
+        (voice) => voice.voiceConfig.provider == selected.provider,
+      );
+      voices[selected] = SupportedVoiceDto(
+        label: selected.config.values.join(', '),
+        providerLabel: sameProvider.isEmpty
+            ? selected.provider
+            : sameProvider.first.providerLabel,
+        voiceConfig: selected,
+      );
     }
+    if (voices.isEmpty) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(top: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
             'Voice: ',
@@ -906,23 +920,56 @@ class _VoicePicker extends StatelessWidget {
               fontWeight: FontWeight.w600,
             ),
           ),
-          DropdownButton<String?>(
-            value: actor.voiceName,
-            underline: const SizedBox.shrink(),
-            style: kMonoStyle.copyWith(
-              color: MeshColors.textSecondary,
-              fontSize: 13,
-            ),
-            dropdownColor: MeshColors.bgTertiary,
-            items: [
-              const DropdownMenuItem<String?>(
-                value: null,
-                child: Text('Instance default'),
+          const SizedBox(height: 8),
+          InputDecorator(
+            key: const ValueKey('voice-selector-field'),
+            decoration: InputDecoration(
+              isDense: true,
+              filled: true,
+              fillColor: MeshColors.bgTertiary,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 12,
               ),
-              for (final voice in supported)
-                DropdownMenuItem<String?>(value: voice, child: Text(voice)),
-            ],
-            onChanged: (voice) => store.updateActorVoice(actor.id, voice),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: const BorderSide(color: MeshColors.border),
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: const BorderSide(color: MeshColors.border),
+              ),
+            ),
+            child: DropdownButton<VoiceConfigDto?>(
+              isExpanded: true,
+              isDense: true,
+              icon: const Icon(
+                Icons.keyboard_arrow_down,
+                color: MeshColors.textSecondary,
+              ),
+              value: selected,
+              underline: const SizedBox.shrink(),
+              style: kMonoStyle.copyWith(
+                color: MeshColors.textSecondary,
+                fontSize: 13,
+              ),
+              dropdownColor: MeshColors.bgTertiary,
+              items: [
+                const DropdownMenuItem<VoiceConfigDto?>(
+                  value: null,
+                  child: Text('Instance default (Gemini)'),
+                ),
+                for (final voice in voices.values)
+                  DropdownMenuItem<VoiceConfigDto?>(
+                    value: voice.voiceConfig,
+                    child: Text(
+                      voice.displayLabel,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+              onChanged: (voice) => store.updateActorVoice(actor.id, voice),
+            ),
           ),
         ],
       ),

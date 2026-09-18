@@ -88,6 +88,20 @@ describe("buildE2EConfig", () => {
         codex: { cliCommand: "codex" },
       },
       geminiApiKey: "base-key-123",
+      elevenlabsApiKey: "elevenlabs-test-key",
+      voice: {
+        transcriptionProvider: "elevenlabs",
+        supportedVoices: [
+          {
+            label: "Christopher",
+            voiceConfig: {
+              schemaVersion: 1,
+              provider: "elevenlabs",
+              config: { voiceId: "synthetic-voice-id-1" },
+            },
+          },
+        ],
+      },
     } as unknown as RusaConfig;
 
     const config = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: base });
@@ -95,6 +109,42 @@ describe("buildE2EConfig", () => {
     expect(Object.keys(config.providers)).toEqual(["claude", "codex", "fake"]);
     expect(config.providers.fake?.cliCommand).toBe("fake");
     expect(config.geminiApiKey).toBe("base-key-123");
+    expect(config.elevenlabsApiKey).toBeUndefined();
+    // ElevenLabs-only voice config is omitted because elevenlabsApiKey is omitted in e2e
+    expect(config.voice).toBeUndefined();
+  });
+
+  it("retains credential-valid Google voice config while omitting disabled ElevenLabs provider config", () => {
+    const googleVoice = {
+      label: "Puck",
+      voiceConfig: {
+        schemaVersion: 1,
+        provider: "google" as const,
+        config: { voiceName: "Puck" },
+      },
+    };
+    const elevenVoice = {
+      label: "Christopher",
+      voiceConfig: {
+        schemaVersion: 1,
+        provider: "elevenlabs" as const,
+        config: { voiceId: "synthetic-voice-id-1" },
+      },
+    };
+    const base = {
+      geminiApiKey: "base-key-123",
+      elevenlabsApiKey: "elevenlabs-test-key",
+      voice: {
+        transcriptionProvider: "google" as const,
+        supportedVoices: [googleVoice, elevenVoice],
+      },
+    } as unknown as RusaConfig;
+
+    const config = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: base });
+    expect(config.voice).toEqual({
+      transcriptionProvider: "google",
+      supportedVoices: [googleVoice],
+    });
   });
 });
 

@@ -3,6 +3,7 @@
  */
 
 import type { ContextConfig } from "../actor/actor-record.js";
+import type { VoiceDefinition } from "../voice/voice-catalog.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
@@ -23,24 +24,21 @@ export interface GitHubOrgConfig {
   excludedRepos?: string[];
 }
 
+/**
+ * GitHub events reach an instance only through the webhook listener
+ * (`webhook.port`). The former `ingestionMode: poll` fallback and its
+ * `pollIntervalSeconds` were removed; the config loader rejects either key so a
+ * stale config.yaml fails at boot instead of silently running webhook-only.
+ */
 export interface GitHubConfig {
   account?: string;
   /**
-   * GitHub poll interval, used only when {@link GitHubConfig.ingestionMode} is
-   * "poll". Optional because `config.yaml` need not supply it; the poller applies
-   * `DEFAULT_POLL_INTERVAL_SECONDS` when it is absent .
-   */
-  pollIntervalSeconds?: number;
-  /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
-  ingestionMode?: "webhook" | "poll";
-  /**
-   * GitHub repositories in "owner/name" format that this instance subscribes to
-   * and polls.
+   * GitHub repositories in "owner/name" format that this instance subscribes to.
    */
   repos?: string[];
   /**
-   * GitHub organizations that this instance subscribes to and polls. Repositories
-   * listed in `excludedRepos` are suppressed at both webhook and poll ingestion.
+   * GitHub organizations that this instance subscribes to. Repositories listed
+   * in `excludedRepos` are suppressed at webhook ingestion.
    */
   orgs?: GitHubOrgConfig[];
   /**
@@ -363,13 +361,15 @@ export interface RootActorConfig {
   avatar?: string;
 }
 
-/**
- * Walkie-talkie voice settings . Entirely optional — the feature itself
- * is gated on `geminiApiKey` being present; these only override the model and
- * voice defaults. No secrets live here.
- */
+/** Walkie-talkie provider and model settings. No secrets live here. */
 export interface VoiceConfig {
-  /** Audio-capable Gemini model for memo transcription. Default "gemini-2.5-flash". */
+  /** STT provider, independent of actor TTS. Default "google". */
+  transcriptionProvider?: "google" | "elevenlabs";
+  /** ElevenLabs TTS model. Default "eleven_multilingual_v2". */
+  elevenlabsTtsModel?: string;
+  /** Named voice choices; new actors pick randomly from this pool when non-empty. */
+  supportedVoices?: VoiceDefinition[];
+  /** Model for the selected STT provider. Defaults to gemini-2.5-flash or scribe_v2. */
   transcriptionModel?: string;
   /** Gemini TTS model for reply audio. Default "gemini-3.1-flash-tts-preview". */
   ttsModel?: string;
@@ -409,6 +409,8 @@ export interface RusaConfig {
    * doesn't need those (e.g. a staging deploy).
    */
   geminiApiKey?: string;
+  /** Host-only ElevenLabs key; secrets/elevenlabs-api-key takes precedence. */
+  elevenlabsApiKey?: string;
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
   webhook: WebhookConfig;
@@ -419,7 +421,7 @@ export interface RusaConfig {
   dashboard?: DashboardConfig;
   /** Shared provider-quota storage and identity. */
   quota?: QuotaConfig;
-  /** Walkie-talkie voice tuning ; the feature is gated on geminiApiKey. */
+  /** Walkie-talkie voice tuning; requires the selected transcription provider key. */
   voice?: VoiceConfig;
   smokeTest?: SmokeTestConfig;
   invocationDebug?: InvocationDebugConfig;

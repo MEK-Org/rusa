@@ -191,6 +191,101 @@ that is the reason for the restore:
   exists to replace. The result reports which happened (`archivedBy`:
   `vacuum` or `rename`). A drill that cannot be undone is not a drill.
 
+### Pacing reset
+
+```bash
+rusa quota-pacing-reset --provider codex   # safe against a running coordinator
+```
+
+When a provider's usage is reset out of band — a purchased top-up, a support
+reset, a plan change — the controller's memory describes a budget that no
+longer exists: the integral has accumulated a standing error against the old
+window and the commanded period was tuned to it. `rusa quota-pacing-reset`
+clears that memory for **one** provider and nothing else:
+
+- **cleared:** the derivative filter state, the integral area, and the current
+  period on every reasoned observation for the provider. The published
+  `intervalSeconds` drops to `0` at once, and the next observation is reasoned
+  as a cold start — proportional term alone, period smoothed up from zero;
+- **kept:** the observations themselves (percent left, reset instants), their
+  `controllerError` history, the proportional gain (a constant), and every
+  other provider's learned state.
+
+The reset covers **every window kind** on that provider's lane (weekly, five
+hourly, and so on). Pacing is applied per lane and the widest window governs
+it, so resetting a single kind would leave another kind's stale period in
+charge and the reset would not be one.
+
+It runs in its own process like `rusa quota-backup`, so the coordinator stays
+up. The write is a `BEGIN IMMEDIATE` transaction, taking its lock up front
+rather than upgrading partway, so it cannot deadlock against the collection
+loop; in WAL mode with the connection's busy timeout, whichever process arrives
+second waits rather than failing, so neither side sees `SQLITE_BUSY` under
+ordinary contention. The coordinator reads the published throttle from the file
+on every request, so each instance picks the reset up on its next throttle poll.
+The update is durable — restarting the coordinator afterwards cannot bring the
+old memory back.
+
+The command reports what it did through the ordinary log stream, which renders
+as a readable line on a terminal and as JSON when redirected. The counts are
+rows across every window kind on the lane, so a provider that reports a weekly
+and a five-hour window shows twice the observations of one that reports only
+a weekly window:
+
+```
+INFO  quota-pacing-reset quota_pacing_reset databasePath=... provider=codex clearedDecisions=26 observations=26
+```
+
+The record is logged at `info`, the same as `quota-backup`'s. A shell running
+with `RUSA_LOG_LEVEL` (or `logging.level`) at `warn` or above sees only the
+exit code; run it at `info` to see the counts.
+
+The command is built for an operator, but "operator" includes an actor with a
+shell: an actor asked to reset a provider's pacing may run this on request, the
+same way it runs `rusa quota-backup` — the guard is the provider name, not who
+types it.
+
+#### What it costs: the provider's retained period history
+
+`interval_seconds` is the column the controller looks itself up by — it reads
+the newest row that has one. Clearing only the newest would therefore promote
+the row before it and make an *older* period current again, which is the exact
+failure the reset exists to prevent. So every retained decision for the
+provider is cleared, and the cost is that the provider's past periods go null:
+`listHistorySince` reports `intervalSeconds: null` for its earlier points and
+dashboard period charts lose that provider's pre-reset line.
+
+That cost is accepted deliberately. Keeping the history would need a reset
+marker the lookup could read past — a new column or table, and so a schema
+migration. The request in #521 asks only for the zeroing; the no-migration
+boundary comes from its triage, which commissioned the change as a focused,
+no-schema reset. Zeroing the newest row in place instead of nulling it — which
+would keep every older period — was rejected because `0` is a period the
+controller genuinely commands when a lane is ahead of pace, so a zeroed row is
+indistinguishable from a real decision made at that instant; `NULL` is the one
+value the controller never writes, which is what lets the published status say
+"reset, no decision yet" (`governingBucketKey: null`). Writing a synthetic
+zero-period row was rejected for the same reason. The loss is also bounded:
+observations are retained for thirty days, so the missing pre-reset line is
+at most thirty days of a series that ages out on that schedule anyway. What
+survives is the evidence and the policy signal — every observation, and every
+`controllerError`, which is what those dashboards chart as pace error.
+
+#### An exhausted provider stays gated
+
+The reset clears pacing policy. It does **not** assert that quota came back.
+
+If the newest observation says the provider is exhausted, that observation is
+evidence and is preserved, so the lane stays deferred until its recorded reset
+instant even though the period is now zero. Releasing it would mean acting on
+an operator's word that the budget refilled, and launching work at a provider
+that may still be refusing it. A fresh scrape showing real headroom is what
+clears the gate, normally within one collection cycle.
+
+If the intent is "the usage reset already happened, stop waiting", let the next
+scrape land — it will both clear the gate and give the controller its first
+honest observation to pace from.
+
 ---
 
 ## 3. Metrics and alerts
