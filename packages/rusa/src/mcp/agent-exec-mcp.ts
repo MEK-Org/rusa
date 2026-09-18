@@ -610,10 +610,15 @@ export function createAgentExecMcpServer(
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
         "Check run_state in list_threads, or just wait for the thread's yield. " +
-        "Also refused while the subtree still owns a live obligation or has a scheduled " +
-        "message pending in either direction; the refusal names each one, and nothing is " +
-        "retired until you have reassigned or finished those obligations and cancelled " +
-        "(cancel_scheduled_message) or re-sent those messages.",
+        "Also refused while the subtree still owns a live obligation, has a scheduled " +
+        "message pending in either direction, or holds a live event subscription; the " +
+        "refusal names each one, and nothing is retired until you have reassigned or finished " +
+        "those obligations, cancelled (cancel_scheduled_message) or re-sent those messages, " +
+        "and disposed of those event subscriptions — an ownership is delegated onward by its " +
+        "holder (delegate_event_source, its parent included) or reclaimed by the owner above it " +
+        "(reclaim_event_source); a direct subscription is dropped by its holder " +
+        "(unsubscribe_event_source) or by you as its ancestor (unsubscribe_event_source with " +
+        "thread_id set to the holder).",
       inputSchema: {
         thread_id: z.string().describe("The descendant thread to retire."),
         force: z
@@ -622,7 +627,7 @@ export function createAgentExecMcpServer(
           .describe(
             "Retire even if the thread or a descendant has a queued run (cancelling the queued run). " +
               "Still refused if any thread in the subtree has an active run in flight, and it does " +
-              "not bypass the obligation/message refusal above — that work is disposed of by name, " +
+              "not bypass the obligation/message/subscription refusal above — that work is disposed of by name, " +
               "never overridden by a flag."
           ),
       },
@@ -721,22 +726,54 @@ export function createAgentExecMcpServer(
     }
   );
 
+  // Removal is wider than addition: you may drop your own subscription or a
+  // descendant's (by naming it in `thread_id`), never a peer's or an
+  // ancestor's. The asymmetry is deliberate. Subscribing another actor would
+  // push work sideways; unsubscribing a descendant only ever removes work
+  // from a subtree you already own — and it is the one explicit disposition
+  // that clears a [subscription] retirement blocker (#540) when the holder is
+  // wedged and cannot clear it itself.
   server.registerTool(
     "unsubscribe_event_source",
     {
-      title: "Unsubscribe yourself from an event source",
+      title: "Unsubscribe yourself or a descendant from an event source",
       description:
-        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you.",
-      inputSchema: eventResourceInputSchema,
+        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you. " +
+        "Pass thread_id to drop a descendant's direct subscription instead of your own — the explicit parent-side disposition for a [subscription] retirement blocker whose holder will not clear it. " +
+        "Refused for any thread that is not your descendant.",
+      inputSchema: {
+        ...eventResourceInputSchema,
+        thread_id: z
+          .string()
+          .optional()
+          .describe(
+            "A descendant thread whose direct subscription to drop. Omit to unsubscribe yourself."
+          ),
+      },
     },
-    async ({ source, kind, org, repo, number, ref, space }) => {
+    async ({ source, kind, org, repo, number, ref, space, thread_id }) => {
       try {
         const resource = parseEventResource(
           { source, kind, org, repo, number, ref, space },
           "subscription"
         );
-        mesh.removeEventSourceSubscriber(resource, selfId);
-        return toolOk(`unsubscribed from ${resourceKey(resource)}`);
+        const holder = thread_id ?? selfId;
+        if (holder !== selfId) {
+          if (!mesh.actors.get(holder)) {
+            return toolError(new Error(`unknown thread id: ${holder}`));
+          }
+          if (!mesh.isAncestorOf(selfId, holder)) {
+            return toolError(
+              new Error("you can only unsubscribe yourself or your own descendant threads")
+            );
+          }
+        }
+        mesh.removeEventSourceSubscriber(resource, holder, selfId);
+        return toolOk(
+          holder === selfId
+            ? `unsubscribed from ${resourceKey(resource)}`
+            : `unsubscribed ${holder} from ${resourceKey(resource)}`
+        );
       } catch (err) {
         return toolError(err);
       }

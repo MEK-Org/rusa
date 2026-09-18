@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
-import type { ActorMesh } from "../actor/actor-mesh.js";
+import { type ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -4028,7 +4028,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
 
-    const workerId = mesh.spawn({
+    const activeMesh = mesh;
+    const workerId = activeMesh.spawn({
       charter: "worker tasks",
       parentId: "root",
       modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
@@ -4036,10 +4037,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource("github:dummy-org", "root", "root");
-    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
+    activeMesh.subscribeEventSource("github:dummy-org", "root", "root");
+    activeMesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
-    // Retire worker (no longer live)
+    // Under #540, worker cannot be retired while holding a live subscription on its delegated slice.
+    expect(() => activeMesh.retire(workerId)).toThrow(RetirementBlockedError);
+
+    // After explicit unsubscription, worker retires cleanly and webhook events continue
+    // to bubble up to root's covering org subscription through the full runStart pipeline.
+    mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", workerId, "2026-01-01T00:00:00Z");
     mesh.retire(workerId);
 
     // Emit event. The conclusion has to be one that wakes somebody: this test

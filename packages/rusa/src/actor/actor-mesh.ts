@@ -280,10 +280,18 @@ export interface MessageRetirementBlocker {
   direction: "incoming" | "outgoing" | "internal";
 }
 
+/** One live event subscription owned inside a retiring subtree (#540). */
+export interface SubscriptionRetirementBlocker {
+  resource: string;
+  actorId: string;
+  kind: "ownership" | "subscription";
+}
+
 /** Everything a subtree must dispose of before it can retire — see {@link ActorMesh.retirementBlockers}. */
 export interface RetirementBlockers {
   obligations: ObligationRetirementBlocker[];
   messages: MessageRetirementBlocker[];
+  subscriptions: SubscriptionRetirementBlocker[];
 }
 
 /**
@@ -386,6 +394,32 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
       ...listWithOverflow(
         blockers.messages,
         (m) => `  ${m.messageId} [${m.direction}] ${m.fromId} -> ${m.toId} at ${m.deliverAt}`
+      )
+    );
+  }
+  if (blockers.subscriptions.length > 0) {
+    // Each kind names the tool that actually clears it, and each kind has an
+    // exit the retirer can take without the holder's cooperation — a wedged
+    // holder must not make its subtree unretirable. Ownership is only ever
+    // reached by delegation (root owns the configured roots; nothing else mints
+    // it), so it leaves the same way: the holder delegates it onward — its
+    // parent included — or the owner above it reclaims it. A direct
+    // subscription is dropped by its holder, or by any ancestor naming the
+    // holder (the same authority that retires it). `unsubscribe_event_source`
+    // is deliberately not an ownership release: ownership with no receiver
+    // would route by whichever ancestor happens to be live, which is the
+    // implicit fallback #540 refuses to add.
+    lines.push(
+      `${blockers.subscriptions.length} live event subscription(s) owned in its subtree — ` +
+        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
+        "or the owner above it reclaims it (reclaim_event_source); " +
+        "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
+        "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder):"
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.subscriptions,
+        (s) => `  ${s.resource} [${s.kind}] held by ${s.actorId}`
       )
     );
   }
@@ -2625,14 +2659,38 @@ export class ActorMesh {
     });
   }
 
-  /** Remove a direct subscriber from an event source. Records an audit event. */
-  removeEventSourceSubscriber(resource: EventResource, actorId: string): void {
+  /**
+   * Remove a direct subscriber from an event source. Records an audit event
+   * naming who removed it.
+   *
+   * The holder may always drop its own subscription. An ancestor may drop a
+   * descendant's, and nobody else may: this is the parent-side exit the
+   * retirement guard (#540) needs, because every actor that opens a PR or
+   * issue is mechanically subscribed to it, and a holder that has wedged will
+   * never unsubscribe itself. Ancestor scope is the same authority that
+   * retires the holder, so whoever can retire a subtree can also dispose of
+   * what blocks that retirement — explicitly, by naming the resource and the
+   * holder, never as a side effect of `retire()` or of any flag.
+   */
+  removeEventSourceSubscriber(
+    resource: EventResource,
+    actorId: string,
+    removedBy: string = actorId
+  ): void {
     actorId = this.resolveThreadId(actorId);
+    removedBy = this.resolveThreadId(removedBy);
+    if (removedBy !== actorId && !this.isAncestorOf(removedBy, actorId)) {
+      throw new Error(
+        `actor ${removedBy} may only unsubscribe itself or its descendants from ` +
+          `${resourceKey(resource)} (cannot unsubscribe ${actorId})`
+      );
+    }
     this.eventSourceSubscriptions.unsubscribe(resource, actorId);
     this.recordEvent({
       kind: "event_source_subscriber_removed",
       actorId,
       detail: resourceKey(resource),
+      payload: JSON.stringify({ removedBy }),
     });
   }
 
@@ -3241,18 +3299,19 @@ export class ActorMesh {
    * only the *queued*-run refusal.
    *
    * **Also refuses while the subtree still holds undisposed work** — a live
-   * obligation, or a scheduled message in either direction (#191). That refusal
-   * names every blocker so the retirer can reassign, finish, or cancel each one
-   * and retry; nothing is dropped mechanically as a fallback, because a dropped
-   * delivery is a decision nobody made. **No flag passes it**, `force` included:
-   * the two refusals answer different questions, and overriding "someone is still
-   * working" was never a licence to destroy the work itself. The subtree cascade
-   * skips it by going through {@link retireUnchecked} instead — the entry call
-   * already cleared the whole subtree, and re-asking mid-teardown would only
-   * re-answer the same question against a tree that is already coming apart.
+   * obligation, a scheduled message in either direction (#191), or a live event
+   * subscription (#540). That refusal names every blocker so the retirer can
+   * reassign, finish, cancel, transfer, or unsubscribe each one and retry; nothing
+   * is dropped mechanically as a fallback, because a dropped delivery is a decision
+   * nobody made. **No flag passes it**, `force` included: the two refusals answer
+   * different questions, and overriding "someone is still working" was never a licence
+   * to destroy the work itself. The subtree cascade skips it by going through
+   * {@link retireUnchecked} instead — the entry call already cleared the whole subtree,
+   * and re-asking mid-teardown would only re-answer the same question against a tree
+   * that is already coming apart.
    *
    * @throws when the subtree has running runs (or queued runs without `force`/`forceQueued`).
-   * @throws {RetirementBlockedError} when the subtree holds live obligations or pending messages.
+   * @throws {RetirementBlockedError} when the subtree holds live obligations, pending messages, or live event subscriptions.
    */
   retire(id: string, opts: RetireOptions = {}): void {
     id = this.resolveThreadId(id);
@@ -3279,7 +3338,11 @@ export class ActorMesh {
     }
     // Outside the `force` branch on purpose: see the doc comment above.
     const blockers = this.retirementBlockers(id);
-    if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
+    if (
+      blockers.obligations.length > 0 ||
+      blockers.messages.length > 0 ||
+      blockers.subscriptions.length > 0
+    ) {
       throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
     }
     this.retireUnchecked(id);
@@ -3512,8 +3575,8 @@ export class ActorMesh {
 
   /**
    * Everything in `id`'s subtree that needs an explicit decision before it can
-   * retire: live obligations owned anywhere in it, and pending scheduled
-   * messages with either endpoint in it.
+   * retire: live obligations owned anywhere in it, pending scheduled
+   * messages with either endpoint in it, and live event subscriptions held in it (#540).
    *
    * Both message directions block by decision (#191). Inbound alone is the
    * narrower rule, but it leaves a retired actor able to speak later with no
@@ -3557,7 +3620,26 @@ export class ActorMesh {
         direction: incoming && outgoing ? "internal" : incoming ? "incoming" : "outgoing",
       });
     }
-    return { obligations, messages };
+    const subscriptions: SubscriptionRetirementBlocker[] = [];
+    for (const sub of this.eventSourceOwners.list()) {
+      if (subtree.has(sub.actorId) && !sub.unsubscribedAt) {
+        subscriptions.push({
+          resource: sub.resource,
+          actorId: sub.actorId,
+          kind: "ownership",
+        });
+      }
+    }
+    for (const sub of this.eventSourceSubscriptions.list()) {
+      if (subtree.has(sub.actorId)) {
+        subscriptions.push({
+          resource: sub.resource,
+          actorId: sub.actorId,
+          kind: "subscription",
+        });
+      }
+    }
+    return { obligations, messages, subscriptions };
   }
 
   /**
@@ -3805,6 +3887,15 @@ export class ActorMesh {
     );
   }
 
+  /**
+   * Safety net cleanup: removes any lingering event subscriptions or ownerships
+   * for the retiring actor.
+   *
+   * Under standard {@link retire}, this is unreachable because `retirementBlockers`
+   * refuses retirement if any active event subscription or ownership remains in the
+   * subtree. It is preserved here as a defense-in-depth safety net during teardown
+   * so that no active routing records can survive an actor's retirement.
+   */
   private retireEventSubscriptions(record: ActorRecord): void {
     const at = this.now();
     for (const subscription of this.eventSourceOwners.list()) {
