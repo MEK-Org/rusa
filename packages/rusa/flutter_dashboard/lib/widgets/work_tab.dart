@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
-import '../actor_display.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
@@ -797,6 +796,7 @@ class _DetailViewState extends State<_DetailView> {
               ObligationCheckpointPanel(
                 obligation: o,
                 lookupHandle: (id) => store.actor(id)?.handle,
+                isHuman: (id) => store.isHuman(id),
                 selectable: true,
               ),
             ],
@@ -820,6 +820,7 @@ class _DetailViewState extends State<_DetailView> {
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
                   lookupActorHandle: (id) => store.actor(id)?.handle,
+                  isHuman: (id) => store.isHuman(id),
                   openLink: openLink,
                 ),
               const SizedBox(height: 16),
@@ -879,7 +880,7 @@ class _DetailViewState extends State<_DetailView> {
   }
 
   Widget _ownerPanel(String ownerId) {
-    final isHuman = ownerId.startsWith('human:');
+    final isHuman = store.isHuman(ownerId);
     final isSystem = ownerId.startsWith('system:');
     final isActor = !isHuman && !isSystem;
 
@@ -958,10 +959,10 @@ class _DetailViewState extends State<_DetailView> {
   /// by Owner (always present) and Creator (rendered separately when null,
   /// above).
   Widget _identityPanel(String id, {Widget? action}) {
-    final isHuman = id.startsWith('human:');
+    final isHuman = store.isHuman(id);
     final isSystem = id.startsWith('system:');
     final isActor = !isHuman && !isSystem;
-    final displayId = actorDisplayLabel(id, (i) => store.actor(i)?.handle);
+    final displayId = store.actorDisplay(id);
     // The second line adds category context beyond the primary label — for
     // human/system ids the primary label already says it, so there is
     // nothing more to add. Raw actor/thread ids only belong under the handle

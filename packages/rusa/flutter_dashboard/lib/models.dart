@@ -350,6 +350,7 @@ class ThreadsSnapshot {
     this.runtimeCursor,
     this.schedulerWarning,
     this.supportedVoices = const [],
+    this.userPrincipalId,
   });
 
   final bool halted;
@@ -367,6 +368,10 @@ class ThreadsSnapshot {
   /// working); this is the health-visible surface for that non-fatal state.
   final List<String>? schedulerWarning;
 
+  /// The viewing user's durable principal ID, reported by the server so
+  /// obligations and chat can be attributed to the person (#460, #538).
+  final String? userPrincipalId;
+
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
     runtimeCursor: j['runtimeCursor'] == null
@@ -382,6 +387,7 @@ class ThreadsSnapshot {
             ?.map((e) => e as String)
             .toList() ??
         const [],
+    userPrincipalId: j['userPrincipalId'] as String?,
   );
 }
 

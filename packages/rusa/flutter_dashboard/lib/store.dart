@@ -3,11 +3,13 @@ import 'dart:convert';
 
 import 'package:rxdart/rxdart.dart';
 
+import 'actor_display.dart';
 import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'principals.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
 import 'voice_platform.dart';
@@ -378,6 +380,19 @@ class DashboardStore {
   ActorViewState? actor(String id) => _actorStates.value.actor(id);
   List<ActorViewState> get runningActors => _actorStates.value.runningActors;
   List<ActorViewState> get queuedActors => _actorStates.value.queuedActors;
+
+  String? get userPrincipalId => _dashboardConfig.value?.userPrincipalId;
+
+  /// Whether [id] names a human operator — either the legacy alias, any
+  /// `human:*` prefix, or the server-resolved durable user principal.
+  bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
+
+  /// Resolves an actor/thread/principal id to a display label.
+  String actorDisplay(String id) => actorDisplayLabel(
+        id,
+        (i) => actor(i)?.handle,
+        isHuman,
+      );
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {
@@ -1410,6 +1425,21 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
+      if (snap.userPrincipalId != null &&
+          _dashboardConfig.value?.userPrincipalId != snap.userPrincipalId) {
+        final cur = _dashboardConfig.value;
+        _dashboardConfig.add(
+          cur == null
+              ? DashboardConfigDto(
+                  quotaProviders: const {},
+                  userPrincipalId: snap.userPrincipalId,
+                )
+              : DashboardConfigDto(
+                  quotaProviders: cur.quotaProviders,
+                  userPrincipalId: snap.userPrincipalId,
+                ),
+        );
+      }
       _updateActorStatesFromThreads(snap.threads);
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree

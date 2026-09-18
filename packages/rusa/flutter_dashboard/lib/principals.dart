@@ -45,3 +45,12 @@ bool isOperatorOwnerText(String text, String? userPrincipalId) {
       t == kOperatorDisplayHandle ||
       isViewerPrincipal(t, userPrincipalId);
 }
+
+/// Whether `id` names a human principal — either the legacy alias, any
+/// `human:*` prefix, or the server-resolved durable user principal.
+bool isHumanPrincipal(String? id, String? userPrincipalId) {
+  if (id == null) return false;
+  if (id.startsWith('human:')) return true;
+  return isViewerPrincipal(id, userPrincipalId);
+}
+

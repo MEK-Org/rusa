@@ -91,6 +91,94 @@ void main() {
   });
 
   testWidgets(
+    'shows "Operator" for a human-owned obligation with durable user principal (#538)',
+    (tester) async {
+      await tester.runAsync(() async {
+        const durableUser = '9f1c2e58-0000-4000-8000-00000000abcd';
+        final ob = makeObligation(
+          'ob-human-owner',
+          ownerId: durableUser,
+          intent: 'Operator decision task',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: durableUser,
+          )
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Operator decision task'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('OWNER'), findsOneWidget);
+        expect(find.text('Operator'), findsOneWidget);
+        expect(find.text('Unknown actor'), findsNothing);
+        expect(find.text(durableUser), findsNothing);
+        expect(find.text('View Owner Queue →'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'shows "Operator" for a human creator with durable user principal (#538)',
+    (tester) async {
+      await tester.runAsync(() async {
+        const durableUser = '9f1c2e58-0000-4000-8000-00000000abcd';
+        final ob = makeObligation(
+          'ob-human-creator-durable',
+          ownerId: 'root',
+          creatorId: durableUser,
+          intent: 'Filed by the durable operator',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: durableUser,
+          )
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Filed by the durable operator'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('CREATOR'), findsOneWidget);
+        expect(find.text('Operator'), findsOneWidget);
+        expect(find.text('Unknown actor'), findsNothing);
+        expect(find.text(durableUser), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     'shows "Unknown actor" for a creator id no lookup can find, never the '
     'raw id',
     (tester) async {

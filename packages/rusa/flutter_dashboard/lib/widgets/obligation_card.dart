@@ -70,7 +70,7 @@ class ObligationRow extends StatelessWidget {
         if (showOwner) ...[
           const SizedBox(height: 2),
           Text(
-            'Owner: ${store.actor(obligation.ownerId)?.handle ?? obligation.ownerId}',
+            'Owner: ${store.isHuman(obligation.ownerId) ? 'Operator' : (store.actor(obligation.ownerId)?.handle ?? obligation.ownerId)}',
             style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
           ),
         ],
@@ -206,6 +206,7 @@ class ObligationRow extends StatelessWidget {
               ObligationCheckpointPanel(
                 obligation: obligation,
                 lookupHandle: (id) => store.actor(id)?.handle,
+                isHuman: (id) => store.isHuman(id),
                 maxLines: 4,
               ),
             ],
@@ -314,7 +315,7 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${store.actor(blocker.ownerId)?.handle ?? blocker.ownerId})',
+                          '• ${blocker.intent ?? blocker.id} (${store.isHuman(blocker.ownerId) ? 'Operator' : (store.actor(blocker.ownerId)?.handle ?? blocker.ownerId)})',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,
@@ -340,9 +341,14 @@ class ObligationRow extends StatelessWidget {
 /// unrepresentable on this API.
 String checkpointStampLabel(
   ObligationDto obligation,
-  String? Function(String id) lookupHandle,
-) {
-  final author = actorDisplayLabel(obligation.checkpointBy!, lookupHandle);
+  String? Function(String id) lookupHandle, {
+  bool Function(String id)? isHuman,
+}) {
+  final author = actorDisplayLabel(
+    obligation.checkpointBy!,
+    lookupHandle,
+    isHuman,
+  );
   final when = formatTs(obligation.checkpointAt!);
   return '$author · $when';
 }
@@ -359,12 +365,14 @@ class ObligationCheckpointPanel extends StatelessWidget {
     super.key,
     required this.obligation,
     required this.lookupHandle,
+    this.isHuman,
     this.maxLines,
     this.selectable = false,
   });
 
   final ObligationDto obligation;
   final String? Function(String id) lookupHandle;
+  final bool Function(String id)? isHuman;
 
   /// Cap the standing's height where the surrounding surface is a summary. Null
   /// shows it whole, which is what a detail view owes a reader.
@@ -408,7 +416,7 @@ class ObligationCheckpointPanel extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  checkpointStampLabel(obligation, lookupHandle),
+                  checkpointStampLabel(obligation, lookupHandle, isHuman: isHuman),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
