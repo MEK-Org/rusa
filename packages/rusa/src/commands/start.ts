@@ -23,6 +23,7 @@ import {
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import {
   ADMINISTRATIVE_CAPABILITIES,
+  bootstrapCapabilitiesFor,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
@@ -3312,8 +3313,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // a pair with any existing row — active or revoked — is left alone, so a
   // revocation survives restarts and topology never re-derives authority. This
   // is the single remaining place the configured id feeds authority, and it
-  // runs after adoption because grants are keyed on the actor row.
-  const seededGrants = seedConfiguredActorGrants(capabilityGrants, rootId);
+  // runs after adoption because grants are keyed on the actor row. Only the
+  // host-maintenance servers this boot actually built are seeded (a host
+  // without a resolvable deploy checkout has no `update` server); a later boot
+  // that can mount one seeds that pair then.
+  const seededGrants = seedConfiguredActorGrants(
+    capabilityGrants,
+    rootId,
+    undefined,
+    bootstrapCapabilitiesFor(new Set(grantableServers.keys()))
+  );
   if (seededGrants.length > 0) {
     log.info("bootstrap_capabilities_seeded", { actorId: rootId, capabilities: seededGrants });
     refreshLiveActorMcp(rootId);

@@ -865,21 +865,27 @@ export function createAgentExecMcpServer(
   // a revocation fails closed on an already-open session. Topology (`isRoot`,
   // a null parent, the configured root id) plays no part: a capable opaque-id
   // actor gets exactly the same tools, and an ungranted parentless actor gets
-  // none. Where a tool names a target actor, the caller is further confined to
-  // its own subtree (self included) — the same scoping the mesh applies to
-  // grants, experiments and model changes.
+  // none. Every tool below is further confined to the caller's own subtree
+  // (self included): a write naming a target actor is refused outside it, and
+  // an inspection read returns only the rows whose actor lies inside it — the
+  // same scoping the mesh applies to grants, experiments and model changes, so
+  // delegating a capability down a tree never widens what its holder can see.
   const holds = (capability: string) => mesh.hasActiveCapability(selfId, capability);
   const assertCapability = (capability: string) =>
     holds(capability)
       ? null
       : toolError(new Error(`${selfId} no longer holds ${capability}; refusing this tool`));
+  const inSubtree = (targetId: string) => mesh.isAncestorOf(selfId, targetId);
   const assertInSubtree = (capability: string, targetId: string, verb: string) => {
-    if (!mesh.isAncestorOf(selfId, targetId)) {
+    if (!inSubtree(targetId)) {
       throw new Error(
         `${selfId} may only ${verb} actors in its own subtree (cannot ${verb} ${targetId}; ${capability} is subtree-scoped)`
       );
     }
   };
+  // A wake target is a thread id or a suffixed slot (`<thread id>:<slot>`);
+  // the thread id in front of the first colon is the actor being scoped.
+  const wakeThreadId = (actorId: string) => actorId.split(":")[0] ?? actorId;
 
   if (holds(MODEL_ADMIN_CAPABILITY)) {
     // Definitions are operational policy held by `model-admin`. The store is
@@ -1061,7 +1067,7 @@ export function createAgentExecMcpServer(
       {
         title: "List experiments and current enrollments (experiment-admin)",
         description:
-          "List the hard-coded experiment registry and the enrollments currently in force. Requires the experiment-admin capability. Pass actor_id to scope the enrollments to one actor; omit it for every enrollment in the mesh. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
+          "List the hard-coded experiment registry and the enrollments currently in force. Requires the experiment-admin capability. Pass actor_id to scope the enrollments to one actor in your own subtree; omit it for every enrollment in your subtree. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
         inputSchema: {
           actor_id: z
             .string()
@@ -1073,12 +1079,18 @@ export function createAgentExecMcpServer(
         const denied = assertExperimentAdmin();
         if (denied) return denied;
         try {
-          const enrollments = mesh.listExperimentEnrollments(actor_id).map((enrollment) => ({
-            actor_id: enrollment.actorId,
-            experiment: enrollment.experiment,
-            enrolled_by: enrollment.enrolledBy,
-            enrolled_at: enrollment.enrolledAt,
-          }));
+          if (actor_id !== undefined) {
+            assertInSubtree(EXPERIMENT_ADMIN_CAPABILITY, actor_id, "inspect");
+          }
+          const enrollments = mesh
+            .listExperimentEnrollments(actor_id)
+            .filter((enrollment) => inSubtree(enrollment.actorId))
+            .map((enrollment) => ({
+              actor_id: enrollment.actorId,
+              experiment: enrollment.experiment,
+              enrolled_by: enrollment.enrolledBy,
+              enrolled_at: enrollment.enrolledAt,
+            }));
           return toolOk({
             experiments: EXPERIMENT_NAMES.map((name) => ({
               name,
@@ -1200,7 +1212,7 @@ export function createAgentExecMcpServer(
       {
         title: "List event source ownership and subscriptions (actor-admin)",
         description:
-          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Requires the actor-admin capability.",
+          "List every event source owner (active claims and released tombstones) and every direct subscriber in your own subtree — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Requires the actor-admin capability.",
         inputSchema: eventResourceInputSchema,
       },
       async (args) => {
@@ -1213,8 +1225,10 @@ export function createAgentExecMcpServer(
           // the ownership half read as the whole answer. When a canonical source
           // is queried, effectiveRoute reconciles live obligation claims against
           // stored subscriptions under that same unified inspection lens.
-          const owners = mesh.listSubscriptions();
-          const subscribers = mesh.listEventSourceSubscriptions();
+          const owners = mesh.listSubscriptions().filter((row) => inSubtree(row.actorId));
+          const subscribers = mesh
+            .listEventSourceSubscriptions()
+            .filter((row) => inSubtree(row.actorId));
 
           const hasResource = Boolean(
             args?.source ||
@@ -1256,7 +1270,7 @@ export function createAgentExecMcpServer(
         {
           title: "Schedule a recurring wake for an actor (actor-admin)",
           description:
-            "Install (or replace) a cron schedule that mechanically wakes an actor — e.g. the nightly IU distill or standing ops (bless cut, digest). `cron_expr` is a standard 5-field cron expression (min hour dom mon dow); `reason` is delivered to the actor's inbox as its wake prompt; `priority` ('responsive' or true) marks the wake to ride the responsive lane and bypass provider pacing. Idempotent per actor. Requires the actor-admin capability.",
+            "Install (or replace) a cron schedule that mechanically wakes an actor — e.g. the nightly IU distill or standing ops (bless cut, digest). `cron_expr` is a standard 5-field cron expression (min hour dom mon dow); `reason` is delivered to the actor's inbox as its wake prompt; `priority` ('responsive' or true) marks the wake to ride the responsive lane and bypass provider pacing. Idempotent per actor. Requires the actor-admin capability; the actor must lie in your own subtree.",
           inputSchema: {
             actor_id: z
               .string()
@@ -1281,6 +1295,7 @@ export function createAgentExecMcpServer(
           const denied = assertActorAdmin();
           if (denied) return denied;
           try {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, wakeThreadId(actor_id), "schedule a wake for");
             const normalizedPriority =
               priority === "responsive" || priority === true ? "responsive" : undefined;
             await wakeScheduler.schedule(actor_id, cron_expr, reason, normalizedPriority);
@@ -1296,7 +1311,7 @@ export function createAgentExecMcpServer(
         {
           title: "Cancel an actor's recurring wake (actor-admin)",
           description:
-            "Remove an actor's cron wake schedule. No-op if none is set. Requires the actor-admin capability.",
+            "Remove an actor's cron wake schedule. No-op if none is set. Requires the actor-admin capability; the actor must lie in your own subtree.",
           inputSchema: {
             actor_id: z
               .string()
@@ -1309,6 +1324,7 @@ export function createAgentExecMcpServer(
           const denied = assertActorAdmin();
           if (denied) return denied;
           try {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, wakeThreadId(actor_id), "cancel a wake for");
             await wakeScheduler.cancel(actor_id);
             return toolOk(`cancelled wake for ${actor_id}`);
           } catch (err) {
@@ -1322,14 +1338,15 @@ export function createAgentExecMcpServer(
         {
           title: "List scheduled wakes (actor-admin)",
           description:
-            "List every scheduled wake (actor id, cron expression, reason) — the inspection view of the nightly triggers. Requires the actor-admin capability.",
+            "List every scheduled wake in your own subtree (actor id, cron expression, reason) — the inspection view of the nightly triggers. Requires the actor-admin capability.",
           inputSchema: {},
         },
         async () => {
           const denied = assertActorAdmin();
           if (denied) return denied;
           try {
-            return toolOk(await wakeScheduler.list());
+            const wakes = await wakeScheduler.list();
+            return toolOk(wakes.filter((wake) => inSubtree(wakeThreadId(wake.actorId))));
           } catch (err) {
             return toolError(err);
           }
@@ -1346,14 +1363,14 @@ export function createAgentExecMcpServer(
       {
         title: "List capability grants (capability-admin)",
         description:
-          "List every capability grant (active and revoked) — the audit/inspection view of who holds what. Requires the capability-admin capability.",
+          "List every capability grant (active and revoked) held by an actor in your own subtree — the audit/inspection view of who holds what. Requires the capability-admin capability.",
         inputSchema: {},
       },
       async () => {
         const denied = assertCapability(CAPABILITY_ADMIN_CAPABILITY);
         if (denied) return denied;
         try {
-          return toolOk(mesh.listGrants());
+          return toolOk(mesh.listGrants().filter((grant) => inSubtree(grant.actorId)));
         } catch (err) {
           return toolError(err);
         }

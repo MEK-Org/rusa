@@ -7,6 +7,7 @@ import {
   ADMINISTRATIVE_CAPABILITIES,
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
+  HOST_MAINTENANCE_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
@@ -44,7 +45,11 @@ function setup() {
     actors,
     rootId: "configured",
     capabilityGrants: grants,
-    grantableCapabilities: new Set([...GRANTABLE, ...ADMINISTRATIVE_CAPABILITIES]),
+    grantableCapabilities: new Set([
+      ...GRANTABLE,
+      ...ADMINISTRATIVE_CAPABILITIES,
+      ...HOST_MAINTENANCE_CAPABILITIES,
+    ]),
     now: () => "2026-01-01T00:00:00Z",
     createActor: (ctx) => ({
       id: ctx.record.id,
@@ -145,6 +150,26 @@ describe("capability administration is grant-derived", () => {
     mesh.grantCapability("0b2c3d4e-steward", EXPERIMENT_ADMIN_CAPABILITY, "configured");
     expect(mesh.hasActiveCapability("0b2c3d4e-steward", EXPERIMENT_ADMIN_CAPABILITY)).toBe(true);
     expect(mesh.hasActiveCapability("steward-child", EXPERIMENT_ADMIN_CAPABILITY)).toBe(false);
+  });
+
+  // Host maintenance (`update`, `pnpm-hardlinks`) acts on the whole daemon, so
+  // the subtree boundary that bounds every other delegation cannot bound it. A
+  // holder may hold, revoke and re-grant it to itself; it may not hand it down.
+  it("refuses to delegate a host-maintenance capability below the holder", async () => {
+    const { grants, mesh } = setup();
+    seedConfiguredActorGrants(grants, "configured", () => "2026-01-01T00:00:00Z");
+    for (const capability of HOST_MAINTENANCE_CAPABILITIES) {
+      expect(() => mesh.grantCapability("0b2c3d4e-steward", capability, "configured")).toThrow(
+        /not delegable/
+      );
+      expect(mesh.hasActiveCapability("0b2c3d4e-steward", capability)).toBe(false);
+    }
+    // Revoking from itself and restoring to itself stays possible, so a
+    // revocation is not a one-way door that only a database edit reopens.
+    await mesh.revokeCapability("configured", "update", "configured");
+    expect(mesh.hasActiveCapability("configured", "update")).toBe(false);
+    expect(() => mesh.grantCapability("configured", "update", "configured")).not.toThrow();
+    expect(mesh.hasActiveCapability("configured", "update")).toBe(true);
   });
 });
 

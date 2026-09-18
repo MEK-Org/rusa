@@ -35,6 +35,7 @@ import {
 import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
@@ -404,6 +405,171 @@ describe("administrative capability gating of management tools (#549)", () => {
     })) as CallToolResult;
     expect(after.isError).toBe(true);
     expect(dataOf(after)).toMatch(/experiment-admin/);
+  });
+
+  /** A steward under root with one child, and a sibling outside the steward's subtree. */
+  function subtreeFixture(capabilities: readonly string[]) {
+    const fixture = setup({ seedRootGrants: false });
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      fixture.registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    for (const capability of capabilities) {
+      fixture.capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    return fixture;
+  }
+
+  it("confines wake schedules to the holder's subtree, slot suffixes included", async () => {
+    const { mesh } = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
+    const sched = new FakeWakeScheduler();
+    sched.entries.push(
+      { actorId: "sibling", cronExpr: "0 1 * * *", reason: "outside" },
+      { actorId: "root:daily-bless-cut", cronExpr: "0 2 * * *", reason: "outside slot" }
+    );
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", sched));
+
+    for (const actor_id of ["steward-child:nightly", "0b2c3d4e-steward"]) {
+      const ok = (await client.callTool({
+        name: "schedule_wake",
+        arguments: { actor_id, cron_expr: "0 3 * * *", reason: "inside" },
+      })) as CallToolResult;
+      expect(ok.isError, actor_id).toBeFalsy();
+    }
+    for (const actor_id of ["sibling", "root:daily-bless-cut", "sibling:nightly", "unknown-id"]) {
+      const refused = (await client.callTool({
+        name: "schedule_wake",
+        arguments: { actor_id, cron_expr: "0 3 * * *", reason: "hijack" },
+      })) as CallToolResult;
+      expect(refused.isError, actor_id).toBe(true);
+      expect(dataOf(refused)).toMatch(/subtree/);
+      const cancelRefused = (await client.callTool({
+        name: "cancel_wake",
+        arguments: { actor_id },
+      })) as CallToolResult;
+      expect(cancelRefused.isError, actor_id).toBe(true);
+      expect(dataOf(cancelRefused)).toMatch(/subtree/);
+    }
+    // Nothing outside the subtree was touched, and the listing is confined too.
+    expect(sched.entries.map((e) => e.actorId).sort()).toEqual(
+      ["0b2c3d4e-steward", "root:daily-bless-cut", "sibling", "steward-child:nightly"].sort()
+    );
+    const listed = dataOf(
+      (await client.callTool({ name: "list_wakes", arguments: {} })) as CallToolResult
+    ) as { actorId: string }[];
+    expect(listed.map((e) => e.actorId).sort()).toEqual(
+      ["0b2c3d4e-steward", "steward-child:nightly"].sort()
+    );
+  });
+
+  it("confines the inspection reads to the holder's subtree", async () => {
+    const experiments = new InMemoryExperimentEnrollmentStore();
+    const fixture = setup({ seedRootGrants: false, experimentEnrollments: experiments });
+    const { mesh, registry, capabilityGrants } = fixture;
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    for (const capability of [
+      CAPABILITY_ADMIN_CAPABILITY,
+      EXPERIMENT_ADMIN_CAPABILITY,
+      ACTOR_ADMIN_CAPABILITY,
+    ]) {
+      capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    // Rows inside and outside the steward's subtree, for every inspected ledger.
+    for (const actorId of ["steward-child", "sibling", "root"]) {
+      capabilityGrants.grant({
+        actorId,
+        capability: "understanding-write",
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      experiments.enroll({
+        actorId,
+        experiment: STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+        enrolledBy: "test",
+        enrolledAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    mesh.subscribeEventSource("github:inside-org", "steward-child", "0b2c3d4e-steward");
+    mesh.subscribeEventSource("github:outside-org", "sibling", "root");
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+
+    const grants = dataOf(
+      (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
+    ) as { actorId: string }[];
+    expect(new Set(grants.map((g) => g.actorId))).toEqual(
+      new Set(["0b2c3d4e-steward", "steward-child"])
+    );
+
+    const enrollments = (
+      dataOf(
+        (await client.callTool({ name: "list_actor_experiments", arguments: {} })) as CallToolResult
+      ) as { enrollments: { actor_id: string }[] }
+    ).enrollments;
+    expect(enrollments.map((e) => e.actor_id)).toEqual(["steward-child"]);
+    const outside = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: { actor_id: "sibling" },
+    })) as CallToolResult;
+    expect(outside.isError).toBe(true);
+    expect(dataOf(outside)).toMatch(/subtree/);
+
+    const subscriptions = dataOf(
+      (await client.callTool({ name: "list_subscriptions", arguments: {} })) as CallToolResult
+    ) as { owners: { actorId: string }[]; subscribers: { actorId: string }[] };
+    expect(subscriptions.owners.map((o) => o.actorId)).toEqual(["steward-child"]);
+    expect(subscriptions.subscribers.every((s) => s.actorId !== "sibling")).toBe(true);
+  });
+
+  it("a second boot leaves a revoked seed revoked and mounts none of its tools", async () => {
+    const { mesh, capabilityGrants } = setup();
+    capabilityGrants.revoke("root", ACTOR_ADMIN_CAPABILITY, "2026-01-02T00:00:00Z");
+    // The wiring re-runs the seed on every boot; it must not restore the pair.
+    expect(
+      seedConfiguredActorGrants(capabilityGrants, "root", () => "2026-01-03T00:00:00Z")
+    ).toEqual([]);
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", new FakeWakeScheduler(), modelClassDeps())
+    );
+    const names = await toolNames(client);
+    const actorAdminTools = MANAGEMENT_TOOLS[ACTOR_ADMIN_CAPABILITY] ?? [];
+    for (const tool of [...actorAdminTools, "schedule_wake", "list_wakes"]) {
+      expect(names, tool).not.toContain(tool);
+    }
+    // The other seeded capabilities are untouched by the revocation.
+    expect(names).toEqual(
+      expect.arrayContaining([...(MANAGEMENT_TOOLS[CAPABILITY_ADMIN_CAPABILITY] ?? [])])
+    );
   });
 
   it("the seeded configured actor keeps every management tool (preserved access)", async () => {
@@ -2575,7 +2741,15 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
   });
 
   it("schedule_wake / list_wakes / cancel_wake drive the scheduler", async () => {
-    const { mesh } = setup();
+    const { mesh, registry } = setup();
+    // A wake targets a known actor in the caller's subtree (#549).
+    registry.upsert({
+      id: "73e0b00f",
+      charter: "nightly",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
     const sched = new FakeWakeScheduler();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root", sched));
 
@@ -2644,7 +2818,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root", sched));
     const res = (await client.callTool({
       name: "schedule_wake",
-      arguments: { actor_id: "x", cron_expr: "bad", reason: "y" },
+      arguments: { actor_id: "root", cron_expr: "bad", reason: "y" },
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);

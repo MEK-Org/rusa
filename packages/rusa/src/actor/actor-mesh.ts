@@ -45,6 +45,7 @@ import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./act
 import {
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
+  HOST_MAINTENANCE_CAPABILITIES,
   MODEL_ADMIN_CAPABILITY,
 } from "./administrative-capabilities.js";
 import {
@@ -2083,10 +2084,24 @@ export class ActorMesh {
       throw new Error(`unknown thread id: ${granteeId}`);
     }
     if (this.hasActiveCapability(grantorId, CAPABILITY_ADMIN_CAPABILITY)) {
-      if (this.isAncestorOf(grantorId, granteeId)) return;
-      throw new Error(
-        `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
-      );
+      if (!this.isAncestorOf(grantorId, granteeId)) {
+        throw new Error(
+          `${grantorId} may only ${verb} capabilities in its own subtree (cannot ${verb} ${granteeId})`
+        );
+      }
+      // Host maintenance acts on the whole daemon, so the subtree boundary that
+      // bounds every other delegation cannot bound it: a holder may hold it
+      // (and revoke/restore it on itself) but never hand it to another actor.
+      if (
+        verb === "grant" &&
+        HOST_MAINTENANCE_CAPABILITIES.has(capability) &&
+        grantorId !== granteeId
+      ) {
+        throw new Error(
+          `${capability} is not delegable: it acts on the whole host, so ${grantorId} may hold it but not grant it to ${granteeId}`
+        );
+      }
+      return;
     }
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {

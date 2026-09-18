@@ -49,7 +49,10 @@ export const ADMINISTRATIVE_CAPABILITIES: ReadonlySet<string> = new Set([
 /**
  * Host/process maintenance is a grantable MCP server like any other: the
  * capability name is the server name, and the composition point mounts the
- * server for whichever actor holds the grant.
+ * server for whichever actor holds the grant. Unlike the administrative
+ * capabilities it is NOT delegable — it acts on the whole daemon, so the
+ * subtree boundary cannot bound it; the mesh lets a holder hold, revoke and
+ * restore it on itself but never grant it to another actor.
  */
 export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
   UPDATE_MCP_NAME,
@@ -65,6 +68,19 @@ export const CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES: readonly string[] = [
   ...ADMINISTRATIVE_CAPABILITIES,
   ...HOST_MAINTENANCE_CAPABILITIES,
 ];
+
+/**
+ * The bootstrap set this boot can actually stand behind: every administrative
+ * capability (they gate tools on the agent-exec endpoint, which always exists)
+ * plus only those host-maintenance servers the wiring managed to build. A host
+ * whose deploy checkout can't be resolved boots without `update`, and a seeded
+ * grant with no server behind it would read as authority that does nothing.
+ */
+export function bootstrapCapabilitiesFor(mountable: ReadonlySet<string>): string[] {
+  return CONFIGURED_ACTOR_BOOTSTRAP_CAPABILITIES.filter(
+    (capability) => ADMINISTRATIVE_CAPABILITIES.has(capability) || mountable.has(capability)
+  );
+}
 
 /** The `grantedBy` recorded on a seeded row, so the audit view shows its provenance. */
 export const CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR = "system:bootstrap";
