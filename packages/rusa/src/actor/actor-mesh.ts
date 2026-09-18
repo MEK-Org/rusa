@@ -20,6 +20,11 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import type {
+  InboxEntry,
+  InboxPayload,
+  InboxRepository,
+} from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
   deduplicatedInboxEntryId,
@@ -72,7 +77,6 @@ import {
   STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
-import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
 import {
   DROPPED_MESSAGE_DETAIL,
   type MeshEventSink,
@@ -690,7 +694,7 @@ export interface ActorMeshOptions {
    */
   obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
-  inboxStore?: InboxStore;
+  inboxStore?: InboxRepository;
   /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
   isVoiceSessionActive?: (actorId: string) => boolean;
   /**
@@ -835,7 +839,7 @@ export class ActorMesh {
   private readonly obligations?: MeshObligationPort;
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
-  private readonly inboxStore?: InboxStore;
+  private readonly inboxStore?: InboxRepository;
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
   private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { attachInboxHints, isGchatThreadHead, resolveInboxHint } from "./inbox-hints.js";
-import type { InboxEntry } from "./inbox-store.js";
 
 function makeEntry(partial: Partial<InboxEntry> = {}): InboxEntry {
   return {

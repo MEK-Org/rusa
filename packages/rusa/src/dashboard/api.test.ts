@@ -12,11 +12,11 @@ import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import { readAvatar } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
-import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createLogger } from "../observability/logger.js";
 import {
@@ -152,7 +152,7 @@ describe("handleMeshApiRequest", () => {
   let db: Database.Database;
   let meshEvents: MeshEventRepository;
   let meshChat: MeshChatRepository;
-  let inbox: InboxRepository;
+  let inbox: SqliteInboxRepository;
   let obligations: ObligationRepository;
   let actors: InMemoryActorRepository;
   let principals: PrincipalRepository;
@@ -167,7 +167,7 @@ describe("handleMeshApiRequest", () => {
     runMigrations(db);
     meshEvents = new MeshEventRepository(db);
     meshChat = new MeshChatRepository(db);
-    inbox = new InboxRepository(db);
+    inbox = new SqliteInboxRepository(db);
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
     principals = new PrincipalRepository(db);

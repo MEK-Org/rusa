@@ -26,11 +26,11 @@ import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-sc
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
-import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   fillModelConfigFromCurrent,
@@ -139,7 +139,7 @@ function setup(
   // manager so this harness cannot drift from production append semantics.
   const eventDb = new Database(":memory:");
   runMigrations(eventDb);
-  const inboxStore = new InboxRepository(eventDb);
+  const inboxStore = new SqliteInboxRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
@@ -381,7 +381,7 @@ describe("agent-execution MCP server", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const actors = new SqliteActorRepository(db);
-    const inboxStore = new InboxRepository(db);
+    const inboxStore = new SqliteInboxRepository(db);
     const chat = new MeshChatRepository(db);
     let holder = "";
     const mesh = new ActorMesh({

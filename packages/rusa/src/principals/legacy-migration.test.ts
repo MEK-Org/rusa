@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { runMigrations } from "../db/migrations/runner.js";
-import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import {
   backupDatabase,
@@ -470,7 +470,7 @@ describe("legacy-migration", () => {
       const principalRepo = new PrincipalRepository(db);
       const actorRepo = new SqliteActorRepository(db, principalRepo);
       const chatRepo = new MeshChatRepository(db);
-      const inboxStore = new InboxRepository(db);
+      const inboxStore = new SqliteInboxRepository(db);
       const obligationRepo = new ObligationRepository(db);
 
       const user1 = principalRepo.createUser({
@@ -590,7 +590,7 @@ describe("legacy-migration", () => {
       const principalRepo = new PrincipalRepository(db);
       const actorRepo = new SqliteActorRepository(db, principalRepo);
       const chatRepo = new MeshChatRepository(db);
-      const inboxStore = new InboxRepository(db);
+      const inboxStore = new SqliteInboxRepository(db);
       const obligationRepo = new ObligationRepository(db);
 
       const mesh = new ActorMesh({
