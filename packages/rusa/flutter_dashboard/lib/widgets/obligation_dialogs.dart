@@ -630,7 +630,12 @@ Future<void> confirmAndSetObligationStatus(
   String status, {
   VoidCallback? onUpdated,
 }) async {
-  final label = status == 'done' ? 'Mark Done' : 'Cancel';
+  final isDone = status == 'done';
+  final actionTitle = isDone ? 'Mark Done Obligation?' : 'Cancel Obligation?';
+  // "Cancel" is clear beside "Mark Done"; cancellation needs "Dismiss" to
+  // distinguish closing the dialog from confirming the destructive action.
+  final dismissLabel = isDone ? 'Cancel' : 'Dismiss';
+  final confirmLabel = isDone ? 'Mark Done' : 'Confirm cancellation';
   // The note is the only record of *why* this transition happened. For a
   // cancellation it is the only trace the intent ever existed, and for a
   // human-owned decision child it is the answer itself, so it is offered on
@@ -649,7 +654,7 @@ Future<void> confirmAndSetObligationStatus(
         side: const BorderSide(color: MeshColors.border),
       ),
       title: Text(
-        '$label Obligation?',
+        actionTitle,
         style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
       ),
       // SizedBox inside a scroll view, matching the create/reparent dialogs:
@@ -668,7 +673,7 @@ Future<void> confirmAndSetObligationStatus(
               ),
               const SizedBox(height: 14),
               Text(
-                status == 'done' ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
+                isDone ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
                 style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
               ),
               const SizedBox(height: 4),
@@ -677,7 +682,7 @@ Future<void> confirmAndSetObligationStatus(
                 maxLines: 3,
                 style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
                 decoration: InputDecoration(
-                  hintText: status == 'done'
+                  hintText: isDone
                       ? 'What became true, or the answer if this was a question.'
                       : 'Why this intent is no longer current.',
                   hintStyle: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
@@ -690,17 +695,17 @@ Future<void> confirmAndSetObligationStatus(
       actions: [
         TextButton(
           onPressed: () => Navigator.of(dialogContext).pop(false),
-          child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+          child: Text(dismissLabel, style: const TextStyle(color: MeshColors.textSecondary)),
         ),
         ElevatedButton(
           onPressed: () => Navigator.of(dialogContext).pop(true),
           style: ElevatedButton.styleFrom(
-            backgroundColor: status == 'done'
+            backgroundColor: isDone
                 ? ObligationStatusColors.done.dot
                 : ObligationStatusColors.cancelled.dot,
             foregroundColor: MeshColors.textPrimary,
           ),
-          child: Text(label),
+          child: Text(confirmLabel),
         ),
       ],
     ),

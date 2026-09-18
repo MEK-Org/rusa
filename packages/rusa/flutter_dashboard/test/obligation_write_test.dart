@@ -502,6 +502,30 @@ void main() {
       await tester.tap(find.byTooltip('Cancel Obligation'));
       await tester.pumpAndSettle();
 
+      // Disambiguated non-destructive and destructive action labels (#508)
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.widgetWithText(TextButton, 'Dismiss'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.widgetWithText(ElevatedButton, 'Confirm cancellation'),
+        ),
+        findsOneWidget,
+      );
+      // No ambiguous duplicate 'Cancel' action in the cancellation confirmation panel
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.widgetWithText(Widget, 'Cancel'),
+        ),
+        findsNothing,
+      );
+
       await tester.enterText(
         find.descendant(
           of: find.byType(AlertDialog),
@@ -512,7 +536,7 @@ void main() {
       await tester.tap(
         find.descendant(
           of: find.byType(AlertDialog),
-          matching: find.widgetWithText(ElevatedButton, 'Cancel'),
+          matching: find.widgetWithText(ElevatedButton, 'Confirm cancellation'),
         ),
       );
       await tester.pumpAndSettle();
@@ -523,6 +547,57 @@ void main() {
         'Superseded by the ancestry projection.',
       );
     });
+
+    testWidgets(
+      'cancellation confirmation panel dismiss action clears without mutating (#508)',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+
+        api.obligationsResult = [
+          makeObligation('ob-root-dismiss', intent: 'Dismiss Test', status: 'ready'),
+        ];
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('Dismiss Test'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('Cancel Obligation'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Cancel Obligation?'), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.widgetWithText(TextButton, 'Dismiss'),
+          ),
+          findsOneWidget,
+        );
+
+        // Tap Dismiss
+        await tester.tap(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.widgetWithText(TextButton, 'Dismiss'),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Dialog dismissed, no status change recorded
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(api.statusCalls, isEmpty);
+      },
+    );
+
 
     testWidgets('shows why a terminal obligation ended', (tester) async {
       final done = makeObligation(
