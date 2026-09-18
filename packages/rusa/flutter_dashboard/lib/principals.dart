@@ -59,4 +59,3 @@ bool isHumanPrincipal(String? id, String? userPrincipalId) {
   if (id.startsWith('human:')) return true;
   return isViewerPrincipal(id, userPrincipalId);
 }
-

@@ -15,4 +15,3 @@ String actorDisplayLabel(
   if (handle != null && handle.trim().isNotEmpty) return handle;
   return 'Unknown actor';
 }
-
