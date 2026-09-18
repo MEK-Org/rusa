@@ -339,6 +339,13 @@ describe("E2EInstanceManager", () => {
     expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
   });
 
+  it("refuses malformed configured coordinator config before launching an instance", async () => {
+    writeFileSync(join(mcHome, "config.yaml"), "quota:\n  coordinator: [\n");
+
+    await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow();
+    expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+  });
+
   it("fails before package installation when a plain clone cannot initialize submodules", async () => {
     const subject = new E2EInstanceManager({
       mcHome,
