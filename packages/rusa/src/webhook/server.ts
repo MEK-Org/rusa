@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
+import { AvatarGenerationCoordinator } from "../avatar/avatars.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
 import {
   type DashboardDataDeps,
@@ -611,6 +612,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           selectedObligationForActor: options.mesh.selectedObligationForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
+          avatarGeneration: new AvatarGenerationCoordinator(),
           supportedVoices: options.mesh.supportedVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,

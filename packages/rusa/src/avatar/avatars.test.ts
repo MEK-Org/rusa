@@ -6,7 +6,7 @@ import { generateHandle } from "../actor/handle-generator.js";
 import {
   avatarCachePath,
   avatarsDir,
-  backfillAvatars,
+  AvatarGenerationCoordinator,
   configuredRootAvatarPath,
   generateAvatarForce,
   generateAvatarOnce,
@@ -287,12 +287,22 @@ describe("with an isolated RUSA_HOME", () => {
     }
   });
 
-  it("backfillAvatars never throws and skips root + cached (no network)", () => {
-    mkdirSync(avatarsDir(), { recursive: true });
-    writeFileSync(avatarCachePath(UUID), Buffer.from("cached"));
-    // root (fixed image) and UUID (already cached) are both no-ops; an empty key
-    // is harmless. No apiKey path is exercised for any uncached worker.
-    expect(() => backfillAvatars(["root", UUID], { apiKey: "" })).not.toThrow();
+  it("coalesces concurrent first-display requests and keeps a failed attempt settled", async () => {
+    const coordinator = new AvatarGenerationCoordinator();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unavailable"));
+
+    try {
+      const first = coordinator.request(UUID, { apiKey: "key" });
+      const second = coordinator.request(UUID, { apiKey: "key" });
+      expect(first).toBe(second);
+      await first;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await coordinator.request(UUID, { apiKey: "key" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 
   it("generateAvatarOnce fetches with imageSize: '512' and aspectRatio: '1:1'", async () => {
