@@ -212,8 +212,20 @@ export function createActorRuntime(
         break;
       }
       case "wake":
-        if (!stopping) actor?.requestRun(message.nudge);
+        if (!stopping) {
+          actor?.requestRun(message.nudge);
+          if (message.requestId !== undefined)
+            send({ type: "wakeAccepted", requestId: message.requestId });
+        }
         break;
+      case "preempt": {
+        // The leader can only report this as effective after this reply: the
+        // leader-side handle has no direct visibility into the follower's
+        // Actor state or its provider abort signal.
+        const result = actor?.preemptForResponsive() ?? { preempted: false as const };
+        send({ type: "preempted", requestId: message.requestId, ...result });
+        break;
+      }
       case "yield":
         actor?.declareYield(message.status, message.note);
         break;

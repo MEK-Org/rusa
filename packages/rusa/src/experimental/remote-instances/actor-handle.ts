@@ -3,7 +3,7 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
-import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
+import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
@@ -48,6 +48,17 @@ export class ActorHandle implements MeshActor {
   private startedRunId: string | undefined;
   private queuedMode: ActorRunMode | undefined;
   private receiveChain: Promise<void> | undefined;
+  /** Latest durable-work nudge retained while no follower channel is usable. */
+  private pendingWake: RunNudge | undefined;
+  /** The only acknowledgement that makes a retained wake safe to discard. */
+  private pendingWakeRequestId: number | undefined;
+  private wakeSequence = 0;
+  /** A running preemption that must be retried after the follower reattaches. */
+  private pendingPreempt = false;
+  /** Promotion requested before the follower's admission request reached the leader. */
+  private pendingQueuedPromotion = false;
+  private preemptSequence = 0;
+  private readonly outstandingPreempts = new Set<number>();
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -80,6 +91,7 @@ export class ActorHandle implements MeshActor {
       if (message.type === "ready") {
         clearTimeout(this.startupTimer);
         resolveReady(message.pid);
+        this.flushPendingWake();
         return;
       }
       this.enqueueReceive(message);
@@ -132,10 +144,10 @@ export class ActorHandle implements MeshActor {
   }
 
   requestRun(nudge?: RunNudge): void {
-    if (this.closed) return;
+    this.retainWake(nudge);
     void this.ready
       .then(() => {
-        if (!this.closed) this.send({ type: "wake", nudge });
+        this.flushPendingWake();
       })
       .catch(() => {});
   }
@@ -147,9 +159,26 @@ export class ActorHandle implements MeshActor {
   markUnkillable(): void {
     this.send({ type: "unkillable" });
   }
-  // The synchronous preemption contract cannot truthfully acknowledge child execution.
-  // Keep responsive preemption unsupported until that contract becomes asynchronous.
+  /**
+   * A follower confirms effective preemption asynchronously. Returning false
+   * here keeps ActorMesh from writing `run_preempted` before that confirmation.
+   * Queued admissions are a leader-owned resource, so they can be promoted
+   * directly without asking the follower to guess at a promise-backed gate.
+   */
   preemptForResponsive(): { preempted: false } {
+    // The follower may still be running while the leader is between transport
+    // generations (#381). Replay the intent first on attach; a live follower
+    // will confirm whether there was anything left to displace.
+    if (this.closed || !this.channel.connected) {
+      this.pendingPreempt = true;
+      return { preempted: false };
+    }
+    if (this.isQueued) {
+      if (!this.promoteQueuedAdmissions()) this.pendingQueuedPromotion = true;
+      return { preempted: false };
+    }
+    if (!this.isRunning) return { preempted: false };
+    if (!this.sendPreempt()) this.pendingPreempt = true;
     return { preempted: false };
   }
 
@@ -157,9 +186,25 @@ export class ActorHandle implements MeshActor {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    this.pendingWake = undefined;
+    this.pendingWakeRequestId = undefined;
+    this.pendingPreempt = false;
+    this.pendingQueuedPromotion = false;
+    this.outstandingPreempts.clear();
     // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
+  }
+
+  /** A transport loss is recoverable: preserve durable-work control intent for attachHost. */
+  private disconnect(): void {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.startupTimer);
+    this.pendingPreempt ||= this.outstandingPreempts.size > 0;
+    this.outstandingPreempts.clear();
+    // Keep running slots occupied until the remote actor releases them or exits.
+    for (const gate of this.gates.values()) gate.handle.cancel?.();
   }
 
   private releaseGates(): void {
@@ -197,7 +242,7 @@ export class ActorHandle implements MeshActor {
 
   private fail(error: Error): void {
     if (this.closed) return;
-    this.close();
+    this.disconnect();
     this.opts.onFailure(error);
     // A connection or startup failure is not itself a run outcome. Only a run
     // the leader actually admitted is terminated here, so an idle disconnect or
@@ -267,11 +312,80 @@ export class ActorHandle implements MeshActor {
     });
   }
 
-  private send(message: LeaderCommand): void {
-    if (this.channel.connected)
-      this.channel.send(message, (error) => {
-        if (error) this.fail(error);
+  private retainWake(nudge: RunNudge = {}): void {
+    if (!this.pendingWake) {
+      this.pendingWake = { ...nudge };
+      return;
+    }
+    const prior = this.pendingWake;
+    const ordinary = prior.mode !== "yield-elicitation" || nudge.mode !== "yield-elicitation";
+    this.pendingWake = {
+      priority: isResponsiveNudge(prior) || isResponsiveNudge(nudge) ? "responsive" : "normal",
+      mode: ordinary ? "ordinary" : "yield-elicitation",
+      ...(prior.voiceTimestamp !== undefined || nudge.voiceTimestamp !== undefined
+        ? {
+            voiceTimestamp: Math.min(
+              prior.voiceTimestamp ?? Infinity,
+              nudge.voiceTimestamp ?? Infinity
+            ),
+          }
+        : {}),
+    };
+  }
+
+  private flushPendingWake(): void {
+    if (this.closed || !this.channel.connected) return;
+    if (this.pendingPreempt && !this.sendPreempt()) return;
+    this.pendingPreempt = false;
+    const nudge = this.pendingWake;
+    if (nudge) {
+      const requestId = ++this.wakeSequence;
+      if (this.send({ type: "wake", nudge, requestId })) this.pendingWakeRequestId = requestId;
+    }
+  }
+
+  /** Promote the leader's real admission handle, not the follower's async gate wrapper. */
+  private promoteQueuedAdmissions(): boolean {
+    let promoted = false;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started) continue;
+      gate.handle.promote();
+      promoted = true;
+    }
+    if (promoted) {
+      this.log.info("remote_admission_promoted", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
       });
+    }
+    return promoted;
+  }
+
+  /** Send a command and separately record the request from the follower's later outcome. */
+  private sendPreempt(): boolean {
+    const requestId = ++this.preemptSequence;
+    if (!this.send({ type: "preempt", requestId })) return false;
+    this.outstandingPreempts.add(requestId);
+    this.opts.context.mesh.recordEvent({
+      kind: "run_preempt_requested",
+      actorId: this.id,
+      detail: this.state,
+      payload: JSON.stringify({ reason: "responsive_notification", target: this.opts.target }),
+    });
+    this.log.info("remote_preempt_requested", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId,
+      phase: this.state,
+    });
+    return true;
+  }
+
+  private send(message: LeaderCommand): boolean {
+    if (!this.channel.connected) return false;
+    return this.channel.send(message, (error) => {
+      if (error) this.fail(error);
+    });
   }
 
   private receive(message: ActorEvent): void | Promise<void> {
@@ -285,7 +399,37 @@ export class ActorHandle implements MeshActor {
       case "state":
         this.state = message.state;
         this.yielded = message.yielded;
+        if (message.state === "idle") this.pendingQueuedPromotion = false;
         ctx.onRuntimeStateChanged(message.state);
+        break;
+      case "wakeAccepted":
+        if (message.requestId === this.pendingWakeRequestId) {
+          this.pendingWake = undefined;
+          this.pendingWakeRequestId = undefined;
+        }
+        break;
+      case "preempted":
+        if (!this.outstandingPreempts.delete(message.requestId)) break;
+        if (message.preempted && message.phase) {
+          ctx.mesh.recordEvent({
+            kind: "run_preempted",
+            actorId: this.id,
+            detail: message.phase,
+            payload: JSON.stringify({ reason: "responsive_notification" }),
+          });
+          this.log.info("remote_preempt_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+            phase: message.phase,
+          });
+        } else {
+          this.log.info("remote_preempt_not_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+          });
+        }
         break;
       case "session":
         this.opts.saveSession(message.sessionId);
@@ -467,6 +611,9 @@ export class ActorHandle implements MeshActor {
                   request.responsive
                 );
                 this.gates.set(requestId, { handle, release });
+                if (this.pendingQueuedPromotion) {
+                  this.pendingQueuedPromotion = !this.promoteQueuedAdmissions();
+                }
                 void handle.result.catch((error: Error) => {
                   this.gates.delete(requestId);
                   this.send({ type: "reply", requestId, error: error.message });

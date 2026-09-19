@@ -6,7 +6,7 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 3;
+export const INSTANCE_PROTOCOL_VERSION = 4;
 export interface Bootstrap {
   id: string;
   cwd: string;
@@ -61,7 +61,10 @@ export type Request =
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
-  | { type: "wake"; nudge?: RunNudge }
+  /** `requestId` lets the leader retain the nudge until the follower observes it. */
+  | { type: "wake"; nudge?: RunNudge; requestId?: number }
+  /** Ask the follower to replace its current opportunity with responsive work. */
+  | { type: "preempt"; requestId: number }
   | { type: "yield"; status?: string; note?: string }
   | { type: "unkillable" }
   | { type: "stop" }
@@ -69,6 +72,15 @@ export type LeaderCommand =
 
 export type ActorEvent =
   | { type: "ready"; pid: number }
+  /** The follower accepted a wake; absence of this acknowledgement keeps it replayable. */
+  | { type: "wakeAccepted"; requestId: number }
+  /** The follower's observed outcome of a leader preemption request. */
+  | {
+      type: "preempted";
+      requestId: number;
+      preempted: boolean;
+      phase?: "running" | "winding_down" | "queued";
+    }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
   | { type: "state"; state: ActorRuntimeState; yielded: boolean }
