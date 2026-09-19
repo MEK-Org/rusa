@@ -3330,6 +3330,44 @@ describe("handleMeshApiRequest", () => {
         expect(data.obligation.parentId).toBe("p2");
       });
 
+      it("accepts a live waiting parent and refuses a terminal one", async () => {
+        // The dashboard's drop rule must match this contract: a parent that
+        // is waiting on its own children is a valid landing place; only a
+        // done or cancelled parent is closed to new children (#564).
+        obligations.create({ title: "waiting-parent", id: "waiting-parent", ownerId: "actor-1" });
+        obligations.create({
+          title: "keeps-parent-waiting",
+          id: "keeps-parent-waiting",
+          parentId: "waiting-parent",
+          ownerId: "actor-1",
+        });
+        obligations.create({ title: "ready-root", id: "ready-root", ownerId: "actor-1" });
+        obligations.create({ title: "done-parent", id: "done-parent", ownerId: "actor-1" });
+        obligations.setTerminalStatus("done-parent", "done", null, null, "system:mesh");
+        expect(obligations.require("waiting-parent").status).toBe("waiting");
+
+        const { res: accepted } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/ready-root/reparent",
+          JSON.stringify({ parentId: "waiting-parent" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(accepted.statusCode).toBe(200);
+        expect(JSON.parse(accepted.body).obligation.parentId).toBe("waiting-parent");
+
+        const { res: refused } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/ready-root/reparent",
+          JSON.stringify({ parentId: "done-parent" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(refused.statusCode).toBe(400);
+        expect(JSON.parse(refused.body).error).toBe("cannot add a child to a terminal obligation");
+        expect(obligations.require("ready-root").parentId).toBe("waiting-parent");
+      });
+
       it("400s on self-parenting or cycle", async () => {
         obligations.create({
           title: "task-self",
