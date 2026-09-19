@@ -56,6 +56,42 @@ function recordObservation(
 }
 
 describe("SharedQuotaStore canonical observations", () => {
+  it("lets an authoritative Kimi five-hour 403 override a contradictory scrape, then accepts a later recovery", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-kimi-live-403-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const scrapedAt = "2030-01-01T00:00:00.000Z";
+      const exhaustedAt = "2030-01-01T00:01:00.000Z";
+      const recoveredAt = "2030-01-01T00:02:00.000Z";
+      const resetAtIso = "2030-01-01T05:00:00.000Z";
+
+      recordObservation(store, "kimi", scrapedAt, 100, resetAtIso, "five_hour", "5-hour");
+      store.recordAuthoritativeKimiFiveHourLimit(exhaustedAt);
+
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: true,
+        exhaustedUntil: resetAtIso,
+      });
+      expect(store.getLatestSnapshot("kimi")?.limits).toEqual([
+        expect.objectContaining({ kind: "five_hour", percentLeft: 0 }),
+      ]);
+
+      // A later successful provider reading is authoritative recovery, even
+      // when it lands in the same five-minute storage slot as the failure.
+      recordObservation(store, "kimi", recoveredAt, 75, resetAtIso, "five_hour", "5-hour");
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: false,
+        exhaustedUntil: null,
+      });
+      expect(store.getLatestSnapshot("kimi")?.limits).toEqual([
+        expect.objectContaining({ kind: "five_hour", percentLeft: 75 }),
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("hydrates a validated legacy bare parsed_state without a schema migration", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-state-"));
     roots.push(root);
