@@ -1082,9 +1082,11 @@ export class GitHubIssueClient implements IssueClient {
     position: number,
     entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
   ): void {
-    const openLowerEntries = entries.filter(
-      (entry) => entry.position < position && entry.pullRequest?.state !== "CLOSED"
-    );
+    const openLowerEntries = entries.filter((entry) => {
+      if (entry.position >= position) return false;
+      const state = entry.pullRequest?.state?.toUpperCase();
+      return state !== "CLOSED" && state !== "MERGED";
+    });
     if (openLowerEntries.length > 0) {
       throw new Error(
         `Refusing to merge ${opts.repo}#${opts.prNumber}: lower stack position(s) ` +

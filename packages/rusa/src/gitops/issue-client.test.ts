@@ -996,7 +996,7 @@ describe("GitHubIssueClient", () => {
     });
   });
 
-  it("falls back to async for a later static stack position once every lower entry is closed", async () => {
+  it("falls back to async for a later static stack position once lower entries are merged or closed", async () => {
     vi.useFakeTimers();
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/12`]: {
@@ -1018,7 +1018,7 @@ describe("GitHubIssueClient", () => {
                   entries: {
                     totalCount: 3,
                     nodes: [
-                      { position: 1, pullRequest: { number: 10, state: "CLOSED" } },
+                      { position: 1, pullRequest: { number: 10, state: "MERGED" } },
                       { position: 2, pullRequest: { number: 11, state: "CLOSED" } },
                       { position: 3, pullRequest: { number: 12, state: "OPEN" } },
                     ],
@@ -1295,6 +1295,175 @@ describe("GitHubIssueClient", () => {
     expect(requests.map((request) => [request.method, request.path])).toEqual([
       ["PUT", `/repos/${REPO}/pulls/12/merge`],
       ["POST", "/graphql"],
+    ]);
+  });
+
+  it("merges pull requests sequentially in a stack as lower positions become MERGED", async () => {
+    const stackNodesBeforeMerge = [
+      { position: 1, pullRequest: { number: 10, state: "OPEN" } },
+      { position: 2, pullRequest: { number: 11, state: "OPEN" } },
+      { position: 3, pullRequest: { number: 12, state: "OPEN" } },
+    ];
+    const stackNodesAfter10Merged = [
+      { position: 1, pullRequest: { number: 10, state: "MERGED" } },
+      { position: 2, pullRequest: { number: 11, state: "OPEN" } },
+      { position: 3, pullRequest: { number: 12, state: "OPEN" } },
+    ];
+    const stackNodesAfter11Merged = [
+      { position: 1, pullRequest: { number: 10, state: "MERGED" } },
+      { position: 2, pullRequest: { number: 11, state: "MERGED" } },
+      { position: 3, pullRequest: { number: 12, state: "OPEN" } },
+    ];
+
+    const requests = installFetch({
+      [`PUT /repos/${REPO}/pulls/11/merge`]: {
+        responses: [
+          {
+            status: 403,
+            json: {
+              message:
+                "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+            },
+          },
+          {
+            status: 403,
+            json: {
+              message:
+                "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+            },
+          },
+        ],
+      },
+      [`PUT /repos/${REPO}/pulls/10/merge`]: {
+        status: 403,
+        json: {
+          message:
+            "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge`]: {
+        status: 403,
+        json: {
+          message:
+            "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+        },
+      },
+      "POST /graphql": {
+        responses: [
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: { entries: { totalCount: 3, nodes: stackNodesBeforeMerge } },
+                    stackEntry: { position: 2 },
+                  },
+                },
+              },
+            },
+          },
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: { entries: { totalCount: 3, nodes: stackNodesBeforeMerge } },
+                    stackEntry: { position: 1 },
+                  },
+                },
+              },
+            },
+          },
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: { entries: { totalCount: 3, nodes: stackNodesAfter10Merged } },
+                    stackEntry: { position: 2 },
+                  },
+                },
+              },
+            },
+          },
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: { entries: { totalCount: 3, nodes: stackNodesAfter11Merged } },
+                    stackEntry: { position: 3 },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+      [`PUT /repos/${REPO}/pulls/10/merge-async`]: {
+        status: 200,
+        json: { status: "merged", details: { sha: "sha-pr-10" } },
+      },
+      [`PUT /repos/${REPO}/pulls/11/merge-async`]: {
+        status: 200,
+        json: { status: "merged", details: { sha: "sha-pr-11" } },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
+        status: 200,
+        json: { status: "merged", details: { sha: "sha-pr-12" } },
+      },
+    });
+
+    const client = new GitHubIssueClient();
+
+    await expect(
+      client.mergePullRequest({
+        repo: REPO,
+        prNumber: 11,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).rejects.toThrow("lower stack position(s) 1 are still open");
+
+    await expect(
+      client.mergePullRequest({
+        repo: REPO,
+        prNumber: 10,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).resolves.toBe("sha-pr-10");
+
+    await expect(
+      client.mergePullRequest({
+        repo: REPO,
+        prNumber: 11,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).resolves.toBe("sha-pr-11");
+
+    await expect(
+      client.mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).resolves.toBe("sha-pr-12");
+
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["PUT", `/repos/${REPO}/pulls/11/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/10/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/10/merge-async`],
+      ["PUT", `/repos/${REPO}/pulls/11/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/11/merge-async`],
+      ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
     ]);
   });
 
