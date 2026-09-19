@@ -219,6 +219,27 @@ export class ActorRunRepository {
     return row?.focus_primary_obligation_id ?? null;
   }
 
+  /**
+   * The selected inbox entry IDs for an active run. Returns null when the run
+   * has completed or has no focus recorded.
+   */
+  activeFocusEntryIds(runId: string): string[] | null {
+    const row = this.db
+      .prepare(
+        `SELECT focus_entry_ids_json
+         FROM actor_runs
+         WHERE id = ? AND outcome IS NULL AND focus_resolution IS NOT NULL`
+      )
+      .get(runId) as { focus_entry_ids_json: string | null } | undefined;
+    if (!row?.focus_entry_ids_json) return null;
+    try {
+      const parsed = JSON.parse(row.focus_entry_ids_json);
+      return Array.isArray(parsed) && parsed.every((id) => typeof id === "string") ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Completed run outputs, newest first, for the bounded portable tail. */
   listRecentCompleted(actorId: string, limit: number): ActorRun[] {
     assertLimit(limit);

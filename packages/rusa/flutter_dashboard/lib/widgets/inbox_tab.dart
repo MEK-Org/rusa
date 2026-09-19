@@ -7,6 +7,7 @@ import '../theme.dart';
 import 'reference_preview.dart';
 import '../util.dart';
 import 'header.dart';
+import 'inbox_item_row.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
 
@@ -586,7 +587,7 @@ class _InboxTabState extends State<InboxTab> {
               spacing: 8,
               runSpacing: 4,
               children: [
-                _InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
+                InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
                 Text(
                   e['source']?.toString() ?? '',
                   style: const TextStyle(
@@ -742,28 +743,6 @@ class _SectionTitle extends StatelessWidget {
         ),
         if (action != null) ...[const SizedBox(width: 8), action!],
       ],
-    ),
-  );
-}
-
-class _InboxChip extends StatelessWidget {
-  const _InboxChip(this.label);
-  final String label;
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-    decoration: BoxDecoration(
-      color: const Color(0xFF173654),
-      border: Border.all(color: const Color(0xFF24527D)),
-      borderRadius: BorderRadius.circular(4),
-    ),
-    child: Text(
-      label.toUpperCase(),
-      style: const TextStyle(
-        fontSize: 10,
-        color: Color(0xFFB8DFFC),
-        fontFamily: kMonoFontFamily,
-      ),
     ),
   );
 }

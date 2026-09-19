@@ -79,6 +79,45 @@ describe("InboxRepository", () => {
     expect(store.read("actor-a", "foreign")).toBeNull();
   });
 
+  it("selects the exact queued-card item responsive first, then earliest, without page truncation", () => {
+    store.append([
+      {
+        id: "normal-oldest",
+        actorId: "actor-a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-01T00:00:00Z"),
+        payload: { type: "message" },
+      },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        id: `newer-${index}`,
+        actorId: "actor-a",
+        source: "chat",
+        deliveredAt: new Date(`2026-07-02T${String(index % 24).padStart(2, "0")}:00:00Z`),
+        payload: { type: "message" },
+      })),
+      {
+        id: "responsive-late",
+        actorId: "actor-a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-03T00:00:00Z"),
+        payload: { type: "message", priority: "responsive" },
+      },
+      {
+        id: "responsive-earlier",
+        actorId: "actor-a",
+        source: "chat",
+        deliveredAt: new Date("2026-07-02T00:00:00Z"),
+        payload: { type: "message", priority: "responsive" },
+      },
+    ]);
+
+    expect(store.selectPrioritizedUnhandled("actor-a")?.id).toBe("responsive-earlier");
+    store.markHandled("actor-a", ["responsive-earlier"]);
+    expect(store.selectPrioritizedUnhandled("actor-a")?.id).toBe("responsive-late");
+    store.markHandled("actor-a", ["responsive-late"]);
+    expect(store.selectPrioritizedUnhandled("actor-a")?.id).toBe("normal-oldest");
+  });
+
   it("rolls back an append batch when any payload is invalid", () => {
     expect(() =>
       store.append([

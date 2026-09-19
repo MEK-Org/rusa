@@ -10,6 +10,7 @@ import '../theme.dart';
 import '../util.dart';
 import 'avatar.dart';
 import 'header.dart';
+import 'inbox_item_row.dart';
 import 'obligation_card.dart';
 import 'obligation_status.dart';
 import 'obligation_dialogs.dart';
@@ -956,6 +957,23 @@ class _OverviewTabState extends State<OverviewTab> {
                   store: widget.store,
                   showActions: false,
                   contentPadding: const EdgeInsets.all(12),
+                  onSelectView: widget.onSelectView,
+                ),
+              ),
+            )
+          else if (actor.selectedInboxItem != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: MeshColors.bgSecondary,
+                  borderRadius: BorderRadius.circular(5),
+                  border: Border.all(color: MeshColors.border),
+                ),
+                child: InboxItemRow(
+                  entry: actor.selectedInboxItem!,
+                  moreCount: actor.moreInboxItemsCount,
+                  store: widget.store,
                   onSelectView: widget.onSelectView,
                 ),
               ),
