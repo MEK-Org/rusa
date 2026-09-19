@@ -405,6 +405,27 @@ describe("distiller MCP — distill_read_events (#537)", () => {
     expect(await errorOf({ since: stamp(0), limit: 201 })).toContain("limit");
     expect(await errorOf({ since: "yesterday" })).toContain("since");
     expect(await errorOf({ since: stamp(0), cursor: "junk" })).toContain("malformed event cursor");
+    expect(await errorOf({ since: stamp(0), cursor: "not-an-iso|1" })).toContain(
+      "malformed event cursor"
+    );
+    expect(await errorOf({ since: stamp(0), cursor: "2026-09-1|1" })).toContain(
+      "malformed event cursor"
+    );
+    expect(await errorOf({ since: stamp(0), cursor: `${stamp(0)}|0` })).toContain(
+      "malformed event cursor"
+    );
+    expect(await errorOf({ since: stamp(0), cursor: `${stamp(0)}|` })).toContain(
+      "malformed event cursor"
+    );
+    expect(await errorOf({ since: stamp(2), until: stamp(4), cursor: `${stamp(1)}|1` })).toContain(
+      "earlier than window since"
+    );
+    expect(await errorOf({ since: stamp(1), until: stamp(3), cursor: `${stamp(3)}|1` })).toContain(
+      "at or later than window until"
+    );
+    expect(await errorOf({ since: stamp(1), until: stamp(3), cursor: `${stamp(4)}|1` })).toContain(
+      "at or later than window until"
+    );
   });
 });
 

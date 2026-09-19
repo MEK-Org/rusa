@@ -260,7 +260,7 @@ export class MeshEventRepository {
       params.push(opts.until);
     }
     if (opts.after != null) {
-      const cursor = decodeEventCursor(opts.after);
+      const cursor = decodeEventCursor(opts.after, opts.since, opts.until);
       sql += ` AND (e.ts > ? OR (e.ts = ? AND e.rowid > ?))`;
       params.push(cursor.ts, cursor.ts, cursor.rowid);
     }
@@ -421,6 +421,18 @@ export class MeshEventRepository {
 }
 
 /**
+ * Canonical ISO-8601 millisecond stamp pattern: YYYY-MM-DDTHH:mm:ss.sssZ.
+ * Matches the stamps produced by `toISOString()` throughout the repository.
+ */
+const CANONICAL_ISO_MS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function isValidStoredIsoTimestamp(ts: string): boolean {
+  if (!CANONICAL_ISO_MS_PATTERN.test(ts)) return false;
+  const parsed = Date.parse(ts);
+  return !Number.isNaN(parsed) && new Date(parsed).toISOString() === ts;
+}
+
+/**
  * The window read's page boundary: the `(ts, rowid)` pair of the last event
  * served, joined with a character that never appears in an ISO stamp. Rowid is
  * the tiebreak inside one timestamp, and it is never surfaced on a
@@ -430,12 +442,30 @@ function encodeEventCursor(ts: string, rowid: number): string {
   return `${ts}|${rowid}`;
 }
 
-function decodeEventCursor(cursor: string): { ts: string; rowid: number } {
+function decodeEventCursor(
+  cursor: string,
+  windowSince?: string,
+  windowUntil?: string
+): { ts: string; rowid: number } {
   const at = cursor.lastIndexOf("|");
-  const rowid = at === -1 ? Number.NaN : Number(cursor.slice(at + 1));
+  const rowidStr = at === -1 ? "" : cursor.slice(at + 1);
   const ts = at === -1 ? "" : cursor.slice(0, at);
-  if (ts === "" || !Number.isInteger(rowid) || rowid < 0) {
+  if (!isValidStoredIsoTimestamp(ts) || !/^[1-9]\d*$/.test(rowidStr)) {
     throw new Error(`malformed event cursor: ${JSON.stringify(cursor)}`);
+  }
+  const rowid = Number(rowidStr);
+  if (!Number.isSafeInteger(rowid)) {
+    throw new Error(`malformed event cursor: ${JSON.stringify(cursor)}`);
+  }
+  if (windowSince != null && ts < windowSince) {
+    throw new Error(
+      `malformed event cursor: cursor timestamp ${ts} is earlier than window since ${windowSince}`
+    );
+  }
+  if (windowUntil != null && ts >= windowUntil) {
+    throw new Error(
+      `malformed event cursor: cursor timestamp ${ts} is at or later than window until ${windowUntil}`
+    );
   }
   return { ts, rowid };
 }

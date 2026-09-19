@@ -436,6 +436,80 @@ describe("MeshEventRepository", () => {
       expect(() =>
         repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|-1` })
       ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|0` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|1.5` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|abc` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|1e2` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}| 3` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: "not-an-iso|1" })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: "2026-09-1|1" })
+      ).toThrow(/malformed event cursor/);
+      expect(() => repo.listEventsWindow({ since: stamp(0), limit: 10, after: "zzz|1" })).toThrow(
+        /malformed event cursor/
+      );
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-99-99T00:00:00.000Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-02-31T00:00:00.000Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-06-18T00:00:00Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      // Fabricated cursor outside the requested window: earlier than since
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(2),
+          until: stamp(5),
+          limit: 10,
+          after: `${stamp(1)}|1`,
+        })
+      ).toThrow(/earlier than window since/);
+      // Fabricated cursor outside the requested window: at or later than until
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(1),
+          until: stamp(3),
+          limit: 10,
+          after: `${stamp(3)}|1`,
+        })
+      ).toThrow(/at or later than window until/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(1),
+          until: stamp(3),
+          limit: 10,
+          after: `${stamp(4)}|1`,
+        })
+      ).toThrow(/at or later than window until/);
     });
 
     it("resolves a spine-participating event's body from mesh_chat, like every other read", () => {
