@@ -110,19 +110,6 @@ export function resolveRootProvider(config: RusaConfig): CodingProvider {
 }
 
 /**
- * Normalize `rootActor.fallbackModel` (string | string[] | unset) to a clean
- * list. Root-only : the root Actor's own `fallback:` option resolves a
- * fresh provider per fallback model (see start.ts) — this list is never
- * passed to a CLI provider as a launch-time flag.
- */
-export function normalizeFallbackModel(config: RusaConfig): string[] | undefined {
-  const raw = config.rootActor?.fallbackModel;
-  if (raw == null) return undefined;
-  const list = (Array.isArray(raw) ? raw : [raw]).map((m) => m.trim()).filter(Boolean);
-  return list.length > 0 ? list : undefined;
-}
-
-/**
  * Resolve an arbitrary configured provider by name (a key under `providers`),
  * with an optional model. Used to run a worker actor on a different harness than
  * the root (e.g. an agy root delegating to a claude worker) — config-driven, like

@@ -173,9 +173,6 @@ rootActor:
   effort                   Required for antigravity (agy); optional otherwise. Provider-native reasoning
                            level (e.g. "low", "high"), stored independently from model. Omit for other providers
                            when no effort is passed to the provider.
-  fallbackModel            Optional string or list. Model(s) the root actor falls back to when the primary
-                           model is overloaded or unavailable, tried in order via a freshly resolved
-                           provider (root-only — ISSUE_NUM; providers.<name>.fallbackModel is rejected).
   context                  Optional. Working-memory policy. Omit for native provider sessions, or set
                            {type: portable, mode: ledger|tail}. Ledger mode requires geminiApiKey and
                            optionally accepts compactionModel; tail mode never compacts.
