@@ -464,19 +464,16 @@ export class PullRequestHeadAdvancedError extends Error {
 
 const API_BASE = "https://api.github.com";
 const ASYNC_MERGE_POLL_INTERVAL_MS = 1_000;
+const ASYNC_MERGE_MAX_POLLS = 60;
 
 interface AsyncMergeResponse {
   status: string;
   details?: {
+    expected_head_sha?: string;
     message?: string;
     sha?: string;
     uuid?: string;
   };
-}
-
-interface GitHubIssueClientOptions {
-  /** Test seam for async stack-merge polling. */
-  asyncMergePollDelay?: (milliseconds: number) => Promise<void>;
 }
 
 /**
@@ -492,8 +489,6 @@ interface GitHubIssueClientOptions {
  */
 export class GitHubIssueClient implements IssueClient {
   private token: string | null = null;
-
-  constructor(private readonly options: GitHubIssueClientOptions = {}) {}
 
   private async resolveToken(): Promise<string> {
     if (this.token) return this.token;
@@ -976,83 +971,67 @@ export class GitHubIssueClient implements IssueClient {
       ? (await this.getPullRequestDetails(opts.repo, opts.prNumber)).headRef
       : undefined;
 
-    // GraphQL exposes stackEntry.position while REST's legacy merge endpoint does
-    // not. Read it before selecting the merge API so a non-bottom request is
-    // rejected before it can merge every ancestor in the stack.
-    let stackPosition: number | null | undefined;
     try {
-      stackPosition = await this.getPullRequestStackPosition(opts.repo, opts.prNumber);
-    } catch {
-      // Stacks are still in GitHub public preview. Preserve legacy merges when
-      // the metadata query is temporarily unavailable, but fail closed if the
-      // legacy endpoint subsequently identifies this as a stack.
-      stackPosition = undefined;
-    }
-
-    let sha: string;
-    if (stackPosition !== null && stackPosition !== undefined) {
-      this.requireBottomOfStack(opts, stackPosition);
-      sha = await this.mergePullRequestAsync(opts);
-    } else {
-      try {
-        const result = await this.api<{ sha: string }>(
-          "PUT",
-          `/repos/${opts.repo}/pulls/${opts.prNumber}/merge`,
-          {
-            merge_method: opts.method,
-            ...(opts.commitMessage ? { commit_message: opts.commitMessage } : {}),
-            ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
-          }
-        );
-        sha = result.sha;
-      } catch (err) {
-        if (this.isLegacyStackMergeRejection(err)) {
-          const fallbackStackPosition = await this.getPullRequestStackPosition(
-            opts.repo,
-            opts.prNumber
-          );
-          if (fallbackStackPosition === null) {
-            throw new Error(
-              `GitHub reported ${opts.repo}#${opts.prNumber} as a stacked pull request, ` +
-                "but its stack position could not be read; refusing an unvalidated stack merge."
-            );
-          }
-          this.requireBottomOfStack(opts, fallbackStackPosition);
-          sha = await this.mergePullRequestAsync(opts);
-        } else if (
-          err instanceof GitHubApiError &&
-          err.status === 409 &&
-          opts.expectedHeadSha &&
-          err.message.includes("Head branch was modified")
-        ) {
-          throw new PullRequestHeadAdvancedError(
-            opts.repo,
-            opts.prNumber,
-            opts.expectedHeadSha,
-            err
-          );
-        } else {
-          throw err;
+      const result = await this.api<{ sha: string }>(
+        "PUT",
+        `/repos/${opts.repo}/pulls/${opts.prNumber}/merge`,
+        {
+          merge_method: opts.method,
+          ...(opts.commitMessage ? { commit_message: opts.commitMessage } : {}),
+          ...(opts.expectedHeadSha ? { sha: opts.expectedHeadSha } : {}),
         }
+      );
+
+      if (headRef) await this.deleteMergedHeadBranch(opts.repo, headRef);
+      return result.sha;
+    } catch (err) {
+      if (this.isLegacyStackMergeRejection(err)) {
+        const stack = await this.getPullRequestStack(opts.repo, opts.prNumber);
+        if (stack === null) {
+          throw new Error(
+            `GitHub reported ${opts.repo}#${opts.prNumber} as a stacked pull request, ` +
+              "but its stack metadata could not be read; refusing an unvalidated stack merge."
+          );
+        }
+        this.requireNoOpenLowerStackEntries(opts, stack.position, stack.entries);
+        const sha = await this.mergePullRequestAsync(opts);
+        if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
+        return sha;
       }
+      if (
+        err instanceof GitHubApiError &&
+        err.status === 409 &&
+        opts.expectedHeadSha &&
+        err.message.includes("Head branch was modified")
+      ) {
+        throw new PullRequestHeadAdvancedError(opts.repo, opts.prNumber, opts.expectedHeadSha, err);
+      }
+      throw err;
     }
-
-    if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
-
-    return sha;
   }
 
-  private async getPullRequestStackPosition(
+  private async getPullRequestStack(
     repo: string,
     prNumber: number
-  ): Promise<number | null> {
+  ): Promise<{
+    position: number;
+    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>;
+  } | null> {
     const [owner, name] = repo.split("/");
     if (!owner || !name) throw new Error(`Invalid repository name: ${repo}`);
 
     const data = await this.graphql<{
       repository?: {
         pullRequest?: {
-          stack?: { id: string } | null;
+          stack?: {
+            entries: {
+              totalCount: number;
+              nodes: Array<{
+                position: number;
+                pullRequest: { number: number; state: string } | null;
+              } | null>;
+            };
+          } | null;
           stackEntry?: { position: number } | null;
         } | null;
       } | null;
@@ -1060,7 +1039,15 @@ export class GitHubIssueClient implements IssueClient {
       `query($owner: String!, $name: String!, $number: Int!) {
         repository(owner: $owner, name: $name) {
           pullRequest(number: $number) {
-            stack { id }
+            stack {
+              entries(first: 100) {
+                totalCount
+                nodes {
+                  position
+                  pullRequest { number state }
+                }
+              }
+            }
             stackEntry { position }
           }
         }
@@ -1073,14 +1060,36 @@ export class GitHubIssueClient implements IssueClient {
     if (!pr.stack || !pr.stackEntry) {
       throw new Error(`GitHub returned incomplete stack metadata for ${repo}#${prNumber}`);
     }
-    return pr.stackEntry.position;
+    if (pr.stack.entries.totalCount !== pr.stack.entries.nodes.length) {
+      throw new Error(
+        `GitHub returned more than 100 stack entries for ${repo}#${prNumber}; refusing an incomplete stack validation.`
+      );
+    }
+    if (pr.stack.entries.nodes.some((entry) => entry === null)) {
+      throw new Error(`GitHub returned an incomplete stack entry for ${repo}#${prNumber}`);
+    }
+    return {
+      position: pr.stackEntry.position,
+      entries: pr.stack.entries.nodes as Array<{
+        position: number;
+        pullRequest: { number: number; state: string } | null;
+      }>,
+    };
   }
 
-  private requireBottomOfStack(opts: MergePullRequestOptions, position: number): void {
-    if (position !== 1) {
+  private requireNoOpenLowerStackEntries(
+    opts: MergePullRequestOptions,
+    position: number,
+    entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
+  ): void {
+    const openLowerEntries = entries.filter(
+      (entry) => entry.position < position && entry.pullRequest?.state !== "CLOSED"
+    );
+    if (openLowerEntries.length > 0) {
       throw new Error(
-        `Refusing to merge ${opts.repo}#${opts.prNumber}: it is position ${position} in a ` +
-          "stack. Merge the bottom pull request (position 1) instead."
+        `Refusing to merge ${opts.repo}#${opts.prNumber}: lower stack position(s) ` +
+          `${openLowerEntries.map((entry) => entry.position).join(", ")} are still open. ` +
+          "Merge or close every lower pull request first."
       );
     }
   }
@@ -1112,7 +1121,23 @@ export class GitHubIssueClient implements IssueClient {
       // for its terminal result rather than treating an in-progress merge as a failure.
       if (err instanceof GitHubApiError && err.status === 409) {
         try {
-          return this.awaitAsyncMergeResult(opts, JSON.parse(err.body) as AsyncMergeResponse);
+          const existing = JSON.parse(err.body) as AsyncMergeResponse;
+          const existingExpectedHeadSha = existing.details?.expected_head_sha;
+          if (opts.expectedHeadSha && existingExpectedHeadSha !== opts.expectedHeadSha) {
+            if (existingExpectedHeadSha) {
+              throw new PullRequestHeadAdvancedError(
+                opts.repo,
+                opts.prNumber,
+                opts.expectedHeadSha,
+                err
+              );
+            }
+            throw new Error(
+              `GitHub returned an existing asynchronous merge for ${opts.repo}#${opts.prNumber} ` +
+                "without its expected head SHA; refusing to join an unverified merge."
+            );
+          }
+          return this.awaitAsyncMergeResult(opts, existing);
         } catch (parseError) {
           if (!(parseError instanceof SyntaxError)) throw parseError;
         }
@@ -1126,7 +1151,7 @@ export class GitHubIssueClient implements IssueClient {
     initial: AsyncMergeResponse
   ): Promise<string> {
     let result = initial;
-    for (;;) {
+    for (let pollCount = 0; ; pollCount += 1) {
       if (result.status === "merged") {
         const sha = result.details?.sha;
         if (!sha) {
@@ -1150,7 +1175,13 @@ export class GitHubIssueClient implements IssueClient {
             `${opts.repo}#${opts.prNumber} without a polling UUID.`
         );
       }
-      await this.asyncMergePollDelay(ASYNC_MERGE_POLL_INTERVAL_MS);
+      if (pollCount >= ASYNC_MERGE_MAX_POLLS) {
+        throw new Error(
+          `Asynchronous merge polling timed out for ${opts.repo}#${opts.prNumber} after ` +
+            `${ASYNC_MERGE_MAX_POLLS} polls.`
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, ASYNC_MERGE_POLL_INTERVAL_MS));
       result = await this.api<AsyncMergeResponse>(
         "GET",
         `/repos/${opts.repo}/pulls/${opts.prNumber}/merge-async/${encodeURIComponent(uuid)}`
@@ -1158,12 +1189,16 @@ export class GitHubIssueClient implements IssueClient {
     }
   }
 
-  private async asyncMergePollDelay(milliseconds: number): Promise<void> {
-    if (this.options.asyncMergePollDelay) {
-      await this.options.asyncMergePollDelay(milliseconds);
-      return;
+  private async deleteMergedHeadBranch(repo: string, headRef: string): Promise<void> {
+    try {
+      await this.api("DELETE", `/repos/${repo}/git/refs/heads/${encodeURIComponent(headRef)}`);
+    } catch (err) {
+      // Tolerate a branch that's already gone (auto-delete-branch repo setting,
+      // a prior manual delete, etc). GitHub reports this as 422 or 404.
+      if (!(err instanceof GitHubApiError && (err.status === 422 || err.status === 404))) {
+        throw err;
+      }
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
   }
 
   private async deleteMergedHeadBranchIfNoOpenDependents(
@@ -1176,15 +1211,7 @@ export class GitHubIssueClient implements IssueClient {
     );
     if (dependents.length > 0) return;
 
-    try {
-      await this.api("DELETE", `/repos/${repo}/git/refs/heads/${encodeURIComponent(headRef)}`);
-    } catch (err) {
-      // Tolerate a branch that's already gone (auto-delete-branch repo setting,
-      // a prior manual delete, etc). GitHub reports this as 422 or 404.
-      if (!(err instanceof GitHubApiError && (err.status === 422 || err.status === 404))) {
-        throw err;
-      }
-    }
+    await this.deleteMergedHeadBranch(repo, headRef);
   }
 
   async createPullRequestReview(opts: CreatePullRequestReviewOptions): Promise<string | undefined> {
