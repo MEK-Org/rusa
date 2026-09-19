@@ -110,6 +110,101 @@ describe("monolithic follower instance", () => {
     expect(h.failures).toEqual([]);
   });
 
+  it("preempts an in-flight remote run only after the follower confirms it", async () => {
+    const h = setup({ delayMs: 500 });
+    const id = h.spawn("Replace this run");
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+
+    // The leader has accepted a command for delivery, not claimed that an
+    // unseen follower/provider abort already happened.
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({ kind: "run_preempt_requested", actorId: id })
+    );
+    expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
+
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id &&
+          event.event.type === "preempted" &&
+          event.event.preempted &&
+          event.event.phase === "running"
+      )
+    );
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_preempted",
+        actorId: id,
+        detail: "running",
+        payload: JSON.stringify({ reason: "responsive_notification" }),
+      })
+    );
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id && event.event.type === "result" && event.event.result.success
+      )
+    );
+  });
+
+  it("promotes queued remote work through the leader-owned admission handle", async () => {
+    const h = setup({ delayMs: 500 });
+    const first = h.spawn("Occupy the ordinary admission lane");
+    await waitUntil(() => h.runtime(first).isRunning);
+    const queued = h.spawn("Promote me");
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
+    );
+    expect(h.events.some((event) => event.actorId === first && event.event.type === "result")).toBe(
+      false
+    );
+    // Queue promotion is not a run abort, so it never impersonates a confirmed preemption.
+    expect(
+      h.meshEvents.some((event) => event.kind === "run_preempted" && event.actorId === queued)
+    ).toBe(false);
+  });
+
+  it("replays a responsive wake when disconnect drops its unacknowledged command", async () => {
+    const h = setup();
+    const id = h.spawn("Reconnect delivery");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "result")
+    );
+
+    // A long-poll transport loss can discard the leader's buffered command
+    // after send() accepted it but before the follower can acknowledge it.
+    h.remote.flush = () => {};
+    const beforeReplay = h.events.length;
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    await waitUntil(() => h.remote.commands.some(({ message }) => message.type === "wake"));
+    const droppedCommands = [...h.remote.commands];
+    h.remote.close();
+    await h.runtime(id).exited;
+    expect(
+      droppedCommands.some(
+        ({ actorId, message }) =>
+          actorId === id && message.type === "wake" && message.nudge?.priority === "responsive"
+      )
+    ).toBe(true);
+
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReplay)
+        .some(
+          (event) => event.actorId === id && event.event.type === "queued" && event.event.responsive
+        )
+    );
+  });
+
   it("rejects duplicate actor init without reconnect flag but permits reconnect", async () => {
     const h = setup();
     const id = h.spawn("Duplicate test");
