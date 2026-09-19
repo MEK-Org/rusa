@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateHandle } from "../actor/handle-generator.js";
 import {
+  AvatarGenerationCoordinator,
   avatarCachePath,
   avatarsDir,
-  AvatarGenerationCoordinator,
   configuredRootAvatarPath,
   generateAvatarForce,
   generateAvatarOnce,

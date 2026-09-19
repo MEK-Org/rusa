@@ -1460,7 +1460,10 @@ export async function handleMeshApiRequest(
       void attempt.then(() => {
         const generated = readAvatar(key as string, deps?.rootIdentity);
         if (generated) {
-          res.writeHead(200, { "Content-Type": generated.contentType, "Cache-Control": "no-store" });
+          res.writeHead(200, {
+            "Content-Type": generated.contentType,
+            "Cache-Control": "no-store",
+          });
           res.end(generated.body);
           return;
         }
@@ -1472,15 +1475,12 @@ export async function handleMeshApiRequest(
       });
       return true;
     }
-
-    {
-      res.writeHead(404, {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store",
-      });
-      res.end("avatar not found");
-      return true;
-    }
+    res.writeHead(404, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end("avatar not found");
+    return true;
   }
 
   if (!deps) {

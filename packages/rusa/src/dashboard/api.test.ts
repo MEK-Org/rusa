@@ -1975,7 +1975,9 @@ describe("handleMeshApiRequest", () => {
     const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-failure-"));
     process.env.RUSA_HOME = home;
     actors.upsert(rec(UUID_B, null, "active"));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("provider unavailable"));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("provider unavailable"));
 
     try {
       const lazyDeps: DashboardDataDeps = {
