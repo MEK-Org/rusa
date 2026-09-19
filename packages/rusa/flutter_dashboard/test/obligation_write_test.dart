@@ -1075,6 +1075,91 @@ void main() {
         expect(api.reparentCalls, [(id: 'child', parentId: 'root')]);
       },
     );
+
+    testWidgets(
+      'reparents a ready root under a waiting parent entered from above',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+
+        // The reported topology: a ready root listed directly above a live
+        // waiting parent whose own child keeps it waiting. The waiting row
+        // can be landed on but never reordered against, and dragging down
+        // into it crosses its top quarter before reaching its middle.
+        final warn = makeObligation(
+          'warn',
+          ownerId: 'actor-a',
+          intent: 'Warn on legacy voice gaps',
+        );
+        final walkie = makeObligation(
+          'walkie',
+          ownerId: 'actor-b',
+          status: 'waiting',
+          intent: 'Walkie Talkie Mode',
+        );
+        final finish = makeObligation(
+          'finish',
+          parentId: 'walkie',
+          ownerId: 'actor-b',
+          intent: 'Finish ElevenLabs voice PR',
+        );
+        api.obligationsResult = [warn, walkie, finish];
+        store.saveWorkExpanded({'walkie'});
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final warnDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Warn on legacy voice gaps',
+        );
+        final walkieTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'Walkie Talkie Mode',
+        );
+        expect(warnDraggable, findsOneWidget);
+        expect(walkieTarget, findsOneWidget);
+
+        final reparent = await tester.startGesture(
+          tester.getCenter(warnDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.moveTo(
+          tester.getTopLeft(walkieTarget) + const Offset(20, 3),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        // The top quarter is a reorder zone the waiting row rejects, so no
+        // insertion rule may be drawn there and nothing may be requested.
+        await reparent.up();
+        await tester.pumpAndSettle();
+        expect(api.reorderCalls, isEmpty);
+        expect(api.reparentCalls, isEmpty);
+
+        final landed = await tester.startGesture(
+          tester.getCenter(warnDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await landed.moveTo(
+          tester.getTopLeft(walkieTarget) + const Offset(20, 3),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await landed.moveTo(tester.getCenter(walkieTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await landed.up();
+        await tester.pumpAndSettle();
+
+        expect(api.reorderCalls, isEmpty);
+        expect(api.reparentCalls, [(id: 'warn', parentId: 'walkie')]);
+      },
+    );
   });
 
   group('InboxTab Interactive Write UI', () {
