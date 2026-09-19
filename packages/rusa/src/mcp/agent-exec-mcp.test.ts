@@ -15,7 +15,18 @@ import {
   type SpawnRequest,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
-import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
+import {
+  ACTOR_ADMIN_CAPABILITY,
+  ADMINISTRATIVE_CAPABILITIES,
+  CAPABILITY_ADMIN_CAPABILITY,
+  EXPERIMENT_ADMIN_CAPABILITY,
+  MODEL_ADMIN_CAPABILITY,
+  seedConfiguredActorGrants,
+} from "../actor/administrative-capabilities.js";
+import {
+  InMemoryCapabilityGrantStore,
+  PARENT_GRANTABLE_CAPABILITIES,
+} from "../actor/capability-grants.js";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
@@ -24,6 +35,7 @@ import {
 import {
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
@@ -122,9 +134,17 @@ function setup(
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
+    /**
+     * Seed the configured actor with the bootstrap administrative grants, as
+     * `start.ts` does at boot (#549). Defaults on so the existing suites keep
+     * exercising the configured actor's access; pass false to model a
+     * parentless actor that holds no grants.
+     */
+    seedRootGrants?: boolean;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
   const events: {
     kind: string;
     actorId?: string;
@@ -173,7 +193,12 @@ function setup(
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
-    grantableCapabilities: new Set(["understanding-write", "secret"]),
+    capabilityGrants,
+    grantableCapabilities: new Set([
+      "understanding-write",
+      "secret",
+      ...ADMINISTRATIVE_CAPABILITIES,
+    ]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
@@ -218,8 +243,415 @@ function setup(
     },
     root
   );
-  return { registry, mesh, events, inboxStore, rootId };
+  if (opts.seedRootGrants !== false) {
+    seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
+  }
+  return { registry, mesh, events, inboxStore, rootId, capabilityGrants };
 }
+
+/** Tools that exist only for a holder of an administrative capability. */
+const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
+  [CAPABILITY_ADMIN_CAPABILITY]: ["list_grants"],
+  [EXPERIMENT_ADMIN_CAPABILITY]: [
+    "enroll_actor_experiment",
+    "unenroll_actor_experiment",
+    "list_actor_experiments",
+  ],
+  [MODEL_ADMIN_CAPABILITY]: ["list_model_classes", "set_model_class", "delete_model_class"],
+  [ACTOR_ADMIN_CAPABILITY]: [
+    "revive_thread",
+    "set_thread_title",
+    "set_thread_charter",
+    "reparent_thread",
+    "list_subscriptions",
+  ],
+};
+const ALL_MANAGEMENT_TOOLS = Object.values(MANAGEMENT_TOOLS).flat();
+
+describe("administrative capability gating of management tools (#549)", () => {
+  const config = {
+    providers: { claude: { cliCommand: "claude" } },
+  } as unknown as RusaConfig;
+
+  function modelClassDeps() {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const modelClasses = new ModelClassRepository(db);
+    return {
+      modelClasses,
+      validateModelClass: (input: ModelConfigInput) =>
+        validateModelConfigPool(config, input, { portable: true }),
+    };
+  }
+
+  async function toolNames(client: Client): Promise<string[]> {
+    const { tools } = await client.listTools();
+    return tools.map((t) => t.name);
+  }
+
+  it("shows no management tool on an ungranted parentless (isRoot) endpoint", async () => {
+    const { mesh } = setup({ seedRootGrants: false });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
+    );
+    const names = await toolNames(client);
+    for (const tool of ALL_MANAGEMENT_TOOLS) expect(names).not.toContain(tool);
+    // The per-actor primitives (mesh-enforced) remain.
+    expect(names).toEqual(expect.arrayContaining(["grant_capability", "spawn_thread"]));
+  });
+
+  it("shows exactly the tools each administrative capability unlocks on a capable opaque-id worker", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    for (const [capability, tools] of Object.entries(MANAGEMENT_TOOLS)) {
+      capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      const client = await connect(
+        createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, modelClassDeps())
+      );
+      const names = await toolNames(client);
+      for (const tool of ALL_MANAGEMENT_TOOLS) {
+        expect(names.includes(tool), `${tool} after granting ${capability}`).toBe(
+          tools.includes(tool)
+        );
+      }
+      capabilityGrants.revoke("0b2c3d4e-steward", capability, "2026-01-01T00:00:01Z");
+    }
+  });
+
+  it("a capable opaque-id actor administers its own subtree and is refused outside it", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: ACTOR_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+
+    const ok = (await client.callTool({
+      name: "set_thread_title",
+      arguments: { thread_id: "steward-child", title: "Child" },
+    })) as CallToolResult;
+    expect(ok.isError).toBeFalsy();
+    expect(registry.get("steward-child")?.title).toBe("Child");
+
+    const refused = (await client.callTool({
+      name: "set_thread_title",
+      arguments: { thread_id: "sibling", title: "Nope" },
+    })) as CallToolResult;
+    expect(refused.isError).toBe(true);
+    expect(dataOf(refused)).toMatch(/subtree/);
+    expect(registry.get("sibling")?.title).toBeUndefined();
+
+    const charterRefused = (await client.callTool({
+      name: "set_thread_charter",
+      arguments: { thread_id: "root", charter: "hijack" },
+    })) as CallToolResult;
+    expect(charterRefused.isError).toBe(true);
+    expect(registry.get("root")?.charter).toBe("root");
+  });
+
+  it("revoking the capability denies an already-open session's handler immediately", async () => {
+    const { mesh, registry, capabilityGrants } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: EXPERIMENT_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+    const before = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: {},
+    })) as CallToolResult;
+    expect(before.isError).toBeFalsy();
+
+    capabilityGrants.revoke(
+      "0b2c3d4e-steward",
+      EXPERIMENT_ADMIN_CAPABILITY,
+      "2026-01-01T00:00:01Z"
+    );
+
+    const after = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: {},
+    })) as CallToolResult;
+    expect(after.isError).toBe(true);
+    expect(dataOf(after)).toMatch(/experiment-admin/);
+  });
+
+  /** A steward under root with one child, and a sibling outside the steward's subtree. */
+  function subtreeFixture(capabilities: readonly string[]) {
+    const fixture = setup({ seedRootGrants: false });
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      fixture.registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    for (const capability of capabilities) {
+      fixture.capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    return fixture;
+  }
+
+  it("confines wake schedules to the holder's subtree, slot suffixes included", async () => {
+    const { mesh } = subtreeFixture([ACTOR_ADMIN_CAPABILITY]);
+    const sched = new FakeWakeScheduler();
+    sched.entries.push(
+      { actorId: "sibling", cronExpr: "0 1 * * *", reason: "outside" },
+      { actorId: "root:daily-bless-cut", cronExpr: "0 2 * * *", reason: "outside slot" }
+    );
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", sched));
+
+    for (const actor_id of ["steward-child:nightly", "0b2c3d4e-steward"]) {
+      const ok = (await client.callTool({
+        name: "schedule_wake",
+        arguments: { actor_id, cron_expr: "0 3 * * *", reason: "inside" },
+      })) as CallToolResult;
+      expect(ok.isError, actor_id).toBeFalsy();
+    }
+    for (const actor_id of ["sibling", "root:daily-bless-cut", "sibling:nightly", "unknown-id"]) {
+      const refused = (await client.callTool({
+        name: "schedule_wake",
+        arguments: { actor_id, cron_expr: "0 3 * * *", reason: "hijack" },
+      })) as CallToolResult;
+      expect(refused.isError, actor_id).toBe(true);
+      expect(dataOf(refused)).toMatch(/subtree/);
+      const cancelRefused = (await client.callTool({
+        name: "cancel_wake",
+        arguments: { actor_id },
+      })) as CallToolResult;
+      expect(cancelRefused.isError, actor_id).toBe(true);
+      expect(dataOf(cancelRefused)).toMatch(/subtree/);
+    }
+    // Nothing outside the subtree was touched, and the listing is confined too.
+    expect(sched.entries.map((e) => e.actorId).sort()).toEqual(
+      ["0b2c3d4e-steward", "root:daily-bless-cut", "sibling", "steward-child:nightly"].sort()
+    );
+    const listed = dataOf(
+      (await client.callTool({ name: "list_wakes", arguments: {} })) as CallToolResult
+    ) as { actorId: string }[];
+    expect(listed.map((e) => e.actorId).sort()).toEqual(
+      ["0b2c3d4e-steward", "steward-child:nightly"].sort()
+    );
+  });
+
+  it("confines the inspection reads to the holder's subtree", async () => {
+    const experiments = new InMemoryExperimentEnrollmentStore();
+    const fixture = setup({ seedRootGrants: false, experimentEnrollments: experiments });
+    const { mesh, registry, capabilityGrants } = fixture;
+    for (const [id, parentId] of [
+      ["0b2c3d4e-steward", "root"],
+      ["steward-child", "0b2c3d4e-steward"],
+      ["sibling", "root"],
+    ] as const) {
+      registry.upsert({
+        id,
+        charter: id,
+        parentId,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    for (const capability of [
+      CAPABILITY_ADMIN_CAPABILITY,
+      EXPERIMENT_ADMIN_CAPABILITY,
+      ACTOR_ADMIN_CAPABILITY,
+    ]) {
+      capabilityGrants.grant({
+        actorId: "0b2c3d4e-steward",
+        capability,
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    // Rows inside and outside the steward's subtree, for every inspected ledger.
+    for (const actorId of ["steward-child", "sibling", "root"]) {
+      capabilityGrants.grant({
+        actorId,
+        capability: "understanding-write",
+        grantedBy: "test",
+        grantedAt: "2026-01-01T00:00:00Z",
+      });
+      experiments.enroll({
+        actorId,
+        experiment: STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+        enrolledBy: "test",
+        enrolledAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    mesh.subscribeEventSource("github:inside-org", "steward-child", "0b2c3d4e-steward");
+    mesh.subscribeEventSource("github:outside-org", "sibling", "root");
+    // Live subscribers, so the resource-specific route below resolves to a
+    // governing principal (a dead subscription yields to uncovered).
+    const modelConfig = { provider: "claude", model: "claude-sonnet-5" };
+    const liveInside = mesh.spawn({
+      charter: "live inside",
+      parentId: "0b2c3d4e-steward",
+      modelConfig,
+    });
+    const liveOutside = mesh.spawn({ charter: "live outside", parentId: "sibling", modelConfig });
+    mesh.subscribeEventSource("github:inside-org/live", liveInside, "0b2c3d4e-steward");
+    mesh.subscribeEventSource("github:outside-org/live", liveOutside, "root");
+    const client = await connect(createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root"));
+
+    const grants = dataOf(
+      (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
+    ) as { actorId: string }[];
+    expect(new Set(grants.map((g) => g.actorId))).toEqual(
+      new Set(["0b2c3d4e-steward", "steward-child"])
+    );
+
+    const enrollments = (
+      dataOf(
+        (await client.callTool({ name: "list_actor_experiments", arguments: {} })) as CallToolResult
+      ) as { enrollments: { actor_id: string }[] }
+    ).enrollments;
+    expect(enrollments.map((e) => e.actor_id)).toEqual(["steward-child"]);
+    const outside = (await client.callTool({
+      name: "list_actor_experiments",
+      arguments: { actor_id: "sibling" },
+    })) as CallToolResult;
+    expect(outside.isError).toBe(true);
+    expect(dataOf(outside)).toMatch(/subtree/);
+
+    const subscriptions = dataOf(
+      (await client.callTool({ name: "list_subscriptions", arguments: {} })) as CallToolResult
+    ) as { owners: { actorId: string }[]; subscribers: { actorId: string }[] };
+    expect(subscriptions.owners.map((o) => o.actorId)).toEqual(["steward-child", liveInside]);
+    expect(subscriptions.subscribers.every((s) => s.actorId !== "sibling")).toBe(true);
+
+    // The resource-specific route is the same lens: a source whose governing
+    // principal lies inside the subtree is projected; one governed outside it
+    // is refused rather than naming the outside principal.
+    const insideRoute = dataOf(
+      (await client.callTool({
+        name: "list_subscriptions",
+        arguments: { source: "github:inside-org/live" },
+      })) as CallToolResult
+    ) as { effectiveRoute: { principal: string | null } };
+    expect(insideRoute.effectiveRoute.principal).toBe(liveInside);
+    const outsideRoute = (await client.callTool({
+      name: "list_subscriptions",
+      arguments: { source: "github:outside-org/live" },
+    })) as CallToolResult;
+    expect(outsideRoute.isError).toBe(true);
+    expect(dataOf(outsideRoute)).toMatch(/subtree/);
+    expect(dataOf(outsideRoute)).not.toMatch(liveOutside);
+    // An uncovered source has no principal to protect and is still answerable.
+    const uncovered = dataOf(
+      (await client.callTool({
+        name: "list_subscriptions",
+        arguments: { source: "github:nobody-org" },
+      })) as CallToolResult
+    ) as { effectiveRoute: { principal: string | null } };
+    expect(uncovered.effectiveRoute.principal).toBeNull();
+  });
+
+  it("a second boot leaves a revoked seed revoked and mounts none of its tools", async () => {
+    const { mesh, capabilityGrants } = setup();
+    capabilityGrants.revoke("root", ACTOR_ADMIN_CAPABILITY, "2026-01-02T00:00:00Z");
+    // The wiring re-runs the seed on every boot; it must not restore the pair.
+    expect(
+      seedConfiguredActorGrants(capabilityGrants, "root", () => "2026-01-03T00:00:00Z")
+    ).toEqual([]);
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", new FakeWakeScheduler(), modelClassDeps())
+    );
+    const names = await toolNames(client);
+    const actorAdminTools = MANAGEMENT_TOOLS[ACTOR_ADMIN_CAPABILITY] ?? [];
+    for (const tool of [...actorAdminTools, "schedule_wake", "list_wakes"]) {
+      expect(names, tool).not.toContain(tool);
+    }
+    // The other seeded capabilities are untouched by the revocation.
+    expect(names).toEqual(
+      expect.arrayContaining([...(MANAGEMENT_TOOLS[CAPABILITY_ADMIN_CAPABILITY] ?? [])])
+    );
+  });
+
+  it("the seeded configured actor keeps every management tool (preserved access)", async () => {
+    const { mesh } = setup();
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, modelClassDeps())
+    );
+    const names = await toolNames(client);
+    expect(names).toEqual(expect.arrayContaining(ALL_MANAGEMENT_TOOLS));
+  });
+
+  it("model-admin attributes model class events to the acting endpoint, not a fixed root", async () => {
+    const { mesh, registry, capabilityGrants, events } = setup({ seedRootGrants: false });
+    registry.upsert({
+      id: "0b2c3d4e-steward",
+      charter: "steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    capabilityGrants.grant({
+      actorId: "0b2c3d4e-steward",
+      capability: MODEL_ADMIN_CAPABILITY,
+      grantedBy: "test",
+      grantedAt: "2026-01-01T00:00:00Z",
+    });
+    const client = await connect(
+      createAgentExecMcpServer(mesh, "0b2c3d4e-steward", "root", undefined, modelClassDeps())
+    );
+    const result = (await client.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(result.isError).toBeFalsy();
+    const event = events.find((e) => e.detail?.includes("set_model_class"));
+    expect(event?.actorId).toBe("0b2c3d4e-steward");
+  });
+});
 
 describe("agent-execution MCP server", () => {
   it("exposes the mesh primitives as tools (root also gets the grant tools)", async () => {
@@ -1479,9 +1911,11 @@ describe("agent-execution MCP server", () => {
       name: "grant_capability",
       arguments: { actor_id: "iu-thread", capability: "understanding-write" },
     });
-    const grants = dataOf(
-      (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
-    ) as Array<{ actorId: string; capability: string; grantedBy: string }>;
+    const grants = (
+      dataOf(
+        (await client.callTool({ name: "list_grants", arguments: {} })) as CallToolResult
+      ) as Array<{ actorId: string; capability: string; grantedBy: string }>
+    ).filter((grant) => grant.grantedBy !== "system:bootstrap");
     expect(grants).toHaveLength(1);
     expect(grants[0]).toMatchObject({
       actorId: "iu-thread",
@@ -1619,7 +2053,7 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(res.isError).toBe(true);
       expect(dataOf(res)).toBe(
-        `only the root may grant ${guessed}; a non-root parent may only grant: secret:gemini-api-key, secret:mistral-api-key`
+        `only a capability-admin holder may grant ${guessed}; a parent without it may only grant: secret:gemini-api-key, secret:mistral-api-key`
       );
     }
     expect(mesh.activeCapabilitiesFor(childId)).toEqual([]);
@@ -2566,7 +3000,15 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
   });
 
   it("schedule_wake / list_wakes / cancel_wake drive the scheduler", async () => {
-    const { mesh } = setup();
+    const { mesh, registry } = setup();
+    // A wake targets a known actor in the caller's subtree (#549).
+    registry.upsert({
+      id: "73e0b00f",
+      charter: "nightly",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
     const sched = new FakeWakeScheduler();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root", sched));
 
@@ -2635,7 +3077,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root", sched));
     const res = (await client.callTool({
       name: "schedule_wake",
-      arguments: { actor_id: "x", cron_expr: "bad", reason: "y" },
+      arguments: { actor_id: "root", cron_expr: "bad", reason: "y" },
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);

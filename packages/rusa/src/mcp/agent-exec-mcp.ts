@@ -1,6 +1,12 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import {
+  ACTOR_ADMIN_CAPABILITY,
+  CAPABILITY_ADMIN_CAPABILITY,
+  EXPERIMENT_ADMIN_CAPABILITY,
+  MODEL_ADMIN_CAPABILITY,
+} from "../actor/administrative-capabilities.js";
 import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
 import {
   type EventResource,
@@ -95,13 +101,22 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 export function createAgentExecMcpServer(
   mesh: ActorMesh,
   selfId: string,
+  /**
+   * The configured actor's id. Used ONLY to route the configured actor's own
+   * spawn/send through `rootControl` for attribution; it grants no authority
+   * (#549) — every management tool below is gated by an active capability.
+   */
   rootId: string,
   wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;
     rootControl?: RootControlService;
     isFenced?: () => boolean;
-    /** Present only on the root runtime endpoint. */
+    /**
+     * Runtime model-class store. The model-class tools mount only when this and
+     * `validateModelClass` are wired AND the endpoint's actor holds
+     * `model-admin` (#549).
+     */
     modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
     /** Config-aware concrete tuple validation at the management boundary. */
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
@@ -785,11 +800,12 @@ export function createAgentExecMcpServer(
   // capability to any actor (as before), and a non-root actor can grant/revoke
   // capabilities in the parent-grantable allow-list (exactly the
   // PARENT_GRANTABLE_CAPABILITIES secret names — 'secret:gemini-api-key' and
-  // 'secret:mistral-api-key'; any other 'secret:<filename>' is root-only) to/from
-  // its DIRECT children. Authorization is enforced in the mesh
-  // (grantCapability/revokeCapability take the grantor into account), with the
-  // caller's identity baked into this endpoint — so a grantee still cannot
-  // re-grant sideways or upward, and non-secret capabilities stay root-only.
+  // 'secret:mistral-api-key'; any other 'secret:<filename>' needs a
+  // `capability-admin` holder) to/from its DIRECT children. Authorization is
+  // enforced in the mesh (grantCapability/revokeCapability take the grantor into
+  // account), with the caller's identity baked into this endpoint — so a grantee
+  // still cannot re-grant sideways or upward, and non-secret capabilities need
+  // a `capability-admin` holder (#549).
   server.registerTool(
     "grant_capability",
     {
@@ -879,16 +895,43 @@ export function createAgentExecMcpServer(
     }
   );
 
-  // ── Root-only management tools  ── Gated two ways (defense in depth,
-  // like the root-only `update` tool): registered ONLY on root's endpoint, AND
-  // each handler re-asserts the caller is root.
-  if (selfId === rootId) {
-    const assertRoot = () =>
-      selfId === rootId ? null : toolError(new Error("only the root may use this tool"));
+  // ── Administrative management tools (#549) ── Gated two ways (defense in
+  // depth, like the grant-gated `update` tool): each group is registered ONLY
+  // when the endpoint's actor holds the named administrative capability as an
+  // active grant at session start, AND each handler re-checks the grant live so
+  // a revocation fails closed on an already-open session. Topology (`isRoot`,
+  // a null parent, the configured root id) plays no part: a capable opaque-id
+  // actor gets exactly the same tools, and an ungranted parentless actor gets
+  // none. Every tool below that touches actors is further confined to the
+  // caller's own subtree (self included): a write naming a target actor is
+  // refused outside it, and an inspection read returns only the rows whose
+  // actor lies inside it — the same scoping the mesh applies to grants,
+  // experiments and model changes, so delegating a capability down a tree
+  // never widens what its holder can see. The model-class registry has no
+  // subtree to scope to; that is why `model-admin` is host-global and never
+  // granted through the mesh (see HOST_GLOBAL_CAPABILITIES).
+  const holds = (capability: string) => mesh.hasActiveCapability(selfId, capability);
+  const assertCapability = (capability: string) =>
+    holds(capability)
+      ? null
+      : toolError(new Error(`${selfId} no longer holds ${capability}; refusing this tool`));
+  const inSubtree = (targetId: string) => mesh.isAncestorOf(selfId, targetId);
+  const assertInSubtree = (capability: string, targetId: string, verb: string) => {
+    if (!inSubtree(targetId)) {
+      throw new Error(
+        `${selfId} may only ${verb} actors in its own subtree (cannot ${verb} ${targetId}; ${capability} is subtree-scoped)`
+      );
+    }
+  };
+  // A wake target is a thread id or a suffixed slot (`<thread id>:<slot>`);
+  // the thread id in front of the first colon is the actor being scoped.
+  const wakeThreadId = (actorId: string) => actorId.split(":")[0] ?? actorId;
 
-    // Definitions are root-only operational policy. The store is intentionally
-    // optional in test/minimal server construction, but production always wires
-    // it on root; workers never receive these tools at all.
+  if (holds(MODEL_ADMIN_CAPABILITY)) {
+    // Definitions are operational policy held by `model-admin`. The store is
+    // intentionally optional in test/minimal server construction; production
+    // wires it on every endpoint and the grant decides who sees the tools.
+    const assertModelAdmin = () => assertCapability(MODEL_ADMIN_CAPABILITY);
     if (options?.modelClasses && options.validateModelClass) {
       const modelClasses = options.modelClasses;
       const validateModelClass = options.validateModelClass;
@@ -904,13 +947,13 @@ export function createAgentExecMcpServer(
       server.registerTool(
         "list_model_classes",
         {
-          title: "List runtime model classes (root-only)",
+          title: "List runtime model classes (model-admin)",
           description:
-            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Root-only.",
+            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Requires the model-admin capability.",
           inputSchema: {},
         },
         async () => {
-          const denied = assertRoot();
+          const denied = assertModelAdmin();
           if (denied) return denied;
           try {
             return toolOk(
@@ -930,9 +973,9 @@ export function createAgentExecMcpServer(
       server.registerTool(
         "set_model_class",
         {
-          title: "Create or replace a runtime model class (root-only)",
+          title: "Create or replace a runtime model class (model-admin)",
           description:
-            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Root-only.",
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
             model_config: concreteModelConfigSchema.describe(
@@ -941,7 +984,7 @@ export function createAgentExecMcpServer(
           },
         },
         async ({ name, model_config }) => {
-          const denied = assertRoot();
+          const denied = assertModelAdmin();
           if (denied) return denied;
           try {
             const className = assertClassName(name);
@@ -949,8 +992,8 @@ export function createAgentExecMcpServer(
             modelClasses.upsert(className, validated, new Date().toISOString());
             mesh.recordEvent({
               kind: "root_control_action",
-              actorId: rootId,
-              detail: "root-llm set_model_class",
+              actorId: selfId,
+              detail: `${MODEL_ADMIN_CAPABILITY} set_model_class`,
               payload: JSON.stringify({ name: className, entries: validated.length }),
             });
             options.onWrite?.();
@@ -964,15 +1007,15 @@ export function createAgentExecMcpServer(
       server.registerTool(
         "delete_model_class",
         {
-          title: "Delete a runtime model class (root-only)",
+          title: "Delete a runtime model class (model-admin)",
           description:
-            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Root-only.",
+            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact class name to delete."),
           },
         },
         async ({ name }) => {
-          const denied = assertRoot();
+          const denied = assertModelAdmin();
           if (denied) return denied;
           try {
             const className = assertClassName(name);
@@ -980,8 +1023,8 @@ export function createAgentExecMcpServer(
             if (deleted) {
               mesh.recordEvent({
                 kind: "root_control_action",
-                actorId: rootId,
-                detail: "root-llm delete_model_class",
+                actorId: selfId,
+                detail: `${MODEL_ADMIN_CAPABILITY} delete_model_class`,
                 payload: JSON.stringify({ name: className }),
               });
               options.onWrite?.();
@@ -993,18 +1036,20 @@ export function createAgentExecMcpServer(
         }
       );
     }
+  }
 
-    // ── Experiment enrollment (#394) ── Rollout state, not actor configuration:
-    // an actor is enrolled in a hard-coded experiment or it is not. Registered
-    // ONLY on root's endpoint, each handler re-asserts root, and the mesh
-    // enforces root-only authority again — the boundary is deliberately
-    // ungrantable, so there is no capability that ever mounts these elsewhere.
+  // ── Experiment enrollment (#394) ── Rollout state, not actor configuration:
+  // an actor is enrolled in a hard-coded experiment or it is not. Registered
+  // only for an `experiment-admin` holder, each handler re-checks the grant,
+  // and the mesh enforces the same capability plus subtree scoping again.
+  if (holds(EXPERIMENT_ADMIN_CAPABILITY)) {
+    const assertExperimentAdmin = () => assertCapability(EXPERIMENT_ADMIN_CAPABILITY);
     server.registerTool(
       "enroll_actor_experiment",
       {
-        title: "Enroll an actor in an experiment (root-only)",
+        title: "Enroll an actor in an experiment (experiment-admin)",
         description:
-          "Enroll an existing actor in one of the hard-coded experiments (see list_actor_experiments for the registry). Root-only and ungrantable. Enrollment is always post-spawn and applies to the named actor alone; an unknown experiment name is rejected rather than stored. Idempotent — re-enrolling an already-enrolled actor reports changed: false and leaves the original enrollment in force. Refused for a retired thread.",
+          "Enroll an existing actor in one of the hard-coded experiments (see list_actor_experiments for the registry). Requires the experiment-admin capability and is confined to the caller's own subtree. Enrollment is always post-spawn and applies to the named actor alone; an unknown experiment name is rejected rather than stored. Idempotent — re-enrolling an already-enrolled actor reports changed: false and leaves the original enrollment in force. Refused for a retired thread.",
         inputSchema: {
           actor_id: z.string().describe("The thread id of the actor to enroll."),
           experiment: z
@@ -1013,7 +1058,7 @@ export function createAgentExecMcpServer(
         },
       },
       async ({ actor_id, experiment }) => {
-        const denied = assertRoot();
+        const denied = assertExperimentAdmin();
         if (denied) return denied;
         try {
           // Echo the canonical id the row is keyed on, not the address typed,
@@ -1029,9 +1074,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "unenroll_actor_experiment",
       {
-        title: "Remove an actor's experiment enrollment (root-only)",
+        title: "Remove an actor's experiment enrollment (experiment-admin)",
         description:
-          "Remove an actor's enrollment in an experiment. Root-only and ungrantable. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Also accepts unregistered experiment names to clean up stale rows after an experiment is retired from the registry. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
+          "Remove an actor's enrollment in an experiment. Requires the experiment-admin capability and is confined to the caller's own subtree. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Also accepts unregistered experiment names to clean up stale rows after an experiment is retired from the registry. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
         inputSchema: {
           actor_id: z.string().describe("The thread id of the actor to unenroll."),
           experiment: z
@@ -1042,7 +1087,7 @@ export function createAgentExecMcpServer(
         },
       },
       async ({ actor_id, experiment }) => {
-        const denied = assertRoot();
+        const denied = assertExperimentAdmin();
         if (denied) return denied;
         try {
           const { actorId, changed } = mesh.unenrollActorFromExperiment(
@@ -1060,9 +1105,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "list_actor_experiments",
       {
-        title: "List experiments and current enrollments (root-only)",
+        title: "List experiments and current enrollments (experiment-admin)",
         description:
-          "List the hard-coded experiment registry and the enrollments currently in force. Root-only. Pass actor_id to scope the enrollments to one actor; omit it for every enrollment in the mesh. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
+          "List the hard-coded experiment registry and the enrollments currently in force. Requires the experiment-admin capability. Pass actor_id to scope the enrollments to one actor in your own subtree; omit it for every enrollment in your subtree. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
         inputSchema: {
           actor_id: z
             .string()
@@ -1071,15 +1116,21 @@ export function createAgentExecMcpServer(
         },
       },
       async ({ actor_id }) => {
-        const denied = assertRoot();
+        const denied = assertExperimentAdmin();
         if (denied) return denied;
         try {
-          const enrollments = mesh.listExperimentEnrollments(actor_id).map((enrollment) => ({
-            actor_id: enrollment.actorId,
-            experiment: enrollment.experiment,
-            enrolled_by: enrollment.enrolledBy,
-            enrolled_at: enrollment.enrolledAt,
-          }));
+          if (actor_id !== undefined) {
+            assertInSubtree(EXPERIMENT_ADMIN_CAPABILITY, actor_id, "inspect");
+          }
+          const enrollments = mesh
+            .listExperimentEnrollments(actor_id)
+            .filter((enrollment) => inSubtree(enrollment.actorId))
+            .map((enrollment) => ({
+              actor_id: enrollment.actorId,
+              experiment: enrollment.experiment,
+              enrolled_by: enrollment.enrolledBy,
+              enrolled_at: enrollment.enrolledAt,
+            }));
           return toolOk({
             experiments: EXPERIMENT_NAMES.map((name) => ({
               name,
@@ -1092,21 +1143,27 @@ export function createAgentExecMcpServer(
         }
       }
     );
+  }
 
+  // ── Actor administration ── Lifecycle, record and routing edits on other
+  // actors, held by `actor-admin` and confined to the caller's subtree.
+  if (holds(ACTOR_ADMIN_CAPABILITY)) {
+    const assertActorAdmin = () => assertCapability(ACTOR_ADMIN_CAPABILITY);
     server.registerTool(
       "revive_thread",
       {
-        title: "Revive a retired thread (root-only)",
+        title: "Revive a retired thread (actor-admin)",
         description:
-          "Revive a previously-retired thread by its thread id. Root-only. Re-instantiates the actor and marks it active, allowing it to be messaged again. The revived actor is born idle and won't run until sent a message.",
+          "Revive a previously-retired thread by its thread id. Requires the actor-admin capability; the thread must lie in your own subtree. Re-instantiates the actor and marks it active, allowing it to be messaged again. The revived actor is born idle and won't run until sent a message.",
         inputSchema: {
           thread_id: z.string().describe("The retired thread id to revive."),
         },
       },
       async ({ thread_id }) => {
-        const denied = assertRoot();
+        const denied = assertActorAdmin();
         if (denied) return denied;
         try {
+          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "revive");
           mesh.reviveThread(thread_id);
           return toolOk(`revived thread ${thread_id}`);
         } catch (err) {
@@ -1118,18 +1175,19 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "set_thread_title",
       {
-        title: "Set an actor's display title (root-only)",
+        title: "Set an actor's display title (actor-admin)",
         description:
-          "Set or replace the parent-authored display title shown under an actor's handle in the dashboard (ISSUE_NUM/ISSUE_NUM). Root-only. Patches the durable thread record and reflects immediately (the dashboard reads the record). Use to backfill titles on actors spawned before titles existed, or to re-title an actor.",
+          "Set or replace the parent-authored display title shown under an actor's handle in the dashboard (ISSUE_NUM/ISSUE_NUM). Requires the actor-admin capability; the actor must lie in your own subtree. Patches the durable thread record and reflects immediately (the dashboard reads the record). Use to backfill titles on actors spawned before titles existed, or to re-title an actor.",
         inputSchema: {
           thread_id: z.string().describe("The actor's thread id."),
           title: z.string().describe("The display title — a brief one-liner."),
         },
       },
       async ({ thread_id, title }) => {
-        const denied = assertRoot();
+        const denied = assertActorAdmin();
         if (denied) return denied;
         try {
+          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "retitle");
           mesh.setThreadTitle(thread_id, title);
           return toolOk(`set title for ${thread_id}`);
         } catch (err) {
@@ -1141,9 +1199,9 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "set_thread_charter",
       {
-        title: "Replace an actor's charter (root-only)",
+        title: "Replace an actor's charter (actor-admin)",
         description:
-          "Replace a long-lived actor's charter — its standing brief — on the durable thread record. Root-only. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
+          "Replace a long-lived actor's charter — its standing brief — on the durable thread record. Requires the actor-admin capability; the actor must lie in your own subtree. The charter is read fresh and re-injected into the actor's prompt each run, so the new charter takes effect on its next wake. Use to durably re-scope an actor (e.g. promote an elder reviewer to a steward) rather than re-scoping by message alone, which a session reap can lose — the charter is the durable re-derivation anchor. Pass the complete intended charter; it replaces the prior one wholesale.",
         inputSchema: {
           thread_id: z.string().describe("The actor's thread id."),
           charter: z
@@ -1152,9 +1210,10 @@ export function createAgentExecMcpServer(
         },
       },
       async ({ thread_id, charter }) => {
-        const denied = assertRoot();
+        const denied = assertActorAdmin();
         if (denied) return denied;
         try {
+          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "re-charter");
           mesh.setThreadCharter(thread_id, charter);
           return toolOk(`set charter for ${thread_id}`);
         } catch (err) {
@@ -1166,18 +1225,20 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "reparent_thread",
       {
-        title: "Move an actor to a new parent (root-only)",
+        title: "Move an actor to a new parent (actor-admin)",
         description:
-          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Root-only. Changes who receives the actor's completion/yield reports and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
+          "Re-parent an actor to a new parent by thread id (e.g. promote a steward and move workers under it so they report to it). Requires the actor-admin capability; both the actor and its new parent must lie in your own subtree. Changes who receives the actor's completion/yield reports and who may retire it (ownership is the parent edge), and grants the new parent a handle so it can message the actor. The actor's own subtree moves with it. Rejected if it would create a cycle, target the root, or reference an unknown thread.",
         inputSchema: {
           thread_id: z.string().describe("The actor to move."),
           new_parent_id: z.string().describe("The actor that becomes its new parent."),
         },
       },
       async ({ thread_id, new_parent_id }) => {
-        const denied = assertRoot();
+        const denied = assertActorAdmin();
         if (denied) return denied;
         try {
+          assertInSubtree(ACTOR_ADMIN_CAPABILITY, thread_id, "reparent");
+          assertInSubtree(ACTOR_ADMIN_CAPABILITY, new_parent_id, "reparent under");
           mesh.reparentThread(thread_id, new_parent_id);
           return toolOk(`reparented ${thread_id} under ${new_parent_id}`);
         } catch (err) {
@@ -1187,34 +1248,15 @@ export function createAgentExecMcpServer(
     );
 
     server.registerTool(
-      "list_grants",
-      {
-        title: "List capability grants (root-only)",
-        description:
-          "List every capability grant (active and revoked) — the audit/inspection view of who holds what.",
-        inputSchema: {},
-      },
-      async () => {
-        const denied = assertRoot();
-        if (denied) return denied;
-        try {
-          return toolOk(mesh.listGrants());
-        } catch (err) {
-          return toolError(err);
-        }
-      }
-    );
-
-    server.registerTool(
       "list_subscriptions",
       {
-        title: "List event source ownership and subscriptions (root-only)",
+        title: "List event source ownership and subscriptions (actor-admin)",
         description:
-          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Root-only.",
+          "List every event source owner (active claims and released tombstones) and every direct subscriber in your own subtree — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Requires the actor-admin capability.",
         inputSchema: eventResourceInputSchema,
       },
       async (args) => {
-        const denied = assertRoot();
+        const denied = assertActorAdmin();
         if (denied) return denied;
         try {
           // All row classes in one response, under the tool's existing name.
@@ -1223,8 +1265,10 @@ export function createAgentExecMcpServer(
           // the ownership half read as the whole answer. When a canonical source
           // is queried, effectiveRoute reconciles live obligation claims against
           // stored subscriptions under that same unified inspection lens.
-          const owners = mesh.listSubscriptions();
-          const subscribers = mesh.listEventSourceSubscriptions();
+          const owners = mesh.listSubscriptions().filter((row) => inSubtree(row.actorId));
+          const subscribers = mesh
+            .listEventSourceSubscriptions()
+            .filter((row) => inSubtree(row.actorId));
 
           const hasResource = Boolean(
             args?.source ||
@@ -1239,6 +1283,17 @@ export function createAgentExecMcpServer(
           if (hasResource) {
             const resource = parseEventResource(args, "inspection");
             const effectiveRoute = mesh.resolveEffectiveRoute(resource);
+            // The route names the governing principal. An actor outside the
+            // caller's subtree is refused, not projected, so probing sources
+            // one by one cannot recover what the row lists above withhold. A
+            // non-actor principal (a human obligation owner) or an uncovered
+            // source is not subtree state and stays answerable.
+            const { principal } = effectiveRoute;
+            if (principal && mesh.actors.get(principal) && !inSubtree(principal)) {
+              throw new Error(
+                `${selfId} may only inspect routes governed inside its own subtree (${resourceKey(resource)} is governed outside it; ${ACTOR_ADMIN_CAPABILITY} is subtree-scoped)`
+              );
+            }
             return toolOk({
               owners,
               subscribers,
@@ -1256,17 +1311,17 @@ export function createAgentExecMcpServer(
       }
     );
 
-    // ── Nightly wake schedule — ROOT-ONLY (ISSUE_NUM, phase 1c) ──
+    // ── Nightly wake schedule (ISSUE_NUM, phase 1c) ──
     // The mechanical nightly trigger backed by the familiar account's own crontab
-    // (a cron job pings the loopback /wake endpoint). Root-only like grants; the
+    // (a cron job pings the loopback /wake endpoint). Held by `actor-admin`; the
     // crontab edits are surgical (one instance-scoped `# mc-wake-instance:` block) + validated.
     if (wakeScheduler) {
       server.registerTool(
         "schedule_wake",
         {
-          title: "Schedule a recurring wake for an actor (root-only)",
+          title: "Schedule a recurring wake for an actor (actor-admin)",
           description:
-            "Install (or replace) a cron schedule that mechanically wakes an actor — e.g. the nightly IU distill or standing ops (bless cut, digest). `cron_expr` is a standard 5-field cron expression (min hour dom mon dow); `reason` is delivered to the actor's inbox as its wake prompt; `priority` ('responsive' or true) marks the wake to ride the responsive lane and bypass provider pacing. Idempotent per actor. Root-only.",
+            "Install (or replace) a cron schedule that mechanically wakes an actor — e.g. the nightly IU distill or standing ops (bless cut, digest). `cron_expr` is a standard 5-field cron expression (min hour dom mon dow); `reason` is delivered to the actor's inbox as its wake prompt; `priority` ('responsive' or true) marks the wake to ride the responsive lane and bypass provider pacing. Idempotent per actor. Requires the actor-admin capability; the actor must lie in your own subtree.",
           inputSchema: {
             actor_id: z
               .string()
@@ -1288,9 +1343,10 @@ export function createAgentExecMcpServer(
           },
         },
         async ({ actor_id, cron_expr, reason, priority }) => {
-          const denied = assertRoot();
+          const denied = assertActorAdmin();
           if (denied) return denied;
           try {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, wakeThreadId(actor_id), "schedule a wake for");
             const normalizedPriority =
               priority === "responsive" || priority === true ? "responsive" : undefined;
             await wakeScheduler.schedule(actor_id, cron_expr, reason, normalizedPriority);
@@ -1304,8 +1360,9 @@ export function createAgentExecMcpServer(
       server.registerTool(
         "cancel_wake",
         {
-          title: "Cancel an actor's recurring wake (root-only)",
-          description: "Remove an actor's cron wake schedule. No-op if none is set. Root-only.",
+          title: "Cancel an actor's recurring wake (actor-admin)",
+          description:
+            "Remove an actor's cron wake schedule. No-op if none is set. Requires the actor-admin capability; the actor must lie in your own subtree.",
           inputSchema: {
             actor_id: z
               .string()
@@ -1315,9 +1372,10 @@ export function createAgentExecMcpServer(
           },
         },
         async ({ actor_id }) => {
-          const denied = assertRoot();
+          const denied = assertActorAdmin();
           if (denied) return denied;
           try {
+            assertInSubtree(ACTOR_ADMIN_CAPABILITY, wakeThreadId(actor_id), "cancel a wake for");
             await wakeScheduler.cancel(actor_id);
             return toolOk(`cancelled wake for ${actor_id}`);
           } catch (err) {
@@ -1329,22 +1387,46 @@ export function createAgentExecMcpServer(
       server.registerTool(
         "list_wakes",
         {
-          title: "List scheduled wakes (root-only)",
+          title: "List scheduled wakes (actor-admin)",
           description:
-            "List every scheduled wake (actor id, cron expression, reason) — the inspection view of the nightly triggers. Root-only.",
+            "List every scheduled wake in your own subtree (actor id, cron expression, reason) — the inspection view of the nightly triggers. Requires the actor-admin capability.",
           inputSchema: {},
         },
         async () => {
-          const denied = assertRoot();
+          const denied = assertActorAdmin();
           if (denied) return denied;
           try {
-            return toolOk(await wakeScheduler.list());
+            const wakes = await wakeScheduler.list();
+            return toolOk(wakes.filter((wake) => inSubtree(wakeThreadId(wake.actorId))));
           } catch (err) {
             return toolError(err);
           }
         }
       );
     }
+  }
+
+  // ── Grant inspection ── The audit view of who holds what, for a
+  // `capability-admin` holder (the actor that can change those rows).
+  if (holds(CAPABILITY_ADMIN_CAPABILITY)) {
+    server.registerTool(
+      "list_grants",
+      {
+        title: "List capability grants (capability-admin)",
+        description:
+          "List every capability grant (active and revoked) held by an actor in your own subtree — the audit/inspection view of who holds what. Requires the capability-admin capability.",
+        inputSchema: {},
+      },
+      async () => {
+        const denied = assertCapability(CAPABILITY_ADMIN_CAPABILITY);
+        if (denied) return denied;
+        try {
+          return toolOk(mesh.listGrants().filter((grant) => inSubtree(grant.actorId)));
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
   }
 
   return server;

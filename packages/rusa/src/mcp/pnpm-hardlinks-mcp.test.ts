@@ -18,6 +18,7 @@ import { pnpmStoreFileForContent } from "../pnpm/hardlinks.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import {
   createPnpmHardlinksMcpServer,
+  PNPM_HARDLINKS_MCP_NAME,
   type PnpmHardlinksToolDeps,
   runForceRelinkWorkers,
 } from "./pnpm-hardlinks-mcp.js";
@@ -78,7 +79,9 @@ describe("pnpm hardlinks MCP", () => {
       createdAt: "2026-06-30T00:00:00.000Z",
     });
     return {
-      rootId: "root",
+      // Only "root" holds the pnpm-hardlinks capability in this fixture.
+      hasCapability: (actorId: string, capability: string) =>
+        actorId === "root" && capability === PNPM_HARDLINKS_MCP_NAME,
       workersDir,
       actors: registry,
       runningThreadIds: () => runningThreadIds,
@@ -125,7 +128,7 @@ describe("pnpm hardlinks MCP", () => {
     );
   });
 
-  it("refuses non-root callers", async () => {
+  it("refuses callers without the pnpm-hardlinks capability", async () => {
     const deps = fixture();
     const client = await connect(createPnpmHardlinksMcpServer(deps, "worker-1"));
 
@@ -137,7 +140,7 @@ describe("pnpm hardlinks MCP", () => {
     );
 
     expect(result).toBe(
-      "'pnpm-hardlinks' is a root-only tool — refusing to run it for 'worker-1'."
+      "'pnpm-hardlinks' requires the 'pnpm-hardlinks' capability — refusing to run it for 'worker-1'."
     );
   });
 

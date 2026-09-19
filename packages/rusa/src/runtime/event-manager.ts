@@ -107,6 +107,10 @@ export interface RawChatIntegrationEvent extends RawEventMetadata {
 /** Timer ingress already owns a canonical payload; EventManager adds routing and durability. */
 export interface RawTimerIntegrationEvent extends RawEventMetadata {
   sourceType: "timer";
+  /**
+   * The row's payload. Scheduling metadata lives on the raw event, not here:
+   * a `priority` inside this object is dropped by normalization.
+   */
   rawPayload: InboxPayload;
 }
 
@@ -662,11 +666,15 @@ export class EventManager {
 
   private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
     const resource = raw.rawResource ?? "system:events";
-    const priority = raw.priority ?? "responsive";
-    const payload: InboxPayload = {
-      ...raw.rawPayload,
-      ...(priority === "responsive" ? { priority: "responsive" } : {}),
-    };
+    // `raw.priority` is the only field that decides the persisted row's
+    // priority: it is the field the wake in `ActorMesh.deliverExternalEvent`
+    // reads, on the same condition the GitHub normalizer applies, and an
+    // unstated value is normal. A `priority` carried inside `rawPayload` is
+    // dropped rather than honoured, so the row and the wake cannot disagree
+    // about one event through either door (#477).
+    const { priority: _payloadCarried, ...rest } = raw.rawPayload;
+    const payload: InboxPayload = { ...rest };
+    if (raw.priority === "responsive") payload.priority = "responsive";
 
     return {
       resource,
