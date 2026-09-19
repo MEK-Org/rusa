@@ -126,6 +126,57 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     }
   });
 
+  it("accepts a host-reported Kimi five-hour 403 as authoritative until a later successful scrape recovers", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["kimi"],
+    });
+    await service.start();
+
+    const scrapedAt = "2030-01-01T00:00:00.000Z";
+    const resetAtIso = "2030-01-01T05:00:00.000Z";
+    const available = {
+      provider: "kimi",
+      status: "available" as const,
+      scrapedAt,
+      limits: [
+        {
+          label: "5-hour",
+          kind: "five_hour" as const,
+          scope: "provider" as const,
+          percentLeft: 100,
+          resetAtIso,
+        },
+      ],
+    };
+    const id = store.recordRaw({ provider: "kimi", scrapedAt, rawOutput: "available panel" });
+    store.recordParsed(id, available, available);
+
+    const client = new QuotaCoordinatorClient({ socketPath });
+    const exhausted = await client.recordKimiFiveHourLimit("2030-01-01T00:01:00.000Z");
+    expect(exhausted).toMatchObject({
+      provider: "kimi",
+      expired: true,
+      exhaustedUntil: resetAtIso,
+    });
+
+    const recovered = {
+      ...available,
+      scrapedAt: "2030-01-01T00:02:00.000Z",
+      limits: [{ ...available.limits[0], percentLeft: 80 }],
+    };
+    const recoveryId = store.recordRaw({
+      provider: "kimi",
+      scrapedAt: recovered.scrapedAt,
+      rawOutput: "recovered panel",
+    });
+    store.recordParsed(recoveryId, recovered, recovered);
+
+    const throttle = await client.getThrottle("kimi");
+    expect(throttle).toMatchObject({ expired: false, exhaustedUntil: null });
+  });
+
   // Criterion 9: Protocol-major rejection is client-side and per-response.
   it("criterion 9: client-side per-response protocolMajor rejection keeps last interval and reports mismatch", () => {
     const logger = { warn: vi.fn(), error: vi.fn() };

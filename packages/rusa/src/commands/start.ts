@@ -234,6 +234,7 @@ import {
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
+import { isKimiFiveHourLimit403 } from "../quota/kimi-live-limit.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { constructActorFromInvocation } from "../runtime/actor-invocation.js";
@@ -2585,6 +2586,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
         // Which declared candidate actually ran, for the failure-notice label.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        let lastAttemptProvider = lastSelected.provider;
         ctx.lifecycle.add({
           onStart: (event) => {
             lastSelected = event.selected;
@@ -2657,6 +2659,30 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               return;
             }
             const { result } = event.terminal;
+            // Kimi's authenticated CLI response is provider ground truth. A
+            // rendered quota scrape may lag it, so publish the explicit
+            // five-hour exhaustion before another local admission can use the
+            // stale lane. The coordinator retains the canonical observation;
+            // a later successful scrape is its recovery evidence.
+            if (
+              lastAttemptProvider === "kimi" &&
+              !result.success &&
+              result.exitCode !== 0 &&
+              quotaCoordinatorClient &&
+              quotaProviders.includes("kimi") &&
+              isKimiFiveHourLimit403(result.output)
+            ) {
+              try {
+                const status = await quotaCoordinatorClient.recordKimiFiveHourLimit(
+                  new Date().toISOString()
+                );
+                if (status) applyCoordinatorThrottleStatus("kimi", status);
+              } catch (err) {
+                log.warn("kimi_live_quota_report_failed", {
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
             logRunEnd(runLogger(id, event.runId), result);
             mesh.recordEvent({
               kind: "run_end",
@@ -2789,6 +2815,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onProviderAttempt: (attempt) => {
+            lastAttemptProvider = attempt.providerName;
             activeRunSelections.set(id, {
               provider: attempt.providerName,
               model: attempt.model,
