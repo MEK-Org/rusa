@@ -5,8 +5,8 @@ period locally from observed token usage in the rusa quota coordinator and expos
 as an additional quota period for pacing, model-class selection, and dashboard
 observability. Nothing here is implemented. No runtime code changes or schema migrations
 are made with this document; the proposed future implementation uses the existing
-`run_token_records` table for local accumulation in Phase 1, with a multi-instance
-shared ledger deferred to scale-out (§4.2).
+`run_token_records` table for local accumulation in Stage A, with a multi-instance
+shared ledger deferred to Stage B (§4.2).
 
 Every source citation below is against `origin/staging` at `106a432`. Paths are
 repository-relative; line numbers are that commit's.
@@ -85,7 +85,7 @@ the requested deliverable and scope:
 
 The specific architectural choices in this document—such as keeping the derived monthly
 window outside `quota_observations`, directly aggregating existing `run_token_records` in
-Phase 1 while deferring a multi-mesh shared ledger, defining qualitative calibration
+Stage A while deferring a multi-mesh shared ledger, defining qualitative calibration
 stages, strictly separating soft pacing from hard deferral, and expanding the DTO with
 explicit estimation states—are proposal mechanics developed to satisfy that requested scope.
 
@@ -99,7 +99,7 @@ locally. The proposed architecture consists of four cooperating mechanisms:
    calendar arithmetic with deterministic DST and month-length disambiguation.
 2. **Local token accumulation**: Directly aggregating immutable source records from
    `run_token_records` (`packages/rusa/src/db/migrations/0010_run_token_records.ts`) in
-   Phase 1, preserving input, output, and cache-read splits with idempotent query
+   Stage A, preserving input, output, and cache-read splits with idempotent query
    deduplication on record identity.
 3. **Limit estimation and confidence rating**: Estimating the monthly token ceiling from
    exhaustion events, expressed via qualitative estimation stages and operator-configured
@@ -195,9 +195,11 @@ the operator. The current period $[T_{\text{start}}, T_{\text{reset}})$ is a det
 function of `(monthlyAnchor, nowMs)`.
 
 On coordinator boot:
-1. `QuotaService` reads the configured anchor and calculates $[T_{\text{start}}, T_{\text{reset}})$.
-2. The coordinator queries `run_token_records` (Phase 1) or the dedicated ledger (Phase 2)
-   for source records spanning $[T_{\text{start}}, \text{now})$.
+1. The coordinator process (`rusa quota-coordinator`, `packages/rusa/src/commands/install-service.ts:266`)
+   reads the configured anchor and calculates $[T_{\text{start}}, T_{\text{reset}})$.
+2. Under Stage A local aggregation, the coordinator queries `run_token_records` via an
+   auxiliary read-only SQLite connection to `<mcHome>/mesh.db` (or the dedicated ledger
+   in Stage B) for source records spanning $[T_{\text{start}}, \text{now})$.
 3. It derives cumulative usage from those immutable splits; it does **not** create a
    `quota_observations` row or advance a synthetic scrape timestamp.
 4. If active pacing is enabled, it restores the small, cycle-keyed monthly controller
@@ -260,21 +262,37 @@ for that result (`packages/rusa/src/actor/actor-mesh.ts:1092-1097, 4299-4328`), 
 schema permits more than one source record for a run. The proposal must preserve that
 distinction.
 
-#### 4.2.2 Phased ledger architecture and deduplication key
+#### 4.2.2 Ledger architecture stages and deduplication key
 
-1. **Phase 1 (Shadow tracking & single-coordinator aggregation)**:
-   For the single-instance operational topology observed today, no new database tables,
-   cross-process ingestion RPCs, or schema migrations are required. The coordinator
-   directly queries the existing `run_token_records` table in `mesh.db` across the active
-   period $[T_{\text{start}}, \text{now})$, aggregating distinct records keyed on
-   `run_token_records.id`. Because `ActorMesh.accountRun` is called once per terminal
-   run result, aggregating by source record `id` is naturally idempotent against read retries.
+1. **Stage A (Local single-mesh aggregation)**:
+   - **Reader process and cross-process read plumbing**: The coordinator daemon
+     (`rusa quota-coordinator --home <mcHome>`, `packages/rusa/src/commands/install-service.ts:266`)
+     directly queries the existing `run_token_records` table in `<mcHome>/mesh.db` across the active
+     period $[T_{\text{start}}, \text{now})$, aggregating distinct records keyed on
+     `run_token_records.id`. Because `ActorMesh.accountRun` is called once per terminal
+     run result (`packages/rusa/src/actor/actor-mesh.ts:1092-1097, 4299-4328`), aggregating
+     by source record `id` is naturally idempotent against read retries. Because the
+     coordinator process owns `quota-coordinator.db` and does not currently open `mesh.db`,
+     Stage A introduces an auxiliary read-only SQLite connection (`better-sqlite3` with
+     `readonly: true`) to `<mcHome>/mesh.db`. This requires cross-process file read access
+     to the host instance's database, but avoids schema migrations, new database tables,
+     or socket ingestion protocols.
+   - **Operational topology and E2E instance undercount**: The operational topology is
+     not strictly single-instance. While the primary host mesh generates the overwhelming
+     majority of production token volume, multiple instances share the coordinator socket
+     today—specifically, isolated E2E sandbox instances spawned by `E2EInstanceManager`
+     (`packages/rusa/src/actor/e2e-instance-manager.ts`, #361), each of which maintains
+     its own isolated `$RUSA_HOME` and separate `mesh.db`. Under Stage A, because the
+     coordinator queries only the primary `<mcHome>/mesh.db`, any Kimi tokens generated
+     by E2E sandbox instances sharing the same credential are uncounted by construction.
+     In practice, E2E test runs use mock providers or negligible token volumes, but this
+     undercount is an explicit, acknowledged limitation of Stage A local aggregation.
 
-2. **Phase 2 (Scale-out multi-mesh shared ledger, deferred)**:
-   If independent coordinator instances or multiple host meshes share a single Kimi
-   credential in the future (the scenario raised in §9, Question 5), a dedicated append-only
-   accounting ledger in `quota-coordinator.db` can be introduced. Each imported event
-   carries:
+2. **Stage B (Scale-out multi-mesh shared ledger, deferred)**:
+   If independent coordinator instances, multiple host meshes, or multi-instance environments
+   requiring shared credential accounting arise in the future (the scenario raised in §9,
+   Question 5), a dedicated append-only accounting ledger in `quota-coordinator.db` can be
+   introduced. Each imported event carries:
    ```text
    (source_instance_id, source_record_id, run_id, provider, measured_at,
     uncached_input, cache_read, output, measurement_kind)
@@ -285,8 +303,8 @@ distinction.
      updates are added, records must declare either monotonic `snapshot_total` (retaining
      the highest sequence) or `delta` increments. Unattributed records without an explicit
      contract are excluded from accumulation.
-   Postponing Phase 2 until cross-instance use is observed delivers 80/20 value with zero
-   operational overhead for the initial implementation.
+   Postponing Stage B until cross-instance use is observed delivers 80/20 value with minimal
+   plumbing for the initial implementation.
 
 #### 4.2.3 Failed runs and retries
 When an actor run fails (for example, due to a tool failure, linter rejection, or provider
@@ -548,8 +566,6 @@ export function selectPoolLane<C>(
 
     export interface QuotaEstimationState {
       stage: QuotaEstimationStage;
-      /** Confidence score (0.0 - 1.0) when calibration is active; null when uncalibrated. */
-      confidenceScore: number | null;
       /** Active safety headroom factor (e.g. 0.80) applied to soft pacing target; null if unpaced. */
       safetyFactor: number | null;
     }
@@ -677,9 +693,12 @@ totals from the public repository.
    dispatched by rusa actors. Any manual CLI sessions executed by the operator directly
    on the host bypass rusa's database, which would cause rusa's local count to
    under-report total account consumption.
-4. **Database locality**: `run_token_records` currently resides in the per-instance
-   `mesh.db`, whereas quota observations reside in the shared `quota-coordinator.db`. A
-   production implementation must bridge this boundary (see §9, Question 2).
+4. **Database locality and multi-instance coverage**: `run_token_records` currently resides
+   in the per-instance `mesh.db`, whereas quota observations reside in the shared
+   `quota-coordinator.db`. Under Stage A local aggregation, the coordinator attaches
+   `<mcHome>/mesh.db` read-only; isolated E2E sandbox instances with separate `mesh.db`
+   instances are uncounted by construction (§4.2.2), deferring unified multi-instance
+   coverage to Stage B (see §9, Question 2).
 
 ---
 
@@ -692,8 +711,8 @@ The following architectural and operational questions are left open for review:
    active pacing?
    *Recommendation*: Keep the raw tuple diagnostic-only until this calibration criterion
    is met; do not sacrifice capacity based on a single uncalibrated weighting hypothesis.
-2. **Storage location for token telemetry**: Phase 1 directly queries `run_token_records`
-   in `mesh.db`. For Phase 2 (multi-mesh or multi-instance topology), should a collector
+2. **Storage location for token telemetry**: Stage A directly queries `run_token_records`
+   in the primary `<mcHome>/mesh.db`. For Stage B (multi-mesh or multi-instance topology), should a collector
    receive idempotent source events over the coordinator socket, or should
    `quota-coordinator.db` host the shared ledger written by actor instances?
    *Tradeoff*: A collector gives one writer and clear delivery acknowledgements; direct
