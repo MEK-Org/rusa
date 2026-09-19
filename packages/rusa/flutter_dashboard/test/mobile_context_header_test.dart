@@ -169,6 +169,76 @@ void main() {
     });
 
     testWidgets(
+      'the header owns each actor status while the phone body omits identity',
+      (tester) async {
+        await tester.runAsync(() async {
+          const cases = [
+            (label: 'IDLE', status: 'active', runState: RunState.idle),
+            (label: 'RUNNING', status: 'active', runState: RunState.running),
+            (label: 'QUEUED', status: 'active', runState: RunState.queued),
+            (label: 'RETIRED', status: 'retired', runState: RunState.idle),
+          ];
+
+          for (final testCase in cases) {
+            final api = FakeApi()
+              ..threadsResult = [
+                makeThread(
+                  _actorId,
+                  created: 't0',
+                  status: testCase.status,
+                  runState: testCase.runState,
+                ),
+              ];
+            final store = DashboardStore(api: api, stream: FakeStream());
+            await store.init();
+
+            await _pump(tester, store, size: const Size(390, 844));
+            await _goToActors(tester);
+            await _openActor(tester, store);
+
+            expect(
+              find.descendant(
+                of: find.byType(MeshHeader),
+                matching: find.text(testCase.label),
+              ),
+              findsOneWidget,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text(testCase.label),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text('$_actorId-handle'),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text(_actorId),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.byType(ActorAvatar),
+              ),
+              findsNothing,
+            );
+
+            await store.dispose();
+          }
+        });
+      },
+    );
+
+    testWidgets(
       'a very long actor handle bounds and ellipsizes without overflowing the header row',
       (tester) async {
         await tester.runAsync(() async {
@@ -458,6 +528,56 @@ void main() {
           findsOneWidget,
         );
         expect(find.byTooltip('Actor actions'), findsNothing);
+
+        await store.dispose();
+      });
+    });
+
+    testWidgets('desktop retains the detail body identity and status chip', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await _store();
+        await _pump(tester, store, size: const Size(1360, 840));
+        await tester.tap(find.text('Actors'));
+        await tester.pump();
+        await _openActor(tester, store);
+
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.byType(ActorAvatar),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text('$_actorId-handle'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text(_actorId),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text('IDLE'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(MeshHeader),
+            matching: find.text('IDLE'),
+          ),
+          findsNothing,
+        );
 
         await store.dispose();
       });
