@@ -233,6 +233,54 @@ export class MeshEventRepository {
   }
 
   /**
+   * The distiller's replay read of a bounded window (#537): every actor's
+   * events in the half-open `[since, until)`, oldest-first, in pages that
+   * resume exactly where the previous one stopped. The order is `ts, rowid`
+   * like {@link listEventsSince}, but the page boundary is a keyset on that
+   * pair rather than a re-run of the same `since`, so two events sharing a
+   * timestamp are never both dropped or both repeated across a page edge.
+   * `nextCursor` is opaque to callers; pass it back as `after` for the next
+   * page, `null` means the window is exhausted. A read never mutates.
+   */
+  listEventsWindow(opts: { since: string; until?: string; limit: number; after?: string | null }): {
+    events: MeshEvent[];
+    hasMore: boolean;
+    nextCursor: string | null;
+  } {
+    if (opts.limit <= 0) return { events: [], hasMore: false, nextCursor: null };
+    const params: (string | number)[] = [opts.since];
+    let sql = `
+      SELECT e.rowid AS rowid, e.*, c.body AS chat_body
+      FROM mesh_events e
+      LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
+      WHERE e.ts >= ?
+    `;
+    if (opts.until != null) {
+      sql += ` AND e.ts < ?`;
+      params.push(opts.until);
+    }
+    if (opts.after != null) {
+      const cursor = decodeEventCursor(opts.after, opts.since, opts.until);
+      sql += ` AND (e.ts > ? OR (e.ts = ? AND e.rowid > ?))`;
+      params.push(cursor.ts, cursor.ts, cursor.rowid);
+    }
+    sql += ` ORDER BY e.ts ASC, e.rowid ASC LIMIT ?`;
+    params.push(opts.limit + 1);
+    const rows = this.db.prepare(sql).all(...params) as (MeshEventRow & {
+      rowid: number;
+      chat_body?: string | null;
+    })[];
+    const hasMore = rows.length > opts.limit;
+    const page = hasMore ? rows.slice(0, opts.limit) : rows;
+    const last = page[page.length - 1];
+    return {
+      events: page.map(toMeshEvent),
+      hasMore,
+      nextCursor: hasMore && last ? encodeEventCursor(last.ts, last.rowid) : null,
+    };
+  }
+
+  /**
    * Count events in `[sinceISO, untilISO)` whose `kind` is one of `kinds` — a cheap
    * `COUNT(*)` used by the nightly distill day-gate to decide whether the window holds
    * any substantive activity (without materializing the rows). `untilISO` is exclusive;
@@ -370,6 +418,56 @@ export class MeshEventRepository {
       .all() as { actorId: string; ts: string }[];
     return new Map(rows.map((r) => [r.actorId, r.ts]));
   }
+}
+
+/**
+ * Canonical ISO-8601 millisecond stamp pattern: YYYY-MM-DDTHH:mm:ss.sssZ.
+ * Matches the stamps produced by `toISOString()` throughout the repository.
+ */
+const CANONICAL_ISO_MS_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function isValidStoredIsoTimestamp(ts: string): boolean {
+  if (!CANONICAL_ISO_MS_PATTERN.test(ts)) return false;
+  const parsed = Date.parse(ts);
+  return !Number.isNaN(parsed) && new Date(parsed).toISOString() === ts;
+}
+
+/**
+ * The window read's page boundary: the `(ts, rowid)` pair of the last event
+ * served, joined with a character that never appears in an ISO stamp. Rowid is
+ * the tiebreak inside one timestamp, and it is never surfaced on a
+ * {@link MeshEvent}, so the cursor is the only place a caller carries it.
+ */
+function encodeEventCursor(ts: string, rowid: number): string {
+  return `${ts}|${rowid}`;
+}
+
+function decodeEventCursor(
+  cursor: string,
+  windowSince?: string,
+  windowUntil?: string
+): { ts: string; rowid: number } {
+  const at = cursor.lastIndexOf("|");
+  const rowidStr = at === -1 ? "" : cursor.slice(at + 1);
+  const ts = at === -1 ? "" : cursor.slice(0, at);
+  if (!isValidStoredIsoTimestamp(ts) || !/^[1-9]\d*$/.test(rowidStr)) {
+    throw new Error(`malformed event cursor: ${JSON.stringify(cursor)}`);
+  }
+  const rowid = Number(rowidStr);
+  if (!Number.isSafeInteger(rowid)) {
+    throw new Error(`malformed event cursor: ${JSON.stringify(cursor)}`);
+  }
+  if (windowSince != null && ts < windowSince) {
+    throw new Error(
+      `malformed event cursor: cursor timestamp ${ts} is earlier than window since ${windowSince}`
+    );
+  }
+  if (windowUntil != null && ts >= windowUntil) {
+    throw new Error(
+      `malformed event cursor: cursor timestamp ${ts} is at or later than window until ${windowUntil}`
+    );
+  }
+  return { ts, rowid };
 }
 
 /**

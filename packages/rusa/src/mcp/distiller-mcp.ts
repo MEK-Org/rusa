@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ChatSpaceMembership } from "../chat/spaces.js";
+import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import type { CommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import type { DistillerStore } from "../understanding/distiller-cursor.js";
 import {
@@ -25,16 +26,40 @@ export interface DistillerSeedSource {
   reason: string;
 }
 
+/** One page of the distiller's bounded, oldest-first mesh_events replay (#537). */
+export interface DistillerEventPage {
+  events: MeshEvent[];
+  hasMore: boolean;
+  /** Opaque resume point for the next page; `null` once the window is exhausted. */
+  nextCursor: string | null;
+}
+
 /**
  * The host-side distiller boundary. This is intentionally narrower than raw
  * mesh.db or repository access: it can touch only cursor state, count
- * substantive activity for the gate, and derive the one-shot seed source.
+ * substantive activity for the gate, derive the one-shot seed source, and
+ * read a bounded window of durable events across every actor.
  */
 export interface DistillerMcpStore extends DistillerStore {
   countSubstantiveEvents(sinceISO: string, untilISO: string): number;
   resolveSeed(): Promise<DistillerSeedSource>;
   unsyncedCount(): number;
+  listEvents(opts: {
+    since: string;
+    until?: string;
+    limit: number;
+    after?: string;
+  }): DistillerEventPage;
 }
+
+/**
+ * Page bounds for `distill_read_events`. The ceiling matches the dashboard's
+ * events route so one page never carries more transcript text than the
+ * human-facing read is already trusted with; a window wider than that is
+ * walked with the cursor.
+ */
+export const DISTILLER_EVENTS_DEFAULT_LIMIT = 100;
+export const DISTILLER_EVENTS_MAX_LIMIT = 200;
 
 /**
  * The instance-side nightly-report sink . Present only where the report
@@ -237,6 +262,57 @@ export function createDistillerServer(
           // Chat on this host", and all three would arrive as `[]`.
           chatSpaces: await resolveChatSpaces(deps.listChatSpaces),
         });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "distill_read_events",
+    {
+      title: "Read a bounded window of mesh events",
+      description:
+        "Replay durable mesh events across ALL actors in the half-open window [since, until), oldest first. Pages are stable: pass the returned `nextCursor` back as `cursor` to continue exactly where the previous page stopped; `nextCursor` is null once the window is exhausted. Read-only — replaying a missed window never touches events or inbox state.",
+      inputSchema: {
+        since: z.string().datetime().describe("Inclusive ISO lower bound."),
+        until: z
+          .string()
+          .datetime()
+          .optional()
+          .describe("Exclusive ISO upper bound; omit for an open-ended read."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(DISTILLER_EVENTS_MAX_LIMIT)
+          .optional()
+          .describe(
+            `Page size, 1..${DISTILLER_EVENTS_MAX_LIMIT} (default ${DISTILLER_EVENTS_DEFAULT_LIMIT}).`
+          ),
+        cursor: z
+          .string()
+          .optional()
+          .describe("Opaque `nextCursor` from the previous page of the same window."),
+      },
+    },
+    async (args) => {
+      try {
+        // Stored stamps are `toISOString()` output and the window compares
+        // lexically against them, so the bounds are canonicalised first: the
+        // schema also admits `…:24Z`, which sorts after `…:24.000Z` as text.
+        const since = new Date(args.since).toISOString();
+        const until = args.until === undefined ? undefined : new Date(args.until).toISOString();
+        if (until !== undefined && until <= since) {
+          return toolError(`until (${until}) must be later than since (${since})`);
+        }
+        const page = deps.store.listEvents({
+          since,
+          ...(until === undefined ? {} : { until }),
+          limit: args.limit ?? DISTILLER_EVENTS_DEFAULT_LIMIT,
+          ...(args.cursor === undefined ? {} : { after: args.cursor }),
+        });
+        return toolOk({ since, until: until ?? null, ...page });
       } catch (err) {
         return toolError(err);
       }

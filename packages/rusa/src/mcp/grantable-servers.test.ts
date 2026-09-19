@@ -1,3 +1,5 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
@@ -61,6 +63,7 @@ const STUB_DEPS: GrantableServerDeps = {
         reason: "glass-goals-latest-op",
       }),
       unsyncedCount: () => 0,
+      listEvents: () => ({ events: [], hasMore: false, nextCursor: null }),
     },
   },
   understanding: { getClient: async () => null },
@@ -142,6 +145,55 @@ describe("grantable capabilities allow-list ", () => {
     servers.get("update")?.("0b2c3d4e-steward", []);
     expect(updateDepsFor).toHaveBeenCalledWith("0b2c3d4e-steward");
     expect(() => servers.get("pnpm-hardlinks")?.("0b2c3d4e-steward", [])).not.toThrow();
+  });
+
+  it("serves the bounded mesh_events read only behind a `distiller` grant (#537)", async () => {
+    // The read has no principal of its own: it exists on an actor's endpoint set
+    // exactly when a `distiller` grant row does, and leaves with it. The
+    // dashboard's `/api/mesh/events` is a separate, Firebase-session route.
+    const servers = buildGrantableServers(STUB_DEPS);
+    const mountedFactories = new Map<string, () => McpServer>();
+    const mcpHttp = {
+      addServer: (name: string, factory: () => McpServer) => {
+        mountedFactories.set(name, factory);
+        return `http://mcp/${name}`;
+      },
+      removeServer: async (name: string) => {
+        mountedFactories.delete(name);
+      },
+    };
+
+    // Denied: an actor holding other grants, but not `distiller`, has no
+    // endpoint that could carry the tool at all.
+    expect(
+      mountGrantedServers("actor-1", ["understanding-write", "host-jobs"], servers, mcpHttp).map(
+        (spec) => spec.name
+      )
+    ).toEqual(["understanding-write", "host-jobs"]);
+    expect(mountedFactories.has("actor-1:distiller")).toBe(false);
+
+    // Authorized: the grant mounts the distiller server, and the read is on it.
+    expect(mountGrantedServers("actor-1", ["distiller"], servers, mcpHttp)).toEqual([
+      { name: "distiller", url: "http://mcp/actor-1:distiller" },
+    ]);
+    const server = mountedFactories.get("actor-1:distiller")?.();
+    if (!server) throw new Error("distiller server was not mounted");
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(
+      "distill_read_events"
+    );
+    const result = await client.callTool({
+      name: "distill_read_events",
+      arguments: { since: "2026-09-16T03:12:24.897Z", until: "2026-09-17T05:10:00.574Z" },
+    });
+    expect(result.isError).toBeFalsy();
+
+    // Revoked: the endpoint goes away with the grant.
+    await handleCapabilityRevoked("actor-1", "distiller", () => [], servers, mcpHttp);
+    expect(mountedFactories.has("actor-1:distiller")).toBe(false);
   });
 
   it("aggregates parameterized grants when mounting and replaces the live factory", () => {
