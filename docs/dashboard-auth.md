@@ -78,7 +78,11 @@ The Web API key, project ID, auth domain, app ID, and messaging sender ID are
 public client configuration;
 the email policy and service-account file are never served to the browser.
 Flutter reads those options at runtime from this operator-owned configuration;
-do not add a generated `firebase_options.dart` or a Firebase configuration file
+FlutterFire's `FirebaseOptions` constructor statically requires `appId` and
+`messagingSenderId` on Web in addition to the project ID and API key used by the
+legacy JavaScript SDK bundle (both identifiers are available in the Firebase Console
+under Project Settings → General → Your apps → Web app).
+Do not add a generated `firebase_options.dart` or a Firebase configuration file
 to this repository. FlutterFire may load its browser SDK support from the
 official Firebase CDN. Rebuild the dashboard and restart Rusa after changing configuration.
 Both `rusa start` and the standalone `rusa dashboard` honor this configuration.
