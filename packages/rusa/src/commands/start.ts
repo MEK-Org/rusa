@@ -2866,15 +2866,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // the dashboard binding its port. A head change cannot commit into a sink
   // that is still undefined.
   //
-  // Boot sweep below over `readyHeads()` reconciles heads at startup.
-  readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
+  // Boot sweep below over `readyHeadRecords()` reconciles heads at startup.
+  readyHeadSink = ({ ownerId, epoch, head, previousHeadId, sequence }) => {
     mesh.deliverReadyHeadAttention(
       ownerId,
       head === null
         ? null
         : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
       previousHeadId,
-      sequence
+      sequence,
+      epoch
     );
   };
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {

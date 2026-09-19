@@ -8,6 +8,11 @@ import type { Migration } from "./types.js";
  * deduplication and sequence tracking are maintained only in process memory,
  * current heads are derived on the fly from obligations, and no
  * persistence remains in SQLite.
+ *
+ * Operational rollback is roll-forward to a 0050-compatible build. Do not
+ * deploy pre-0050 code against this schema: it writes the removed table. An
+ * emergency code rollback must first recreate the 0025 table shape; its rows
+ * are recomputable.
  */
 export const dropObligationReadyHeads: Migration = {
   id: "0050_drop_obligation_ready_heads",

@@ -5,7 +5,6 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
-import { migrations } from "../db/migrations/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -33,28 +32,6 @@ function createMockLiveActor(id: string): Actor {
     isRunning: false,
     preemptForResponsive: () => ({ preempted: false as const }),
   } as unknown as Actor;
-}
-
-function runMigrationsThrough(db: Database.Database, throughId: string): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS _migrations (
-      id TEXT PRIMARY KEY,
-      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-  `);
-  // Zero-padded ids sort lexicographically in application order.
-  for (const migration of migrations) {
-    if (migration.id > throughId) break;
-    if (migration.noTransaction) {
-      migration.up(db);
-      db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
-    } else {
-      db.transaction(() => {
-        migration.up(db);
-        db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
-      })();
-    }
-  }
 }
 
 function setupLegacyDatabase(dbPath?: string): Database.Database {
@@ -916,7 +893,7 @@ describe("legacy-migration", () => {
 
       // 1. Build the schema exactly as a pre-0050 production instance has it:
       // migration 0025 created obligation_ready_heads and it still exists at 0049.
-      runMigrationsThrough(db, "0049_obligation_responsive");
+      runMigrations(db, { throughId: "0049_obligation_responsive" });
       const legacyTableAt0049 = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"

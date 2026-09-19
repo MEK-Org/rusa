@@ -23,10 +23,11 @@ export function pendingMigrationIds(db: Database): string[] {
 }
 
 /**
- * Executes all pending migrations against the provided database.
- * Handles both fresh databases and upgrades from pre-migration systems.
+ * Executes pending migrations against the provided database. `throughId`
+ * limits a rehearsal to migrations at or before that id while preserving the
+ * production runner's bookkeeping and transaction behavior.
  */
-export function runMigrations(db: Database): void {
+export function runMigrations(db: Database, opts: { throughId?: string } = {}): void {
   // 1. Ensure the migrations tracking table exists.
   db.exec(`
     CREATE TABLE IF NOT EXISTS _migrations (
@@ -52,6 +53,9 @@ export function runMigrations(db: Database): void {
   );
 
   for (const migration of migrations) {
+    if (opts.throughId !== undefined && migration.id > opts.throughId) {
+      continue;
+    }
     if (appliedMigrations.has(migration.id)) {
       continue;
     }

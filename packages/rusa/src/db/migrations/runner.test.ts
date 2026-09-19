@@ -178,6 +178,36 @@ describe("Database Migration System", () => {
     db.close();
   });
 
+  it("can rehearse the production runner through a migration", () => {
+    const db = new Database(dbPath);
+
+    runMigrations(db, { throughId: "0049_obligation_responsive" });
+    expect(
+      db.prepare("SELECT id FROM _migrations WHERE id = '0050_drop_obligation_ready_heads'").get()
+    ).toBeUndefined();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get()
+    ).toBeDefined();
+
+    runMigrations(db);
+    expect(
+      db.prepare("SELECT id FROM _migrations WHERE id = '0050_drop_obligation_ready_heads'").get()
+    ).toBeDefined();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get()
+    ).toBeUndefined();
+
+    db.close();
+  });
+
   it("pendingMigrationIds reports what runMigrations would apply, without applying it", () => {
     const db = new Database(dbPath);
 

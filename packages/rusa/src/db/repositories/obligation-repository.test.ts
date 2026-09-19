@@ -705,12 +705,14 @@ describe("ObligationRepository", () => {
         expect.arrayContaining([
           {
             ownerId: "actor-a",
+            epoch: repository.readyHeadEpoch,
             head: expect.objectContaining({ id: "ob-a" }),
             previousHeadId: null,
             sequence: 1,
           },
           {
             ownerId: "actor-b",
+            epoch: repository.readyHeadEpoch,
             head: expect.objectContaining({ id: "ob-b" }),
             previousHeadId: null,
             sequence: 1,

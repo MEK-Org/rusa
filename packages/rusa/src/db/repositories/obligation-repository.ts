@@ -184,6 +184,12 @@ export interface OwnedObligationPageOptions extends ObligationPageOptions {
 export interface ReadyHeadChange {
   ownerId: EntityId;
   /**
+   * Lifetime marker for the repository's in-memory transition sequence.
+   * Consumers key durable attention on this value so replacing a repository
+   * cannot reuse a handled sequence from its predecessor.
+   */
+  epoch: string;
+  /**
    * The owner's new ready head, or `null` when they no longer have one — the
    * queue emptied, or the head became a waiting parent the moment a child was
    * filed under it.
@@ -205,7 +211,7 @@ export interface ReadyHeadChange {
    */
   previousHeadId: string | null;
   /** Monotonically increasing sequence number for head changes on this owner. */
-  sequence?: number;
+  sequence: number;
 }
 
 export interface ObligationPage {
@@ -602,10 +608,16 @@ export class ObligationRepository {
   private readyHeadListener?: (change: ReadyHeadChange) => void;
 
   /**
-   * In-memory previous ready head and monotonic sequence per owner (#513).
-   * Keyed per owner; empty across process restart.
+   * Lifetime marker for in-memory ready-head sequences (#513). It belongs to
+   * this repository, so replacing the repository changes dedupe generation.
    */
-  private previousHeads = new Map<string, { headId: string | null; sequence: number }>();
+  readonly readyHeadEpoch = randomUUID();
+
+  /**
+   * In-memory monotonic ready-head sequence per owner (#513). Updated only
+   * after a mutation commits, so a rollback cannot consume a sequence.
+   */
+  private previousHeadSequences = new Map<string, number>();
 
   /**
    * Supply the actor-existence probe after construction.
@@ -891,6 +903,7 @@ export class ObligationRepository {
       throw new Error("ObligationRepository.mutate cannot be called re-entrantly");
     }
     const changes: ReadyHeadChange[] = [];
+    const committedSequences = new Map<string, number>();
     this.dirtyScheduleIds.clear();
     this.pendingCancellationAttention = [];
     this.pendingResponsiveReady = [];
@@ -932,10 +945,15 @@ export class ObligationRepository {
       for (const ownerId of before.keys()) {
         if (!after.has(ownerId) && this.isActorOwner(ownerId)) {
           const previousHeadId = before.get(ownerId) ?? null;
-          const prev = this.previousHeads.get(ownerId);
-          const sequence = (prev?.sequence ?? 0) + 1;
-          this.previousHeads.set(ownerId, { headId: null, sequence });
-          changes.push({ ownerId, head: null, previousHeadId, sequence });
+          const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+          committedSequences.set(ownerId, sequence);
+          changes.push({
+            ownerId,
+            epoch: this.readyHeadEpoch,
+            head: null,
+            previousHeadId,
+            sequence,
+          });
         }
       }
 
@@ -946,10 +964,9 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const prev = this.previousHeads.get(ownerId);
-        const sequence = (prev?.sequence ?? 0) + 1;
-        this.previousHeads.set(ownerId, { headId, sequence });
-        changes.push({ ownerId, head, previousHeadId, sequence });
+        const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+        committedSequences.set(ownerId, sequence);
+        changes.push({ ownerId, epoch: this.readyHeadEpoch, head, previousHeadId, sequence });
       }
 
       // A ready head that stays in place would ordinarily produce no head
@@ -964,14 +981,25 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const prev = this.previousHeads.get(ownerId);
-        const sequence = (prev?.sequence ?? 0) + 1;
-        this.previousHeads.set(ownerId, { headId, sequence });
-        changes.push({ ownerId, head, previousHeadId: headId, sequence });
+        const sequence = (this.previousHeadSequences.get(ownerId) ?? 0) + 1;
+        committedSequences.set(ownerId, sequence);
+        changes.push({
+          ownerId,
+          epoch: this.readyHeadEpoch,
+          head,
+          previousHeadId: headId,
+          sequence,
+        });
       }
 
       return res;
     })();
+
+    // A rolled-back mutation must not consume a sequence. Once committed, a
+    // later listener failure can only leave a safe gap in the dedupe keys.
+    for (const [ownerId, sequence] of committedSequences) {
+      this.previousHeadSequences.set(ownerId, sequence);
+    }
 
     const listener = this.readyHeadListener;
     if (listener) {
