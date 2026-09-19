@@ -10,7 +10,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
-import { readAvatar } from "../avatar/avatars.js";
+import { AvatarGenerationCoordinator, readAvatar } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -1912,6 +1912,94 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
     expect(res.statusCode).toBe(404);
     expect(res.headers["Cache-Control"]).toBe("no-store");
+  });
+
+  it("lazily generates only known actors and coalesces simultaneous avatar requests", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatars-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("lazy-avatar"),
+    ]);
+    let release: ((response: Response) => void) | undefined;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        })
+    );
+
+    try {
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: new AvatarGenerationCoordinator(),
+      };
+      const [first, second] = await Promise.all([
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(first.res.ended).toBe(false);
+      expect(second.res.ended).toBe(false);
+
+      const unknown = await call(lazyDeps, "GET", "/api/mesh/avatar/not-a-known-actor.png");
+      expect(unknown.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      release?.({
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ inlineData: { data: png.toString("base64") } }] } }],
+        }),
+      } as unknown as Response);
+      await settled(first.res);
+      await settled(second.res);
+      expect(first.res.statusCode).toBe(200);
+      expect(second.res.statusCode).toBe(200);
+    } finally {
+      release?.({ ok: false, status: 500 } as Response);
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a failed lazy attempt on the fallback instead of retrying on later GETs", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-failure-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_B, null, "active"));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("provider unavailable"));
+
+    try {
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: new AvatarGenerationCoordinator(),
+      };
+      const first = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      await settled(first.res);
+      expect(first.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const repeat = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      await settled(repeat.res);
+      expect(repeat.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("serves avatars even with no mesh bound (filesystem-backed, deps=null)", async () => {

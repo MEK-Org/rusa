@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -14,6 +16,25 @@ import 'fakes.dart';
 Widget _wrap(Widget child) => MaterialApp(
   home: Scaffold(body: Center(child: child)),
 );
+
+/// A deterministic decoded frame for the avatar fade test. It avoids tying the
+/// visual transition test to a network transport or image-codec fixture.
+class _OneFrameImageProvider extends ImageProvider<_OneFrameImageProvider> {
+  const _OneFrameImageProvider(this.image);
+
+  final ui.Image image;
+
+  @override
+  Future<_OneFrameImageProvider> obtainKey(ImageConfiguration configuration) async => this;
+
+  @override
+  ImageStreamCompleter loadImage(
+    _OneFrameImageProvider key,
+    ImageDecoderCallback decode,
+  ) => OneFrameImageStreamCompleter(
+    Future<ImageInfo>.value(ImageInfo(image: image)),
+  );
+}
 
 void main() {
   testWidgets(
@@ -34,6 +55,9 @@ void main() {
         expect(find.byType(ActorAvatar), findsOneWidget);
         // Graceful placeholder: a neutral silhouette, never a broken-image glyph.
         expect(find.byIcon(Icons.pets), findsOneWidget);
+        // A terminal network failure settles on the fallback; it does not keep
+        // presenting the first-display loading indicator.
+        expect(find.byType(CircularProgressIndicator), findsNothing);
 
         // The container is masked to a circle (shape: circle).
         final decorated = tester.widget<Container>(
@@ -48,6 +72,44 @@ void main() {
       });
     },
   );
+
+  testWidgets(
+    'shows a progress ring around the fallback while a first avatar request loads',
+    (tester) async {
+      await tester.pumpWidget(
+        _wrap(
+          const ActorAvatar(
+            id: 'eeeeeeee-0000-4000-8000-000000000007',
+            size: 26,
+          ),
+        ),
+      );
+
+      expect(find.byIcon(Icons.pets), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    },
+  );
+
+  testWidgets('fades a generated avatar in after the image frame arrives', (
+    tester,
+  ) async {
+    final image = (await tester.runAsync(() => createTestImage(cache: false)))!;
+    addTearDown(image.dispose);
+    final provider = _OneFrameImageProvider(image);
+    await tester.pumpWidget(
+      _wrap(
+        ActorAvatar(
+          id: 'ffffffff-0000-4000-8000-000000000008',
+          size: 26,
+          imageProvider: provider,
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final fade = tester.widget<AnimatedOpacity>(find.byType(AnimatedOpacity));
+    expect(fade.duration, const Duration(milliseconds: 200));
+  });
 
   testWidgets('retired avatar renders muted (wrapped in Opacity)', (
     tester,

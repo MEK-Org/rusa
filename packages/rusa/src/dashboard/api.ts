@@ -8,6 +8,7 @@ import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.j
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
+  AvatarGenerationCoordinator,
   generateAvatarForce,
   isRootHandle,
   type RootAvatarIdentity,
@@ -120,6 +121,8 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  /** Process-local one-attempt state for first-display avatar generation. */
+  avatarGeneration?: AvatarGenerationCoordinator;
   supportedVoices?: readonly SupportedVoice[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
@@ -132,6 +135,7 @@ export type { FollowerInfo };
 
 /** Route prefix for the per-actor avatar endpoint . */
 const AVATAR_PREFIX = "/api/mesh/avatar/";
+const fallbackAvatarGeneration = new AvatarGenerationCoordinator();
 
 /**
  * Extract the avatar lookup key from `/api/mesh/avatar/<key>.(png|jpg)`: strip
@@ -1423,31 +1427,59 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar , keyed by
-  // the unique thread id (the root id serves the fixed bundled image).
-  // Filesystem-backed and independent of the live mesh, so it's served even when
-  // `deps` is null (a UI-only server). 404 when nothing is cached yet so the UI
-  // falls back to its placeholder.
+  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar, keyed by the
+  // unique thread id (the root id serves the fixed bundled image). A missing
+  // image for a real actor begins one shared lazy attempt; unknown ids always
+  // stay a cheap 404 and can never spend provider quota.
   if (pathname.startsWith(AVATAR_PREFIX)) {
     const key = avatarKeyFromPath(pathname);
     const avatar = key ? readAvatar(key, deps?.rootIdentity) : null;
-    if (!avatar) {
-      res.writeHead(404, {
-        "Content-Type": "text/plain; charset=utf-8",
+    if (avatar) {
+      res.writeHead(200, {
+        "Content-Type": avatar.contentType,
+        // Avatars can change from the bundled default to a generated/uploaded image,
+        // and the client resets its cache-busting epoch on every page load. Disable
+        // HTTP caching so a freshly generated avatar is never masked by a stale
+        // cached default after refresh.
         "Cache-Control": "no-store",
       });
-      res.end("avatar not found");
+      res.end(avatar.body);
       return true;
     }
-    res.writeHead(200, {
-      "Content-Type": avatar.contentType,
-      // Avatars can change from the bundled default to a generated/uploaded image,
-      // and the client resets its cache-busting epoch on every page load. Disable
-      // HTTP caching so a freshly generated avatar is never masked by a stale
-      // cached default after refresh.
+
+    const attempt =
+      key && deps?.actors.get(key)
+        ? (deps.avatarGeneration ?? fallbackAvatarGeneration).request(key, {
+            apiKey: deps.geminiApiKey ?? "",
+            rootHandle: deps.rootIdentity?.handle,
+            rootId: deps.rootIdentity?.id,
+            log: (message) => deps.logger?.warn("avatar_lazy_generation_failed", { key, message }),
+          })
+        : undefined;
+    if (attempt) {
+      void attempt.then(() => {
+        const generated = readAvatar(key as string, deps?.rootIdentity);
+        if (generated) {
+          res.writeHead(200, {
+            "Content-Type": generated.contentType,
+            "Cache-Control": "no-store",
+          });
+          res.end(generated.body);
+          return;
+        }
+        res.writeHead(404, {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end("avatar not found");
+      });
+      return true;
+    }
+    res.writeHead(404, {
+      "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-store",
     });
-    res.end(avatar.body);
+    res.end("avatar not found");
     return true;
   }
 

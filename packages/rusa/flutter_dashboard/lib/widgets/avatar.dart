@@ -14,11 +14,11 @@ import 'status_dot.dart';
 /// the image codec sniffs the bytes). The image is masked to a circle with a
 /// subtle border.
 ///
-/// Availability is best-effort: an avatar is generated asynchronously on spawn,
-/// so it may not exist yet (404) on first sighting. While the image loads — or
-/// if it 404s / fails — a graceful silhouette placeholder shows instead, so the
-/// UI never blocks on avatar availability. The tree pairs this with the live
-/// status dot, so run-state is always visible even before the image resolves.
+/// A missing avatar starts one server-side generation attempt only after this
+/// widget requests it. While that request is pending, the fallback silhouette
+/// stays visible beneath an edge progress ring; a returned image fades in, and
+/// a failed request settles on the fallback without client-side retrying. The
+/// tree pairs this with the live status dot, so run-state is always visible.
 /// Retired actors render muted.
 class ActorAvatar extends StatelessWidget {
   const ActorAvatar({
@@ -27,6 +27,7 @@ class ActorAvatar extends StatelessWidget {
     this.size = 22,
     this.retired = false,
     this.store,
+    this.imageProvider,
   });
 
   /// The unique thread id — the avatar's identity and cache key.
@@ -39,6 +40,10 @@ class ActorAvatar extends StatelessWidget {
   /// config-driven via `rootActor.avatar`) and re-fetches past the browser's
   /// URL-keyed image cache after a successful upload.
   final DashboardStore? store;
+
+  /// Optional image source used by widget tests. Production uses the avatar
+  /// endpoint below, which is what starts the server's lazy first-display work.
+  final ImageProvider<Object>? imageProvider;
 
   @override
   Widget build(BuildContext context) {
@@ -53,17 +58,14 @@ class ActorAvatar extends StatelessWidget {
             .resolve('/api/mesh/avatar/$id.png${epoch > 0 ? '?v=$epoch' : ''}')
             .toString();
 
-        final image = Image.network(
-          url,
-          width: size,
-          height: size,
-          fit: BoxFit.cover,
-          // Keep the last frame during a rebuild so the avatar never flickers
-          // when the tree re-renders on SSE updates.
-          gaplessPlayback: true,
-          loadingBuilder: (_, child, progress) =>
-              progress == null ? child : _placeholder(),
-          errorBuilder: (_, _, _) => _placeholder(),
+        final image = _AvatarImage(
+          // A successful manual upload/generate increments the epoch, so its
+          // new URL must create a fresh image state instead of retaining a
+          // previous failed first-display attempt.
+          key: ValueKey(url),
+          id: id,
+          size: size,
+          imageProvider: imageProvider ?? NetworkImage(url),
         );
 
         // A true circle, with no flat tangent edges. A circular `BoxDecoration`
@@ -111,18 +113,96 @@ class ActorAvatar extends StatelessWidget {
       },
     );
   }
+}
 
-  /// Neutral silhouette shown until the image resolves (or if it never does).
-  Widget _placeholder() => Container(
-    color: MeshColors.bgTertiary,
-    alignment: Alignment.center,
-    child: Icon(
-      id == 'human:operator' ? Icons.person : Icons.pets,
-      size: size * 0.55,
-      color: MeshColors.textMuted,
-    ),
+/// Keeps first-display loading, fade-in, and terminal fallback state scoped to
+/// one avatar URL. A URL change (manual upload/generate epoch) creates a fresh
+/// instance; ordinary tree rebuilds retain the settled image or fallback.
+class _AvatarImage extends StatefulWidget {
+  const _AvatarImage({
+    super.key,
+    required this.id,
+    required this.size,
+    required this.imageProvider,
+  });
+
+  final String id;
+  final double size;
+  final ImageProvider<Object> imageProvider;
+
+  @override
+  State<_AvatarImage> createState() => _AvatarImageState();
+}
+
+class _AvatarImageState extends State<_AvatarImage> {
+  bool _hasFrame = false;
+  bool _showImage = false;
+  bool _fadeScheduled = false;
+
+  void _scheduleFadeIn() {
+    if (_showImage || _fadeScheduled) return;
+    _fadeScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() => _showImage = true);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Image(
+    image: widget.imageProvider,
+    width: widget.size,
+    height: widget.size,
+    fit: BoxFit.cover,
+    // Keep the last frame during a rebuild so the avatar never flickers when
+    // the tree re-renders on SSE updates.
+    gaplessPlayback: true,
+    frameBuilder: (_, child, frame, _) {
+      if (frame == null) return child;
+      // `loadingBuilder` runs after this callback. Record the frame here so
+      // the first decoded image can replace the fallback in the same build;
+      // `_showImage` flips post-frame to animate its opacity from zero.
+      _hasFrame = true;
+      _scheduleFadeIn();
+      return AnimatedOpacity(
+        opacity: _showImage ? 1 : 0,
+        duration: const Duration(milliseconds: 200),
+        child: child,
+      );
+    },
+    loadingBuilder: (_, child, progress) {
+      // `Image` has a brief initial state before it emits byte progress. The
+      // fallback/ring must cover that state too, otherwise a slow first lazy
+      // request begins as a blank circle rather than a visible placeholder.
+      if (_hasFrame) return child;
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          _avatarPlaceholder(widget.id, widget.size),
+          Padding(
+            padding: const EdgeInsets.all(1.5),
+            child: CircularProgressIndicator(
+              strokeWidth: widget.size >= 20 ? 2 : 1,
+              semanticsLabel: 'Generating avatar',
+            ),
+          ),
+        ],
+      );
+    },
+    errorBuilder: (_, _, _) => _avatarPlaceholder(widget.id, widget.size),
   );
 }
+
+/// Neutral silhouette shown until the image resolves, or after its one lazy
+/// request fails. The error path deliberately has no retry mechanism.
+Widget _avatarPlaceholder(String id, double size) => Container(
+  color: MeshColors.bgTertiary,
+  alignment: Alignment.center,
+  child: Icon(
+    id == 'human:operator' ? Icons.person : Icons.pets,
+    size: size * 0.55,
+    color: MeshColors.textMuted,
+  ),
+);
 
 /// The hierarchy's actor identity marker: a circular avatar with its live run
 /// state overlaid at the lower-right corner. Overview rows use this same widget
