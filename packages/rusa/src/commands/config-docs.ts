@@ -66,6 +66,8 @@ Minimal example:
   #     projectId: example-project
   #     apiKey: YOUR_FIREBASE_WEB_API_KEY
   #     authDomain: example-project.firebaseapp.com
+  #     appId: YOUR_FIREBASE_WEB_APP_ID
+  #     messagingSenderId: YOUR_FIREBASE_MESSAGING_SENDER_ID
   #     serviceAccountKeyPath: /absolute/path/to/firebase-admin.json
 
   dashboard:

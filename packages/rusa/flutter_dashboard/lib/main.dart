@@ -3,7 +3,6 @@ import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:web/web.dart' as web;
 
 import 'api.dart';
-import 'session_events_web.dart';
 import 'breakpoints.dart';
 import 'avatar_upload_web.dart';
 import 'dashboard_title.dart';
@@ -11,6 +10,9 @@ import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
 import 'sse.dart';
 import 'store.dart';
+import 'session.dart';
+import 'session_events_web.dart';
+import 'session_web.dart';
 import 'theme.dart';
 import 'voice_web.dart';
 import 'web_actor_hierarchy_cache.dart';
@@ -22,13 +24,14 @@ import 'widgets/dashboard_body.dart';
 /// SSE stream and renders the locked V1.4.0 design: an alive-actor tree on the
 /// left and the selected actor's Events / Live Output on the right.
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   usePathUrlStrategy();
   // Read the served shell's title before the first frame — see
   // `dashboard_title.dart` for why MaterialApp would otherwise overwrite it.
   runApp(RusaDashboardApp(title: resolveDashboardTitle(web.document.title)));
 }
 
-class RusaDashboardApp extends StatelessWidget {
+class RusaDashboardApp extends StatefulWidget {
   const RusaDashboardApp({super.key, this.title = defaultDashboardTitle});
 
   /// Browser tab title; the served `index.html`'s, branded with this instance's
@@ -36,9 +39,16 @@ class RusaDashboardApp extends StatelessWidget {
   final String title;
 
   @override
+  State<RusaDashboardApp> createState() => _RusaDashboardAppState();
+}
+
+class _RusaDashboardAppState extends State<RusaDashboardApp> {
+  late final Future<DashboardSession> _session = bootstrapDashboardSession();
+
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: title,
+      title: widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
       // Keep one DashboardPage for every initial path. With path URL strategy,
@@ -47,13 +57,146 @@ class RusaDashboardApp extends StatelessWidget {
       // duplicate stores and SSE connections mounted. The home fallback is
       // intentional, including its debug-only initial-route diagnostic; direct
       // deep links still select their view in DashboardBody.
-      home: const DashboardPage(),
+      home: FutureBuilder<DashboardSession>(
+        future: _session,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const _DarkFrame();
+          }
+          final session = snapshot.data;
+          if (snapshot.hasError || session == null) return const _AuthStartupError();
+          return _DashboardSessionHost(session: session);
+        },
+      ),
     );
   }
 }
 
+/// Keeps browser visit hooks scoped to the session that owns them.
+class _DashboardSessionHost extends StatefulWidget {
+  const _DashboardSessionHost({required this.session});
+
+  final DashboardSession session;
+
+  @override
+  State<_DashboardSessionHost> createState() => _DashboardSessionHostState();
+}
+
+class _DashboardSessionHostState extends State<_DashboardSessionHost> {
+  @override
+  void initState() {
+    super.initState();
+    installDashboardSession(widget.session);
+  }
+
+  @override
+  void dispose() {
+    disposeDashboardSession(widget.session);
+    widget.session.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.session,
+    builder: (context, _) {
+      return switch (widget.session.status) {
+        DashboardSessionStatus.local || DashboardSessionStatus.signedIn =>
+          DashboardPage(session: widget.session),
+        DashboardSessionStatus.signedOut => SignInPage(session: widget.session),
+      };
+    },
+  );
+}
+
+class _DarkFrame extends StatelessWidget {
+  const _DarkFrame();
+
+  @override
+  Widget build(BuildContext context) =>
+      const Scaffold(backgroundColor: MeshColors.bgPrimary, body: SizedBox.expand());
+}
+
+class _AuthStartupError extends StatelessWidget {
+  const _AuthStartupError();
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: MeshColors.bgPrimary,
+    body: Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Text(
+          'Unable to connect to Rusa. Please reload and try again.',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.bodyLarge,
+        ),
+      ),
+    ),
+  );
+}
+
+class SignInPage extends StatefulWidget {
+  const SignInPage({super.key, required this.session});
+
+  final DashboardSession session;
+
+  @override
+  State<SignInPage> createState() => _SignInPageState();
+}
+
+class _SignInPageState extends State<SignInPage> {
+  bool _signingIn = false;
+  String? _error;
+
+  Future<void> _signIn() async {
+    setState(() {
+      _signingIn = true;
+      _error = null;
+    });
+    try {
+      await widget.session.signIn();
+    } catch (_) {
+      if (mounted) {
+        setState(() => _error = 'Unable to sign in. Check your connection and try again.');
+      }
+    } finally {
+      if (mounted) setState(() => _signingIn = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: MeshColors.bgPrimary,
+    body: Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Rusa', style: Theme.of(context).textTheme.headlineMedium),
+            const SizedBox(height: 16),
+            Text('Sign in to your agent dashboard.', style: Theme.of(context).textTheme.bodyLarge),
+            if (_error != null) ...[
+              const SizedBox(height: 12),
+              Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: MeshColors.statusHalted)),
+            ],
+            const SizedBox(height: 20),
+            FilledButton(
+              onPressed: _signingIn ? null : _signIn,
+              child: Text(_signingIn ? 'Signing in…' : 'Sign in with Google'),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
 class DashboardPage extends StatefulWidget {
-  const DashboardPage({super.key});
+  const DashboardPage({super.key, required this.session});
+
+  final DashboardSession session;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -66,7 +209,7 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
-    _api = DashboardApi();
+    _api = DashboardApi(session: widget.session);
     _store = DashboardStore(
       api: _api,
       stream: WebEventSourceStream(),
@@ -100,8 +243,8 @@ class _DashboardPageState extends State<DashboardPage> {
           // screenshot harness.
           Expanded(
             child: DashboardBody(
-              onLogout: authenticationEnabled ? logout : null,
-              profilePhotoUrl: profilePhotoUrl,
+              onLogout: widget.session.authenticationEnabled ? logout : null,
+              profilePhotoUrl: widget.session.profilePhotoUrl,
               store: _store,
               understandingBuilder: (_) => const IuTreeBody(),
               reportsBuilder: (_) => IuReportsBody(store: _store),

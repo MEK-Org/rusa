@@ -9,8 +9,8 @@ import 'session_client.dart';
 /// the page origin (`Uri.base`), so the same build works on localhost and
 /// behind `tailscale serve` (relative paths, no hard-coded host).
 class DashboardApi {
-  DashboardApi({http.Client? client, Uri? base})
-    : _client = SessionClient(client),
+  DashboardApi({http.Client? client, Uri? base, SessionRequestState? session})
+    : _client = SessionClient(client, session),
       _base = base ?? Uri.base;
 
   final http.Client _client;

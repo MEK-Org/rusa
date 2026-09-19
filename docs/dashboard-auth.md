@@ -43,6 +43,8 @@ auth:
     projectId: example-project
     apiKey: YOUR_FIREBASE_WEB_API_KEY
     authDomain: example-project.firebaseapp.com
+    appId: YOUR_FIREBASE_WEB_APP_ID
+    messagingSenderId: YOUR_FIREBASE_MESSAGING_SENDER_ID
     serviceAccountKeyPath: /absolute/path/to/firebase-admin.json
 ```
 
@@ -72,10 +74,24 @@ knowledge-graph project's admin tooling. Set `auth.firebase.serviceAccountKeyPat
 independently; startup rejects a key whose `project_id` is not
 `auth.firebase.projectId`, so the same file serves both fields only if both
 really are the same Firebase project. Neither field falls back to the other.
-The Web API key, project ID, and auth domain are public client configuration;
+The Web API key, project ID, auth domain, app ID, and messaging sender ID are
+public client configuration;
 the email policy and service-account file are never served to the browser.
-The Firebase SDK is bundled with the dashboard; no additional script CDN is
-required. Rebuild the dashboard and restart Rusa after changing configuration.
+Flutter reads those options at runtime from this operator-owned configuration;
+FlutterFire's `FirebaseOptions` constructor statically requires `appId` and
+`messagingSenderId` on Web in addition to the project ID and API key used by the
+legacy JavaScript SDK bundle (both identifiers are available in the Firebase Console
+under Project Settings → General → Your apps → Web app).
+When upgrading an existing authenticated configuration, add both fields before
+restarting Rusa. They cannot be inferred reliably from the legacy project ID,
+API key, and domain: a project can have multiple Web apps, and the sender ID is
+the Firebase project number rather than its project ID. Startup intentionally
+fails closed, naming the missing `auth.firebase` field, rather than serving a
+dashboard that cannot initialize FlutterFire. This is a configuration update
+only; it does not rewrite durable data or require a database migration.
+Do not add a generated `firebase_options.dart` or a Firebase configuration file
+to this repository. FlutterFire may load its browser SDK support from the
+official Firebase CDN. Rebuild the dashboard and restart Rusa after changing configuration.
 Both `rusa start` and the standalone `rusa dashboard` honor this configuration.
 
 Serve the dashboard over HTTPS, for example through Tailscale Serve. A reverse
@@ -98,8 +114,8 @@ before the mutation runs. Origin checks and Strict cookies remain required.
 The CSRF cookie is Secure, host-only, SameSite=Strict, and intentionally not
 HttpOnly; the Firebase authentication cookie remains HttpOnly. Session creation,
 renewal, and logout replace the CSRF binding. The bootstrap reuses a valid token
-and never creates or renews an authentication session. Both browser clients
-bootstrap before mutations, so a server restart (which replaces the in-memory
+and never creates or renews an authentication session. The Flutter dashboard
+bootstraps before mutations, so a server restart (which replaces the in-memory
 CSRF signing key) does not require a new login. No database/config secret is
 added; this is a single-server implementation, not a shared-key multi-replica setup.
 
@@ -152,8 +168,9 @@ own and the existing cookie is verified again. Configuration changes apply at
 restart.
 
 All dashboard data, mutations, avatars, quota/understanding views, voice, and SSE
-are behind the same gate. Public routes are the generic login shell and bundled
-login script, health, client auth configuration, and login/session endpoints.
+are behind the same gate. The Flutter app bundle, health, client auth
+configuration, and login/session endpoints are public; the unauthenticated app
+shell contains no configured instance name, avatar, or dashboard data.
 The header-protected CSRF bootstrap is also public so login itself can be protected.
 GitHub webhook HMAC, host wake tokens, and actor MCP endpoints retain their
 separate machine authentication; Firebase does not authorize them.
@@ -170,15 +187,8 @@ Firebase references: [Google sign-in](https://firebase.google.com/docs/auth/web/
 Run the focused server/config/browser-controller suite with:
 
 ```sh
-pnpm --filter rusa exec vitest run src/dashboard/auth.test.ts src/dashboard/auth-browser.test.ts src/config/dashboard-auth.test.ts
-```
-
-The built-asset smoke test uses Chromium, with no real Firebase account:
-
-```sh
-pnpm --filter rusa run build:dashboard-ui
-pnpm --filter rusa exec playwright install chromium
-RUSA_AUTH_BROWSER_SMOKE=1 pnpm --filter rusa exec vitest run src/dashboard/auth.browser.integration.test.ts
+pnpm --filter rusa exec vitest run src/dashboard/auth.test.ts src/config/dashboard-auth.test.ts
+pnpm --filter rusa run test:dashboard-ui
 ```
 
 Before deployment, exercise Google sign-in against the configured project over

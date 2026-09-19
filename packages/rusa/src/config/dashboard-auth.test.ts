@@ -8,6 +8,8 @@ describe("optional shared-human auth config", () => {
       projectId: "project",
       apiKey: "key",
       authDomain: "project.firebaseapp.com",
+      appId: "app-id",
+      messagingSenderId: "sender-id",
       serviceAccountKeyPath: "/keys/admin.json",
     },
   });
@@ -73,5 +75,12 @@ describe("optional shared-human auth config", () => {
         firebase: { ...valid().firebase, authDomain: "https://secret.example" },
       })
     ).toThrow("config.yaml: auth.firebase.authDomain must be a hostname");
+  });
+  it("fails closed with the required FlutterFire upgrade field for legacy auth configs", () => {
+    const legacy = valid();
+    delete (legacy.firebase as Partial<typeof legacy.firebase>).appId;
+    expect(() => validateDashboardAuth(legacy)).toThrow(
+      "config.yaml: auth.firebase.appId must be a non-empty string"
+    );
   });
 });
