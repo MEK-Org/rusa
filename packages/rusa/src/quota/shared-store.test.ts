@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
-import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ProviderQuotaSnapshot, QuotaService, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import { QuotaCoordinatorClient } from "./coordinator-client.js";
+import { QuotaCollectionLoop } from "./coordinator-collection.js";
+import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
@@ -524,9 +527,14 @@ interface ConcurrentOpener {
   child: ChildProcessWithoutNullStreams;
   ready: Promise<void>;
   completed: Promise<void>;
+  output: () => string;
 }
 
-function startConcurrentOpener(moduleUrl: string, databasePath: string): ConcurrentOpener {
+function startConcurrentOpener(
+  moduleUrl: string,
+  databasePath: string,
+  client?: { moduleUrl: string; socketPath: string }
+): ConcurrentOpener {
   // TypeScript writes intra-package imports with a `.js` extension naming a
   // `.ts` file. Vitest's resolver follows that; plain node's does not, and this
   // opener is plain node — so the store's own imports have to be mapped here or
@@ -547,11 +555,25 @@ function startConcurrentOpener(moduleUrl: string, databasePath: string): Concurr
     import { register } from "node:module";
     register("data:text/javascript," + encodeURIComponent(${JSON.stringify(resolveTsSources)}));
     const { SharedQuotaStore } = await import(${JSON.stringify(moduleUrl)});
+    const clientModuleUrl = ${JSON.stringify(client?.moduleUrl)};
+    const socketPath = ${JSON.stringify(client?.socketPath)};
+    const { QuotaCoordinatorClient } = clientModuleUrl
+      ? await import(clientModuleUrl)
+      : {};
     process.stdout.write("ready\\n");
-    process.stdin.once("data", () => {
+    process.stdin.once("data", async () => {
       try {
-        const store = new SharedQuotaStore(process.argv[1]);
-        store.close();
+        if (QuotaCoordinatorClient && socketPath) {
+          const coordinator = new QuotaCoordinatorClient({
+            socketPath,
+            configuredProviders: ["claude"],
+          });
+          await coordinator.getThrottle();
+          process.stdout.write("applied=" + coordinator.getLastAppliedInterval("claude") + "\\n");
+        } else {
+          const store = new SharedQuotaStore(process.argv[1]);
+          store.close();
+        }
       } catch (error) {
         console.error(error);
         process.exitCode = 1;
@@ -599,8 +621,84 @@ function startConcurrentOpener(moduleUrl: string, databasePath: string): Concurr
   child.stderr.on("data", (chunk: Buffer) => {
     errorOutput += chunk.toString();
   });
-  return { child, ready, completed };
+  return { child, ready, completed, output: () => output };
 }
+
+describe("Quota coordinator multi-process reads", () => {
+  it("criterion 12b: two clients apply one published interval after the pool performs one scrape", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-coordinator-e2e-"));
+    roots.push(root);
+    const databasePath = join(root, "quota.db");
+    const socketPath = join(root, "coordinator.sock");
+    const store = new SharedQuotaStore(databasePath);
+    const scrapedAt = new Date().toISOString();
+    const resetAtIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+    try {
+      store.configureController({ maxIntervalSeconds: 3600 });
+      // The pool begins cold. The observation below is owned by the one
+      // service probe; the collection tick advances it into the value both
+      // independently-running clients receive.
+      expect(store.getProviderThrottle("claude")).toBeNull();
+      const scrape = vi.fn().mockImplementation(async () => {
+        recordObservation(store, "claude", scrapedAt, 50, resetAtIso);
+        return {
+          state: store.getLatestSnapshot("claude"),
+          didProbe: true,
+        };
+      });
+      const collection = new QuotaCollectionLoop({
+        store,
+        quotaService: {
+          getQuotaProbeOutcome: scrape,
+          hydrate: vi.fn(),
+        } as unknown as QuotaService,
+        providers: ["claude"],
+      });
+      const coordinator = new QuotaCoordinatorService({
+        socketPath,
+        store,
+        configuredProviders: ["claude"],
+      });
+      await coordinator.start();
+      try {
+        await collection.tick();
+        expect(scrape).toHaveBeenCalledTimes(1);
+        const publishedInterval = store.getProviderThrottle("claude")?.intervalSeconds;
+        if (publishedInterval === undefined)
+          throw new Error("expected a published claude interval");
+
+        const localClient = new QuotaCoordinatorClient({
+          socketPath,
+          configuredProviders: ["claude"],
+        });
+        const child = startConcurrentOpener(
+          pathToFileURL(join(process.cwd(), "src/quota/shared-store.ts")).href,
+          databasePath,
+          {
+            moduleUrl: pathToFileURL(join(process.cwd(), "src/quota/coordinator-client.ts")).href,
+            socketPath,
+          }
+        );
+        await child.ready;
+        await localClient.getThrottle();
+        child.child.stdin.end("read\\n");
+        await child.completed;
+
+        expect(localClient.getLastAppliedInterval("claude")).toBe(publishedInterval);
+        expect(child.output()).toContain(`applied=${publishedInterval}`);
+        expect(scrape).toHaveBeenCalledTimes(1);
+
+        // This is deliberately not a spacing test. These are client reads, not
+        // shared launch reservations: no union of start timestamps is asserted
+        // against the interval (§1.5; deferred to §11/v2).
+      } finally {
+        await coordinator.stop();
+      }
+    } finally {
+      store.close();
+    }
+  }, 15_000);
+});
 
 describe("SharedQuotaStore PID integral term", () => {
   it("accumulates standing error so one integral time doubles the proportional response", () => {

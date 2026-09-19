@@ -1,4 +1,6 @@
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -10,11 +12,26 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
+import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
+import { SharedQuotaStore } from "../quota/shared-store.js";
 import { E2E_INSTANCE_UNIT_NAME, E2EInstanceManager } from "./e2e-instance-manager.js";
+
+function probeBwrapCapable(): boolean {
+  try {
+    execFileSync("bwrap", ["--ro-bind", "/", "/", "--", "/bin/true"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const BWRAP_CAPABLE = probeBwrapCapable();
 
 describe("E2EInstanceManager", () => {
   let root = "";
@@ -49,7 +66,23 @@ describe("E2EInstanceManager", () => {
       `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
     );
     writeFileSync(join(actorWorktree, "packages", "rusa", "scripts", "e2e.mjs"), "");
-    writeFileSync(join(mcHome, "config.yaml"), "providers: {}\n");
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
     writeFileSync(claudeExecutable, "");
     active = false;
     stopFails = false;
@@ -209,6 +242,259 @@ describe("E2EInstanceManager", () => {
     if (launch?.args.includes("/run/user")) {
       expect(launch.args).toEqual(expect.arrayContaining(["--tmpfs", "/run/user"]));
     }
+  });
+
+  it("projects the configured coordinator socket into the one E2E instance", async () => {
+    const socketDirectory = join(root, "rusa-quota");
+    const socketPath = join(socketDirectory, "coordinator.sock");
+    const coordinatorDatabasePath = join(root, "rusa-quota-coordinator.db");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(coordinatorDatabasePath, "coordinator-owned database");
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        `quota: { coordinator: { socketPath: ${socketPath}, databasePath: ${coordinatorDatabasePath} }, throttle: { enabled: true } }`,
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await manager().up("actor-a", actorWorktree);
+      const launch = calls.find((call) => call.file === "systemd-run");
+      // Bind the dedicated socket directory instead of the socket inode: a
+      // coordinator restart unlinks and recreates the listener, and clients in
+      // the disposable instance must see that replacement.
+      expect(launch?.args).toEqual(
+        expect.arrayContaining(["--ro-bind", dirname(socketPath), dirname(socketPath)])
+      );
+      expect(launch?.args).not.toContain(coordinatorDatabasePath);
+    } finally {
+      manager().down("actor-a");
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent is not dedicated before launching an instance", async () => {
+    const socketPath = join(root, "coordinator.sock");
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be a dedicated directory/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent violates the required 0700 mode before launching an instance", async () => {
+    const socketDirectory = join(root, "rusa-quota-permissive");
+    const socketPath = join(socketDirectory, "coordinator.sock");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(socketDirectory, 0o755);
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be mode 0o700/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent is not owned by the current user before launching an instance", async () => {
+    const socketDirectory = join(root, "rusa-quota-foreign-owner");
+    const socketPath = join(socketDirectory, "coordinator.sock");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    const originalGetuid = process.getuid;
+    const currentUid = typeof originalGetuid === "function" ? originalGetuid() : 1000;
+    const foreignUid = currentUid + 100;
+    const getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(foreignUid);
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be owned by the current user/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
+      getuidSpy.mockRestore();
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses an unavailable configured coordinator socket before launching an instance", async () => {
+    const socketPath = join(root, "missing-coordinator.sock");
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+      /configured quota coordinator socket.*missing-coordinator\.sock/
+    );
+    expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+  });
+
+  it("refuses a relative configured coordinator socket before launching an instance", async () => {
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        "    socketPath: quota/coordinator.sock",
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+      /configured quota coordinator socket must be absolute for projection/
+    );
+    expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+  });
+
+  it("refuses malformed configured coordinator config before launching an instance", async () => {
+    writeFileSync(join(mcHome, "config.yaml"), "quota:\n  coordinator: [\n");
+
+    await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow();
+    expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
   });
 
   it("fails before package installation when a plain clone cannot initialize submodules", async () => {
@@ -1117,3 +1403,258 @@ describe("E2EInstanceManager", () => {
     );
   });
 });
+
+describe.skipIf(!BWRAP_CAPABLE)(
+  "E2EInstanceManager coordinator projection (real nested bwrap)",
+  () => {
+    let root = "";
+    let workersDir = "";
+    let mcHome = "";
+    let actorWorktree = "";
+
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "e2e-instance-coordinator-"));
+      workersDir = join(root, "workers");
+      mcHome = join(root, "mc-home");
+      actorWorktree = join(workersDir, "actor-a", "rusa");
+      mkdirSync(join(actorWorktree, "packages", "rusa", "scripts"), { recursive: true });
+      mkdirSync(mcHome, { recursive: true });
+      writeFileSync(
+        join(actorWorktree, "package.json"),
+        `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
+      );
+      writeFileSync(join(actorWorktree, "packages", "rusa", "scripts", "e2e.mjs"), "");
+    });
+
+    afterEach(() => {
+      teardownFlutterOverlay(join(mcHome, "e2e-instance", "runtime"));
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    it("criterion 12a: boots one manager-built instance and applies the service interval to its real pacer", async () => {
+      const socketPath = join(root, "rusa-quota", "coordinator.sock");
+      const databasePath = join(root, "coordinator.db");
+      const store = new SharedQuotaStore(databasePath);
+      const scrapedAt = new Date().toISOString();
+      const resetAtIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+      const state = {
+        provider: "claude",
+        status: "available" as const,
+        scrapedAt,
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly" as const,
+            percentLeft: 50,
+            resetAtIso,
+            scope: { provider: "claude" },
+          },
+        ],
+      };
+      store.configureController({ maxIntervalSeconds: 3600 });
+      const scrapeId = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+      store.recordParsed(scrapeId, state, state);
+      store.advancePendingController({ maxIntervalSeconds: 3600 });
+      const publishedInterval = store.getProviderThrottle("claude")?.intervalSeconds;
+      if (publishedInterval === undefined) throw new Error("expected a published claude interval");
+
+      const service = new QuotaCoordinatorService({
+        socketPath,
+        store,
+        configuredProviders: ["claude"],
+      });
+      writeFileSync(
+        join(mcHome, "config.yaml"),
+        [
+          "quota:",
+          "  coordinator:",
+          `    socketPath: ${socketPath}`,
+          `    databasePath: ${databasePath}`,
+          "  throttle:",
+          "    enabled: true",
+          "github:",
+          "  account: mock-bot",
+          "providers:",
+          "  claude:",
+          "    cliCommand: claude",
+          "rootActor:",
+          "  provider: claude",
+          "  model: claude-sonnet-5",
+          "  effort: high",
+          "webhook:",
+          "  port: 0",
+          '  secret: ""',
+          "geminiApiKey: fake-gemini-key",
+          "",
+        ].join("\n")
+      );
+
+      const resolveTsSources = `
+      import { existsSync } from "node:fs";
+      import { fileURLToPath } from "node:url";
+      export async function resolve(specifier, context, next) {
+        if (specifier.startsWith(".") && specifier.endsWith(".js")) {
+          const asTs = await next(specifier.slice(0, -3) + ".ts", context).catch(() => null);
+          if (asTs && existsSync(fileURLToPath(asTs.url))) return asTs;
+        }
+        return next(specifier, context);
+      }
+    `;
+      const source = (path: string) => pathToFileURL(join(process.cwd(), "src", path)).href;
+      const instanceScript = `
+      import { register } from "node:module";
+      register("data:text/javascript," + encodeURIComponent(${JSON.stringify(resolveTsSources)}));
+      const { provisionE2EInstance } = await import(${JSON.stringify(source("e2e/provision.ts"))});
+      const { runStart } = await import(${JSON.stringify(source("commands/start.ts"))});
+      const { ProviderPacer } = await import(${JSON.stringify(source("actor/provider-pacer.ts"))});
+      const root = process.argv[1];
+      const baseConfigHome = process.argv[2];
+      const launchMarkerPath = process.argv[3];
+      const { existsSync } = await import("node:fs");
+      // runStart's service shutdown terminates a production process. This
+      // nested characterization needs to inspect the real pacer immediately
+      // afterward, so preserve the exit code without ending this probe first.
+      process.exit = (code = 0) => { process.exitCode = code; };
+      while (!existsSync(launchMarkerPath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const instance = provisionE2EInstance({ root, baseConfigHome });
+      const pacers = new Set();
+      const originalSetInterval = ProviderPacer.prototype.setInterval;
+      ProviderPacer.prototype.setInterval = function(intervalMs) {
+        pacers.add(this);
+        return originalSetInterval.call(this, intervalMs);
+      };
+      let shutdown;
+      let appliedInterval;
+      let readyResolve;
+      let readyReject;
+      const ready = new Promise((resolve, reject) => {
+        readyResolve = resolve;
+        readyReject = reject;
+      });
+      const started = runStart({
+        e2e: {
+          onReady: (handles) => {
+            appliedInterval = handles.coordinatorAppliedInterval("claude");
+            shutdown = handles.shutdown;
+            readyResolve();
+          },
+        },
+      });
+      started.catch(readyReject);
+      await ready;
+      await shutdown();
+      console.log("E2E_COORDINATOR_RESULT=" + JSON.stringify({
+        appliedInterval,
+        pacerIntervals: [...pacers].map((pacer) => pacer.interval),
+        instanceDatabasePath: instance.config.quota?.coordinator?.databasePath ?? null,
+      }));
+    `;
+      const launchMarkerPath = join(mcHome, "e2e-instance", "runtime", "launch-after-restart");
+      let active = false;
+      let bwrapChild: ChildProcess | undefined;
+      let bwrapCompleted: Promise<void> | undefined;
+      let bwrapOutput = "";
+      let bwrapErrorOutput = "";
+      const subject = new E2EInstanceManager({
+        mcHome,
+        workersDir,
+        hostHome: root,
+        corepackPath: "/bin/true",
+        flutterRoot: "",
+        providerExecutables: {},
+        isPortReady: async () => true,
+        delay: async () => {},
+        handleForId: (id) => `handle-${id}`,
+        exec: (file, args) => {
+          if (file === "systemd-run") {
+            const bwrapIndex = args.indexOf("bwrap");
+            const bwrapArgs = args.slice(bwrapIndex + 1);
+            const separatorIndex = bwrapArgs.indexOf("--");
+            const e2eRoot = bwrapArgs[bwrapArgs.indexOf("--root") + 1];
+            const baseConfigHome = bwrapArgs[bwrapArgs.indexOf("--base-config-home") + 1];
+            bwrapChild = spawn(
+              "bwrap",
+              [
+                ...bwrapArgs.slice(0, separatorIndex),
+                "--",
+                process.execPath,
+                "--no-warnings",
+                "--experimental-transform-types",
+                "--input-type=module",
+                "-e",
+                instanceScript,
+                e2eRoot,
+                baseConfigHome,
+                launchMarkerPath,
+              ],
+              { stdio: ["ignore", "pipe", "pipe"] }
+            );
+            bwrapChild.stdout?.on("data", (chunk: Buffer) => {
+              bwrapOutput += chunk.toString();
+            });
+            bwrapChild.stderr?.on("data", (chunk: Buffer) => {
+              bwrapErrorOutput += chunk.toString();
+            });
+            bwrapCompleted = new Promise((resolve, reject) => {
+              bwrapChild?.once("error", reject);
+              bwrapChild?.once("exit", (code, signal) => {
+                if (code === 0) resolve();
+                else
+                  reject(
+                    new Error(
+                      `nested manager instance exited ${code ?? signal}: ${bwrapErrorOutput}`
+                    )
+                  );
+              });
+            });
+            active = true;
+            return "";
+          }
+          if (file === "systemctl" && args.includes("stop")) {
+            active = false;
+            return "";
+          }
+          return [
+            "LoadState=loaded",
+            `ActiveState=${active ? "active" : "inactive"}`,
+            `SubState=${active ? "running" : "dead"}`,
+            "Result=success",
+          ].join("\n");
+        },
+      });
+
+      try {
+        await service.start();
+        await subject.up("actor-a", actorWorktree);
+        // A coordinator restart unlinks and recreates the listener. The manager
+        // has already built the outer bwrap; now release its real boot only
+        // after the host service owns the replacement socket entry.
+        await service.stop();
+        await service.start();
+        writeFileSync(launchMarkerPath, "restart complete\n");
+        await bwrapCompleted;
+        const result = bwrapOutput
+          .split("\n")
+          .find((line) => line.startsWith("E2E_COORDINATOR_RESULT="));
+        if (!result) throw new Error(`nested manager instance produced no result: ${bwrapOutput}`);
+        const nested = JSON.parse(result.slice("E2E_COORDINATOR_RESULT=".length));
+        expect(nested.appliedInterval).toBe(publishedInterval);
+        // The assertion is about the claude pacer receiving the publication,
+        // not a permanent claim that this fixture can construct only one pacer.
+        expect(nested.pacerIntervals).toContain(publishedInterval * 1_000);
+        expect(nested.instanceDatabasePath).toBeNull();
+
+        // This is deliberately not a spacing test. One manager-built instance
+        // proves boot-time application only; §1.5/§11 leaves cross-instance
+        // launch-clock spacing for v2, so no start-timestamp union is asserted.
+      } finally {
+        bwrapChild?.kill("SIGTERM");
+        subject.down("actor-a");
+        await service.stop();
+        store.close();
+      }
+    }, 30_000);
+  }
+);
