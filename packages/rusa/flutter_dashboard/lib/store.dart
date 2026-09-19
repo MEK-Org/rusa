@@ -1400,6 +1400,12 @@ class DashboardStore {
         selectedObligation: clearsSelectedObligation
             ? null
             : existing.thread.selectedObligation,
+        selectedInboxItem: clearsSelectedObligation
+            ? null
+            : existing.thread.selectedInboxItem,
+        moreInboxItemsCount: clearsSelectedObligation
+            ? null
+            : existing.thread.moreInboxItemsCount,
       ),
       runState: delta.runState,
     );

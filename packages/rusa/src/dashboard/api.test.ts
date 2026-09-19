@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import type { InboxEntry } from "../actor/inbox-store.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import { readAvatar } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
@@ -1368,6 +1369,223 @@ describe("handleMeshApiRequest", () => {
     });
     expect(byId(UUID_B).selectedObligation).toBeUndefined();
     expect(byId("root").selectedObligation).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads surfaces selectedInboxItem for a running actor without obligation (responsive first, then earliest) with (+N more)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+
+    const normalEarly: InboxEntry = {
+      id: "norm-early",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Normal early" },
+    };
+    const normalLate: InboxEntry = {
+      id: "norm-late",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:30:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Normal late" },
+    };
+    const respLate: InboxEntry = {
+      id: "resp-late",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", priority: "responsive", content: "Responsive late" },
+    };
+
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedInboxItemsForActor: (actorId) =>
+        actorId === UUID_A ? [normalEarly, normalLate, respLate] : null,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((thread: { id: string }) => thread.id === id);
+
+    expect(byId(UUID_A).selectedInboxItem).toMatchObject({
+      id: "resp-late",
+    });
+    expect(byId(UUID_A).moreInboxItemsCount).toBe(2);
+    expect(byId(UUID_B).selectedInboxItem).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads prefers selectedObligation over selectedInboxItem for running actor", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+
+    const runningFocus = obligations.create({
+      id: "running-focus",
+      ownerId: UUID_A,
+      title: "Current running work",
+    });
+    const inboxItem: InboxEntry = {
+      id: "item-1",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Inbox item" },
+    };
+
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedObligationForActor: (actorId) => (actorId === UUID_A ? runningFocus : null),
+      selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [inboxItem] : null),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const threadA = body.threads.find((thread: { id: string }) => thread.id === UUID_A);
+
+    expect(threadA.selectedObligation).toMatchObject({
+      id: "running-focus",
+    });
+    expect(threadA.selectedInboxItem).toBeUndefined();
+    expect(threadA.moreInboxItemsCount).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads surfaces one inbox item for queued actor, including single-item case and (+N more)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+
+    // UUID_A has a single unhandled inbox item (queued single-item case)
+    inbox.append([
+      {
+        id: "queued-single",
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+        payload: { type: "message", content: "Single queued item" },
+      },
+    ]);
+
+    // UUID_B has multiple unhandled items (one normal early, one responsive late)
+    inbox.append([
+      {
+        id: "b-norm-early",
+        actorId: UUID_B,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+        payload: { type: "message", content: "B normal early" },
+      },
+      {
+        id: "b-resp-late",
+        actorId: UUID_B,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+        payload: { type: "message", priority: "responsive", content: "B responsive late" },
+      },
+    ]);
+
+    deps = {
+      ...deps,
+      queuedThreadIds: () => new Set([UUID_A, UUID_B]),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((thread: { id: string }) => thread.id === id);
+
+    // UUID_A: single-item case (no (+N more) count)
+    expect(byId(UUID_A).selectedInboxItem).toMatchObject({
+      id: "queued-single",
+    });
+    expect(byId(UUID_A).moreInboxItemsCount).toBeUndefined();
+
+    // UUID_B: multiple items (responsive first -> b-resp-late, moreCount = 1)
+    expect(byId(UUID_B).selectedInboxItem).toMatchObject({
+      id: "b-resp-late",
+    });
+    expect(byId(UUID_B).moreInboxItemsCount).toBe(1);
+
+    // Root actor (idle): no selectedInboxItem
+    expect(byId("root").selectedInboxItem).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads selects the earliest matching queued item beyond the first 100 rows", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    inbox.append([
+      {
+        id: "queued-oldest",
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T00:00:00.000Z"),
+        payload: { type: "message", content: "Oldest queued item" },
+      },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        id: `queued-newer-${index}`,
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date(`2026-09-02T${String(index % 24).padStart(2, "0")}:00:00.000Z`),
+        payload: { type: "message", content: `Newer queued item ${index}` },
+      })),
+    ]);
+    deps = { ...deps, queuedThreadIds: () => new Set([UUID_A]) };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem).toMatchObject({ id: "queued-oldest" });
+    expect(thread.moreInboxItemsCount).toBe(100);
+  });
+
+  it("GET /api/mesh/threads resolves a selected GitHub inbox item through the reference cache", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    const selected: InboxEntry = {
+      id: "github-selected",
+      actorId: UUID_A,
+      source: "github:MEK-Org/rusa/issues/534",
+      deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "issue", content: "Fallback" },
+    };
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [selected] : null),
+      referenceCache: {
+        get: async () => ({
+          ref: selected.source,
+          scheme: "github",
+          title: "Cached issue",
+          body: "Cached body",
+          cacheState: "fresh",
+          entity: { type: "github_issue", title: "Cached issue", description: "Cached body" },
+          unavailable: null,
+        }),
+      } as unknown as ReferenceCacheService,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem.reference).toMatchObject({ title: "Cached issue" });
   });
 
   it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
