@@ -7,8 +7,8 @@ import '../theme.dart';
 import 'header.dart';
 import 'reference_preview.dart';
 
-class _InboxChip extends StatelessWidget {
-  const _InboxChip(this.label);
+class InboxChip extends StatelessWidget {
+  const InboxChip(this.label, {super.key});
   final String label;
 
   @override
@@ -95,7 +95,7 @@ class InboxItemRow extends StatelessWidget {
               spacing: 8,
               runSpacing: 4,
               children: [
-                _InboxChip(entry.type),
+                InboxChip(entry.type),
                 if (entry.isResponsive) const _ResponsiveBadge(),
                 if (entry.source.isNotEmpty)
                   Text(

@@ -145,6 +145,20 @@ export class InboxRepository implements InboxStore {
     };
   }
 
+  selectPrioritizedUnhandled(actorId: string): InboxEntry | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM actor_inbox_entries
+         WHERE actor_id = ? AND handled_at IS NULL
+         ORDER BY CASE WHEN json_extract(payload_json, '$.priority') = 'responsive' THEN 0 ELSE 1 END,
+                  delivered_at ASC,
+                  id ASC
+         LIMIT 1`
+      )
+      .get(actorId) as InboxRow | undefined;
+    return row ? toEntry(row) : null;
+  }
+
   read(actorId: string, entryId: string): InboxEntry | null {
     const row = this.db
       .prepare("SELECT * FROM actor_inbox_entries WHERE actor_id = ? AND id = ?")

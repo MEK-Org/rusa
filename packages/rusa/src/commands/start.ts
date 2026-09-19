@@ -3738,9 +3738,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             const entryIds = getRepositories().actorRuns.activeFocusEntryIds(runId);
             if (!entryIds || entryIds.length === 0) return null;
             const entries: InboxEntry[] = [];
-            for (const id of entryIds) {
+            for (const id of new Set(entryIds)) {
               const entry = getRepositories().inbox.read(actorId, id);
-              if (entry) entries.push(entry);
+              if (entry && entry.handledAt === null) entries.push(entry);
             }
             return entries.length > 0 ? entries : null;
           },

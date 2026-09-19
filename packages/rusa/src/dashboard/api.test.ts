@@ -1522,6 +1522,72 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").selectedInboxItem).toBeUndefined();
   });
 
+  it("GET /api/mesh/threads selects the earliest matching queued item beyond the first 100 rows", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    inbox.append([
+      {
+        id: "queued-oldest",
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T00:00:00.000Z"),
+        payload: { type: "message", content: "Oldest queued item" },
+      },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        id: `queued-newer-${index}`,
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date(`2026-09-02T${String(index % 24).padStart(2, "0")}:00:00.000Z`),
+        payload: { type: "message", content: `Newer queued item ${index}` },
+      })),
+    ]);
+    deps = { ...deps, queuedThreadIds: () => new Set([UUID_A]) };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem).toMatchObject({ id: "queued-oldest" });
+    expect(thread.moreInboxItemsCount).toBe(100);
+  });
+
+  it("GET /api/mesh/threads resolves a selected GitHub inbox item through the reference cache", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    const selected: InboxEntry = {
+      id: "github-selected",
+      actorId: UUID_A,
+      source: "github:MEK-Org/rusa/issues/534",
+      deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "issue", content: "Fallback" },
+    };
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [selected] : null),
+      referenceCache: {
+        get: async () => ({
+          ref: selected.source,
+          scheme: "github",
+          title: "Cached issue",
+          body: "Cached body",
+          cacheState: "fresh",
+          entity: { type: "github_issue", title: "Cached issue", description: "Cached body" },
+          unavailable: null,
+        }),
+      } as unknown as ReferenceCacheService,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem.reference).toMatchObject({ title: "Cached issue" });
+  });
+
   it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));

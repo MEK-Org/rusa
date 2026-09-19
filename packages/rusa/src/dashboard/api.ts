@@ -113,13 +113,6 @@ export interface DashboardDataDeps {
    */
   selectedInboxItemsForActor?: (actorId: string) => InboxEntry[] | null;
   /**
-   * Optional direct resolver for the selected inbox item and more count.
-   */
-  selectedInboxItemForActor?: (
-    actorId: string,
-    runState: "running" | "queued" | "winding_down" | "idle"
-  ) => { item: InboxEntry; moreCount?: number } | null;
-  /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
    * set in config. Optional: absent (or fields unset) reproduces today's
@@ -206,17 +199,10 @@ function charterPreview(charter: string): string {
   return `${points.slice(0, CHARTER_PREVIEW_CHARS).join("").trimEnd()}\u2026`;
 }
 
-export interface ResolvedInboxEntry {
-  id: string;
-  actorId: string;
-  source: string;
-  deliveredAt: string;
-  seenAt: string | null;
-  handledAt: string | null;
-  handledNote: string | null;
-  payload: InboxPayload;
+type ResolvedInboxEntry = InboxEntry & {
   reference?: ResolvedReference;
-}
+};
+type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
 
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
@@ -493,40 +479,6 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   return Math.min(requested, maxLimit);
 }
 
-function resolveInboxEntrySync(entry: InboxEntry, deps: DashboardDataDeps): ResolvedInboxEntry {
-  const { messageId, ...payload } = entry.payload as InboxPayload & {
-    messageId?: unknown;
-  };
-  let reference: ResolvedReference | undefined;
-  if (typeof messageId === "string") {
-    reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-      meshChat: deps.meshChat,
-    });
-  } else if (entry.source.startsWith("github:") || entry.source.startsWith("mesh:")) {
-    reference = resolveReferenceSync(entry.source, {
-      meshChat: deps.meshChat,
-    });
-  }
-  const content =
-    reference?.body !== null && reference?.body !== undefined ? reference.body : payload.content;
-
-  return {
-    id: entry.id,
-    actorId: entry.actorId,
-    source: entry.source,
-    deliveredAt:
-      entry.deliveredAt instanceof Date
-        ? entry.deliveredAt.toISOString()
-        : String(entry.deliveredAt),
-    seenAt: entry.seenAt instanceof Date ? entry.seenAt.toISOString() : (entry.seenAt ?? null),
-    handledAt:
-      entry.handledAt instanceof Date ? entry.handledAt.toISOString() : (entry.handledAt ?? null),
-    handledNote: entry.handledNote ?? null,
-    payload: content !== undefined ? { ...payload, content } : payload,
-    ...(reference ? { reference } : {}),
-  };
-}
-
 /**
  * Inbox entries intentionally store lightweight pointers. The dashboard is the
  * presentation boundary, so resolve a mesh-message pointer, or a GitHub source
@@ -539,9 +491,12 @@ function resolveInboxEntrySync(entry: InboxEntry, deps: DashboardDataDeps): Reso
  * resolving it here would show the wrong entity. Every other payload keeps
  * its raw JSON, which is the honest rendering until that has a resolver.
  */
-async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
-  const entries = await Promise.all(
-    page.entries.map(async (entry) => {
+async function resolveInboxPage(
+  page: InboxPage,
+  deps: DashboardDataDeps
+): Promise<ResolvedInboxPage> {
+  const entries: ResolvedInboxEntry[] = await Promise.all(
+    page.entries.map(async (entry): Promise<ResolvedInboxEntry> => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
         messageId?: unknown;
       };
@@ -1574,93 +1529,115 @@ export async function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    const threads: ThreadDto[] = actors.list().map((r) => {
-      let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
-      if (runtime) {
-        runState = runtime.states.get(r.id) ?? "idle";
-      } else if (running.has(r.id)) {
-        runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
-      } else if (queued.has(r.id)) {
-        runState = "queued";
-      }
-      const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
-      // Durable inbox focus is created only after a run starts. A queued
-      // reservation deliberately has no focus from the prior run (or a
-      // speculative next one) to project.
-      const selectedObligation =
-        runState === "running" || runState === "winding_down"
-          ? (deps.selectedObligationForActor?.(r.id) ?? null)
-          : null;
+    const threads: ThreadDto[] = await Promise.all(
+      actors.list().map(async (r) => {
+        let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
+        if (runtime) {
+          runState = runtime.states.get(r.id) ?? "idle";
+        } else if (running.has(r.id)) {
+          runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
+        } else if (queued.has(r.id)) {
+          runState = "queued";
+        }
+        const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
+        // Durable inbox focus is created only after a run starts. A queued
+        // reservation deliberately has no focus from the prior run (or a
+        // speculative next one) to project.
+        const selectedObligation =
+          runState === "running" || runState === "winding_down"
+            ? (deps.selectedObligationForActor?.(r.id) ?? null)
+            : null;
 
-      let inboxSelection: { item: InboxEntry; moreCount?: number } | null = null;
-      if (runState === "running" || runState === "winding_down") {
-        if (!selectedObligation) {
-          if (deps.selectedInboxItemForActor) {
-            inboxSelection = deps.selectedInboxItemForActor(r.id, runState);
-          } else if (deps.selectedInboxItemsForActor) {
-            const items = deps.selectedInboxItemsForActor(r.id);
+        let inboxSelection: { item: InboxEntry; moreCount?: number } | null = null;
+        if (runState === "running" || runState === "winding_down") {
+          if (!selectedObligation) {
+            const items = deps.selectedInboxItemsForActor?.(r.id);
             if (items && items.length > 0) {
               inboxSelection = selectPrioritizedInboxItem(items);
             }
           }
-        }
-      } else if (runState === "queued") {
-        if (deps.selectedInboxItemForActor) {
-          inboxSelection = deps.selectedInboxItemForActor(r.id, runState);
-        } else if (deps.inbox) {
-          const page = deps.inbox.list(r.id, { status: "unhandled", limit: 100 });
-          if (page.entries.length > 0) {
-            inboxSelection = selectPrioritizedInboxItem(page.entries, page.unhandledCount);
+        } else if (runState === "queued") {
+          const inbox = deps.inbox;
+          const prioritized = inbox?.selectPrioritizedUnhandled?.(r.id);
+          if (prioritized && inbox) {
+            inboxSelection = {
+              item: prioritized,
+              moreCount: Math.max(0, inbox.countUnhandled(r.id) - 1),
+            };
+          } else if (inbox) {
+            // Non-SQL stores may not expose the exact query above. Read every
+            // bounded page so this fallback still honors the public heuristic.
+            const entries: InboxEntry[] = [];
+            let cursor: string | undefined;
+            let unhandledCount = 0;
+            do {
+              const page = inbox.list(r.id, {
+                status: "unhandled",
+                limit: 100,
+                cursor,
+              });
+              entries.push(...page.entries);
+              unhandledCount = page.unhandledCount;
+              cursor = page.nextCursor ?? undefined;
+            } while (cursor);
+            inboxSelection = selectPrioritizedInboxItem(entries, unhandledCount);
           }
         }
-      }
 
-      const selectedInboxItem = inboxSelection
-        ? resolveInboxEntrySync(inboxSelection.item, deps)
-        : null;
-      const moreInboxItemsCount =
-        inboxSelection && inboxSelection.moreCount !== undefined && inboxSelection.moreCount > 0
-          ? inboxSelection.moreCount
-          : undefined;
+        const selectedInboxItem = inboxSelection
+          ? (
+              await resolveInboxPage(
+                { entries: [inboxSelection.item], unhandledCount: 1, nextCursor: null },
+                deps
+              )
+            ).entries[0]
+          : null;
+        const moreInboxItemsCount =
+          inboxSelection && inboxSelection.moreCount !== undefined && inboxSelection.moreCount > 0
+            ? inboxSelection.moreCount
+            : undefined;
 
-      return {
-        id: r.id,
-        handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
-        parentId: r.parentId,
-        status: r.status,
-        executionTarget: r.executionTarget ?? null,
-        provider: r.modelConfig?.[0]?.provider ?? null,
-        model: r.modelConfig?.[0]?.model ?? null,
-        effort: r.modelConfig?.[0]?.effort ?? null,
-        desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
-        ...(r.desiredModelConfig !== undefined
-          ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
-          : {}),
-        desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
-        modelConfig: r.modelConfig ?? [],
-        ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
-        ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
-        ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
-        charterPreview: charterPreview(r.charter),
-        title: r.title ?? summarizeCharter(r.charter),
-        createdAt: r.createdAt,
-        runState,
-        chatDisabled: r.status === "retired",
-        lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
-        estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
-        pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
-        selectedProvider: selection?.provider ?? null,
-        selectedLane: selection?.lane ?? null,
-        selectedModel: selection?.model ?? null,
-        selectedEffort: selection?.effort ?? null,
-        eligibleAt: selection?.eligibleAt ?? null,
-        ...(selectedObligation ? { selectedObligation } : {}),
-        voiceConfig: r.voiceConfig ?? null,
-        ...(selectedInboxItem ? { selectedInboxItem } : {}),
-        ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
-      };
-    });
+        return {
+          id: r.id,
+          handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
+          parentId: r.parentId,
+          status: r.status,
+          executionTarget: r.executionTarget ?? null,
+          provider: r.modelConfig?.[0]?.provider ?? null,
+          model: r.modelConfig?.[0]?.model ?? null,
+          effort: r.modelConfig?.[0]?.effort ?? null,
+          desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
+          ...(r.desiredModelConfig !== undefined
+            ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
+            : {}),
+          desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
+          modelConfig: r.modelConfig ?? [],
+          ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
+          ...(r.desiredModelConfig !== undefined
+            ? { desiredModelConfig: r.desiredModelConfig }
+            : {}),
+          ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
+          charterPreview: charterPreview(r.charter),
+          title: r.title ?? summarizeCharter(r.charter),
+          createdAt: r.createdAt,
+          runState,
+          chatDisabled: r.status === "retired",
+          lastActiveAt: lastActiveByActor.get(r.id) ?? null,
+          queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
+          estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+          pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
+          selectedProvider: selection?.provider ?? null,
+          selectedLane: selection?.lane ?? null,
+          selectedModel: selection?.model ?? null,
+          selectedEffort: selection?.effort ?? null,
+          eligibleAt: selection?.eligibleAt ?? null,
+          ...(selectedObligation ? { selectedObligation } : {}),
+          voiceConfig: r.voiceConfig ?? null,
+          ...(selectedInboxItem ? { selectedInboxItem } : {}),
+          ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
+        };
+      })
+    );
     const schedulerHealth = deps.schedulerHealth?.();
     const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
