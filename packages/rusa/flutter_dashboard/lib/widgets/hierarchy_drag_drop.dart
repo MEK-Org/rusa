@@ -60,6 +60,13 @@ class _HierarchyDropTargetState<T extends Object>
     );
   }
 
+  /// The zone under the pointer when the consumer accepts [data] there, else
+  /// null so hovering an unacceptable edge draws nothing and drops nothing.
+  HierarchyDropZone? _acceptedZoneAt(T data, Offset globalPosition) {
+    final zone = _zoneAt(globalPosition);
+    return widget.canAccept(data, zone) ? zone : null;
+  }
+
   void _setActiveZone(HierarchyDropZone? zone) {
     if (_activeZone == zone || !mounted) return;
     setState(() => _activeZone = zone);
@@ -70,20 +77,30 @@ class _HierarchyDropTargetState<T extends Object>
     return SizedBox(
       key: _targetKey,
       child: DragTarget<T>(
+        // Flutter settles candidacy once, at the point where the pointer
+        // first crosses into the row, and never asks again while it stays
+        // inside. A pointer dragged downward crosses the top quarter first,
+        // so judging candidacy by that entry zone alone locked out every row
+        // that could be landed on but not reordered against — a ready root
+        // could never reach a waiting parent's middle (#564). Stay a
+        // candidate whenever any zone would accept; the zone actually under
+        // the pointer is re-judged on every move and again at the drop.
         onWillAcceptWithDetails: (details) {
-          final zone = _zoneAt(details.offset);
-          final accepted = widget.canAccept(details.data, zone);
-          _setActiveZone(accepted ? zone : null);
+          final accepted = HierarchyDropZone.values.any(
+            (zone) => widget.canAccept(details.data, zone),
+          );
+          _setActiveZone(
+            accepted ? _acceptedZoneAt(details.data, details.offset) : null,
+          );
           return accepted;
         },
-        onMove: (details) {
-          final zone = _zoneAt(details.offset);
-          _setActiveZone(widget.canAccept(details.data, zone) ? zone : null);
-        },
+        onMove: (details) =>
+            _setActiveZone(_acceptedZoneAt(details.data, details.offset)),
         onLeave: (_) => _setActiveZone(null),
         onAcceptWithDetails: (details) {
-          final zone = _activeZone ?? _zoneAt(details.offset);
+          final zone = _acceptedZoneAt(details.data, details.offset);
           _setActiveZone(null);
+          if (zone == null) return;
           unawaited(Future.sync(() => widget.onDrop(details.data, zone)));
         },
         builder: (context, candidateData, rejectedData) =>
