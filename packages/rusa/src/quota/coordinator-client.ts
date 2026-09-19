@@ -13,6 +13,7 @@ import {
   HISTORY_WINDOW_MS,
   isValidHistoryRecord,
   isValidQuotaPayload,
+  KIMI_FIVE_HOUR_LIMIT_REPORT_PATH,
   type PublishedHistoryRecord,
   type PublishedThrottleColdResponse,
   type PublishedThrottleCollectionResponse,
@@ -504,6 +505,86 @@ export class QuotaCoordinatorClient {
       }, timeoutMs);
       deadlineTimer.unref?.();
       req.end();
+    });
+  }
+
+  /**
+   * Deliver an authenticated Kimi CLI's explicit five-hour limit response to
+   * the coordinator. This host-process path carries only the observation time;
+   * the provider stderr remains in the bounded, sanitized actor-run output.
+   */
+  async recordKimiFiveHourLimit(observedAt: string): Promise<PublishedThrottleResponse | null> {
+    if (
+      !Number.isFinite(Date.parse(observedAt)) ||
+      (this.options.configuredProviders && !this.options.configuredProviders.includes("kimi"))
+    ) {
+      return null;
+    }
+    const body = JSON.stringify({ observedAt });
+    return new Promise((resolve) => {
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout | undefined;
+      const finish = (value: PublishedThrottleResponse | null): void => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        resolve(value);
+      };
+      const fail = (err: unknown): void => {
+        this.markUnavailable();
+        this.options.logger?.warn(
+          `[quota-client] Coordinator Kimi-limit report failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        finish(null);
+      };
+      const req = http.request(
+        {
+          socketPath: this.options.socketPath,
+          path: KIMI_FIVE_HOUR_LIMIT_REPORT_PATH,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("error", fail);
+          res.on("end", () => {
+            if (res.statusCode !== 200) {
+              fail(new Error(`Non-200 status code: ${res.statusCode}`));
+              return;
+            }
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+              validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
+            } catch (err) {
+              fail(err);
+              return;
+            }
+            if (!isValidSingleThrottlePayload(parsed, "kimi")) {
+              fail(new Error("Invalid Kimi-limit response shape"));
+              return;
+            }
+            this.markReachable();
+            this.applyPublishedInterval("kimi", parsed);
+            finish(parsed as PublishedThrottleResponse);
+          });
+        }
+      );
+      req.on("error", fail);
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`coordinator Kimi-limit report timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      deadlineTimer.unref?.();
+      req.end(body);
     });
   }
 
