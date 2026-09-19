@@ -102,9 +102,11 @@ function isSocket(path: string): boolean {
 }
 
 function configuredCoordinatorSocketDirectory(configPath: string): string | undefined {
-  // The same loader that the nested instance uses is the source of truth for
-  // whether a coordinator client is configured. Fail before launch if its
-  // configuration is invalid rather than omitting a requested connection.
+  // The host config.yaml is the single source of truth for whether a coordinator
+  // client is configured. We load it with the normal config loader so any host
+  // config must pass standard schema validation before an E2E launch is attempted.
+  // Fail before launch if its configuration is invalid rather than omitting a
+  // requested connection.
   const socketPath = loadConfig(dirname(configPath)).quota?.coordinator?.socketPath;
   if (!socketPath) return undefined;
   if (!isAbsolute(socketPath)) {
@@ -118,9 +120,26 @@ function configuredCoordinatorSocketDirectory(configPath: string): string | unde
     );
   }
   const socketDirectory = dirname(socketPath);
+  const dirStat = statSync(socketDirectory);
+  if (!dirStat.isDirectory()) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket parent must be a directory: ${socketDirectory}`
+    );
+  }
+  if (typeof process.getuid === "function" && dirStat.uid !== process.getuid()) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket parent must be owned by the current user (uid ${process.getuid()}, got ${dirStat.uid}): ${socketDirectory}`
+    );
+  }
+  if ((dirStat.mode & 0o777) !== 0o700) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket parent must be mode 0o700 (got 0o${(dirStat.mode & 0o777).toString(8)}): ${socketDirectory}`
+    );
+  }
   // A directory bind is necessary so a coordinator restart's replacement
-  // socket remains visible, but it would expose every sibling. Limit it to a
-  // directory that currently contains only the configured listener.
+  // socket remains visible, but it would expose every sibling. Limit it to an
+  // operator-owned 0700 directory that currently contains only the configured
+  // listener.
   const entries = readdirSync(socketDirectory);
   if (entries.length !== 1 || entries[0] !== basename(socketPath)) {
     throw new Error(
@@ -418,7 +437,12 @@ export class E2EInstanceManager {
     return root;
   }
 
-  private buildBwrapArgs(worktree: string, root: string, resume: boolean): string[] {
+  private buildBwrapArgs(
+    worktree: string,
+    root: string,
+    resume: boolean,
+    coordinatorSocketDirectory?: string
+  ): string[] {
     const runtimeHome = join(this.runtimeDir, "home");
     const providerBin = join(this.runtimeDir, "provider-bin");
     const baseConfigHome = join(this.runtimeDir, "base-config");
@@ -495,15 +519,12 @@ export class E2EInstanceManager {
       // listener inode. The service recreates a Unix socket on restart; a
       // read-only directory bind lets the client observe that replacement while
       // still keeping coordinator databases outside the E2E instance.
-      const coordinatorSocketDirectory = configuredCoordinatorSocketDirectory(configSource);
-      if (coordinatorSocketDirectory) {
-        ensureTargetParentDirs(args, coordinatorSocketDirectory);
-        args.push("--dir", coordinatorSocketDirectory);
-        args.push(
-          "--ro-bind",
-          realpathIfExists(coordinatorSocketDirectory),
-          coordinatorSocketDirectory
-        );
+      const socketDirectory =
+        coordinatorSocketDirectory ?? configuredCoordinatorSocketDirectory(configSource);
+      if (socketDirectory) {
+        ensureTargetParentDirs(args, socketDirectory);
+        args.push("--dir", socketDirectory);
+        args.push("--ro-bind", realpathIfExists(socketDirectory), socketDirectory);
       }
       // Carry exactly the LLM keys the nested instance always received — the
       // parent-grantable allow-list (#542) — never the whole secrets directory:
@@ -698,7 +719,9 @@ export class E2EInstanceManager {
     }
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     const configSource = join(this.opts.mcHome, "config.yaml");
-    if (existsSync(configSource)) configuredCoordinatorSocketDirectory(configSource);
+    const coordinatorSocketDirectory = existsSync(configSource)
+      ? configuredCoordinatorSocketDirectory(configSource)
+      : undefined;
     this.prepareWorktree(worktree);
     // No valid holder record and no live unit: any surviving runtime directory
     // or preserved run root is an orphan (its owning record is gone), not
@@ -717,8 +740,13 @@ export class E2EInstanceManager {
       startedAt: this.now(),
       resumableRoot,
     };
-    return this.launchAndAwaitPort(worktree, resumableRoot, false, record, () =>
-      rmSync(this.stateFile, { force: true })
+    return this.launchAndAwaitPort(
+      worktree,
+      resumableRoot,
+      false,
+      record,
+      () => rmSync(this.stateFile, { force: true }),
+      coordinatorSocketDirectory
     );
   }
 
@@ -756,7 +784,9 @@ export class E2EInstanceManager {
     const resumeRoot = this.validateResumableRoot(requestedRoot, existing.resumableRoot);
     const worktree = this.validateOwnedWorktree(actorId, existing.worktree);
     const configSource = join(this.opts.mcHome, "config.yaml");
-    if (existsSync(configSource)) configuredCoordinatorSocketDirectory(configSource);
+    const coordinatorSocketDirectory = existsSync(configSource)
+      ? configuredCoordinatorSocketDirectory(configSource)
+      : undefined;
     const record: E2EInstanceRecord = {
       actorId,
       actorHandle: existing.actorHandle,
@@ -767,8 +797,13 @@ export class E2EInstanceManager {
       // via the runs-area fallback, so its NEXT resume is exact-bound too.
       resumableRoot: resumeRoot,
     };
-    return this.launchAndAwaitPort(worktree, resumeRoot, true, record, () =>
-      this.writeRecord(existing)
+    return this.launchAndAwaitPort(
+      worktree,
+      resumeRoot,
+      true,
+      record,
+      () => this.writeRecord(existing),
+      coordinatorSocketDirectory
     );
   }
 
@@ -777,7 +812,8 @@ export class E2EInstanceManager {
     root: string,
     resume: boolean,
     record: E2EInstanceRecord,
-    onFailure: () => void
+    onFailure: () => void,
+    coordinatorSocketDirectory?: string
   ): Promise<E2EInstanceStatus> {
     this.writeRecord(record);
     try {
@@ -794,7 +830,7 @@ export class E2EInstanceManager {
         "--property=TimeoutStopSec=30s",
         "--",
         "bwrap",
-        ...this.buildBwrapArgs(worktree, root, resume),
+        ...this.buildBwrapArgs(worktree, root, resume, coordinatorSocketDirectory),
       ]);
     } catch (err) {
       // A fresh launch that never started owns nothing worth keeping: its root

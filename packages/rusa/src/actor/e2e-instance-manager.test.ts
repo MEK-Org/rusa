@@ -1,5 +1,6 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,7 +16,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
@@ -327,6 +328,101 @@ describe("E2EInstanceManager", () => {
       );
       expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
     } finally {
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent violates the required 0700 mode before launching an instance", async () => {
+    const socketDirectory = join(root, "rusa-quota-permissive");
+    const socketPath = join(socketDirectory, "coordinator.sock");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+    chmodSync(socketDirectory, 0o755);
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be mode 0o700/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent is not owned by the current user before launching an instance", async () => {
+    const socketDirectory = join(root, "rusa-quota-foreign-owner");
+    const socketPath = join(socketDirectory, "coordinator.sock");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    const originalGetuid = process.getuid;
+    const currentUid = typeof originalGetuid === "function" ? originalGetuid() : 1000;
+    const foreignUid = currentUid + 100;
+    const getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(foreignUid);
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be owned by the current user/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
+      getuidSpy.mockRestore();
       await new Promise<void>((resolve, reject) => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
