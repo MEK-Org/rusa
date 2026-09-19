@@ -909,20 +909,20 @@ describe("legacy-migration", () => {
       db.close();
     });
 
-    it("proves a production-shaped rehearsal: 0048 schema with a legacy ready-head row upgrades via 0049, then the principal migration reaches zero unclassified references", async () => {
+    it("proves a production-shaped rehearsal: 0049 schema with a legacy ready-head row upgrades via 0050, then the principal migration reaches zero unclassified references", async () => {
       const dbFile = join(tempDir, "production-shaped-rehearsal.db");
       const db = new Database(dbFile);
       db.pragma("foreign_keys = ON");
 
-      // 1. Build the schema exactly as a pre-0049 production instance has it:
-      // migration 0025 created obligation_ready_heads and it still exists at 0048.
-      runMigrationsThrough(db, "0048_portable_context_snapshots");
-      const legacyTableAt0048 = db
+      // 1. Build the schema exactly as a pre-0050 production instance has it:
+      // migration 0025 created obligation_ready_heads and it still exists at 0049.
+      runMigrationsThrough(db, "0049_obligation_responsive");
+      const legacyTableAt0049 = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
         )
         .get();
-      expect(legacyTableAt0048).toBeDefined();
+      expect(legacyTableAt0049).toBeDefined();
 
       // 2. Seed the exact production failure shape from #513: a ready
       // obligation owned by the legacy alias plus its ready-head cache row
@@ -977,15 +977,15 @@ describe("legacy-migration", () => {
         .get(HUMAN_OPERATOR);
       expect(rolledBack).toBeDefined();
 
-      // 3. The production upgrade path: forward schema migration 0049 runs
+      // 3. The production upgrade path: forward schema migration 0050 runs
       // first and drops the recomputable cache table, legacy row included.
       runMigrations(db);
-      const tableAfter0049 = db
+      const tableAfter0050 = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
         )
         .get();
-      expect(tableAfter0049).toBeUndefined();
+      expect(tableAfter0050).toBeUndefined();
 
       // 4. Derived ready heads still reflect the obligations rows on the fly.
       const repo = new ObligationRepository(db);
