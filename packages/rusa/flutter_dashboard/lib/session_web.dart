@@ -142,6 +142,7 @@ Future<void> _applyBranding() async {
   if (response.statusCode != 200) return;
   final manifest = jsonDecode(response.body);
   if (manifest is! Map<String, dynamic>) return;
+  _installAuthenticatedManifest();
   final name = manifest['name'];
   if (name is String) web.document.title = name;
   final icon = (manifest['icons'] is List && (manifest['icons'] as List).isNotEmpty)
@@ -155,4 +156,19 @@ Future<void> _applyBranding() async {
     ..setAttribute('rel', 'icon')
     ..setAttribute('href', icon['src'] as String);
   web.document.head?.append(link);
+}
+
+/// The public shell intentionally omits this link: the manifest is branded
+/// instance metadata and the server returns it only to an authenticated user.
+/// Installing it after the authenticated fetch lets the browser load PWA
+/// metadata without an initial 401 being cached as its manifest result.
+void _installAuthenticatedManifest() {
+  final head = web.document.head;
+  if (head == null) return;
+  head.querySelector('link[data-rusa-auth-manifest]')?.remove();
+  final link = web.document.createElement('link')
+    ..setAttribute('data-rusa-auth-manifest', '')
+    ..setAttribute('rel', 'manifest')
+    ..setAttribute('href', 'manifest.json');
+  head.append(link);
 }

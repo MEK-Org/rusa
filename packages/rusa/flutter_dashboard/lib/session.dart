@@ -32,6 +32,7 @@ abstract class DashboardSession extends ChangeNotifier implements SessionRequest
   Future<void> signIn();
   Future<void> signOut();
   Future<void> visit();
+  void idleFromServer();
 }
 
 class LocalDashboardSession extends DashboardSession {
@@ -61,6 +62,9 @@ class LocalDashboardSession extends DashboardSession {
 
   @override
   Future<void> visit() async {}
+
+  @override
+  void idleFromServer() {}
 }
 
 class FirebaseDashboardSession extends DashboardSession {
@@ -204,6 +208,14 @@ class FirebaseDashboardSession extends DashboardSession {
     if (inFlight != null) return inFlight;
     _renewing = _renew();
     return _renewing!;
+  }
+
+  /// A stream can observe server-side inactivity before a throttled browser
+  /// timer runs. Keep the controller authoritative so the next visit changes
+  /// idle state and reconnects every stream listening to this session.
+  @override
+  void idleFromServer() {
+    if (_status == DashboardSessionStatus.signedIn) _setIdle(true);
   }
 
   Future<void> _renew() async {

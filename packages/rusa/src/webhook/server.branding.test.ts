@@ -18,7 +18,6 @@ const INDEX_HTML = `<!DOCTYPE html>
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
   <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
   <title>Rusa</title>
-  <link rel="manifest" href="manifest.json">
 </head>
 <body></body>
 </html>

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
@@ -6,11 +7,40 @@ import 'package:web/web.dart' as web;
 import 'session.dart';
 
 DashboardSession? _session;
+web.EventListener? _visibilityListener;
+web.EventListener? _popStateListener;
 
 /// The web entrypoint installs the one session owner before it mounts a page.
 /// URL changes, API failures, and SSE events call it directly rather than
 /// translating auth state through DOM custom events.
-void installDashboardSession(DashboardSession session) => _session = session;
+void installDashboardSession(DashboardSession session) {
+  if (identical(_session, session)) return;
+  disposeDashboardSession(_session);
+  _session = session;
+  final visibilityListener = ((web.Event _) {
+    if (web.document.visibilityState == 'visible') unawaited(session.visit());
+  }).toJS;
+  final popStateListener = ((web.Event _) => unawaited(session.visit())).toJS;
+  _visibilityListener = visibilityListener;
+  _popStateListener = popStateListener;
+  web.document.addEventListener('visibilitychange', visibilityListener);
+  web.window.addEventListener('popstate', popStateListener);
+}
+
+/// Removes browser visit hooks with the session that installed them.
+void disposeDashboardSession(DashboardSession? session) {
+  if (session == null || !identical(_session, session)) return;
+  if (_visibilityListener case final listener?) {
+    web.document.removeEventListener('visibilitychange', listener);
+  }
+  if (_popStateListener case final listener?) {
+    web.window.removeEventListener('popstate', listener);
+  }
+  _visibilityListener = null;
+  _popStateListener = null;
+  _session = null;
+}
+
 void requireAuthentication() => _session?.requireAuthentication();
 void notifyNavigation() => _session?.visit();
 Future<void> logout() => _session?.signOut() ?? Future.value();
@@ -26,8 +56,9 @@ String? get profilePhotoUrl => _session?.profilePhotoUrl;
 /// closed; that case is settled by asking `/api/auth/session` directly, so a
 /// dead stream never waits for the next poll to notice.
 ///
-/// A server `session_idle` frame only disconnects; the session controller's
-/// inactivity timer is the normal path, and a successful visit reconnects.
+/// A server `session_idle` frame also marks the controller idle. This covers a
+/// throttled tab whose local inactivity timer did not run: a later visit then
+/// changes the controller back to active and reconnects every stream.
 class SessionEventSource {
   SessionEventSource(this.url) {
     _sessionListener = _onSessionChanged;
@@ -55,7 +86,10 @@ class SessionEventSource {
     final source = web.EventSource(url);
     source.addEventListener(
       'session_idle',
-      ((web.Event _) => _disconnect()).toJS,
+      ((web.Event _) {
+        _session?.idleFromServer();
+        _disconnect();
+      }).toJS,
     );
     source.addEventListener(
       'auth_required',

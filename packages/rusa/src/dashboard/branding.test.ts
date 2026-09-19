@@ -36,7 +36,6 @@ const BUILT_INDEX_HTML = `<!DOCTYPE html>
   <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
   <link rel="icon" type="image/png" href="favicon.png"/>
   <title>Rusa</title>
-  <link rel="manifest" href="manifest.json">
 </head>
 <body>
   <script src="flutter_bootstrap.js" async></script>
@@ -196,8 +195,9 @@ describe("applyBrandingToHtml", () => {
       '<link rel="icon" type="image/png" href="/api/mesh/avatar/root.png?v=7-16"/>'
     );
     expect(html).toContain('<link rel="apple-touch-icon" href="/api/mesh/avatar/root.png?v=7-16">');
-    // The manifest link is not an icon link and must survive.
-    expect(html).toContain('<link rel="manifest" href="manifest.json">');
+    // The public shell does not request instance-specific PWA metadata. Flutter
+    // installs the manifest link only after authenticated branding succeeds.
+    expect(html).not.toContain('rel="manifest"');
   });
 
   it("keeps the bundled icons when the shell has no head to re-anchor them to", () => {

@@ -76,4 +76,11 @@ describe("optional shared-human auth config", () => {
       })
     ).toThrow("config.yaml: auth.firebase.authDomain must be a hostname");
   });
+  it("fails closed with the required FlutterFire upgrade field for legacy auth configs", () => {
+    const legacy = valid();
+    delete (legacy.firebase as Partial<typeof legacy.firebase>).appId;
+    expect(() => validateDashboardAuth(legacy)).toThrow(
+      "config.yaml: auth.firebase.appId must be a non-empty string"
+    );
+  });
 });

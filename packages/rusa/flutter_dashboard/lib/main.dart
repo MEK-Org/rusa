@@ -65,21 +65,48 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
           }
           final session = snapshot.data;
           if (snapshot.hasError || session == null) return const _AuthStartupError();
-          installDashboardSession(session);
-          return AnimatedBuilder(
-            animation: session,
-            builder: (context, _) {
-              return switch (session.status) {
-                DashboardSessionStatus.local || DashboardSessionStatus.signedIn =>
-                  DashboardPage(session: session),
-                DashboardSessionStatus.signedOut => SignInPage(session: session),
-              };
-            },
-          );
+          return _DashboardSessionHost(session: session);
         },
       ),
     );
   }
+}
+
+/// Keeps browser visit hooks scoped to the session that owns them.
+class _DashboardSessionHost extends StatefulWidget {
+  const _DashboardSessionHost({required this.session});
+
+  final DashboardSession session;
+
+  @override
+  State<_DashboardSessionHost> createState() => _DashboardSessionHostState();
+}
+
+class _DashboardSessionHostState extends State<_DashboardSessionHost> {
+  @override
+  void initState() {
+    super.initState();
+    installDashboardSession(widget.session);
+  }
+
+  @override
+  void dispose() {
+    disposeDashboardSession(widget.session);
+    widget.session.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.session,
+    builder: (context, _) {
+      return switch (widget.session.status) {
+        DashboardSessionStatus.local || DashboardSessionStatus.signedIn =>
+          DashboardPage(session: widget.session),
+        DashboardSessionStatus.signedOut => SignInPage(session: widget.session),
+      };
+    },
+  );
 }
 
 class _DarkFrame extends StatelessWidget {

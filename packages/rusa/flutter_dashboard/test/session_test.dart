@@ -150,4 +150,31 @@ void main() {
     session.dispose();
     await auth.close();
   });
+
+  test('a server idle frame pauses streams until the next visit renews them', () async {
+    final auth = _Auth(_User('restored-token'));
+    final client = _Client([
+      http.Response('{}', 200),
+      http.Response('{}', 200),
+      http.Response('{}', 200),
+    ]);
+    final session = FirebaseDashboardSession(
+      auth,
+      client: client,
+      csrfToken: () => 'csrf-token',
+    );
+    session.start();
+    await Future<void>.delayed(Duration.zero);
+
+    session.idleFromServer();
+    expect(session.isIdle, isTrue);
+
+    await session.visit();
+
+    expect(session.isIdle, isFalse);
+    expect(client.paths, ['/api/auth/session', '/api/auth/csrf', '/api/auth/refresh']);
+
+    session.dispose();
+    await auth.close();
+  });
 }
