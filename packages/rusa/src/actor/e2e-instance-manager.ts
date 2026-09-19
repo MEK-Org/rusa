@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -12,7 +13,7 @@ import {
 } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { loadConfig } from "../config/index.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
@@ -101,15 +102,9 @@ function isSocket(path: string): boolean {
 }
 
 function configuredCoordinatorSocketDirectory(configPath: string): string | undefined {
-  // Most manager tests and legacy minimal configurations intentionally provide
-  // only `providers: {}`. They have no coordinator boundary to project, so do
-  // not turn their incomplete service config into a new launch requirement.
-  // Once a coordinator block is present, however, load and validate it fully
-  // rather than silently omitting a requested client connection.
-  if (!/^\s*coordinator\s*:/m.test(readFileSync(configPath, "utf8"))) return undefined;
-  // Config validation makes socketPath absolute. Do not swallow a malformed
-  // config here: an E2E instance with its coordinator omitted would boot into a
-  // misleading local fallback rather than reporting the bad client boundary.
+  // The same loader that the nested instance uses is the source of truth for
+  // whether a coordinator client is configured. Fail before launch if its
+  // configuration is invalid rather than omitting a requested connection.
   const socketPath = loadConfig(dirname(configPath)).quota?.coordinator?.socketPath;
   if (!socketPath) return undefined;
   if (!isAbsolute(socketPath)) {
@@ -122,7 +117,17 @@ function configuredCoordinatorSocketDirectory(configPath: string): string | unde
       `e2e-instance: configured quota coordinator socket is unavailable or not a Unix socket: ${socketPath}`
     );
   }
-  return dirname(socketPath);
+  const socketDirectory = dirname(socketPath);
+  // A directory bind is necessary so a coordinator restart's replacement
+  // socket remains visible, but it would expose every sibling. Limit it to a
+  // directory that currently contains only the configured listener.
+  const entries = readdirSync(socketDirectory);
+  if (entries.length !== 1 || entries[0] !== basename(socketPath)) {
+    throw new Error(
+      `e2e-instance: configured quota coordinator socket parent must be a dedicated directory containing only ${basename(socketPath)}: ${socketDirectory}`
+    );
+  }
+  return socketDirectory;
 }
 
 function parseSystemdStatus(output: string): E2EInstanceLiveStatus {

@@ -65,7 +65,23 @@ describe.skipIf(!BWRAP_CAPABLE)(
       actorWorktree = join(workersDir, "actor-a", "rusa");
       mkdirSync(mcHome, { recursive: true });
       makeWorktree(actorWorktree);
-      writeFileSync(join(mcHome, "config.yaml"), "providers: {}\n");
+      writeFileSync(
+        join(mcHome, "config.yaml"),
+        [
+          "github:",
+          "  account: mock-bot",
+          "providers:",
+          "  fake:",
+          "    cliCommand: fake",
+          "rootActor:",
+          "  provider: fake",
+          "  model: fake-model",
+          "webhook:",
+          "  port: 0",
+          '  secret: ""',
+          "",
+        ].join("\n")
+      );
       // Synthetic fixtures only — structurally like kimi's real files, no real secrets.
       const kimiCodeDir = join(root, ".kimi-code");
       mkdirSync(join(kimiCodeDir, "credentials"), { recursive: true });

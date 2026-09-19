@@ -65,7 +65,23 @@ describe("E2EInstanceManager", () => {
       `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
     );
     writeFileSync(join(actorWorktree, "packages", "rusa", "scripts", "e2e.mjs"), "");
-    writeFileSync(join(mcHome, "config.yaml"), "providers: {}\n");
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
     writeFileSync(claudeExecutable, "");
     active = false;
     stopFails = false;
@@ -228,8 +244,10 @@ describe("E2EInstanceManager", () => {
   });
 
   it("projects the configured coordinator socket into the one E2E instance", async () => {
-    const socketPath = join(root, "rusa-quota-coordinator.sock");
+    const socketDirectory = join(root, "rusa-quota");
+    const socketPath = join(socketDirectory, "coordinator.sock");
     const coordinatorDatabasePath = join(root, "rusa-quota-coordinator.db");
+    mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
     const coordinator = createServer();
     await new Promise<void>((resolve, reject) => {
       coordinator.once("error", reject);
@@ -239,12 +257,7 @@ describe("E2EInstanceManager", () => {
     writeFileSync(
       join(mcHome, "config.yaml"),
       [
-        "quota:",
-        "  coordinator:",
-        `    socketPath: ${socketPath}`,
-        `    databasePath: ${coordinatorDatabasePath}`,
-        "  throttle:",
-        "    enabled: true",
+        `quota: { coordinator: { socketPath: ${socketPath}, databasePath: ${coordinatorDatabasePath} }, throttle: { enabled: true } }`,
         "github:",
         "  account: mock-bot",
         "providers:",
@@ -272,6 +285,48 @@ describe("E2EInstanceManager", () => {
       expect(launch?.args).not.toContain(coordinatorDatabasePath);
     } finally {
       manager().down("actor-a");
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("refuses a coordinator socket whose parent is not dedicated before launching an instance", async () => {
+    const socketPath = join(root, "coordinator.sock");
+    const coordinator = createServer();
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "quota:",
+        "  coordinator:",
+        `    socketPath: ${socketPath}`,
+        "  throttle:",
+        "    enabled: true",
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  fake:",
+        "    cliCommand: fake",
+        "rootActor:",
+        "  provider: fake",
+        "  model: fake-model",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    try {
+      await expect(manager().up("actor-a", actorWorktree)).rejects.toThrow(
+        /configured quota coordinator socket parent must be a dedicated directory/
+      );
+      expect(calls).not.toContainEqual(expect.objectContaining({ file: "systemd-run" }));
+    } finally {
       await new Promise<void>((resolve, reject) => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
@@ -1281,8 +1336,8 @@ describe.skipIf(!BWRAP_CAPABLE)(
     });
 
     it("criterion 12a: boots one manager-built instance and applies the service interval to its real pacer", async () => {
-      const socketPath = join(root, "coordinator", "quota.sock");
-      const databasePath = join(root, "coordinator", "quota.db");
+      const socketPath = join(root, "rusa-quota", "coordinator.sock");
+      const databasePath = join(root, "coordinator.db");
       const store = new SharedQuotaStore(databasePath);
       const scrapedAt = new Date().toISOString();
       const resetAtIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
