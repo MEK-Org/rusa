@@ -947,6 +947,32 @@ describe("ActorMesh", () => {
     expect(logs).toContain("inbox_changed for not-live not nudged — no live actor");
   });
 
+  it("re-derives a remote reattach nudge from the durable inbox (#568)", () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "remote", parentId: "root" });
+
+    // Nothing unhandled: an ordinary nudge, so an idle follower is not woken as responsive.
+    expect(mesh.durableInboxNudge(id)).toEqual({});
+
+    inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
+    expect(mesh.durableInboxNudge(id)).toEqual({});
+
+    // A responsive item the follower never observed (delivered during a
+    // transport gap) is what makes the reattach nudge responsive.
+    const [urgent] = inboxStore.append([
+      {
+        actorId: id,
+        source: "mesh:root",
+        payload: { ...payload("mesh.message"), priority: "responsive" },
+      },
+    ]);
+    expect(mesh.durableInboxNudge(id)).toEqual({ priority: "responsive" });
+
+    inboxStore.markHandled(id, [urgent.id]);
+    expect(mesh.durableInboxNudge(id)).toEqual({});
+  });
+
   it("coalesces inbox changes during a run into one dirty follow-up", async () => {
     const d = deferredProvider();
     const { mesh, tick } = setup({ sharedProvider: d.provider });

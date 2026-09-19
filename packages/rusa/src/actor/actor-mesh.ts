@@ -1262,6 +1262,20 @@ export class ActorMesh {
     }
   }
 
+  /**
+   * The nudge a re-attached actor should receive for the work it already holds.
+   * A wake lost in transit is not durable, but the inbox entry behind it is: a
+   * responsive entry still unhandled after the gap earns the responsive wake
+   * (quick start and preemption) it would have had on first delivery.
+   */
+  durableInboxNudge(actorId: string): RunNudge {
+    if (!this.inboxStore) return {};
+    actorId = this.resolveThreadId(actorId);
+    return this.inboxStore.countUnhandled(actorId, { responsiveOnly: true }) > 0
+      ? { priority: "responsive" }
+      : {};
+  }
+
   /** Resume recovery: nudge only work that never passed a pre-run halt gate. */
   reconcileUnseenInbox(): void {
     if (!this.inboxStore) return;

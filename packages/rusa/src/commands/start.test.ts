@@ -5787,6 +5787,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
       body: JSON.stringify({ id: "mac-mini", session: enrollment.session }),
     });
 
+    getRepositories().inbox.append([
+      {
+        actorId: "placed-worker",
+        source: "mesh:root",
+        payload: {
+          type: "mesh.message",
+          messageId: "msg-during-gap",
+          fromId: "root",
+          priority: "responsive",
+        },
+      },
+    ]);
+
     const reconnect = await fetch(`http://127.0.0.1:${port}/register`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -5800,8 +5813,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(reconnect.status).toBe(200);
     const reconnected = (await reconnect.json()) as { session: string };
 
-    // Same-leader reattach nudges inbox recovery on the existing actor
-    expect(notifyInboxSpy).toHaveBeenCalledWith("placed-worker");
+    // Same-leader reattach nudges inbox recovery on the existing actor at the
+    // priority the durable inbox says it deserves: the responsive item that
+    // landed while the follower was unreachable is what makes it responsive (#568).
+    expect(notifyInboxSpy).toHaveBeenCalledWith("placed-worker", { priority: "responsive" });
 
     // The follower's poll receives both the re-attached actor's fresh init
     // and the retired actor's stop command to prevent runtime orphaning

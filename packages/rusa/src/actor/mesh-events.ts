@@ -108,10 +108,6 @@ export type MeshEventKind =
   // paths, which made them invisible in the timeline and — worse — left the
   // mesh's in-flight accounting permanently short one decrement .
   | "run_abandoned"
-  // The leader delivered a responsive-preemption request to its remote
-  // transport. This is an attempted control-plane action, not proof that the
-  // follower displaced a run; its matching outcome, when any, is `run_preempted`.
-  | "run_preempt_requested"
   // A durable responsive inbox delivery displaced the actor's current queued or
   // running opportunity. `actorId` = the recipient; `detail` = the displaced
   // phase; payload = { reason: "responsive_notification" }. The displaced

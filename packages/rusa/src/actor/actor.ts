@@ -308,6 +308,11 @@ export class Actor {
     });
   }
 
+  /** The admission gate raised this queued run to responsive priority; report the run as such. */
+  promoteQueuedRun(): void {
+    this.pendingStart?.promote();
+  }
+
   /** Wake this actor with content-free scheduling metadata. */
   requestRun(nudge: RunNudge = {}): void {
     if (this.closed) return;

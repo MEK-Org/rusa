@@ -2839,9 +2839,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           continue;
         }
         const existing = mesh.get(record.id);
+        // A wake the follower never observed is re-derived from the durable
+        // inbox here, whichever branch re-creates the channel (#568).
         if (!existing) {
           mesh.rehydrate(record);
-          mesh.notifyInboxChanged(record.id);
+          mesh.notifyInboxChanged(record.id, mesh.durableInboxNudge(record.id));
         } else if (
           "attachHost" in existing &&
           typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
@@ -2849,7 +2851,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           try {
             const newHost = followerHub.createHost(follower.id, record.id);
             (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
-            mesh.notifyInboxChanged(record.id);
+            mesh.notifyInboxChanged(record.id, mesh.durableInboxNudge(record.id));
           } catch (err) {
             log.warn("follower_reconnect_attach_failed", {
               actorId: record.id,

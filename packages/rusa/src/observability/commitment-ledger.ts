@@ -200,7 +200,6 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_queued: "ignored",
   run_selected: "ignored",
   run_first_chunk: "ignored",
-  run_preempt_requested: "ignored",
   run_preempted: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",

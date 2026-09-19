@@ -121,6 +121,8 @@ export function createActorRuntime(
           if ("deferred" in admitted) throw new RunStartCancelledError();
           snapshot = admitted;
           if (stopping) throw new Error("Actor stopped before admission");
+          // The leader's admission decision, not wake ordering, sets the run's priority.
+          if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
           sessionId = snapshot.record.sessionId;
           if (snapshot.mcpServers) {
             // Actor holds the array by reference, matching the in-process tool refresh path.
@@ -212,11 +214,7 @@ export function createActorRuntime(
         break;
       }
       case "wake":
-        if (!stopping) {
-          actor?.requestRun(message.nudge);
-          if (message.requestId !== undefined)
-            send({ type: "wakeAccepted", requestId: message.requestId });
-        }
+        if (!stopping) actor?.requestRun(message.nudge);
         break;
       case "preempt": {
         // The leader can only report this as effective after this reply: the

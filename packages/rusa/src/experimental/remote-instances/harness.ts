@@ -6,6 +6,7 @@ import {
 } from "../../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import type { MeshEventInput } from "../../actor/mesh-events.js";
+import type { LogFields, Logger } from "../../observability/logger.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./fixture-provider.js";
@@ -47,6 +48,21 @@ export function createHarness(options: {
   const messages: Array<{ fromId: string; toId: string; body: string }> = [];
   const events: Array<{ actorId: string; event: ActorEvent }> = [];
   const meshEvents: MeshEventInput[] = [];
+  // The leader's request/outcome distinction is only visible in its structured logs.
+  const logs: Array<{ event: string; fields?: LogFields }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    warn: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    error: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    child: () => logger,
+  };
   const failures: Error[] = [];
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
@@ -102,6 +118,7 @@ export function createHarness(options: {
         onFailure: (error) => {
           failures.push(error);
         },
+        logger,
       });
       runtimes.set(context.record.id, runtime);
       return runtime;
@@ -125,6 +142,7 @@ export function createHarness(options: {
     messages,
     events,
     meshEvents,
+    logs,
     failures,
     follower,
     get remote() {

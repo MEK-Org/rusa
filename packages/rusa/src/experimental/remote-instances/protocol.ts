@@ -34,6 +34,12 @@ export interface RunSnapshot {
   mcpServers?: McpServerSpec[];
   /** The candidate the leader's pacing gate reserved for this run. */
   selected?: RawProviderModelConfig;
+  /**
+   * True when the leader admitted this run at responsive priority. A promotion
+   * decided on the leader is only reliably visible to the follower here; the
+   * responsive wake behind it can lose the race with this reply on the wire.
+   */
+  responsive?: boolean;
 }
 
 export interface ProviderBridge {
@@ -61,8 +67,7 @@ export type Request =
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
-  /** `requestId` lets the leader retain the nudge until the follower observes it. */
-  | { type: "wake"; nudge?: RunNudge; requestId?: number }
+  | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }
   | { type: "yield"; status?: string; note?: string }
@@ -72,8 +77,6 @@ export type LeaderCommand =
 
 export type ActorEvent =
   | { type: "ready"; pid: number }
-  /** The follower accepted a wake; absence of this acknowledgement keeps it replayable. */
-  | { type: "wakeAccepted"; requestId: number }
   /** The follower's observed outcome of a leader preemption request. */
   | {
       type: "preempted";
