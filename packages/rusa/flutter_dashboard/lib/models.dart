@@ -197,13 +197,9 @@ class ThreadDto {
     this.pacingIntervalMs,
     this.ownerExpectsRetirement,
     this.selectedObligation,
-<<<<<<< HEAD
-    this.voiceConfig,
-=======
     this.selectedInboxItem,
     this.moreInboxItemsCount,
-    this.voiceName,
->>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
+    this.voiceConfig,
   });
 
   final String id;
@@ -332,13 +328,9 @@ class ThreadDto {
     int? pacingIntervalMs,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
-<<<<<<< HEAD
-    Object? voiceConfig = _keepThreadField,
-=======
     Object? selectedInboxItem = _keepThreadField,
     Object? moreInboxItemsCount = _keepThreadField,
-    Object? voiceName = _keepThreadField,
->>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
+    Object? voiceConfig = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -385,21 +377,15 @@ class ThreadDto {
     selectedObligation: identical(selectedObligation, _keepThreadField)
         ? this.selectedObligation
         : selectedObligation as ObligationDto?,
-<<<<<<< HEAD
-    voiceConfig: identical(voiceConfig, _keepThreadField)
-        ? this.voiceConfig
-        : voiceConfig as VoiceConfigDto?,
-=======
     selectedInboxItem: identical(selectedInboxItem, _keepThreadField)
         ? this.selectedInboxItem
         : selectedInboxItem as InboxEntryDto?,
     moreInboxItemsCount: identical(moreInboxItemsCount, _keepThreadField)
         ? this.moreInboxItemsCount
         : moreInboxItemsCount as int?,
-    voiceName: identical(voiceName, _keepThreadField)
-        ? this.voiceName
-        : voiceName as String?,
->>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
+    voiceConfig: identical(voiceConfig, _keepThreadField)
+        ? this.voiceConfig
+        : voiceConfig as VoiceConfigDto?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -449,21 +435,17 @@ class ThreadDto {
             (j['selectedObligation'] as Map).cast<String, dynamic>(),
           )
         : null,
-<<<<<<< HEAD
-    voiceConfig: j['voiceConfig'] != null
-        ? VoiceConfigDto.fromJson(j['voiceConfig'] as Map<String, dynamic>)
-        : j['voiceName'] != null
-        ? VoiceConfigDto(provider: 'google', config: {'voiceName': j['voiceName']})
-        : null,
-=======
     selectedInboxItem: j['selectedInboxItem'] is Map
         ? InboxEntryDto.fromJson(
             (j['selectedInboxItem'] as Map).cast<String, dynamic>(),
           )
         : null,
     moreInboxItemsCount: j['moreInboxItemsCount'] as int?,
-    voiceName: j['voiceName'] as String?,
->>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
+    voiceConfig: j['voiceConfig'] != null
+        ? VoiceConfigDto.fromJson(j['voiceConfig'] as Map<String, dynamic>)
+        : j['voiceName'] != null
+        ? VoiceConfigDto(provider: 'google', config: {'voiceName': j['voiceName']})
+        : null,
   );
 }
 

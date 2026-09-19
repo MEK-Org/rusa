@@ -63,15 +63,11 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
-<<<<<<< HEAD
+  selectedInboxItem: selectedInboxItem,
+  moreInboxItemsCount: moreInboxItemsCount,
   voiceConfig: voiceName == null
       ? null
       : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
-=======
-  selectedInboxItem: selectedInboxItem,
-  moreInboxItemsCount: moreInboxItemsCount,
-  voiceName: voiceName,
->>>>>>> 9bdc258 (feat(dashboard): show prioritized inbox items with (+N more) count (#534))
   pacingIntervalMs: pacingIntervalMs,
 );
 

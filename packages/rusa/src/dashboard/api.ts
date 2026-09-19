@@ -1659,7 +1659,6 @@ export async function handleMeshApiRequest(
         voiceConfig: r.voiceConfig ?? null,
         ...(selectedInboxItem ? { selectedInboxItem } : {}),
         ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
-        voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
