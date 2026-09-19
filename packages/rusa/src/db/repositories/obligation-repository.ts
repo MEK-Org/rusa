@@ -602,6 +602,12 @@ export class ObligationRepository {
   private readyHeadListener?: (change: ReadyHeadChange) => void;
 
   /**
+   * In-memory previous ready head and monotonic sequence per owner (#513).
+   * Keyed per owner; empty across process restart.
+   */
+  private previousHeads = new Map<string, { headId: string | null; sequence: number }>();
+
+  /**
    * Supply the actor-existence probe after construction.
    *
    * Needed because the production container is built from a `Database` alone,
@@ -792,7 +798,7 @@ export class ObligationRepository {
    * derived fresh from persisted state rather than a separate ledger — a
    * cancellation is permanent, so "is this edge still dangling" is always just
    * "does the prerequisite's row still say cancelled". Used to reconcile
-   * durable attention at boot, the same role {@link readyHeadTransitions} plays
+   * durable attention at boot, the same role {@link readyHeads} plays
    * for ready-head attention.
    */
   listPrerequisiteCancellationAttention(): PrerequisiteAttention[] {
@@ -868,43 +874,17 @@ export class ObligationRepository {
   }
 
   /**
-   * Current ready head transition records per owner, persisted transactionally in SQLite.
-   */
-  readyHeadTransitions(): Array<{
-    ownerId: EntityId;
-    headId: string;
-    previousHeadId: string | null;
-    sequence: number;
-  }> {
-    const rows = this.db
-      .prepare(
-        `SELECT owner_id, head_id, previous_head_id, sequence
-         FROM obligation_ready_heads
-         WHERE head_id IS NOT NULL`
-      )
-      .all() as Array<{
-      owner_id: string;
-      head_id: string;
-      previous_head_id: string | null;
-      sequence: number;
-    }>;
-    return rows.map((row) => ({
-      ownerId: row.owner_id,
-      headId: row.head_id,
-      previousHeadId: row.previous_head_id,
-      sequence: row.sequence,
-    }));
-  }
-
-  /**
    * The single mutation seam: one transaction, with ready-head tracking around it.
    *
    * Every state-changing repository method routes through here, so a new
    * mutation cannot be added that commits without being observed — the same
    * reason `updated_at` is set at every UPDATE rather than left to a caller.
    *
-   * Ready-head transitions are written transactionally inside SQLite to
-   * guarantee durability across restarts and process downtime.
+   * Ready-head transitions are maintained in process memory to guarantee
+   * exactly-once delivery within a session without SQLite table persistence (#513).
+   * Because sequences restart at 1 after a restart, the mesh scopes its durable
+   * inbox dedupe with a per-process epoch so a genuine repeated transition
+   * across restarts still delivers instead of colliding with a handled entry.
    */
   private mutate<T>(principal: EntityId, work: () => T): T {
     if (this.isMutating) {
@@ -952,23 +932,9 @@ export class ObligationRepository {
       for (const ownerId of before.keys()) {
         if (!after.has(ownerId) && this.isActorOwner(ownerId)) {
           const previousHeadId = before.get(ownerId) ?? null;
-          const now = this.stamp();
-          this.db
-            .prepare(
-              `UPDATE obligation_ready_heads
-             SET head_id = NULL,
-                 previous_head_id = ?,
-                 sequence = sequence + 1,
-                 updated_at = ?
-             WHERE owner_id = ?`
-            )
-            .run(previousHeadId, now, ownerId);
-
-          const seqRow = this.db
-            .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
-            .get(ownerId) as { sequence: number } | undefined;
-          const sequence = seqRow?.sequence ?? 1;
-
+          const prev = this.previousHeads.get(ownerId);
+          const sequence = (prev?.sequence ?? 0) + 1;
+          this.previousHeads.set(ownerId, { headId: null, sequence });
           changes.push({ ownerId, head: null, previousHeadId, sequence });
         }
       }
@@ -980,24 +946,9 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const now = this.stamp();
-        this.db
-          .prepare(
-            `INSERT INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
-           VALUES (?, ?, ?, 1, ?)
-           ON CONFLICT(owner_id) DO UPDATE SET
-             previous_head_id = excluded.previous_head_id,
-             head_id = excluded.head_id,
-             sequence = sequence + 1,
-             updated_at = excluded.updated_at`
-          )
-          .run(ownerId, headId, previousHeadId, now);
-
-        const seqRow = this.db
-          .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
-          .get(ownerId) as { sequence: number } | undefined;
-        const sequence = seqRow?.sequence ?? 1;
-
+        const prev = this.previousHeads.get(ownerId);
+        const sequence = (prev?.sequence ?? 0) + 1;
+        this.previousHeads.set(ownerId, { headId, sequence });
         changes.push({ ownerId, head, previousHeadId, sequence });
       }
 
@@ -1013,20 +964,9 @@ export class ObligationRepository {
         const head = this.get(headId);
         if (!head) continue;
 
-        const now = this.stamp();
-        this.db
-          .prepare(
-            `UPDATE obligation_ready_heads
-             SET previous_head_id = head_id,
-                 sequence = sequence + 1,
-                 updated_at = ?
-             WHERE owner_id = ?`
-          )
-          .run(now, ownerId);
-        const seqRow = this.db
-          .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
-          .get(ownerId) as { sequence: number } | undefined;
-        const sequence = seqRow?.sequence ?? 1;
+        const prev = this.previousHeads.get(ownerId);
+        const sequence = (prev?.sequence ?? 0) + 1;
+        this.previousHeads.set(ownerId, { headId, sequence });
         changes.push({ ownerId, head, previousHeadId: headId, sequence });
       }
 

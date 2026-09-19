@@ -897,6 +897,21 @@ export class ActorMesh {
   private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
+  /**
+   * Per-process epoch scoping durable ready-head inbox dedupe (#513).
+   *
+   * The obligation repository keeps transition sequences in process memory
+   * only, so after every restart a genuine new transition can reuse the exact
+   * same `(previousHeadId, headId, sequence)` triple a pre-restart transition
+   * already delivered and had handled. Without the epoch, the identical inbox
+   * entry id would hit `ON CONFLICT DO NOTHING` and the actor would never be
+   * woken about live work. Keying live entries on this epoch makes dedupe
+   * exactly-once per process while guaranteeing a real repeated transition
+   * always delivers; the accepted cost, per the operator ruling on #513, is at
+   * most one duplicate attention entry when a transition is replayed across a
+   * restart.
+   */
+  private readonly readyHeadEpoch = randomUUID();
   private runtimeRevision = 0;
   private readonly runtimeStateListeners = new Set<(delta: ActorRuntimeStateDelta) => void>();
   private readonly activeRunCounts = new Map<string, number>();
@@ -1282,7 +1297,15 @@ export class ActorMesh {
    * Boot recovery for ready-head inbox attention (#1645).
    *
    * Verifies that every active actor with a ready head has durable attention in
-   * its inbox. Keyed by exact transition fact and sequence persisted in SQLite.
+   * its inbox. Ready-head entries derived from `readyHeads()` are scoped to this
+   * process's {@link readyHeadEpoch} (#513): dedupe is exactly-once within the
+   * process, repeated reconcile passes over an unchanged head stay silent, and
+   * any restart delivers at most the operator-accepted one duplicate attention
+   * entry per ready head. Scoping boot reconciliation to the process epoch
+   * guarantees that a missed recurrence whose live append was lost (e.g.
+   * process crash between commit and append) always delivers a recovery
+   * attention after restart, without colliding with an earlier handled repair
+   * entry from a previous process generation.
    */
   reconcileReadyHeads(obligations: {
     readyHeadTransitions?(): Iterable<{
@@ -1309,11 +1332,12 @@ export class ActorMesh {
           if (!record || record.status !== "active") continue;
           const head = obligations.get(headId);
           if (!head) continue;
-          this.deliverReadyHeadAttention(
+          this.appendReadyHeadEntry(
             actorId,
             { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
             previousHeadId,
-            sequence
+            sequence,
+            null
           );
         }
       } else if (typeof obligations.readyHeads === "function") {
@@ -1324,11 +1348,12 @@ export class ActorMesh {
           if (!record || record.status !== "active") continue;
           const head = obligations.get(headId);
           if (!head) continue;
-          this.deliverReadyHeadAttention(
+          this.appendReadyHeadEntry(
             actorId,
             { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
             null,
-            null
+            null,
+            this.readyHeadEpoch
           );
         }
       }
@@ -1631,7 +1656,7 @@ export class ActorMesh {
     // Nothing moved, it settled back where it started, or it ended with no head
     // at all — in the last case there is no obligation to point the actor at.
     if (!net || net.to === null || net.to.id === net.from) return;
-    this.appendReadyHeadEntry(actorId, net.to, net.from);
+    this.appendReadyHeadEntry(actorId, net.to, net.from, null, this.readyHeadEpoch);
   }
 
   /**
@@ -1650,10 +1675,19 @@ export class ActorMesh {
    * already handled. Keying on `previousHeadId -> head.id` makes that a
    * distinct transition, so the actor is woken again.
    *
-   * A restart or a replay of the same committed transition is still silent.
-   * The residual case — the identical transition recurring after the actor
-   * handled it — cannot be expressed in the id, and falls back to a live nudge:
-   * it wakes a running mesh but is not durable across a restart.
+   * Dedupe is scoped to this process via {@link readyHeadEpoch}: the
+   * repository's sequence numbers restart at 1 on every boot, so a genuine
+   * repeated transition (the same `previousHeadId -> headId` recurring after a
+   * restart) reuses a triple a handled pre-restart entry already claimed. The
+   * epoch keeps that recurrence a distinct inbox entry instead of letting the
+   * conflict clause swallow a real wake — exactly-once within a process, never
+   * silently lost across one. The accepted cost, per the operator ruling on
+   * #513 (recomputable table removed; process-local dedupe), is at most one
+   * duplicate attention entry when a committed transition is replayed across
+   * a restart. Boot reconciliation in {@link reconcileReadyHeads} over `readyHeads()`
+   * likewise scopes its entry to {@link readyHeadEpoch}, so a head that recurred
+   * after its transition's append was lost does not collide with an already-handled
+   * entry from an earlier process generation.
    */
   deliverReadyHeadAttention(
     actorId: string,
@@ -1672,23 +1706,28 @@ export class ActorMesh {
       return false;
     }
     if (head === null) return false;
-    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence);
+    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence, this.readyHeadEpoch);
   }
 
   private appendReadyHeadEntry(
     actorId: string,
     head: { id: string; intent: string | null; responsive?: boolean },
     previousHeadId: string | null,
-    sequence: number | null = null
+    sequence: number | null = null,
+    /** Process epoch for dedupe scoping. Null for legacy epoch-free transitions. */
+    epoch: string | null = null
   ): boolean {
     if (!this.inboxStore) return false;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
-    // ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the prior entry remains.
+    // Live transitions and readyHeads() boot repairs are keyed on
+    // (epoch, transition, sequence): exactly-once within a process,
+    // and never silently suppressed across a restart even though the
+    // repository's sequence restarts at 1 (#513).
+    const epochKey = epoch !== null ? `${epoch}:` : "";
     const seqKey = sequence !== null ? `:${sequence}` : "";
     const entryId = deduplicatedInboxEntryId(
-      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
+      `obligation-head:${epochKey}${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
       actorId
     );
     const responsive = head.responsive === true;

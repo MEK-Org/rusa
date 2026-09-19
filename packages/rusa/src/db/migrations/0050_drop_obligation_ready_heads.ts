@@ -1,0 +1,17 @@
+import type { Database } from "better-sqlite3";
+import type { Migration } from "./types.js";
+
+/**
+ * Drop obsolete `obligation_ready_heads` table (#513).
+ *
+ * The ready-head cache table is recomputable and removed. Head-of-queue
+ * deduplication and sequence tracking are maintained only in process memory,
+ * current heads are derived on the fly from obligations, and no
+ * persistence remains in SQLite.
+ */
+export const dropObligationReadyHeads: Migration = {
+  id: "0050_drop_obligation_ready_heads",
+  up: (db: Database) => {
+    db.exec("DROP TABLE IF EXISTS obligation_ready_heads;");
+  },
+};

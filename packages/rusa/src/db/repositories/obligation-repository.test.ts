@@ -24,7 +24,12 @@ import { obligationDependencies } from "../migrations/0037_obligation_dependenci
 import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
 import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
-import { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-repository.js";
+import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_ready_heads.js";
+import {
+  MAX_OBLIGATION_PAGE_LIMIT,
+  ObligationRepository,
+  type ReadyHeadChange,
+} from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
 class FakeObligationScheduler implements ObligationActivationScheduler {
@@ -68,6 +73,7 @@ describe("ObligationRepository", () => {
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
     obligationResponsive.up(db);
+    dropObligationReadyHeads.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -464,24 +470,18 @@ describe("ObligationRepository", () => {
         expect(announced).toEqual([]);
       });
 
-      it("persists an unchanged ready head's responsive escalation for idempotent boot replay", () => {
+      it("derives an unchanged ready head's responsive escalation after restart", () => {
         repository.create({ title: "hotfix", id: "hotfix", ownerId: "actor-a" });
 
         repository.markResponsive("hotfix", "system:mesh");
 
-        // The same previous-head identity used by the live listener is durable,
-        // so boot reconciliation derives the identical inbox key instead of a
-        // second wake with stale transition state.
-        expect(repository.readyHeadTransitions()).toEqual([
-          { ownerId: "actor-a", headId: "hotfix", previousHeadId: "hotfix", sequence: 2 },
-        ]);
         const reloaded = new ObligationRepository(
           db,
           (id) => id === "actor-a",
           () => now++
         );
-        expect(reloaded.readyHeadTransitions()).toEqual([
-          { ownerId: "actor-a", headId: "hotfix", previousHeadId: "hotfix", sequence: 2 },
+        expect(reloaded.readyHeadRecords()).toEqual([
+          { ownerId: "actor-a", headId: "hotfix", responsive: true },
         ]);
       });
 
@@ -627,8 +627,12 @@ describe("ObligationRepository", () => {
       ]);
       expect(heads.some((change) => change.ownerId === userId)).toBe(false);
       expect(
-        db.prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = ?").all(userId)
-      ).toEqual([]);
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+          )
+          .get()
+      ).toBeUndefined();
     });
 
     it("carries the head it displaced, so a restored head is not a repeat", () => {
@@ -684,10 +688,10 @@ describe("ObligationRepository", () => {
       warn.mockRestore();
     });
 
-    it("returns readyHeads and readyHeadTransitions with sequence numbers allowing boot recovery", () => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      repository.setReadyHeadListener(() => {
-        throw new Error("inbox is unavailable");
+    it("derives ready heads from obligations and tracks transitions in memory with sequence numbers", () => {
+      const transitions: ReadyHeadChange[] = [];
+      repository.setReadyHeadListener((change) => {
+        transitions.push(change);
       });
 
       repository.create({ title: "Task A", id: "ob-a", ownerId: "actor-a", priority: 5 });
@@ -697,14 +701,31 @@ describe("ObligationRepository", () => {
       expect(headsMap.get("actor-a")).toBe("ob-a");
       expect(headsMap.get("actor-b")).toBe("ob-b");
 
-      const transitions = repository.readyHeadTransitions();
       expect(transitions).toEqual(
         expect.arrayContaining([
-          { ownerId: "actor-a", headId: "ob-a", previousHeadId: null, sequence: 1 },
-          { ownerId: "actor-b", headId: "ob-b", previousHeadId: null, sequence: 1 },
+          {
+            ownerId: "actor-a",
+            head: expect.objectContaining({ id: "ob-a" }),
+            previousHeadId: null,
+            sequence: 1,
+          },
+          {
+            ownerId: "actor-b",
+            head: expect.objectContaining({ id: "ob-b" }),
+            previousHeadId: null,
+            sequence: 1,
+          },
         ])
       );
-      warn.mockRestore();
+
+      // Verify no persistence table exists in SQLite
+      expect(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+          )
+          .get()
+      ).toBeUndefined();
     });
 
     it("reports ready heads with effective responsiveness in a single pass", () => {
@@ -731,37 +752,76 @@ describe("ObligationRepository", () => {
       );
     });
 
-    it("preserves and increments the sequence number when queue drains completely and recurs", () => {
+    it("preserves and increments the in-memory sequence number when queue drains completely and recurs", () => {
+      const transitions: ReadyHeadChange[] = [];
+      repository.setReadyHeadListener((change) => {
+        transitions.push(change);
+      });
       // 1. Initial ready head "ob-1" (sequence 1)
       repository.create({ title: "Task 1", id: "ob-1", ownerId: "actor-a", priority: 10 });
-      let transitions = repository.readyHeadTransitions();
-      expect(transitions).toEqual([
-        { ownerId: "actor-a", headId: "ob-1", previousHeadId: null, sequence: 1 },
-      ]);
+      expect(transitions[0]).toMatchObject({
+        ownerId: "actor-a",
+        head: { id: "ob-1" },
+        previousHeadId: null,
+        sequence: 1,
+      });
 
       // 2. Complete terminal status on "ob-1" -> queue is empty!
       repository.setTerminalStatus("ob-1", "done", null, null, "system:mesh");
-      transitions = repository.readyHeadTransitions();
-      expect(transitions).toEqual([]);
-
-      // Check the raw database state of obligation_ready_heads
-      const rawRows = db
-        .prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = 'actor-a'")
-        .all();
-      expect(rawRows).toHaveLength(1);
-      expect(rawRows[0]).toMatchObject({
-        owner_id: "actor-a",
-        head_id: null,
-        previous_head_id: "ob-1",
+      expect(transitions[1]).toMatchObject({
+        ownerId: "actor-a",
+        head: null,
+        previousHeadId: "ob-1",
         sequence: 2,
       });
 
+      // Assert table does NOT exist in db
+      expect(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+          )
+          .get()
+      ).toBeUndefined();
+
       // 3. Add a new ready head "ob-2" for the same owner.
       repository.create({ title: "Task 2", id: "ob-2", ownerId: "actor-a", priority: 10 });
-      transitions = repository.readyHeadTransitions();
-      expect(transitions).toEqual([
-        { ownerId: "actor-a", headId: "ob-2", previousHeadId: null, sequence: 3 },
-      ]);
+      expect(transitions[2]).toMatchObject({
+        ownerId: "actor-a",
+        head: { id: "ob-2" },
+        previousHeadId: null,
+        sequence: 3,
+      });
+    });
+
+    it("resets in-memory previous-head state across repository instances while ready heads remain derived", () => {
+      repository.create({ title: "Task 1", id: "ob-1", ownerId: "actor-a", priority: 10 });
+      expect(repository.readyHeads().get("actor-a")).toBe("ob-1");
+
+      // Simulate a process restart by constructing a new repository on the same database
+      const restartedRepo = new ObligationRepository(
+        db,
+        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
+        () => now++
+      );
+
+      // Heads are derived directly from obligations table
+      expect(restartedRepo.readyHeads().get("actor-a")).toBe("ob-1");
+
+      const transitions: ReadyHeadChange[] = [];
+      restartedRepo.setReadyHeadListener((change) => {
+        transitions.push(change);
+      });
+
+      // A new mutation in the restarted session increments sequence from 1
+      restartedRepo.create({ title: "Task 2", id: "ob-2", ownerId: "actor-a", priority: 5 });
+      expect(transitions).toHaveLength(1);
+      expect(transitions[0]).toMatchObject({
+        ownerId: "actor-a",
+        head: { id: "ob-2" },
+        previousHeadId: "ob-1",
+        sequence: 1,
+      });
     });
 
     it("announces the displacing obligation when new work takes the head", () => {
