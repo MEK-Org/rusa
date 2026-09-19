@@ -275,14 +275,41 @@ describe("handleMeshApiRequest", () => {
       expect(runNowMock).toHaveBeenCalledWith(UUID_A, other);
     });
 
-    it("rejects every mutation with a bootstrap hint when no durable user exists", async () => {
+    it("uses the legacy local identity when no durable user is active", async () => {
       principals.setDisabled(LOCAL_USER, "2026-06-22T00:00:00.000Z");
-      await expectAllRejected(deps, "migrate:legacy-principal");
+      obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
+
+      const { res } = await call(
+        deps,
+        "POST",
+        "/api/mesh/obligations/task/status",
+        JSON.stringify({ status: "cancelled" })
+      );
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(obligations.listHistory("task")).toEqual(
+        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
+      );
     });
 
-    it("rejects every mutation when no principal storage is bound at all", async () => {
+    it("cancels with the legacy local identity when no durable principal is available (#509)", async () => {
       const { principals: _omitted, ...withoutPrincipals } = deps;
-      await expectAllRejected(withoutPrincipals, "no durable user principal");
+      obligations.create({ id: "task", ownerId: UUID_A, title: "local cancellation" });
+
+      const { res } = await call(
+        withoutPrincipals,
+        "POST",
+        "/api/mesh/obligations/task/status",
+        JSON.stringify({ status: "cancelled", note: "local stop" })
+      );
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(obligations.get("task")?.status).toBe("cancelled");
+      expect(obligations.listHistory("task")).toEqual(
+        expect.arrayContaining([expect.objectContaining({ actingPrincipal: HUMAN_OPERATOR })])
+      );
     });
 
     it("rejects every mutation as ambiguous when several users are active, never guessing", async () => {
