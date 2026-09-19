@@ -129,6 +129,7 @@ export async function runActorMeshE2EUp(opts: {
   portOffset?: number;
   rootControlPort?: number;
   resume?: boolean;
+  slack?: import("../config/types.js").SlackConfig;
 }): Promise<void> {
   const offset = opts.portOffset ?? 0;
   if (!Number.isInteger(offset) || offset < 0 || GIT_REMOTE_PORT + offset > 65535) {
@@ -187,6 +188,7 @@ export async function runActorMeshE2EUp(opts: {
           gchatConfigDir: "/tmp/rusa-e2e-gchat",
           errorChat: "spaces/e2e-errors",
         },
+        slack: opts.slack,
       });
   const { root: rootDir, home, config, repo } = instance;
   const bot = config.github.account ?? "quickstart-user";

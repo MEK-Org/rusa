@@ -159,6 +159,7 @@ export interface DashboardMeshRefs {
   supportedVoices?: DashboardDataDeps["supportedVoices"];
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
+  slackClient?: DashboardDataDeps["slackClient"];
   issueClient?: DashboardDataDeps["issueClient"];
   getFollowers?: DashboardDataDeps["getFollowers"];
 }
@@ -614,6 +615,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           supportedVoices: options.mesh.supportedVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
+          slackClient: options.mesh.slackClient,
           issueClient: options.mesh.issueClient,
           getFollowers: options.mesh.getFollowers,
         }

@@ -2,6 +2,7 @@ import type { InboxStore } from "../actor/inbox-store.js";
 import type { ChatClient } from "../chat/types.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import type { SlackClient } from "../slack/slack-client.js";
 import {
   asGitHubBranch,
   asGitHubIssue,
@@ -18,6 +19,8 @@ export type ReferenceEntity =
   | { type: "github_review"; body: string; state: string }
   | { type: "gchat_message"; contents: string }
   | { type: "gchat_space"; name: string }
+  | { type: "slack_message"; contents: string }
+  | { type: "slack_channel"; name: string }
   | { type: "mesh_message"; senderId: string; recipientId: string };
 
 /**
@@ -61,6 +64,7 @@ export interface ReferenceResolverDeps {
   inbox?: Pick<InboxStore, "read">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
   chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
+  slackClient?: Pick<SlackClient, "getMessage" | "getChannel">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
   issueClient?: Partial<
     Pick<
@@ -227,6 +231,47 @@ async function resolveGchat(
     url: null,
     unavailable: text ? null : "message has no text",
     entity: text ? { type: "gchat_message", contents: text } : undefined,
+  };
+}
+
+async function resolveSlack(
+  reference: Reference,
+  deps: ReferenceResolverDeps
+): Promise<ResolvedReferenceWithEntity> {
+  const [channelPart, messagePart] = pairs(reference, 0);
+  if (channelPart?.[0] !== "channels" || !channelPart[1]) {
+    return unresolved(reference, reference.key, "unrecognised Slack resource");
+  }
+  if (!deps.slackClient) return unresolved(reference, reference.key, "Slack edge not configured");
+  const channel = channelPart[1];
+  if (!messagePart) {
+    const found = await deps.slackClient.getChannel(channel);
+    return {
+      ref: reference.key,
+      scheme: reference.scheme,
+      title: found.name,
+      body: null,
+      author: null,
+      timestamp: null,
+      url: referenceUrl(reference),
+      unavailable: null,
+      entity: { type: "slack_channel", name: found.name },
+    };
+  }
+  if (messagePart[0] !== "messages" || !/^\d+\.\d+$/.test(messagePart[1])) {
+    return unresolved(reference, reference.key, "unrecognised Slack resource");
+  }
+  const found = await deps.slackClient.getMessage(channel, messagePart[1]);
+  return {
+    ref: reference.key,
+    scheme: reference.scheme,
+    title: `Slack message in ${channel}`,
+    body: found.text,
+    author: found.user ?? null,
+    timestamp: new Date(Number(found.ts) * 1000).toISOString(),
+    url: referenceUrl(reference),
+    unavailable: found.text ? null : "message has no text",
+    entity: { type: "slack_message", contents: found.text },
   };
 }
 
@@ -478,6 +523,8 @@ export async function resolveReference(
         return resolveMesh(reference, deps);
       case "gchat":
         return await resolveGchat(reference, deps);
+      case "slack":
+        return await resolveSlack(reference, deps);
       case "github":
         return await resolveGitHub(reference, deps);
       default:

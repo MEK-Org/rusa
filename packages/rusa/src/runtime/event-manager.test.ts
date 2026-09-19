@@ -114,6 +114,26 @@ function unusedLadder(): never {
 }
 
 describe("EventManager", () => {
+  it("routes Slack messages by channel and preserves the message reference", async () => {
+    const inbox = new FakeInboxStore();
+    const resolver: EventRoutingKernel = {
+      resolveOwner: unusedLadder,
+      resolveRecipients: () => ({ directed: false, ownerIds: ["root"], subscriberIds: [] }),
+    };
+    const manager = new EventManager({ inboxStore: inbox, resolver });
+    const raw: RawIntegrationEvent = {
+      sourceType: "slack",
+      rawPayload: { channel: "C123", ts: "1720000000.000001", user: "U123" },
+      idempotencyKey: "Ev123",
+    };
+    const first = await manager.handleExternalEvent(raw);
+    await manager.handleExternalEvent(raw);
+    expect(first.entries[0].source).toBe("slack:channels/C123");
+    expect(first.entries[0].payload.messageRef).toBe(
+      "slack:channels/C123/messages/1720000000.000001"
+    );
+    expect(inbox.entries).toHaveLength(1);
+  });
   describe("Normalization without changing public payloads", () => {
     it("normalizes GitHub webhook payloads preserving exact issue/comment payload contracts", async () => {
       const inbox = new FakeInboxStore();

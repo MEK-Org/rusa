@@ -123,6 +123,7 @@ export interface DashboardDataDeps {
   supportedVoices?: readonly SupportedVoice[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
+  slackClient?: import("../slack/slack-client.js").SlackClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
   getFollowers?: () => FollowerInfo[];
 }

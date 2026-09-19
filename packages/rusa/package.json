@@ -47,6 +47,8 @@
     "@google/genai": "^1.43.0",
     "@inquirer/prompts": "^8.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@slack/socket-mode": "^3.0.1",
+    "@slack/web-api": "^8.1.1",
     "@thkp-eng/goals-core": "workspace:*",
     "@thkp-eng/goals-types": "workspace:*",
     "better-sqlite3": "^12.6.2",

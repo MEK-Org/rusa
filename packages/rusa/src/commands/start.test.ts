@@ -1579,7 +1579,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await readyPromise;
     warnSpy.mockRestore();
 
-    expect(warns).toContain("[update] no errorChat configured — lifecycle pings disabled");
+    expect(warns).toContain("[update] no error source configured — lifecycle pings disabled");
   });
 
   it("warns at boot when the self-update tool mounts with errorChat configured but no chat client", async () => {
@@ -1613,8 +1613,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await readyPromise;
     warnSpy.mockRestore();
 
-    expect(warns).toContain("[update] chat client unavailable — lifecycle pings disabled");
-    expect(warns).not.toContain("[update] no errorChat configured — lifecycle pings disabled");
+    expect(warns).toContain("[update] error source writer unavailable — lifecycle pings disabled");
+    expect(warns).not.toContain("[update] no error source configured — lifecycle pings disabled");
   });
 
   it("does not warn at boot when self-update tool mounts with both errorChat and chat client present", async () => {

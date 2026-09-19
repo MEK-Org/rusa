@@ -54,7 +54,7 @@
  */
 
 /** Integrations that can be referenced. One per external system, not per entity. */
-export const REFERENCE_SCHEMES = ["github", "gchat", "mesh", "system"] as const;
+export const REFERENCE_SCHEMES = ["github", "gchat", "slack", "mesh", "system"] as const;
 
 export type ReferenceScheme = (typeof REFERENCE_SCHEMES)[number];
 
@@ -86,6 +86,7 @@ const SCHEMES = new Set<string>(REFERENCE_SCHEMES);
 const ROOT_SEGMENTS: Record<ReferenceScheme, number> = {
   github: 2,
   gchat: 0,
+  slack: 0,
   mesh: 0,
   system: 1,
 };
@@ -143,7 +144,9 @@ export function parseReference(value: string): Reference {
   // that produced owner refs but refused to parse them would contradict itself.
   const isPartialRoot =
     (root > 1 && segments.length < root) ||
-    (scheme === "gchat" && segments.length === 1 && segments[0] === "spaces");
+    (((scheme === "gchat" && segments[0] === "spaces") ||
+      (scheme === "slack" && segments[0] === "channels")) &&
+      segments.length === 1);
   if (segments.length < 1) {
     throw new InvalidReferenceError(`a ${scheme} reference needs at least one path segment`);
   }
@@ -180,14 +183,21 @@ export function isReference(value: string): boolean {
 export function referenceParent(reference: Reference): Reference | null {
   const root = ROOT_SEGMENTS[reference.scheme];
   const segments = [...reference.segments];
-  if (reference.scheme === "gchat" && segments.length === 1 && segments[0] === "spaces") {
-    return null;
+  if (
+    (reference.scheme === "gchat" && segments[0] === "spaces") ||
+    (reference.scheme === "slack" && segments[0] === "channels")
+  ) {
+    if (segments.length === 1) return null;
   }
-  if (reference.scheme === "gchat" && segments.length === 2 && segments[0] === "spaces") {
+  if (
+    segments.length === 2 &&
+    ((reference.scheme === "gchat" && segments[0] === "spaces") ||
+      (reference.scheme === "slack" && segments[0] === "channels"))
+  ) {
     return {
-      scheme: "gchat",
-      segments: ["spaces"],
-      key: "gchat:spaces",
+      scheme: reference.scheme,
+      segments: [segments[0]],
+      key: `${reference.scheme}:${segments[0]}`,
     };
   }
   if (segments.length > root) {
@@ -334,6 +344,15 @@ export function asGitHubTarget(reference: Reference): GitHubTarget | null {
  * `issue_comment` event into our issue and review comment kinds.
  */
 export function referenceUrl(reference: Reference): string | null {
+  if (reference.scheme === "slack" && reference.segments[0] === "channels") {
+    const channel = reference.segments[1];
+    const ts = reference.segments[3];
+    if (!channel) return null;
+    if (ts && reference.segments[2] === "messages") {
+      return `https://app.slack.com/archives/${encodeURIComponent(channel)}/p${ts.replace(".", "")}`;
+    }
+    return `https://app.slack.com/archives/${encodeURIComponent(channel)}`;
+  }
   if (reference.scheme !== "github") return null;
   const branch = asGitHubBranch(reference);
   if (branch) {

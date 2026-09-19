@@ -5,6 +5,7 @@ import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
 import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
+import { resolveWritableErrorSource } from "../observability/error-source.js";
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
@@ -132,6 +133,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 
   const parsed = applyProfile(rawParsed);
   validateDashboardAuth(parsed.auth);
+  resolveWritableErrorSource(parsed);
 
   // Basic validation & defaulting
   if (parsed.github && !parsed.github.account) {
@@ -431,6 +433,28 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
   }
   const chat = parsed.chat;
+  if (parsed.slack !== undefined) {
+    const slack = parsed.slack;
+    if (!slack || typeof slack !== "object" || Array.isArray(slack)) {
+      throw new Error("config.yaml: slack must be a mapping");
+    }
+    for (const key of ["appTokenPath", "botTokenPath"] as const) {
+      if (typeof slack[key] !== "string" || !slack[key].trim()) {
+        throw new Error(`config.yaml: slack.${key} must be a non-empty file path`);
+      }
+    }
+    if (
+      slack.channels !== undefined &&
+      slack.channels !== "all" &&
+      (!Array.isArray(slack.channels) ||
+        slack.channels.length === 0 ||
+        !slack.channels.every((id) => typeof id === "string" && /^[CDG][A-Z0-9]+$/.test(id)))
+    ) {
+      throw new Error(
+        'config.yaml: slack.channels must be "all" or a non-empty array of channel IDs'
+      );
+    }
+  }
   if (chat !== undefined) {
     if (chat.gchat !== undefined) {
       if (
