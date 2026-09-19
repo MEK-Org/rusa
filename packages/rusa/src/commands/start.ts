@@ -1568,8 +1568,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // history cache (`listHistory` below, §12 item 4 / #356), so the cache is
   // warmed whenever a coordinator is configured — independent of whether launch
   // pacing (`quota.throttle.enabled`) is on.
+  let initialQuotaHistoryWarmup: Promise<void> | null = null;
   if (quotaCoordinatorClient) {
-    void refreshQuotaHistory();
+    // Initiate warmup in the background. Dashboard reachability gates on this
+    // warmup settling so that an in-flight cold cache is not observable as
+    // authoritative empty history (#527), while headless starts and host
+    // initialization proceed concurrently.
+    initialQuotaHistoryWarmup = refreshQuotaHistory();
   }
 
   // ── Capability grants  ──
@@ -3621,11 +3626,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           logger: log.child({ component: "voice-session" }),
         })
       : null;
-  const dashboardServer = shouldBindDashboardServer({
+  const bindDashboard = shouldBindDashboardServer({
     e2eMode,
     e2eDashboard: opts?.e2e?.dashboard === true,
     noDashboardServer,
-  })
+  });
+  if (bindDashboard && initialQuotaHistoryWarmup) {
+    // A successful empty cache is meaningful to the dashboard, so do not make
+    // it observable until the initial coordinator read has settled. The
+    // refresher retains a prior cache on failures and resolves after handling
+    // them, which preserves that behavior without publishing an in-flight
+    // cold cache as an authoritative empty snapshot (#527).
+    await initialQuotaHistoryWarmup;
+  }
+  const dashboardServer = bindDashboard
     ? await startDashboardServer({
         auth: config.auth,
         principals: getRepositories().principals,

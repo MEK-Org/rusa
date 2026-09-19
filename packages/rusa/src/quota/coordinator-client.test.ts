@@ -1046,6 +1046,100 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       const result = await client.getHistory("claude");
       expect(result).toBeNull();
     });
+
+    it("populates history cache independently per provider when concurrent requests have partial success", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-partial-"));
+      const socketPath = join(root, "coordinator.sock");
+
+      const agyRecord: PublishedHistoryRecord = {
+        scope: "provider",
+        kind: "5h",
+        label: "Antigravity 5h",
+        observedAt: "2026-09-16T20:00:00.000Z",
+        percentLeft: 60,
+        resetAtIso: null,
+        controllerError: null,
+        intervalSeconds: 300,
+      };
+
+      await listen(socketPath, (req, res) => {
+        res.setHeader("content-type", "application/json");
+        const url = new URL(req.url ?? "", "http://localhost");
+        const provider = url.searchParams.get("provider");
+
+        if (provider === "agy") {
+          res.end(
+            JSON.stringify({
+              service: serviceInfo(),
+              provider: "agy",
+              since: "2026-09-15T00:00:00.000Z",
+              records: [agyRecord],
+            })
+          );
+        } else if (provider === "claude") {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: "coordinator internal error" }));
+        } else {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+
+      const client = new QuotaCoordinatorClient({ socketPath });
+
+      // Simulate refreshQuotaHistory: Promise.allSettled across multiple configured providers
+      const sinceIso = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
+      const results = await Promise.allSettled([
+        client.getHistory("agy", sinceIso),
+        client.getHistory("claude", sinceIso),
+      ]);
+
+      expect(results[0].status).toBe("fulfilled");
+      expect(results[1].status).toBe("fulfilled");
+
+      // Successful provider's history cache is populated independently
+      expect(client.getCachedHistory("agy")).toEqual([agyRecord]);
+
+      // Failed provider resolves null and its cache remains empty without affecting the successful provider
+      expect(client.getCachedHistory("claude")).toEqual([]);
+    });
+
+    it("cleans up in-flight coordinator history request on timeout and allows clean server teardown without hanging", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-cleanup-"));
+      const socketPath = join(root, "coordinator.sock");
+      let releaseResponse: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      let requestSeen: (() => void) | undefined;
+      const requestSeenPromise = new Promise<void>((resolve) => {
+        requestSeen = resolve;
+      });
+
+      await listen(socketPath, async (_req, res) => {
+        requestSeen?.();
+        await gate;
+        if (!res.writableEnded) {
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ service: serviceInfo(), provider: "claude", records: [] }));
+        }
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        requestTimeoutMs: 100,
+      });
+
+      const historyPromise = client.getHistory("claude");
+      await requestSeenPromise;
+
+      // Timeout fires while handler is waiting on gate
+      const result = await historyPromise;
+      expect(result).toBeNull();
+
+      // Deterministic cleanup: release gate and stop server cleanly without hanging
+      releaseResponse?.();
+    });
   });
 
   describe("Production tick reconciliation: warm → outage/cold → hard-stale", () => {
