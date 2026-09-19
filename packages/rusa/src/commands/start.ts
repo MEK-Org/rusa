@@ -202,6 +202,7 @@ import { createExhaustionClassifier } from "../providers/exhaustion-classifier.j
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import {
+  describeModelConfigEntry,
   describeModelConfigPool,
   fillModelConfigFromCurrent,
   resolveModelClasses,
@@ -209,7 +210,6 @@ import {
 } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
-  normalizeFallbackModel,
   providerCapabilityName,
   providerThrottleKey,
   QUOTA_THROTTLE_PROVIDERS,
@@ -1340,7 +1340,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
-  const fallbackModels = normalizeFallbackModel(config);
   const classifyExhaustion = createExhaustionClassifier(config.geminiApiKey);
   const repoRoot = (() => {
     try {
@@ -3242,8 +3241,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // Root's declared pool is whatever its record carries: the persisted
     // ordered pool after a restart, or the configured tuple on first boot
     // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
-    // so resolution reads the live entry rather than freezing the
-    // boot-time pool. `fallback` below is its own, separate degrade path.
+    // so resolution reads the live entry rather than freezing the boot-time
+    // pool. An exhausted root invocation then proceeds through the remaining
+    // entries of this same ordered pool.
     modelConfig: [...rootBootModelConfig.modelConfig],
     resolveProvider: (selected) =>
       resolveProvider(config, selected.provider, selected.model, selected.effort),
@@ -3273,20 +3273,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       };
     },
     lifecycle: rootLifecycle,
-    fallback: fallbackModels
-      ? {
-          models: fallbackModels,
-          // `runWithFallback` only calls this after `onRunStart` captures the
-          // entry that actually launched. Resolve the fallback under that
-          // provider and effort, rather than the scalar file tuple which may
-          // no longer be root's durable pool after a restart. An unsupported
-          // fallback model then throws explicitly instead of silently moving
-          // recovery onto the stale file provider.
-          resolveProvider: (model) =>
-            resolveProvider(config, rootLastSelected.provider, model, rootLastSelected.effort),
-          classify: classifyExhaustion,
-        }
-      : undefined,
+    classifyExhaustion,
+    onPoolFallback: ({ runId, attempt, failed, next, remainingAfter }) => {
+      // A pool is capped at validation time and these fields are configured
+      // tuple labels/counts only: retain a compact diagnostic without placing
+      // provider output (which can echo prompts) in observability logs.
+      runLogger(rootId, runId).warn("run_pool_fallback", {
+        attempt,
+        failed: describeModelConfigEntry(failed),
+        next: describeModelConfigEntry(next),
+        remainingAfter,
+      });
+    },
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
     beforeRun: ({ mode }): boolean => {

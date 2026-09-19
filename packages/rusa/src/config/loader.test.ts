@@ -898,13 +898,18 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
     ).toThrow(/providers\.claude\.fallbackModel is no longer supported/);
   });
 
-  it("still accepts rootActor.fallbackModel (root-only, unaffected)", () => {
-    const config = loadConfig(
-      writeConfig({
-        rootActor: { provider: "codex", model: "gpt-5.6-sol", fallbackModel: "codex-fallback" },
-      })
-    );
-    expect(config.rootActor?.fallbackModel).toBe("codex-fallback");
+  it("rejects the removed rootActor.fallbackModel with the pool migration path", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          rootActor: {
+            provider: "codex",
+            model: "gpt-5.6-sol",
+            fallbackModel: "codex-fallback",
+          },
+        })
+      )
+    ).toThrow(/rootActor\.fallbackModel has been removed.*set_actor_model/);
   });
 });
 

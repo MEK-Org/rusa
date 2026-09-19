@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
-import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import {
+  describeModelConfigEntry,
+  type ProviderModelConfig,
+  type RawProviderModelConfig,
+} from "../providers/model-config.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
@@ -102,13 +106,23 @@ export interface ActorOptions {
   lifecycle?: ActorLifecycle;
   /** Firehose: receives the agent's streamed output. */
   log?: (chunk: string) => void;
-  /** Optional model fallback for provider capacity/quota exhaustion. */
-  fallback?: {
-    models: string[];
-    /** Resolve one configured fallback model using the established fallback policy. */
-    resolveProvider: (model: string) => CodingProvider;
-    classify: ExhaustionClassifier;
-  };
+  /**
+   * Eligibility classifier for pool-chain fallback after a failed invocation
+   * (MEK-Org/rusa#450). When set, an invocation that fails with a classified
+   * capacity/quota exhaustion recovers onto the remaining entries of this
+   * actor's declared {@link modelConfig} pool, in order, each entry keeping
+   * its own provider/model/effort tuple. When unset (every worker), a failed
+   * invocation is reported as-is — exhaustion is a signal to the parent, not
+   * something the actor self-heals out of.
+   */
+  classifyExhaustion?: ExhaustionClassifier;
+  /**
+   * Structured, bounded diagnostic for each pool-fallback transition: the
+   * invocation on `failed` was classified exhausted, so recovery is moving to
+   * `next`. Carries configured entry tuples and counts only — never provider
+   * output, which echoes the prompt and can hold secrets.
+   */
+  onPoolFallback?: (diagnostic: PoolFallbackDiagnostic) => void;
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
   debounceMs?: number;
   /** Per-run provider timeout. */
@@ -187,34 +201,52 @@ export interface RunAbandon {
 export type RunAbandonReason = ActorLifecycleAbandonmentReason;
 
 /**
- * Compose the failure report for a fallback that ran but failed for a reason
+ * One pool-fallback transition within a run: the invocation on {@link failed}
+ * was classified exhausted, so recovery is moving to {@link next}. Emitted
+ * through {@link ActorOptions.onPoolFallback} before each recovery attempt.
+ */
+export interface PoolFallbackDiagnostic {
+  /** Lifecycle run id the transition belongs to, for run-scoped records. */
+  runId: string;
+  /** 1-based invocation index in this run's chain: 1 is the gated primary attempt. */
+  attempt: number;
+  /** Configured pool entry whose invocation just failed. */
+  failed: RawProviderModelConfig;
+  /** Configured pool entry recovery will try next. */
+  next: RawProviderModelConfig;
+  /** Configured entries still untried after {@link next}. */
+  remainingAfter: number;
+}
+
+/**
+ * Compose the failure report for a pool recovery attempt that failed for a reason
  * that is *not* exhaustion .
  *
  * The primary's exhaustion is the load-bearing fact — it is why recovery was
  * attempted at all, and it is the condition that actually resolves on a timer.
- * The fallback's failure only explains why recovery didn't happen. Reporting the
+ * The recovery failure only explains why recovery didn't happen. Reporting the
  * latter alone converts a self-healing wait into an error naming a model nobody
  * configured, which is what made ISSUE_NUM cost two separate diagnoses.
  *
  * The primary's exhaustion is carried as a *named condition*, never as its raw
  * output: ISSUE_NUM deliberately scrubs raw provider output out of synthesized
  * failures because a provider echoes the prompt, and the prompt carries secrets.
- * The fallback's raw output is kept because this path already returned it
+ * The recovery's raw output is kept because this path already returned it
  * verbatim before this function existed; withholding it would lose the config
  * diagnostics (`invalid --model ...`) that make a wiring bug findable.
  */
-export function formatFallbackRecoveryFailure(input: {
+export function formatPoolRecoveryFailure(input: {
   primaryName: string;
-  fallbackModel: string;
-  fallbackOutput: string;
+  recoveryEntry: string;
+  recoveryOutput: string;
 }): string {
   return [
-    `primary ${input.primaryName} exhausted; recovery onto fallback ${input.fallbackModel} failed for an unrelated reason.`,
+    `primary ${input.primaryName} exhausted; recovery onto pool entry ${input.recoveryEntry} failed for an unrelated reason.`,
     "",
-    `The exhaustion of ${input.primaryName} is what caused this run to fail, and it clears on a timer. The fallback error below explains only why recovery was unavailable — it is context, not the cause.`,
+    `The exhaustion of ${input.primaryName} is what caused this run to fail, and it clears on a timer. The recovery error below explains only why recovery was unavailable — it is context, not the cause.`,
     "",
-    `--- fallback ${input.fallbackModel} (recovery failed) ---`,
-    input.fallbackOutput,
+    `--- pool entry ${input.recoveryEntry} (recovery failed) ---`,
+    input.recoveryOutput,
   ].join("\n");
 }
 
@@ -761,7 +793,7 @@ export class Actor {
         timeoutMs: runTimeoutMs + 30_000,
         signal: abortController.signal,
         onChunk: (chunk: string) => {
-          // Once per RUN, not per provider attempt: `runWithFallback` can call
+          // Once per RUN, not per provider attempt: `runWithPoolFallback` can call
           // runProvider again on a different model, and the question this answers
           // is "when did this wake start producing output", not "when did each
           // attempt". The flag lives in the run scope for that reason.
@@ -834,7 +866,12 @@ export class Actor {
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
       startWatchdogTimers();
-      return this.runWithFallback(this.opts.resolveProvider(selected), runProvider);
+      return this.runWithPoolFallback(
+        runId,
+        selected,
+        this.opts.resolveProvider(selected),
+        runProvider
+      );
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -1010,77 +1047,135 @@ export class Actor {
     this.opts.onRuntimeStateChanged?.(state);
   }
 
-  private async runWithFallback(
+  /**
+   * Run the gated primary entry, then — only when this actor has an
+   * exhaustion classifier and the primary's failure is classified as provider
+   * capacity/quota exhaustion — recover onto the remaining entries of the
+   * declared modelConfig pool, in configured order, without retrying the
+   * failed entry (MEK-Org/rusa#450). Each entry keeps its own
+   * provider/model/effort tuple: the chain never reinterprets a model under a
+   * different provider. The classifier is wired only for the root, so a
+   * worker's failures still report as-is.
+   */
+  private async runWithPoolFallback(
+    runId: string,
+    selected: RawProviderModelConfig,
     primary: CodingProvider,
     runProvider: (provider: CodingProvider) => Promise<RunResult>
   ): Promise<RunResult> {
     const result = await runProvider(primary);
-    const fallback = this.opts.fallback;
-    if (result.success || !fallback || fallback.models.length === 0) return result;
+    const classify = this.opts.classifyExhaustion;
+    if (result.success || !classify) return result;
     // A supervisor grace-kill (#257) is cleanup after the actor already yielded,
     // not a capacity failure, and the kill has already aborted this run's
     // signal — so there is nothing left to retry: every fallback attempt would
     // short-circuit to an instantly-killed result. Deterministically, without
     // this guard such a run is still handed to the exhaustion classifier, an
     // LLM judgment over its own transcript tail. Conditionally, if that returns
-    // exhausted, the ladder then runs to its end and replaces the termination
-    // diagnostic with a both-tiers-exhausted summary that never happened.
+    // exhausted, the chain then runs to its end and replaces the termination
+    // diagnostic with a pool-exhausted summary that never happened.
     if (result.graceKilled) return result;
 
-    if (!(await fallback.classify(result)).exhausted) return result;
+    if (!(await classify(result)).exhausted) return result;
 
-    const primaryName = primary.model ?? primary.name;
-    for (const model of fallback.models) {
+    const primaryName = describeModelConfigEntry(selected);
+    // The chain excludes the failed entry by value, not by position: the gate
+    // may have launched a later pool entry (earliest-available-first), and
+    // recovery must never retry the entry that just failed, wherever it sits
+    // in the declared order.
+    const chain = this.opts.modelConfig.filter((entry) => !sameModelConfigEntry(entry, selected));
+    let failed = selected;
+    let lastResult = result;
+    for (const [index, entry] of chain.entries()) {
+      const attempt = index + 2; // attempt 1 was the gated primary
+      this.opts.onPoolFallback?.({
+        runId,
+        attempt,
+        failed: { ...failed },
+        next: { ...entry },
+        remainingAfter: chain.length - index - 1,
+      });
+      this.opts.log?.(
+        `\n[PoolFallback] ${describeModelConfigEntry(failed)} exhausted; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
+      );
       let provider: CodingProvider;
       try {
-        provider = fallback.resolveProvider(model);
+        provider = this.opts.resolveProvider(entry);
       } catch (err) {
-        // The fallback could not even be built — e.g. its model pin is not
-        // valid under the provider the primary actually ran on. That is a
-        // configuration failure, and it must stay one rather than be retried
-        // under some other tuple; but the run still failed because the primary
-        // was exhausted, so report it the same way as a fallback attempt that
+        // The entry could not even be built — e.g. its provider was dropped
+        // from config after this pool was persisted. That is a configuration
+        // failure, and it must stay one rather than be retried under some
+        // other tuple; but the run still failed because the primary was
+        // exhausted, so report it the same way as a recovery attempt that
         // failed for a non-exhaustion reason below: exhaustion first, the
         // resolver error as context. Letting it escape would reach the
         // terminal boundary as a bare stack with no mention of the exhaustion.
         return {
           success: false,
-          output: formatFallbackRecoveryFailure({
+          output: formatPoolRecoveryFailure({
             primaryName,
-            fallbackModel: model,
-            fallbackOutput: err instanceof Error ? err.message : String(err),
+            recoveryEntry: describeModelConfigEntry(entry),
+            recoveryOutput: err instanceof Error ? err.message : String(err),
           }),
-          exitCode: result.exitCode || 1,
-          sessionId: result.sessionId,
+          exitCode: lastResult.exitCode || 1,
+          sessionId: lastResult.sessionId,
         };
       }
-      this.opts.log?.(
-        `\n[Fallback] primary ${primaryName} exhausted; continuing on fallback ${model}\n`
-      );
-      const fallbackResult = await runProvider(provider);
-      if (fallbackResult.success) return fallbackResult;
-      if (!(await fallback.classify(fallbackResult)).exhausted) {
+      const recoveryResult = await runProvider(provider);
+      if (recoveryResult.success) return recoveryResult;
+      if (!(await classify(recoveryResult)).exhausted) {
         // We only reach here because the primary was classified exhausted, so
-        // returning the fallback's error bare would report a soft, timer-bound
-        // condition as an unrelated hard failure . Keep the fallback's
-        // exitCode/sessionId — the fallback attempt is the live session — but
+        // returning the entry's error bare would report a soft, timer-bound
+        // condition as an unrelated hard failure . Keep the entry's
+        // exitCode/sessionId — the recovery attempt is the live session — but
         // lead the output with the exhaustion that actually caused this run.
         return {
-          ...fallbackResult,
-          output: formatFallbackRecoveryFailure({
+          ...recoveryResult,
+          output: formatPoolRecoveryFailure({
             primaryName,
-            fallbackModel: model,
-            fallbackOutput: fallbackResult.output,
+            recoveryEntry: describeModelConfigEntry(entry),
+            recoveryOutput: recoveryResult.output,
           }),
         };
       }
+      failed = entry;
+      lastResult = recoveryResult;
     }
 
     return {
       success: false,
-      output: `both tiers exhausted: primary ${primaryName} and fallback ${fallback.models.join(", ")} have no capacity available`,
-      exitCode: result.exitCode || 1,
-      sessionId: result.sessionId,
+      output: formatPoolExhaustedFailure({ attempted: [selected, ...chain] }),
+      exitCode: lastResult.exitCode || 1,
+      sessionId: lastResult.sessionId,
     };
   }
+}
+
+/** Same configured tuple, modulo an absent model/effort spelling. */
+function sameModelConfigEntry(a: RawProviderModelConfig, b: RawProviderModelConfig): boolean {
+  return (
+    a.provider === b.provider &&
+    (a.model ?? "") === (b.model ?? "") &&
+    (a.effort ?? "") === (b.effort ?? "")
+  );
+}
+
+/**
+ * The terminal report when every configured pool entry was tried and each
+ * failed with classified capacity/quota exhaustion. Actionable on purpose:
+ * it names the condition, lists what was attempted in order, says what clears
+ * it (the providers' reset timers), and what an operator can do about it.
+ * Only configured entry tuples are named — raw provider output is never
+ * pasted here, because a provider echoes the prompt and the prompt carries
+ * secrets.
+ */
+export function formatPoolExhaustedFailure(input: {
+  /** Every entry attempted, launch first, then the chain in tried order. */
+  attempted: readonly RawProviderModelConfig[];
+}): string {
+  return [
+    `model pool exhausted: all ${input.attempted.length} configured pool ${input.attempted.length === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion.`,
+    `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`,
+    "The exhaustion is a provider-side condition that clears on the providers' reset timers; no configured entry has capacity right now. Wait for a quota reset, or configure an additional pool entry that has capacity so recovery has somewhere to go.",
+  ].join("\n");
 }
