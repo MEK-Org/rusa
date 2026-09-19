@@ -1219,6 +1219,7 @@ class FakeStream implements MeshStreamSource {
   final runtimeHelloCtrl = StreamController<RuntimeHello>.broadcast();
   final runtimeStatesCtrl =
       StreamController<ActorRuntimeStateDelta>.broadcast();
+  final avatarCtrl = StreamController<AvatarGenerationUpdate>.broadcast();
   final connectCalls = <List<String>>[];
 
   @override
@@ -1231,6 +1232,8 @@ class FakeStream implements MeshStreamSource {
   Stream<RuntimeHello> get runtimeHello => runtimeHelloCtrl.stream;
   @override
   Stream<ActorRuntimeStateDelta> get runtimeStates => runtimeStatesCtrl.stream;
+  @override
+  Stream<AvatarGenerationUpdate> get avatarUpdates => avatarCtrl.stream;
   @override
   void connect(List<String> actors) => connectCalls.add(actors);
   @override

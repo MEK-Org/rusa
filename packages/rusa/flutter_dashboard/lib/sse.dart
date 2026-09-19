@@ -22,6 +22,7 @@ class WebEventSourceStream implements MeshStreamSource {
   final _elided = StreamController<void>.broadcast();
   final _runtimeHello = StreamController<RuntimeHello>.broadcast();
   final _runtimeStates = StreamController<ActorRuntimeStateDelta>.broadcast();
+  final _avatarUpdates = StreamController<AvatarGenerationUpdate>.broadcast();
   SessionEventSource? _es;
 
   @override
@@ -34,6 +35,8 @@ class WebEventSourceStream implements MeshStreamSource {
   Stream<RuntimeHello> get runtimeHello => _runtimeHello.stream;
   @override
   Stream<ActorRuntimeStateDelta> get runtimeStates => _runtimeStates.stream;
+  @override
+  Stream<AvatarGenerationUpdate> get avatarUpdates => _avatarUpdates.stream;
 
   @override
   void connect(List<String> actors) {
@@ -75,6 +78,16 @@ class WebEventSourceStream implements MeshStreamSource {
         );
       }),
     );
+    es.addEventListener(
+      'avatar',
+      _listener((data) {
+        _avatarUpdates.add(
+          AvatarGenerationUpdate.fromJson(
+            jsonDecode(data) as Map<String, dynamic>,
+          ),
+        );
+      }),
+    );
     _es = es;
   }
 
@@ -101,5 +114,6 @@ class WebEventSourceStream implements MeshStreamSource {
     _elided.close();
     _runtimeHello.close();
     _runtimeStates.close();
+    _avatarUpdates.close();
   }
 }

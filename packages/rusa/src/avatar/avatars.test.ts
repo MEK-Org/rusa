@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateHandle } from "../actor/handle-generator.js";
 import {
   AvatarGenerationCoordinator,
+  type AvatarGenerationEvent,
   avatarCachePath,
   avatarsDir,
   configuredRootAvatarPath,
@@ -289,20 +290,42 @@ describe("with an isolated RUSA_HOME", () => {
 
   it("coalesces concurrent first-display requests and keeps a failed attempt settled", async () => {
     const coordinator = new AvatarGenerationCoordinator();
+    const events: AvatarGenerationEvent[] = [];
+    coordinator.onStateChange((event) => events.push(event));
     const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unavailable"));
 
     try {
       const first = coordinator.request(UUID, { apiKey: "key" });
       const second = coordinator.request(UUID, { apiKey: "key" });
       expect(first).toBe(second);
+      // Joining a pending attempt re-announces it (a late-loading dashboard
+      // still gets its ring); nothing is announced twice once it settles.
+      expect(events.map((e) => e.state)).toEqual(["generating", "generating"]);
       await first;
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events.at(-1)).toEqual({ actorId: UUID, state: "failed" });
 
       await coordinator.request(UUID, { apiKey: "key" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(3);
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  it("request skips root, cached, and keyless cases without announcing anything", () => {
+    const coordinator = new AvatarGenerationCoordinator();
+    const events: AvatarGenerationEvent[] = [];
+    coordinator.onStateChange((event) => events.push(event));
+    mkdirSync(avatarsDir(), { recursive: true });
+    writeFileSync(avatarCachePath(UUID), Buffer.from("cached"));
+
+    expect(coordinator.request("root", { apiKey: "key" })).toBeUndefined();
+    expect(coordinator.request(UUID, { apiKey: "key" })).toBeUndefined();
+    expect(
+      coordinator.request("bbbbbbbb-0000-4000-8000-000000000002", { apiKey: "" })
+    ).toBeUndefined();
+    expect(events).toEqual([]);
   });
 
   it("generateAvatarOnce fetches with imageSize: '512' and aspectRatio: '1:1'", async () => {

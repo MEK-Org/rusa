@@ -10,7 +10,11 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
-import { AvatarGenerationCoordinator, readAvatar } from "../avatar/avatars.js";
+import {
+  AvatarGenerationCoordinator,
+  type AvatarGenerationEvent,
+  readAvatar,
+} from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -1914,11 +1918,12 @@ describe("handleMeshApiRequest", () => {
     expect(res.headers["Cache-Control"]).toBe("no-store");
   });
 
-  it("lazily generates only known actors and coalesces simultaneous avatar requests", async () => {
+  it("answers a missing avatar 404 at once and starts one coalesced attempt only for live actors", async () => {
     const previousHome = process.env.RUSA_HOME;
     const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatars-"));
     process.env.RUSA_HOME = home;
     actors.upsert(rec(UUID_A, null, "active"));
+    actors.upsert(rec(UUID_B, null, "retired"));
 
     const png = Buffer.concat([
       Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -1933,23 +1938,39 @@ describe("handleMeshApiRequest", () => {
     );
 
     try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
       const lazyDeps: DashboardDataDeps = {
         ...deps,
         geminiApiKey: "key",
-        avatarGeneration: new AvatarGenerationCoordinator(),
+        avatarGeneration: coordinator,
       };
       const [first, second] = await Promise.all([
         call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
         call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
       ]);
 
+      // The response never waits on the provider: it would otherwise occupy one
+      // of the browser's few HTTP/1.1 connections for the whole round trip.
+      expect(first.res.statusCode).toBe(404);
+      expect(second.res.statusCode).toBe(404);
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(first.res.ended).toBe(false);
-      expect(second.res.ended).toBe(false);
+      // Both requests announce the same in-flight attempt to dashboards.
+      expect(events).toEqual([
+        { actorId: UUID_A, state: "generating" },
+        { actorId: UUID_A, state: "generating" },
+      ]);
 
       const unknown = await call(lazyDeps, "GET", "/api/mesh/avatar/not-a-known-actor.png");
       expect(unknown.res.statusCode).toBe(404);
+      const retired = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(retired.res.statusCode).toBe(404);
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
 
       release?.({
         ok: true,
@@ -1957,10 +1978,12 @@ describe("handleMeshApiRequest", () => {
           candidates: [{ content: { parts: [{ inlineData: { data: png.toString("base64") } }] } }],
         }),
       } as unknown as Response);
-      await settled(first.res);
-      await settled(second.res);
-      expect(first.res.statusCode).toBe(200);
-      expect(second.res.statusCode).toBe(200);
+      expect(await outcome).toEqual({ actorId: UUID_A, state: "ready" });
+
+      // The `ready` frame is what makes the dashboard re-request; that request is served.
+      const served = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
+      expect(served.res.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       release?.({ ok: false, status: 500 } as Response);
       fetchMock.mockRestore();
@@ -1980,20 +2003,55 @@ describe("handleMeshApiRequest", () => {
       .mockRejectedValue(new Error("provider unavailable"));
 
     try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
       const lazyDeps: DashboardDataDeps = {
         ...deps,
         geminiApiKey: "key",
-        avatarGeneration: new AvatarGenerationCoordinator(),
+        avatarGeneration: coordinator,
       };
       const first = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
-      await settled(first.res);
       expect(first.res.statusCode).toBe(404);
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(await outcome).toEqual({ actorId: UUID_B, state: "failed" });
+      expect(events).toEqual([
+        { actorId: UUID_B, state: "generating" },
+        { actorId: UUID_B, state: "failed" },
+      ]);
 
+      // A later page load re-requests the image (`no-store`); the settled
+      // failure means no second provider call and no renewed ring.
       const repeat = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
-      await settled(repeat.res);
       expect(repeat.res.statusCode).toBe(404);
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("never generates when no coordinator is wired (UI-only server)", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-disabled-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    try {
+      const { res } = await call(
+        { ...deps, geminiApiKey: "key" },
+        "GET",
+        `/api/mesh/avatar/${UUID_A}.png`
+      );
+      expect(res.statusCode).toBe(404);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       fetchMock.mockRestore();
       if (previousHome === undefined) delete process.env.RUSA_HOME;

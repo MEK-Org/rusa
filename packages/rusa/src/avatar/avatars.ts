@@ -297,20 +297,46 @@ export function uploadAvatar(id: string, bytes: Buffer, rootId?: string): void {
   writeAvatarCacheFile(id === rootId ? "root" : id, bytes);
 }
 
+/** Lifecycle of one actor's lazy first-display generation attempt. */
+export type AvatarGenerationState = "generating" | "ready" | "failed";
+
+/** Pushed to dashboards (as an `avatar` SSE frame) so they can show the ring and re-request the image. */
+export interface AvatarGenerationEvent {
+  actorId: string;
+  state: AvatarGenerationState;
+}
+
 /**
  * Process-local single-flight state for lazy avatar generation. A settled entry
  * intentionally stays in the map: successful generations already have a stable
  * cache file, and failures must remain on the fallback rather than retriggering
- * provider work whenever a displayed widget rebuilds. Explicit upload and force
- * generation deliberately bypass this first-display policy.
+ * provider work every time a dashboard re-requests the image (the avatar route
+ * is `no-store`, so every page load would otherwise be a retry). Explicit
+ * upload and force generation deliberately bypass this first-display policy.
+ *
+ * The coordinator never holds an HTTP response open: the avatar route answers a
+ * missing image with an immediate 404 and the outcome travels over the existing
+ * SSE stream via {@link onStateChange}, so a slow provider call can never occupy
+ * one of the browser's few HTTP/1.1 connections.
  */
 export class AvatarGenerationCoordinator {
-  private readonly attempts = new Map<string, Promise<void>>();
+  private readonly attempts = new Map<string, { promise: Promise<void>; settled: boolean }>();
+  private readonly listeners = new Set<(event: AvatarGenerationEvent) => void>();
+
+  /** Subscribe to attempt lifecycle events; returns the unsubscribe function. */
+  onStateChange(listener: (event: AvatarGenerationEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   /**
    * Start (or join) the single first-display attempt for one non-root actor.
-   * Returns undefined when there is nothing to generate; otherwise callers can
-   * wait for the shared, always-settling attempt before re-reading the cache.
+   * Returns undefined when there is nothing to generate; otherwise the shared,
+   * always-settling attempt. Joining a still-pending attempt re-announces
+   * `generating`, so a dashboard that loaded after the attempt began still
+   * shows the ring; a settled attempt is returned silently.
    */
   request(threadId: string, deps: AvatarGenDeps): Promise<void> | undefined {
     if (
@@ -323,15 +349,40 @@ export class AvatarGenerationCoordinator {
     }
 
     const prior = this.attempts.get(threadId);
-    if (prior) return prior;
+    if (prior) {
+      if (!prior.settled) this.emit({ actorId: threadId, state: "generating" });
+      return prior.promise;
+    }
 
-    const attempt = generateAvatarOnce(threadId, deps).catch((err) => {
-      deps.log?.(
-        `avatar gen for ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    });
-    this.attempts.set(threadId, attempt);
-    return attempt;
+    const entry = { settled: false, promise: Promise.resolve() };
+    entry.promise = generateAvatarOnce(threadId, deps)
+      .then(() => {
+        entry.settled = true;
+        this.emit({
+          actorId: threadId,
+          state: existsSync(avatarCachePath(threadId)) ? "ready" : "failed",
+        });
+      })
+      .catch((err) => {
+        entry.settled = true;
+        deps.log?.(
+          `avatar gen for ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        this.emit({ actorId: threadId, state: "failed" });
+      });
+    this.attempts.set(threadId, entry);
+    this.emit({ actorId: threadId, state: "generating" });
+    return entry.promise;
+  }
+
+  private emit(event: AvatarGenerationEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A dashboard fan-out failure must never surface into the avatar path.
+      }
+    }
   }
 }
 

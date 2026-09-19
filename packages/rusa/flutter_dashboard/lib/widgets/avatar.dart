@@ -14,12 +14,14 @@ import 'status_dot.dart';
 /// the image codec sniffs the bytes). The image is masked to a circle with a
 /// subtle border.
 ///
-/// A missing avatar starts one server-side generation attempt only after this
-/// widget requests it. While that request is pending, the fallback silhouette
-/// stays visible beneath an edge progress ring; a returned image fades in, and
-/// a failed request settles on the fallback without client-side retrying. The
-/// tree pairs this with the live status dot, so run-state is always visible.
-/// Retired actors render muted.
+/// A missing avatar is an immediate 404 (the fallback silhouette) that also
+/// starts one server-side generation attempt for a live actor. The server
+/// reports that attempt over the SSE stream: while it is generating, the store
+/// shows an edge progress ring over the silhouette; on `ready` the store bumps
+/// this actor's URL version and the new image fades in; on `failed` the ring
+/// simply goes away — there is no client-side retry. The tree pairs this with
+/// the live status dot, so run-state is always visible. Retired actors render
+/// muted.
 class ActorAvatar extends StatelessWidget {
   const ActorAvatar({
     super.key,
@@ -27,7 +29,6 @@ class ActorAvatar extends StatelessWidget {
     this.size = 22,
     this.retired = false,
     this.store,
-    this.imageProvider,
   });
 
   /// The unique thread id — the avatar's identity and cache key.
@@ -37,35 +38,56 @@ class ActorAvatar extends StatelessWidget {
 
   /// Optional store . When present, the lightbox opened from this
   /// avatar offers an upload control (root excluded — it stays
-  /// config-driven via `rootActor.avatar`) and re-fetches past the browser's
-  /// URL-keyed image cache after a successful upload.
+  /// config-driven via `rootActor.avatar`), re-fetches past the browser's
+  /// URL-keyed image cache after a successful upload, and drives the
+  /// generating ring from the server's `avatar` SSE frames.
   final DashboardStore? store;
-
-  /// Optional image source used by widget tests. Production uses the avatar
-  /// endpoint below, which is what starts the server's lazy first-display work.
-  final ImageProvider<Object>? imageProvider;
 
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<int>(
       stream: store?.avatarEpoch,
       initialData: 0,
-      builder: (context, snapshot) {
+      builder: (context, _) {
         // Relative to the page origin (Uri.base) so the same build works on
         // localhost and behind `tailscale serve`, matching DashboardApi.
-        final epoch = snapshot.data ?? 0;
+        final version = store?.avatarVersion(id) ?? 0;
+        final generating = store?.isAvatarGenerating(id) ?? false;
         final url = Uri.base
-            .resolve('/api/mesh/avatar/$id.png${epoch > 0 ? '?v=$epoch' : ''}')
+            .resolve(
+              '/api/mesh/avatar/$id.png${version > 0 ? '?v=$version' : ''}',
+            )
             .toString();
 
-        final image = _AvatarImage(
-          // A successful manual upload/generate increments the epoch, so its
-          // new URL must create a fresh image state instead of retaining a
-          // previous failed first-display attempt.
+        final image = Image.network(
+          url,
+          // A new version (upload, manual generate, or lazy `ready`) must start
+          // from a clean image state rather than inherit the previous URL's
+          // error, so the replacement image fades in instead of snapping.
           key: ValueKey(url),
-          id: id,
-          size: size,
-          imageProvider: imageProvider ?? NetworkImage(url),
+          width: size,
+          height: size,
+          fit: BoxFit.cover,
+          // Keep the last frame during a rebuild so the avatar never flickers
+          // when the tree re-renders on SSE updates.
+          gaplessPlayback: true,
+          frameBuilder: (_, child, frame, wasSynchronouslyLoaded) {
+            // An in-memory-cached image needs no transition. Otherwise the
+            // silhouette sits underneath and the decoded frame fades over it.
+            if (wasSynchronouslyLoaded) return child;
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                _avatarPlaceholder(id, size),
+                AnimatedOpacity(
+                  opacity: frame == null ? 0 : 1,
+                  duration: const Duration(milliseconds: 200),
+                  child: child,
+                ),
+              ],
+            );
+          },
+          errorBuilder: (_, _, _) => _avatarPlaceholder(id, size),
         );
 
         // A true circle, with no flat tangent edges. A circular `BoxDecoration`
@@ -76,7 +98,27 @@ class ActorAvatar extends StatelessWidget {
         // it edge-to-edge. The border is a separate circular ring painted over
         // the masked image's rim.
         Widget avatar = ClipOval(
-          child: SizedBox(width: size, height: size, child: image),
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                image,
+                // The ring means exactly one thing: the server is generating
+                // this avatar right now. Ordinary loads of a cached image
+                // never show it.
+                if (generating)
+                  Padding(
+                    padding: const EdgeInsets.all(1.5),
+                    child: CircularProgressIndicator(
+                      strokeWidth: size >= 20 ? 2 : 1,
+                      semanticsLabel: 'Generating avatar',
+                    ),
+                  ),
+              ],
+            ),
+          ),
         );
         if (retired) avatar = Opacity(opacity: 0.55, child: avatar);
 
@@ -113,83 +155,6 @@ class ActorAvatar extends StatelessWidget {
       },
     );
   }
-}
-
-/// Keeps first-display loading, fade-in, and terminal fallback state scoped to
-/// one avatar URL. A URL change (manual upload/generate epoch) creates a fresh
-/// instance; ordinary tree rebuilds retain the settled image or fallback.
-class _AvatarImage extends StatefulWidget {
-  const _AvatarImage({
-    super.key,
-    required this.id,
-    required this.size,
-    required this.imageProvider,
-  });
-
-  final String id;
-  final double size;
-  final ImageProvider<Object> imageProvider;
-
-  @override
-  State<_AvatarImage> createState() => _AvatarImageState();
-}
-
-class _AvatarImageState extends State<_AvatarImage> {
-  bool _hasFrame = false;
-  bool _showImage = false;
-  bool _fadeScheduled = false;
-
-  void _scheduleFadeIn() {
-    if (_showImage || _fadeScheduled) return;
-    _fadeScheduled = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) setState(() => _showImage = true);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) => Image(
-    image: widget.imageProvider,
-    width: widget.size,
-    height: widget.size,
-    fit: BoxFit.cover,
-    // Keep the last frame during a rebuild so the avatar never flickers when
-    // the tree re-renders on SSE updates.
-    gaplessPlayback: true,
-    frameBuilder: (_, child, frame, _) {
-      if (frame == null) return child;
-      // `loadingBuilder` runs after this callback. Record the frame here so
-      // the first decoded image can replace the fallback in the same build;
-      // `_showImage` flips post-frame to animate its opacity from zero.
-      _hasFrame = true;
-      _scheduleFadeIn();
-      return AnimatedOpacity(
-        opacity: _showImage ? 1 : 0,
-        duration: const Duration(milliseconds: 200),
-        child: child,
-      );
-    },
-    loadingBuilder: (_, child, progress) {
-      // `Image` has a brief initial state before it emits byte progress. The
-      // fallback/ring must cover that state too, otherwise a slow first lazy
-      // request begins as a blank circle rather than a visible placeholder.
-      if (_hasFrame) return child;
-      return Stack(
-        fit: StackFit.expand,
-        children: [
-          _avatarPlaceholder(widget.id, widget.size),
-          Padding(
-            padding: const EdgeInsets.all(1.5),
-            child: CircularProgressIndicator(
-              strokeWidth: widget.size >= 20 ? 2 : 1,
-              semanticsLabel: 'Generating avatar',
-            ),
-          ),
-        ],
-      );
-    },
-    errorBuilder: (_, _, _) => _avatarPlaceholder(widget.id, widget.size),
-  );
 }
 
 /// Neutral silhouette shown until the image resolves, or after its one lazy
@@ -315,27 +280,28 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                     Flexible(
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8.0),
-                      child: StreamBuilder<int>(
-                        stream: widget.store?.avatarEpoch,
-                        initialData: 0,
-                        builder: (context, snapshot) {
-                          final epoch = snapshot.data ?? 0;
-                          final url = Uri.base
-                              .resolve(
-                                '/api/mesh/avatar/${widget.id}.png${epoch > 0 ? '?v=$epoch' : ''}',
-                              )
-                              .toString();
-                          return Image.network(
-                            url,
-                            fit: BoxFit.contain,
-                            gaplessPlayback: true,
-                            loadingBuilder: (_, child, progress) =>
-                                progress == null ? child : _placeholder(),
-                            errorBuilder: (_, _, _) => _placeholder(),
-                          );
-                        },
+                        child: StreamBuilder<int>(
+                          stream: widget.store?.avatarEpoch,
+                          initialData: 0,
+                          builder: (context, _) {
+                            final version =
+                                widget.store?.avatarVersion(widget.id) ?? 0;
+                            final url = Uri.base
+                                .resolve(
+                                  '/api/mesh/avatar/${widget.id}.png${version > 0 ? '?v=$version' : ''}',
+                                )
+                                .toString();
+                            return Image.network(
+                              url,
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                              loadingBuilder: (_, child, progress) =>
+                                  progress == null ? child : _placeholder(),
+                              errorBuilder: (_, _, _) => _placeholder(),
+                            );
+                          },
+                        ),
                       ),
-                    ),
                     ),
                     if (_canEditAvatar) ...[
                       const SizedBox(height: 16),
@@ -343,12 +309,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _upload,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _upload,
                             icon: _uploading
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.upload, size: 18),
                             label: Text(
@@ -361,12 +331,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                           ),
                           const SizedBox(width: 8),
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _generate,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _generate,
                             icon: _generating
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.auto_awesome, size: 18),
                             label: Text(

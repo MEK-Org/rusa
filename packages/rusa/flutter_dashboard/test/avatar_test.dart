@@ -1,9 +1,12 @@
-import 'dart:ui' as ui;
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 
@@ -12,28 +15,91 @@ import 'fakes.dart';
 // In widget tests Image.network has no real transport, so the load fails and the
 // errorBuilder fires — which is exactly the "not generated yet / unreachable"
 // path the placeholder exists for. So these tests double as placeholder coverage.
+// The fade test swaps in a fake transport through Flutter's own
+// `debugNetworkImageHttpClientProvider` hook so the real NetworkImage path runs.
 
 Widget _wrap(Widget child) => MaterialApp(
   home: Scaffold(body: Center(child: child)),
 );
 
-/// A deterministic decoded frame for the avatar fade test. It avoids tying the
-/// visual transition test to a network transport or image-codec fixture.
-class _OneFrameImageProvider extends ImageProvider<_OneFrameImageProvider> {
-  const _OneFrameImageProvider(this.image);
+/// A 1×1 PNG, so the real codec decodes exactly one frame.
+final List<int> _onePixelPng = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+);
 
-  final ui.Image image;
+/// Serves [body] for every request, but only once [release] completes, so a
+/// test can observe the pre-frame state before letting the image arrive.
+class _FakeHttpClient implements HttpClient {
+  _FakeHttpClient(this.body, this.release);
+
+  final List<int> body;
+  final Completer<void> release;
+  int requests = 0;
 
   @override
-  Future<_OneFrameImageProvider> obtainKey(ImageConfiguration configuration) async => this;
+  Future<HttpClientRequest> getUrl(Uri url) async {
+    requests++;
+    return _FakeHttpClientRequest(_FakeHttpClientResponse(body, release));
+  }
 
   @override
-  ImageStreamCompleter loadImage(
-    _OneFrameImageProvider key,
-    ImageDecoderCallback decode,
-  ) => OneFrameImageStreamCompleter(
-    Future<ImageInfo>.value(ImageInfo(image: image)),
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _FakeHttpClientRequest implements HttpClientRequest {
+  _FakeHttpClientRequest(this.response);
+
+  final HttpClientResponse response;
+
+  @override
+  Future<HttpClientResponse> close() async => response;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _FakeHttpClientResponse extends Stream<List<int>>
+    implements HttpClientResponse {
+  _FakeHttpClientResponse(this.body, this.release);
+
+  final List<int> body;
+  final Completer<void> release;
+
+  @override
+  int get statusCode => HttpStatus.ok;
+
+  @override
+  int get contentLength => body.length;
+
+  @override
+  HttpClientResponseCompressionState get compressionState =>
+      HttpClientResponseCompressionState.notCompressed;
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int> event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) => Stream<List<int>>.fromFuture(release.future.then((_) => body)).listen(
+    onData,
+    onError: onError,
+    onDone: onDone,
+    cancelOnError: cancelOnError,
   );
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+DashboardStore _storeWith(FakeStream stream) {
+  final store = DashboardStore(
+    api: FakeApi(),
+    stream: stream,
+    avatarFilePicker: FakeAvatarFilePicker(),
+  );
+  addTearDown(store.dispose);
+  return store;
 }
 
 void main() {
@@ -55,8 +121,7 @@ void main() {
         expect(find.byType(ActorAvatar), findsOneWidget);
         // Graceful placeholder: a neutral silhouette, never a broken-image glyph.
         expect(find.byIcon(Icons.pets), findsOneWidget);
-        // A terminal network failure settles on the fallback; it does not keep
-        // presenting the first-display loading indicator.
+        // A plain missing/cached load is not a generation: no ring.
         expect(find.byType(CircularProgressIndicator), findsNothing);
 
         // The container is masked to a circle (shape: circle).
@@ -74,41 +139,126 @@ void main() {
   );
 
   testWidgets(
-    'shows a progress ring around the fallback while a first avatar request loads',
+    'shows the progress ring over the fallback only while the server reports generating',
     (tester) async {
-      await tester.pumpWidget(
-        _wrap(
-          const ActorAvatar(
-            id: 'eeeeeeee-0000-4000-8000-000000000007',
-            size: 26,
-          ),
-        ),
-      );
+      await tester.runAsync(() async {
+        const id = 'eeeeeeee-0000-4000-8000-000000000007';
+        final stream = FakeStream();
+        final store = _storeWith(stream);
+        await store.init();
 
-      expect(find.byIcon(Icons.pets), findsOneWidget);
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+        await tester.pumpWidget(
+          _wrap(ActorAvatar(id: id, size: 26, store: store)),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(find.byIcon(Icons.pets), findsOneWidget);
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+
+        stream.avatarCtrl.add(
+          const AvatarGenerationUpdate(
+            actorId: id,
+            state: AvatarGenerationState.generating,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.byIcon(Icons.pets), findsOneWidget);
+        expect(find.byType(CircularProgressIndicator), findsOneWidget);
+        expect(
+          tester
+              .widget<CircularProgressIndicator>(
+                find.byType(CircularProgressIndicator),
+              )
+              .semanticsLabel,
+          'Generating avatar',
+        );
+
+        // Another actor's generation is not this avatar's ring.
+        stream.avatarCtrl.add(
+          const AvatarGenerationUpdate(
+            actorId: 'ffffffff-0000-4000-8000-000000000099',
+            state: AvatarGenerationState.failed,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+        // A failed attempt settles on the fallback: ring gone, URL unchanged
+        // (no re-request), silhouette stays.
+        stream.avatarCtrl.add(
+          const AvatarGenerationUpdate(
+            actorId: id,
+            state: AvatarGenerationState.failed,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+        expect(find.byIcon(Icons.pets), findsOneWidget);
+        expect(store.avatarVersion(id), 0);
+      });
     },
   );
 
-  testWidgets('fades a generated avatar in after the image frame arrives', (
+  testWidgets('fades the generated avatar in over the fallback once it is ready', (
     tester,
   ) async {
-    final image = (await tester.runAsync(() => createTestImage(cache: false)))!;
-    addTearDown(image.dispose);
-    final provider = _OneFrameImageProvider(image);
-    await tester.pumpWidget(
-      _wrap(
-        ActorAvatar(
-          id: 'ffffffff-0000-4000-8000-000000000008',
-          size: 26,
-          imageProvider: provider,
-        ),
-      ),
-    );
-    await tester.pump();
+    const id = 'ffffffff-0000-4000-8000-000000000008';
+    final release = Completer<void>();
+    final client = _FakeHttpClient(_onePixelPng, release);
+    // The binding asserts every painting debug variable is reset before the
+    // test body returns, so this is restored in `finally`, not a tearDown.
+    debugNetworkImageHttpClientProvider = () => client;
+    try {
+      await tester.runAsync(() async {
+        final stream = FakeStream();
+        final store = _storeWith(stream);
+        await store.init();
 
-    final fade = tester.widget<AnimatedOpacity>(find.byType(AnimatedOpacity));
-    expect(fade.duration, const Duration(milliseconds: 200));
+        await tester.pumpWidget(
+          _wrap(ActorAvatar(id: id, size: 26, store: store)),
+        );
+        await tester.pump();
+        // The first request is the 404-and-start path; the store's `ready` frame
+        // bumps this actor's version so a fresh URL is requested.
+        stream.avatarCtrl.add(
+          const AvatarGenerationUpdate(
+            actorId: id,
+            state: AvatarGenerationState.ready,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(store.avatarVersion(id), 1);
+        expect(
+          tester.widget<Image>(find.byType(Image)).image,
+          isA<NetworkImage>().having((p) => p.url, 'url', contains('?v=1')),
+        );
+
+        // Bytes not delivered yet: fallback visible, image held at opacity 0.
+        expect(find.byIcon(Icons.pets), findsOneWidget);
+        var fade = tester.widget<AnimatedOpacity>(find.byType(AnimatedOpacity));
+        expect(fade.opacity, 0);
+        expect(fade.duration, const Duration(milliseconds: 200));
+
+        release.complete();
+        // Fetch and decode run on the real event loop inside runAsync, so give
+        // them real time (pump alone only advances the fake clock).
+        for (var i = 0; i < 100 && fade.opacity == 0; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          await tester.pump();
+          fade = tester.widget<AnimatedOpacity>(find.byType(AnimatedOpacity));
+        }
+        // The decoded frame arrived and the opacity target flipped to fully
+        // visible, animating over the still-present fallback.
+        expect(fade.opacity, 1);
+        expect(find.byIcon(Icons.pets), findsOneWidget);
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+      });
+    } finally {
+      debugNetworkImageHttpClientProvider = null;
+    }
   });
 
   testWidgets('retired avatar renders muted (wrapped in Opacity)', (

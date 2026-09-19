@@ -588,8 +588,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
+  // One coordinator per process: the avatar route starts attempts on it and the
+  // SSE hub relays their outcome, so single-flight and the UI's ring agree.
+  const avatarGeneration = options.mesh ? new AvatarGenerationCoordinator() : undefined;
   const sseHub = options.mesh
-    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh })
+    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh, avatarGeneration })
     : null;
   const dataDeps: DashboardDataDeps | null =
     options.mesh && sseHub
@@ -612,7 +615,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           selectedObligationForActor: options.mesh.selectedObligationForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
-          avatarGeneration: new AvatarGenerationCoordinator(),
+          avatarGeneration,
           supportedVoices: options.mesh.supportedVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
