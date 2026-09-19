@@ -104,6 +104,7 @@ describe("Database Migration System", () => {
       "0045_obligation_history",
       "0047_actor_experiments",
       "0048_portable_context_snapshots",
+      "0049_obligation_responsive",
     ]);
 
     const meshEventsColumns = (

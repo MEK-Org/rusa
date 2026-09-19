@@ -177,7 +177,11 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
-import { isTerminalObligationStatus } from "../obligations/obligation.js";
+import {
+  type EntityId,
+  isTerminalObligationStatus,
+  type Obligation,
+} from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import {
@@ -1041,6 +1045,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let prerequisiteCancellationSink: ((attention: PrerequisiteAttention) => void) | undefined;
   getRepositories().obligations.setCancellationAttentionListener((attention) =>
     prerequisiteCancellationSink?.(attention)
+  );
+
+  // #531 responsive-ready attention: same deferred-sink shape as the two
+  // listeners above — the mesh doesn't exist yet at this point in startup.
+  let responsiveReadySink:
+    | ((obligation: Obligation, actingPrincipal: EntityId) => void)
+    | undefined;
+  getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
+    responsiveReadySink?.(obligation, actingPrincipal)
   );
 
   try {
@@ -2853,13 +2866,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
     mesh.deliverReadyHeadAttention(
       ownerId,
-      head === null ? null : { id: head.id, intent: head.intent },
+      head === null
+        ? null
+        : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
       previousHeadId,
       sequence
     );
   };
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
+  };
+  responsiveReadySink = (obligation, actingPrincipal) => {
+    mesh.deliverResponsiveReadyAttention(
+      obligation.ownerId,
+      { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
+      actingPrincipal === obligation.ownerId
+    );
   };
 
   const rootControl = new RootControlService({
@@ -3427,6 +3449,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
   try {
     mesh.reconcileCancelledPrerequisiteAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
+  try {
+    mesh.reconcileResponsiveReadyAttention(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }

@@ -94,6 +94,7 @@ export class InboxFocusResolver {
       }
       if (
         entry.payload.type === "obligation.ready_head" ||
+        entry.payload.type === "obligation.ready_responsive" ||
         entry.payload.type === "obligation.prerequisite_cancelled"
       ) {
         const id = entry.payload.obligationId;
