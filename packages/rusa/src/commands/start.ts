@@ -116,7 +116,10 @@ import { GchatOAuth } from "../chat/gchat-oauth.js";
 import { PubsubChatSource } from "../chat/pubsub-source.js";
 import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
-import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
+import {
+  type SystemChatSubscriptionLapseEvent,
+  WorkspaceEventsSubscriber,
+} from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
@@ -426,16 +429,25 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
   }
   if (config.slack) configured.push("slack:channels");
 
-  // Disk alerts are a host-owned event source, so whatever runs the producer is
-  // also the subscription declaration. Both sides read `diskAlertActive`, so a
-  // running sensor always has a receiver: an absent `observability` block used
-  // to leave the sensor emitting into a source nobody covered, and every alert
-  // it raised was dropped at the routing boundary (#481).
-  if (diskAlertActive(config)) {
+  // Host alarms are a host-owned event source, so whatever runs a producer is
+  // also the subscription declaration. Both sides read `hostAlarmProducerActive`,
+  // so a running producer always has a receiver: an absent `observability` block
+  // used to leave the disk sensor emitting into a source nobody covered, and
+  // every alert it raised was dropped at the routing boundary (#481).
+  if (hostAlarmProducerActive(config)) {
     configured.push("system:events");
   }
 
   return configured;
+}
+
+/**
+ * Every producer that raises host alarms into `system:events`: the disk sensor,
+ * and the chat subscription keeper's lapse alert (#578) whenever chat is
+ * configured. Root's `system:events` ownership is derived from this same call.
+ */
+export function hostAlarmProducerActive(config: RusaConfig): boolean {
+  return diskAlertActive(config) || config.chat !== undefined;
 }
 
 /**
@@ -467,14 +479,18 @@ export async function deliverHostAlarm(opts: {
   message: string;
   sendToErrorChat: ((text: string) => void) | null;
   log?: Logger;
+  alarmName?: string;
 }): Promise<HostAlarmOutcome> {
   let delivery: DurableEventDelivery;
   try {
     delivery = await opts.deliver();
   } catch (error) {
-    opts.log?.warn("disk_alert_delivery_failed", {
-      err: error,
-    });
+    opts.log?.warn(
+      opts.alarmName ? `${opts.alarmName}_delivery_failed` : "disk_alert_delivery_failed",
+      {
+        err: error,
+      }
+    );
     if (!opts.sendToErrorChat) return "dropped";
     opts.sendToErrorChat(opts.message);
     return "errorChat";
@@ -3926,24 +3942,42 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const identity = loadGchatIdentity(config.chat.gchatConfigDir);
 
         // Keep the Workspace Events subscription alive (4h TTL) so messages keep
-        // flowing into the Pub/Sub topic the pull source reads. Best-effort: a
-        // failure here may just mean a still-live subscription, so we log and
-        // continue rather than disabling chat.
+        // flowing into the Pub/Sub topic the pull source reads.
         const oauth = new GchatOAuth(config.chat.gchatConfigDir);
         const topic = `projects/${config.chat.projectId}/topics/${config.chat.topic ?? "chat-events"}`;
+        const chatLogger = log.child({ component: "chat" });
+        const onLapse = async (event: SystemChatSubscriptionLapseEvent) => {
+          const outcome = await deliverHostAlarm({
+            deliver: () =>
+              mesh.deliverExternalEvent({
+                sourceType: "timer",
+                rawResource: "system:events",
+                rawPayload: event,
+                priority: "responsive",
+                eventSummary: event.message,
+              }),
+            message: event.message,
+            sendToErrorChat,
+            log: chatLogger,
+            alarmName: "chat_subscription_lapse",
+          });
+          if (outcome !== "delivered") {
+            chatLogger.warn("chat_subscription_lapse_not_delivered_to_mesh", {
+              fallback: outcome,
+              topic: event.topic,
+            });
+          }
+        };
         weSubscriber = new WorkspaceEventsSubscriber({
           topic,
           getToken: () => oauth.token(),
-          log: (m) => console.log(`[chat] events: ${m}`),
+          logger: chatLogger,
+          onLapse,
         });
-        try {
-          await weSubscriber.start();
-          console.log(`[chat] events subscription active → ${topic}`);
-        } catch (err) {
-          console.warn(
-            `[chat] events subscription failed (continuing): ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        // Resolves whether or not the first pass succeeded: the subscriber logs
+        // `chat_subscription_*` records and keeps retrying with backoff, so a
+        // failure here never blocks the puller below.
+        await weSubscriber.start();
 
         chatSource = new PubsubChatSource({
           projectId: config.chat.projectId,
