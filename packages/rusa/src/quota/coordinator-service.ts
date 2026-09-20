@@ -772,8 +772,7 @@ export class QuotaCoordinatorService {
       stale_observation: {
         status: 409,
         code: "stale_observation" as const,
-        message:
-          "Observation is not newer than, or is outranked by, the current authoritative observation",
+        message: "Observation is not newer than the current authoritative observation",
       },
       idempotency_conflict: {
         status: 409,

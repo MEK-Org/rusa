@@ -136,14 +136,6 @@ export type ManualObservationResult =
   | { result: "stale_observation" }
   | { result: "idempotency_conflict" };
 
-/** Rollback sentinel: a standing authoritative row outranked the manual reading. */
-class ManualObservationOutrankedError extends Error {
-  constructor() {
-    super("manual observation is outranked by a standing authoritative observation");
-    this.name = "ManualObservationOutrankedError";
-  }
-}
-
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
 }
@@ -624,6 +616,11 @@ export class SharedQuotaStore {
     if (!Number.isFinite(observedMs)) throw new Error("manual observation scrapedAt is invalid");
     const acceptedMs = Date.parse(input.acceptedAt);
     if (!Number.isFinite(acceptedMs)) throw new Error("manual observation acceptedAt is invalid");
+    for (const limit of input.snapshot.limits ?? []) {
+      if (!Number.isFinite(limit.percentLeft) || limit.percentLeft < 0 || limit.percentLeft > 100) {
+        throw new Error("manual observation percentLeft must be between 0 and 100");
+      }
+    }
     const fingerprint = manualObservationFingerprint(input.snapshot);
     const candidates = this.manualObservationSlots(input.snapshot, observedMs);
     if (candidates.length === 0)
@@ -685,15 +682,7 @@ export class SharedQuotaStore {
         idempotencyKey: input.idempotencyKey,
         generation: input.generation,
       };
-      const inserted = this.insertObservations(state, observedAt, provider);
-      if (inserted !== candidates.length) {
-        // The preflight above clears the slots this reading claims, so a
-        // declined row means the store's own precedence outranked part of the
-        // reading after the check. Throwing rolls back every partial write
-        // (sibling windows, reset tightening) so the rejection is atomic and
-        // leaves no receipt to make it look accepted.
-        throw new ManualObservationOutrankedError();
-      }
+      this.insertObservations(state, observedAt, provider);
       this.db
         .prepare(
           `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
@@ -723,13 +712,7 @@ export class SharedQuotaStore {
       return { result: "accepted", observedAt, generation: input.generation };
     });
 
-    let result: ManualObservationResult;
-    try {
-      result = record.immediate();
-    } catch (error) {
-      if (!(error instanceof ManualObservationOutrankedError)) throw error;
-      result = { result: "stale_observation" };
-    }
+    const result = record.immediate();
     // A manual POST is an authoritative observation, not an instruction for a
     // later collector tick: the caller that owns pacing passes its controller
     // options so the accepted rows are reasoned before the response is sent.
@@ -1236,16 +1219,15 @@ export class SharedQuotaStore {
     state: ProviderQuotaSnapshot,
     storedObservedAt?: string,
     storedProvider?: string
-  ): number {
+  ): void {
     const observedAt = state.scrapedAt ?? storedObservedAt;
     const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
-    if (!observedAt || !Number.isFinite(observedMs)) return 0;
+    if (!observedAt || !Number.isFinite(observedMs)) return;
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
     const observed = (result: QuotaObservationResult): void => {
       this.metrics.counter(QUOTA_SERVICE_METRICS.observationsTotal, { provider, result });
     };
     const seenKinds = new Set<string>();
-    let inserted = 0;
     for (const limit of state.limits ?? []) {
       // A window this store will not reason about — model-scoped, or a percent
       // outside 0..100 — is counted as rejected rather than dropped silently,
@@ -1323,8 +1305,6 @@ export class SharedQuotaStore {
           candidate.windowMs
         );
       observed("recorded");
-      inserted += 1;
     }
-    return inserted;
   }
 }

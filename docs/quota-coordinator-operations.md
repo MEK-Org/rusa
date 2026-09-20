@@ -166,9 +166,7 @@ Responses, in the order the coordinator checks them:
 - HTTP 409 `idempotency_conflict` when the same key arrives with a different
   body. `duplicate: true` (HTTP 200) means the same key with byte-identical
   content; nothing is written again.
-- HTTP 409 `stale_observation` for old, out-of-order, or same-slot readings, and
-  for a reading the store's own observation precedence outranks. The rejection
-  is atomic: no partial window is written and no receipt is left behind.
+- HTTP 409 `stale_observation` for old, out-of-order, or same-slot readings.
 
 None of the rejections changes `/v1/quota`, `/v1/throttle`, history, or its
 reported age. An accepted reading is stored as an ordinary `quota_scrapes`

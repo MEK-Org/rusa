@@ -240,6 +240,82 @@ describe("SharedQuotaStore canonical observations", () => {
     }
   });
 
+  it("rejects direct manual observation with invalid percentLeft with a truthful error", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-manual-invalid-percent-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const mode = store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:00:00.000Z");
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 120,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-high",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: -5,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-neg",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: Number.NaN,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-nan",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+    } finally {
+      store.close();
+    }
+  });
+
   it("hydrates a validated legacy bare parsed_state without a schema migration", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-state-"));
     roots.push(root);

@@ -131,7 +131,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       expect([200, 503].includes(getWithBody.status)).toBe(true);
     }
 
-    // The operator writes live beside the #565 report, outside `/v1/`, and are POST-only.
+    // The operator writes live under `/internal/`, outside `/v1/`, and are POST-only.
     for (const writeRoute of [QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH]) {
       expect(writeRoute.startsWith("/internal/")).toBe(true);
       for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
