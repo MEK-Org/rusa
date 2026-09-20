@@ -9,7 +9,9 @@ import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -86,6 +88,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   };
   let auth: DashboardAuth;
   let db: Database.Database;
+  let meshEvents: MeshEventRepository;
   let principals: PrincipalRepository;
   let server: ReturnType<typeof createServer>;
   let origin: string;
@@ -100,6 +103,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     vi.clearAllMocks();
     db = new Database(":memory:");
     runMigrations(db);
+    meshEvents = new MeshEventRepository(db);
     principals = new PrincipalRepository(db);
     allowedEmails = mode === "legacy" ? [config.email] : [config.email, "colleague@example.com"];
     auth = new DashboardAuth(
@@ -124,7 +128,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
               },
             ],
           },
-          meshEvents: { latestActivityByActor: () => new Map() },
+          meshEvents,
           mesh: { interrupt },
         } as unknown as DashboardDataDeps,
         null,
@@ -181,6 +185,75 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     const authenticated = await post("/api/mesh/actors/actor/interrupt", cookie);
     expect(authenticated.status).toBe(200);
     expect(interrupt).toHaveBeenCalledWith("actor", principal?.id);
+  });
+
+  it("keeps an authenticated viewer's unrelated message events out of an actor event view", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({
+      issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
+      subject: token.sub,
+    });
+    if (!viewer) throw new Error("Expected authenticated viewer");
+
+    const selected = "selected-actor";
+    const unrelated = "unrelated-actor";
+    meshEvents.record({ kind: "message_sent", actorId: selected, detail: "selected sent" });
+    meshEvents.record({ kind: "message_received", actorId: selected, detail: "selected received" });
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: viewer.id,
+      detail: "viewer sent elsewhere",
+    });
+    meshEvents.record({
+      kind: "message_received",
+      actorId: viewer.id,
+      detail: "viewer received elsewhere",
+    });
+    meshEvents.record({ kind: "message_sent", actorId: unrelated, detail: "unrelated sent" });
+
+    const response = await fetch(`${origin}/api/mesh/events?actors=${selected}`, {
+      headers: { Cookie: cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as {
+      events: Array<{ actorId: string; detail: string | null }>;
+    };
+    expect(page.events.map((event) => event.detail)).toEqual([
+      "selected received",
+      "selected sent",
+    ]);
+    expect(page.events.map((event) => event.actorId)).toEqual([selected, selected]);
+    expect(page.events.map((event) => event.detail)).not.toContain("viewer sent elsewhere");
+    expect(page.events.map((event) => event.detail)).not.toContain("viewer received elsewhere");
+    expect(page.events.map((event) => event.detail)).not.toContain("unrelated sent");
+  });
+
+  it("keeps legacy human:operator event queries scoped to the legacy actor id", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({
+      issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
+      subject: token.sub,
+    });
+    if (!viewer) throw new Error("Expected authenticated viewer");
+
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: HUMAN_OPERATOR,
+      detail: "legacy operator event",
+    });
+    meshEvents.record({ kind: "message_sent", actorId: viewer.id, detail: "durable user event" });
+
+    const response = await fetch(`${origin}/api/mesh/events?actors=${HUMAN_OPERATOR}`, {
+      headers: { Cookie: cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as {
+      events: Array<{ actorId: string; detail: string | null }>;
+    };
+    expect(page.events.map((event) => event.detail)).toEqual(["legacy operator event"]);
+    expect(page.events.map((event) => event.actorId)).toEqual([HUMAN_OPERATOR]);
   });
 
   it.skipIf(mode !== "shared")(

@@ -1665,8 +1665,7 @@ export async function handleMeshApiRequest(
       sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
       return true;
     }
-    const rawActors = parseActors(url);
-    const actors = resolveChatQueryActors(rawActors, deps, req);
+    const actors = parseActors(url);
     const conversation = url.searchParams.get("conversation") === "true";
     const page = meshEvents.listEventsByActors(actors, {
       limit: clampLimit(url),
