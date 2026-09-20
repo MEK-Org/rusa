@@ -20,7 +20,7 @@ import {
   getRemoteUrl,
   initializeWorkspace,
 } from "../gitops/worktree.js";
-import { resolveWritableErrorSink } from "../observability/error-sink.js";
+import { resolveErrorSink } from "../observability/error-sink.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   defaultQuotaBackupDir,
@@ -538,7 +538,7 @@ function installSingleRusaService(opts: {
         "notify-failure.mjs"
       ),
       mcHome: instance.mcHome,
-      errorSink: resolveWritableErrorSink(config)?.ref,
+      errorSink: resolveErrorSink(config)?.ref,
       gchatConfigDir: config.chat?.gchatConfigDir,
       slackBotTokenPath: config.slack?.botTokenPath,
       message: `${instance.serviceUnit} entered a failed state`,
@@ -797,7 +797,7 @@ export async function runInstallQuotaCoordinator(opts?: {
         "notify-failure.mjs"
       ),
       mcHome: instance.mcHome,
-      errorSink: resolveWritableErrorSink(config)?.ref,
+      errorSink: resolveErrorSink(config)?.ref,
       gchatConfigDir: config.chat?.gchatConfigDir,
       slackBotTokenPath: config.slack?.botTokenPath,
       message: `${names.serviceUnit} entered a failed state`,

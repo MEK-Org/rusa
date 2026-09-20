@@ -1,7 +1,7 @@
 import type { RusaConfig } from "../config/types.js";
 import { parseReference } from "../references/reference.js";
 
-export type WritableErrorSink =
+export type ErrorSink =
   | { ref: string; kind: "gchat"; target: string }
   | { ref: string; kind: "slack"; target: string };
 
@@ -24,7 +24,7 @@ export function configuredErrorSink(config: RusaConfig): string | undefined {
 }
 
 /** The error destination must be a concrete, configured event source with an outbound writer. */
-export function resolveWritableErrorSink(config: RusaConfig): WritableErrorSink | null {
+export function resolveErrorSink(config: RusaConfig): ErrorSink | null {
   const ref = configuredErrorSink(config);
   if (!ref) return null;
   const parsed = parseReference(ref);

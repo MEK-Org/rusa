@@ -5,7 +5,7 @@ import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
 import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
-import { resolveWritableErrorSink } from "../observability/error-sink.js";
+import { resolveErrorSink } from "../observability/error-sink.js";
 import { validateModelConfigPool } from "../providers/model-config.js";
 import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
@@ -133,7 +133,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 
   const parsed = applyProfile(rawParsed);
   validateDashboardAuth(parsed.auth);
-  resolveWritableErrorSink(parsed);
+  resolveErrorSink(parsed);
 
   // Basic validation & defaulting
   if (parsed.github && !parsed.github.account) {

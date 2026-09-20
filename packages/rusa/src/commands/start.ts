@@ -197,7 +197,7 @@ import {
   diskAlertActive,
   resolveDiskAlertConfig,
 } from "../observability/disk-alert.js";
-import { resolveWritableErrorSink } from "../observability/error-sink.js";
+import { resolveErrorSink } from "../observability/error-sink.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -888,7 +888,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     return;
   }
   const rootActor = config.rootActor;
-  const errorSink = resolveWritableErrorSink(config);
+  const errorSink = resolveErrorSink(config);
   if (!rootActor) {
     throw new Error("config loader returned no rootActor after validating root configuration");
   }
