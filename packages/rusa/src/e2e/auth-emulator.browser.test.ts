@@ -13,6 +13,20 @@ async function enableFlutterSemantics(page: Page): Promise<void> {
   await placeholder.click({ force: true });
 }
 
+/**
+ * Drive the emulator's simulated Google popup. Its account list loads after
+ * the popup opens; a click that lands before that load is reset by the list.
+ */
+async function signInThroughPopup(page: Page, email: string): Promise<void> {
+  const popupPromise = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
+  const popup = await popupPromise;
+  await popup.waitForLoadState("networkidle");
+  await popup.getByText("Add new account", { exact: true }).click();
+  await popup.locator("#email-input").fill(email);
+  await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
+}
+
 function sessionCreated(page: Page) {
   return page.waitForResponse(
     (response) =>
@@ -34,13 +48,8 @@ it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
         const page = await context.newPage();
         await page.goto(process.env.RUSA_SHARED_AUTH_EMULATOR_E2E as string);
         await enableFlutterSemantics(page);
-        const popupPromise = page.waitForEvent("popup");
-        await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
-        const popup = await popupPromise;
-        await popup.getByText("Add new account", { exact: true }).click();
-        await popup.locator("#email-input").fill(email);
         const created = sessionCreated(page);
-        await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
+        await signInThroughPopup(page, email);
         await created;
         pages.push(page);
       }
@@ -93,13 +102,8 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
         await page.goto(origin);
         expect(await status("/api/mesh/threads")).toBe(401);
         await enableFlutterSemantics(page);
-        const popupPromise = page.waitForEvent("popup");
-        await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
-        const popup = await popupPromise;
-        await popup.getByText("Add new account", { exact: true }).click();
-        await popup.locator("#email-input").fill(email);
         const created = email.startsWith("not-") ? null : sessionCreated(page);
-        await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
+        await signInThroughPopup(page, email);
         if (email.startsWith("not-")) {
           await page.getByText("Unable to sign in.", { exact: false }).waitFor();
           expect(await status("/api/auth/session")).toBe(401);
@@ -126,7 +130,10 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
             (response) =>
               response.url().endsWith("/api/auth/refresh") && response.request().method() === "POST"
           );
-          await page.evaluate(() => window.dispatchEvent(new PopStateEvent("popstate")));
+          // Renew through the tab-visible hook. A synthetic null-state popstate
+          // is read by Flutter's web history as leaving the app and unloads the
+          // page before the renewal response can land.
+          await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
           const renewed = await refresh;
           expect(renewed.status()).toBe(200);
           expect(renewed.request().headers()["x-rusa-csrf"]).toBeTruthy();
