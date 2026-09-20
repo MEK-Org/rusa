@@ -58,17 +58,30 @@ describe("loadConfig deployBranch", () => {
 });
 
 describe("loadConfig Slack", () => {
-  it("accepts host token paths and a channel grant", () => {
+  it("accepts host token paths", () => {
     const config = loadConfig(
       writeConfig({
         slack: {
           appTokenPath: "/tmp/app-token",
           botTokenPath: "/tmp/bot-token",
-          channels: ["C123ABC"],
         },
       })
     );
-    expect(config.slack?.channels).toEqual(["C123ABC"]);
+    expect(config.slack?.botTokenPath).toBe("/tmp/bot-token");
+  });
+
+  it("rejects channel restrictions until they are supported", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          slack: {
+            appTokenPath: "/tmp/app-token",
+            botTokenPath: "/tmp/bot-token",
+            channels: ["C123ABC"],
+          },
+        })
+      )
+    ).toThrow(/slack.channels is not supported yet/);
   });
 
   it("rejects incomplete credentials", () => {
@@ -78,14 +91,14 @@ describe("loadConfig Slack", () => {
   });
 });
 
-describe("loadConfig error source", () => {
+describe("loadConfig error sink", () => {
   const slack = { appTokenPath: "/tmp/app-token", botTokenPath: "/tmp/bot-token" };
 
   it("accepts a configured writable Slack event source", () => {
     const config = loadConfig(
-      writeConfig({ slack, observability: { errorSource: "slack:channels/C123" } })
+      writeConfig({ slack, observability: { errorSink: "slack:channels/C123" } })
     );
-    expect(config.observability?.errorSource).toBe("slack:channels/C123");
+    expect(config.observability?.errorSink).toBe("slack:channels/C123");
   });
 
   it("keeps a legacy Google Chat error space valid during migration", () => {
@@ -95,7 +108,7 @@ describe("loadConfig error source", () => {
 
   it("rejects a source whose integration is not configured", () => {
     expect(() =>
-      loadConfig(writeConfig({ observability: { errorSource: "slack:channels/C123" } }))
+      loadConfig(writeConfig({ observability: { errorSink: "slack:channels/C123" } }))
     ).toThrow(/no configured writer/);
   });
 });

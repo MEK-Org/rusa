@@ -210,7 +210,7 @@ chat:
   gchatConfigDir           Optional. Directory holding gchat user-OAuth tokens (minted by gchat-auth).
                            Defaults to ~/.config/gchat.
   errorChat                Deprecated. Google Chat space name (e.g. spaces/AAAA) for mechanical
-                           failure notices. Use observability.errorSource instead.
+                           failure notices. Use observability.errorSink instead.
   gchat                    Optional. "all" or a list of space resource names (e.g. ["spaces/AAAA"]) granting
                            the root actor outbound write capability to those spaces.
   excludedSpaces           Optional list of space resource names (e.g. ["spaces/AAAA_STAGING"]). Inbound
@@ -223,9 +223,8 @@ slack:
   botTokenPath             Required. File directly inside RUSA_HOME/secrets containing the xoxb bot token.
                            Configure app_mentions:read,
                            im:history, channels:history, channels:read, chat:write, and reactions:write bot scopes.
-  channels                 Optional. "all" (default) or a list of channel IDs the root may write to.
-                           Root owns inbound slack:channels; workers may receive delegated channels.
-                           Message references use slack:channels/<id>/messages/<timestamp>.
+  Root owns inbound slack:channels; workers may receive delegated channels.
+  Message references use slack:channels/<id>/messages/<timestamp>.
 
 dashboard:
 
@@ -245,7 +244,7 @@ invocationDebug:
   maxBytesPerInvocation    Optional number. Hard cap in bytes across prompt, transcript, raw streams,
                            and failure patch for one invocation. Default: 209715200 (200 MB).
 
-observability.errorSource:
+observability.errorSink:
 
   Preferred destination for mechanical failure notices and lifecycle alerts. Use a
   concrete writable event source reference: gchat:spaces/AAAA or
@@ -271,7 +270,7 @@ observability.diskAlert:
   The disk sensor runs unless it is explicitly disabled, and root is subscribed to
   responsive system.disk events on exactly the same condition — so this section can be
   omitted entirely and alerts still reach root. When a disk alert resolves no recipient,
-  it falls back to observability.errorSource (or deprecated chat.errorChat) so a
+  it falls back to observability.errorSink (or deprecated chat.errorChat) so a
   host-level alarm never depends on mesh routing.
   enabled                  Optional boolean. Disk headroom alert is enabled by default;
                            set enabled: false to deactivate it and drop the subscription.

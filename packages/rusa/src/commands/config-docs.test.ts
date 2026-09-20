@@ -47,7 +47,7 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain(
       "root is subscribed to\n  responsive system.disk events on exactly the same condition"
     );
-    expect(CONFIG_DOCS).toContain("falls back to observability.errorSource");
+    expect(CONFIG_DOCS).toContain("falls back to observability.errorSink");
     expect(CONFIG_DOCS).toContain("Default: 10 when neither threshold is set");
     expect(CONFIG_DOCS).not.toContain("kind: system");
   });

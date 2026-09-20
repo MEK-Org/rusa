@@ -153,7 +153,7 @@ export interface ChatConfig {
    */
   gchatConfigDir?: string;
   /**
-   * @deprecated Use observability.errorSource (e.g. `gchat:spaces/AAAA`).
+   * @deprecated Use observability.errorSink (e.g. `gchat:spaces/AAAA`).
    * Chat space (resource name, e.g. `spaces/AAAA`) that receives mechanical
    * failure notices when the *root* actor's run fails — the root has no parent
    * inbox to fall back to. Rote, not judgment: the failure sink posts here
@@ -180,8 +180,6 @@ export interface ChatConfig {
 export interface SlackConfig {
   appTokenPath: string;
   botTokenPath: string;
-  /** Channels the root actor may write to; "all" permits every joined conversation. */
-  channels?: "all" | string[];
 }
 
 export interface DashboardConfig {
@@ -294,7 +292,7 @@ export interface DiskAlertConfig {
 
 export interface ObservabilityConfig {
   /** Writable event source receiving mechanical failures, e.g. `gchat:spaces/AAAA` or `slack:channels/C123`. */
-  errorSource?: string;
+  errorSink?: string;
   diskAlert?: DiskAlertConfig;
   logging?: LoggingConfig;
 }

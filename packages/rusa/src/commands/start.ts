@@ -197,7 +197,7 @@ import {
   diskAlertActive,
   resolveDiskAlertConfig,
 } from "../observability/disk-alert.js";
-import { resolveWritableErrorSource } from "../observability/error-source.js";
+import { resolveWritableErrorSink } from "../observability/error-sink.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -888,7 +888,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     return;
   }
   const rootActor = config.rootActor;
-  const errorSource = resolveWritableErrorSource(config);
+  const errorSink = resolveWritableErrorSink(config);
   if (!rootActor) {
     throw new Error("config loader returned no rootActor after validating root configuration");
   }
@@ -911,7 +911,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     context: { component: "start" },
   });
   if (config.chat?.errorChat) {
-    log.warn("chat_error_chat_deprecated", { replacement: "observability.errorSource" });
+    log.warn("chat_error_chat_deprecated", { replacement: "observability.errorSink" });
   }
 
   // The sandbox layer has no logger of its own (it is built per spawn by the
@@ -1353,11 +1353,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     gchat = new GchatClient(config.chat.gchatConfigDir);
     chatClient = gchat;
   }
-  const sendErrorSource =
-    errorSource?.kind === "gchat" && chatClient
-      ? (text: string) => chatClient.send(errorSource.target, text).then(() => {})
-      : errorSource?.kind === "slack" && slackClient
-        ? (text: string) => slackClient.send(errorSource.target, text).then(() => {})
+  const sendErrorSink =
+    errorSink?.kind === "gchat" && chatClient
+      ? (text: string) => chatClient.send(errorSink.target, text).then(() => {})
+      : errorSink?.kind === "slack" && slackClient
+        ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
         : null;
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
@@ -1465,8 +1465,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       } catch {
         /* best-effort marker */
       }
-      if (sendErrorSource) {
-        void sendErrorSource(`⚠️ ${alert}`).catch(() => {});
+      if (sendErrorSink) {
+        void sendErrorSink(`⚠️ ${alert}`).catch(() => {});
       }
     }
   } catch {
@@ -1767,10 +1767,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const repoRoot = resolveRepoRoot();
     const packageDir = join(repoRoot, "packages", "rusa");
     const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
-    if (!errorSource) {
-      console.warn("[update] no error source configured — lifecycle pings disabled");
-    } else if (!sendErrorSource) {
-      console.warn("[update] error source writer unavailable — lifecycle pings disabled");
+    if (!errorSink) {
+      console.warn("[update] no error sink configured — lifecycle pings disabled");
+    } else if (!sendErrorSink) {
+      console.warn("[update] error sink writer unavailable — lifecycle pings disabled");
     }
     updateToolDepsFor = (selfId) => ({
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
@@ -1783,9 +1783,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
-        notify: sendErrorSource
+        notify: sendErrorSink
           ? {
-              notify: sendErrorSource,
+              notify: sendErrorSink,
             }
           : undefined,
         // Chat-independent durable marker for the worst states (e.g. a failed
@@ -2933,9 +2933,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
   // for the root, which has no parent — to the statically configured error chat.
   // The raw delivery to the human's error chat.
-  const sendToErrorChat = sendErrorSource
+  const sendToErrorChat = sendErrorSink
     ? (text: string) => {
-        void sendErrorSource(text).catch((err) => {
+        void sendErrorSink(text).catch((err) => {
           console.warn(
             `[failure-sink] error chat post failed: ${err instanceof Error ? err.message : String(err)}`
           );
@@ -3133,7 +3133,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, config.slack?.channels ?? "all")
+          createSlackWriteMcpServer(slackClient, "all")
         )
       : undefined;
 

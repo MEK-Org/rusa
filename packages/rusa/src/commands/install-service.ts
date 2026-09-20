@@ -20,7 +20,7 @@ import {
   getRemoteUrl,
   initializeWorkspace,
 } from "../gitops/worktree.js";
-import { resolveWritableErrorSource } from "../observability/error-source.js";
+import { resolveWritableErrorSink } from "../observability/error-sink.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   defaultQuotaBackupDir,
@@ -195,7 +195,7 @@ export function buildAlertUnit(opts: {
   nodePath: string;
   notifyScript: string;
   mcHome: string;
-  errorSource?: string;
+  errorSink?: string;
   gchatConfigDir?: string;
   slackBotTokenPath?: string;
   message: string;
@@ -208,7 +208,7 @@ export function buildAlertUnit(opts: {
     "Type=oneshot",
     `Environment=RUSA_HOME=${opts.mcHome}`,
   ];
-  if (opts.errorSource) unit.push(`Environment=RUSA_ERROR_SOURCE=${opts.errorSource}`);
+  if (opts.errorSink) unit.push(`Environment=RUSA_ERROR_SINK=${opts.errorSink}`);
   if (opts.gchatConfigDir) unit.push(`Environment=GCHAT_CONFIG_DIR=${opts.gchatConfigDir}`);
   if (opts.slackBotTokenPath)
     unit.push(`Environment=RUSA_SLACK_BOT_TOKEN_PATH=${opts.slackBotTokenPath}`);
@@ -538,7 +538,7 @@ function installSingleRusaService(opts: {
         "notify-failure.mjs"
       ),
       mcHome: instance.mcHome,
-      errorSource: resolveWritableErrorSource(config)?.ref,
+      errorSink: resolveWritableErrorSink(config)?.ref,
       gchatConfigDir: config.chat?.gchatConfigDir,
       slackBotTokenPath: config.slack?.botTokenPath,
       message: `${instance.serviceUnit} entered a failed state`,
@@ -797,7 +797,7 @@ export async function runInstallQuotaCoordinator(opts?: {
         "notify-failure.mjs"
       ),
       mcHome: instance.mcHome,
-      errorSource: resolveWritableErrorSource(config)?.ref,
+      errorSink: resolveWritableErrorSink(config)?.ref,
       gchatConfigDir: config.chat?.gchatConfigDir,
       slackBotTokenPath: config.slack?.botTokenPath,
       message: `${names.serviceUnit} entered a failed state`,

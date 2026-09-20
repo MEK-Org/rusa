@@ -15,7 +15,7 @@
 // fails.
 //
 // Usage: node notify-failure.mjs <message...>
-//   source: $RUSA_ERROR_SOURCE (e.g. gchat:spaces/AAAA or slack:channels/C123)
+//   source: $RUSA_ERROR_SINK (e.g. gchat:spaces/AAAA or slack:channels/C123)
 //   legacy: $RUSA_ERROR_CHAT (Google Chat space name)
 //   creds:  $GCHAT_CONFIG_DIR (default ~/.config/gchat)
 //           $RUSA_SLACK_BOT_TOKEN_PATH for Slack
@@ -33,7 +33,7 @@ const MARKER = join(MC_HOME, "alerts", "last-failure.txt");
 
 const message = process.argv.slice(2).join(" ") || "rusa.service entered a failed state";
 const source =
-  process.env.RUSA_ERROR_SOURCE ||
+  process.env.RUSA_ERROR_SINK ||
   (process.env.RUSA_ERROR_CHAT ? `gchat:${process.env.RUSA_ERROR_CHAT}` : undefined);
 const stamp = new Date().toISOString();
 const line = `[${stamp}] ${message}`;
@@ -75,7 +75,7 @@ async function accessToken() {
 // reflects that chat didn't go through.
 async function chat() {
   if (!source) {
-    console.error("rusa-alert: RUSA_ERROR_SOURCE unset — skipping chat (journal+marker only)");
+    console.error("rusa-alert: RUSA_ERROR_SINK unset — skipping chat (journal+marker only)");
     return false;
   }
   if (/^gchat:spaces\/[^/]+$/.test(source)) {
@@ -104,7 +104,7 @@ async function chat() {
     const result = await resp.json();
     if (!result.ok) throw new Error(`Slack send failed: ${result.error ?? "unknown_error"}`);
   } else {
-    throw new Error(`unsupported error source: ${source}`);
+    throw new Error(`unsupported error sink: ${source}`);
   }
   console.error(`rusa-alert: chat sent to ${source}`);
   return true;

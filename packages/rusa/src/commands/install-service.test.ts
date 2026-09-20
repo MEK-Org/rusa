@@ -63,13 +63,13 @@ describe("buildAlertUnit — OnFailure oneshot (build-independent notifier)", ()
       nodePath: "/usr/bin/node",
       notifyScript: "/deploy/rusa-prod/packages/rusa/scripts/notify-failure.mjs",
       mcHome: "/home/x/.rusa",
-      errorSource: "gchat:spaces/AAAA",
+      errorSink: "gchat:spaces/AAAA",
       gchatConfigDir: "/home/x/.config/gchat",
       message: "rusa.service entered a failed state",
     });
     expect(unit).toContain("Type=oneshot");
     expect(unit).toContain("notify-failure.mjs");
-    expect(unit).toContain("Environment=RUSA_ERROR_SOURCE=gchat:spaces/AAAA");
+    expect(unit).toContain("Environment=RUSA_ERROR_SINK=gchat:spaces/AAAA");
     expect(unit).toContain("Environment=GCHAT_CONFIG_DIR=/home/x/.config/gchat");
     expect(unit).toContain("Environment=RUSA_HOME=/home/x/.rusa");
     expect(unit).toContain('ExecStart="/usr/bin/node"');
@@ -83,21 +83,21 @@ describe("buildAlertUnit — OnFailure oneshot (build-independent notifier)", ()
       mcHome: "/home/x/.rusa",
       message: "failed",
     });
-    expect(unit).not.toContain("RUSA_ERROR_SOURCE");
+    expect(unit).not.toContain("RUSA_ERROR_SINK");
     expect(unit).not.toContain("GCHAT_CONFIG_DIR");
   });
 
-  it("passes a Slack error source and bot token path to the standalone notifier", () => {
+  it("passes a Slack error sink and bot token path to the standalone notifier", () => {
     const unit = buildAlertUnit({
       description: "alert",
       nodePath: "/usr/bin/node",
       notifyScript: "/x/notify-failure.mjs",
       mcHome: "/home/x/.rusa",
-      errorSource: "slack:channels/C123",
+      errorSink: "slack:channels/C123",
       slackBotTokenPath: "/home/x/.rusa/secrets/slack-bot-token",
       message: "failed",
     });
-    expect(unit).toContain("Environment=RUSA_ERROR_SOURCE=slack:channels/C123");
+    expect(unit).toContain("Environment=RUSA_ERROR_SINK=slack:channels/C123");
     expect(unit).toContain(
       "Environment=RUSA_SLACK_BOT_TOKEN_PATH=/home/x/.rusa/secrets/slack-bot-token"
     );

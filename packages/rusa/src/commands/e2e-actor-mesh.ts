@@ -6,6 +6,7 @@ import type { ContextConfig } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
+import type { SlackConfig } from "../config/types.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { getRepositories } from "../db/index.js";
 import { createE2EDashboardAuth } from "../e2e/auth-emulator.js";
@@ -129,7 +130,7 @@ export async function runActorMeshE2EUp(opts: {
   portOffset?: number;
   rootControlPort?: number;
   resume?: boolean;
-  slack?: import("../config/types.js").SlackConfig;
+  slack?: SlackConfig;
 }): Promise<void> {
   const offset = opts.portOffset ?? 0;
   if (!Number.isInteger(offset) || offset < 0 || GIT_REMOTE_PORT + offset > 65535) {

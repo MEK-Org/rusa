@@ -25,7 +25,7 @@ globalThis.fetch = async (url, options) => {
       env: {
         ...process.env,
         RUSA_HOME: home,
-        RUSA_ERROR_SOURCE: "slack:channels/C123",
+        RUSA_ERROR_SINK: "slack:channels/C123",
         RUSA_SLACK_BOT_TOKEN_PATH: tokenPath,
         TEST_FETCH_LOG: fetchLog,
       },

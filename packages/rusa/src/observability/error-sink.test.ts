@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { resolveWritableErrorSource } from "./error-source.js";
+import { resolveWritableErrorSink } from "./error-sink.js";
 
 const base = {
   github: { account: "test" },
@@ -8,55 +8,55 @@ const base = {
   webhook: { port: 0, secret: "" },
 } as RusaConfig;
 
-describe("writable error source", () => {
+describe("writable error sink", () => {
   it("resolves Google Chat and Slack event source references", () => {
     expect(
-      resolveWritableErrorSource({
+      resolveWritableErrorSink({
         ...base,
         chat: {} as RusaConfig["chat"],
-        observability: { errorSource: "gchat:spaces/AAAA" },
+        observability: { errorSink: "gchat:spaces/AAAA" },
       })
     ).toEqual({ ref: "gchat:spaces/AAAA", kind: "gchat", target: "spaces/AAAA" });
     expect(
-      resolveWritableErrorSource({
+      resolveWritableErrorSink({
         ...base,
         slack: {} as RusaConfig["slack"],
-        observability: { errorSource: "slack:channels/C123" },
+        observability: { errorSink: "slack:channels/C123" },
       })
     ).toEqual({ ref: "slack:channels/C123", kind: "slack", target: "C123" });
   });
 
   it("keeps chat.errorChat as a deprecated fallback", () => {
     expect(
-      resolveWritableErrorSource({
+      resolveWritableErrorSink({
         ...base,
         chat: { errorChat: "spaces/AAAA" } as RusaConfig["chat"],
       })
     ).toEqual({ ref: "gchat:spaces/AAAA", kind: "gchat", target: "spaces/AAAA" });
     expect(
-      resolveWritableErrorSource({
+      resolveWritableErrorSink({
         ...base,
         chat: { errorChat: "spaces/AAAA" } as RusaConfig["chat"],
-        observability: { errorSource: "gchat:spaces/AAAA" },
+        observability: { errorSink: "gchat:spaces/AAAA" },
       })
     ).toEqual({ ref: "gchat:spaces/AAAA", kind: "gchat", target: "spaces/AAAA" });
   });
 
   it("rejects conflicting, unsupported, and non-writable references", () => {
     expect(() =>
-      resolveWritableErrorSource({
+      resolveWritableErrorSink({
         ...base,
         chat: { errorChat: "spaces/AAAA" } as RusaConfig["chat"],
-        observability: { errorSource: "slack:channels/C123" },
+        observability: { errorSink: "slack:channels/C123" },
       })
     ).toThrow(/conflicts/);
     for (const ref of ["github:org/repo", "gchat:spaces/AAAA/messages/M1", "slack:channels"]) {
       expect(() =>
-        resolveWritableErrorSource({ ...base, observability: { errorSource: ref } })
+        resolveWritableErrorSink({ ...base, observability: { errorSink: ref } })
       ).toThrow();
     }
     expect(() =>
-      resolveWritableErrorSource({ ...base, observability: { errorSource: "slack:channels/C123" } })
+      resolveWritableErrorSink({ ...base, observability: { errorSink: "slack:channels/C123" } })
     ).toThrow(/no configured writer/);
   });
 });
