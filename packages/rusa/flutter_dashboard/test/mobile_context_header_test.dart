@@ -169,6 +169,153 @@ void main() {
     });
 
     testWidgets(
+      'the header owns each actor status while the phone body omits identity',
+      (tester) async {
+        await tester.runAsync(() async {
+          const cases = [
+            (label: 'IDLE', status: 'active', runState: RunState.idle),
+            (label: 'RUNNING', status: 'active', runState: RunState.running),
+            (label: 'QUEUED', status: 'active', runState: RunState.queued),
+            (label: 'RETIRED', status: 'retired', runState: RunState.idle),
+          ];
+
+          for (final testCase in cases) {
+            final api = FakeApi()
+              ..threadsResult = [
+                makeThread(
+                  _actorId,
+                  created: 't0',
+                  status: testCase.status,
+                  runState: testCase.runState,
+                ),
+              ];
+            final store = DashboardStore(api: api, stream: FakeStream());
+            await store.init();
+
+            await _pump(tester, store, size: const Size(390, 844));
+            await _goToActors(tester);
+            await _openActor(tester, store);
+
+            expect(
+              find.descendant(
+                of: find.byType(MeshHeader),
+                matching: find.text(testCase.label),
+              ),
+              findsOneWidget,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text(testCase.label),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text('$_actorId-handle'),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text(_actorId),
+              ),
+              findsNothing,
+            );
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.byType(ActorAvatar),
+              ),
+              findsNothing,
+            );
+
+            await store.dispose();
+          }
+        });
+      },
+    );
+
+    testWidgets(
+      'the header chip tracks live run-state deltas while the detail stays open',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..runtimeCursor = const RuntimeCursor(
+              streamId: 'stream-a',
+              revision: 0,
+            )
+            ..threadsResult = [
+              makeThread(_actorId, created: 't0', runState: RunState.idle),
+            ];
+          final stream = FakeStream();
+          final store = DashboardStore(api: api, stream: stream);
+          await store.init();
+          await _pump(tester, store, size: const Size(390, 844));
+          await _goToActors(tester);
+          await _openActor(tester, store);
+
+          Finder headerChip(String label) => find.descendant(
+            of: find.byType(MeshHeader),
+            matching: find.text(label),
+          );
+
+          expect(headerChip('IDLE'), findsOneWidget);
+
+          // The authoritative stream moves the actor through each live run
+          // state; with no navigation or other interaction, the relocated
+          // header chip must follow each delta. A queued delta also makes the
+          // store re-fetch the thread snapshot for pacing, so the fake server
+          // is kept in agreement with the delta it just emitted — otherwise
+          // the stale seed would legitimately win the chip back.
+          const transitions = [
+            (revision: 1, runState: RunState.running, label: 'RUNNING'),
+            (revision: 2, runState: RunState.queued, label: 'QUEUED'),
+            (revision: 3, runState: RunState.idle, label: 'IDLE'),
+          ];
+          for (final step in transitions) {
+            api
+              ..threadsResult = [
+                makeThread(_actorId, created: 't0', runState: step.runState),
+              ]
+              ..runtimeCursor = RuntimeCursor(
+                streamId: 'stream-a',
+                revision: step.revision,
+              );
+            stream.runtimeStatesCtrl.add(
+              ActorRuntimeStateDelta(
+                streamId: 'stream-a',
+                revision: step.revision,
+                actorId: _actorId,
+                runState: step.runState,
+              ),
+            );
+            await tester.pump(const Duration(milliseconds: 50));
+            await tester.pump(const Duration(milliseconds: 50));
+
+            expect(headerChip(step.label), findsOneWidget);
+            for (final other in ['IDLE', 'RUNNING', 'QUEUED', 'RETIRED']) {
+              if (other == step.label) continue;
+              expect(headerChip(other), findsNothing);
+            }
+            // The phone body still owns no copy of the chip.
+            expect(
+              find.descendant(
+                of: find.byType(DetailPanel),
+                matching: find.text(step.label),
+              ),
+              findsNothing,
+            );
+          }
+
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets(
       'a very long actor handle bounds and ellipsizes without overflowing the header row',
       (tester) async {
         await tester.runAsync(() async {
@@ -458,6 +605,56 @@ void main() {
           findsOneWidget,
         );
         expect(find.byTooltip('Actor actions'), findsNothing);
+
+        await store.dispose();
+      });
+    });
+
+    testWidgets('desktop retains the detail body identity and status chip', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await _store();
+        await _pump(tester, store, size: const Size(1360, 840));
+        await tester.tap(find.text('Actors'));
+        await tester.pump();
+        await _openActor(tester, store);
+
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.byType(ActorAvatar),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text('$_actorId-handle'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text(_actorId),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(DetailPanel),
+            matching: find.text('IDLE'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: find.byType(MeshHeader),
+            matching: find.text('IDLE'),
+          ),
+          findsNothing,
+        );
 
         await store.dispose();
       });

@@ -5,6 +5,7 @@ import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'actor_status_badge.dart';
 import 'actor_tree.dart';
 import 'avatar.dart';
 import 'brand_mark.dart';
@@ -310,7 +311,9 @@ class MeshHeader extends StatelessWidget {
                                       store.actorsStale.valueOrNull ?? false,
                                   builder: (_, snap) => (snap.data == true)
                                       ? Padding(
-                                          padding: const EdgeInsets.only(left: 6),
+                                          padding: const EdgeInsets.only(
+                                            left: 6,
+                                          ),
                                           child: CachedHierarchyBadge(
                                             compact: compact,
                                           ),
@@ -548,10 +551,10 @@ List<_ActorHeaderAction> _actorHeaderActions({
   }
 }
 
-/// The phone detail title: the actor's avatar and handle in the app bar, so
-/// the page identifies who you are looking at without the detail body needing
-/// to. Sits in the wordmark's slot; the handle ellipsizes rather than pushing
-/// the badges or the overflow off the row.
+/// The phone detail title: the actor's avatar, handle, and status in the app
+/// bar, so the page identifies who you are looking at without a duplicate
+/// detail-body identity block. Sits in the wordmark's slot; the handle
+/// ellipsizes rather than pushing the chip or overflow off the row.
 class _DetailIdentity extends StatelessWidget {
   const _DetailIdentity({required this.actor, required this.store});
 
@@ -582,6 +585,8 @@ class _DetailIdentity extends StatelessWidget {
             ),
           ),
         ),
+        const SizedBox(width: 6),
+        ActorStatusBadge(state: store.dotFor(actor)),
       ],
     );
   }
@@ -1238,7 +1243,10 @@ class _SchedulerWarningBadge extends StatelessWidget {
     return Tooltip(
       message: 'Scheduler unavailable:\n${issues.join('\n')}',
       child: Container(
-        padding: EdgeInsets.symmetric(horizontal: compact ? 6 : 10, vertical: 4),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 6 : 10,
+          vertical: 4,
+        ),
         decoration: BoxDecoration(
           color: MeshColors.statusIdle.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(4),
