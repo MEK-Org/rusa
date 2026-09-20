@@ -491,9 +491,14 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(template).toContain('<base href="$FLUTTER_BASE_HREF">');
     expect(template).not.toContain("dashboard-auth.js");
     expect((await fetch(`${origin}/api/mesh/threads`)).status).toBe(401);
-    // The public Flutter shell remains generic; only a cookie-authenticated
-    // manifest response may contain the configured instance branding.
-    expect((await fetch(`${origin}/manifest.json`)).status).toBe(401);
+    // The root image is public tab branding; other actors and all mutations
+    // retain the session boundary.
+    for (const path of ["/api/mesh/avatar/root.png", "/api/mesh/avatar/root.jpg?v=1"]) {
+      const icon = await fetch(origin + path);
+      expect(icon.status).toBe(200);
+      expect(icon.headers.get("content-type")).toContain("image/");
+      expect((await post(path)).status).toBe(401);
+    }
   });
 
   it("keeps legacy auth configuration bootable with FlutterFire metadata defaults", () => {
@@ -528,6 +533,8 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     "/api/mesh/voice/stream",
     "/api/mesh/voice/audio/opaque-id",
     "/api/mesh/avatar/actor.png",
+    "/api/mesh/avatar/root.png/extra",
+    "/api/mesh/avatar/root",
     "/api/quota",
     "/api/understanding/ops",
     "/api/dashboard/config",
