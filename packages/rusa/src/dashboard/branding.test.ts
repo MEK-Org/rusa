@@ -8,7 +8,6 @@ import {
   type DashboardBranding,
   formatBrandName,
   hasBranding,
-  removeManifestLink,
   resolveDashboardBranding,
 } from "./branding.js";
 
@@ -210,15 +209,6 @@ describe("applyBrandingToHtml", () => {
   it("is a no-op for tags a future Flutter shell no longer emits", () => {
     const minimal = "<html><head></head><body></body></html>";
     expect(applyBrandingToHtml(minimal, named)).toBe(minimal);
-  });
-});
-
-describe("removeManifestLink", () => {
-  it("removes only the manifest link from an anonymous auth shell", () => {
-    const html = removeManifestLink(BUILT_INDEX_HTML);
-    expect(html).not.toContain('rel="manifest"');
-    expect(html).toContain('rel="apple-touch-icon"');
-    expect(html).toContain("<title>Rusa</title>");
   });
 });
 
