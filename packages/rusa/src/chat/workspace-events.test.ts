@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkspaceEventsSubscriber } from "./workspace-events.js";
+import type { Logger } from "../observability/logger.js";
+import { type WorkspaceEventsLapseAlert, WorkspaceEventsSubscriber } from "./workspace-events.js";
 
 const TOPIC = "projects/p/topics/chat-events";
 const CHAT_TARGET = "//chat.googleapis.com/spaces/-";
@@ -9,6 +10,7 @@ interface FakeSub {
   name: string;
   state: string;
   notificationEndpoint: { pubsubTopic: string };
+  expireTime?: string;
 }
 
 interface Call {
@@ -57,7 +59,11 @@ class FakeWeApi {
     }
     const name = path.replace(/^\//, "").replace(/:reactivate$/, "");
     const sub = this.subs.find((s) => s.name === name);
-    if (method === "PATCH") return jsonResponse(200, { name: "operations/patch" });
+    if (method === "PATCH") {
+      if (!sub) return jsonResponse(404, { error: "not found" });
+      if (sub.state === "EXPIRED") return jsonResponse(400, { error: "subscription expired" });
+      return jsonResponse(200, { name: "operations/patch" });
+    }
     if (method === "POST" && path.endsWith(":reactivate")) {
       if (sub) sub.state = "ACTIVE";
       return jsonResponse(200, { name: "operations/reactivate" });
@@ -74,12 +80,31 @@ class FakeWeApi {
   }
 }
 
-function makeSubscriber(api: FakeWeApi, overrides: Partial<{ renewIntervalMs: number }> = {}) {
+function makeSubscriber(
+  api: FakeWeApi,
+  overrides: Partial<{
+    renewIntervalMs: number;
+    retryBackoffMs: number;
+    maxRetryBackoffMs: number;
+    expectedTtlSeconds: number;
+    alertCooldownMs: number;
+    now: () => number;
+    logger: Logger;
+    onLapseAlert: (alert: WorkspaceEventsLapseAlert) => Promise<void> | void;
+  }> = {}
+) {
   return new WorkspaceEventsSubscriber({
     topic: TOPIC,
     getToken: async () => "fake-token",
     fetchImpl: api.fetch,
     renewIntervalMs: overrides.renewIntervalMs,
+    retryBackoffMs: overrides.retryBackoffMs,
+    maxRetryBackoffMs: overrides.maxRetryBackoffMs,
+    expectedTtlSeconds: overrides.expectedTtlSeconds,
+    alertCooldownMs: overrides.alertCooldownMs,
+    now: overrides.now,
+    logger: overrides.logger,
+    onLapseAlert: overrides.onLapseAlert,
   });
 }
 
@@ -201,5 +226,211 @@ describe("WorkspaceEventsSubscriber", () => {
     api.fetch = async () => jsonResponse(403, { error: "forbidden" });
     const sub = makeSubscriber(api);
     await expect(sub.start()).rejects.toThrow(/HTTP 403/);
+    await sub.close();
+  });
+
+  it("retries a boot-time create failure and recovers without a restart", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([]);
+    let failuresRemaining = 1;
+    let postAttempts = 0;
+    const fetch = api.fetch;
+    api.fetch = async (url, init) => {
+      if (failuresRemaining > 0 && init?.method === "POST") {
+        failuresRemaining--;
+        postAttempts++;
+        return jsonResponse(503, { error: "unavailable" });
+      }
+      if (init?.method === "POST") postAttempts++;
+      return fetch(url, init);
+    };
+    const sub = makeSubscriber(api, { retryBackoffMs: 100 });
+
+    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
+    expect(sub.currentSubscription).toBeNull();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(postAttempts).toBe(2);
+    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    await sub.close();
+  });
+
+  it("retries a boot-time renew failure with bounded exponential backoff", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([
+      {
+        name: "subscriptions/existing",
+        state: "ACTIVE",
+        notificationEndpoint: { pubsubTopic: TOPIC },
+      },
+    ]);
+    let failuresRemaining = 2;
+    let patchAttempts = 0;
+    const fetch = api.fetch;
+    api.fetch = async (url, init) => {
+      if (failuresRemaining > 0 && init?.method === "PATCH") {
+        failuresRemaining--;
+        patchAttempts++;
+        return jsonResponse(503, { error: "unavailable" });
+      }
+      if (init?.method === "PATCH") patchAttempts++;
+      return fetch(url, init);
+    };
+    const retryDelays: number[] = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: (event: string, fields?: Record<string, unknown>) => {
+        if (event.includes("failed")) retryDelays.push(fields?.retryInMs as number);
+      },
+      error: () => {},
+      child: () => logger,
+    };
+    const sub = makeSubscriber(api, {
+      retryBackoffMs: 100,
+      maxRetryBackoffMs: 200,
+      logger,
+    });
+
+    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(sub.currentSubscription).toBe("subscriptions/existing");
+    expect(patchAttempts).toBe(3);
+    expect(retryDelays).toEqual([100, 200]);
+    await sub.close();
+  });
+
+  it("recreates a missing subscription on a later renewal tick", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([
+      { name: "subscriptions/old", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
+    ]);
+    const sub = makeSubscriber(api, { renewIntervalMs: 100 });
+    await sub.start();
+    api.subs = [];
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    await sub.close();
+  });
+
+  it("recreates an expired subscription instead of attempting to renew it", async () => {
+    const api = new FakeWeApi([
+      {
+        name: "subscriptions/expired",
+        state: "ACTIVE",
+        expireTime: "2026-09-19T10:00:00.000Z",
+        notificationEndpoint: { pubsubTopic: TOPIC },
+      },
+    ]);
+    const sub = makeSubscriber(api, { now: () => Date.parse("2026-09-19T12:00:00.000Z") });
+
+    await sub.start();
+
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.countWhere((call) => call.method === "PATCH")).toBe(0);
+    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    await sub.close();
+  });
+
+  it("recreates when renewal reports that the subscription is missing", async () => {
+    const api = new FakeWeApi([
+      {
+        name: "subscriptions/missing",
+        state: "ACTIVE",
+        notificationEndpoint: { pubsubTopic: TOPIC },
+      },
+    ]);
+    const fetch = api.fetch;
+    api.fetch = async (url, init) =>
+      init?.method === "PATCH" ? jsonResponse(404, { error: "not found" }) : fetch(url, init);
+    const sub = makeSubscriber(api);
+
+    await sub.start();
+
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    await sub.close();
+  });
+
+  it("alerts once per cooldown when no active subscription persists past its TTL", async () => {
+    vi.useFakeTimers();
+    let clock = 0;
+    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const api = new FakeWeApi([]);
+    api.fetch = async () => jsonResponse(503, { error: "unavailable" });
+    const sub = makeSubscriber(api, {
+      retryBackoffMs: 1000,
+      maxRetryBackoffMs: 4000,
+      expectedTtlSeconds: 10,
+      alertCooldownMs: 5000,
+      now: () => clock,
+      onLapseAlert: (alert) => {
+        alerts.push(alert);
+      },
+    });
+
+    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
+    clock = 11_000;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ topic: TOPIC, subscriptionName: null, elapsedSeconds: 11 });
+
+    clock = 12_000;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(alerts).toHaveLength(1);
+
+    clock = 17_000;
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(alerts).toHaveLength(2);
+    await sub.close();
+  });
+
+  it("only renews and never alerts while the subscription is healthy", async () => {
+    vi.useFakeTimers();
+    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const api = new FakeWeApi([
+      {
+        name: "subscriptions/stable",
+        state: "ACTIVE",
+        notificationEndpoint: { pubsubTopic: TOPIC },
+      },
+    ]);
+    const sub = makeSubscriber(api, {
+      renewIntervalMs: 100,
+      onLapseAlert: (alert) => {
+        alerts.push(alert);
+      },
+    });
+
+    await sub.start();
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(api.countWhere((call) => call.method === "POST")).toBe(0);
+    expect(api.countWhere((call) => call.method === "PATCH")).toBe(4);
+    expect(alerts).toEqual([]);
+    await sub.close();
+  });
+
+  it("emits structured lifecycle logs", async () => {
+    const logs: string[] = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: (event: string) => logs.push(event),
+      warn: () => {},
+      error: () => {},
+      child: () => logger,
+    };
+    const sub = makeSubscriber(new FakeWeApi([]), { logger });
+
+    await sub.start();
+
+    expect(logs).toContain("chat_subscription_created");
+    await sub.close();
   });
 });

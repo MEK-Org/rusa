@@ -146,4 +146,27 @@ describe("deliverHostAlarm", () => {
       },
     ]);
   });
+
+  it("uses the alarm name when another host alarm falls back to errorChat", async () => {
+    const logged: Array<{ event: string; fields?: unknown }> = [];
+    const log = {
+      warn: (event: string, fields?: unknown) => logged.push({ event, fields }),
+    } as unknown as Logger;
+    const error = new Error("delivery unavailable");
+
+    const outcome = await deliverHostAlarm({
+      deliver: async () => {
+        throw error;
+      },
+      message: "subscription lapsed",
+      sendToErrorChat: () => {},
+      log,
+      alarmName: "chat_subscription_lapse",
+    });
+
+    expect(outcome).toBe("errorChat");
+    expect(logged).toEqual([
+      { event: "chat_subscription_lapse_delivery_failed", fields: { err: error } },
+    ]);
+  });
 });

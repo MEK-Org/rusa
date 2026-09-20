@@ -116,7 +116,10 @@ import { GchatOAuth } from "../chat/gchat-oauth.js";
 import { PubsubChatSource } from "../chat/pubsub-source.js";
 import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
-import { WorkspaceEventsSubscriber } from "../chat/workspace-events.js";
+import {
+  type WorkspaceEventsLapseAlert,
+  WorkspaceEventsSubscriber,
+} from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
@@ -458,14 +461,18 @@ export async function deliverHostAlarm(opts: {
   message: string;
   sendToErrorChat: ((text: string) => void) | null;
   log?: Logger;
+  alarmName?: string;
 }): Promise<HostAlarmOutcome> {
   let delivery: DurableEventDelivery;
   try {
     delivery = await opts.deliver();
   } catch (error) {
-    opts.log?.warn("disk_alert_delivery_failed", {
-      err: error,
-    });
+    opts.log?.warn(
+      opts.alarmName ? `${opts.alarmName}_delivery_failed` : "disk_alert_delivery_failed",
+      {
+        err: error,
+      }
+    );
     if (!opts.sendToErrorChat) return "dropped";
     opts.sendToErrorChat(opts.message);
     return "errorChat";
@@ -3921,15 +3928,52 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // continue rather than disabling chat.
         const oauth = new GchatOAuth(config.chat.gchatConfigDir);
         const topic = `projects/${config.chat.projectId}/topics/${config.chat.topic ?? "chat-events"}`;
+        const chatLogger = log.child({ component: "chat" });
+        const onLapseAlert = async (alert: WorkspaceEventsLapseAlert) => {
+          const outcome = await deliverHostAlarm({
+            deliver: () =>
+              mesh.deliverExternalEvent({
+                sourceType: "timer",
+                rawResource: "system:events",
+                rawPayload: {
+                  type: "system.chat_subscription_lapsed",
+                  topic: alert.topic,
+                  subscriptionName: alert.subscriptionName,
+                  expectedTtlSeconds: alert.expectedTtlSeconds,
+                  elapsedSeconds: alert.elapsedSeconds,
+                  message: alert.message,
+                },
+                priority: "responsive",
+                eventSummary: alert.message,
+              }),
+            message: alert.message,
+            sendToErrorChat,
+            log: chatLogger,
+            alarmName: "chat_subscription_lapse",
+          });
+          if (outcome !== "delivered") {
+            chatLogger.warn("chat_subscription_lapse_not_delivered_to_mesh", {
+              fallback: outcome,
+              topic: alert.topic,
+            });
+          }
+        };
         weSubscriber = new WorkspaceEventsSubscriber({
           topic,
           getToken: () => oauth.token(),
           log: (m) => console.log(`[chat] events: ${m}`),
+          logger: chatLogger,
+          onLapseAlert,
         });
         try {
           await weSubscriber.start();
+          chatLogger.info("chat_events_subscription_active", {
+            topic,
+            subscriptionName: weSubscriber.currentSubscription,
+          });
           console.log(`[chat] events subscription active → ${topic}`);
         } catch (err) {
+          chatLogger.warn("chat_events_subscription_boot_failed", { topic, err, continuing: true });
           console.warn(
             `[chat] events subscription failed (continuing): ${err instanceof Error ? err.message : String(err)}`
           );
