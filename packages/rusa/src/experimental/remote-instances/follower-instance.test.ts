@@ -308,6 +308,105 @@ describe("monolithic follower instance", () => {
     expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
   });
 
+  it("runs a responsive replacement after a queued admission is rejected on reconnect", async () => {
+    const h = setup({ delayMs: 1500 });
+    const first = h.spawn("Occupy concurrency");
+    await waitUntil(() => h.runtime(first).isRunning);
+
+    const queued = h.spawn("Await admission");
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    // Responsive work arrives while awaiting admission
+    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+
+    // Disconnect while queued awaiting admission
+    h.remote.close();
+    await h.runtime(queued).exited;
+
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_abandoned",
+        actorId: queued,
+        detail: "start-cancelled",
+      })
+    );
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(first).attachHost(reconnect.createHost(first));
+    h.runtime(queued).attachHost(reconnect.createHost(queued));
+
+    // Prove a responsive replacement runs after the old admission rejection
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === queued && event.event.type === "runStart" && event.event.responsive
+        )
+    );
+  });
+
+  it("recovers a run admitted before a lease flap when disconnect abandons it at start", async () => {
+    const h = setup({ delayMs: 500 });
+
+    // Hold runStart to simulate the lease flap occurring after admission was
+    // granted by the leader but before the start was acknowledged across the wire.
+    let heldRunStart = false;
+    const receive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.message.type === "runStart") {
+        heldRunStart = true;
+        return;
+      }
+      receive(event);
+    };
+
+    const id = h.spawn("Admitted during flap");
+    await waitUntil(() => heldRunStart);
+
+    // Lease flap occurs: channel drops while admitted run is in-flight before start acknowledgment
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // The leader records run_abandoned with start-cancelled, started: false (exact fe5e367d pattern)
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_abandoned",
+        actorId: id,
+        detail: "start-cancelled",
+      })
+    );
+
+    // Restore receiver for reconnect
+    h.remote.receive = receive;
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+
+    // What start.ts does on register: re-derives normal priority wake from durable inbox
+    h.mesh.notifyInboxChanged(id);
+
+    // Prove the replacement run executes after the old admission rejection and completes
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "runStart" && !event.event.responsive
+        )
+    );
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "result" && event.event.result.success
+        )
+    );
+  });
+
   it("rejects duplicate actor init without reconnect flag but permits reconnect", async () => {
     const h = setup();
     const id = h.spawn("Duplicate test");

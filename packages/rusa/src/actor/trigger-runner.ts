@@ -207,7 +207,7 @@ export class TriggerRunner {
   }
 }
 
-function mergeNudges(left: RunNudge | null, right: RunNudge | null): RunNudge {
+export function mergeNudges(left: RunNudge | null, right: RunNudge | null): RunNudge {
   if (!left) return right ? { ...right } : {};
   if (!right) return { ...left };
   const ordinary = left.mode !== "yield-elicitation" || right.mode !== "yield-elicitation";

@@ -29,6 +29,7 @@ import type { InjectRecord } from "./portable-context.js";
 import {
   type ActorRunMode,
   isResponsiveNudge,
+  mergeNudges,
   type RunNudge,
   TriggerRunner,
 } from "./trigger-runner.js";
@@ -262,6 +263,8 @@ export class Actor {
   /** A model re-quote has cancelled its old reservation and is awaiting its one dirty-bit replay. */
   private reschedulingQueuedRun = false;
   private preemptedQueuedRun = false;
+  /** Scheduling metadata delivered while queued for admission; replayed if the queued opportunity fails or is cancelled before start. */
+  private nudgeWhileQueued?: RunNudge;
   /**
    * Set within a run at the moment it commits to reporting its result through
    * `onRunEnd`. Read by the terminal hook in `runOnce`'s `finally` to decide
@@ -325,7 +328,10 @@ export class Actor {
     // Work delivered while queued joins the accepted execution opportunity. The
     // provider will list the live inbox only after admission, so no follow-up is
     // necessary. Running actors still flow through TriggerRunner's dirty bit.
-    if (this.queued) return;
+    if (this.queued) {
+      this.nudgeWhileQueued = mergeNudges(this.nudgeWhileQueued ?? null, nudge);
+      return;
+    }
     this.runner.requestRun(nudge);
   }
 
@@ -428,7 +434,11 @@ export class Actor {
       return true;
     }
     if (!this.pendingStart?.cancel?.()) return false;
-    this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+    this.cancelledQueuedNudge = mergeNudges(
+      this.runner.currentNudgeSnapshot(),
+      this.nudgeWhileQueued ?? null
+    );
+    this.nudgeWhileQueued = undefined;
     this.cancelledQueuedRun = true;
     this.opts.onQueuedRunCancelled?.();
     return true;
@@ -568,6 +578,7 @@ export class Actor {
 
   close(): void {
     this.closed = true;
+    this.nudgeWhileQueued = undefined;
     this.runner.close();
     this.pendingStart?.cancel?.();
     if (this.opts.sandbox) {
@@ -649,6 +660,11 @@ export class Actor {
       // depends on the pairing being total, not on the current list of exits.
       if (!this.runEndReported) await this.reportAbandonedRun();
       this.currentRunId = undefined;
+      if (!this.runStartReported && this.nudgeWhileQueued) {
+        const replay = this.nudgeWhileQueued;
+        this.nudgeWhileQueued = undefined;
+        this.runner.requestRun(replay);
+      }
     }
   }
 
@@ -784,6 +800,7 @@ export class Actor {
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;
       this.queued = false;
+      this.nudgeWhileQueued = undefined;
       if (this.closed || this.preemptedQueuedRun) {
         this.preemptedQueuedRun = false;
         throw new RunStartCancelledError();

@@ -84,6 +84,18 @@ export function createHarness(options: {
     createActor: (context) => {
       let cursor = 0;
       let admittedCursor = 0;
+      context.lifecycle.add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "abandoned") {
+            mesh.recordEvent({
+              kind: "run_abandoned",
+              actorId: context.record.id,
+              detail: event.terminal.reason,
+              payload: JSON.stringify({ started: event.terminal.started }),
+            });
+          }
+        },
+      });
       const runtime = new ActorHandle({
         host: remote.createHost(context.record.id),
         context,
