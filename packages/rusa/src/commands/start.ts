@@ -164,6 +164,12 @@ import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
 import { createPnpmInstallMcpServer, PNPM_INSTALL_MCP_NAME } from "../mcp/pnpm-install-mcp.js";
 import { createQuotaMcpServer, createQuotaService, QUOTA_MCP_NAME } from "../mcp/quota-mcp.js";
 import { createRepoMcpServer, REPO_MCP_NAME } from "../mcp/repo-mcp.js";
+import {
+  createSlackReadMcpServer,
+  createSlackWriteMcpServer,
+  SLACK_READ_MCP_NAME,
+  SLACK_WRITE_MCP_NAME,
+} from "../mcp/slack-mcp.js";
 import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
 import {
   createStuckLoopDetectorMcpServer,
@@ -190,6 +196,7 @@ import {
   diskAlertActive,
   resolveDiskAlertConfig,
 } from "../observability/disk-alert.js";
+import { resolveErrorSink } from "../observability/error-sink.js";
 import {
   collectConfigSecretEntries,
   collectEnvSecretEntries,
@@ -241,6 +248,8 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { readSlackToken, SlackClient } from "../slack/slack-client.js";
+import { SlackSocketSource } from "../slack/socket-source.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -415,6 +424,7 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
     // event ownership; ingestion exclusions remain `chat.excludedSpaces`.
     configured.push("gchat:spaces");
   }
+  if (config.slack) configured.push("slack:channels");
 
   // Disk alerts are a host-owned event source, so whatever runs the producer is
   // also the subscription declaration. Both sides read `diskAlertActive`, so a
@@ -877,6 +887,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     return;
   }
   const rootActor = config.rootActor;
+  const errorSink = resolveErrorSink(config);
   if (!rootActor) {
     throw new Error("config loader returned no rootActor after validating root configuration");
   }
@@ -884,12 +895,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // through the same closure) and its configured level takes effect.
   const configSecretEntries = collectConfigSecretEntries(config);
   for (const { value } of configSecretEntries) knownSecrets.add(value);
+  const slackBotToken = config.slack
+    ? readSlackToken(config.slack.botTokenPath, mcHome)
+    : undefined;
+  const slackAppToken = config.slack
+    ? readSlackToken(config.slack.appTokenPath, mcHome)
+    : undefined;
+  if (slackBotToken) knownSecrets.add(slackBotToken);
+  if (slackAppToken) knownSecrets.add(slackAppToken);
   const log = createLogger({
     level: config.observability?.logging?.level,
     format: config.observability?.logging?.format,
     secrets: readSecrets,
     context: { component: "start" },
   });
+  if (config.chat?.errorChat) {
+    log.warn("chat_error_chat_deprecated", { replacement: "observability.errorSink" });
+  }
 
   // The sandbox layer has no logger of its own (it is built per spawn by the
   // providers); hand it this one so its host-side records — e.g. a granted
@@ -1324,14 +1346,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       ),
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
+  const slackClient = slackBotToken ? new SlackClient(slackBotToken) : null;
   let gchat: GchatClient | null = null;
   if (!chatClient && config.chat && !opts?.e2e) {
     gchat = new GchatClient(config.chat.gchatConfigDir);
     chatClient = gchat;
   }
+  const sendErrorSink =
+    errorSink?.kind === "gchat" && chatClient
+      ? (text: string) => chatClient.send(errorSink.target, text).then(() => {})
+      : errorSink?.kind === "slack" && slackClient
+        ? (text: string) => slackClient.send(errorSink.target, text).then(() => {})
+        : null;
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
+  if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
 
   const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
@@ -1434,8 +1464,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       } catch {
         /* best-effort marker */
       }
-      if (chatClient && config.chat?.errorChat) {
-        void chatClient.send(config.chat.errorChat, `⚠️ ${alert}`).catch(() => {});
+      if (sendErrorSink) {
+        void sendErrorSink(`⚠️ ${alert}`).catch(() => {});
       }
     }
   } catch {
@@ -1735,14 +1765,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   try {
     const repoRoot = resolveRepoRoot();
     const packageDir = join(repoRoot, "packages", "rusa");
-    const errorChatSpace = config.chat?.errorChat;
     const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
-    if (!errorChatSpace) {
-      console.warn("[update] no errorChat configured — lifecycle pings disabled");
-    } else if (!chatClient) {
-      console.warn("[update] chat client unavailable — lifecycle pings disabled");
+    if (!errorSink) {
+      console.warn("[update] no error sink configured — lifecycle pings disabled");
+    } else if (!sendErrorSink) {
+      console.warn("[update] error sink writer unavailable — lifecycle pings disabled");
     }
-    const updateChatClient = chatClient;
     updateToolDepsFor = (selfId) => ({
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       hasCapability: (actorId, capability) => mesh.hasActiveCapability(actorId, capability),
@@ -1754,12 +1782,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
-        notify:
-          updateChatClient && errorChatSpace
-            ? {
-                notify: (text) => updateChatClient.send(errorChatSpace, text).then(() => {}),
-              }
-            : undefined,
+        notify: sendErrorSink
+          ? {
+              notify: sendErrorSink,
+            }
+          : undefined,
         // Chat-independent durable marker for the worst states (e.g. a failed
         // rollback) — same file the boot-flap alert appends to.
         alertMarker: (text: string) => {
@@ -1868,6 +1895,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }),
       }),
     chatClient: chatClient ?? undefined,
+    slackClient: slackClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
     // Confines chat-write attachment filePaths to the grantee's workdir — same
@@ -1944,6 +1972,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     void mcpHttp.removeServer(`${actorId}:${STUCK_LOOP_DETECTOR_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
+    void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
     // Tear down EVERY granted-capability endpoint this actor could have mounted
     //  — iterate the full grantable set, not the current grants, so an
     // endpoint can't leak past retire even after a revoke cleared the grant.
@@ -2529,6 +2558,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           );
           perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
         }
+        if (slackClient) {
+          const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
+            createSlackReadMcpServer(slackClient, isFenced)
+          );
+          perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
+        }
 
         // Workers get their per-actor shared tools, agent execution, and durable messaging.
         const workerMcp: McpServerSpec[] = [
@@ -2857,15 +2892,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // the dashboard binding its port. A head change cannot commit into a sink
   // that is still undefined.
   //
-  // Boot sweep below over `readyHeads()` reconciles heads at startup.
-  readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
+  // Boot sweep below over `readyHeadRecords()` reconciles heads at startup.
+  readyHeadSink = ({ ownerId, epoch, head, previousHeadId, sequence }) => {
     mesh.deliverReadyHeadAttention(
       ownerId,
       head === null
         ? null
         : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
       previousHeadId,
-      sequence
+      sequence,
+      epoch
     );
   };
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
@@ -2888,18 +2924,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
   // for the root, which has no parent — to the statically configured error chat.
-  const errorChat = config.chat?.errorChat;
   // The raw delivery to the human's error chat.
-  const sendToErrorChat =
-    chatClient && errorChat
-      ? (text: string) => {
-          void chatClient?.send(errorChat, text).catch((err) => {
-            console.warn(
-              `[failure-sink] error chat post failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          });
-        }
-      : null;
+  const sendToErrorChat = sendErrorSink
+    ? (text: string) => {
+        void sendErrorSink(text).catch((err) => {
+          console.warn(
+            `[failure-sink] error chat post failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        });
+      }
+    : null;
   // Governor: alert eagerly on the first failure, then coalesce a storm into one
   // summary per growing window (so a rate-limit cascade can't DM the human 14×).
   const errorNotifier = sendToErrorChat ? new CoalescingNotifier({ send: sendToErrorChat }) : null;
@@ -3088,6 +3122,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         )
       : undefined;
 
+  const rootSlackUrl =
+    slackClient && config.slack
+      ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
+          createSlackWriteMcpServer(slackClient, "all")
+        )
+      : undefined;
+
   rootMcp.push(
     ...sharedMcp,
     { name: TRACKER_MCP_NAME, url: rootTrackerUrl },
@@ -3101,6 +3142,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   if (rootChatUrl) {
     rootMcp.push({ name: CHAT_WRITE_MCP_NAME, url: rootChatUrl });
   }
+  if (rootSlackUrl) rootMcp.push({ name: SLACK_WRITE_MCP_NAME, url: rootSlackUrl });
   refreshLiveActorMcp(rootId);
 
   const externalRoot =
@@ -3673,6 +3715,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             logger: log.child({ component: "reference-cache" }),
           }),
           chatClient: chatClient ?? undefined,
+          slackClient: slackClient ?? undefined,
           issueClient: issueClient,
           emitter: meshEmitter,
           // Read-only exposures: the emergency-brake state and a snapshot of
@@ -3776,6 +3819,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // ── Google Chat inbound (optional; disabled when config.chat is absent) ──
   let chatSource: ChatSource | null = null;
+  let slackSource: SlackSocketSource | null = null;
   let weSubscriber: WorkspaceEventsSubscriber | null = null;
   if (config.chat && chatClient) {
     const cc = chatClient;
@@ -3921,6 +3965,40 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   }
 
+  if (slackClient && config.slack && slackAppToken) {
+    try {
+      slackSource = new SlackSocketSource(
+        slackAppToken,
+        (err) =>
+          log.error("slack_event_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        (event) => log.info("slack_event_received", event)
+      );
+      await slackSource.start(async (msg) => {
+        await mesh.deliverExternalEvent({
+          sourceType: "slack",
+          rawPayload: {
+            channel: msg.channel,
+            ts: msg.ts,
+            threadTs: msg.threadTs,
+            user: msg.user,
+          },
+          idempotencyKey: msg.eventId,
+          priority: "responsive",
+          eventSummary: `Slack message from ${msg.user}`,
+        });
+        log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
+      });
+      log.info("slack_socket_active");
+    } catch (err) {
+      log.error("slack_socket_start_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      slackSource = null;
+    }
+  }
+
   console.log("\n✓ Root actor live. Waiting for events...\n");
 
   // Mechanical lifecycle ping : emitted by startup once the mesh is up.
@@ -3979,6 +4057,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (chatSource) {
       try {
         await chatSource.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    if (slackSource) {
+      try {
+        await slackSource.close();
       } catch {
         /* already closed */
       }

@@ -1,6 +1,7 @@
 import { EventEmitter, once } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DashboardAuth } from "../dashboard/auth.js";
 import type { DashboardMeshRefs } from "./server.js";
 import { createDashboardRequestHandler } from "./server.js";
 
@@ -82,9 +83,10 @@ function meshWithRoot(rootIdentity: DashboardMeshRefs["rootIdentity"]): Dashboar
 
 async function get(
   url: string,
-  mesh?: DashboardMeshRefs
+  mesh?: DashboardMeshRefs,
+  auth?: DashboardAuth
 ): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
-  const handler = createDashboardRequestHandler({ port: 8788, mesh });
+  const handler = createDashboardRequestHandler({ port: 8788, mesh }, null, null, auth);
   const req = new MockIncomingMessage("GET", url);
   const res = new MockServerResponse();
   const done = once(res, "finish");
@@ -99,6 +101,25 @@ describe("dashboard branding from the configured root actor", () => {
     // No uploaded root image in this suite: point the avatar cache at a directory
     // that does not exist, so only the name half of branding applies.
     vi.stubEnv("RUSA_HOME", "/nonexistent/rusa-home-branding-test");
+  });
+
+  it("brands the signed-out shell and manifest before authentication", async () => {
+    const authorize = vi.fn(async (_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(401);
+      res.end("Authentication required");
+      return false;
+    });
+    const auth = { handle: async () => false, authorize } as unknown as DashboardAuth;
+    const mesh = meshWithRoot({ handle: "ember-familiar" });
+    for (const path of ["/", "/index.html", "/dashboard"]) {
+      const shell = await get(path, mesh, auth);
+      expect(shell.body).toContain("<title>Ember Familiar</title>");
+      expect(shell.body).toContain('rel="manifest"');
+    }
+    const manifest = await get("/manifest.json", mesh, auth);
+    expect(manifest.statusCode).toBe(200);
+    expect(JSON.parse(manifest.body).name).toBe("Ember Familiar");
+    expect(authorize).not.toHaveBeenCalled();
   });
 
   it("serves the built shell unchanged when no root actor is configured", async () => {

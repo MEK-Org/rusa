@@ -150,6 +150,7 @@ reply, a Google Chat message, a GitHub review or issue comment — close it with
 
 - \`mesh:messages/<id>\` — an operator or peer reply in the mesh
 - \`gchat:spaces/<space>/messages/<id>\` — Google Chat
+- \`slack:channels/<channel>/messages/<timestamp>\` — Slack
 - \`github:OWNER/REPO/issues/<n>\`, \`github:OWNER/REPO/pulls/<n>\`
 - \`github:OWNER/REPO/issues/<n>/comments/<id>\` — a comment on one
 - \`mesh:actors/<actor>/inbox/<entry>\` — when the item that woke you is the source

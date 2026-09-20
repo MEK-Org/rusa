@@ -36,6 +36,10 @@ function deriveDisplayTitle(reference: Reference, entity: ReferenceEntity): stri
       // The provider author is intentionally not preserved in the cached
       // entity (only what the widget renders is), so this stays generic.
       return "Chat message";
+    case "slack_channel":
+      return entity.name;
+    case "slack_message":
+      return "Slack message";
     case "mesh_message":
       return undefined; // mesh is resolved locally, never cached here.
   }
@@ -241,6 +245,10 @@ function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
     if (typeof obj.name === "string") {
       return { type: obj.type, name: obj.name };
     }
+  } else if (obj.type === "slack_message") {
+    if (typeof obj.contents === "string") return { type: obj.type, contents: obj.contents };
+  } else if (obj.type === "slack_channel") {
+    if (typeof obj.name === "string") return { type: obj.type, name: obj.name };
   }
 
   return undefined;
@@ -269,6 +277,11 @@ function getResourceShape(reference: ReturnType<typeof parseReference>): string 
     if (reference.segments.length >= 4 && reference.segments[2] === "messages") {
       return "gchat_message";
     }
+  } else if (reference.scheme === "slack") {
+    if (reference.segments.length === 2 && reference.segments[0] === "channels")
+      return "slack_channel";
+    if (reference.segments.length === 4 && reference.segments[2] === "messages")
+      return "slack_message";
   }
   return undefined;
 }

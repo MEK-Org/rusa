@@ -62,6 +62,7 @@ export function buildE2EConfig(opts: {
   rootActor?: RusaConfig["rootActor"];
   /** Chat config; set (with fakes injected at runtime) to exercise the chat edge. */
   chat?: RusaConfig["chat"];
+  slack?: RusaConfig["slack"];
 }): RusaConfig {
   const base = opts.baseConfig ?? null;
   const e2eValidVoices = filterConfiguredVoices(base?.voice?.supportedVoices, {
@@ -81,6 +82,7 @@ export function buildE2EConfig(opts: {
   return {
     rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
+    ...(opts.slack ? { slack: opts.slack } : {}),
     github: { account: E2E_BOT },
     providers: {
       ...(base?.providers ?? { antigravity: { cliCommand: "agy" } }),
@@ -124,6 +126,7 @@ export function provisionE2EInstance(opts: {
   baseConfigHome?: string;
   rootActor?: RusaConfig["rootActor"];
   chat?: RusaConfig["chat"];
+  slack?: RusaConfig["slack"];
 }): E2EInstance {
   const root = opts.root ?? mkdtempSync(join(tmpdir(), "rusa-e2e-"));
   const home = join(root, "home");
@@ -186,6 +189,7 @@ export function provisionE2EInstance(opts: {
     baseConfig,
     rootActor: opts.rootActor,
     chat: opts.chat,
+    slack: opts.slack,
   });
   writeFileSync(join(home, "config.yaml"), toYaml(config), { encoding: "utf8", mode: 0o600 });
 

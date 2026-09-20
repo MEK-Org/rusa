@@ -53,6 +53,7 @@ export function mayBubbleToParent(
     case "pull_request_review_comment.created":
     case "check_suite.completed":
     case "gchat.message":
+    case "slack.message":
       return true;
     case "pull_request.opened":
       // A draft PR is work in progress: it stays with its exact-resource
@@ -68,7 +69,7 @@ export function mayBubbleToParent(
   }
 }
 
-export type IntegrationSourceType = "github" | "chat" | "timer";
+export type IntegrationSourceType = "github" | "chat" | "slack" | "timer";
 
 export interface StampedAuthorInfo {
   actorId: string;
@@ -104,6 +105,11 @@ export interface RawChatIntegrationEvent extends RawEventMetadata {
   };
 }
 
+export interface RawSlackIntegrationEvent extends RawEventMetadata {
+  sourceType: "slack";
+  rawPayload: { channel: string; ts: string; threadTs?: string; user: string };
+}
+
 /** Timer ingress already owns a canonical payload; EventManager adds routing and durability. */
 export interface RawTimerIntegrationEvent extends RawEventMetadata {
   sourceType: "timer";
@@ -117,6 +123,7 @@ export interface RawTimerIntegrationEvent extends RawEventMetadata {
 export type RawIntegrationEvent =
   | RawGitHubIntegrationEvent
   | RawChatIntegrationEvent
+  | RawSlackIntegrationEvent
   | RawTimerIntegrationEvent;
 
 export interface NormalizedIntegrationEvent {
@@ -598,6 +605,8 @@ export class EventManager {
         return this.normalizeGitHubEvent(raw);
       case "chat":
         return this.normalizeChatEvent(raw);
+      case "slack":
+        return this.normalizeSlackEvent(raw);
       case "timer":
         return this.normalizeTimerEvent(raw);
     }
@@ -657,6 +666,28 @@ export class EventManager {
       dedupeKey: raw.idempotencyKey ?? message.name,
       deliveredAt:
         raw.receivedAt ?? (message.createTime ? new Date(message.createTime) : undefined),
+      directedTarget: raw.directedTarget,
+      stampedAuthor: raw.stampedAuthor,
+      instanceId: raw.instanceId,
+      eventSummary: raw.eventSummary,
+    };
+  }
+
+  private normalizeSlackEvent(raw: RawSlackIntegrationEvent): NormalizedIntegrationEvent {
+    const message = raw.rawPayload;
+    return {
+      resource: `slack:channels/${message.channel}`,
+      payload: {
+        type: "slack.message",
+        messageRef: `slack:channels/${message.channel}/messages/${message.ts}`,
+        channel: message.channel,
+        ts: message.ts,
+        threadTs: message.threadTs,
+        senderName: message.user,
+        priority: "responsive",
+      },
+      dedupeKey: raw.idempotencyKey ?? `${message.channel}:${message.ts}`,
+      deliveredAt: raw.receivedAt,
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,

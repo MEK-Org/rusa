@@ -897,6 +897,8 @@ export class ActorMesh {
   private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
+  /** Direct callers without repository changes use this mesh-local epoch. */
+  private readonly directReadyHeadEpoch = randomUUID();
   private runtimeRevision = 0;
   private readonly runtimeStateListeners = new Set<(delta: ActorRuntimeStateDelta) => void>();
   private readonly activeRunCounts = new Map<string, number>();
@@ -927,6 +929,7 @@ export class ActorMesh {
     {
       from: string | null;
       to: { id: string; intent: string | null; responsive?: boolean } | null;
+      epoch: string;
     }
   >();
   /**
@@ -1282,55 +1285,37 @@ export class ActorMesh {
    * Boot recovery for ready-head inbox attention (#1645).
    *
    * Verifies that every active actor with a ready head has durable attention in
-   * its inbox. Keyed by exact transition fact and sequence persisted in SQLite.
+   * its inbox. Entries are scoped to the source repository's epoch (#513):
+   * dedupe is exactly-once within that repository lifetime, repeated reconcile
+   * passes over an unchanged head stay silent, and any restart delivers at
+   * most the operator-accepted one duplicate attention entry per ready head.
+   * Scoping boot reconciliation to the repository epoch guarantees that a
+   * missed recurrence whose live append was lost (e.g.
+   * process crash between commit and append) always delivers a recovery
+   * attention after restart, without colliding with an earlier handled repair
+   * entry from a previous process generation.
    */
   reconcileReadyHeads(obligations: {
-    readyHeadTransitions?(): Iterable<{
-      ownerId: string;
-      headId: string;
-      previousHeadId: string | null;
-      sequence: number;
-    }>;
-    readyHeads?(): Iterable<[string, string]>;
-    get(id: string): { id: string; intent: string | null; effectiveResponsive?: boolean } | null;
+    readyHeadEpoch: string;
+    readyHeadRecords(): Iterable<{ ownerId: string; headId: string; responsive: boolean }>;
+    get(id: string): { id: string; intent: string | null } | null;
   }): void {
     if (!this.inboxStore) return;
     try {
-      if (typeof obligations.readyHeadTransitions === "function") {
-        for (const {
-          ownerId,
-          headId,
-          previousHeadId,
-          sequence,
-        } of obligations.readyHeadTransitions()) {
-          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
-          const actorId = this.resolveThreadId(ownerId);
-          const record = this.actors.get(actorId);
-          if (!record || record.status !== "active") continue;
-          const head = obligations.get(headId);
-          if (!head) continue;
-          this.deliverReadyHeadAttention(
-            actorId,
-            { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
-            previousHeadId,
-            sequence
-          );
-        }
-      } else if (typeof obligations.readyHeads === "function") {
-        for (const [ownerId, headId] of obligations.readyHeads()) {
-          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
-          const actorId = this.resolveThreadId(ownerId);
-          const record = this.actors.get(actorId);
-          if (!record || record.status !== "active") continue;
-          const head = obligations.get(headId);
-          if (!head) continue;
-          this.deliverReadyHeadAttention(
-            actorId,
-            { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
-            null,
-            null
-          );
-        }
+      for (const { ownerId, headId, responsive } of obligations.readyHeadRecords()) {
+        if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+        const actorId = this.resolveThreadId(ownerId);
+        const record = this.actors.get(actorId);
+        if (!record || record.status !== "active") continue;
+        const head = obligations.get(headId);
+        if (!head) continue;
+        this.appendReadyHeadEntry(
+          actorId,
+          { id: head.id, intent: head.intent, responsive },
+          null,
+          null,
+          obligations.readyHeadEpoch
+        );
       }
     } catch (err) {
       this.log(
@@ -1631,7 +1616,7 @@ export class ActorMesh {
     // Nothing moved, it settled back where it started, or it ended with no head
     // at all — in the last case there is no obligation to point the actor at.
     if (!net || net.to === null || net.to.id === net.from) return;
-    this.appendReadyHeadEntry(actorId, net.to, net.from);
+    this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
   }
 
   /**
@@ -1650,17 +1635,31 @@ export class ActorMesh {
    * already handled. Keying on `previousHeadId -> head.id` makes that a
    * distinct transition, so the actor is woken again.
    *
-   * A restart or a replay of the same committed transition is still silent.
-   * The residual case — the identical transition recurring after the actor
-   * handled it — cannot be expressed in the id, and falls back to a live nudge:
-   * it wakes a running mesh but is not durable across a restart.
+   * Dedupe is scoped to the repository's epoch: the
+   * repository's sequence numbers restart at 1 on every boot, so a genuine
+   * repeated transition (the same `previousHeadId -> headId` recurring after a
+   * restart) reuses a triple a handled pre-restart entry already claimed. The
+   * epoch keeps that recurrence a distinct inbox entry instead of letting the
+   * conflict clause swallow a real wake — exactly-once within a repository
+   * lifetime. The accepted cost, per the operator ruling on
+   * #513 (recomputable table removed; process-local dedupe), is at most one
+   * duplicate attention entry when a committed transition is replayed across
+   * a restart. Boot reconciliation in {@link reconcileReadyHeads} likewise
+   * scopes its entry to the repository epoch, so a head that recurred
+   * after its transition's append was lost does not collide with an already-handled
+   * entry from an earlier process generation.
+   *
+   * A run-collapsed transition has no repository sequence. Repeating its
+   * identical net `previousHeadId -> headId` within one repository lifetime
+   * therefore remains deliberately deduplicated after the first entry.
    */
   deliverReadyHeadAttention(
     actorId: string,
     /** The new head, or null when the owner no longer has one. */
     head: { id: string; intent: string | null; responsive?: boolean } | null,
     previousHeadId: string | null = null,
-    sequence: number | null = null
+    sequence: number | null = null,
+    epoch: string = this.directReadyHeadEpoch
   ): boolean {
     actorId = this.resolveThreadId(actorId);
     // Mid-run: accumulate rather than deliver. `from` is fixed by the first
@@ -1668,27 +1667,31 @@ export class ActorMesh {
     // not where its last mutation happened to leave off.
     if (this.actorsInRun.has(actorId)) {
       const net = this.runHeadNet.get(actorId);
-      this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head });
+      this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head, epoch });
       return false;
     }
     if (head === null) return false;
-    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence);
+    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence, epoch);
   }
 
   private appendReadyHeadEntry(
     actorId: string,
     head: { id: string; intent: string | null; responsive?: boolean },
     previousHeadId: string | null,
-    sequence: number | null = null
+    sequence: number | null,
+    /** Epoch from the repository whose sequence produced this transition. */
+    epoch: string
   ): boolean {
     if (!this.inboxStore) return false;
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
-    // ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the prior entry remains.
+    // Live transitions and boot repairs are keyed on
+    // (repository epoch, transition, sequence): exactly-once within that
+    // repository lifetime, and never silently suppressed after its sequence
+    // restarts in a replacement repository (#513).
     const seqKey = sequence !== null ? `:${sequence}` : "";
     const entryId = deduplicatedInboxEntryId(
-      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
+      `obligation-head:${epoch}:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
       actorId
     );
     const responsive = head.responsive === true;

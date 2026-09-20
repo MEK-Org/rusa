@@ -5,6 +5,7 @@ import type { DriveClient } from "../drive/drive-client.js";
 import type { GmailClient } from "../email/gmail-client.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { McpServerSpec } from "../providers/types.js";
+import type { SlackClient } from "../slack/slack-client.js";
 import {
   CALENDAR_READ_MCP_NAME,
   CALENDAR_WRITE_MCP_NAME,
@@ -36,6 +37,7 @@ import {
   PNPM_HARDLINKS_MCP_NAME,
   type PnpmHardlinksToolDeps,
 } from "./pnpm-hardlinks-mcp.js";
+import { createSlackWriteMcpServer, SLACK_WRITE_MCP_NAME } from "./slack-mcp.js";
 import {
   createUnderstandingWriteServer,
   UNDERSTANDING_WRITE_MCP_NAME,
@@ -67,6 +69,7 @@ export interface GrantableServerDeps {
   onCalendarRead?: (actorId: string, observation: CalendarReadObservation) => void;
   onCalendarWrite?: (actorId: string, observation: CalendarWriteObservation) => void;
   chatClient?: ChatClient;
+  slackClient?: SlackClient;
   onChatWrite?: (actorId: string) => void;
   /** Provider selection currently executing for each actor. */
   getRunSelectionForActor: (actorId: string) => RawProviderModelConfig | undefined;
@@ -204,6 +207,16 @@ export function buildGrantableServers(
       });
     });
   }
+  if (deps.slackClient) {
+    map.set(SLACK_WRITE_MCP_NAME, (_selfId, params, options) => {
+      if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
+      return createSlackWriteMcpServer(
+        deps.slackClient,
+        params.includes("*") ? "all" : params,
+        options?.isFenced
+      );
+    });
+  }
   const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;
   if (updateToolDepsFor) {
     map.set(UPDATE_MCP_NAME, (selfId) => createUpdateMcpServer(updateToolDepsFor(selfId), selfId));
@@ -290,6 +303,8 @@ export async function handleCapabilityRevoked(
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("slack-write:")) {
+      baseCapability = "slack-write";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -302,6 +317,7 @@ export async function handleCapabilityRevoked(
 
     if (
       baseCapability === "chat-write" ||
+      baseCapability === "slack-write" ||
       baseCapability === "calendar-read" ||
       baseCapability === "calendar-write" ||
       baseCapability === "email-send" ||

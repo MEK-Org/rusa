@@ -173,10 +173,8 @@ Future<String?> _applyBranding() async {
   return name is String && name.trim().isNotEmpty ? name : null;
 }
 
-/// The public shell intentionally omits this link: the manifest is branded
-/// instance metadata and the server returns it only to an authenticated user.
-/// Installing it after the authenticated fetch lets the browser load PWA
-/// metadata without an initial 401 being cached as its manifest result.
+/// Refresh the public manifest after sign-in, including for a cached shell
+/// from a version that omitted its manifest link before authentication.
 void _installAuthenticatedManifest() {
   final head = web.document.head;
   if (head == null) return;

@@ -57,6 +57,62 @@ describe("loadConfig deployBranch", () => {
   });
 });
 
+describe("loadConfig Slack", () => {
+  it("accepts host token paths", () => {
+    const config = loadConfig(
+      writeConfig({
+        slack: {
+          appTokenPath: "/tmp/app-token",
+          botTokenPath: "/tmp/bot-token",
+        },
+      })
+    );
+    expect(config.slack?.botTokenPath).toBe("/tmp/bot-token");
+  });
+
+  it("rejects channel restrictions until they are supported", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          slack: {
+            appTokenPath: "/tmp/app-token",
+            botTokenPath: "/tmp/bot-token",
+            channels: ["C123ABC"],
+          },
+        })
+      )
+    ).toThrow(/slack.channels is not supported yet/);
+  });
+
+  it("rejects incomplete credentials", () => {
+    expect(() => loadConfig(writeConfig({ slack: { botTokenPath: "/tmp/bot-token" } }))).toThrow(
+      /slack.appTokenPath/
+    );
+  });
+});
+
+describe("loadConfig error sink", () => {
+  const slack = { appTokenPath: "/tmp/app-token", botTokenPath: "/tmp/bot-token" };
+
+  it("accepts a configured writable Slack event source", () => {
+    const config = loadConfig(
+      writeConfig({ slack, observability: { errorSink: "slack:channels/C123" } })
+    );
+    expect(config.observability?.errorSink).toBe("slack:channels/C123");
+  });
+
+  it("keeps a legacy Google Chat error space valid during migration", () => {
+    const config = loadConfig(writeConfig({ chat: { errorChat: "spaces/AAAA" } }));
+    expect(config.chat?.errorChat).toBe("spaces/AAAA");
+  });
+
+  it("rejects a source whose integration is not configured", () => {
+    expect(() =>
+      loadConfig(writeConfig({ observability: { errorSink: "slack:channels/C123" } }))
+    ).toThrow(/no configured writer/);
+  });
+});
+
 describe("loadConfig geminiApiKey (optional)", () => {
   it("loads a config that omits geminiApiKey", () => {
     // writeConfig always injects the key, so build one without it directly.

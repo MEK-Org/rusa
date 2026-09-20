@@ -18,6 +18,7 @@ describe("reference grammar", () => {
       "github:MEK-Org/rusa/issues/33/comments/12345",
       "github:MEK-Org/rusa/pulls/76",
       "gchat:spaces/AAAA/messages/BBBB",
+      "slack:channels/C123/messages/1720000000.000001",
       "mesh:messages/abc-123",
       "mesh:actors/actor-1/inbox/entry-9",
     ]) {
@@ -49,6 +50,7 @@ describe("reference grammar", () => {
       "mesh: messages/1",
       "github:o/r/issues", // dangling collection with no id
       "gchat:spaces/AAAA/messages", // same
+      "slack:channels/C123/messages",
     ]) {
       expect(isReference(bad), bad).toBe(false);
     }
@@ -85,6 +87,13 @@ describe("reference grammar", () => {
 
     expect(referenceParent(parseReference("gchat:spaces/A/messages/B"))?.key).toBe(
       "gchat:spaces/A"
+    );
+    expect(
+      referenceParent(parseReference("slack:channels/C123/messages/1720000000.000001"))?.key
+    ).toBe("slack:channels/C123");
+    expect(referenceParent(parseReference("slack:channels/C123"))?.key).toBe("slack:channels");
+    expect(referenceUrl(parseReference("slack:channels/C123/messages/1720000000.000001"))).toBe(
+      "https://app.slack.com/archives/C123/p1720000000000001"
     );
   });
 
