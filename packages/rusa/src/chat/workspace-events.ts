@@ -22,6 +22,11 @@ const RETRY_BACKOFF_MS = 5_000;
 const MAX_RETRY_BACKOFF_MS = 5 * 60_000;
 /** Repeat the lapse alert at most hourly while recovery keeps failing. */
 const ALERT_COOLDOWN_MS = 60 * 60_000;
+/**
+ * How long an accepted create is trusted to show up in `list()` before the
+ * next failed pass creates again (a duplicate the following pass then prunes).
+ */
+const CREATE_VISIBILITY_WINDOW_MS = 60_000;
 
 /**
  * The fields of the API's `Subscription` resource this module reads. `state` is
@@ -102,6 +107,8 @@ export class WorkspaceEventsSubscriber {
    */
   private lastConfirmedActiveAt: number;
   private lastAlertAt: number | null = null;
+  /** When the API last accepted a create whose subscription `list()` has not shown yet. */
+  private createAcceptedAt: number | null = null;
 
   constructor(private readonly opts: WorkspaceEventsSubscriberOptions) {
     this.logger = opts.logger;
@@ -199,7 +206,6 @@ export class WorkspaceEventsSubscriber {
   private async ensure(): Promise<void> {
     const matches = await this.list();
     const now = Date.now();
-    this.seedConfirmationFromListed(matches);
     // The API does not promise list order, so rank rather than take the first:
     // an ACTIVE subscription is already delivering and beats one that would
     // first need reactivating.
@@ -208,6 +214,8 @@ export class WorkspaceEventsSubscriber {
 
     // Prune the rest: duplicates double-deliver every message, and an expired
     // subscription can't be renewed (the API refuses a TTL update past expiry).
+    // Whatever survives the prune is what delivery rests on.
+    const delivering = keep ? [keep] : [];
     for (const extra of matches) {
       if (extra === keep || !extra.name) continue;
       const reason = isLapsed(extra, now) ? "lapsed" : "duplicate";
@@ -219,6 +227,7 @@ export class WorkspaceEventsSubscriber {
           reason,
         });
       } catch (err) {
+        if (reason === "duplicate" && extra.state === "ACTIVE") delivering.push(extra);
         this.logger?.warn("chat_subscription_prune_failed", {
           topic: this.opts.topic,
           subscriptionName: extra.name,
@@ -227,6 +236,8 @@ export class WorkspaceEventsSubscriber {
         });
       }
     }
+    // With nothing delivering, the lapsed leftovers say when delivery stopped.
+    this.seedConfirmationFromListed(delivering.length > 0 ? delivering : matches);
 
     if (!keep?.name) {
       this.subscriptionName = null;
@@ -270,17 +281,19 @@ export class WorkspaceEventsSubscriber {
     this.subscriptionName = subscriptionName;
     this.lastConfirmedActiveAt = Date.now();
     this.lastAlertAt = null;
+    this.createAcceptedAt = null;
     this.logger?.info(event, { topic: this.opts.topic, subscriptionName, ttl: TTL });
   }
 
   /**
-   * The latest listed `expireTime` is when delivery stops if nothing is
-   * confirmed first, so the confirmation baseline can be no later than one TTL
-   * before it. Only ever moves the baseline earlier (see `lastConfirmedActiveAt`).
+   * The latest `expireTime` among the subscriptions delivery rests on is when it
+   * stops if nothing is confirmed first, so the confirmation baseline can be no
+   * later than one TTL before it. Only ever moves the baseline earlier (see
+   * `lastConfirmedActiveAt`).
    */
-  private seedConfirmationFromListed(matches: readonly WeSubscription[]): void {
+  private seedConfirmationFromListed(delivering: readonly WeSubscription[]): void {
     let latestExpiry = Number.NEGATIVE_INFINITY;
-    for (const subscription of matches) {
+    for (const subscription of delivering) {
       const expiresAt = subscription.expireTime ? Date.parse(subscription.expireTime) : NaN;
       if (Number.isFinite(expiresAt)) latestExpiry = Math.max(latestExpiry, expiresAt);
     }
@@ -304,6 +317,19 @@ export class WorkspaceEventsSubscriber {
   }
 
   private async create(previousNames: Set<string>): Promise<string> {
+    // An accepted create that list() has not shown yet is waited for, not
+    // repeated: each retry's list() adopts it once it appears. Past the window
+    // the pass creates again and a later pass prunes any duplicate.
+    const now = Date.now();
+    if (
+      this.createAcceptedAt !== null &&
+      now - this.createAcceptedAt < CREATE_VISIBILITY_WINDOW_MS
+    ) {
+      throw new Error(
+        `subscription create accepted ${Math.floor((now - this.createAcceptedAt) / 1_000)}s ago but not yet visible in list()`
+      );
+    }
+    this.createAcceptedAt = null;
     const body = {
       targetResource: CHAT_TARGET,
       eventTypes: [MESSAGE_CREATED],
@@ -314,19 +340,26 @@ export class WorkspaceEventsSubscriber {
     };
     // create returns a long-running operation that normally completes inline
     // with the Subscription as its response. Prefer that name; when the
-    // operation is still pending, fall back to the newly visible subscription in
-    // list(). If it is not visible yet, fail this pass rather than create again:
-    // the retry's list() adopts it once it appears.
+    // operation is still pending, fall back to the newly visible subscription
+    // in list(), and otherwise fail this pass with the create held as accepted.
     const operation = (await this.request("POST", "/subscriptions", body)) as {
       done?: boolean;
       response?: { name?: string };
+      error?: { code?: number; message?: string };
     };
+    if (operation.error) {
+      throw new Error(
+        `subscription create operation failed: ${operation.error.message ?? "unknown"}`
+      );
+    }
     if (operation.done && operation.response?.name) return operation.response.name;
+    this.createAcceptedAt = now;
     const matches = await this.list();
     const name = matches.find(
       (subscription) => subscription.name && !previousNames.has(subscription.name)
     )?.name;
     if (!name) throw new Error("subscription create accepted but not yet visible in list()");
+    this.createAcceptedAt = null;
     return name;
   }
 

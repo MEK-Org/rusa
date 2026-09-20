@@ -16,6 +16,7 @@ const HOUR = 60 * MINUTE;
 const TTL_MS = 4 * HOUR;
 const FIRST_RETRY_MS = 5 * SECOND;
 const MAX_RETRY_MS = 5 * MINUTE;
+const CREATE_VISIBILITY_WINDOW_MS = MINUTE;
 
 interface FakeSub {
   name: string;
@@ -51,6 +52,8 @@ class FakeWeApi {
    * response (the API's normal shape) or answers with a bare pending operation.
    */
   createResponseInline = true;
+  /** When set, the create operation completes with this error and no subscription. */
+  createOperationError: string | null = null;
   /** How many list() calls a newly created subscription stays invisible for. */
   createListLag = 0;
   private pending: Array<{ sub: FakeSub; listsUntilVisible: number }> = [];
@@ -78,6 +81,13 @@ class FakeWeApi {
     }
     if (method === "POST" && path === "/subscriptions") {
       if (this.createStatus !== null) return jsonResponse(this.createStatus, { error: "create" });
+      if (this.createOperationError !== null) {
+        return jsonResponse(200, {
+          name: "operations/op1",
+          done: true,
+          error: { code: 8, message: this.createOperationError },
+        });
+      }
       const sub: FakeSub = {
         name: `subscriptions/new-${this.seq++}`,
         state: "ACTIVE",
@@ -242,6 +252,57 @@ describe("WorkspaceEventsSubscriber", () => {
     expect(api.count("POST", "/subscriptions")).toBe(1);
     expect(api.subs).toHaveLength(1);
     expect(records.at(-1)?.event).toBe("chat_subscription_renewed");
+    await sub.close();
+  });
+
+  it("holds an accepted create across retries until it is listed, then creates again past the window", async () => {
+    vi.useFakeTimers();
+    // Visibility lag spanning two retries: the first retry still lists nothing,
+    // and must wait on the accepted create rather than POST a duplicate.
+    const api = new FakeWeApi([]);
+    api.createResponseInline = false;
+    api.createListLag = 2;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+
+    await sub.start();
+    await vi.advanceTimersByTimeAsync(FIRST_RETRY_MS);
+    expect(sub.currentSubscription).toBeNull();
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect((records.at(-1)?.fields?.err as Error).message).toMatch(/accepted 5s ago/);
+
+    await vi.advanceTimersByTimeAsync(2 * FIRST_RETRY_MS);
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(api.subs).toHaveLength(1);
+    await sub.close();
+
+    // Bounded: a create that never shows up is repeated once the window has
+    // passed (retries at 5, 15, 35 and 75 seconds after the accepted create).
+    const stuck = new FakeWeApi([]);
+    stuck.createResponseInline = false;
+    stuck.createListLag = 99;
+    const again = makeSubscriber(stuck);
+    await again.start();
+    await vi.advanceTimersByTimeAsync(CREATE_VISIBILITY_WINDOW_MS - FIRST_RETRY_MS);
+    expect(stuck.count("POST", "/subscriptions")).toBe(1);
+    await vi.advanceTimersByTimeAsync(8 * FIRST_RETRY_MS);
+    expect(stuck.count("POST", "/subscriptions")).toBe(2);
+    await again.close();
+  });
+
+  it("treats a failed create operation as a failure, not as an accepted create", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([]);
+    api.createOperationError = "quota exceeded";
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+
+    await sub.start();
+    expect((records.at(-1)?.fields?.err as Error).message).toMatch(/quota exceeded/);
+    // Nothing was accepted, so the retry creates again right away.
+    await vi.advanceTimersByTimeAsync(FIRST_RETRY_MS);
+    expect(api.count("POST", "/subscriptions")).toBe(2);
     await sub.close();
   });
 
@@ -536,6 +597,72 @@ describe("WorkspaceEventsSubscriber", () => {
     await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]?.elapsedSeconds).toBeGreaterThanOrEqual(14400);
+    await sub.close();
+  });
+
+  it("times the lapse from the kept subscription, not from a suspended leftover that expires later", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    // Restart onto a SUSPENDED leftover that stays listed until 15:00 (its
+    // prune keeps failing) beside the ACTIVE subscription delivery actually
+    // rests on, expiring 12:30. The leftover delivers nothing, so its later
+    // expiry must not delay the alert.
+    const api = new FakeWeApi([
+      {
+        ...activeSub("subscriptions/susp"),
+        state: "SUSPENDED",
+        expireTime: "2026-09-19T15:00:00.000Z",
+      },
+      { ...activeSub("subscriptions/live"), expireTime: "2026-09-19T12:30:00.000Z" },
+    ]);
+    const inner = api.fetch;
+    api.fetch = async (url, init) =>
+      init?.method === "DELETE" ? jsonResponse(500, { error: "boom" }) : inner(url, init);
+    api.renewStatus = 500;
+    api.createStatus = 500;
+    const sub = makeSubscriber(api, {
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+    await sub.start();
+    expect(sub.currentSubscription).toBe("subscriptions/live");
+
+    await vi.advanceTimersByTimeAsync(30 * MINUTE - SECOND);
+    expect(alerts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
+    expect(alerts).toHaveLength(1);
+    await sub.close();
+  });
+
+  it("extends the lapse horizon by an ACTIVE duplicate that could not be pruned", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    // Both subscriptions deliver; the duplicate's prune fails, so it keeps
+    // delivering until 13:00 after the kept one expires at 12:30.
+    const api = new FakeWeApi([
+      { ...activeSub("subscriptions/a"), expireTime: "2026-09-19T12:30:00.000Z" },
+      { ...activeSub("subscriptions/b"), expireTime: "2026-09-19T13:00:00.000Z" },
+    ]);
+    const inner = api.fetch;
+    api.fetch = async (url, init) =>
+      init?.method === "DELETE" || init?.method === "PATCH"
+        ? jsonResponse(500, { error: "boom" })
+        : inner(url, init);
+    api.createStatus = 500;
+    const sub = makeSubscriber(api, {
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+    await sub.start();
+
+    await vi.advanceTimersByTimeAsync(HOUR - SECOND);
+    expect(alerts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
+    expect(alerts).toHaveLength(1);
     await sub.close();
   });
 
