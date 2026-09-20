@@ -26,7 +26,6 @@ import {
   RunStartStaleProviderError,
 } from "./concurrency-limiter.js";
 import type { InjectRecord } from "./portable-context.js";
-import { appendFailedProviderStderr, ProviderStderrCapture } from "./provider-stderr.js";
 import {
   type ActorRunMode,
   isResponsiveNudge,
@@ -748,36 +747,32 @@ export class Actor {
     let built: PromptBuild;
     const runProvider = (provider: CodingProvider): Promise<RunResult> => {
       this.opts.onProviderAttempt?.(provider);
-      const stderr = new ProviderStderrCapture();
-      return provider
-        .run({
-          prompt: built.prompt,
-          cwd: this.opts.cwd,
-          // Continue this actor's own session (id undefined on first run → created).
-          session: { id: sessionId },
-          mcpServers: this.opts.mcpServers,
-          addDirs: this.opts.addDirs,
-          sandbox,
-          // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
-          // margin. The AbortController is the primary kill path; Node's spawn
-          // timeout is only a backstop for the rare case our abort fails to land.
-          timeoutMs: runTimeoutMs + 30_000,
-          signal: abortController.signal,
-          onChunk: (chunk: string) => {
-            // Once per RUN, not per provider attempt: `runWithFallback` can call
-            // runProvider again on a different model, and the question this answers
-            // is "when did this wake start producing output", not "when did each
-            // attempt". The flag lives in the run scope for that reason.
-            if (!firstChunkSeen) {
-              firstChunkSeen = true;
-              this.opts.onFirstChunk?.();
-            }
-            resetStallTimer();
-            this.opts.log?.(chunk);
-          },
-          onStderr: (chunk: string) => stderr.append(chunk),
-        })
-        .then((result) => appendFailedProviderStderr(result, stderr.render()));
+      return provider.run({
+        prompt: built.prompt,
+        cwd: this.opts.cwd,
+        // Continue this actor's own session (id undefined on first run → created).
+        session: { id: sessionId },
+        mcpServers: this.opts.mcpServers,
+        addDirs: this.opts.addDirs,
+        sandbox,
+        // timeoutMs: provider OS-level timeout is the actor ceiling plus a grace
+        // margin. The AbortController is the primary kill path; Node's spawn
+        // timeout is only a backstop for the rare case our abort fails to land.
+        timeoutMs: runTimeoutMs + 30_000,
+        signal: abortController.signal,
+        onChunk: (chunk: string) => {
+          // Once per RUN, not per provider attempt: `runWithFallback` can call
+          // runProvider again on a different model, and the question this answers
+          // is "when did this wake start producing output", not "when did each
+          // attempt". The flag lives in the run scope for that reason.
+          if (!firstChunkSeen) {
+            firstChunkSeen = true;
+            this.opts.onFirstChunk?.();
+          }
+          resetStallTimer();
+          this.opts.log?.(chunk);
+        },
+      });
     };
     const invoke = async (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
