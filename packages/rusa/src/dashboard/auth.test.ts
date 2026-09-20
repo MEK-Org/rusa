@@ -30,6 +30,8 @@ const config = {
     projectId: "project",
     apiKey: "public-key",
     authDomain: "project.firebaseapp.com",
+    appId: "app-id",
+    messagingSenderId: "sender-id",
     serviceAccountKeyPath: "/private/credential.json",
   },
 };
@@ -467,7 +469,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     }
   });
 
-  it("exposes only client-safe config and a generic login shell", async () => {
+  it("exposes only client-safe config and keeps dashboard APIs gated", async () => {
     const res = await fetch(`${origin}/api/auth/config`);
     expect(await res.json()).toEqual({
       enabled: true,
@@ -475,22 +477,46 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         projectId: "project",
         apiKey: "public-key",
         authDomain: "project.firebaseapp.com",
+        appId: "app-id",
+        messagingSenderId: "sender-id",
       },
     });
-    const shell = await fetch(`${origin}/actors/some-actor`);
-    expect(shell.headers.get("cache-control")).toBe("no-store");
-    const html = await shell.text();
-    expect(html).not.toContain(config.email);
-    // The login shell replaces Flutter's generated page, and bootDashboard() re-injects
-    // the loader by hand; both silently drift if the template ever needs more than that.
+    // Flutter owns the public sign-in shell; this source template is generic
+    // and contains no authentication bootstrap script.
     const template = readFileSync(
       new URL("../../flutter_dashboard/web/index.html", import.meta.url),
       "utf8"
     );
     expect(template.match(/<script[^>]*>/g)).toEqual(['<script src="flutter_bootstrap.js" async>']);
     expect(template).toContain('<base href="$FLUTTER_BASE_HREF">');
-    expect(html).toContain('<base href="/">');
-    expect(html).toContain('<script src="/dashboard-auth.js" defer>');
+    expect(template).not.toContain("dashboard-auth.js");
+    expect((await fetch(`${origin}/api/mesh/threads`)).status).toBe(401);
+    // The public Flutter shell remains generic; only a cookie-authenticated
+    // manifest response may contain the configured instance branding.
+    expect((await fetch(`${origin}/manifest.json`)).status).toBe(401);
+  });
+
+  it("keeps legacy auth configuration bootable with FlutterFire metadata defaults", () => {
+    const {
+      appId: _appId,
+      messagingSenderId: _messagingSenderId,
+      ...legacyFirebase
+    } = config.firebase;
+    const legacy = new DashboardAuth(
+      { email: config.email, firebase: legacyFirebase },
+      firebase,
+      new DashboardIdentityResolver(() => principals, legacyFirebase.projectId),
+      () => now
+    );
+
+    expect(legacy.clientConfig()).toMatchObject({
+      enabled: true,
+      firebase: {
+        projectId: "project",
+        appId: "",
+        messagingSenderId: "",
+      },
+    });
   });
 
   it.each([

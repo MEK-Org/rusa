@@ -35,14 +35,28 @@ export function validateDashboardAuth(
       throw new Error("config.yaml: duplicate auth.allowedEmails entry");
     value.allowedEmails = emails;
   }
-  const fields = ["projectId", "apiKey", "authDomain", "serviceAccountKeyPath"];
+  const requiredFields = ["projectId", "apiKey", "authDomain", "serviceAccountKeyPath"];
+  // FirebaseOptions makes these non-nullable in Dart, but Firebase Auth on the
+  // web neither consumes nor validates them. Keep legacy auth configurations
+  // deployable; DashboardAuth.clientConfig supplies the empty-string values the
+  // Flutter constructor needs when the optional metadata is absent.
+  const optionalWebMetadata = ["appId", "messagingSenderId"];
+  const fields = [...requiredFields, ...optionalWebMetadata];
   if (Object.keys(value.firebase).some((key) => !fields.includes(key))) {
     throw new Error("config.yaml: unknown auth.firebase field");
   }
-  for (const key of fields) {
+  for (const key of requiredFields) {
     const field = value.firebase[key];
     if (typeof field !== "string" || !field.trim()) {
       throw new Error(`config.yaml: auth.firebase.${key} must be a non-empty string`);
+    }
+    value.firebase[key] = field.trim();
+  }
+  for (const key of optionalWebMetadata) {
+    const field = value.firebase[key];
+    if (field === undefined) continue;
+    if (typeof field !== "string" || !field.trim()) {
+      throw new Error(`config.yaml: auth.firebase.${key} must be a non-empty string when set`);
     }
     value.firebase[key] = field.trim();
   }

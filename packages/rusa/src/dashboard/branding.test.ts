@@ -8,6 +8,7 @@ import {
   type DashboardBranding,
   formatBrandName,
   hasBranding,
+  removeManifestLink,
   resolveDashboardBranding,
 } from "./branding.js";
 
@@ -31,12 +32,12 @@ const BUILT_INDEX_HTML = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="description" content="Rusa actor mesh dashboard.">
   <meta name="theme-color" content="#38bdf8">
+  <link rel="manifest" href="manifest.json">
   <meta name="apple-mobile-web-app-title" content="Rusa">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
   <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
   <link rel="icon" type="image/png" href="favicon.png"/>
   <title>Rusa</title>
-  <link rel="manifest" href="manifest.json">
 </head>
 <body>
   <script src="flutter_bootstrap.js" async></script>
@@ -196,8 +197,9 @@ describe("applyBrandingToHtml", () => {
       '<link rel="icon" type="image/png" href="/api/mesh/avatar/root.png?v=7-16"/>'
     );
     expect(html).toContain('<link rel="apple-touch-icon" href="/api/mesh/avatar/root.png?v=7-16">');
-    // The manifest link is not an icon link and must survive.
-    expect(html).toContain('<link rel="manifest" href="manifest.json">');
+    // Local-mode shells keep their normal PWA manifest; auth-mode serving strips
+    // it separately before an anonymous client can request branded metadata.
+    expect(html).toContain('rel="manifest"');
   });
 
   it("keeps the bundled icons when the shell has no head to re-anchor them to", () => {
@@ -208,6 +210,15 @@ describe("applyBrandingToHtml", () => {
   it("is a no-op for tags a future Flutter shell no longer emits", () => {
     const minimal = "<html><head></head><body></body></html>";
     expect(applyBrandingToHtml(minimal, named)).toBe(minimal);
+  });
+});
+
+describe("removeManifestLink", () => {
+  it("removes only the manifest link from an anonymous auth shell", () => {
+    const html = removeManifestLink(BUILT_INDEX_HTML);
+    expect(html).not.toContain('rel="manifest"');
+    expect(html).toContain('rel="apple-touch-icon"');
+    expect(html).toContain("<title>Rusa</title>");
   });
 });
 

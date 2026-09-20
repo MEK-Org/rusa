@@ -22,7 +22,13 @@ it("uses a demo project and advertises the emulator without credentials", async 
   try {
     expect(auth.clientConfig()).toEqual({
       enabled: true,
-      firebase: { projectId: "demo-rusa-auth", apiKey: "e2e-key", authDomain: "localhost" },
+      firebase: {
+        projectId: "demo-rusa-auth",
+        apiKey: "e2e-key",
+        authDomain: "localhost",
+        appId: "e2e-app-id",
+        messagingSenderId: "e2e-sender-id",
+      },
       emulatorUrl: "http://127.0.0.1:9099",
     });
     expect(process.env.FIREBASE_AUTH_EMULATOR_HOST).toBe("127.0.0.1:9099");
