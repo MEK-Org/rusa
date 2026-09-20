@@ -1699,16 +1699,28 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/events?actors=&limit=&before=&kinds=&conversation= — merged, newest-first.
   // GET /api/mesh/events?since=<ISO>&until=<ISO>&limit= — ALL actors, oldest-first,
-  //   the half-open window [since, until) (until optional; the IU distiller's
-  //   mesh_events read, ISSUE_NUM 2a). Takes precedence over the actor/before path.
+  //   the half-open window [since, until) (until optional; the dashboard's
+  //   Yields view reads it). Takes precedence over the actor/before path.
+  //
+  // Both branches carry the joined mesh_chat body, and this route is a human
+  // dashboard session throughout (no machine principal reaches it), so both
+  // are scoped to the viewing human: choosing a `since` window is not a way
+  // around the actor path's isolation (#590).
   if (pathname === "/api/mesh/events") {
+    const humanViewerIds = [...resolveHumanChatScope(req, deps.principals).viewerIds];
     const since = url.searchParams.get("since");
     if (since) {
-      const until = url.searchParams.get("until") ?? undefined;
-      const kinds = parseKinds(url);
       const rawOrder = url.searchParams.get("order");
-      const order = rawOrder === "desc" ? "desc" : "asc";
-      sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
+      sendJson(
+        res,
+        200,
+        meshEvents.listEventsSince(since, clampLimit(url), {
+          until: url.searchParams.get("until") ?? undefined,
+          kinds: parseKinds(url),
+          order: rawOrder === "desc" ? "desc" : "asc",
+          humanViewerIds,
+        })
+      );
       return true;
     }
     const actors = parseActors(url);
@@ -1718,10 +1730,7 @@ export async function handleMeshApiRequest(
       before: parsePositiveInt(url, "before") ?? null,
       kinds: parseKinds(url),
       conversation,
-      // Message events carry the joined mesh_chat body, so another human's
-      // conversation with a selected actor is excluded here, not just on the
-      // chat route (#590).
-      humanViewerIds: [...resolveHumanChatScope(req, deps.principals).viewerIds],
+      humanViewerIds,
     });
     sendJson(res, 200, page);
     return true;

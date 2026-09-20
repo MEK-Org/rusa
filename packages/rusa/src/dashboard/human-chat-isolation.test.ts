@@ -271,6 +271,7 @@ describe("human chat isolation (#590)", () => {
 
   type ChatPage = { chat: Array<{ senderId: string; recipientId: string; body: string }> };
   type EventPage = { events: Array<{ kind: string; actorId: string | null; body: string | null }> };
+  type WindowPage = EventPage & { hasMore: boolean };
   type InboxPage = {
     entries: Array<{
       payload: Record<string, unknown>;
@@ -390,6 +391,35 @@ describe("human chat isolation (#590)", () => {
     expect(bodies).not.toContain("reply to bob");
     // Not merely redacted: the other human's message events are not in the feed.
     expect(JSON.stringify(feed.body)).not.toContain(b.id);
+  });
+
+  it("keeps another human's messages out of the since-window event feed", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    await seedBothConversations(a, b);
+    record(ACTOR, PEER, "root to child");
+    meshEvents.record({ kind: "actor_spawned", actorId: PEER, detail: "spawned" });
+
+    // The window read spans every actor with no `actors` filter, so it is the
+    // obvious way around the actor path's scoping if it goes unscoped.
+    const window = "2000-01-01T00:00:00.000Z";
+    const feed = await getJson<WindowPage>(`/api/mesh/events?since=${window}`, a.cookie);
+    expect(feed.status).toBe(200);
+    const bodies = feed.body.events.map((e) => e.body);
+    expect(bodies).toContain("alice asks");
+    expect(bodies).toContain("reply to alice");
+    expect(bodies).toContain("root to child");
+    expect(feed.body.events.map((e) => e.kind)).toContain("actor_spawned");
+    expect(bodies).not.toContain("bob asks");
+    expect(bodies).not.toContain("reply to bob");
+    // Not merely body-redacted: bob's message events are not in the window at
+    // all, so nothing says he talks to this actor or how often.
+    expect(JSON.stringify(feed.body)).not.toContain(b.id);
+
+    // And the same window read is bob's own conversation for bob.
+    const bobFeed = await getJson<WindowPage>(`/api/mesh/events?since=${window}`, b.cookie);
+    expect(bobFeed.body.events.map((e) => e.body)).toContain("bob asks");
+    expect(JSON.stringify(bobFeed.body)).not.toContain(a.id);
   });
 
   it("keeps a legacy message event with no mesh_chat row out of another human's feed", async () => {

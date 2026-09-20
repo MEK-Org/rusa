@@ -190,26 +190,36 @@ export class MeshEventRepository {
   }
 
   /**
-   * Forward, all-actors **windowed** scan — the nightly distiller's mesh_events read
-   * (ISSUE_NUM phase 2a), served via `GET /api/mesh/events?since=&until=`. Events in the
-   * half-open window `[sinceISO, untilISO)` (`untilISO` optional — omitted = open-
-   * ended, today's behavior), oldest-first (ISO sorts chronologically; `rowid`
-   * breaks ties), capped at `limit`. `hasMore` is true when more matched than
-   * `limit`. The `until` upper bound lets the distiller fix an **atomic window** at
-   * run start so a run never sees events that stream in mid-run (Operator's atomicity
-   * point). Unlike {@link listEventsByActors} this spans ALL actors + reads forward.
+   * Forward, all-actors **windowed** scan, served via
+   * `GET /api/mesh/events?since=&until=` — the dashboard's window read (the
+   * Yields view asks it for recent `run_yielded` events). Events in the
+   * half-open window `[since, until)` (`until` optional — omitted = open-
+   * ended), oldest-first (ISO sorts chronologically; `rowid` breaks ties),
+   * capped at `limit`. `hasMore` is true when more matched than `limit`. The
+   * `until` upper bound lets a caller fix an atomic window at the start of a
+   * pass so it never sees events that stream in mid-pass. Unlike
+   * {@link listEventsByActors} this spans ALL actors + reads forward; like it,
+   * `humanViewerIds` scopes message events to one human viewer (#590), since
+   * this read joins `mesh_chat.body` too and the route serving it is a
+   * human dashboard session. The distiller's own replay read is
+   * {@link listEventsWindow}, reached through its dedicated capability rather
+   * than this HTTP route, and stays unscoped.
    */
   listEventsSince(
     sinceISO: string,
     limit: number,
-    untilISO?: string,
-    kinds?: string[],
-    order: "asc" | "desc" = "asc"
+    opts: {
+      until?: string;
+      kinds?: string[];
+      order?: "asc" | "desc";
+      humanViewerIds?: readonly string[];
+    } = {}
   ): { events: MeshEvent[]; hasMore: boolean } {
     if (limit <= 0) return { events: [], hasMore: false };
+    const { until: untilISO, kinds, order = "asc" } = opts;
     const params: (string | number)[] = [sinceISO];
     let sql = `
-      SELECT e.*, c.body as chat_body 
+      SELECT e.*, c.body as chat_body
       FROM mesh_events e
       LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
       WHERE e.ts >= ?
@@ -217,6 +227,9 @@ export class MeshEventRepository {
     if (untilISO != null) {
       sql += ` AND e.ts < ?`;
       params.push(untilISO);
+    }
+    if (opts.humanViewerIds) {
+      sql += ` AND ${humanReadableMessageSql(opts.humanViewerIds, params)}`;
     }
     if (kinds && kinds.length > 0) {
       sql += ` AND e.kind IN (${kinds.map(() => "?").join(", ")})`;
@@ -397,19 +410,7 @@ export class MeshEventRepository {
     }
 
     if (opts.humanViewerIds) {
-      // Bounded: the viewer's own ids (at most a durable id and the alias)
-      // per participant column, never one parameter per known human.
-      const viewers = opts.humanViewerIds;
-      const readable = (participant: string): string => {
-        const mine =
-          viewers.length > 0 ? ` OR ${participant} IN (${viewers.map(() => "?").join(", ")})` : "";
-        params.push(...viewers, HUMAN_OPERATOR);
-        return `(${participant} IS NULL${mine} OR (${participant} != ? AND ${participant} NOT IN (SELECT id FROM principals WHERE kind = 'user')))`;
-      };
-      sql += ` AND (e.kind NOT IN ('message_sent', 'message_received')
-        OR (c.id IS NOT NULL AND ${readable("c.sender_id")} AND ${readable("c.recipient_id")})
-        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("json_extract(e.payload, '$.to')")} AND ${readable("json_extract(e.payload, '$.from')")})
-      )`;
+      sql += ` AND ${humanReadableMessageSql(opts.humanViewerIds, params)}`;
     }
 
     if (opts.kinds && opts.kinds.length > 0) {
@@ -450,6 +451,37 @@ export class MeshEventRepository {
       .all() as { actorId: string; ts: string }[];
     return new Map(rows.map((r) => [r.actorId, r.ts]));
   }
+}
+
+/**
+ * The one human-visibility predicate for a viewer-facing event read (#590),
+ * shared by {@link MeshEventRepository.listEventsByActors} and
+ * {@link MeshEventRepository.listEventsSince} so the two dashboard event
+ * routes cannot drift: whichever one a human asks, the same message events
+ * are readable. Written against the `mesh_events e` / `mesh_chat c` aliases
+ * both reads use, and it appends its host parameters to `params` in the order
+ * the returned SQL binds them, so callers must splice it into the statement at
+ * the point they call it.
+ *
+ * Bounded by construction: the viewer's own ids (at most a durable id and the
+ * legacy alias) per participant column, never one parameter per known human.
+ * An empty `viewerIds` — a viewer who cannot be identified — reads actor↔actor
+ * traffic alone.
+ */
+function humanReadableMessageSql(
+  viewerIds: readonly string[],
+  params: (string | number)[]
+): string {
+  const readable = (participant: string): string => {
+    const mine =
+      viewerIds.length > 0 ? ` OR ${participant} IN (${viewerIds.map(() => "?").join(", ")})` : "";
+    params.push(...viewerIds, HUMAN_OPERATOR);
+    return `(${participant} IS NULL${mine} OR (${participant} != ? AND ${participant} NOT IN (SELECT id FROM principals WHERE kind = 'user')))`;
+  };
+  return `(e.kind NOT IN ('message_sent', 'message_received')
+        OR (c.id IS NOT NULL AND ${readable("c.sender_id")} AND ${readable("c.recipient_id")})
+        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("json_extract(e.payload, '$.to')")} AND ${readable("json_extract(e.payload, '$.from')")})
+      )`;
 }
 
 /**
