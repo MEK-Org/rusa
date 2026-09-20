@@ -1,7 +1,7 @@
-import type { InboxStore } from "../actor/inbox-store.js";
 import type { ChatClient } from "../chat/types.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 import type { SlackClient } from "../slack/slack-client.js";
 import {
   asGitHubBranch,
@@ -61,7 +61,7 @@ export type ResolvedReferenceWithEntity = ResolvedReference & {
 
 export interface ReferenceResolverDeps {
   meshChat?: Pick<MeshChatRepository, "getById">;
-  inbox?: Pick<InboxStore, "read">;
+  inbox?: Pick<InboxRepository, "read">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
   chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
   slackClient?: Pick<SlackClient, "getMessage" | "getChannel">;

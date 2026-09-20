@@ -4,6 +4,7 @@ import type { ExperimentEnrollmentStore } from "../../actor/experiments.js";
 import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
+import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
@@ -11,7 +12,6 @@ import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repo
 import { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
 import { DbHostJobStore } from "./host-job-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
-import { InboxRepository } from "./inbox-repository.js";
 import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
@@ -25,6 +25,10 @@ import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
+import {
+  type InboxListenerErrorHandler,
+  SqliteInboxRepository,
+} from "./sqlite-inbox-repository.js";
 
 /**
  * Aggregate of the entity repositories the actor mesh + the retained
@@ -47,6 +51,12 @@ export class Repositories {
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
   readonly inbox: InboxRepository;
+  /**
+   * The same object as {@link inbox}, kept concretely so wiring that only the
+   * SQLite implementation offers stays reachable from the composition root
+   * without widening the abstract contract every other caller sees.
+   */
+  private readonly sqliteInbox: SqliteInboxRepository;
   readonly inboxFocus: InboxFocusRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
@@ -72,7 +82,8 @@ export class Repositories {
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
-    this.inbox = new InboxRepository(db);
+    this.sqliteInbox = new SqliteInboxRepository(db);
+    this.inbox = this.sqliteInbox;
     this.inboxFocus = new InboxFocusRepository(db);
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
@@ -99,6 +110,15 @@ export class Repositories {
   setOsScheduler(scheduler: ObligationActivationScheduler): void {
     this.obligations.setOsScheduler(scheduler);
   }
+
+  /**
+   * Journal failures of advisory `onItemsAppended` listeners. Built from a
+   * Database alone, the container has no logger of its own; without this line
+   * a listener that throws is contained and unrecorded.
+   */
+  setInboxListenerErrorHandler(handler: InboxListenerErrorHandler): void {
+    this.sqliteInbox.setListenerErrorHandler(handler);
+  }
 }
 
 export type {
@@ -114,7 +134,6 @@ export { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.
 export { DbHostJobStore } from "./host-job-repository.js";
 export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
 export { InboxFocusRepository } from "./inbox-focus-repository.js";
-export { InboxRepository } from "./inbox-repository.js";
 export { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 export { MaintenanceRepository } from "./maintenance-repository.js";
 export type { MeshChat } from "./mesh-chat-repository.js";
@@ -138,3 +157,5 @@ export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
 export { ReferenceCacheRepository } from "./reference-cache-repository.js";
 export { SqliteActorRepository } from "./sqlite-actor-repository.js";
+export type { InboxListenerErrorHandler } from "./sqlite-inbox-repository.js";
+export { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
