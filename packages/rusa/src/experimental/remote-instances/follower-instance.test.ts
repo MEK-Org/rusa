@@ -110,6 +110,303 @@ describe("monolithic follower instance", () => {
     expect(h.failures).toEqual([]);
   });
 
+  it("preempts an in-flight remote run only after the follower confirms it", async () => {
+    const h = setup({ delayMs: 500 });
+    const id = h.spawn("Replace this run");
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+
+    // The leader has handed a command to its transport, not claimed that an
+    // unseen follower/provider abort already happened.
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({
+        event: "remote_preempt_requested",
+        fields: expect.objectContaining({ actorId: id, phase: "running" }),
+      })
+    );
+    expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
+
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id &&
+          event.event.type === "preempted" &&
+          event.event.preempted &&
+          event.event.phase === "running"
+      )
+    );
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_preempted",
+        actorId: id,
+        detail: "running",
+        payload: JSON.stringify({ reason: "responsive_notification" }),
+      })
+    );
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id && event.event.type === "result" && event.event.result.success
+      )
+    );
+  });
+
+  it("promotes queued remote work through the leader-owned admission handle", async () => {
+    const h = setup({ delayMs: 500 });
+    const first = h.spawn("Occupy the ordinary admission lane");
+    await waitUntil(() => h.runtime(first).isRunning);
+    const queued = h.spawn("Promote me");
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
+    );
+    // Promotion carries the responsive truth across the admission seam: the
+    // follower reports the run at the priority the leader admitted it under.
+    expect(h.events).toContainEqual({
+      actorId: queued,
+      event: expect.objectContaining({ type: "runStart", responsive: true }),
+    });
+    expect(h.events.some((event) => event.actorId === first && event.event.type === "result")).toBe(
+      false
+    );
+    // Queue promotion is not a run abort, so it never impersonates a confirmed preemption.
+    expect(
+      h.meshEvents.some((event) => event.kind === "run_preempted" && event.actorId === queued)
+    ).toBe(false);
+  });
+
+  it("admits at responsive priority when the item lands before the admission request", async () => {
+    const h = setup({ delayMs: 500 });
+    const first = h.spawn("Occupy the ordinary admission lane");
+    await waitUntil(() => h.runtime(first).isRunning);
+    // Hold the follower's admission request on the wire: the leader has seen
+    // `state: queued` but holds no gate to promote yet.
+    const held: Parameters<typeof h.remote.receive>[0][] = [];
+    const receive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.message.type === "request" && event.message.request.op === "admit") {
+        held.push(event);
+        return;
+      }
+      receive(event);
+    };
+    const queued = h.spawn("Promote me before you admit me");
+    await waitUntil(() => h.runtime(queued).isQueued && held.length === 1);
+
+    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+    h.remote.receive = receive;
+    for (const event of held.splice(0)) receive(event);
+
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
+    );
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({
+        event: "remote_admission_promoted",
+        fields: expect.objectContaining({ actorId: queued }),
+      })
+    );
+    expect(h.events).toContainEqual({
+      actorId: queued,
+      event: expect.objectContaining({ type: "runStart", responsive: true }),
+    });
+    expect(h.events.some((event) => event.actorId === first && event.event.type === "result")).toBe(
+      false
+    );
+  });
+
+  it("re-decides a preemption requested during disconnect against the follower's reattach state", async () => {
+    const h = setup({ delayMs: 1500 });
+    const id = h.spawn("Survive the gap");
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    // A transport loss drops the leader's channel while the follower keeps
+    // executing the run it admitted. The responsive item arrives in the gap.
+    h.remote.close();
+    await h.runtime(id).exited;
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    // The handle retains nothing: the wake is reported dropped and the
+    // preemption is deferred until the follower says what it is doing.
+    await waitUntil(() =>
+      h.logs.some(
+        (log) =>
+          log.event === "remote_wake_dropped" &&
+          log.fields?.actorId === id &&
+          log.fields?.priority === "responsive"
+      )
+    );
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({
+        event: "remote_preempt_deferred",
+        fields: expect.objectContaining({ actorId: id }),
+      })
+    );
+    expect(h.logs.some((log) => log.event === "remote_preempt_requested")).toBe(false);
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    // What start.ts does on register: re-derive the wake from the durable inbox.
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id &&
+            event.event.type === "preempted" &&
+            event.event.preempted &&
+            event.event.phase === "running"
+        )
+    );
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({ kind: "run_preempted", actorId: id, detail: "running" })
+    );
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "runStart" && event.event.responsive
+        )
+    );
+  });
+
+  it("does not replay a preemption against a follower that reattaches idle", async () => {
+    const h = setup();
+    const id = h.spawn("Idle across the gap");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "result")
+    );
+    h.remote.close();
+    await h.runtime(id).exited;
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "runStart" && event.event.responsive
+        )
+    );
+    // Nothing was in flight, so nothing is asked to stop and nothing is booked as displaced.
+    expect(h.logs.some((log) => log.event === "remote_preempt_requested")).toBe(false);
+    expect(h.events.slice(beforeReattach).some((event) => event.event.type === "preempted")).toBe(
+      false
+    );
+    expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
+  });
+
+  it("runs a responsive replacement after a queued admission is rejected on reconnect", async () => {
+    const h = setup({ delayMs: 1500 });
+    const first = h.spawn("Occupy concurrency");
+    await waitUntil(() => h.runtime(first).isRunning);
+
+    const queued = h.spawn("Await admission");
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    // Responsive work arrives while awaiting admission
+    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+
+    // Disconnect while queued awaiting admission
+    h.remote.close();
+    await h.runtime(queued).exited;
+
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_abandoned",
+        actorId: queued,
+        detail: "start-cancelled",
+      })
+    );
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(first).attachHost(reconnect.createHost(first));
+    h.runtime(queued).attachHost(reconnect.createHost(queued));
+
+    // Prove a responsive replacement runs after the old admission rejection
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === queued && event.event.type === "runStart" && event.event.responsive
+        )
+    );
+  });
+
+  it("recovers a run admitted before a lease flap when disconnect abandons it at start", async () => {
+    const h = setup({ delayMs: 500 });
+
+    // Hold runStart to simulate the lease flap occurring after admission was
+    // granted by the leader but before the start was acknowledged across the wire.
+    let heldRunStart = false;
+    const receive = h.remote.receive.bind(h.remote);
+    h.remote.receive = (event) => {
+      if (event.message.type === "runStart") {
+        heldRunStart = true;
+        return;
+      }
+      receive(event);
+    };
+
+    const id = h.spawn("Admitted during flap");
+    await waitUntil(() => heldRunStart);
+
+    // Lease flap occurs: channel drops while admitted run is in-flight before start acknowledgment
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // The leader records run_abandoned with start-cancelled, started: false (exact fe5e367d pattern)
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({
+        kind: "run_abandoned",
+        actorId: id,
+        detail: "start-cancelled",
+      })
+    );
+
+    // Restore receiver for reconnect
+    h.remote.receive = receive;
+
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+
+    // What start.ts does on register: re-derives normal priority wake from durable inbox
+    h.mesh.notifyInboxChanged(id);
+
+    // Prove the replacement run executes after the old admission rejection and completes
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "runStart" && !event.event.responsive
+        )
+    );
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id && event.event.type === "result" && event.event.result.success
+        )
+    );
+  });
+
   it("rejects duplicate actor init without reconnect flag but permits reconnect", async () => {
     const h = setup();
     const id = h.spawn("Duplicate test");

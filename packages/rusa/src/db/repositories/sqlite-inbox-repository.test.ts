@@ -4,12 +4,14 @@ import { Actor } from "../../actor/actor.js";
 import { ActorMesh } from "../../actor/actor-mesh.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
+import type { InboxEntry } from "../../repositories/inbox-repository.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
-import { InboxRepository } from "./inbox-repository.js";
+import { Repositories } from "./index.js";
+import { SqliteInboxRepository } from "./sqlite-inbox-repository.js";
 
-describe("InboxRepository", () => {
+describe("SqliteInboxRepository", () => {
   it("treats an already-persisted deterministic id as an idempotent no-op", () => {
     const first = store.append([
       {
@@ -34,14 +36,14 @@ describe("InboxRepository", () => {
   });
 
   let db: Database.Database;
-  let store: InboxRepository;
+  let store: SqliteInboxRepository;
 
   beforeEach(() => {
     db = new Database(":memory:");
     actorInbox.up(db);
     actorInboxSeen.up(db);
     actorInboxHandledNote.up(db);
-    store = new InboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
+    store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
   });
 
   it("appends atomically and lists actor-bound entries newest first with opaque pagination", () => {
@@ -204,6 +206,223 @@ describe("InboxRepository", () => {
 
     store.markHandled("a", ["a-responsive"]);
     expect(store.actorsWithUnhandled()).toContainEqual({ actorId: "a", priority: "normal" });
+  });
+
+  describe("onItemsAppended", () => {
+    const entry = (id: string, actorId = "actor-a") => ({
+      id,
+      actorId,
+      source: "chat",
+      payload: { type: "message.created" },
+    });
+
+    it("notifies every subscriber with exactly the committed rows, after commit", () => {
+      const seen: Array<{ items: readonly InboxEntry[]; persisted: number }> = [];
+      const first = vi.fn((items: readonly InboxEntry[]) => {
+        // The listener reads durable state: the rows it was told about are
+        // already visible, so an immediate turnaround read cannot miss them.
+        seen.push({ items, persisted: store.countUnhandled("actor-a") });
+      });
+      const second = vi.fn();
+      store.onItemsAppended(first);
+      store.onItemsAppended(second);
+
+      // The duplicate id is a no-op insert and must not be announced.
+      store.append([entry("dup")]);
+      first.mockClear();
+      second.mockClear();
+      seen.length = 0;
+
+      const inserted = store.append([entry("dup"), entry("x"), entry("y")]);
+
+      expect(inserted.map((row) => row.id)).toEqual(["x", "y"]);
+      expect(first).toHaveBeenCalledTimes(1);
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(seen).toEqual([{ items: inserted, persisted: 3 }]);
+      expect(second).toHaveBeenCalledWith(inserted);
+      expect(store.list("actor-a", { status: "all" }).entries.map((row) => row.id)).toEqual([
+        "y",
+        "x",
+        "dup",
+      ]);
+    });
+
+    it("emits nothing when the batch is empty or every row was already present", () => {
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+      store.append([entry("known")]);
+      listener.mockClear();
+
+      expect(store.append([])).toEqual([]);
+      expect(store.append([entry("known")])).toEqual([]);
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("deduplicates same-batch IDs so exactly the committed row is returned and emitted", () => {
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+
+      const inserted = store.append([
+        { id: "batch-dup", actorId: "actor-a", source: "chat", payload: { type: "first" } },
+        { id: "batch-dup", actorId: "actor-b", source: "webhook", payload: { type: "second" } },
+      ]);
+
+      expect(inserted).toHaveLength(1);
+      expect(inserted[0]).toMatchObject({
+        id: "batch-dup",
+        actorId: "actor-a",
+        source: "chat",
+        payload: { type: "first" },
+      });
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith(inserted);
+      expect(store.read("actor-a", "batch-dup")).toMatchObject({
+        id: "batch-dup",
+        actorId: "actor-a",
+        payload: { type: "first" },
+      });
+      expect(store.read("actor-b", "batch-dup")).toBeNull();
+    });
+
+    it("emits nothing when validation rejects the batch before any write", () => {
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+
+      expect(() =>
+        store.append([entry("good"), { ...entry("bad"), payload: {} as never }])
+      ).toThrow(/payload\.type/);
+      expect(listener).not.toHaveBeenCalled();
+      expect(store.countUnhandled("actor-a")).toBe(0);
+    });
+
+    it("emits nothing when the write transaction itself rolls back", () => {
+      // A test-only trigger makes the second row fail mid-transaction so the
+      // whole batch, including the already-inserted first row, is rolled back.
+      db.exec(
+        `CREATE TRIGGER reject_poison BEFORE INSERT ON actor_inbox_entries
+         WHEN NEW.source = 'poison' BEGIN SELECT RAISE(ABORT, 'poison row'); END`
+      );
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+
+      expect(() => store.append([entry("good"), { ...entry("bad"), source: "poison" }])).toThrow(
+        /poison row/
+      );
+      expect(listener).not.toHaveBeenCalled();
+      expect(store.list("actor-a", { status: "all" }).entries).toEqual([]);
+      expect(store.actorsWithUnhandled()).toEqual([]);
+    });
+
+    it("refuses to append inside an enclosing transaction rather than defer notice to boot", () => {
+      // Nested in an outer transaction the write would be only a savepoint,
+      // so the after-commit notification could never be honest, and the only
+      // reconciliation of a silently deferred row is the next boot/resume
+      // sweep. Fail loudly before any write instead.
+      const listener = vi.fn();
+      store.onItemsAppended(listener);
+
+      expect(() =>
+        db.transaction(() => {
+          store.append([entry("nested")]);
+        })()
+      ).toThrow(/enclosing transaction/);
+      expect(listener).not.toHaveBeenCalled();
+      expect(store.list("actor-a", { status: "all" }).entries).toEqual([]);
+      expect(store.actorsWithUnhandled()).toEqual([]);
+      expect(db.inTransaction).toBe(false);
+    });
+
+    it("stops notifying an unsubscribed listener while others keep receiving", () => {
+      const stays = vi.fn();
+      const leaves = vi.fn();
+      const unsubscribe = store.onItemsAppended(leaves);
+      store.onItemsAppended(stays);
+
+      store.append([entry("one")]);
+      unsubscribe();
+      unsubscribe();
+      store.append([entry("two")]);
+
+      expect(leaves).toHaveBeenCalledTimes(1);
+      expect(stays).toHaveBeenCalledTimes(2);
+    });
+
+    it("contains a throwing subscriber: the write stands and later subscribers still run", () => {
+      const errors: unknown[] = [];
+      store.setListenerErrorHandler((error) => errors.push(error));
+      const after = vi.fn();
+      store.onItemsAppended(() => {
+        throw new Error("listener boom");
+      });
+      store.onItemsAppended(after);
+
+      const inserted = store.append([entry("kept")]);
+
+      expect(inserted.map((row) => row.id)).toEqual(["kept"]);
+      expect(after).toHaveBeenCalledWith(inserted);
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as Error).message).toBe("listener boom");
+      expect(store.read("actor-a", "kept")?.handledAt).toBeNull();
+      expect(store.actorsWithUnhandled()).toEqual([{ actorId: "actor-a", priority: "normal" }]);
+    });
+
+    it("reaches the journal the composition root wires, not only a test hook", () => {
+      // Repositories owns the concrete instance and exposes exactly this seam,
+      // which runStart points at the application logger; a listener failure is
+      // therefore recorded in the running service, not silently dropped.
+      const repositories = new Repositories(db);
+      const journaled: unknown[] = [];
+      repositories.setInboxListenerErrorHandler((error) => journaled.push(error));
+      repositories.inbox.onItemsAppended(() => {
+        throw new Error("listener boom");
+      });
+
+      const inserted = repositories.inbox.append([entry("kept-by-container")]);
+
+      expect(inserted.map((row) => row.id)).toEqual(["kept-by-container"]);
+      expect(journaled).toHaveLength(1);
+      expect((journaled[0] as Error).message).toBe("listener boom");
+    });
+
+    it("contains a throwing error reporter: write stands and later subscribers still run", () => {
+      store.setListenerErrorHandler(() => {
+        throw new Error("reporter exploded");
+      });
+      const after = vi.fn();
+      store.onItemsAppended(() => {
+        throw new Error("listener failed");
+      });
+      store.onItemsAppended(after);
+
+      let inserted: InboxEntry[] = [];
+      expect(() => {
+        inserted = store.append([entry("kept-despite-reporter-throw")]);
+      }).not.toThrow();
+
+      expect(inserted.map((row) => row.id)).toEqual(["kept-despite-reporter-throw"]);
+      expect(after).toHaveBeenCalledWith(inserted);
+      expect(store.read("actor-a", "kept-despite-reporter-throw")?.handledAt).toBeNull();
+    });
+
+    it("recovers through actorsWithUnhandled() when no notification was delivered", () => {
+      // Rows written before any listener existed, or whose callback was
+      // dropped, are still found by the durable boot reconciliation query.
+      store.append([entry("before-subscribe")]);
+      const dropped = vi.fn(() => {
+        throw new Error("dropped");
+      });
+      store.onItemsAppended(dropped);
+      store.append([entry("dropped-callback", "actor-b")]);
+      expect(dropped).toHaveBeenCalledTimes(1);
+
+      const reopened = new SqliteInboxRepository(db);
+      expect(reopened.actorsWithUnhandled()).toEqual([
+        { actorId: "actor-a", priority: "normal" },
+        { actorId: "actor-b", priority: "normal" },
+      ]);
+      expect(reopened.list("actor-a").entries.map((row) => row.id)).toEqual(["before-subscribe"]);
+      expect(reopened.list("actor-b").entries.map((row) => row.id)).toEqual(["dropped-callback"]);
+    });
   });
 
   it("handled_at changes only through actor mark_handled", async () => {
