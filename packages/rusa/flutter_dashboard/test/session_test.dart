@@ -433,4 +433,70 @@ void main() {
       await auth.close();
     },
   );
+  test('local mode never asks the server about a session', () async {
+    final session = LocalDashboardSession();
+
+    expect(session.authenticationEnabled, isFalse);
+    // A refused stream reconnect in local mode has nothing to check: there is
+    // no cookie session and no `/api/auth/session` route to ask.
+    await session.checkSession();
+
+    expect(session.status, DashboardSessionStatus.local);
+    expect(session.isIdle, isFalse);
+  });
+
+  test(
+    'a refused stream reconnect checks the session and only a 401 expires it',
+    () async {
+      final auth = _Auth(_User('restored-token'));
+      final client = _Client([
+        http.Response('{}', 200), // start()
+        http.Response('{}', 200), // still live
+        http.Response('{}', 401), // gone
+      ]);
+      final session = FirebaseDashboardSession(
+        auth,
+        client: client,
+        csrfToken: () => 'csrf',
+      );
+      session.start();
+      await Future<void>.delayed(Duration.zero);
+
+      await session.checkSession();
+      expect(session.status, DashboardSessionStatus.signedIn);
+      expect(auth.signOutCount, 0);
+
+      await session.checkSession();
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+      expect(client.paths, [
+        '/api/auth/session',
+        '/api/auth/session',
+        '/api/auth/session',
+      ]);
+
+      session.dispose();
+      await auth.close();
+    },
+  );
+
+  test('a failed session check keeps a signed-in user', () async {
+    final auth = _Auth(_User('restored-token'));
+    final session = FirebaseDashboardSession(
+      auth,
+      client: _Client([http.Response('{}', 200)]),
+      csrfToken: () => 'csrf',
+    );
+    session.start();
+    await Future<void>.delayed(Duration.zero);
+
+    // The fake client throws once its scripted responses run out.
+    await session.checkSession();
+
+    expect(session.status, DashboardSessionStatus.signedIn);
+    expect(auth.signOutCount, 0);
+
+    session.dispose();
+    await auth.close();
+  });
 }

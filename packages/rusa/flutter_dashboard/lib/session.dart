@@ -36,6 +36,12 @@ abstract class DashboardSession extends ChangeNotifier
   Future<void> signOut();
   Future<void> visit();
   void idleFromServer();
+
+  /// Asks the server whether the cookie session is still live and expires the
+  /// dashboard on a 401. Local mode has no session to check, so it never
+  /// issues a request; callers recovering from a refused stream reconnect rely
+  /// on that.
+  Future<void> checkSession();
 }
 
 class LocalDashboardSession extends DashboardSession {
@@ -74,6 +80,9 @@ class LocalDashboardSession extends DashboardSession {
 
   @override
   void idleFromServer() {}
+
+  @override
+  Future<void> checkSession() async {}
 }
 
 class FirebaseDashboardSession extends DashboardSession {
@@ -139,7 +148,7 @@ class FirebaseDashboardSession extends DashboardSession {
       return;
     }
     _markSignedIn();
-    unawaited(_checkSession());
+    unawaited(checkSession());
   }
 
   void _onAuthStateChanged(SessionUser? user) {
@@ -150,7 +159,7 @@ class FirebaseDashboardSession extends DashboardSession {
     }
     if (_status == DashboardSessionStatus.signedOut && !_creatingSession) {
       _markSignedIn();
-      unawaited(_checkSession());
+      unawaited(checkSession());
     }
   }
 
@@ -207,7 +216,8 @@ class FirebaseDashboardSession extends DashboardSession {
     ),
   );
 
-  Future<void> _checkSession() async {
+  @override
+  Future<void> checkSession() async {
     try {
       final response = await _client.get(Uri.base.resolve('/api/auth/session'));
       if (response.statusCode == 401) await _expire();

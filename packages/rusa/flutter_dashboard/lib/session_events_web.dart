@@ -89,20 +89,14 @@ class SessionEventSource {
       'error',
       ((web.Event _) {
         // CONNECTING is a native retry in progress; CLOSED means the server refused
-        // the reconnect. Only a 401 turns that refusal into a login prompt.
-        if (_source != source || source.readyState != web.EventSource.CLOSED) {
+        // the reconnect. Only a 401 turns that refusal into a login prompt, and
+        // local mode has no session to ask about.
+        if (!session.authenticationEnabled ||
+            _source != source ||
+            source.readyState != web.EventSource.CLOSED) {
           return;
         }
-        web.window
-            .fetch('/api/auth/session'.toJS, web.RequestInit(cache: 'no-store'))
-            .toDart
-            .then((response) {
-              if (response.status == 401) {
-                _disconnect();
-                unawaited(session.requireAuthentication());
-              }
-            })
-            .catchError((Object _) {});
+        unawaited(session.checkSession());
       }).toJS,
     );
     for (final entry in _listeners.entries) {
