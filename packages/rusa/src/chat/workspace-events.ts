@@ -37,7 +37,14 @@ interface WeSubscription {
   expireTime?: string;
 }
 
-export interface WorkspaceEventsLapseAlert {
+/**
+ * The subscription keeper's inbox payload, in the shape the host disk sensor
+ * already emits (`SystemDiskEvent`): the host wiring hands it to
+ * `deliverExternalEvent` unchanged, and scheduling priority is not part of it.
+ */
+export interface SystemChatSubscriptionLapseEvent {
+  [key: string]: unknown;
+  type: "system.chat_subscription_lapsed";
   topic: string;
   subscriptionName: string | null;
   expectedTtlSeconds: number;
@@ -60,7 +67,7 @@ export interface WorkspaceEventsSubscriberOptions {
    * Called once a full TTL has passed without a confirmed create or renew, i.e.
    * once delivery has certainly lapsed. Repeats at most hourly until recovery.
    */
-  onLapseAlert?: (alert: WorkspaceEventsLapseAlert) => Promise<void> | void;
+  onLapse?: (event: SystemChatSubscriptionLapseEvent) => Promise<void> | void;
 }
 
 /**
@@ -74,7 +81,7 @@ export interface WorkspaceEventsSubscriberOptions {
  * one, pruning duplicates and expired leftovers, and creating one when none is
  * usable. A failed pass is retried with bounded backoff rather than waiting for
  * the next renewal slot, and a full TTL without a confirmed create/renew raises
- * {@link WorkspaceEventsSubscriberOptions.onLapseAlert}.
+ * {@link WorkspaceEventsSubscriberOptions.onLapse}.
  */
 export class WorkspaceEventsSubscriber {
   private readonly logger?: Logger;
@@ -164,7 +171,8 @@ export class WorkspaceEventsSubscriber {
     if (this.lastAlertAt !== null && now - this.lastAlertAt < ALERT_COOLDOWN_MS) return;
 
     this.lastAlertAt = now;
-    const alert: WorkspaceEventsLapseAlert = {
+    const event: SystemChatSubscriptionLapseEvent = {
+      type: "system.chat_subscription_lapsed",
       topic: this.opts.topic,
       subscriptionName: this.subscriptionName,
       expectedTtlSeconds: MAX_TTL_SECONDS,
@@ -172,13 +180,13 @@ export class WorkspaceEventsSubscriber {
       message: formatLapseMessage(this.opts.topic, this.subscriptionName, elapsedSeconds),
     };
     this.logger?.error("chat_subscription_lapsed", {
-      topic: alert.topic,
-      subscriptionName: alert.subscriptionName,
+      topic: event.topic,
+      subscriptionName: event.subscriptionName,
       elapsedSeconds,
-      expectedTtlSeconds: alert.expectedTtlSeconds,
+      expectedTtlSeconds: event.expectedTtlSeconds,
     });
     try {
-      await this.opts.onLapseAlert?.(alert);
+      await this.opts.onLapse?.(event);
     } catch (err) {
       this.logger?.warn("chat_subscription_lapse_alert_failed", { topic: this.opts.topic, err });
     }

@@ -117,7 +117,7 @@ import { PubsubChatSource } from "../chat/pubsub-source.js";
 import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
 import {
-  type WorkspaceEventsLapseAlert,
+  type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
 } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
@@ -3936,24 +3936,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const oauth = new GchatOAuth(config.chat.gchatConfigDir);
         const topic = `projects/${config.chat.projectId}/topics/${config.chat.topic ?? "chat-events"}`;
         const chatLogger = log.child({ component: "chat" });
-        const onLapseAlert = async (alert: WorkspaceEventsLapseAlert) => {
+        const onLapse = async (event: SystemChatSubscriptionLapseEvent) => {
           const outcome = await deliverHostAlarm({
             deliver: () =>
               mesh.deliverExternalEvent({
                 sourceType: "timer",
                 rawResource: "system:events",
-                rawPayload: {
-                  type: "system.chat_subscription_lapsed",
-                  topic: alert.topic,
-                  subscriptionName: alert.subscriptionName,
-                  expectedTtlSeconds: alert.expectedTtlSeconds,
-                  elapsedSeconds: alert.elapsedSeconds,
-                  message: alert.message,
-                },
+                rawPayload: event,
                 priority: "responsive",
-                eventSummary: alert.message,
+                eventSummary: event.message,
               }),
-            message: alert.message,
+            message: event.message,
             sendToErrorChat,
             log: chatLogger,
             alarmName: "chat_subscription_lapse",
@@ -3961,7 +3954,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           if (outcome !== "delivered") {
             chatLogger.warn("chat_subscription_lapse_not_delivered_to_mesh", {
               fallback: outcome,
-              topic: alert.topic,
+              topic: event.topic,
             });
           }
         };
@@ -3969,7 +3962,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           topic,
           getToken: () => oauth.token(),
           logger: chatLogger,
-          onLapseAlert,
+          onLapse,
         });
         // Resolves whether or not the first pass succeeded: the subscriber logs
         // `chat_subscription_*` records and keeps retrying with backoff, so a

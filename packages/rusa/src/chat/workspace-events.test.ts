@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../observability/logger.js";
-import { type WorkspaceEventsLapseAlert, WorkspaceEventsSubscriber } from "./workspace-events.js";
+import {
+  type SystemChatSubscriptionLapseEvent,
+  WorkspaceEventsSubscriber,
+} from "./workspace-events.js";
 
 const TOPIC = "projects/p/topics/chat-events";
 const CHAT_TARGET = "//chat.googleapis.com/spaces/-";
@@ -145,7 +148,7 @@ function makeSubscriber(
   overrides: Partial<{
     renewIntervalMs: number;
     logger: Logger;
-    onLapseAlert: (alert: WorkspaceEventsLapseAlert) => Promise<void> | void;
+    onLapse: (event: SystemChatSubscriptionLapseEvent) => Promise<void> | void;
   }> = {}
 ) {
   return new WorkspaceEventsSubscriber({
@@ -461,7 +464,7 @@ describe("WorkspaceEventsSubscriber", () => {
 
   it("alerts once per hour after a TTL without a confirmed renewal, even while the subscription stays listed", async () => {
     vi.useFakeTimers();
-    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
     // The subscription keeps appearing in list() but every renewal fails with a
     // shape the subscriber does not recognise as "gone": only a confirmed
     // renewal may count as activity, or this lapse would never be reported.
@@ -470,8 +473,8 @@ describe("WorkspaceEventsSubscriber", () => {
     const { logger, records } = captureLogger();
     const sub = makeSubscriber(api, {
       logger,
-      onLapseAlert: (alert) => {
-        alerts.push(alert);
+      onLapse: (event) => {
+        alerts.push(event);
       },
     });
     await sub.start();
@@ -481,6 +484,9 @@ describe("WorkspaceEventsSubscriber", () => {
     await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toMatchObject({
+      // The payload the host hands to the mesh unchanged, so it asserts the
+      // event `type` the root inbox routes on alongside the diagnosis fields.
+      type: "system.chat_subscription_lapsed",
       topic: TOPIC,
       subscriptionName: "subscriptions/stuck",
       expectedTtlSeconds: 14400,
@@ -508,7 +514,7 @@ describe("WorkspaceEventsSubscriber", () => {
   it("alerts when an adopted subscription's own expireTime passes, not a TTL after boot", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
-    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
     // Restart onto a subscription that was last renewed elsewhere and has 30
     // minutes left; every renewal, and every replacement create once it has
     // expired, fails. Delivery stops at 12:30, so the alert must follow that
@@ -519,8 +525,8 @@ describe("WorkspaceEventsSubscriber", () => {
     api.renewStatus = 500;
     api.createStatus = 500;
     const sub = makeSubscriber(api, {
-      onLapseAlert: (alert) => {
-        alerts.push(alert);
+      onLapse: (event) => {
+        alerts.push(event);
       },
     });
     await sub.start();
@@ -535,12 +541,12 @@ describe("WorkspaceEventsSubscriber", () => {
 
   it("alerts with no subscription name when nothing was ever created", async () => {
     vi.useFakeTimers();
-    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
     const api = new FakeWeApi([]);
     api.fetch = async () => jsonResponse(503, { error: "unavailable" });
     const sub = makeSubscriber(api, {
-      onLapseAlert: (alert) => {
-        alerts.push(alert);
+      onLapse: (event) => {
+        alerts.push(event);
       },
     });
     await sub.start();
@@ -563,7 +569,7 @@ describe("WorkspaceEventsSubscriber", () => {
     const { logger, records } = captureLogger();
     const sub = makeSubscriber(api, {
       logger,
-      onLapseAlert: async () => {
+      onLapse: async () => {
         throw new Error("mesh unavailable");
       },
     });
@@ -581,13 +587,13 @@ describe("WorkspaceEventsSubscriber", () => {
 
   it("only renews and never alerts while the subscription is healthy", async () => {
     vi.useFakeTimers();
-    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
     const api = new FakeWeApi([activeSub("subscriptions/stable")]);
     const { logger, records } = captureLogger();
     const sub = makeSubscriber(api, {
       logger,
-      onLapseAlert: (alert) => {
-        alerts.push(alert);
+      onLapse: (event) => {
+        alerts.push(event);
       },
     });
 
