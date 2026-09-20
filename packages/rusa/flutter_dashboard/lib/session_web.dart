@@ -35,12 +35,14 @@ class _FirebaseSessionAuth implements SessionAuth {
   }
 
   @override
-  Stream<SessionUser?> authStateChanges() =>
-      _auth.authStateChanges().map((user) => user == null ? null : _FirebaseSessionUser(user));
+  Stream<SessionUser?> authStateChanges() => _auth.authStateChanges().map(
+    (user) => user == null ? null : _FirebaseSessionUser(user),
+  );
 
   @override
   Future<SessionUser> signInWithGoogle() async {
-    final provider = GoogleAuthProvider()..setCustomParameters({'prompt': 'select_account'});
+    final provider = GoogleAuthProvider()
+      ..setCustomParameters({'prompt': 'select_account'});
     final result = await _auth.signInWithPopup(provider);
     final user = result.user;
     if (user == null) throw StateError('Google sign in returned no user');
@@ -57,6 +59,13 @@ String _firebaseValue(Map<String, dynamic> config, String name) {
     throw StateError('Dashboard Firebase configuration is unavailable');
   }
   return value;
+}
+
+/// The Web SDK accepts these as absent/empty for Firebase Auth, but Flutter's
+/// FirebaseOptions constructor keeps them non-nullable for all platforms.
+String _firebaseWebMetadata(Map<String, dynamic> config, String name) {
+  final value = config[name];
+  return value is String ? value : '';
 }
 
 Future<DashboardSession> bootstrapDashboardSession() async {
@@ -80,8 +89,8 @@ Future<DashboardSession> bootstrapDashboardSession() async {
   await Firebase.initializeApp(
     options: FirebaseOptions(
       apiKey: _firebaseValue(firebase, 'apiKey'),
-      appId: _firebaseValue(firebase, 'appId'),
-      messagingSenderId: _firebaseValue(firebase, 'messagingSenderId'),
+      appId: _firebaseWebMetadata(firebase, 'appId'),
+      messagingSenderId: _firebaseWebMetadata(firebase, 'messagingSenderId'),
       projectId: _firebaseValue(firebase, 'projectId'),
       authDomain: _firebaseValue(firebase, 'authDomain'),
     ),
@@ -130,32 +139,38 @@ void _clearDashboardCaches() {
       if (key != null) keys.add(key);
     }
     for (final key in keys) {
-      if (key.startsWith('rusa.dashboard.')) web.window.localStorage.removeItem(key);
+      if (key.startsWith('rusa.dashboard.')) {
+        web.window.localStorage.removeItem(key);
+      }
     }
   } catch (_) {
     // Storage is unavailable in some private browsing modes.
   }
 }
 
-Future<void> _applyBranding() async {
+Future<String?> _applyBranding() async {
   final response = await http.get(Uri.base.resolve('/manifest.json'));
-  if (response.statusCode != 200) return;
+  if (response.statusCode != 200) return null;
   final manifest = jsonDecode(response.body);
-  if (manifest is! Map<String, dynamic>) return;
+  if (manifest is! Map<String, dynamic>) return null;
   _installAuthenticatedManifest();
   final name = manifest['name'];
-  if (name is String) web.document.title = name;
-  final icon = (manifest['icons'] is List && (manifest['icons'] as List).isNotEmpty)
+  final icon =
+      (manifest['icons'] is List && (manifest['icons'] as List).isNotEmpty)
       ? (manifest['icons'] as List).first
       : null;
-  if (icon is! Map || icon['src'] is! String) return;
-  final previous = web.document.head?.querySelector('link[data-rusa-auth-icon]');
-  previous?.remove();
-  final link = web.document.createElement('link')
-    ..setAttribute('data-rusa-auth-icon', '')
-    ..setAttribute('rel', 'icon')
-    ..setAttribute('href', icon['src'] as String);
-  web.document.head?.append(link);
+  if (icon is Map && icon['src'] is String) {
+    final previous = web.document.head?.querySelector(
+      'link[data-rusa-auth-icon]',
+    );
+    previous?.remove();
+    final link = web.document.createElement('link')
+      ..setAttribute('data-rusa-auth-icon', '')
+      ..setAttribute('rel', 'icon')
+      ..setAttribute('href', icon['src'] as String);
+    web.document.head?.append(link);
+  }
+  return name is String && name.trim().isNotEmpty ? name : null;
 }
 
 /// The public shell intentionally omits this link: the manifest is branded

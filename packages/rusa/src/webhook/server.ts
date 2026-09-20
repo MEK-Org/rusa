@@ -23,6 +23,7 @@ import { createDashboardAuth, type DashboardAuth } from "../dashboard/auth.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
+  removeManifestLink,
   resolveDashboardBranding,
 } from "../dashboard/branding.js";
 import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/iu-reports-api.js";
@@ -417,7 +418,11 @@ export function createDashboardRequestHandler(
         // refresh keeps working — when the Flutter assets have been built.
         if (hasDashboardAsset("index.html")) {
           try {
-            const html = applyBrandingToHtml(getDashboardHtml(), branding);
+            const brandedHtml = applyBrandingToHtml(getDashboardHtml(), branding);
+            // The local dashboard keeps its normal manifest link. In auth mode
+            // the generic anonymous shell must not fetch an instance-branded
+            // manifest before Flutter has established a session.
+            const html = auth ? removeManifestLink(brandedHtml) : brandedHtml;
             res.writeHead(200, {
               "Content-Type": "text/html; charset=utf-8",
               // The title and icon links are branded per request; see above.

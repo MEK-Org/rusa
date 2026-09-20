@@ -382,10 +382,10 @@ export type DashboardAuthConfig = {
     projectId: string;
     apiKey: string;
     authDomain: string;
-    /** Firebase Web app identifier, read from the config file. */
-    appId: string;
-    /** Firebase Web sender identifier, read from the config file. */
-    messagingSenderId: string;
+    /** Optional Firebase Web app identifier, read from the config file when used. */
+    appId?: string;
+    /** Optional Firebase Web sender identifier, read from the config file when used. */
+    messagingSenderId?: string;
     /** Explicit Admin SDK credential file; never sent to the browser. */
     serviceAccountKeyPath: string;
   };

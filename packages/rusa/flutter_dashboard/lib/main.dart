@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:web/web.dart' as web;
@@ -43,12 +45,41 @@ class RusaDashboardApp extends StatefulWidget {
 }
 
 class _RusaDashboardAppState extends State<RusaDashboardApp> {
-  late final Future<DashboardSession> _session = bootstrapDashboardSession();
+  DashboardSession? _resolvedSession;
+  String? _authenticatedTitle;
+  late final Future<DashboardSession> _session = _bootstrapSession();
+
+  Future<DashboardSession> _bootstrapSession() async {
+    final session = await bootstrapDashboardSession();
+    _resolvedSession = session;
+    session.addListener(_onSessionChanged);
+    _onSessionChanged();
+    return session;
+  }
+
+  void _onSessionChanged() {
+    final title = _resolvedSession?.browserTitle;
+    if (title == null || title == _authenticatedTitle) return;
+    if (!mounted) {
+      _authenticatedTitle = title;
+      return;
+    }
+    setState(() => _authenticatedTitle = title);
+  }
+
+  @override
+  void dispose() {
+    _resolvedSession?.removeListener(_onSessionChanged);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: widget.title,
+      // Flutter's Title widget owns document.title on rebuild. Once the
+      // authenticated manifest has supplied the instance title, feed it back
+      // into MaterialApp so route and window rebuilds retain it.
+      title: _authenticatedTitle ?? widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
       // Keep one DashboardPage for every initial path. With path URL strategy,
@@ -64,7 +95,9 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
             return const _DarkFrame();
           }
           final session = snapshot.data;
-          if (snapshot.hasError || session == null) return const _AuthStartupError();
+          if (snapshot.hasError || session == null) {
+            return const _AuthStartupError();
+          }
           return _DashboardSessionHost(session: session);
         },
       ),
@@ -83,15 +116,17 @@ class _DashboardSessionHost extends StatefulWidget {
 }
 
 class _DashboardSessionHostState extends State<_DashboardSessionHost> {
+  late final DashboardSessionBrowserHooks _browserHooks;
+
   @override
   void initState() {
     super.initState();
-    installDashboardSession(widget.session);
+    _browserHooks = DashboardSessionBrowserHooks(widget.session);
   }
 
   @override
   void dispose() {
-    disposeDashboardSession(widget.session);
+    _browserHooks.dispose();
     widget.session.dispose();
     super.dispose();
   }
@@ -113,8 +148,10 @@ class _DarkFrame extends StatelessWidget {
   const _DarkFrame();
 
   @override
-  Widget build(BuildContext context) =>
-      const Scaffold(backgroundColor: MeshColors.bgPrimary, body: SizedBox.expand());
+  Widget build(BuildContext context) => const Scaffold(
+    backgroundColor: MeshColors.bgPrimary,
+    body: SizedBox.expand(),
+  );
 }
 
 class _AuthStartupError extends StatelessWidget {
@@ -158,7 +195,10 @@ class _SignInPageState extends State<SignInPage> {
       await widget.session.signIn();
     } catch (_) {
       if (mounted) {
-        setState(() => _error = 'Unable to sign in. Check your connection and try again.');
+        setState(
+          () => _error =
+              'Unable to sign in. Check your connection and try again.',
+        );
       }
     } finally {
       if (mounted) setState(() => _signingIn = false);
@@ -176,10 +216,17 @@ class _SignInPageState extends State<SignInPage> {
           children: [
             Text('Rusa', style: Theme.of(context).textTheme.headlineMedium),
             const SizedBox(height: 16),
-            Text('Sign in to your agent dashboard.', style: Theme.of(context).textTheme.bodyLarge),
+            Text(
+              'Sign in to your agent dashboard.',
+              style: Theme.of(context).textTheme.bodyLarge,
+            ),
             if (_error != null) ...[
               const SizedBox(height: 12),
-              Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: MeshColors.statusHalted)),
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: MeshColors.statusHalted),
+              ),
             ],
             const SizedBox(height: 20),
             FilledButton(
@@ -212,11 +259,11 @@ class _DashboardPageState extends State<DashboardPage> {
     _api = DashboardApi(session: widget.session);
     _store = DashboardStore(
       api: _api,
-      stream: WebEventSourceStream(),
+      stream: WebEventSourceStream(widget.session),
       quotaCache: WebQuotaCache(),
       treePreferencesCache: WebTreePreferencesCache(),
       actorHierarchyCache: WebActorHierarchyCache(),
-      walkie: webWalkieDeps(_api),
+      walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );
     // Opens the SSE stream before the initial /threads fetch (seam-safe).
@@ -243,14 +290,21 @@ class _DashboardPageState extends State<DashboardPage> {
           // screenshot harness.
           Expanded(
             child: DashboardBody(
-              onLogout: widget.session.authenticationEnabled ? logout : null,
+              onLogout: widget.session.authenticationEnabled
+                  ? () => unawaited(widget.session.signOut())
+                  : null,
+              onNavigation: widget.session.visit,
               profilePhotoUrl: widget.session.profilePhotoUrl,
               store: _store,
-              understandingBuilder: (_) => const IuTreeBody(),
+              understandingBuilder: (_) => IuTreeBody(session: widget.session),
               reportsBuilder: (_) => IuReportsBody(store: _store),
             ),
           ),
-          _ErrorBar(store: _store),
+          AnimatedBuilder(
+            animation: widget.session,
+            builder: (_, _) =>
+                _ErrorBar(store: _store, session: widget.session),
+          ),
         ],
       ),
     );
@@ -259,8 +313,9 @@ class _DashboardPageState extends State<DashboardPage> {
 
 /// A thin footer that surfaces the latest API/stream error, if any.
 class _ErrorBar extends StatelessWidget {
-  const _ErrorBar({required this.store});
+  const _ErrorBar({required this.store, required this.session});
   final DashboardStore store;
+  final DashboardSession session;
 
   @override
   Widget build(BuildContext context) {
@@ -271,7 +326,7 @@ class _ErrorBar extends StatelessWidget {
     return StreamBuilder<String?>(
       stream: store.error,
       builder: (_, snap) {
-        final err = snap.data;
+        final err = session.errorMessage ?? snap.data;
         if (err == null) return const SizedBox.shrink();
         return Container(
           width: double.infinity,

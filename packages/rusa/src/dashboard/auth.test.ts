@@ -406,6 +406,29 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect((await fetch(`${origin}/manifest.json`)).status).toBe(401);
   });
 
+  it("keeps legacy auth configuration bootable with FlutterFire metadata defaults", () => {
+    const {
+      appId: _appId,
+      messagingSenderId: _messagingSenderId,
+      ...legacyFirebase
+    } = config.firebase;
+    const legacy = new DashboardAuth(
+      { email: config.email, firebase: legacyFirebase },
+      firebase,
+      new DashboardIdentityResolver(() => principals, legacyFirebase.projectId),
+      () => now
+    );
+
+    expect(legacy.clientConfig()).toMatchObject({
+      enabled: true,
+      firebase: {
+        projectId: "project",
+        appId: "",
+        messagingSenderId: "",
+      },
+    });
+  });
+
   it.each([
     "/api/mesh/threads",
     "/api/mesh/chat",

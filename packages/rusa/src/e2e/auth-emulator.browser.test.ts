@@ -1,6 +1,26 @@
 // @vitest-environment node
-import { chromium } from "@playwright/test";
+import { chromium, type Page } from "@playwright/test";
 import { expect, it } from "vitest";
+
+/** Flutter draws controls on canvas until its accessibility bridge is enabled. */
+async function enableFlutterSemantics(page: Page): Promise<void> {
+  const placeholder = page.locator("flt-semantics-placeholder");
+  await placeholder.waitFor({ timeout: 45_000 });
+  await placeholder.evaluate((element) => {
+    (element as HTMLElement).style.cssText =
+      "position:fixed;left:0;top:0;width:20px;height:20px;z-index:9999";
+  });
+  await placeholder.click({ force: true });
+}
+
+function sessionCreated(page: Page) {
+  return page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/auth/session") &&
+      response.request().method() === "GET" &&
+      response.status() === 200
+  );
+}
 
 // Requires --auth-emails operator@example.com,colleague@example.com.
 it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
@@ -13,13 +33,15 @@ it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
         const context = await browser.newContext();
         const page = await context.newPage();
         await page.goto(process.env.RUSA_SHARED_AUTH_EMULATOR_E2E as string);
+        await enableFlutterSemantics(page);
         const popupPromise = page.waitForEvent("popup");
         await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
         const popup = await popupPromise;
         await popup.getByText("Add new account", { exact: true }).click();
         await popup.locator("#email-input").fill(email);
+        const created = sessionCreated(page);
         await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
-        await page.locator("flutter-view").waitFor({ timeout: 45_000 });
+        await created;
         pages.push(page);
       }
       const snapshots = await Promise.all(
@@ -39,11 +61,6 @@ it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
       expect(snapshots[0].ids.length).toBeGreaterThan(0);
       expect(snapshots[1]).toEqual(snapshots[0]);
       // Exercise the actual profile dropdown for the first user only.
-      await pages[0].locator("flt-semantics-placeholder").evaluate((element) => {
-        (element as HTMLElement).style.cssText =
-          "position:fixed;left:0;top:0;width:20px;height:20px;z-index:9999";
-      });
-      await pages[0].locator("flt-semantics-placeholder").click({ force: true });
       await pages[0].getByRole("button", { name: "Profile menu" }).click();
       await pages[0].getByRole("menuitem", { name: "Log out", exact: true }).click();
       await pages[0].getByRole("button", { name: "Sign in with Google", exact: true }).waitFor();
@@ -75,17 +92,19 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
           page.evaluate(async (url) => (await fetch(url)).status, path);
         await page.goto(origin);
         expect(await status("/api/mesh/threads")).toBe(401);
+        await enableFlutterSemantics(page);
         const popupPromise = page.waitForEvent("popup");
         await page.getByRole("button", { name: "Sign in with Google", exact: true }).click();
         const popup = await popupPromise;
         await popup.getByText("Add new account", { exact: true }).click();
         await popup.locator("#email-input").fill(email);
+        const created = email.startsWith("not-") ? null : sessionCreated(page);
         await popup.getByRole("button", { name: "Sign in with Google.com", exact: true }).click();
         if (email.startsWith("not-")) {
           await page.getByText("Unable to sign in.", { exact: false }).waitFor();
           expect(await status("/api/auth/session")).toBe(401);
         } else {
-          await page.locator("flutter-view").waitFor({ timeout: 45_000 });
+          await created;
           expect(await status("/api/auth/session")).toBe(200);
           expect(await status("/api/mesh/threads")).toBe(200);
           const cookie = (await context.cookies()).find(
@@ -103,14 +122,15 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
             )
           ).toBe(403);
           expect(await status("/api/auth/session")).toBe(200);
-          // Route changes call the Flutter session controller directly; the
-          // dashboard's session unit tests cover the renewal and CSRF header.
-          // Enable Flutter's accessibility tree to exercise the actual profile menu.
-          await page.locator("flt-semantics-placeholder").evaluate((element) => {
-            (element as HTMLElement).style.cssText =
-              "position:fixed;left:0;top:0;width:20px;height:20px;z-index:9999";
-          });
-          await page.locator("flt-semantics-placeholder").click({ force: true });
+          const refresh = page.waitForResponse(
+            (response) =>
+              response.url().endsWith("/api/auth/refresh") && response.request().method() === "POST"
+          );
+          await page.evaluate(() => window.dispatchEvent(new PopStateEvent("popstate")));
+          const renewed = await refresh;
+          expect(renewed.status()).toBe(200);
+          expect(renewed.request().headers()["x-rusa-csrf"]).toBeTruthy();
+          // Semantics are already enabled so this exercises the actual profile menu.
           // Exercise Flutter's mutation client without leaving fixture obligations behind.
           await page.route("**/api/mesh/obligations", async (route) => {
             if (route.request().method() === "POST") {

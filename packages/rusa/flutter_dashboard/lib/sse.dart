@@ -6,6 +6,7 @@ import 'package:web/web.dart' as web;
 
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'session.dart';
 import 'session_events_web.dart';
 
 /// Browser `EventSource` implementation of [MeshStreamSource].
@@ -17,6 +18,9 @@ import 'session_events_web.dart';
 /// safe. The `: connected` / `: heartbeat` comment frames are ignored by the
 /// browser automatically.
 class WebEventSourceStream implements MeshStreamSource {
+  WebEventSourceStream(this._session);
+
+  final DashboardSession _session;
   final _mesh = StreamController<MeshEvent>.broadcast();
   final _live = StreamController<LiveOutputChunk>.broadcast();
   final _elided = StreamController<void>.broadcast();
@@ -41,7 +45,7 @@ class WebEventSourceStream implements MeshStreamSource {
     final qs = actors.isEmpty
         ? ''
         : '?actors=${Uri.encodeQueryComponent(actors.join(','))}';
-    final es = SessionEventSource('/api/mesh/stream$qs');
+    final es = SessionEventSource('/api/mesh/stream$qs', _session);
     es.addEventListener(
       'mesh_event',
       _listener((data) {

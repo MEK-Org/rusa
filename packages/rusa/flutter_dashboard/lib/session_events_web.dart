@@ -6,46 +6,27 @@ import 'package:web/web.dart' as web;
 
 import 'session.dart';
 
-DashboardSession? _session;
-web.EventListener? _visibilityListener;
-web.EventListener? _popStateListener;
-
-/// The web entrypoint installs the one session owner before it mounts a page.
-/// URL changes, API failures, and SSE events call it directly rather than
-/// translating auth state through DOM custom events.
-void installDashboardSession(DashboardSession session) {
-  if (identical(_session, session)) return;
-  disposeDashboardSession(_session);
-  _session = session;
-  final visibilityListener = ((web.Event _) {
-    if (web.document.visibilityState == 'visible') unawaited(session.visit());
-  }).toJS;
-  final popStateListener = ((web.Event _) => unawaited(session.visit())).toJS;
-  _visibilityListener = visibilityListener;
-  _popStateListener = popStateListener;
-  web.document.addEventListener('visibilitychange', visibilityListener);
-  web.window.addEventListener('popstate', popStateListener);
-}
-
-/// Removes browser visit hooks with the session that installed them.
-void disposeDashboardSession(DashboardSession? session) {
-  if (session == null || !identical(_session, session)) return;
-  if (_visibilityListener case final listener?) {
-    web.document.removeEventListener('visibilitychange', listener);
+/// Browser visit hooks are owned by the mounted dashboard session. Keeping
+/// them instance-scoped avoids hidden global state between dashboard mounts.
+class DashboardSessionBrowserHooks {
+  DashboardSessionBrowserHooks(this.session) {
+    _visibilityListener = ((web.Event _) {
+      if (web.document.visibilityState == 'visible') unawaited(session.visit());
+    }).toJS;
+    _popStateListener = ((web.Event _) => unawaited(session.visit())).toJS;
+    web.document.addEventListener('visibilitychange', _visibilityListener);
+    web.window.addEventListener('popstate', _popStateListener);
   }
-  if (_popStateListener case final listener?) {
-    web.window.removeEventListener('popstate', listener);
-  }
-  _visibilityListener = null;
-  _popStateListener = null;
-  _session = null;
-}
 
-void requireAuthentication() => _session?.requireAuthentication();
-void notifyNavigation() => _session?.visit();
-Future<void> logout() => _session?.signOut() ?? Future.value();
-bool get authenticationEnabled => _session?.authenticationEnabled ?? false;
-String? get profilePhotoUrl => _session?.profilePhotoUrl;
+  final DashboardSession session;
+  late final web.EventListener _visibilityListener;
+  late final web.EventListener _popStateListener;
+
+  void dispose() {
+    web.document.removeEventListener('visibilitychange', _visibilityListener);
+    web.window.removeEventListener('popstate', _popStateListener);
+  }
+}
 
 /// Owns reconnects so an idle EventSource cannot silently reopen itself.
 /// Navigation renews the cookie before reconnecting either mesh or voice streams.
@@ -60,18 +41,24 @@ String? get profilePhotoUrl => _session?.profilePhotoUrl;
 /// throttled tab whose local inactivity timer did not run: a later visit then
 /// changes the controller back to active and reconnects every stream.
 class SessionEventSource {
-  SessionEventSource(this.url) {
+  SessionEventSource(this.url, this.session) {
     _sessionListener = _onSessionChanged;
-    _session?.addListener(_sessionListener);
+    session.addListener(_sessionListener);
+    _wasIdle = session.isIdle;
     _connect();
   }
   final String url;
+  final DashboardSession session;
   final Map<String, List<web.EventListener>> _listeners = {};
   late final VoidCallback _sessionListener;
   web.EventSource? _source;
+  late bool _wasIdle;
 
   void _onSessionChanged() {
-    if (_session?.isIdle ?? false) {
+    final isIdle = session.isIdle;
+    if (isIdle == _wasIdle) return;
+    _wasIdle = isIdle;
+    if (isIdle) {
       _disconnect();
     } else {
       _connect();
@@ -80,14 +67,14 @@ class SessionEventSource {
 
   void _connect() {
     _disconnect();
-    if (_session?.isIdle ?? false) {
+    if (session.isIdle) {
       return;
     }
     final source = web.EventSource(url);
     source.addEventListener(
       'session_idle',
       ((web.Event _) {
-        _session?.idleFromServer();
+        session.idleFromServer();
         _disconnect();
       }).toJS,
     );
@@ -95,7 +82,7 @@ class SessionEventSource {
       'auth_required',
       ((web.Event _) {
         _disconnect();
-        requireAuthentication();
+        unawaited(session.requireAuthentication());
       }).toJS,
     );
     source.addEventListener(
@@ -103,9 +90,7 @@ class SessionEventSource {
       ((web.Event _) {
         // CONNECTING is a native retry in progress; CLOSED means the server refused
         // the reconnect. Only a 401 turns that refusal into a login prompt.
-        if (!authenticationEnabled ||
-            _source != source ||
-            source.readyState != web.EventSource.CLOSED) {
+        if (_source != source || source.readyState != web.EventSource.CLOSED) {
           return;
         }
         web.window
@@ -114,7 +99,7 @@ class SessionEventSource {
             .then((response) {
               if (response.status == 401) {
                 _disconnect();
-                requireAuthentication();
+                unawaited(session.requireAuthentication());
               }
             })
             .catchError((Object _) {});
@@ -140,7 +125,7 @@ class SessionEventSource {
 
   void close() {
     _disconnect();
-    _session?.removeListener(_sessionListener);
+    session.removeListener(_sessionListener);
     _listeners.clear();
   }
 }

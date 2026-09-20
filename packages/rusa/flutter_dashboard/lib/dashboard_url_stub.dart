@@ -12,4 +12,5 @@ void writeDashboardViewToUrl(
   DashboardView view, {
   String? focusedObligationId,
   String? focusedActorId,
+  Future<void> Function()? onNavigation,
 }) {}

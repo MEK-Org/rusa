@@ -8,6 +8,7 @@ import 'package:goals_widgets/goals_widgets.dart' show FlattenedGoalTree;
 import 'iu_node_detail_panel.dart';
 import 'iu_tree_actions.dart';
 import 'op_getter_persistence.dart';
+import '../session_client.dart';
 
 /// The IU tree view: renders the Integrated Knowledge Universe graph
 /// (served by the rusa op-getter) in a interactive master-detail tree.
@@ -64,7 +65,12 @@ List<GoalPath> iuTopLevelPaths(Map<String, Goal>? goalMap, String? rootNodeId) {
 }
 
 class IuTreeBody extends StatefulWidget {
-  const IuTreeBody({super.key});
+  const IuTreeBody({super.key, this.session});
+
+  /// The dashboard session is injected into the persistence HTTP client so a
+  /// 401 from the read-only IU endpoints follows the same expiry path as every
+  /// other dashboard API request.
+  final SessionRequestState? session;
 
   @override
   State<IuTreeBody> createState() => _IuTreeBodyState();
@@ -79,7 +85,7 @@ class _IuTreeBodyState extends State<IuTreeBody> {
   void initState() {
     super.initState();
     // Same-origin: the dashboard serves both the UI and /api/understanding/ops.
-    _persistence = OpGetterPersistenceService();
+    _persistence = OpGetterPersistenceService(session: widget.session);
     _syncClient = SyncClient(persistenceService: _persistence);
     _ready = _syncClient.init();
     // Selection is shared (glass-goals) UI state; start clean so a prior mount's

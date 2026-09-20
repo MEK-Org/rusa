@@ -129,7 +129,17 @@ export class DashboardAuth {
     const { projectId, apiKey, authDomain, appId, messagingSenderId } = this.config.firebase;
     return {
       enabled: true,
-      firebase: { projectId, apiKey, authDomain, appId, messagingSenderId },
+      // FlutterFire's Dart constructor makes these fields non-nullable, while
+      // Firebase Auth web accepts omitted/empty values and does not use them.
+      // Retaining keys here lets existing auth configurations upgrade without
+      // a startup outage; operators may still configure real metadata.
+      firebase: {
+        projectId,
+        apiKey,
+        authDomain,
+        appId: appId ?? "",
+        messagingSenderId: messagingSenderId ?? "",
+      },
       ...(this.emulatorUrl ? { emulatorUrl: this.emulatorUrl } : {}),
     };
   }

@@ -77,18 +77,15 @@ really are the same Firebase project. Neither field falls back to the other.
 The Web API key, project ID, auth domain, app ID, and messaging sender ID are
 public client configuration;
 the email policy and service-account file are never served to the browser.
-Flutter reads those options at runtime from this operator-owned configuration;
-FlutterFire's `FirebaseOptions` constructor statically requires `appId` and
-`messagingSenderId` on Web in addition to the project ID and API key used by the
-legacy JavaScript SDK bundle (both identifiers are available in the Firebase Console
-under Project Settings → General → Your apps → Web app).
-When upgrading an existing authenticated configuration, add both fields before
-restarting Rusa. They cannot be inferred reliably from the legacy project ID,
-API key, and domain: a project can have multiple Web apps, and the sender ID is
-the Firebase project number rather than its project ID. Startup intentionally
-fails closed, naming the missing `auth.firebase` field, rather than serving a
-dashboard that cannot initialize FlutterFire. This is a configuration update
-only; it does not rewrite durable data or require a database migration.
+Flutter reads those options at runtime from this operator-owned configuration.
+`appId` and `messagingSenderId` are optional Firebase Web metadata: FlutterFire's
+`FirebaseOptions` constructor requires Dart values, but Firebase Auth on Web accepts
+their empty compatibility values and does not use them. Existing authenticated
+configurations therefore keep working without an upgrade-time outage. Set both from
+the Firebase Console (Project Settings → General → Your apps → Web app) when another
+Firebase browser service needs them; if present, Rusa validates that they are
+non-empty strings. This is a configuration update only; it does not rewrite durable
+data or require a database migration.
 Do not add a generated `firebase_options.dart` or a Firebase configuration file
 to this repository. FlutterFire may load its browser SDK support from the
 official Firebase CDN. Rebuild the dashboard and restart Rusa after changing configuration.

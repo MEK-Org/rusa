@@ -3,12 +3,13 @@ import 'package:http/http.dart' as http;
 abstract interface class SessionRequestState {
   bool get authenticationEnabled;
   String? get csrfToken;
-  void requireAuthentication();
+  Future<void> requireAuthentication();
 }
 
 /// The cookie is browser-managed. Polling observes expiry but never renews it.
 class SessionClient extends http.BaseClient {
-  SessionClient([http.Client? inner, this._session]) : _inner = inner ?? http.Client();
+  SessionClient([http.Client? inner, this._session])
+    : _inner = inner ?? http.Client();
   final http.Client _inner;
   final SessionRequestState? _session;
 
@@ -27,7 +28,7 @@ class SessionClient extends http.BaseClient {
       request.headers['X-Rusa-CSRF'] = token;
     }
     final response = await _inner.send(request);
-    if (response.statusCode == 401) _session?.requireAuthentication();
+    if (response.statusCode == 401) await _session?.requireAuthentication();
     return response;
   }
 

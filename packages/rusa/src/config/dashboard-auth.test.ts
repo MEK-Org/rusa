@@ -76,11 +76,15 @@ describe("optional shared-human auth config", () => {
       })
     ).toThrow("config.yaml: auth.firebase.authDomain must be a hostname");
   });
-  it("fails closed with the required FlutterFire upgrade field for legacy auth configs", () => {
+  it("keeps legacy auth config valid when optional FlutterFire web metadata is absent", () => {
     const legacy = valid();
     delete (legacy.firebase as Partial<typeof legacy.firebase>).appId;
-    expect(() => validateDashboardAuth(legacy)).toThrow(
-      "config.yaml: auth.firebase.appId must be a non-empty string"
-    );
+    delete (legacy.firebase as Partial<typeof legacy.firebase>).messagingSenderId;
+    expect(() => validateDashboardAuth(legacy)).not.toThrow();
+  });
+  it("rejects blank optional FlutterFire web metadata when it is configured", () => {
+    expect(() =>
+      validateDashboardAuth({ ...valid(), firebase: { ...valid().firebase, appId: "  " } })
+    ).toThrow("config.yaml: auth.firebase.appId must be a non-empty string when set");
   });
 });

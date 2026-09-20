@@ -19,8 +19,11 @@ import '../session_client.dart';
 /// map on load so [loadString] can hydrate node bodies (the `SyncClient` fetches text-goal
 /// bodies via `loadString`, not inline). It NEVER writes: [save] throws.
 class OpGetterPersistenceService implements PersistenceService {
-  OpGetterPersistenceService({this.baseUrl = '', http.Client? client})
-    : _client = SessionClient(client);
+  OpGetterPersistenceService({
+    this.baseUrl = '',
+    http.Client? client,
+    SessionRequestState? session,
+  }) : _client = SessionClient(client, session);
 
   /// Origin for the endpoint; '' = same-origin (the dashboard serves both).
   final String baseUrl;
