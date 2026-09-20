@@ -26,6 +26,7 @@ it.skipIf(!process.env.RUSA_BRANDING_BROWSER_TEST)(
           authDomain: "demo-rusa.firebaseapp.com",
           appId: "1:123456789:web:abcdef",
           messagingSenderId: "123456789",
+          serviceAccountKeyPath: "/unused-in-fake-verifier.json",
         },
       },
       {
