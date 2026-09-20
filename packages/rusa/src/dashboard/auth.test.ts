@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -226,6 +227,33 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(page.events.map((event) => event.detail)).not.toContain("viewer sent elsewhere");
     expect(page.events.map((event) => event.detail)).not.toContain("viewer received elsewhere");
     expect(page.events.map((event) => event.detail)).not.toContain("unrelated sent");
+  });
+
+  it("keeps legacy human:operator event queries scoped to the legacy actor id", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({
+      issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
+      subject: token.sub,
+    });
+    if (!viewer) throw new Error("Expected authenticated viewer");
+
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: HUMAN_OPERATOR,
+      detail: "legacy operator event",
+    });
+    meshEvents.record({ kind: "message_sent", actorId: viewer.id, detail: "durable user event" });
+
+    const response = await fetch(`${origin}/api/mesh/events?actors=${HUMAN_OPERATOR}`, {
+      headers: { Cookie: cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as {
+      events: Array<{ actorId: string; detail: string | null }>;
+    };
+    expect(page.events.map((event) => event.detail)).toEqual(["legacy operator event"]);
+    expect(page.events.map((event) => event.actorId)).toEqual([HUMAN_OPERATOR]);
   });
 
   it.skipIf(mode !== "shared")(
