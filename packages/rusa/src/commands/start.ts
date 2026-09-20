@@ -420,16 +420,25 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
     configured.push("gchat:spaces");
   }
 
-  // Disk alerts are a host-owned event source, so whatever runs the producer is
-  // also the subscription declaration. Both sides read `diskAlertActive`, so a
-  // running sensor always has a receiver: an absent `observability` block used
-  // to leave the sensor emitting into a source nobody covered, and every alert
-  // it raised was dropped at the routing boundary (#481).
-  if (diskAlertActive(config)) {
+  // Host alarms are a host-owned event source, so whatever runs a producer is
+  // also the subscription declaration. Both sides read `hostAlarmProducerActive`,
+  // so a running producer always has a receiver: an absent `observability` block
+  // used to leave the disk sensor emitting into a source nobody covered, and
+  // every alert it raised was dropped at the routing boundary (#481).
+  if (hostAlarmProducerActive(config)) {
     configured.push("system:events");
   }
 
   return configured;
+}
+
+/**
+ * Every producer that raises host alarms into `system:events`: the disk sensor,
+ * and the chat subscription keeper's lapse alert (#578) whenever chat is
+ * configured. Root's `system:events` ownership is derived from this same call.
+ */
+export function hostAlarmProducerActive(config: RusaConfig): boolean {
+  return diskAlertActive(config) || config.chat !== undefined;
 }
 
 /**

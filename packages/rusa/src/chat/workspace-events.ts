@@ -87,9 +87,11 @@ export class WorkspaceEventsSubscriber {
   private subscriptionName: string | null = null;
   /**
    * When the API last confirmed a subscription with a fresh TTL (a successful
-   * create or renew). Merely seeing one listed does not count: a listed
+   * create or renew). Merely seeing one listed does not advance it: a listed
    * subscription whose renewals keep failing is exactly the lapse this must
-   * detect, so only confirmations may advance it.
+   * detect. A listed `expireTime` may only pull it *earlier*, so a process that
+   * restarts onto an ageing subscription alerts when that subscription actually
+   * lapses rather than a full TTL after its own boot.
    */
   private lastConfirmedActiveAt: number;
   private lastAlertAt: number | null = null;
@@ -189,7 +191,12 @@ export class WorkspaceEventsSubscriber {
   private async ensure(): Promise<void> {
     const matches = await this.list();
     const now = Date.now();
-    const keep = matches.find((subscription) => !isLapsed(subscription, now));
+    this.seedConfirmationFromListed(matches);
+    // The API does not promise list order, so rank rather than take the first:
+    // an ACTIVE subscription is already delivering and beats one that would
+    // first need reactivating.
+    const usable = matches.filter((subscription) => !isLapsed(subscription, now));
+    const keep = usable.find((subscription) => subscription.state === "ACTIVE") ?? usable[0];
 
     // Prune the rest: duplicates double-deliver every message, and an expired
     // subscription can't be renewed (the API refuses a TTL update past expiry).
@@ -258,6 +265,24 @@ export class WorkspaceEventsSubscriber {
     this.logger?.info(event, { topic: this.opts.topic, subscriptionName, ttl: TTL });
   }
 
+  /**
+   * The latest listed `expireTime` is when delivery stops if nothing is
+   * confirmed first, so the confirmation baseline can be no later than one TTL
+   * before it. Only ever moves the baseline earlier (see `lastConfirmedActiveAt`).
+   */
+  private seedConfirmationFromListed(matches: readonly WeSubscription[]): void {
+    let latestExpiry = Number.NEGATIVE_INFINITY;
+    for (const subscription of matches) {
+      const expiresAt = subscription.expireTime ? Date.parse(subscription.expireTime) : NaN;
+      if (Number.isFinite(expiresAt)) latestExpiry = Math.max(latestExpiry, expiresAt);
+    }
+    if (!Number.isFinite(latestExpiry)) return;
+    this.lastConfirmedActiveAt = Math.min(
+      this.lastConfirmedActiveAt,
+      latestExpiry - MAX_TTL_SECONDS * 1_000
+    );
+  }
+
   /** List the user's subscriptions for our event type/target and topic. */
   private async list(): Promise<WeSubscription[]> {
     const filter = `event_types:"${MESSAGE_CREATED}" AND target_resource="${CHAT_TARGET}"`;
@@ -279,14 +304,21 @@ export class WorkspaceEventsSubscriber {
       payloadOptions: { includeResource: true },
       ttl: TTL,
     };
-    // create returns a long-running operation; the subscription appears on the
-    // next list(), so choose the newly visible subscription rather than parse the LRO.
-    await this.request("POST", "/subscriptions", body);
+    // create returns a long-running operation that normally completes inline
+    // with the Subscription as its response. Prefer that name; when the
+    // operation is still pending, fall back to the newly visible subscription in
+    // list(). If it is not visible yet, fail this pass rather than create again:
+    // the retry's list() adopts it once it appears.
+    const operation = (await this.request("POST", "/subscriptions", body)) as {
+      done?: boolean;
+      response?: { name?: string };
+    };
+    if (operation.done && operation.response?.name) return operation.response.name;
     const matches = await this.list();
     const name = matches.find(
       (subscription) => subscription.name && !previousNames.has(subscription.name)
     )?.name;
-    if (!name) throw new Error("subscription created but did not appear in list()");
+    if (!name) throw new Error("subscription create accepted but not yet visible in list()");
     return name;
   }
 

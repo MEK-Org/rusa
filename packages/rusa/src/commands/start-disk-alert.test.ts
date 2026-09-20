@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import type { Logger } from "../observability/logger.js";
 import type { DurableEventDelivery } from "../runtime/event-manager.js";
-import { configuredRootEventSources, deliverHostAlarm, diskAlertUncovered } from "./start.js";
+import {
+  configuredRootEventSources,
+  deliverHostAlarm,
+  diskAlertUncovered,
+  hostAlarmProducerActive,
+} from "./start.js";
 
 /** The minimum a loaded config carries; every case below varies only observability. */
 const baseConfig = {
@@ -50,8 +55,23 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
   it("drops the subscription exactly when the operator disables the sensor", () => {
     const config = withObservability({ diskAlert: { enabled: false } });
     expect(configuredRootEventSources(config)).not.toContain("system:events");
+    expect(hostAlarmProducerActive(config)).toBe(false);
     // Nothing produces the events, so nothing is uncovered either.
     expect(diskAlertUncovered(config, configuredRootEventSources(config))).toBe(false);
+  });
+
+  it("keeps system:events covered for the chat lapse alert when the disk sensor is off", () => {
+    // Chat configured, disk alerts explicitly disabled: the subscription keeper
+    // still raises host alarms into system:events, so root must still own it —
+    // otherwise the lapse alert reproduces the uncovered-producer shape of #481.
+    const config = {
+      ...withObservability({ diskAlert: { enabled: false } }),
+      chat: { gchatConfigDir: "/tmp/gchat", projectId: "p" },
+    } as unknown as RusaConfig;
+    expect(hostAlarmProducerActive(config)).toBe(true);
+    expect(configuredRootEventSources(config)).toEqual(
+      expect.arrayContaining(["gchat:spaces", "system:events"])
+    );
   });
 });
 

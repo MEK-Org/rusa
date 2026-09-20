@@ -43,6 +43,14 @@ class FakeWeApi {
   renewStatus: number | null = null;
   /** When set, POST /subscriptions (create) answers with this status instead. */
   createStatus: number | null = null;
+  /**
+   * Whether the create operation completes inline with the Subscription as its
+   * response (the API's normal shape) or answers with a bare pending operation.
+   */
+  createResponseInline = true;
+  /** How many list() calls a newly created subscription stays invisible for. */
+  createListLag = 0;
+  private pending: Array<{ sub: FakeSub; listsUntilVisible: number }> = [];
   private seq = 0;
 
   constructor(initial: FakeSub[] = []) {
@@ -59,16 +67,30 @@ class FakeWeApi {
     if (method === "GET" && path === "/subscriptions") {
       // The real API filters server-side by event type/target; mirror only what
       // matters here and return everything (the subscriber filters by topic).
+      const visible = this.pending.filter((entry) => entry.listsUntilVisible <= 0);
+      this.pending = this.pending.filter((entry) => entry.listsUntilVisible > 0);
+      for (const entry of this.pending) entry.listsUntilVisible--;
+      this.subs.push(...visible.map((entry) => entry.sub));
       return jsonResponse(200, { subscriptions: this.subs });
     }
     if (method === "POST" && path === "/subscriptions") {
       if (this.createStatus !== null) return jsonResponse(this.createStatus, { error: "create" });
-      this.subs.push({
+      const sub: FakeSub = {
         name: `subscriptions/new-${this.seq++}`,
         state: "ACTIVE",
         notificationEndpoint: { pubsubTopic: body.notificationEndpoint.pubsubTopic },
-      });
-      return jsonResponse(200, { name: "operations/op1" });
+      };
+      if (this.createListLag > 0) {
+        this.pending.push({ sub, listsUntilVisible: this.createListLag });
+      } else {
+        this.subs.push(sub);
+      }
+      return jsonResponse(
+        200,
+        this.createResponseInline
+          ? { name: "operations/op1", done: true, response: sub }
+          : { name: "operations/op1" }
+      );
     }
     const name = path.replace(/^\//, "").replace(/:reactivate$/, "");
     const sub = this.subs.find((s) => s.name === name);
@@ -182,6 +204,56 @@ describe("WorkspaceEventsSubscriber", () => {
     await sub.close();
 
     expect(api.calls.filter((c) => c.path.endsWith(":reactivate"))).toHaveLength(1);
+    expect(api.count("PATCH")).toBe(1);
+  });
+
+  it("adopts the subscription named by the create operation without re-listing", async () => {
+    const api = new FakeWeApi([]);
+    const sub = makeSubscriber(api);
+    await sub.start();
+    await sub.close();
+
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    // One list to find nothing, one create; the inline response settles the name.
+    expect(api.count("GET")).toBe(1);
+  });
+
+  it("waits for a slow-to-appear subscription instead of creating a second one", async () => {
+    vi.useFakeTimers();
+    // A pending operation with no inline response, and list() lagging one call
+    // behind the create: the first pass fails, and the retry must adopt the
+    // subscription that has since become visible rather than POST again.
+    const api = new FakeWeApi([]);
+    api.createResponseInline = false;
+    api.createListLag = 1;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+
+    await sub.start();
+    expect(sub.currentSubscription).toBeNull();
+    expect(records.at(-1)?.event).toBe("chat_subscription_boot_failed");
+    expect((records.at(-1)?.fields?.err as Error).message).toMatch(/not yet visible/);
+
+    await vi.advanceTimersByTimeAsync(FIRST_RETRY_MS);
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(api.subs).toHaveLength(1);
+    expect(records.at(-1)?.event).toBe("chat_subscription_renewed");
+    await sub.close();
+  });
+
+  it("keeps the ACTIVE subscription and prunes a SUSPENDED one regardless of list order", async () => {
+    const api = new FakeWeApi([
+      { ...activeSub("subscriptions/susp"), state: "SUSPENDED" },
+      activeSub("subscriptions/live"),
+    ]);
+    const sub = makeSubscriber(api);
+    await sub.start();
+    await sub.close();
+
+    expect(sub.currentSubscription).toBe("subscriptions/live");
+    expect(api.subs.map((s) => s.name)).toEqual(["subscriptions/live"]);
+    expect(api.calls.filter((c) => c.path.endsWith(":reactivate"))).toHaveLength(0);
     expect(api.count("PATCH")).toBe(1);
   });
 
@@ -430,6 +502,34 @@ describe("WorkspaceEventsSubscriber", () => {
     api.renewStatus = 500;
     await vi.advanceTimersByTimeAsync(TTL_MS + MAX_RETRY_MS);
     expect(alerts).toHaveLength(3);
+    await sub.close();
+  });
+
+  it("alerts when an adopted subscription's own expireTime passes, not a TTL after boot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
+    const alerts: WorkspaceEventsLapseAlert[] = [];
+    // Restart onto a subscription that was last renewed elsewhere and has 30
+    // minutes left; every renewal, and every replacement create once it has
+    // expired, fails. Delivery stops at 12:30, so the alert must follow that
+    // expiry rather than wait until 16:00.
+    const api = new FakeWeApi([
+      { ...activeSub("subscriptions/ageing"), expireTime: "2026-09-19T12:30:00.000Z" },
+    ]);
+    api.renewStatus = 500;
+    api.createStatus = 500;
+    const sub = makeSubscriber(api, {
+      onLapseAlert: (alert) => {
+        alerts.push(alert);
+      },
+    });
+    await sub.start();
+
+    await vi.advanceTimersByTimeAsync(30 * MINUTE - SECOND);
+    expect(alerts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.elapsedSeconds).toBeGreaterThanOrEqual(14400);
     await sub.close();
   });
 
