@@ -84,6 +84,7 @@ describe("human chat isolation (#590)", () => {
   let meshChat: MeshChatRepository;
   let inbox: InboxRepository;
   let principals: PrincipalRepository;
+  let obligations: ObligationRepository;
   let emitter: MeshEventEmitter;
   let auth: DashboardAuth;
   let server: ReturnType<typeof createServer>;
@@ -132,6 +133,7 @@ describe("human chat isolation (#590)", () => {
     meshChat = new MeshChatRepository(db);
     inbox = new InboxRepository(db);
     principals = new PrincipalRepository(db);
+    obligations = new ObligationRepository(db);
     emitter = new MeshEventEmitter();
     const actors = new InMemoryActorRepository();
     actors.upsert(rec(ACTOR, null));
@@ -201,7 +203,7 @@ describe("human chat isolation (#590)", () => {
       meshEvents,
       meshChat,
       inbox,
-      obligations: new ObligationRepository(db),
+      obligations,
       sseHub: new SseHub(emitter, { principals }),
       mesh: mesh as unknown as ActorMesh,
       // The actor is queued, so its thread card projects its prioritized
@@ -276,6 +278,19 @@ describe("human chat isolation (#590)", () => {
     entries: Array<{
       payload: Record<string, unknown>;
       reference?: { body: string | null; unavailable: string | null };
+    }>;
+  };
+  type ObligationDetail = {
+    artifacts: Array<{
+      artifact: { ref: string };
+      reference: {
+        title: string;
+        body: string | null;
+        author: string | null;
+        timestamp: string | null;
+        unavailable: string | null;
+        entity?: unknown;
+      };
     }>;
   };
   type ThreadsPage = {
@@ -474,6 +489,53 @@ describe("human chat isolation (#590)", () => {
       null,
     ]);
     expect(JSON.stringify(bobFeed.body)).not.toContain(a.id);
+  });
+
+  it("hides another human's cited message on an obligation without hiding the citation", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    const fromAlice = record(a.id, ACTOR, "alice decided it");
+    const fromBob = record(b.id, ACTOR, "bob decided it");
+    const fromPeer = record(PEER, ACTOR, "child reported in");
+    const obligation = obligations.create({ ownerId: ACTOR, title: "Shared work" });
+    for (const messageId of [fromAlice, fromBob, fromPeer]) {
+      obligations.attachArtifact(obligation.id, `mesh:messages/${messageId}`);
+    }
+
+    const detail = await getJson<ObligationDetail>(
+      `/api/mesh/obligations/${obligation.id}`,
+      a.cookie
+    );
+    expect(detail.status).toBe(200);
+    const cited = new Map(detail.body.artifacts.map((e) => [e.artifact.ref, e.reference]));
+    expect(cited.get(`mesh:messages/${fromAlice}`)?.body).toBe("alice decided it");
+    // Actor↔actor citations are shared mesh visibility, as before.
+    expect(cited.get(`mesh:messages/${fromPeer}`)?.body).toBe("child reported in");
+    // Bob's citation is still listed — the obligation's own record of what
+    // settled it — but says nothing about whose conversation it was.
+    const hidden = cited.get(`mesh:messages/${fromBob}`);
+    expect(hidden).toBeDefined();
+    expect(hidden).toMatchObject({
+      body: null,
+      author: null,
+      timestamp: null,
+      title: "Mesh chat",
+    });
+    expect(hidden?.unavailable).not.toBeNull();
+    expect(hidden?.entity).toBeUndefined();
+    const serialized = JSON.stringify(detail.body);
+    expect(serialized).not.toContain("bob decided it");
+    expect(serialized).not.toContain(b.id);
+
+    // The same obligation is bob's own citation for bob.
+    const bobDetail = await getJson<ObligationDetail>(
+      `/api/mesh/obligations/${obligation.id}`,
+      b.cookie
+    );
+    const bobCited = new Map(bobDetail.body.artifacts.map((e) => [e.artifact.ref, e.reference]));
+    expect(bobCited.get(`mesh:messages/${fromBob}`)?.body).toBe("bob decided it");
+    expect(bobCited.get(`mesh:messages/${fromAlice}`)?.body).toBeNull();
+    expect(JSON.stringify(bobDetail.body)).not.toContain(a.id);
   });
 
   it("omits another human's message from the actor's inbox and thread projections", async () => {

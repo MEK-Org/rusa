@@ -28,7 +28,11 @@ import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
-import { type ResolvedReference, resolveReferenceSync } from "../references/resolve.js";
+import {
+  type ResolvedReference,
+  type ResolvedReferenceWithEntity,
+  resolveReferenceSync,
+} from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
@@ -554,6 +558,38 @@ async function resolveInboxPage(
     })
   );
   return { ...page, entries: entries.filter((entry) => entry !== null) };
+}
+
+/**
+ * A cited `mesh:messages/<id>` resolves to the message itself — body, both
+ * participants, author and time — so a surface that renders an artifact would
+ * otherwise hand any signed-in human another human's conversation with an
+ * actor (#590). The citation stays visible, because the artifact list is the
+ * obligation's own record of what it was settled by, but nothing of the
+ * message behind it is projected: no body, no participants, no author, no
+ * timestamp, and a neutral title in place of `<sender> → <recipient>`.
+ *
+ * Unlike an inbox page, where the entry is omitted outright, the reader here
+ * already knows the obligation cites *something*; what they must not learn is
+ * whose conversation it is. References to anything else pass through
+ * untouched, so external citations and actor↔actor messages are unaffected.
+ */
+function scopeMeshMessageReference(
+  reference: ResolvedReferenceWithEntity,
+  scope: HumanChatScope
+): ResolvedReferenceWithEntity {
+  const entity = reference.entity;
+  if (entity?.type !== "mesh_message") return reference;
+  if (scope.canSee(entity.senderId, entity.recipientId)) return reference;
+  const { entity: _hidden, ...rest } = reference;
+  return {
+    ...rest,
+    title: "Mesh chat",
+    body: null,
+    author: null,
+    timestamp: null,
+    unavailable: "not your conversation",
+  };
 }
 
 function parseKinds(url: URL): string[] | undefined {
@@ -1520,6 +1556,14 @@ export async function handleMeshApiRequest(
 
   const { actors, meshEvents, sseHub } = deps;
 
+  // One viewer resolution per request (#590). A request takes exactly one of
+  // the read branches below, and each asks the same question of the same
+  // principal list, so the scope is resolved on first use and reused — a route
+  // that reads nothing human-involving still costs no principal read.
+  let resolvedScope: HumanChatScope | undefined;
+  const viewerScope = (): HumanChatScope =>
+    (resolvedScope ??= resolveHumanChatScope(req, deps.principals));
+
   if (pathname === "/api/mesh/control/options") {
     if (!deps.rootControl) {
       sendJson(res, 503, { error: "root control unavailable" });
@@ -1565,7 +1609,7 @@ export async function handleMeshApiRequest(
       (deps.providerQueueSnapshots?.() ?? []).map((entry) => [entry.threadId, entry])
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
-    const chatScope = resolveHumanChatScope(req, deps.principals);
+    const chatScope = viewerScope();
     // Aggregate last activity once for all actors; the covering index on
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
@@ -1707,7 +1751,7 @@ export async function handleMeshApiRequest(
   // are scoped to the viewing human: choosing a `since` window is not a way
   // around the actor path's isolation (#590).
   if (pathname === "/api/mesh/events") {
-    const humanViewerIds = [...resolveHumanChatScope(req, deps.principals).viewerIds];
+    const humanViewerIds = [...viewerScope().viewerIds];
     const since = url.searchParams.get("since");
     if (since) {
       const rawOrder = url.searchParams.get("order");
@@ -1738,10 +1782,7 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
   if (pathname === "/api/mesh/chat") {
-    const resolved = resolveChatQueryActors(
-      parseActors(url),
-      resolveHumanChatScope(req, deps.principals)
-    );
+    const resolved = resolveChatQueryActors(parseActors(url), viewerScope());
     if (!resolved.ok) {
       sendJson(res, 403, { error: resolved.error });
       return true;
@@ -1779,7 +1820,7 @@ export async function handleMeshApiRequest(
           limit: clampLimit(url),
         }),
         deps,
-        resolveHumanChatScope(req, deps.principals)
+        viewerScope()
       )
     );
     return true;
@@ -1912,28 +1953,30 @@ export async function handleMeshApiRequest(
       offset: blocksOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    // The obligation's own citations and the reference it claims resolve the
+    // same way, through one scoped resolution: a `mesh:messages/<id>` naming
+    // another human's conversation is projected without its content or ends
+    // (#590). Mesh refs are resolved locally by the cache service rather than
+    // stored, so the scope applies to the cached and uncached paths alike.
+    const resolveCited = async (ref: string): Promise<ResolvedReferenceWithEntity> =>
+      scopeMeshMessageReference(
+        deps.referenceCache
+          ? await deps.referenceCache.get(ref, deps).catch(() => ({
+              ...resolveReferenceSync(ref, { meshChat: deps.meshChat }),
+              unavailable: "could not load context",
+              cacheState: "unavailable" as const,
+            }))
+          : resolveReferenceSync(ref, { meshChat: deps.meshChat }),
+        viewerScope()
+      );
     const artifacts = await Promise.all(
       deps.obligations.listArtifacts(id).map(async (artifact) => ({
         artifact,
-        reference: deps.referenceCache
-          ? await deps.referenceCache.get(artifact.ref, deps).catch(() => ({
-              ...resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
-              unavailable: "could not load context",
-              cacheState: "unavailable",
-            }))
-          : resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
+        reference: await resolveCited(artifact.ref),
       }))
     );
     const externalRefKey = obligation.externalRef?.key;
-    const externalReference = externalRefKey
-      ? deps.referenceCache
-        ? await deps.referenceCache.get(externalRefKey, deps).catch(() => ({
-            ...resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat }),
-            unavailable: "could not load context",
-            cacheState: "unavailable",
-          }))
-        : resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat })
-      : null;
+    const externalReference = externalRefKey ? await resolveCited(externalRefKey) : null;
     sendJson(res, 200, {
       obligation,
       parent,
