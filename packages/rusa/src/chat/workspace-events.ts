@@ -214,8 +214,9 @@ export class WorkspaceEventsSubscriber {
 
     // Prune the rest: duplicates double-deliver every message, and an expired
     // subscription can't be renewed (the API refuses a TTL update past expiry).
-    // Whatever survives the prune is what delivery rests on.
-    const delivering = keep ? [keep] : [];
+    // Whatever survives the prune is what delivery rests on — a SUSPENDED keep
+    // only once its reactivation below succeeds.
+    const delivering = keep?.state === "ACTIVE" ? [keep] : [];
     for (const extra of matches) {
       if (extra === keep || !extra.name) continue;
       const reason = isLapsed(extra, now) ? "lapsed" : "duplicate";
@@ -237,7 +238,9 @@ export class WorkspaceEventsSubscriber {
       }
     }
     // With nothing delivering, the lapsed leftovers say when delivery stopped.
-    this.seedConfirmationFromListed(delivering.length > 0 ? delivering : matches);
+    this.seedConfirmationFromListed(
+      delivering.length > 0 ? delivering : matches.filter((match) => isLapsed(match, now))
+    );
 
     if (!keep?.name) {
       this.subscriptionName = null;
@@ -251,10 +254,11 @@ export class WorkspaceEventsSubscriber {
     this.subscriptionName = keep.name;
     if (keep.state === "SUSPENDED") {
       await this.reactivate(keep.name);
-      this.logger?.info("chat_subscription_reactivated", {
-        topic: this.opts.topic,
-        subscriptionName: keep.name,
-      });
+      // Delivering again as of now — but reactivation does not move `expireTime`,
+      // so the seed still holds the alert to the expiry the renew below (or a
+      // retry of it) has yet to push out.
+      this.confirmActive(keep.name, "chat_subscription_reactivated", {});
+      this.seedConfirmationFromListed([keep]);
     }
 
     try {
@@ -276,13 +280,17 @@ export class WorkspaceEventsSubscriber {
     }
   }
 
-  /** Record an API-confirmed create/renew: the only thing that resets lapse tracking. */
-  private confirmActive(subscriptionName: string, event: string): void {
+  /** Record an API-confirmed create/renew/reactivate: the only thing that resets lapse tracking. */
+  private confirmActive(
+    subscriptionName: string,
+    event: string,
+    fields: Record<string, unknown> = { ttl: TTL }
+  ): void {
     this.subscriptionName = subscriptionName;
     this.lastConfirmedActiveAt = Date.now();
     this.lastAlertAt = null;
     this.createAcceptedAt = null;
-    this.logger?.info(event, { topic: this.opts.topic, subscriptionName, ttl: TTL });
+    this.logger?.info(event, { topic: this.opts.topic, subscriptionName, ...fields });
   }
 
   /**
@@ -353,7 +361,9 @@ export class WorkspaceEventsSubscriber {
       );
     }
     if (operation.done && operation.response?.name) return operation.response.name;
-    this.createAcceptedAt = now;
+    // Stamped when the acceptance is *learned*: a slow POST must not spend the
+    // window before the first retry has had a chance to list the new one.
+    this.createAcceptedAt = Date.now();
     const matches = await this.list();
     const name = matches.find(
       (subscription) => subscription.name && !previousNames.has(subscription.name)

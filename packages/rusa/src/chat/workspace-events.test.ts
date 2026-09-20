@@ -47,6 +47,10 @@ class FakeWeApi {
   renewStatus: number | null = null;
   /** When set, POST /subscriptions (create) answers with this status instead. */
   createStatus: number | null = null;
+  /** When set, POST :reactivate answers with this status instead of succeeding. */
+  reactivateStatus: number | null = null;
+  /** How long the create request takes to answer (virtual time, fake timers only). */
+  createLatencyMs = 0;
   /**
    * Whether the create operation completes inline with the Subscription as its
    * response (the API's normal shape) or answers with a bare pending operation.
@@ -80,6 +84,7 @@ class FakeWeApi {
       return jsonResponse(200, { subscriptions: this.subs });
     }
     if (method === "POST" && path === "/subscriptions") {
+      if (this.createLatencyMs > 0) await vi.advanceTimersByTimeAsync(this.createLatencyMs);
       if (this.createStatus !== null) return jsonResponse(this.createStatus, { error: "create" });
       if (this.createOperationError !== null) {
         return jsonResponse(200, {
@@ -113,6 +118,9 @@ class FakeWeApi {
       return jsonResponse(200, { name: "operations/patch" });
     }
     if (method === "POST" && path.endsWith(":reactivate")) {
+      if (this.reactivateStatus !== null) {
+        return jsonResponse(this.reactivateStatus, { error: "reactivate" });
+      }
       if (sub) sub.state = "ACTIVE";
       return jsonResponse(200, { name: "operations/reactivate" });
     }
@@ -289,6 +297,36 @@ describe("WorkspaceEventsSubscriber", () => {
     await vi.advanceTimersByTimeAsync(8 * FIRST_RETRY_MS);
     expect(stuck.count("POST", "/subscriptions")).toBe(2);
     await again.close();
+  });
+
+  it("holds an accepted create for the window measured from the answer, not the request", async () => {
+    vi.useFakeTimers();
+    // A create that takes 58s to answer: the visibility window runs from when
+    // the acceptance is learned, so the first retry 5s later still waits on it
+    // rather than POSTing a second subscription.
+    const api = new FakeWeApi([]);
+    api.createResponseInline = false;
+    api.createLatencyMs = 58 * SECOND;
+    api.createListLag = 3;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+
+    await sub.start();
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(FIRST_RETRY_MS);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect((records.at(-1)?.fields?.err as Error).message).toMatch(/accepted 5s ago/);
+
+    await vi.advanceTimersByTimeAsync(2 * FIRST_RETRY_MS);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+
+    // Adopted on the pass that finally lists it, 35s after the acceptance.
+    await vi.advanceTimersByTimeAsync(4 * FIRST_RETRY_MS);
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(api.subs).toHaveLength(1);
+    await sub.close();
   });
 
   it("treats a failed create operation as a failure, not as an accepted create", async () => {
@@ -605,9 +643,9 @@ describe("WorkspaceEventsSubscriber", () => {
     vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const alerts: SystemChatSubscriptionLapseEvent[] = [];
     // Restart onto a SUSPENDED leftover that stays listed until 15:00 (its
-    // prune keeps failing) beside the ACTIVE subscription delivery actually
-    // rests on, expiring 12:30. The leftover delivers nothing, so its later
-    // expiry must not delay the alert.
+    // prune keeps failing, and so does its reactivation) beside the ACTIVE
+    // subscription delivery actually rests on, expiring 12:30. The leftover
+    // delivers nothing, so its later expiry must not delay the alert.
     const api = new FakeWeApi([
       {
         ...activeSub("subscriptions/susp"),
@@ -621,6 +659,7 @@ describe("WorkspaceEventsSubscriber", () => {
       init?.method === "DELETE" ? jsonResponse(500, { error: "boom" }) : inner(url, init);
     api.renewStatus = 500;
     api.createStatus = 500;
+    api.reactivateStatus = 500;
     const sub = makeSubscriber(api, {
       onLapse: (event) => {
         alerts.push(event);
@@ -630,6 +669,69 @@ describe("WorkspaceEventsSubscriber", () => {
     expect(sub.currentSubscription).toBe("subscriptions/live");
 
     await vi.advanceTimersByTimeAsync(30 * MINUTE - SECOND);
+    expect(alerts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
+    expect(alerts).toHaveLength(1);
+    await sub.close();
+  });
+
+  it("times the lapse from the expired subscription when reactivating the leftover fails", async () => {
+    vi.useFakeTimers();
+    // Restart at 12:40 onto nothing that delivers: the ACTIVE subscription
+    // expired at 12:30 and the SUSPENDED leftover listed to 15:00 delivers
+    // only if reactivation succeeds — here it fails, so the alert is due now.
+    vi.setSystemTime(Date.parse("2026-09-19T12:40:00.000Z"));
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([
+      {
+        ...activeSub("subscriptions/susp"),
+        state: "SUSPENDED",
+        expireTime: "2026-09-19T15:00:00.000Z",
+      },
+      { ...activeSub("subscriptions/live"), expireTime: "2026-09-19T12:30:00.000Z" },
+    ]);
+    api.reactivateStatus = 500;
+    const sub = makeSubscriber(api, {
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+    await sub.start();
+
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.subscriptionName).toBe("subscriptions/susp");
+    // One TTL before the 12:30 expiry is 08:30, so 4h10m without delivery.
+    expect(alerts[0]?.elapsedSeconds).toBe(15_000);
+    await sub.close();
+  });
+
+  it("restarts the lapse clock when reactivation succeeds, up to the unchanged expiry", async () => {
+    vi.useFakeTimers();
+    // Same restart, but reactivation succeeds: the leftover delivers again from
+    // 12:40, so no alert is due until its own 15:00 expiry passes with every
+    // renew still failing.
+    vi.setSystemTime(Date.parse("2026-09-19T12:40:00.000Z"));
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([
+      {
+        ...activeSub("subscriptions/susp"),
+        state: "SUSPENDED",
+        expireTime: "2026-09-19T15:00:00.000Z",
+      },
+      { ...activeSub("subscriptions/live"), expireTime: "2026-09-19T12:30:00.000Z" },
+    ]);
+    api.renewStatus = 500;
+    api.createStatus = 500;
+    const sub = makeSubscriber(api, {
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+    await sub.start();
+    expect(sub.currentSubscription).toBe("subscriptions/susp");
+    expect(alerts).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(2 * HOUR + 20 * MINUTE - SECOND);
     expect(alerts).toEqual([]);
     await vi.advanceTimersByTimeAsync(MAX_RETRY_MS + SECOND);
     expect(alerts).toHaveLength(1);
