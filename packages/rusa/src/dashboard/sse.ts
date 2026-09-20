@@ -1,6 +1,7 @@
 import type { ServerResponse } from "node:http";
 import type { ActorRuntimeStateDelta, ActorRuntimeStateSnapshot } from "../actor/actor-mesh.js";
 import type { AvatarGenerationEvent } from "../avatar/avatars.js";
+import { eventVisibleTo, type HumanChatScope } from "./human-chat-scope.js";
 import type { LiveOutputChunk, MeshEventEmitter } from "./mesh-event-emitter.js";
 
 /**
@@ -104,6 +105,11 @@ class SseClient {
    * `channel` separates the dashboard stream ("mesh": mesh_event + live_output)
    * from the walkie-talkie stream ("voice": reply-TTS announcements only, ISSUE_NUM)
    * — a voice client never receives mesh frames and vice versa.
+   *
+   * `chatScope`, when present, is the human whose conversations this mesh
+   * client may read: message events about another human principal's
+   * conversation are withheld from it (#590). Absent means unscoped (a caller
+   * that has no principal boundary, such as the root's own tooling).
    */
   constructor(
     private readonly res: ServerResponse,
@@ -114,7 +120,8 @@ class SseClient {
      * it deterministically even on the write-throw path (no req close event). */
     private readonly onClose?: () => void,
     /** Stable leased-session id for targeted voice handoff controls. */
-    readonly voiceSessionId?: string
+    readonly voiceSessionId?: string,
+    readonly chatScope?: HumanChatScope
   ) {}
 
   wantsLiveOutput(actorId: string): boolean {
@@ -239,6 +246,7 @@ export class SseHub {
         const text = frame("mesh_event", event);
         for (const client of this.clients) {
           if (client.channel !== "mesh") continue;
+          if (client.chatScope && !eventVisibleTo(client.chatScope, event)) continue;
           try {
             client.send(text);
           } catch {
@@ -302,10 +310,16 @@ export class SseHub {
   /**
    * Attach a new SSE connection. Writes the SSE headers, registers the client,
    * and wires teardown on socket close/error/abort. Returns false (and 503s) if
-   * the connection cap is reached.
+   * the connection cap is reached. `chatScope` is the viewer's human chat
+   * scope; message frames about another human's conversation never reach
+   * this connection (#590).
    */
-  addConnection(res: ServerResponse, actors: Set<string> | null): boolean {
-    return this.attach(res, actors, "mesh");
+  addConnection(
+    res: ServerResponse,
+    actors: Set<string> | null,
+    chatScope?: HumanChatScope
+  ): boolean {
+    return this.attach(res, actors, "mesh", undefined, undefined, chatScope);
   }
 
   /**
@@ -360,7 +374,8 @@ export class SseHub {
     actors: Set<string> | null,
     channel: "mesh" | "voice",
     onClose?: () => void,
-    voiceSessionId?: string
+    voiceSessionId?: string,
+    chatScope?: HumanChatScope
   ): boolean {
     if (this.clients.size >= this.maxClients) {
       res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
@@ -390,7 +405,8 @@ export class SseHub {
         this.remove(client);
         onClose?.();
       },
-      voiceSessionId
+      voiceSessionId,
+      chatScope
     );
     if (channel === "mesh" && this.runtimeState) {
       client.send(frame("hello", { streamId: this.runtimeState.runtimeStateSnapshot().streamId }));

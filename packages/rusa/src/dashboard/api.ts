@@ -38,6 +38,7 @@ import {
   voiceConfigSchema,
 } from "../voice/voice-config.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
+import { type HumanChatScope, resolveHumanChatScope } from "./human-chat-scope.js";
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 
@@ -502,7 +503,8 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
  */
 async function resolveInboxPage(
   page: InboxPage,
-  deps: DashboardDataDeps
+  deps: DashboardDataDeps,
+  chatScope: HumanChatScope
 ): Promise<ResolvedInboxPage> {
   const entries: ResolvedInboxEntry[] = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry> => {
@@ -513,9 +515,20 @@ async function resolveInboxPage(
         // `content` is kept as-is so nothing that reads it today regresses;
         // `reference` is the addition, so the dashboard can render an inbox item
         // through the same widget as an obligation's cited artifacts.
-        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+        const resolved = resolveReferenceSync(`mesh:messages/${messageId}`, {
           meshChat: deps.meshChat,
         });
+        // An actor's inbox is shared mesh state, but the message a human item
+        // points at is that human's conversation: another viewer sees that
+        // the item exists, never what it says (#590).
+        const reference =
+          resolved.entity?.type === "mesh_message" && !chatScope.canSee(resolved.entity)
+            ? {
+                ...resolved,
+                body: null,
+                unavailable: "private to another human principal's conversation",
+              }
+            : resolved;
         return {
           ...entry,
           payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
@@ -599,20 +612,41 @@ export function viewingUserPrincipalId(
   return sole.ok ? sole.user.id : null;
 }
 
+/**
+ * The participant set a `/api/mesh/chat` query may read (#590). A human id in
+ * the request is the client asking for "the human side" of the conversation,
+ * and the only human side a viewer may read is their own: the request's human
+ * ids are replaced by the viewer's own ids (durable principal plus the legacy
+ * alias while it still names them), so the same query reads correctly whether
+ * the client sent `human:operator`, the viewer's id, or both. Naming another
+ * human principal is refused rather than silently narrowed — a direct API
+ * caller asking for someone else's conversation gets told no, not an answer
+ * that looks complete. The legacy `human:operator` alias is never "another
+ * human": the shipped client always sends it, so it stands for the viewer when
+ * it still resolves to them and is simply dropped once several durable users
+ * make it nobody's. A query that names no human (actor↔actor) is untouched.
+ */
 export function resolveChatQueryActors(
   actors: string[],
-  deps: DashboardDataDeps | null,
-  req: IncomingMessage
-): string[] {
-  const result = new Set(actors);
-  const reqPrincipal = getDashboardRequestPrincipal(req);
-  if (reqPrincipal) result.add(reqPrincipal.id);
-  if (result.has(HUMAN_OPERATOR) && deps?.principals) {
-    for (const u of deps.principals.listUsers()) {
-      result.add(u.id);
-    }
+  scope: HumanChatScope
+): { ok: true; actors: string[] } | { ok: false; error: string } {
+  const other = actors.find((id) => id !== HUMAN_OPERATOR && scope.isOtherHuman(id));
+  if (other !== undefined) {
+    return { ok: false, error: "cannot read another human principal's conversation" };
   }
-  return [...result];
+  const mine = scope.viewerIds();
+  const humanRequested = actors.some((id) => id === HUMAN_OPERATOR || mine.has(id));
+  if (!humanRequested) return { ok: true, actors: [...new Set(actors)] };
+  if (mine.size === 0) {
+    return {
+      ok: false,
+      error:
+        "cannot pair this chat with a human principal: several active durable users exist, so configure dashboard auth so each request carries an authenticated identity",
+    };
+  }
+  const result = new Set(actors.filter((id) => id !== HUMAN_OPERATOR && !mine.has(id)));
+  for (const id of mine) result.add(id);
+  return { ok: true, actors: [...result] };
 }
 
 /**
@@ -1546,6 +1580,7 @@ export async function handleMeshApiRequest(
       (deps.providerQueueSnapshots?.() ?? []).map((entry) => [entry.threadId, entry])
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
+    const chatScope = resolveHumanChatScope(req, deps.principals);
     // Aggregate last activity once for all actors; the covering index on
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
@@ -1609,7 +1644,8 @@ export async function handleMeshApiRequest(
           ? (
               await resolveInboxPage(
                 { entries: [inboxSelection.item], unhandledCount: 1, nextCursor: null },
-                deps
+                deps,
+                chatScope
               )
             ).entries[0]
           : null;
@@ -1693,6 +1729,10 @@ export async function handleMeshApiRequest(
       before: parsePositiveInt(url, "before") ?? null,
       kinds: parseKinds(url),
       conversation,
+      // Message events carry the joined mesh_chat body, so another human's
+      // conversation with a selected actor is excluded here, not just on the
+      // chat route (#590).
+      excludeParticipants: resolveHumanChatScope(req, deps.principals).otherHumanIds(),
     });
     sendJson(res, 200, page);
     return true;
@@ -1700,9 +1740,15 @@ export async function handleMeshApiRequest(
 
   // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
   if (pathname === "/api/mesh/chat") {
-    const rawActors = parseActors(url);
-    const actors = resolveChatQueryActors(rawActors, deps, req);
-    const page = deps.meshChat.listChatByActors(actors, {
+    const resolved = resolveChatQueryActors(
+      parseActors(url),
+      resolveHumanChatScope(req, deps.principals)
+    );
+    if (!resolved.ok) {
+      sendJson(res, 403, { error: resolved.error });
+      return true;
+    }
+    const page = deps.meshChat.listChatByActors(resolved.actors, {
       limit: clampLimit(url),
       before: parsePositiveInt(url, "before") ?? null,
     });
@@ -1734,7 +1780,8 @@ export async function handleMeshApiRequest(
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),
         }),
-        deps
+        deps,
+        resolveHumanChatScope(req, deps.principals)
       )
     );
     return true;
@@ -1912,7 +1959,11 @@ export async function handleMeshApiRequest(
   // GET /api/mesh/stream?actors= — SSE: all mesh_event, live_output for `actors`.
   if (pathname === "/api/mesh/stream") {
     const actors = parseActors(url);
-    sseHub.addConnection(res, actors.length > 0 ? new Set(actors) : null);
+    sseHub.addConnection(
+      res,
+      actors.length > 0 ? new Set(actors) : null,
+      resolveHumanChatScope(req, deps.principals)
+    );
     return true;
   }
 

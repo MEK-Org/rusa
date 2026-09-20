@@ -353,11 +353,21 @@ export class MeshEventRepository {
    * `actorIds`. Used by the dashboard Events tab, including the merged stream
    * across a multi-selection. Pass the previous page's `nextCursor` as
    * `before` to page backward in time. `kinds`, if given, restricts to those
-   * event kinds. Returns an empty page for an empty `actorIds`.
+   * event kinds. `excludeParticipants`, if given, drops every message event
+   * whose mesh_chat row has one of those ids at either end — the other human
+   * principals' conversations a viewer may not read (#590) — while leaving
+   * non-message events and legacy message rows with no mesh_chat row alone.
+   * Returns an empty page for an empty `actorIds`.
    */
   listEventsByActors(
     actorIds: string[],
-    opts: { limit: number; before?: number | null; kinds?: string[]; conversation?: boolean } = {
+    opts: {
+      limit: number;
+      before?: number | null;
+      kinds?: string[];
+      conversation?: boolean;
+      excludeParticipants?: string[];
+    } = {
       limit: 50,
     }
   ): EventPage {
@@ -378,6 +388,12 @@ export class MeshEventRepository {
         c.sender_id IN (${actorPlaceholders}) AND c.recipient_id IN (${actorPlaceholders}) AND c.sender_id != c.recipient_id
       )`;
       params.push(...actorIds, ...actorIds);
+    }
+
+    if (opts.excludeParticipants && opts.excludeParticipants.length > 0) {
+      const excluded = opts.excludeParticipants.map(() => "?").join(", ");
+      sql += ` AND (c.id IS NULL OR (c.sender_id NOT IN (${excluded}) AND c.recipient_id NOT IN (${excluded})))`;
+      params.push(...opts.excludeParticipants, ...opts.excludeParticipants);
     }
 
     if (opts.kinds && opts.kinds.length > 0) {

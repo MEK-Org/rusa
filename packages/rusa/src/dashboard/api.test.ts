@@ -398,6 +398,74 @@ describe("handleMeshApiRequest", () => {
       });
       expect(rerun.rewritesApplied).toBe(0);
     });
+
+    describe("human chat scope (#590)", () => {
+      const chatBodies = (res: MockRes): string[] =>
+        (JSON.parse(res.body).chat as Array<{ body: string }>).map((m) => m.body).sort();
+
+      it("pairs the sole local user with their own and the unmigrated alias's rows", async () => {
+        actors.upsert(rec(UUID_A, null, "active"));
+        meshChat.record({ senderId: HUMAN_OPERATOR, recipientId: UUID_A, body: "legacy" });
+        meshChat.record({ senderId: LOCAL_USER, recipientId: UUID_A, body: "mine" });
+        meshChat.record({ senderId: UUID_A, recipientId: LOCAL_USER, body: "reply" });
+        for (const query of [
+          `${UUID_A},${HUMAN_OPERATOR}`,
+          `${UUID_A},${LOCAL_USER}`,
+          `${UUID_A},${HUMAN_OPERATOR},${LOCAL_USER}`,
+        ]) {
+          const { res } = await call(deps, "GET", `/api/mesh/chat?actors=${query}`);
+          expect(res.statusCode).toBe(200);
+          expect(chatBodies(res)).toEqual(["legacy", "mine", "reply"]);
+        }
+      });
+
+      it("refuses to guess which of several local users a human-scoped chat belongs to", async () => {
+        actors.upsert(rec(UUID_A, null, "active"));
+        const other = principals.createUser({
+          email: "second@example.com",
+          createdAt: "2026-06-22T00:00:00.000Z",
+        }).id;
+        for (const [from, body] of [
+          [LOCAL_USER, "first's"],
+          [other, "second's"],
+        ]) {
+          const messageId = meshChat.record({ senderId: from, recipientId: UUID_A, body });
+          meshEvents.record({
+            kind: "message_received",
+            actorId: UUID_A,
+            detail: "s",
+            payload: JSON.stringify({ messageId, from }),
+          });
+        }
+
+        const alias = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${HUMAN_OPERATOR}`);
+        expect(alias.res.statusCode).toBe(403);
+        expect(JSON.parse(alias.res.body).error).toContain("configure dashboard auth");
+        // Naming a durable user outright is asking for someone's private
+        // conversation with no identity to match it against.
+        const named = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${other}`);
+        expect(named.res.statusCode).toBe(403);
+        // The actor's event feed still answers, minus every human's message events.
+        const feed = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}`);
+        expect(feed.res.statusCode).toBe(200);
+        expect(JSON.parse(feed.res.body).events).toEqual([]);
+      });
+
+      it("leaves actor↔actor chat untouched by the human pairing", async () => {
+        actors.upsert(rec(UUID_A, null, "active"));
+        actors.upsert(rec(UUID_B, UUID_A, "active"));
+        principals.createUser({
+          email: "second@example.com",
+          createdAt: "2026-06-22T00:00:00.000Z",
+        });
+        meshChat.record({ senderId: UUID_A, recipientId: UUID_B, body: "down" });
+        meshChat.record({ senderId: UUID_B, recipientId: UUID_A, body: "up" });
+        meshChat.record({ senderId: LOCAL_USER, recipientId: UUID_A, body: "human" });
+        const { res } = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${UUID_B}`);
+        expect(res.statusCode).toBe(200);
+        expect(chatBodies(res)).toEqual(["down", "up"]);
+      });
+    });
   });
 
   it("exposes one provider-aware voice catalog", async () => {
