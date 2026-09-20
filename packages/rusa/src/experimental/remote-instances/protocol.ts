@@ -6,7 +6,7 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 3;
+export const INSTANCE_PROTOCOL_VERSION = 4;
 export interface Bootstrap {
   id: string;
   cwd: string;
@@ -34,6 +34,12 @@ export interface RunSnapshot {
   mcpServers?: McpServerSpec[];
   /** The candidate the leader's pacing gate reserved for this run. */
   selected?: RawProviderModelConfig;
+  /**
+   * True when the leader admitted this run at responsive priority. A promotion
+   * decided on the leader is only reliably visible to the follower here; the
+   * responsive wake behind it can lose the race with this reply on the wire.
+   */
+  responsive?: boolean;
 }
 
 export interface ProviderBridge {
@@ -62,6 +68,8 @@ export type Request =
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   | { type: "wake"; nudge?: RunNudge }
+  /** Ask the follower to replace its current opportunity with responsive work. */
+  | { type: "preempt"; requestId: number }
   | { type: "yield"; status?: string; note?: string }
   | { type: "unkillable" }
   | { type: "stop" }
@@ -69,6 +77,13 @@ export type LeaderCommand =
 
 export type ActorEvent =
   | { type: "ready"; pid: number }
+  /** The follower's observed outcome of a leader preemption request. */
+  | {
+      type: "preempted";
+      requestId: number;
+      preempted: boolean;
+      phase?: "running" | "winding_down" | "queued";
+    }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
   | { type: "state"; state: ActorRuntimeState; yielded: boolean }

@@ -101,12 +101,23 @@ export function createActorRuntime(
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeRun: async ({ mode }) => {
         pendingRunMode = mode;
-        const reply = await request<{ allowed: boolean; sessionId?: string }>({
-          op: "beforeRun",
-          mode,
-        }).result;
-        sessionId = reply.sessionId;
-        return reply.allowed;
+        try {
+          const reply = await request<{ allowed: boolean; sessionId?: string }>({
+            op: "beforeRun",
+            mode,
+          }).result;
+          sessionId = reply.sessionId;
+          return reply.allowed;
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            (err.message.includes("Coordinator reconnected") ||
+              err.message.includes("Coordinator disconnected"))
+          ) {
+            return false;
+          }
+          throw err;
+        }
       },
       gate: async (fn, candidates, responsive) => {
         activeGates++;
@@ -117,10 +128,24 @@ export function createActorRuntime(
           mode: pendingRunMode,
         });
         try {
-          const admitted = await admission.result;
+          let admitted: RunSnapshot | { deferred: true };
+          try {
+            admitted = await admission.result;
+          } catch (err) {
+            if (
+              err instanceof Error &&
+              (err.message.includes("Coordinator reconnected") ||
+                err.message.includes("Coordinator disconnected"))
+            ) {
+              throw new RunStartCancelledError();
+            }
+            throw err;
+          }
           if ("deferred" in admitted) throw new RunStartCancelledError();
           snapshot = admitted;
           if (stopping) throw new Error("Actor stopped before admission");
+          // The leader's admission decision, not wake ordering, sets the run's priority.
+          if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
           sessionId = snapshot.record.sessionId;
           if (snapshot.mcpServers) {
             // Actor holds the array by reference, matching the in-process tool refresh path.
@@ -214,6 +239,14 @@ export function createActorRuntime(
       case "wake":
         if (!stopping) actor?.requestRun(message.nudge);
         break;
+      case "preempt": {
+        // The leader can only report this as effective after this reply: the
+        // leader-side handle has no direct visibility into the follower's
+        // Actor state or its provider abort signal.
+        const result = actor?.preemptForResponsive() ?? { preempted: false as const };
+        send({ type: "preempted", requestId: message.requestId, ...result });
+        break;
+      }
       case "yield":
         actor?.declareYield(message.status, message.note);
         break;

@@ -5,6 +5,8 @@ import {
   InMemoryEventSourceSubscriptionStore,
 } from "../../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
+import type { MeshEventInput } from "../../actor/mesh-events.js";
+import type { LogFields, Logger } from "../../observability/logger.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./fixture-provider.js";
@@ -28,7 +30,7 @@ export function createHarness(options: {
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
-  const remote = new RemoteInstance("test-follower", process.platform, process.pid);
+  let remote = new RemoteInstance("test-follower", process.platform, process.pid);
   const follower = new FollowerInstance(
     options.cwd,
     false,
@@ -36,12 +38,31 @@ export function createHarness(options: {
     options.providerFactory ?? createProvider
   );
   // Exercise the same instance commands without opening a port in unit tests.
-  remote.flush = () => {
-    for (const command of remote.commands.splice(0))
-      queueMicrotask(() => follower.dispatch(structuredClone(command)));
+  const wire = (instance: RemoteInstance) => {
+    instance.flush = () => {
+      for (const command of instance.commands.splice(0))
+        queueMicrotask(() => follower.dispatch(structuredClone(command)));
+    };
   };
+  wire(remote);
   const messages: Array<{ fromId: string; toId: string; body: string }> = [];
   const events: Array<{ actorId: string; event: ActorEvent }> = [];
+  const meshEvents: MeshEventInput[] = [];
+  // The leader's request/outcome distinction is only visible in its structured logs.
+  const logs: Array<{ event: string; fields?: LogFields }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    info: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    warn: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    error: (event, fields) => {
+      logs.push({ event, fields });
+    },
+    child: () => logger,
+  };
   const failures: Error[] = [];
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
@@ -54,6 +75,7 @@ export function createHarness(options: {
     eventSourceOwners,
     eventSourceSubscriptions,
     maxConcurrent: 1,
+    events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     recordChat: (message) => {
       messages.push({ fromId: message.senderId, toId: message.recipientId, body: message.body });
@@ -62,6 +84,18 @@ export function createHarness(options: {
     createActor: (context) => {
       let cursor = 0;
       let admittedCursor = 0;
+      context.lifecycle.add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "abandoned") {
+            mesh.recordEvent({
+              kind: "run_abandoned",
+              actorId: context.record.id,
+              detail: event.terminal.reason,
+              payload: JSON.stringify({ started: event.terminal.started }),
+            });
+          }
+        },
+      });
       const runtime = new ActorHandle({
         host: remote.createHost(context.record.id),
         context,
@@ -96,6 +130,7 @@ export function createHarness(options: {
         onFailure: (error) => {
           failures.push(error);
         },
+        logger,
       });
       runtimes.set(context.record.id, runtime);
       return runtime;
@@ -118,9 +153,18 @@ export function createHarness(options: {
     runtimes,
     messages,
     events,
+    meshEvents,
+    logs,
     failures,
     follower,
-    remote,
+    get remote() {
+      return remote;
+    },
+    reconnect() {
+      remote = new RemoteInstance("test-follower", process.platform, process.pid);
+      wire(remote);
+      return remote;
+    },
     runtime: (id: string) => {
       const runtime = runtimes.get(id);
       if (!runtime) throw new Error(`No runtime for ${id}`);
