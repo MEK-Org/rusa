@@ -7,8 +7,6 @@ export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
-/** Host-only report endpoint; the public v1 API remains GET-only. */
-export const KIMI_FIVE_HOUR_LIMIT_REPORT_PATH = "/internal/kimi-five-hour-limit";
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;
@@ -101,7 +99,6 @@ export function isValidHistoryRecord(record: unknown): record is PublishedHistor
 export type QuotaCoordinatorErrorCode =
   | "not_ready"
   | "provider_unknown"
-  | "invalid_request"
   | "method_not_allowed"
   | "internal_error";
 

@@ -27,14 +27,6 @@ export { parseParsedState, serializeParsedState } from "./parsed-state.js";
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-export const KIMI_LIVE_FIVE_HOUR_403_LABEL = "Kimi live 403 five-hour limit";
-const KIMI_FIVE_HOUR_WINDOW_MS = 5 * 60 * 60 * 1000;
-/**
- * Panel reset times are parsed from a rendered "resets in Xh Ym" and drift by
- * scrape duration and minute rounding. A window rollover moves the reset by
- * hours; anything inside this tolerance is the same window read again.
- */
-const KIMI_RESET_CLOCK_TOLERANCE_MS = SLOT_MS;
 
 /**
  * Observation retention window (30 days).
@@ -406,99 +398,6 @@ export class SharedQuotaStore {
       provider: scrape?.provider ?? "unknown",
       outcome: "failure",
     });
-  }
-
-  /**
-   * Record the authenticated Kimi CLI's explicit five-hour exhaustion signal.
-   *
-   * This is intentionally a canonical observation in the existing quota
-   * tables, not a separate override table: the provider's own response is
-   * stronger evidence than a contradictory rendered status panel. The stable
-   * label marks the row so {@link insertObservations} can keep it standing.
-   *
-   * Recovery (#565 requirement 1) is the provider's clock, never the panel's
-   * capacity figure: the exhaustion clears when the recorded reset passes
-   * ({@link getExhaustedUntil}) or when a later panel reading shows the reset
-   * advanced into the next window. A panel that keeps reporting capacity for
-   * the same window is the lagging reading the live 403 already disproved, so
-   * it is recorded as superseded and cannot re-admit Kimi. The panel's reset
-   * clock is still trusted in one direction: an earlier reset shortens the
-   * lockout, which is what bounds the cold-start estimate below.
-   *
-   * The reset is the newest known future five-hour reset; without one the
-   * response gives no window start, so `observedAt + 5h` is the conservative
-   * upper bound until a panel reading supplies the real clock.
-   */
-  recordAuthoritativeKimiFiveHourLimit(observedAt: string): PersistedQuotaProviderStatus | null {
-    const observedMs = Date.parse(observedAt);
-    if (!Number.isFinite(observedMs)) {
-      throw new Error(`invalid authoritative Kimi observation timestamp: ${observedAt}`);
-    }
-    const known = this.db
-      .prepare(
-        `SELECT reset_at_iso
-         FROM quota_observations
-         WHERE provider = 'kimi' AND kind = 'five_hour' AND reset_at_iso IS NOT NULL
-           AND reset_at_iso > ?
-         ORDER BY observed_at DESC, rowid DESC
-         LIMIT 1`
-      )
-      .get(observedAt) as { reset_at_iso: string } | undefined;
-    const resetAtIso =
-      known?.reset_at_iso ?? new Date(observedMs + KIMI_FIVE_HOUR_WINDOW_MS).toISOString();
-    const state: ProviderQuotaSnapshot = {
-      provider: "kimi",
-      status: "exhausted",
-      scrapedAt: observedAt,
-      limits: [
-        {
-          label: KIMI_LIVE_FIVE_HOUR_403_LABEL,
-          kind: "five_hour",
-          scope: "provider",
-          percentLeft: 0,
-          resetAtIso,
-        },
-      ],
-    };
-    const id = this.recordRaw({
-      provider: "kimi",
-      scrapedAt: observedAt,
-      // Preserve the fact and provenance category, but never copy untrusted
-      // provider stderr into the quota database. The bounded/redacted run
-      // output is the diagnostic record for that text.
-      rawOutput: "authoritative live Kimi 403 five-hour usage-limit response",
-    });
-    const slot = Math.floor(observedMs / SLOT_MS);
-    this.db.transaction(() => {
-      this.db
-        .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
-        .run(serializeParsedState(state), id);
-      this.db
-        .prepare(
-          `INSERT INTO quota_observations
-            (provider, kind, observed_slot, label, observed_at,
-             percent_left, reset_at_iso, window_ms, processed)
-           VALUES ('kimi', 'five_hour', ?, ?, ?, 0, ?, ?, 0)
-           ON CONFLICT(provider, kind, observed_slot) DO UPDATE SET
-             label = excluded.label,
-             observed_at = excluded.observed_at,
-             percent_left = excluded.percent_left,
-             reset_at_iso = excluded.reset_at_iso,
-             window_ms = excluded.window_ms,
-             processed = 0,
-             controller_error = NULL,
-             controller_derivative = NULL,
-             controller_integral = NULL,
-             uncapped_interval_seconds = NULL,
-             interval_seconds = NULL`
-        )
-        .run(slot, KIMI_LIVE_FIVE_HOUR_403_LABEL, observedAt, resetAtIso, KIMI_FIVE_HOUR_WINDOW_MS);
-    })();
-    if (this.controllerOptions) {
-      this.advancePendingController(this.controllerOptions, "kimi");
-      this.controllerUpdated?.("kimi");
-    }
-    return this.getProviderThrottle("kimi");
   }
 
   listSince(provider: string, sinceIso: string): QuotaScrape[] {
@@ -975,49 +874,6 @@ export class SharedQuotaStore {
     };
   }
 
-  /**
-   * Whether a standing live Kimi 403 outranks this five-hour panel candidate.
-   *
-   * The 403 stands while it is the newest five-hour row and its reset is still
-   * ahead of the candidate. A candidate whose reset advanced past it by more
-   * than the clock tolerance is the next window and ends the override; one
-   * whose reset is earlier tightens the standing row's reset in place (the
-   * panel's clock is trusted, its capacity is not); anything else is the same
-   * window's lagging reading and is dropped. Older out-of-order candidates
-   * fall through to the ordinary rules because they never become newest.
-   */
-  private kimiLiveLimitStands(candidate: StoredObservation): boolean {
-    const standing = this.db
-      .prepare(
-        `SELECT label, observed_at AS observedAt, observed_slot AS slot,
-                reset_at_iso AS resetAtIso
-         FROM quota_observations
-         WHERE provider = 'kimi' AND kind = 'five_hour'
-         ORDER BY observed_at DESC, rowid DESC
-         LIMIT 1`
-      )
-      .get() as Pick<StoredObservation, "label" | "observedAt" | "slot" | "resetAtIso"> | undefined;
-    if (!standing || standing.label !== KIMI_LIVE_FIVE_HOUR_403_LABEL) return false;
-    const candidateMs = Date.parse(candidate.observedAt);
-    const recordedResetMs = Date.parse(standing.resetAtIso ?? "");
-    if (!(candidateMs > Date.parse(standing.observedAt)) || !(recordedResetMs > candidateMs)) {
-      return false;
-    }
-    const candidateResetMs = hasValidReset(candidate)
-      ? Date.parse(candidate.resetAtIso ?? "")
-      : Number.NaN;
-    if (candidateResetMs - recordedResetMs > KIMI_RESET_CLOCK_TOLERANCE_MS) return false;
-    if (recordedResetMs - candidateResetMs > KIMI_RESET_CLOCK_TOLERANCE_MS) {
-      this.db
-        .prepare(
-          `UPDATE quota_observations SET reset_at_iso = ?
-           WHERE provider = 'kimi' AND kind = 'five_hour' AND observed_slot = ?`
-        )
-        .run(candidate.resetAtIso, standing.slot);
-    }
-    return true;
-  }
-
   private insertObservations(
     state: ProviderQuotaSnapshot,
     storedObservedAt?: string,
@@ -1071,22 +927,12 @@ export class SharedQuotaStore {
            WHERE provider = ? AND kind = ? AND observed_slot = ?`
         )
         .get(provider, kind, candidate.slot) as StoredObservation | undefined;
-      if (provider === "kimi" && kind === "five_hour" && this.kimiLiveLimitStands(candidate)) {
-        observed("superseded");
-        continue;
-      }
-      const replacesAuthoritativeKimi403 =
-        provider === "kimi" &&
-        kind === "five_hour" &&
-        existing?.label === KIMI_LIVE_FIVE_HOUR_403_LABEL &&
-        Date.parse(candidate.observedAt) > Date.parse(existing.observedAt);
-      if (existing?.processed === 1 && !replacesAuthoritativeKimi403) {
+      if (existing?.processed === 1) {
         observed("superseded");
         continue;
       }
       const candidateWins =
         !existing ||
-        replacesAuthoritativeKimi403 ||
         (hasValidReset(candidate) && !hasValidReset(existing)) ||
         (hasValidReset(candidate) === hasValidReset(existing) &&
           Date.parse(candidate.observedAt) > Date.parse(existing.observedAt));
@@ -1105,13 +951,7 @@ export class SharedQuotaStore {
              observed_at = excluded.observed_at,
              percent_left = excluded.percent_left,
              reset_at_iso = excluded.reset_at_iso,
-             window_ms = excluded.window_ms,
-             processed = 0,
-             controller_error = NULL,
-             controller_derivative = NULL,
-             controller_integral = NULL,
-             uncapped_interval_seconds = NULL,
-             interval_seconds = NULL`
+             window_ms = excluded.window_ms`
         )
         .run(
           provider,
