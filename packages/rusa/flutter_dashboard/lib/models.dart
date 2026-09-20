@@ -61,11 +61,8 @@ class ProviderModelConfig {
 
   /// One candidate on one line — `provider · model · effort medium` — with
   /// the effort clause dropped when the server sent no explicit effort.
-  String get label => [
-    provider,
-    model,
-    if (effort != null) 'effort $effort',
-  ].join(' · ');
+  String get label =>
+      [provider, model, if (effort != null) 'effort $effort'].join(' · ');
 
   @override
   bool operator ==(Object other) =>
@@ -444,7 +441,10 @@ class ThreadDto {
     voiceConfig: j['voiceConfig'] != null
         ? VoiceConfigDto.fromJson(j['voiceConfig'] as Map<String, dynamic>)
         : j['voiceName'] != null
-        ? VoiceConfigDto(provider: 'google', config: {'voiceName': j['voiceName']})
+        ? VoiceConfigDto(
+            provider: 'google',
+            config: {'voiceName': j['voiceName']},
+          )
         : null,
   );
 }
@@ -612,6 +612,28 @@ class ActorRuntimeStateDelta {
       );
 }
 
+/// Lifecycle of one actor's lazy first-display avatar generation, relayed by
+/// the server as an `avatar` SSE frame. `generating` turns the ring on; `ready`
+/// re-requests the image; `failed` settles on the fallback silhouette.
+enum AvatarGenerationState { generating, ready, failed }
+
+class AvatarGenerationUpdate {
+  const AvatarGenerationUpdate({required this.actorId, required this.state});
+
+  final String actorId;
+  final AvatarGenerationState state;
+
+  factory AvatarGenerationUpdate.fromJson(Map<String, dynamic> j) =>
+      AvatarGenerationUpdate(
+        actorId: j['actorId'] as String,
+        state: switch (j['state']) {
+          'generating' => AvatarGenerationState.generating,
+          'ready' => AvatarGenerationState.ready,
+          _ => AvatarGenerationState.failed,
+        },
+      );
+}
+
 /// Normalized view state for a single actor in the mesh.
 /// Combines the underlying [ThreadDto] metadata with the live, reactive [RunState].
 class ActorViewState {
@@ -719,18 +741,19 @@ class ActorStateSnapshot {
     this.actors = const {},
     this.orderedIds = const [],
     Set<String>? activeObligationIds,
-  }) : activeObligationIds = activeObligationIds ??
-            {
-              for (final a in actors.values)
-                if (a.isActiveRun && a.selectedObligation?.id != null)
-                  a.selectedObligation!.id,
-            };
+  }) : activeObligationIds =
+           activeObligationIds ??
+           {
+             for (final a in actors.values)
+               if (a.isActiveRun && a.selectedObligation?.id != null)
+                 a.selectedObligation!.id,
+           };
 
   const ActorStateSnapshot.empty()
-      : revision = 0,
-        actors = const {},
-        orderedIds = const [],
-        activeObligationIds = const {};
+    : revision = 0,
+      actors = const {},
+      orderedIds = const [],
+      activeObligationIds = const {};
 
   final int revision;
   final Map<String, ActorViewState> actors;
@@ -785,7 +808,8 @@ class ActorStateSnapshot {
     revision: revision ?? this.revision,
     actors: actors ?? this.actors,
     orderedIds: orderedIds ?? this.orderedIds,
-    activeObligationIds: activeObligationIds ??
+    activeObligationIds:
+        activeObligationIds ??
         (actors != null ? null : this.activeObligationIds),
   );
 
@@ -1525,7 +1549,8 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
+  final String
+  status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1610,7 +1635,9 @@ class ObligationDto {
   /// statuses represent durable lifecycle states (completed, cancelled,
   /// scheduled for future execution, or waiting on dependencies/blockers)
   /// that are not overridden by a run focus.
-  ObligationPresentationState presentationState({required bool activelyWorked}) {
+  ObligationPresentationState presentationState({
+    required bool activelyWorked,
+  }) {
     final base = ObligationPresentationState.fromStatus(status);
     if (activelyWorked && base == ObligationPresentationState.ready) {
       return ObligationPresentationState.active;
@@ -1715,14 +1742,13 @@ class ObligationForest {
   final int total;
   final bool hasMore;
 
-  factory ObligationForest.fromJson(Map<String, dynamic> j) =>
-      ObligationForest(
-        trees: (j['trees'] as List<dynamic>? ?? const [])
-            .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        total: j['total'] as int? ?? 0,
-        hasMore: j['hasMore'] as bool? ?? false,
-      );
+  factory ObligationForest.fromJson(Map<String, dynamic> j) => ObligationForest(
+    trees: (j['trees'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    total: j['total'] as int? ?? 0,
+    hasMore: j['hasMore'] as bool? ?? false,
+  );
 }
 
 class ObligationListPage {

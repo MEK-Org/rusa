@@ -11,7 +11,11 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxEntry } from "../actor/inbox-store.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
-import { readAvatar } from "../avatar/avatars.js";
+import {
+  AvatarGenerationCoordinator,
+  type AvatarGenerationEvent,
+  readAvatar,
+} from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -2130,6 +2134,148 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
     expect(res.statusCode).toBe(404);
     expect(res.headers["Cache-Control"]).toBe("no-store");
+  });
+
+  it("answers a missing avatar 404 at once and starts one coalesced attempt only for live actors", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatars-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+    actors.upsert(rec(UUID_B, null, "retired"));
+
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("lazy-avatar"),
+    ]);
+    let release: ((response: Response) => void) | undefined;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        })
+    );
+
+    try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: coordinator,
+      };
+      const [first, second] = await Promise.all([
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+      ]);
+
+      // The response never waits on the provider: it would otherwise occupy one
+      // of the browser's few HTTP/1.1 connections for the whole round trip.
+      expect(first.res.statusCode).toBe(404);
+      expect(second.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Both requests announce the same in-flight attempt to dashboards.
+      expect(events).toEqual([
+        { actorId: UUID_A, state: "generating" },
+        { actorId: UUID_A, state: "generating" },
+      ]);
+
+      const unknown = await call(lazyDeps, "GET", "/api/mesh/avatar/not-a-known-actor.png");
+      expect(unknown.res.statusCode).toBe(404);
+      const retired = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(retired.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
+
+      release?.({
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ inlineData: { data: png.toString("base64") } }] } }],
+        }),
+      } as unknown as Response);
+      expect(await outcome).toEqual({ actorId: UUID_A, state: "ready" });
+
+      // The `ready` frame is what makes the dashboard re-request; that request is served.
+      const served = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
+      expect(served.res.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.({ ok: false, status: 500 } as Response);
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a failed lazy attempt on the fallback instead of retrying on later GETs", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-failure-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_B, null, "active"));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("provider unavailable"));
+
+    try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: coordinator,
+      };
+      const first = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(first.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(await outcome).toEqual({ actorId: UUID_B, state: "failed" });
+      expect(events).toEqual([
+        { actorId: UUID_B, state: "generating" },
+        { actorId: UUID_B, state: "failed" },
+      ]);
+
+      // A later page load re-requests the image (`no-store`); the settled
+      // failure means no second provider call and no renewed ring.
+      const repeat = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(repeat.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("never generates when no coordinator is wired (UI-only server)", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-disabled-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    try {
+      const { res } = await call(
+        { ...deps, geminiApiKey: "key" },
+        "GET",
+        `/api/mesh/avatar/${UUID_A}.png`
+      );
+      expect(res.statusCode).toBe(404);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("serves avatars even with no mesh bound (filesystem-backed, deps=null)", async () => {

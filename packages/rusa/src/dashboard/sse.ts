@@ -1,5 +1,6 @@
 import type { ServerResponse } from "node:http";
 import type { ActorRuntimeStateDelta, ActorRuntimeStateSnapshot } from "../actor/actor-mesh.js";
+import type { AvatarGenerationEvent } from "../avatar/avatars.js";
 import type { LiveOutputChunk, MeshEventEmitter } from "./mesh-event-emitter.js";
 
 /**
@@ -197,6 +198,13 @@ export interface SseHubOptions {
     runtimeStateSnapshot(): ActorRuntimeStateSnapshot;
     onRuntimeStateDelta(listener: (delta: ActorRuntimeStateDelta) => void): () => void;
   };
+  /**
+   * Lazy avatar generation lifecycle, relayed as `avatar` frames so a dashboard
+   * can show the generating ring and re-request the image once it exists.
+   */
+  avatarGeneration?: {
+    onStateChange(listener: (event: AvatarGenerationEvent) => void): () => void;
+  };
 }
 
 /**
@@ -258,6 +266,21 @@ export class SseHub {
       this.unsubscribers.push(
         opts.runtimeState.onRuntimeStateDelta((delta) => {
           const text = frame("actor_runtime_state", delta);
+          for (const client of this.clients) {
+            if (client.channel !== "mesh") continue;
+            try {
+              client.send(text);
+            } catch {
+              this.remove(client);
+            }
+          }
+        })
+      );
+    }
+    if (opts.avatarGeneration) {
+      this.unsubscribers.push(
+        opts.avatarGeneration.onStateChange((event) => {
+          const text = frame("avatar", event);
           for (const client of this.clients) {
             if (client.channel !== "mesh") continue;
             try {

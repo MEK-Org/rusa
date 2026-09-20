@@ -15,6 +15,9 @@ abstract interface class MeshStreamSource {
   Stream<RuntimeHello> get runtimeHello;
   Stream<ActorRuntimeStateDelta> get runtimeStates;
 
+  /// Lazy avatar generation lifecycle (the named `avatar` frame), for every actor.
+  Stream<AvatarGenerationUpdate> get avatarUpdates;
+
   /// (Re)open the stream filtered to [actors] for the live_output channel.
   /// mesh_event still arrives for every actor regardless of this filter.
   void connect(List<String> actors);

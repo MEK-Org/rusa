@@ -44,6 +44,9 @@ class _BenchStream implements MeshStreamSource {
   Stream<ActorRuntimeStateDelta> get runtimeStates => const Stream.empty();
 
   @override
+  Stream<AvatarGenerationUpdate> get avatarUpdates => const Stream.empty();
+
+  @override
   void connect(List<String> actors) {}
 
   @override

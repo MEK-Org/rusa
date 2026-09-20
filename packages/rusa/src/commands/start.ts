@@ -110,7 +110,6 @@ import {
   sweepOrphanedWorkspaces,
   unattributedCheckouts,
 } from "../actor/workspace-sweep.js";
-import { backfillAvatars, kickAvatarGeneration } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
 import { GchatOAuth } from "../chat/gchat-oauth.js";
@@ -2306,14 +2305,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }),
     lifecycleListeners: [
       {
-        // Eagerly generate an avatar on genuine spawn. Root is adopted, so it
-        // never reaches this listener and continues to use its fixed image.
-        onSpawn: ({ actorId }) =>
-          kickAvatarGeneration(actorId, {
-            apiKey: config.geminiApiKey ?? "",
-            rootId,
-            log: (m) => console.log(`[avatar] ${m}`),
-          }),
         onRetire: ({ actorId }) => {
           teardownActorMcp(actorId);
         },
@@ -3478,18 +3469,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       });
     }
   }
-
-  // One-time avatar backfill : generate a cached avatar for every currently
-  // live actor that lacks one, so existing actors get an avatar without waiting to
-  // respawn. Strictly fire-and-forget — the root and already-cached handles are
-  // no-ops inside the generator, and any failure is isolated to a log line.
-  backfillAvatars(
-    actors
-      .list()
-      .filter((r) => r.status === "active")
-      .map((r) => r.id),
-    { apiKey: config.geminiApiKey ?? "", rootId, log: (m) => console.log(`[avatar] ${m}`) }
-  );
 
   // ── Inbound edges → root inbox ──
   const webhookPort = config.webhook?.port ?? 9742;

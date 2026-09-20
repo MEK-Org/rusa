@@ -22,10 +22,10 @@ import { resolveHome } from "../config/index.js";
  *
  * Two hard rules, both about keeping the system calm and stable:
  *
- *  - **Strictly fire-and-forget.** Generation is an out-of-band side effect on
- *    spawn. It must NEVER block, delay, or break actor spawning, and it must NOT
- *    retry — a recent rate-limit storm came from self-continuing failures, so the
- *    avatar path is one shot: on any error we log and move on.
+ *  - **First display, one attempt.** Generation starts only when the dashboard
+ *    asks for a known actor's missing avatar. It never runs in the actor spawn
+ *    path, and a process keeps one settled attempt per actor so a failed image
+ *    cannot turn routine widget rebuilds into provider retries.
  *  - **Generate once, never regenerate.** Image generation is non-deterministic;
  *    the first image for a handle is cached to disk and kept stable across
  *    restarts. An existing cache file is never overwritten.
@@ -196,8 +196,8 @@ async function callGeminiImage(apiKey: string, prompt: string): Promise<Buffer> 
  * through a temp file + rename so a crash mid-download can never leave a
  * half-written PNG cached (which we'd then never regenerate).
  *
- * Throws on failure — callers should use {@link kickAvatarGeneration} so the
- * error stays isolated to a log line.
+ * Throws on failure — callers should use {@link AvatarGenerationCoordinator}
+ * so errors stay isolated to a log line and concurrent requests coalesce.
  */
 export async function generateAvatarOnce(threadId: string, deps: AvatarGenDeps): Promise<void> {
   if (threadId === deps.rootId || isRootHandle(threadId)) return; // root uses the fixed bundled image
@@ -255,13 +255,13 @@ export function isValidImageSignature(bytes: Buffer): boolean {
 /**
  * Generate and cache the avatar for one thread, **always** overwriting any
  * existing cached file. This is the explicit-user-action counterpart to
- * {@link generateAvatarOnce}: that function's "never regenerate" guard exists
- * to keep a fire-and-forget, non-deterministic spawn-time generation stable
- * across restarts, but a dashboard "Generate" button click is a deliberate,
- * one-shot request that must always take effect. Root and a missing API key
+ * {@link generateAvatarOnce}: that function's "never regenerate" guard keeps
+ * a lazy, non-deterministic first image stable across restarts, but a dashboard
+ * "Generate" button click is a deliberate, one-shot request that must always
+ * take effect. Root and a missing API key
  * still short-circuit as no-ops. Throws on failure (e.g. the Gemini call) —
  * callers (the dashboard API route) report the error directly rather than
- * swallowing it, unlike the fire-and-forget {@link kickAvatarGeneration}.
+ * swallowing it, unlike {@link AvatarGenerationCoordinator}'s lazy path.
  */
 export async function generateAvatarForce(threadId: string, deps: AvatarGenDeps): Promise<void> {
   if (!deps.apiKey) return; // no key configured → nothing to do
@@ -297,27 +297,93 @@ export function uploadAvatar(id: string, bytes: Buffer, rootId?: string): void {
   writeAvatarCacheFile(id === rootId ? "root" : id, bytes);
 }
 
-/**
- * Fire-and-forget avatar generation for one thread. NEVER throws and NEVER
- * blocks the caller — this is the only entry point the spawn path and backfill
- * should use. A single attempt; on any error we log and move on (no retries).
- */
-export function kickAvatarGeneration(threadId: string, deps: AvatarGenDeps): void {
-  void generateAvatarOnce(threadId, deps).catch((err) => {
-    deps.log?.(
-      `avatar gen for ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`
-    );
-  });
+/** Lifecycle of one actor's lazy first-display generation attempt. */
+export type AvatarGenerationState = "generating" | "ready" | "failed";
+
+/** Pushed to dashboards (as an `avatar` SSE frame) so they can show the ring and re-request the image. */
+export interface AvatarGenerationEvent {
+  actorId: string;
+  state: AvatarGenerationState;
 }
 
 /**
- * One-time backfill: kick generation for every currently-live actor that lacks a
- * cached avatar, so existing actors (root, elder, stewards) get an avatar without
- * waiting to respawn. Same fire-and-forget path as on-spawn; root and already
- * cached ids are no-ops inside {@link generateAvatarOnce}.
+ * Process-local single-flight state for lazy avatar generation. A settled entry
+ * intentionally stays in the map: successful generations already have a stable
+ * cache file, and failures must remain on the fallback rather than retriggering
+ * provider work every time a dashboard re-requests the image (the avatar route
+ * is `no-store`, so every page load would otherwise be a retry). Explicit
+ * upload and force generation deliberately bypass this first-display policy.
+ *
+ * The coordinator never holds an HTTP response open: the avatar route answers a
+ * missing image with an immediate 404 and the outcome travels over the existing
+ * SSE stream via {@link onStateChange}, so a slow provider call can never occupy
+ * one of the browser's few HTTP/1.1 connections.
  */
-export function backfillAvatars(threadIds: Iterable<string>, deps: AvatarGenDeps): void {
-  for (const id of threadIds) kickAvatarGeneration(id, deps);
+export class AvatarGenerationCoordinator {
+  private readonly attempts = new Map<string, { promise: Promise<void>; settled: boolean }>();
+  private readonly listeners = new Set<(event: AvatarGenerationEvent) => void>();
+
+  /** Subscribe to attempt lifecycle events; returns the unsubscribe function. */
+  onStateChange(listener: (event: AvatarGenerationEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Start (or join) the single first-display attempt for one non-root actor.
+   * Returns undefined when there is nothing to generate; otherwise the shared,
+   * always-settling attempt. Joining a still-pending attempt re-announces
+   * `generating`, so a dashboard that loaded after the attempt began still
+   * shows the ring; a settled attempt is returned silently.
+   */
+  request(threadId: string, deps: AvatarGenDeps): Promise<void> | undefined {
+    if (
+      !deps.apiKey ||
+      threadId === deps.rootId ||
+      isRootHandle(threadId, deps.rootHandle) ||
+      existsSync(avatarCachePath(threadId))
+    ) {
+      return undefined;
+    }
+
+    const prior = this.attempts.get(threadId);
+    if (prior) {
+      if (!prior.settled) this.emit({ actorId: threadId, state: "generating" });
+      return prior.promise;
+    }
+
+    const entry = { settled: false, promise: Promise.resolve() };
+    entry.promise = generateAvatarOnce(threadId, deps)
+      .then(() => {
+        entry.settled = true;
+        this.emit({
+          actorId: threadId,
+          state: existsSync(avatarCachePath(threadId)) ? "ready" : "failed",
+        });
+      })
+      .catch((err) => {
+        entry.settled = true;
+        deps.log?.(
+          `avatar gen for ${threadId} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        this.emit({ actorId: threadId, state: "failed" });
+      });
+    this.attempts.set(threadId, entry);
+    this.emit({ actorId: threadId, state: "generating" });
+    return entry.promise;
+  }
+
+  private emit(event: AvatarGenerationEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A dashboard fan-out failure must never surface into the avatar path.
+      }
+    }
+  }
 }
 
 /** A resolved avatar ready to serve: file bytes plus its content type. */

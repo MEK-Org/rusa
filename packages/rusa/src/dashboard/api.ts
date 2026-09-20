@@ -8,6 +8,7 @@ import type { InboxEntry, InboxPage, InboxPayload, InboxStore } from "../actor/i
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
+  type AvatarGenerationCoordinator,
   generateAvatarForce,
   isRootHandle,
   type RootAvatarIdentity,
@@ -126,6 +127,13 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  /**
+   * Process-local one-attempt state for first-display avatar generation. The
+   * live mesh server injects the single instance it also wires into the SSE
+   * hub; when absent (a UI-only server) missing avatars simply stay 404 and
+   * nothing can spend provider quota.
+   */
+  avatarGeneration?: AvatarGenerationCoordinator;
   supportedVoices?: readonly SupportedVoice[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
@@ -1445,15 +1453,27 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar , keyed by
-  // the unique thread id (the root id serves the fixed bundled image).
-  // Filesystem-backed and independent of the live mesh, so it's served even when
-  // `deps` is null (a UI-only server). 404 when nothing is cached yet so the UI
-  // falls back to its placeholder.
+  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar, keyed by the
+  // unique thread id (the root id serves the fixed bundled image). Filesystem-
+  // backed, so it's served even when `deps` is null (a UI-only server). A
+  // missing image is always an immediate 404 so the UI falls back to its
+  // placeholder; for a live actor it additionally starts (or joins) the one
+  // background generation attempt, whose outcome reaches the dashboard as an
+  // `avatar` SSE frame rather than by holding this response open. Unknown and
+  // retired ids never spend provider quota.
   if (pathname.startsWith(AVATAR_PREFIX)) {
     const key = avatarKeyFromPath(pathname);
     const avatar = key ? readAvatar(key, deps?.rootIdentity) : null;
     if (!avatar) {
+      if (key && deps?.avatarGeneration && deps.actors.get(key)?.status === "active") {
+        // Never rejects: the coordinator logs and settles every failure itself.
+        void deps.avatarGeneration.request(key, {
+          apiKey: deps.geminiApiKey ?? "",
+          rootHandle: deps.rootIdentity?.handle,
+          rootId: deps.rootIdentity?.id,
+          log: (message) => deps.logger?.warn("avatar_lazy_generation_failed", { key, message }),
+        });
+      }
       res.writeHead(404, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
