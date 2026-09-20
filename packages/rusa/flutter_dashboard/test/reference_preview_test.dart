@@ -579,6 +579,23 @@ void main() {
         ),
       );
       expect(find.text('Msg content'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'slack:channels/C123/messages/1720000000.000001',
+              scheme: 'slack',
+              title: 'Slack message',
+              entity: {
+                'type': 'slack_message',
+                'contents': 'A decision in Slack',
+              },
+            ),
+          ),
+        ),
+      );
+      expect(find.text('A decision in Slack'), findsOneWidget);
     });
 
     testWidgets(

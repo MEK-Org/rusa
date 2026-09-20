@@ -159,8 +159,8 @@ In certain circumstances, an actor can automatically be delegated an event
 source, for example, an actor that opens a PR or an issue, is automatically
 delegated the corresponding event source.
 
-Pull requests have their own `github_pr:` sources, and Google Chat spaces are
-subscribed the same way (`gchat:spaces/…`). Inbox entries are durable: an actor
+Pull requests have their own `github_pr:` sources, and chat conversations are
+subscribed the same way (`gchat:spaces/…` or `slack:channels/…`). Inbox entries are durable: an actor
 reads them with the inbox MCP tools, marks them handled when it has acted, and
 unhandled entries survive restarts. GitHub events arrive over a webhook
 listener; there is no polling fallback. See

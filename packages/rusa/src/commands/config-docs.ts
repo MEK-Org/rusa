@@ -133,6 +133,7 @@ Top-level fields:
   rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
                            root-actor.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
+  slack                    Optional. Slack Socket Mode ingestion and bot REST settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
   voice                    Optional. Walkie-talkie transcription and actor speech settings.
                            Enabled by geminiApiKey (for Google) or elevenlabsApiKey (for ElevenLabs).
@@ -211,11 +212,22 @@ chat:
   pubsubKeyPath            Required. Path to the chat-puller service-account key JSON (Pub/Sub auth).
   gchatConfigDir           Optional. Directory holding gchat user-OAuth tokens (minted by gchat-auth).
                            Defaults to ~/.config/gchat.
-  errorChat                Optional space resource name (e.g. spaces/AAAA) that receives mechanical failure notices.
+  errorChat                Deprecated. Google Chat space name (e.g. spaces/AAAA) for mechanical
+                           failure notices. Use observability.errorSink instead.
   gchat                    Optional. "all" or a list of space resource names (e.g. ["spaces/AAAA"]) granting
                            the root actor outbound write capability to those spaces.
   excludedSpaces           Optional list of space resource names (e.g. ["spaces/AAAA_STAGING"]). Inbound
                            messages from these spaces are dropped early before mesh delivery.
+
+slack:
+
+  appTokenPath             Required. File directly inside RUSA_HOME/secrets containing the app-level
+                           xapp token with connections:write.
+  botTokenPath             Required. File directly inside RUSA_HOME/secrets containing the xoxb bot token.
+                           Configure app_mentions:read,
+                           im:history, channels:history, channels:read, chat:write, and reactions:write bot scopes.
+  Root owns inbound slack:channels; workers may receive delegated channels.
+  Message references use slack:channels/<id>/messages/<timestamp>.
 
 dashboard:
 
@@ -235,6 +247,14 @@ invocationDebug:
   maxBytesPerInvocation    Optional number. Hard cap in bytes across prompt, transcript, raw streams,
                            and failure patch for one invocation. Default: 209715200 (200 MB).
 
+observability.errorSink:
+
+  Preferred destination for mechanical failure notices and lifecycle alerts. Use a
+  concrete writable event source reference: gchat:spaces/AAAA or
+  slack:channels/C123. The matching integration must be configured. Startup rejects
+  references without a writer and conflicting values of this setting and the
+  deprecated chat.errorChat. If only chat.errorChat is set, it remains supported.
+
 observability.logging:
 
   level                    Optional string. Minimum level the application logger records:
@@ -253,7 +273,8 @@ observability.diskAlert:
   The disk sensor runs unless it is explicitly disabled, and root is subscribed to
   responsive system.disk events on exactly the same condition — so this section can be
   omitted entirely and alerts still reach root. When a disk alert resolves no recipient,
-  it falls back to chat.errorChat so a host-level alarm never depends on mesh routing.
+  it falls back to observability.errorSink (or deprecated chat.errorChat) so a
+  host-level alarm never depends on mesh routing.
   enabled                  Optional boolean. Disk headroom alert is enabled by default;
                            set enabled: false to deactivate it and drop the subscription.
   volume                   Optional string. The path to the relevant volume to check.

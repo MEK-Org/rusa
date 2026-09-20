@@ -32,6 +32,8 @@ program
   .option("--root <path>", "Use a specific root directory instead of a fresh tempdir")
   .option("--resume", "Resume an existing instance root without reprovisioning")
   .option("--base-config-home <path>", "Home to seed providers and the Gemini key from")
+  .option("--slack-app-token-path <path>", "Host file containing the Slack app-level token")
+  .option("--slack-bot-token-path <path>", "Host file containing the Slack bot token")
   .option("--root-driver <driver>", "Root driver: provider or external", "provider")
   .option("--auth-emulator <host:port>", "Use a loopback Firebase Auth emulator (demo-rusa-auth)")
   .option("--auth-email <email>", "Sole emulator operator", "operator@example.com")
@@ -55,6 +57,8 @@ program
     async (opts: {
       root?: string;
       baseConfigHome?: string;
+      slackAppTokenPath?: string;
+      slackBotTokenPath?: string;
       rootDriver: string;
       authEmulator?: string;
       authEmail: string;
@@ -69,12 +73,19 @@ program
       if (opts.rootDriver !== "provider" && opts.rootDriver !== "external") {
         throw new Error("--root-driver must be provider or external");
       }
+      if (Boolean(opts.slackAppTokenPath) !== Boolean(opts.slackBotTokenPath)) {
+        throw new Error("both Slack token paths must be supplied together");
+      }
       if (opts.followerBind && (!opts.followerTokenFile || opts.resume)) {
         throw new Error("Follower prototype requires --follower-token-file and a fresh instance");
       }
       await runActorMeshE2EUp({
         root: opts.root,
         baseConfigHome: opts.baseConfigHome,
+        slack:
+          opts.slackAppTokenPath && opts.slackBotTokenPath
+            ? { appTokenPath: opts.slackAppTokenPath, botTokenPath: opts.slackBotTokenPath }
+            : undefined,
         rootDriver: opts.rootDriver,
         authEmulator: opts.authEmulator,
         authEmail: opts.authEmail,

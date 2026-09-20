@@ -68,10 +68,10 @@ class _ReferencePreviewState extends State<ReferencePreview> {
       displayBody = reviewBody.isNotEmpty
           ? reviewBody
           : _reviewVerdictText(entity?['state'] as String?) ?? displayBody;
-    } else if (entityType == 'gchat_space') {
+    } else if (entityType == 'gchat_space' || entityType == 'slack_channel') {
       displayTitle = entity?['name'] as String? ?? displayTitle;
       displayBody = '';
-    } else if (entityType == 'gchat_message') {
+    } else if (entityType == 'gchat_message' || entityType == 'slack_message') {
       displayBody = (entity?['contents'] as String?)?.trim() ?? displayBody;
     } else if (entityType == 'mesh_message') {
       final senderId = entity?['senderId'] as String?;
@@ -261,9 +261,12 @@ String _genericTitle(String scheme, String? entityType) => switch (entityType) {
   'github_review' => 'GitHub review',
   'gchat_message' => 'Chat message',
   'gchat_space' => 'Chat space',
+  'slack_message' => 'Slack message',
+  'slack_channel' => 'Slack channel',
   _ => switch (scheme) {
     'github' => 'GitHub reference',
     'gchat' => 'Chat reference',
+    'slack' => 'Slack reference',
     'mesh' => 'Mesh message',
     _ => 'Reference unavailable',
   },

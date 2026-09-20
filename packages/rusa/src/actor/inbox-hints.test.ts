@@ -17,6 +17,44 @@ function makeEntry(partial: Partial<InboxEntry> = {}): InboxEntry {
 }
 
 describe("inbox hints", () => {
+  describe("Slack messages", () => {
+    it("keeps top-level replies at the top level", () => {
+      for (const threadTs of [undefined, "1720000000.000001"]) {
+        const hint = resolveInboxHint(
+          makeEntry({
+            source: "slack:channels/D1",
+            payload: {
+              type: "slack.message",
+              channel: "D1",
+              ts: "1720000000.000001",
+              threadTs,
+              messageRef: "slack:channels/D1/messages/1720000000.000001",
+            },
+          })
+        );
+        expect(hint).toContain(
+          "omitting threadTs, unless the message explicitly requests a new thread"
+        );
+      }
+    });
+
+    it("replies within an existing thread", () => {
+      const hint = resolveInboxHint(
+        makeEntry({
+          source: "slack:channels/C1",
+          payload: {
+            type: "slack.message",
+            channel: "C1",
+            ts: "1720000001.000001",
+            threadTs: "1720000000.000001",
+          },
+        })
+      );
+      expect(hint).toContain("existing thread");
+      expect(hint).toContain("threadTs '1720000000.000001'");
+    });
+  });
+
   describe("human operator messages ", () => {
     it("provides a reminder to reply via mesh chat for human.message payload", () => {
       const entry = makeEntry({

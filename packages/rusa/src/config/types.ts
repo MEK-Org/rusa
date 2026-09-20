@@ -153,6 +153,7 @@ export interface ChatConfig {
    */
   gchatConfigDir?: string;
   /**
+   * @deprecated Use observability.errorSink (e.g. `gchat:spaces/AAAA`).
    * Chat space (resource name, e.g. `spaces/AAAA`) that receives mechanical
    * failure notices when the *root* actor's run fails — the root has no parent
    * inbox to fall back to. Rote, not judgment: the failure sink posts here
@@ -173,6 +174,12 @@ export interface ChatConfig {
    * to avoid processing messages meant for a staging instance.
    */
   excludedSpaces?: string[];
+}
+
+/** Slack Socket Mode integration. Token files stay on the host. */
+export interface SlackConfig {
+  appTokenPath: string;
+  botTokenPath: string;
 }
 
 export interface DashboardConfig {
@@ -284,6 +291,8 @@ export interface DiskAlertConfig {
 }
 
 export interface ObservabilityConfig {
+  /** Writable event source receiving mechanical failures, e.g. `gchat:spaces/AAAA` or `slack:channels/C123`. */
+  errorSink?: string;
   diskAlert?: DiskAlertConfig;
   logging?: LoggingConfig;
 }
@@ -422,6 +431,7 @@ export interface RusaConfig {
   rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;
+  slack?: SlackConfig;
   dashboard?: DashboardConfig;
   /** Shared provider-quota storage and identity. */
   quota?: QuotaConfig;
