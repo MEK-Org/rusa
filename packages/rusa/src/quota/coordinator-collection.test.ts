@@ -151,6 +151,224 @@ function observationRows(store: SharedQuotaStore) {
 }
 
 describe("QuotaCollectionLoop", () => {
+  it("suppresses automated collection for manual lanes, including Kimi", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    try {
+      store.setQuotaReadingMode("kimi", "manual", "2030-01-01T00:00:00.000Z");
+      const getQuotaProbeOutcome = vi.fn();
+      const loop = new QuotaCollectionLoop({
+        store,
+        quotaService: { getQuotaProbeOutcome, hydrate: vi.fn() } as unknown as QuotaService,
+        providers: ["kimi"],
+      });
+
+      await loop.tick();
+
+      expect(getQuotaProbeOutcome).not.toHaveBeenCalled();
+      expect(loop.getStats("kimi")).toMatchObject({ attempts: 0, failures: 0 });
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("fences a scrape result that completes after a switch to manual", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    try {
+      let releaseProbe: (() => void) | undefined;
+      const getQuotaProbeOutcome = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          releaseProbe = resolve;
+        });
+        const scrapedAt = "2030-01-01T00:05:00.000Z";
+        const snapshot: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 80,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: { provider: "claude" },
+            },
+          ],
+        };
+        const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "late scrape" });
+        store.recordParsed(id, snapshot, snapshot);
+        return { state: snapshot, didProbe: true };
+      });
+      const loop = new QuotaCollectionLoop({
+        store,
+        quotaService: { getQuotaProbeOutcome, hydrate: vi.fn() } as unknown as QuotaService,
+        providers: ["claude"],
+      });
+
+      const tick = loop.tick();
+      await vi.waitFor(() => expect(getQuotaProbeOutcome).toHaveBeenCalledTimes(1));
+      store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:01:00.000Z");
+      releaseProbe?.();
+      await tick;
+
+      expect(store.getLatestSnapshot("claude")).toBeNull();
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 0 });
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_observations").get()).toEqual({
+        n: 0,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("discards a scrape that spans a manual reading even after the lane returns to scrape mode", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    try {
+      let releaseProbe: (() => void) | undefined;
+      const getQuotaProbeOutcome = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          releaseProbe = resolve;
+        });
+        const scrapedAt = "2030-01-01T00:00:00.000Z";
+        const snapshot: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 80,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: { provider: "claude" },
+            },
+          ],
+        };
+        const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "late scrape" });
+        store.recordParsed(id, snapshot, snapshot);
+        return { state: snapshot, didProbe: true };
+      });
+      const loop = new QuotaCollectionLoop({
+        store,
+        quotaService: { getQuotaProbeOutcome, hydrate: vi.fn() } as unknown as QuotaService,
+        providers: ["claude"],
+      });
+
+      const tick = loop.tick();
+      await vi.waitFor(() => expect(getQuotaProbeOutcome).toHaveBeenCalledTimes(1));
+      const manual = store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:01:00.000Z");
+      const manualObservedAt = "2030-01-01T00:06:00.000Z";
+      expect(
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: manualObservedAt,
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 40,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: { provider: "claude" },
+              },
+            ],
+          },
+          generation: manual.generation,
+          idempotencyKey: "during-probe",
+          acceptedAt: manualObservedAt,
+        })
+      ).toMatchObject({ result: "accepted" });
+      // Back in scrape mode before the old probe lands: a bare mode check would
+      // admit it; the generation captured when the probe began does not.
+      expect(store.setQuotaReadingMode("claude", "scrape", "2030-01-01T00:07:00.000Z")).toEqual({
+        mode: "scrape",
+        generation: 2,
+        updatedAt: "2030-01-01T00:07:00.000Z",
+      });
+      releaseProbe?.();
+      await tick;
+
+      expect(store.getLatestSnapshot("claude")).toMatchObject({
+        scrapedAt: manualObservedAt,
+        limits: [expect.objectContaining({ percentLeft: 40 })],
+      });
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 1 });
+      expect(observationRows(store)).toEqual([
+        expect.objectContaining({ observedAt: manualObservedAt, percentLeft: 40 }),
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("fences the real QuotaService persistence path and persists normally once scrape mode returns", async () => {
+    const root = makeRoot();
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    let nowMs = Date.parse("2040-01-01T00:01:00.000Z");
+    let releaseRun: (() => void) | undefined;
+    const run = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        releaseRun = resolve;
+      });
+      return { success: true, output: "synthetic Claude /usage panel", exitCode: 0 };
+    });
+    mockGenerateContent.mockReset();
+    mockGenerateContent.mockResolvedValue(availableParse("2040-01-08T00:00:00.000Z"));
+    const quotaService = configuredClaudeService({
+      root,
+      store,
+      now: () => nowMs,
+      run,
+      ttlMs: 1,
+    });
+    const loop = new QuotaCollectionLoop({
+      store,
+      quotaService,
+      providers: ["claude"],
+      maxIntervalSeconds: 3600,
+    });
+    try {
+      // The lane goes manual while the CLI probe is still running: the probe's
+      // own recordRaw/recordParsed calls inherit the stale permit and write
+      // nothing, and the loop counts the attempt as a probe, not a failure.
+      const firstTick = loop.tick();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+      store.setQuotaReadingMode("claude", "manual", new Date(nowMs).toISOString());
+      releaseRun?.();
+      await firstTick;
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 0 });
+      expect(observationRows(store)).toEqual([]);
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 1, failures: 0 });
+
+      // Manual lane: no probe at all.
+      nowMs += 10_000;
+      await loop.tick();
+      expect(run).toHaveBeenCalledTimes(1);
+
+      // Back to scrape under a new generation: the next probe persists as usual.
+      nowMs += 10_000;
+      store.setQuotaReadingMode("claude", "scrape", new Date(nowMs).toISOString());
+      const thirdTick = loop.tick();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      releaseRun?.();
+      await thirdTick;
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 1 });
+      expect(observationRows(store)).toEqual([
+        expect.objectContaining({ provider: "claude", kind: "weekly", percentLeft: 50 }),
+      ]);
+      expect(store.getLatestSnapshot("claude")).toMatchObject({
+        scrapedAt: new Date(nowMs).toISOString(),
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("dedupes concurrent ticks to one service-owned probe and one controller advance", async () => {
     const store = storeWithReading();
     try {
