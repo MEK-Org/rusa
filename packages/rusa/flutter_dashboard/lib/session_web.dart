@@ -1,11 +1,26 @@
 import 'dart:convert';
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_core_web/firebase_core_web.dart';
 import 'package:http/http.dart' as http;
 import 'package:web/web.dart' as web;
 
 import 'session.dart';
+
+@JS('firebase_core.initializeApp')
+external JSObject _initializeJsApp(JSObject options);
+
+@JS('firebase_auth')
+external JSObject get _authSdk;
+
+@JS('firebase_auth.initializeAuth')
+external JSObject _initializeJsAuth(JSObject app, JSObject options);
+
+@JS('firebase_auth.connectAuthEmulator')
+external void _connectJsAuthEmulator(JSObject auth, JSString origin);
 
 class _FirebaseSessionUser implements SessionUser {
   _FirebaseSessionUser(this._user);
@@ -86,6 +101,8 @@ Future<DashboardSession> bootstrapDashboardSession() async {
     throw StateError('Dashboard authentication configuration is unavailable');
   }
 
+  final emulator = config['emulatorUrl'];
+  if (emulator != null) await _configureAuthEmulator(emulator, firebase);
   await Firebase.initializeApp(
     options: FirebaseOptions(
       apiKey: _firebaseValue(firebase, 'apiKey'),
@@ -96,8 +113,6 @@ Future<DashboardSession> bootstrapDashboardSession() async {
     ),
   );
   final auth = FirebaseAuth.instance;
-  final emulator = config['emulatorUrl'];
-  if (emulator != null) _connectAuthEmulator(auth, emulator);
   await auth.setPersistence(Persistence.LOCAL);
   final session = FirebaseDashboardSession(
     _FirebaseSessionAuth(auth),
@@ -109,15 +124,56 @@ Future<DashboardSession> bootstrapDashboardSession() async {
   return session;
 }
 
-void _connectAuthEmulator(FirebaseAuth auth, Object value) {
+Future<void> _configureAuthEmulator(
+  Object value,
+  Map<String, dynamic> firebase,
+) async {
   if (value is! String) {
     throw StateError('Dashboard Firebase configuration is unavailable');
   }
   final emulator = Uri.tryParse(value);
-  if (emulator == null || emulator.host.isEmpty || !emulator.hasPort) {
+  if (emulator == null ||
+      emulator.scheme != 'http' ||
+      emulator.host.isEmpty ||
+      !emulator.hasPort ||
+      emulator.userInfo.isNotEmpty) {
     throw StateError('Dashboard Firebase configuration is unavailable');
   }
-  auth.useAuthEmulator(emulator.host, emulator.port);
+  // FlutterFire restores persisted Auth inside Firebase.initializeApp. Prepare
+  // the emulator synchronously with JS Auth creation, before restoration can
+  // issue accounts:lookup. Use FlutterFire's own SDK version and Auth options
+  // so its subsequent initializeAuth call adopts this same instance.
+  final core = FirebaseCoreWeb();
+  // FlutterFire has no public pre-Auth emulator hook. Reuse its version and
+  // loader (including Trusted Types support) for this emulator-only bridge.
+  // ignore: invalid_use_of_visible_for_testing_member
+  final sdkBase =
+      // ignore: invalid_use_of_visible_for_testing_member
+      'https://www.gstatic.com/firebasejs/${core.firebaseSDKVersion}';
+  // ignore: invalid_use_of_visible_for_testing_member
+  await core.injectSrcScript('$sdkBase/firebase-app.js', 'firebase_core');
+  // ignore: invalid_use_of_visible_for_testing_member
+  await core.injectSrcScript('$sdkBase/firebase-auth.js', 'firebase_auth');
+  final app = _initializeJsApp(firebase.jsify() as JSObject);
+  final options = JSObject();
+  options.setProperty(
+    'errorMap'.toJS,
+    _authSdk.getProperty<JSAny?>('debugErrorMap'.toJS),
+  );
+  options.setProperty(
+    'persistence'.toJS,
+    [
+      _authSdk.getProperty<JSAny?>('indexedDBLocalPersistence'.toJS),
+      _authSdk.getProperty<JSAny?>('browserLocalPersistence'.toJS),
+      _authSdk.getProperty<JSAny?>('browserSessionPersistence'.toJS),
+    ].toJS,
+  );
+  options.setProperty(
+    'popupRedirectResolver'.toJS,
+    _authSdk.getProperty<JSAny?>('browserPopupRedirectResolver'.toJS),
+  );
+  final auth = _initializeJsAuth(app, options);
+  _connectJsAuthEmulator(auth, emulator.origin.toJS);
 }
 
 String? _csrfToken() {
