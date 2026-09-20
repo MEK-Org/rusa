@@ -380,7 +380,7 @@ class _DetailPanelState extends State<DetailPanel>
                       color: MeshColors.textPrimary,
                     ),
                   ),
-                  ActorStatusBadge(actor: a, store: widget.store),
+                  ActorStatusBadge(state: widget.store.dotFor(a)),
                   // On a phone the run-state actions live in the app bar's
                   // overflow menu (issue #462), not inline here; the desktop
                   // detail header keeps them inline as before.

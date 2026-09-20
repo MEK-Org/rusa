@@ -586,7 +586,7 @@ class _DetailIdentity extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 6),
-        ActorStatusBadge(actor: actor, store: store),
+        ActorStatusBadge(state: store.dotFor(actor)),
       ],
     );
   }
