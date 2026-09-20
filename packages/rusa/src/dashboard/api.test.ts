@@ -438,9 +438,12 @@ describe("handleMeshApiRequest", () => {
           });
         }
 
+        // The alias names nobody, so — like the event feed and the live
+        // stream — the chat answers with nothing human-involving rather than
+        // erroring on a query the dashboard sends unconditionally.
         const alias = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${HUMAN_OPERATOR}`);
-        expect(alias.res.statusCode).toBe(403);
-        expect(JSON.parse(alias.res.body).error).toContain("configure dashboard auth");
+        expect(alias.res.statusCode).toBe(200);
+        expect(chatBodies(alias.res)).toEqual([]);
         // Naming a durable user outright is asking for someone's private
         // conversation with no identity to match it against.
         const named = await call(deps, "GET", `/api/mesh/chat?actors=${UUID_A},${other}`);

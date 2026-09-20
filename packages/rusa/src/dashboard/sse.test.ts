@@ -3,6 +3,8 @@ import type { ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import type { ActorRuntimeStateDelta } from "../actor/actor-mesh.js";
 import type { AvatarGenerationEvent } from "../avatar/avatars.js";
+import type { UserPrincipal } from "../principals/principal-ref.js";
+import type { HumanChatViewer } from "./human-chat-scope.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { LiveOutputBuffer, SseHub } from "./sse.js";
 
@@ -50,10 +52,36 @@ class MockRes extends EventEmitter {
   }
 }
 
-function connect(hub: SseHub, actors: string[] | null): MockRes {
+function connect(hub: SseHub, actors: string[] | null, viewer?: HumanChatViewer): MockRes {
   const res = new MockRes();
-  hub.addConnection(res as unknown as ServerResponse, actors ? new Set(actors) : null);
+  hub.addConnection(res as unknown as ServerResponse, actors ? new Set(actors) : null, viewer);
   return res;
+}
+
+function user(name: string): UserPrincipal {
+  return { kind: "user", id: `${name}-id`, createdAt: "t", email: `${name}@example.test` };
+}
+
+/** A human who reads their own side and every conversation with no other human in it. */
+const viewerFor =
+  (id: string): HumanChatViewer =>
+  (users) => ({
+    viewerIds: new Set([id]),
+    canSee: (...participants) =>
+      participants.every((p) => p === id || !users.some((u) => u.id === p)),
+  });
+
+function messageEvent(actorId: string | null, payload: string | null) {
+  return {
+    id: "m1",
+    ts: "t",
+    kind: "message_received" as const,
+    actorId,
+    detail: null,
+    body: null,
+    payload,
+    success: null,
+  };
 }
 
 describe("LiveOutputBuffer", () => {
@@ -185,6 +213,69 @@ describe("SseHub", () => {
     expect(viewingA.dataFrames()).toHaveLength(1);
     expect(viewingNothing.dataFrames()).toHaveLength(1);
     expect(viewingA.dataFrames()[0]).toContain("event: mesh_event");
+    hub.close();
+  });
+
+  it("delivers a message frame only to the human it belongs to, reading users once per event", () => {
+    const emitter = new MeshEventEmitter();
+    const alice = user("alice");
+    const bob = user("bob");
+    let reads = 0;
+    const hub = new SseHub(emitter, {
+      principals: {
+        listUsers: () => {
+          reads += 1;
+          return [alice, bob];
+        },
+      },
+    });
+    const asAlice = connect(hub, null, viewerFor(alice.id));
+    const asAliceToo = connect(hub, ["a"], viewerFor(alice.id));
+    const asBob = connect(hub, null, viewerFor(bob.id));
+    const unscoped = connect(hub, null);
+
+    emitter.emitMeshEvent(messageEvent("a", JSON.stringify({ messageId: "m", from: alice.id })));
+
+    expect(asAlice.dataFrames()).toHaveLength(1);
+    expect(asAliceToo.dataFrames()).toHaveLength(1);
+    expect(asBob.dataFrames()).toHaveLength(0);
+    expect(unscoped.dataFrames()).toHaveLength(1);
+    // One principal read for the whole fan-out, not one per client.
+    expect(reads).toBe(1);
+
+    emitter.emitMeshEvent({ ...messageEvent("a", null), id: "m2", kind: "run_start" });
+    expect(asBob.dataFrames()).toHaveLength(1);
+    expect(reads).toBe(1);
+    hub.close();
+  });
+
+  it("withholds a message frame whose participants cannot be read from every scoped client", () => {
+    const emitter = new MeshEventEmitter();
+    const hub = new SseHub(emitter, { principals: { listUsers: () => [user("alice")] } });
+    const scoped = connect(hub, null, viewerFor("alice-id"));
+    const unscoped = connect(hub, null);
+
+    emitter.emitMeshEvent(messageEvent("a", JSON.stringify({ messageId: "m" })));
+    emitter.emitMeshEvent({ ...messageEvent(null, JSON.stringify({ from: "x" })), id: "m2" });
+    emitter.emitMeshEvent({ ...messageEvent("a", "{not json"), id: "m3" });
+
+    expect(scoped.dataFrames()).toHaveLength(0);
+    expect(unscoped.dataFrames()).toHaveLength(3);
+    hub.close();
+  });
+
+  it("honours a colleague admitted after a scoped client connected", () => {
+    const emitter = new MeshEventEmitter();
+    const users: UserPrincipal[] = [user("alice")];
+    const hub = new SseHub(emitter, { principals: { listUsers: () => [...users] } });
+    const asAlice = connect(hub, null, viewerFor("alice-id"));
+
+    emitter.emitMeshEvent(messageEvent("a", JSON.stringify({ from: "bob-id" })));
+    expect(asAlice.dataFrames()).toHaveLength(1);
+
+    users.push(user("bob"));
+    emitter.emitMeshEvent({ ...messageEvent("a", JSON.stringify({ from: "bob-id" })), id: "m2" });
+    expect(asAlice.dataFrames()).toHaveLength(1);
     hub.close();
   });
 

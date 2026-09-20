@@ -38,7 +38,12 @@ import {
   voiceConfigSchema,
 } from "../voice/voice-config.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
-import { type HumanChatScope, resolveHumanChatScope } from "./human-chat-scope.js";
+import {
+  type HumanChatScope,
+  humanChatViewer,
+  resolveHumanChatScope,
+  viewingUserPrincipalId,
+} from "./human-chat-scope.js";
 import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 
@@ -506,8 +511,8 @@ async function resolveInboxPage(
   deps: DashboardDataDeps,
   chatScope: HumanChatScope
 ): Promise<ResolvedInboxPage> {
-  const entries: ResolvedInboxEntry[] = await Promise.all(
-    page.entries.map(async (entry): Promise<ResolvedInboxEntry> => {
+  const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
+    page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
         messageId?: unknown;
       };
@@ -515,20 +520,19 @@ async function resolveInboxPage(
         // `content` is kept as-is so nothing that reads it today regresses;
         // `reference` is the addition, so the dashboard can render an inbox item
         // through the same widget as an obligation's cited artifacts.
-        const resolved = resolveReferenceSync(`mesh:messages/${messageId}`, {
+        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
           meshChat: deps.meshChat,
         });
-        // An actor's inbox is shared mesh state, but the message a human item
-        // points at is that human's conversation: another viewer sees that
-        // the item exists, never what it says (#590).
-        const reference =
-          resolved.entity?.type === "mesh_message" && !chatScope.canSee(resolved.entity)
-            ? {
-                ...resolved,
-                body: null,
-                unavailable: "private to another human principal's conversation",
-              }
-            : resolved;
+        // The message a human item points at is that human's conversation
+        // with the actor. Another viewer is shown nothing of it — not the
+        // body, not who sent it, not that it exists — so a projection cannot
+        // reveal who talks to this actor or how often (#590).
+        if (
+          reference.entity?.type === "mesh_message" &&
+          !chatScope.canSee(reference.entity.senderId, reference.entity.recipientId)
+        ) {
+          return null;
+        }
         return {
           ...entry,
           payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
@@ -549,7 +553,7 @@ async function resolveInboxPage(
       return entry;
     })
   );
-  return { ...page, entries };
+  return { ...page, entries: entries.filter((entry) => entry !== null) };
 }
 
 function parseKinds(url: URL): string[] | undefined {
@@ -598,52 +602,33 @@ export function requireOperatorPrincipal(
 }
 
 /**
- * The durable user a read surface should treat as "me": the authenticated
- * identity, else local mode's sole active user, else null. Read paths never
- * fail on this — they just cannot personalize.
- */
-export function viewingUserPrincipalId(
-  req: IncomingMessage,
-  principals: DashboardDataDeps["principals"]
-): string | null {
-  const reqPrincipal = getDashboardRequestPrincipal(req);
-  if (reqPrincipal) return reqPrincipal.id;
-  const sole = resolveSoleActiveUser(principals);
-  return sole.ok ? sole.user.id : null;
-}
-
-/**
- * The participant set a `/api/mesh/chat` query may read (#590). A human id in
- * the request is the client asking for "the human side" of the conversation,
- * and the only human side a viewer may read is their own: the request's human
- * ids are replaced by the viewer's own ids (durable principal plus the legacy
- * alias while it still names them), so the same query reads correctly whether
- * the client sent `human:operator`, the viewer's id, or both. Naming another
+ * The participant set a `/api/mesh/chat` query may read (#590). The viewer's
+ * own ids (durable principal plus the legacy alias while it still names them)
+ * are always part of the set, as #469 did for an authenticated viewer, so a
+ * two-actor query still reads the viewer's side with each of them. A human id
+ * in the request is the client asking for "the human side", and the only
+ * human side a viewer may read is their own: the request's human ids are
+ * replaced by the viewer's, so the same query reads correctly whether the
+ * client sent `human:operator`, the viewer's id, or both. Naming another
  * human principal is refused rather than silently narrowed — a direct API
  * caller asking for someone else's conversation gets told no, not an answer
  * that looks complete. The legacy `human:operator` alias is never "another
- * human": the shipped client always sends it, so it stands for the viewer when
- * it still resolves to them and is simply dropped once several durable users
- * make it nobody's. A query that names no human (actor↔actor) is untouched.
+ * human": the shipped client always sends it, so it stands for the viewer
+ * while it still resolves to them and is simply dropped once several durable
+ * users make it nobody's. A viewer who cannot be identified (auth-disabled
+ * local mode with several users) has no human side at all and reads only
+ * actor↔actor rows, the same silent narrowing the events feed and the live
+ * stream apply; the write path is where that misconfiguration is reported.
  */
 export function resolveChatQueryActors(
   actors: string[],
   scope: HumanChatScope
 ): { ok: true; actors: string[] } | { ok: false; error: string } {
-  const other = actors.find((id) => id !== HUMAN_OPERATOR && scope.isOtherHuman(id));
+  const other = actors.find((id) => id !== HUMAN_OPERATOR && !scope.canSee(id));
   if (other !== undefined) {
     return { ok: false, error: "cannot read another human principal's conversation" };
   }
-  const mine = scope.viewerIds();
-  const humanRequested = actors.some((id) => id === HUMAN_OPERATOR || mine.has(id));
-  if (!humanRequested) return { ok: true, actors: [...new Set(actors)] };
-  if (mine.size === 0) {
-    return {
-      ok: false,
-      error:
-        "cannot pair this chat with a human principal: several active durable users exist, so configure dashboard auth so each request carries an authenticated identity",
-    };
-  }
+  const mine = scope.viewerIds;
   const result = new Set(actors.filter((id) => id !== HUMAN_OPERATOR && !mine.has(id)));
   for (const id of mine) result.add(id);
   return { ok: true, actors: [...result] };
@@ -1640,6 +1625,8 @@ export async function handleMeshApiRequest(
           }
         }
 
+        // A selected item private to another human's conversation projects as
+        // nothing at all — no item and no "+N more" beside an empty slot (#590).
         const selectedInboxItem = inboxSelection
           ? (
               await resolveInboxPage(
@@ -1650,7 +1637,9 @@ export async function handleMeshApiRequest(
             ).entries[0]
           : null;
         const moreInboxItemsCount =
-          inboxSelection && inboxSelection.moreCount !== undefined && inboxSelection.moreCount > 0
+          selectedInboxItem &&
+          inboxSelection?.moreCount !== undefined &&
+          inboxSelection.moreCount > 0
             ? inboxSelection.moreCount
             : undefined;
 
@@ -1732,7 +1721,7 @@ export async function handleMeshApiRequest(
       // Message events carry the joined mesh_chat body, so another human's
       // conversation with a selected actor is excluded here, not just on the
       // chat route (#590).
-      excludeParticipants: resolveHumanChatScope(req, deps.principals).otherHumanIds(),
+      humanViewerIds: [...resolveHumanChatScope(req, deps.principals).viewerIds],
     });
     sendJson(res, 200, page);
     return true;
@@ -1959,11 +1948,7 @@ export async function handleMeshApiRequest(
   // GET /api/mesh/stream?actors= — SSE: all mesh_event, live_output for `actors`.
   if (pathname === "/api/mesh/stream") {
     const actors = parseActors(url);
-    sseHub.addConnection(
-      res,
-      actors.length > 0 ? new Set(actors) : null,
-      resolveHumanChatScope(req, deps.principals)
-    );
+    sseHub.addConnection(res, actors.length > 0 ? new Set(actors) : null, humanChatViewer(req));
     return true;
   }
 

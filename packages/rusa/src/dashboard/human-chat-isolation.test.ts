@@ -202,8 +202,11 @@ describe("human chat isolation (#590)", () => {
       meshChat,
       inbox,
       obligations: new ObligationRepository(db),
-      sseHub: new SseHub(emitter),
+      sseHub: new SseHub(emitter, { principals }),
       mesh: mesh as unknown as ActorMesh,
+      // The actor is queued, so its thread card projects its prioritized
+      // inbox item.
+      queuedThreadIds: () => new Set([ACTOR]),
     };
     server = createServer(
       createDashboardRequestHandler(
@@ -272,6 +275,13 @@ describe("human chat isolation (#590)", () => {
     entries: Array<{
       payload: Record<string, unknown>;
       reference?: { body: string | null; unavailable: string | null };
+    }>;
+  };
+  type ThreadsPage = {
+    threads: Array<{
+      id: string;
+      selectedInboxItem?: { payload: Record<string, unknown> };
+      moreInboxItemsCount?: number;
     }>;
   };
 
@@ -350,10 +360,17 @@ describe("human chat isolation (#590)", () => {
     record(ACTOR, PEER, "root to child");
     record(PEER, ACTOR, "child to root");
 
-    for (const who of [a, b]) {
+    // A two-actor query reads the pair plus the viewer's own side with each of
+    // them, as #469 established — never the other human's side.
+    for (const [who, own] of [
+      [a, ["alice asks", "reply to alice"]],
+      [b, ["bob asks", "reply to bob"]],
+    ] as const) {
       const view = await getJson<ChatPage>(`/api/mesh/chat?actors=${ACTOR},${PEER}`, who.cookie);
       expect(view.status).toBe(200);
-      expect(view.body.chat.map((m) => m.body).sort()).toEqual(["child to root", "root to child"]);
+      expect(view.body.chat.map((m) => m.body).sort()).toEqual(
+        ["child to root", "root to child", ...own].sort()
+      );
     }
   });
 
@@ -375,29 +392,98 @@ describe("human chat isolation (#590)", () => {
     expect(JSON.stringify(feed.body)).not.toContain(b.id);
   });
 
-  it("redacts another human's message in the actor's inbox and thread projections", async () => {
+  it("keeps a legacy message event with no mesh_chat row out of another human's feed", async () => {
+    const a = await login(alice);
+    const b = await login(bob);
+    // Rows that pre-date mesh_chat keep their body in mesh_events and name
+    // their peer only through the event itself: the subject, or a payload
+    // peer with no messageId to join on.
+    meshEvents.record({
+      kind: "message_received",
+      actorId: ACTOR,
+      detail: "s",
+      body: "legacy from bob",
+      payload: JSON.stringify({ from: b.id }),
+    });
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: ACTOR,
+      detail: "s",
+      body: "legacy to alice",
+      payload: JSON.stringify({ to: a.id }),
+    });
+    meshEvents.record({
+      kind: "message_received",
+      actorId: ACTOR,
+      detail: "s",
+      body: "legacy from peer",
+      payload: null,
+    });
+    // A backfilled row whose mesh_chat row is gone names nobody and, as
+    // before, resolves no body from anywhere.
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: ACTOR,
+      detail: "s",
+      body: "legacy unpaired",
+      payload: JSON.stringify({ messageId: "gone" }),
+    });
+
+    const aliceFeed = await getJson<EventPage>(`/api/mesh/events?actors=${ACTOR}`, a.cookie);
+    expect(aliceFeed.body.events.map((e) => e.body).sort()).toEqual([
+      "legacy from peer",
+      "legacy to alice",
+      null,
+    ]);
+    expect(JSON.stringify(aliceFeed.body)).not.toContain(b.id);
+    expect(JSON.stringify(aliceFeed.body)).not.toContain("legacy unpaired");
+    const bobFeed = await getJson<EventPage>(`/api/mesh/events?actors=${ACTOR}`, b.cookie);
+    expect(bobFeed.body.events.map((e) => e.body).sort()).toEqual([
+      "legacy from bob",
+      "legacy from peer",
+      null,
+    ]);
+    expect(JSON.stringify(bobFeed.body)).not.toContain(a.id);
+  });
+
+  it("omits another human's message from the actor's inbox and thread projections", async () => {
     const a = await login(alice);
     const b = await login(bob);
     await seedBothConversations(a, b);
 
     const page = await getJson<InboxPage>(`/api/mesh/inbox?actor=${ACTOR}&status=all`, a.cookie);
     expect(page.status).toBe(200);
-    expect(page.body.entries).toHaveLength(2);
-    const mine = page.body.entries.find((e) => e.payload.fromId === a.id);
-    const theirs = page.body.entries.find((e) => e.payload.fromId === b.id);
-    expect(mine?.payload.content).toBe("alice asks");
-    expect(mine?.reference?.body).toBe("alice asks");
-    expect(theirs).toBeDefined();
-    expect(theirs?.payload.content).toBeUndefined();
-    expect(theirs?.reference?.body).toBeNull();
-    expect(theirs?.reference?.unavailable).toContain("another human principal");
-    expect(JSON.stringify(page.body)).not.toContain("bob asks");
+    // Not a redacted placeholder: nothing says who else talks to this actor
+    // or how often.
+    expect(page.body.entries).toHaveLength(1);
+    expect(page.body.entries[0].payload.fromId).toBe(a.id);
+    expect(page.body.entries[0].payload.content).toBe("alice asks");
+    expect(page.body.entries[0].reference?.body).toBe("alice asks");
+    const serialized = JSON.stringify(page.body);
+    expect(serialized).not.toContain("bob asks");
+    expect(serialized).not.toContain(b.id);
+
+    // The queued actor's thread card projects its prioritized item — alice's
+    // message, the earliest responsive one — to alice alone. Bob's card shows
+    // nothing in that slot: no redacted placeholder and no "+N more" beside it
+    // that would still reveal that someone else is talking to this actor.
+    const aliceThreads = await getJson<ThreadsPage>("/api/mesh/threads", a.cookie);
+    const aliceCard = aliceThreads.body.threads.find((t) => t.id === ACTOR);
+    expect(aliceCard?.selectedInboxItem?.payload.fromId).toBe(a.id);
+    expect(JSON.stringify(aliceThreads.body)).not.toContain(b.id);
+    const bobThreads = await getJson<ThreadsPage>("/api/mesh/threads", b.cookie);
+    const bobCard = bobThreads.body.threads.find((t) => t.id === ACTOR);
+    expect(bobCard).toBeDefined();
+    expect(bobCard?.selectedInboxItem).toBeUndefined();
+    expect(bobCard?.moreInboxItemsCount).toBeUndefined();
+    expect(JSON.stringify(bobThreads.body)).not.toContain(a.id);
+    expect(JSON.stringify(bobThreads.body)).not.toContain("alice asks");
   });
 
   it("streams live message frames only to the human they belong to", async () => {
     const a = await login(alice);
-    const b = await login(bob);
-
+    // Bob is admitted only after alice's stream is open: the stream must
+    // learn about him from the next frame on, not from its opening scope.
     const controller = new AbortController();
     const stream = await fetch(`${origin}/api/mesh/stream?actors=${ACTOR}`, {
       headers: { Cookie: a.cookie },
@@ -417,6 +503,7 @@ describe("human chat isolation (#590)", () => {
     })().catch(() => undefined);
 
     try {
+      const b = await login(bob);
       await seedBothConversations(a, b);
       record(ACTOR, PEER, "root to child");
       // A non-message event is shared mesh visibility and still arrives.

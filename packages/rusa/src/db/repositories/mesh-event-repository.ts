@@ -8,6 +8,7 @@ import type Database from "better-sqlite3";
 // *forwarding* is the failure-sink's job). This is a type-only import: no
 // runtime coupling from db → actor.
 import type { MeshEventKind } from "../../actor/mesh-events.js";
+import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 export type { MeshEventKind };
 
 /** An appended mesh event (camelCase domain object). */
@@ -353,11 +354,16 @@ export class MeshEventRepository {
    * `actorIds`. Used by the dashboard Events tab, including the merged stream
    * across a multi-selection. Pass the previous page's `nextCursor` as
    * `before` to page backward in time. `kinds`, if given, restricts to those
-   * event kinds. `excludeParticipants`, if given, drops every message event
-   * whose mesh_chat row has one of those ids at either end — the other human
-   * principals' conversations a viewer may not read (#590) — while leaving
-   * non-message events and legacy message rows with no mesh_chat row alone.
-   * Returns an empty page for an empty `actorIds`.
+   * event kinds. `humanViewerIds`, if given, keeps only the message events a
+   * human viewer may read (#590): those whose every human participant — the
+   * legacy `human:operator` alias or any durable user — is one of these ids,
+   * i.e. the viewer's own conversations plus actor↔actor traffic; an empty
+   * list reads actor↔actor traffic alone. A participant is read from the
+   * mesh_chat row when the event has one (the authoritative, migrated pairing)
+   * and otherwise from the event's own subject and payload peer, so a legacy
+   * row that pre-dates mesh_chat cannot surface another human's conversation
+   * either. Non-message events are unaffected. Returns an empty page for an
+   * empty `actorIds`.
    */
   listEventsByActors(
     actorIds: string[],
@@ -366,7 +372,7 @@ export class MeshEventRepository {
       before?: number | null;
       kinds?: string[];
       conversation?: boolean;
-      excludeParticipants?: string[];
+      humanViewerIds?: readonly string[];
     } = {
       limit: 50,
     }
@@ -390,10 +396,20 @@ export class MeshEventRepository {
       params.push(...actorIds, ...actorIds);
     }
 
-    if (opts.excludeParticipants && opts.excludeParticipants.length > 0) {
-      const excluded = opts.excludeParticipants.map(() => "?").join(", ");
-      sql += ` AND (c.id IS NULL OR (c.sender_id NOT IN (${excluded}) AND c.recipient_id NOT IN (${excluded})))`;
-      params.push(...opts.excludeParticipants, ...opts.excludeParticipants);
+    if (opts.humanViewerIds) {
+      // Bounded: the viewer's own ids (at most a durable id and the alias)
+      // per participant column, never one parameter per known human.
+      const viewers = opts.humanViewerIds;
+      const readable = (participant: string): string => {
+        const mine =
+          viewers.length > 0 ? ` OR ${participant} IN (${viewers.map(() => "?").join(", ")})` : "";
+        params.push(...viewers, HUMAN_OPERATOR);
+        return `(${participant} IS NULL${mine} OR (${participant} != ? AND ${participant} NOT IN (SELECT id FROM principals WHERE kind = 'user')))`;
+      };
+      sql += ` AND (e.kind NOT IN ('message_sent', 'message_received')
+        OR (c.id IS NOT NULL AND ${readable("c.sender_id")} AND ${readable("c.recipient_id")})
+        OR (c.id IS NULL AND ${readable("e.actor_id")} AND ${readable("json_extract(e.payload, '$.to')")} AND ${readable("json_extract(e.payload, '$.from')")})
+      )`;
     }
 
     if (opts.kinds && opts.kinds.length > 0) {
