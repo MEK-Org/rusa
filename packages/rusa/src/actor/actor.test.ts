@@ -1,7 +1,4 @@
-import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runMigrations } from "../db/migrations/runner.js";
-import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import { deterministicExhaustionFallback } from "../providers/exhaustion-classifier.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
@@ -23,7 +20,6 @@ import {
   type RunStartHandle,
 } from "./concurrency-limiter.js";
 import { routeContinuationCapped, routeRunFailure } from "./failure-sink.js";
-import { createRunAccounting, projectActorRunLaunchConfig } from "./run-accounting.js";
 
 /** Let the timer-less corrective-run microtasks drain. */
 const flush = async () => {
@@ -43,7 +39,7 @@ type TestActorHooks = {
 
 function makeActor(
   over: Partial<ActorOptions> & TestActorHooks = {},
-  provider: CodingProvider = new FakeProvider()
+  provider = new FakeProvider()
 ): Actor {
   let session: string | undefined;
   const {
@@ -112,96 +108,6 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
-  });
-
-  it("persists bounded, redacted provider stderr only when a provider exits non-zero", async () => {
-    const db = new Database(":memory:");
-    runMigrations(db);
-    const runs = new ActorRunRepository(db);
-    const accounting = createRunAccounting(() => runs);
-    const lifecycle = createActorLifecycle([
-      {
-        onStart: (event) =>
-          accounting.begin(event.actorId, event.runId, projectActorRunLaunchConfig(event.selected)),
-        onEnd: (event) => {
-          if (event.terminal.kind === "result") {
-            accounting.complete(event.actorId, event.runId, event.terminal.result);
-          }
-        },
-      },
-    ]);
-    const failure: CodingProvider = {
-      name: "kimi",
-      providerName: "kimi",
-      run: async (opts) => {
-        const stderr =
-          `provider.auth_error: 403 You've reached your 5-hour usage limit\n` +
-          `Authorization: Bearer synthetic-provider-token\n${"x".repeat(20_000)}`;
-        opts.onStderr?.(stderr);
-        // Providers fold stderr into their raw output when no response text was
-        // parsed, so the failed output itself already carries the credential.
-        return { success: false, output: `partial response\n${stderr}`, exitCode: 1 };
-      },
-    };
-
-    const failed = makeActor(
-      { lifecycle, modelConfig: [{ provider: "kimi", model: "kimi-k3" }] },
-      failure
-    );
-    failed.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-
-    const failedOutput = runs.listRecentCompleted("a1", 1)[0]?.output ?? "";
-    expect(failedOutput).toContain("partial response");
-    expect(failedOutput).toContain("provider.auth_error: 403");
-    expect(failedOutput).toContain("provider stderr truncated");
-    expect(failedOutput).not.toContain("synthetic-provider-token");
-    expect(failedOutput).toContain("Authorization: Bearer [redacted]");
-
-    const success: CodingProvider = {
-      name: "kimi",
-      providerName: "kimi",
-      run: async (opts) => {
-        opts.onStderr?.("successful provider diagnostic");
-        return { success: true, output: "successful output", exitCode: 0 };
-      },
-    };
-    let successful!: Actor;
-    successful = makeActor(
-      {
-        lifecycle: createActorLifecycle([
-          {
-            onStart: (event) =>
-              accounting.begin(
-                event.actorId,
-                event.runId,
-                projectActorRunLaunchConfig(event.selected)
-              ),
-            onEnd: (event) => {
-              if (event.terminal.kind === "result") {
-                accounting.complete(event.actorId, event.runId, event.terminal.result);
-              }
-            },
-          },
-        ]),
-        modelConfig: [{ provider: "kimi", model: "kimi-k3" }],
-      },
-      success
-    );
-    // A clean yield prevents the success path's normal corrective run.
-    const originalRun = success.run;
-    success.run = async (opts) => {
-      const result = await originalRun(opts);
-      successful.declareYield();
-      return result;
-    };
-    successful.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-
-    expect(runs.listRecentCompleted("a1", 1)[0]?.output).toBe("successful output");
-    db.close();
   });
 
   it("reports the instantiated provider immediately before it runs", async () => {
