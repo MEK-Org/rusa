@@ -9,8 +9,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import type { InboxEntry } from "../actor/inbox-store.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
-import { readAvatar } from "../avatar/avatars.js";
+import {
+  AvatarGenerationCoordinator,
+  type AvatarGenerationEvent,
+  readAvatar,
+} from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
@@ -1370,6 +1375,223 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").selectedObligation).toBeUndefined();
   });
 
+  it("GET /api/mesh/threads surfaces selectedInboxItem for a running actor without obligation (responsive first, then earliest) with (+N more)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+
+    const normalEarly: InboxEntry = {
+      id: "norm-early",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Normal early" },
+    };
+    const normalLate: InboxEntry = {
+      id: "norm-late",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:30:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Normal late" },
+    };
+    const respLate: InboxEntry = {
+      id: "resp-late",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", priority: "responsive", content: "Responsive late" },
+    };
+
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedInboxItemsForActor: (actorId) =>
+        actorId === UUID_A ? [normalEarly, normalLate, respLate] : null,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((thread: { id: string }) => thread.id === id);
+
+    expect(byId(UUID_A).selectedInboxItem).toMatchObject({
+      id: "resp-late",
+    });
+    expect(byId(UUID_A).moreInboxItemsCount).toBe(2);
+    expect(byId(UUID_B).selectedInboxItem).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads prefers selectedObligation over selectedInboxItem for running actor", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+
+    const runningFocus = obligations.create({
+      id: "running-focus",
+      ownerId: UUID_A,
+      title: "Current running work",
+    });
+    const inboxItem: InboxEntry = {
+      id: "item-1",
+      actorId: UUID_A,
+      source: "chat",
+      deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "message", content: "Inbox item" },
+    };
+
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedObligationForActor: (actorId) => (actorId === UUID_A ? runningFocus : null),
+      selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [inboxItem] : null),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const threadA = body.threads.find((thread: { id: string }) => thread.id === UUID_A);
+
+    expect(threadA.selectedObligation).toMatchObject({
+      id: "running-focus",
+    });
+    expect(threadA.selectedInboxItem).toBeUndefined();
+    expect(threadA.moreInboxItemsCount).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads surfaces one inbox item for queued actor, including single-item case and (+N more)", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+
+    // UUID_A has a single unhandled inbox item (queued single-item case)
+    inbox.append([
+      {
+        id: "queued-single",
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+        payload: { type: "message", content: "Single queued item" },
+      },
+    ]);
+
+    // UUID_B has multiple unhandled items (one normal early, one responsive late)
+    inbox.append([
+      {
+        id: "b-norm-early",
+        actorId: UUID_B,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T09:00:00.000Z"),
+        payload: { type: "message", content: "B normal early" },
+      },
+      {
+        id: "b-resp-late",
+        actorId: UUID_B,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+        payload: { type: "message", priority: "responsive", content: "B responsive late" },
+      },
+    ]);
+
+    deps = {
+      ...deps,
+      queuedThreadIds: () => new Set([UUID_A, UUID_B]),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((thread: { id: string }) => thread.id === id);
+
+    // UUID_A: single-item case (no (+N more) count)
+    expect(byId(UUID_A).selectedInboxItem).toMatchObject({
+      id: "queued-single",
+    });
+    expect(byId(UUID_A).moreInboxItemsCount).toBeUndefined();
+
+    // UUID_B: multiple items (responsive first -> b-resp-late, moreCount = 1)
+    expect(byId(UUID_B).selectedInboxItem).toMatchObject({
+      id: "b-resp-late",
+    });
+    expect(byId(UUID_B).moreInboxItemsCount).toBe(1);
+
+    // Root actor (idle): no selectedInboxItem
+    expect(byId("root").selectedInboxItem).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads selects the earliest matching queued item beyond the first 100 rows", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    inbox.append([
+      {
+        id: "queued-oldest",
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date("2026-09-01T00:00:00.000Z"),
+        payload: { type: "message", content: "Oldest queued item" },
+      },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        id: `queued-newer-${index}`,
+        actorId: UUID_A,
+        source: "chat",
+        deliveredAt: new Date(`2026-09-02T${String(index % 24).padStart(2, "0")}:00:00.000Z`),
+        payload: { type: "message", content: `Newer queued item ${index}` },
+      })),
+    ]);
+    deps = { ...deps, queuedThreadIds: () => new Set([UUID_A]) };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem).toMatchObject({ id: "queued-oldest" });
+    expect(thread.moreInboxItemsCount).toBe(100);
+  });
+
+  it("GET /api/mesh/threads resolves a selected GitHub inbox item through the reference cache", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    const selected: InboxEntry = {
+      id: "github-selected",
+      actorId: UUID_A,
+      source: "github:MEK-Org/rusa/issues/534",
+      deliveredAt: new Date("2026-09-01T10:00:00.000Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: { type: "issue", content: "Fallback" },
+    };
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      selectedInboxItemsForActor: (actorId) => (actorId === UUID_A ? [selected] : null),
+      referenceCache: {
+        get: async () => ({
+          ref: selected.source,
+          scheme: "github",
+          title: "Cached issue",
+          body: "Cached body",
+          cacheState: "fresh",
+          entity: { type: "github_issue", title: "Cached issue", description: "Cached body" },
+          unavailable: null,
+        }),
+      } as unknown as ReferenceCacheService,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const thread = body.threads.find((candidate: { id: string }) => candidate.id === UUID_A);
+
+    expect(thread.selectedInboxItem.reference).toMatchObject({ title: "Cached issue" });
+  });
+
   it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
@@ -1912,6 +2134,148 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
     expect(res.statusCode).toBe(404);
     expect(res.headers["Cache-Control"]).toBe("no-store");
+  });
+
+  it("answers a missing avatar 404 at once and starts one coalesced attempt only for live actors", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatars-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+    actors.upsert(rec(UUID_B, null, "retired"));
+
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from("lazy-avatar"),
+    ]);
+    let release: ((response: Response) => void) | undefined;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        })
+    );
+
+    try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: coordinator,
+      };
+      const [first, second] = await Promise.all([
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+        call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`),
+      ]);
+
+      // The response never waits on the provider: it would otherwise occupy one
+      // of the browser's few HTTP/1.1 connections for the whole round trip.
+      expect(first.res.statusCode).toBe(404);
+      expect(second.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Both requests announce the same in-flight attempt to dashboards.
+      expect(events).toEqual([
+        { actorId: UUID_A, state: "generating" },
+        { actorId: UUID_A, state: "generating" },
+      ]);
+
+      const unknown = await call(lazyDeps, "GET", "/api/mesh/avatar/not-a-known-actor.png");
+      expect(unknown.res.statusCode).toBe(404);
+      const retired = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(retired.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
+
+      release?.({
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ inlineData: { data: png.toString("base64") } }] } }],
+        }),
+      } as unknown as Response);
+      expect(await outcome).toEqual({ actorId: UUID_A, state: "ready" });
+
+      // The `ready` frame is what makes the dashboard re-request; that request is served.
+      const served = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
+      expect(served.res.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.({ ok: false, status: 500 } as Response);
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a failed lazy attempt on the fallback instead of retrying on later GETs", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-failure-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_B, null, "active"));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("provider unavailable"));
+
+    try {
+      const coordinator = new AvatarGenerationCoordinator();
+      const events: AvatarGenerationEvent[] = [];
+      coordinator.onStateChange((event) => events.push(event));
+      const outcome = new Promise<AvatarGenerationEvent>((resolve) =>
+        coordinator.onStateChange((event) => event.state !== "generating" && resolve(event))
+      );
+      const lazyDeps: DashboardDataDeps = {
+        ...deps,
+        geminiApiKey: "key",
+        avatarGeneration: coordinator,
+      };
+      const first = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(first.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(await outcome).toEqual({ actorId: UUID_B, state: "failed" });
+      expect(events).toEqual([
+        { actorId: UUID_B, state: "generating" },
+        { actorId: UUID_B, state: "failed" },
+      ]);
+
+      // A later page load re-requests the image (`no-store`); the settled
+      // failure means no second provider call and no renewed ring.
+      const repeat = await call(lazyDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`);
+      expect(repeat.res.statusCode).toBe(404);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(2);
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("never generates when no coordinator is wired (UI-only server)", async () => {
+    const previousHome = process.env.RUSA_HOME;
+    const home = mkdtempSync(join(tmpdir(), "mc-api-lazy-avatar-disabled-"));
+    process.env.RUSA_HOME = home;
+    actors.upsert(rec(UUID_A, null, "active"));
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    try {
+      const { res } = await call(
+        { ...deps, geminiApiKey: "key" },
+        "GET",
+        `/api/mesh/avatar/${UUID_A}.png`
+      );
+      expect(res.statusCode).toBe(404);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+      if (previousHome === undefined) delete process.env.RUSA_HOME;
+      else process.env.RUSA_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("serves avatars even with no mesh bound (filesystem-backed, deps=null)", async () => {
@@ -3328,6 +3692,44 @@ describe("handleMeshApiRequest", () => {
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
         expect(data.obligation.parentId).toBe("p2");
+      });
+
+      it("accepts a live waiting parent and refuses a terminal one", async () => {
+        // The dashboard's drop rule must match this contract: a parent that
+        // is waiting on its own children is a valid landing place; only a
+        // done or cancelled parent is closed to new children (#564).
+        obligations.create({ title: "waiting-parent", id: "waiting-parent", ownerId: "actor-1" });
+        obligations.create({
+          title: "keeps-parent-waiting",
+          id: "keeps-parent-waiting",
+          parentId: "waiting-parent",
+          ownerId: "actor-1",
+        });
+        obligations.create({ title: "ready-root", id: "ready-root", ownerId: "actor-1" });
+        obligations.create({ title: "done-parent", id: "done-parent", ownerId: "actor-1" });
+        obligations.setTerminalStatus("done-parent", "done", null, null, "system:mesh");
+        expect(obligations.require("waiting-parent").status).toBe("waiting");
+
+        const { res: accepted } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/ready-root/reparent",
+          JSON.stringify({ parentId: "waiting-parent" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(accepted.statusCode).toBe(200);
+        expect(JSON.parse(accepted.body).obligation.parentId).toBe("waiting-parent");
+
+        const { res: refused } = await call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/ready-root/reparent",
+          JSON.stringify({ parentId: "done-parent" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(refused.statusCode).toBe(400);
+        expect(JSON.parse(refused.body).error).toBe("cannot add a child to a terminal obligation");
+        expect(obligations.require("ready-root").parentId).toBe("waiting-parent");
       });
 
       it("400s on self-parenting or cycle", async () => {

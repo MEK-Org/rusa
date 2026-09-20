@@ -7,6 +7,7 @@ import 'package:web/web.dart' as web;
 
 import 'api.dart';
 import 'models.dart';
+import 'session.dart';
 import 'session_events_web.dart';
 import 'voice_platform.dart';
 
@@ -16,13 +17,14 @@ import 'voice_platform.dart';
 /// entrypoint) — everything else stays headless-testable.
 
 /// Wire the real web deps once at startup.
-WalkieDeps webWalkieDeps(DashboardApi api) => WalkieDeps(
-  api: api,
-  recorder: WebVoiceRecorder(),
-  player: WebVoicePlayer(),
-  wakeLock: WebScreenWakeLock(),
-  createStream: WebVoiceStream.new,
-);
+WalkieDeps webWalkieDeps(DashboardApi api, DashboardSession session) =>
+    WalkieDeps(
+      api: api,
+      recorder: WebVoiceRecorder(),
+      player: WebVoicePlayer(),
+      wakeLock: WebScreenWakeLock(),
+      createStream: () => WebVoiceStream(session),
+    );
 
 /// Recording mime preference: webm/opus where supported (Chrome, Firefox),
 /// falling back to whatever the browser can produce (Safari records mp4/aac —
@@ -241,6 +243,9 @@ class WebScreenWakeLock implements ScreenWakeLock {
 /// EventSource auto-reconnects on blips; `open`/`error` events surface as
 /// [VoiceStreamStatus] so the controller can re-fetch the backlog after a gap.
 class WebVoiceStream implements VoiceStreamSource {
+  WebVoiceStream(this._session);
+
+  final DashboardSession _session;
   final _frames = StreamController<VoiceAnnouncement>.broadcast();
   final _status = StreamController<VoiceStreamStatus>.broadcast();
   final _controls = StreamController<VoiceSessionControl>.broadcast();
@@ -261,6 +266,7 @@ class WebVoiceStream implements VoiceStreamSource {
     final session = Uri.encodeQueryComponent(sessionId);
     final es = SessionEventSource(
       '/api/mesh/voice/stream?actors=$qs&sessionId=$session',
+      _session,
     );
     es.addEventListener(
       'voice',

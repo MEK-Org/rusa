@@ -61,11 +61,8 @@ class ProviderModelConfig {
 
   /// One candidate on one line — `provider · model · effort medium` — with
   /// the effort clause dropped when the server sent no explicit effort.
-  String get label => [
-    provider,
-    model,
-    if (effort != null) 'effort $effort',
-  ].join(' · ');
+  String get label =>
+      [provider, model, if (effort != null) 'effort $effort'].join(' · ');
 
   @override
   bool operator ==(Object other) =>
@@ -84,6 +81,87 @@ List<ProviderModelConfig> _modelConfigFromJson(Object? raw) =>
     (raw as List<dynamic>? ?? const [])
         .map((e) => ProviderModelConfig.fromJson(e as Map<String, dynamic>))
         .toList();
+
+/// An inbox entry as returned by the dashboard API, resolved with referenced data.
+class InboxEntryDto {
+  const InboxEntryDto({
+    required this.id,
+    required this.actorId,
+    required this.source,
+    required this.deliveredAt,
+    this.seenAt,
+    this.handledAt,
+    this.handledNote,
+    this.payload = const {},
+    this.reference,
+  });
+
+  final String id;
+  final String actorId;
+  final String source;
+  final String deliveredAt;
+  final String? seenAt;
+  final String? handledAt;
+  final String? handledNote;
+  final Map<String, dynamic> payload;
+  final ReferenceDto? reference;
+
+  factory InboxEntryDto.fromJson(Map<String, dynamic> j) {
+    final rawReference = j['reference'];
+    return InboxEntryDto(
+      id: j['id'] as String? ?? '',
+      actorId: j['actorId'] as String? ?? '',
+      source: j['source'] as String? ?? '',
+      deliveredAt: j['deliveredAt'] as String? ?? '',
+      seenAt: j['seenAt'] as String?,
+      handledAt: j['handledAt'] as String?,
+      handledNote: j['handledNote'] as String?,
+      payload: (j['payload'] as Map<String, dynamic>?) ?? const {},
+      reference: rawReference is Map<String, dynamic>
+          ? ReferenceDto.fromJson(rawReference)
+          : null,
+    );
+  }
+
+  bool get isHandled => handledAt != null;
+
+  String get type => payload['type']?.toString() ?? 'INBOX ITEM';
+
+  bool get isResponsive =>
+      payload['priority'] == 'responsive' ||
+      payload['isResponsive'] == true ||
+      payload['responsive'] == true;
+
+  String get contentText =>
+      reference?.body ??
+      payload['content']?.toString() ??
+      payload.entries
+          .where(
+            (x) =>
+                x.key != 'type' &&
+                x.key != 'priority' &&
+                x.key != 'messageId' &&
+                x.key != 'fromId',
+          )
+          .map((x) => '${x.key}: ${x.value}')
+          .join('\n');
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is InboxEntryDto &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          actorId == other.actorId &&
+          source == other.source &&
+          deliveredAt == other.deliveredAt &&
+          seenAt == other.seenAt &&
+          handledAt == other.handledAt &&
+          handledNote == other.handledNote;
+
+  @override
+  int get hashCode => Object.hash(id, actorId, source, deliveredAt, handledAt);
+}
 
 /// A mesh thread/actor, as returned by `GET /api/mesh/threads`.
 class ThreadDto {
@@ -116,6 +194,8 @@ class ThreadDto {
     this.pacingIntervalMs,
     this.ownerExpectsRetirement,
     this.selectedObligation,
+    this.selectedInboxItem,
+    this.moreInboxItemsCount,
     this.voiceConfig,
   });
 
@@ -201,6 +281,14 @@ class ThreadDto {
   /// This is absent rather than a stale previous-run value once that run ends.
   final ObligationDto? selectedObligation;
 
+  /// For a running actor with selected inbox items but no selected obligation,
+  /// or a queued actor with unhandled inbox items: the top inbox item chosen
+  /// responsive-first then earliest.
+  final InboxEntryDto? selectedInboxItem;
+
+  /// Additional inbox items beyond the one shown, when more exist.
+  final int? moreInboxItemsCount;
+
   /// The actor's persisted walkie-talkie voice, or null when it follows the
   /// instance-wide default. Absent (null) is the state of every actor without
   /// a stored voice setting, including all actors on an older server.
@@ -237,6 +325,8 @@ class ThreadDto {
     int? pacingIntervalMs,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
+    Object? selectedInboxItem = _keepThreadField,
+    Object? moreInboxItemsCount = _keepThreadField,
     Object? voiceConfig = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
@@ -284,6 +374,12 @@ class ThreadDto {
     selectedObligation: identical(selectedObligation, _keepThreadField)
         ? this.selectedObligation
         : selectedObligation as ObligationDto?,
+    selectedInboxItem: identical(selectedInboxItem, _keepThreadField)
+        ? this.selectedInboxItem
+        : selectedInboxItem as InboxEntryDto?,
+    moreInboxItemsCount: identical(moreInboxItemsCount, _keepThreadField)
+        ? this.moreInboxItemsCount
+        : moreInboxItemsCount as int?,
     voiceConfig: identical(voiceConfig, _keepThreadField)
         ? this.voiceConfig
         : voiceConfig as VoiceConfigDto?,
@@ -336,10 +432,19 @@ class ThreadDto {
             (j['selectedObligation'] as Map).cast<String, dynamic>(),
           )
         : null,
+    selectedInboxItem: j['selectedInboxItem'] is Map
+        ? InboxEntryDto.fromJson(
+            (j['selectedInboxItem'] as Map).cast<String, dynamic>(),
+          )
+        : null,
+    moreInboxItemsCount: j['moreInboxItemsCount'] as int?,
     voiceConfig: j['voiceConfig'] != null
         ? VoiceConfigDto.fromJson(j['voiceConfig'] as Map<String, dynamic>)
         : j['voiceName'] != null
-        ? VoiceConfigDto(provider: 'google', config: {'voiceName': j['voiceName']})
+        ? VoiceConfigDto(
+            provider: 'google',
+            config: {'voiceName': j['voiceName']},
+          )
         : null,
   );
 }
@@ -507,6 +612,28 @@ class ActorRuntimeStateDelta {
       );
 }
 
+/// Lifecycle of one actor's lazy first-display avatar generation, relayed by
+/// the server as an `avatar` SSE frame. `generating` turns the ring on; `ready`
+/// re-requests the image; `failed` settles on the fallback silhouette.
+enum AvatarGenerationState { generating, ready, failed }
+
+class AvatarGenerationUpdate {
+  const AvatarGenerationUpdate({required this.actorId, required this.state});
+
+  final String actorId;
+  final AvatarGenerationState state;
+
+  factory AvatarGenerationUpdate.fromJson(Map<String, dynamic> j) =>
+      AvatarGenerationUpdate(
+        actorId: j['actorId'] as String,
+        state: switch (j['state']) {
+          'generating' => AvatarGenerationState.generating,
+          'ready' => AvatarGenerationState.ready,
+          _ => AvatarGenerationState.failed,
+        },
+      );
+}
+
 /// Normalized view state for a single actor in the mesh.
 /// Combines the underlying [ThreadDto] metadata with the live, reactive [RunState].
 class ActorViewState {
@@ -536,6 +663,8 @@ class ActorViewState {
   int? get pacingIntervalMs => thread.pacingIntervalMs;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
   ObligationDto? get selectedObligation => thread.selectedObligation;
+  InboxEntryDto? get selectedInboxItem => thread.selectedInboxItem;
+  int? get moreInboxItemsCount => thread.moreInboxItemsCount;
 
   bool get isRunning => runState == RunState.running;
   bool get isWindingDown => runState == RunState.windingDown;
@@ -612,18 +741,19 @@ class ActorStateSnapshot {
     this.actors = const {},
     this.orderedIds = const [],
     Set<String>? activeObligationIds,
-  }) : activeObligationIds = activeObligationIds ??
-            {
-              for (final a in actors.values)
-                if (a.isActiveRun && a.selectedObligation?.id != null)
-                  a.selectedObligation!.id,
-            };
+  }) : activeObligationIds =
+           activeObligationIds ??
+           {
+             for (final a in actors.values)
+               if (a.isActiveRun && a.selectedObligation?.id != null)
+                 a.selectedObligation!.id,
+           };
 
   const ActorStateSnapshot.empty()
-      : revision = 0,
-        actors = const {},
-        orderedIds = const [],
-        activeObligationIds = const {};
+    : revision = 0,
+      actors = const {},
+      orderedIds = const [],
+      activeObligationIds = const {};
 
   final int revision;
   final Map<String, ActorViewState> actors;
@@ -678,7 +808,8 @@ class ActorStateSnapshot {
     revision: revision ?? this.revision,
     actors: actors ?? this.actors,
     orderedIds: orderedIds ?? this.orderedIds,
-    activeObligationIds: activeObligationIds ??
+    activeObligationIds:
+        activeObligationIds ??
         (actors != null ? null : this.activeObligationIds),
   );
 
@@ -1418,7 +1549,8 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
+  final String
+  status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1503,7 +1635,9 @@ class ObligationDto {
   /// statuses represent durable lifecycle states (completed, cancelled,
   /// scheduled for future execution, or waiting on dependencies/blockers)
   /// that are not overridden by a run focus.
-  ObligationPresentationState presentationState({required bool activelyWorked}) {
+  ObligationPresentationState presentationState({
+    required bool activelyWorked,
+  }) {
     final base = ObligationPresentationState.fromStatus(status);
     if (activelyWorked && base == ObligationPresentationState.ready) {
       return ObligationPresentationState.active;
@@ -1608,14 +1742,13 @@ class ObligationForest {
   final int total;
   final bool hasMore;
 
-  factory ObligationForest.fromJson(Map<String, dynamic> j) =>
-      ObligationForest(
-        trees: (j['trees'] as List<dynamic>? ?? const [])
-            .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        total: j['total'] as int? ?? 0,
-        hasMore: j['hasMore'] as bool? ?? false,
-      );
+  factory ObligationForest.fromJson(Map<String, dynamic> j) => ObligationForest(
+    trees: (j['trees'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    total: j['total'] as int? ?? 0,
+    hasMore: j['hasMore'] as bool? ?? false,
+  );
 }
 
 class ObligationListPage {

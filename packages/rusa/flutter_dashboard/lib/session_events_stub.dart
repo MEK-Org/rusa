@@ -1,4 +1,6 @@
 void requireAuthentication() {}
 void notifyNavigation() {}
-bool needsCsrf(Uri url) => false;
-String? get csrfToken => null;
+void disposeDashboardSession(Object? session) {}
+Future<void> logout() async {}
+bool get authenticationEnabled => false;
+String? get profilePhotoUrl => null;

@@ -7,6 +7,7 @@ import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'actor_status_badge.dart';
 import 'avatar.dart';
 import 'events_tab.dart';
 import 'conversation_tab.dart';
@@ -142,6 +143,8 @@ class _DetailPanelState extends State<DetailPanel>
           children: [
             isConversationMode
                 ? _conversationHeader(actorA!, actorB!)
+                : widget.narrow
+                ? const SizedBox.shrink()
                 : _header(actor!, parentHandle),
             _tabBar(isConversationMode),
             const Divider(height: 1, color: MeshColors.border),
@@ -377,7 +380,7 @@ class _DetailPanelState extends State<DetailPanel>
                       color: MeshColors.textPrimary,
                     ),
                   ),
-                  _statusBadge(a),
+                  ActorStatusBadge(state: widget.store.dotFor(a)),
                   // On a phone the run-state actions live in the app bar's
                   // overflow menu (issue #462), not inline here; the desktop
                   // detail header keeps them inline as before.
@@ -480,48 +483,6 @@ class _DetailPanelState extends State<DetailPanel>
       ],
     ),
   );
-
-  Widget _statusBadge(ThreadDto a) {
-    final state = widget.store.actorStates.value.actors[a.id];
-    final retired = a.isRetired;
-    final runState = state?.runState ?? RunState.unknown;
-
-    String text;
-    Color color;
-
-    if (retired) {
-      text = 'RETIRED';
-      color = MeshColors.statusRetired;
-    } else if (runState == RunState.running ||
-        runState == RunState.windingDown) {
-      text = 'RUNNING';
-      color = MeshColors.statusActive;
-    } else if (runState == RunState.queued) {
-      text = 'QUEUED';
-      color = MeshColors.statusIdle;
-    } else {
-      text = 'IDLE';
-      color = MeshColors.statusRetired;
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withValues(alpha: 0.4)),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          color: color,
-          fontSize: 11,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.5,
-        ),
-      ),
-    );
-  }
 
   Widget _tabBar(bool isConversationMode) => StreamBuilder<List<Object?>>(
     stream: Rx.combineLatestList<Object?>([

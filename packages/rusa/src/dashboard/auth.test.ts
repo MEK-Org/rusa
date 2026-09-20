@@ -9,7 +9,9 @@ import Database from "better-sqlite3";
 import type { DecodedIdToken } from "firebase-admin/auth";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
+import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -28,6 +30,8 @@ const config = {
     projectId: "project",
     apiKey: "public-key",
     authDomain: "project.firebaseapp.com",
+    appId: "app-id",
+    messagingSenderId: "sender-id",
     serviceAccountKeyPath: "/private/credential.json",
   },
 };
@@ -86,6 +90,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
   };
   let auth: DashboardAuth;
   let db: Database.Database;
+  let meshEvents: MeshEventRepository;
   let principals: PrincipalRepository;
   let server: ReturnType<typeof createServer>;
   let origin: string;
@@ -100,6 +105,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     vi.clearAllMocks();
     db = new Database(":memory:");
     runMigrations(db);
+    meshEvents = new MeshEventRepository(db);
     principals = new PrincipalRepository(db);
     allowedEmails = mode === "legacy" ? [config.email] : [config.email, "colleague@example.com"];
     auth = new DashboardAuth(
@@ -124,7 +130,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
               },
             ],
           },
-          meshEvents: { latestActivityByActor: () => new Map() },
+          meshEvents,
           mesh: { interrupt },
         } as unknown as DashboardDataDeps,
         null,
@@ -181,6 +187,75 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     const authenticated = await post("/api/mesh/actors/actor/interrupt", cookie);
     expect(authenticated.status).toBe(200);
     expect(interrupt).toHaveBeenCalledWith("actor", principal?.id);
+  });
+
+  it("keeps an authenticated viewer's unrelated message events out of an actor event view", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({
+      issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
+      subject: token.sub,
+    });
+    if (!viewer) throw new Error("Expected authenticated viewer");
+
+    const selected = "selected-actor";
+    const unrelated = "unrelated-actor";
+    meshEvents.record({ kind: "message_sent", actorId: selected, detail: "selected sent" });
+    meshEvents.record({ kind: "message_received", actorId: selected, detail: "selected received" });
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: viewer.id,
+      detail: "viewer sent elsewhere",
+    });
+    meshEvents.record({
+      kind: "message_received",
+      actorId: viewer.id,
+      detail: "viewer received elsewhere",
+    });
+    meshEvents.record({ kind: "message_sent", actorId: unrelated, detail: "unrelated sent" });
+
+    const response = await fetch(`${origin}/api/mesh/events?actors=${selected}`, {
+      headers: { Cookie: cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as {
+      events: Array<{ actorId: string; detail: string | null }>;
+    };
+    expect(page.events.map((event) => event.detail)).toEqual([
+      "selected received",
+      "selected sent",
+    ]);
+    expect(page.events.map((event) => event.actorId)).toEqual([selected, selected]);
+    expect(page.events.map((event) => event.detail)).not.toContain("viewer sent elsewhere");
+    expect(page.events.map((event) => event.detail)).not.toContain("viewer received elsewhere");
+    expect(page.events.map((event) => event.detail)).not.toContain("unrelated sent");
+  });
+
+  it("keeps legacy human:operator event queries scoped to the legacy actor id", async () => {
+    const cookie = await login();
+    const viewer = principals.findUserByExternalIdentity({
+      issuer: `https://securetoken.google.com/${config.firebase.projectId}`,
+      subject: token.sub,
+    });
+    if (!viewer) throw new Error("Expected authenticated viewer");
+
+    meshEvents.record({
+      kind: "message_sent",
+      actorId: HUMAN_OPERATOR,
+      detail: "legacy operator event",
+    });
+    meshEvents.record({ kind: "message_sent", actorId: viewer.id, detail: "durable user event" });
+
+    const response = await fetch(`${origin}/api/mesh/events?actors=${HUMAN_OPERATOR}`, {
+      headers: { Cookie: cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as {
+      events: Array<{ actorId: string; detail: string | null }>;
+    };
+    expect(page.events.map((event) => event.detail)).toEqual(["legacy operator event"]);
+    expect(page.events.map((event) => event.actorId)).toEqual([HUMAN_OPERATOR]);
   });
 
   it.skipIf(mode !== "shared")(
@@ -394,7 +469,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     }
   });
 
-  it("exposes only client-safe config and a generic login shell", async () => {
+  it("exposes only client-safe config and keeps dashboard APIs gated", async () => {
     const res = await fetch(`${origin}/api/auth/config`);
     expect(await res.json()).toEqual({
       enabled: true,
@@ -402,22 +477,46 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
         projectId: "project",
         apiKey: "public-key",
         authDomain: "project.firebaseapp.com",
+        appId: "app-id",
+        messagingSenderId: "sender-id",
       },
     });
-    const shell = await fetch(`${origin}/actors/some-actor`);
-    expect(shell.headers.get("cache-control")).toBe("no-store");
-    const html = await shell.text();
-    expect(html).not.toContain(config.email);
-    // The login shell replaces Flutter's generated page, and bootDashboard() re-injects
-    // the loader by hand; both silently drift if the template ever needs more than that.
+    // Flutter owns the public sign-in shell; this source template is generic
+    // and contains no authentication bootstrap script.
     const template = readFileSync(
       new URL("../../flutter_dashboard/web/index.html", import.meta.url),
       "utf8"
     );
     expect(template.match(/<script[^>]*>/g)).toEqual(['<script src="flutter_bootstrap.js" async>']);
     expect(template).toContain('<base href="$FLUTTER_BASE_HREF">');
-    expect(html).toContain('<base href="/">');
-    expect(html).toContain('<script src="/dashboard-auth.js" defer>');
+    expect(template).not.toContain("dashboard-auth.js");
+    expect((await fetch(`${origin}/api/mesh/threads`)).status).toBe(401);
+    // The public Flutter shell remains generic; only a cookie-authenticated
+    // manifest response may contain the configured instance branding.
+    expect((await fetch(`${origin}/manifest.json`)).status).toBe(401);
+  });
+
+  it("keeps legacy auth configuration bootable with FlutterFire metadata defaults", () => {
+    const {
+      appId: _appId,
+      messagingSenderId: _messagingSenderId,
+      ...legacyFirebase
+    } = config.firebase;
+    const legacy = new DashboardAuth(
+      { email: config.email, firebase: legacyFirebase },
+      firebase,
+      new DashboardIdentityResolver(() => principals, legacyFirebase.projectId),
+      () => now
+    );
+
+    expect(legacy.clientConfig()).toMatchObject({
+      enabled: true,
+      firebase: {
+        projectId: "project",
+        appId: "",
+        messagingSenderId: "",
+      },
+    });
   });
 
   it.each([

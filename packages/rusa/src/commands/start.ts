@@ -110,7 +110,6 @@ import {
   sweepOrphanedWorkspaces,
   unattributedCheckouts,
 } from "../actor/workspace-sweep.js";
-import { backfillAvatars, kickAvatarGeneration } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
 import { GchatOAuth } from "../chat/gchat-oauth.js";
@@ -177,7 +176,11 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import type { UpdateToolDeps } from "../mcp/update-mcp.js";
-import { isTerminalObligationStatus } from "../obligations/obligation.js";
+import {
+  type EntityId,
+  isTerminalObligationStatus,
+  type Obligation,
+} from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import {
@@ -1043,6 +1046,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     prerequisiteCancellationSink?.(attention)
   );
 
+  // #531 responsive-ready attention: same deferred-sink shape as the two
+  // listeners above — the mesh doesn't exist yet at this point in startup.
+  let responsiveReadySink:
+    | ((obligation: Obligation, actingPrincipal: EntityId) => void)
+    | undefined;
+  getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
+    responsiveReadySink?.(obligation, actingPrincipal)
+  );
+
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
   } catch (err) {
@@ -1151,6 +1163,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return resolveSeed(client !== null, client ? latestOpCreatedAt(client) : null);
     },
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
+    // The distiller's replay read (#537) crosses the capability boundary here
+    // and nowhere else: the dashboard's `/api/mesh/events` stays a human-only
+    // Firebase-session route with no machine principal behind it.
+    listEvents: (opts) => getRepositories().meshEvents.listEventsWindow(opts),
   };
   const actors = getRepositories().actors;
   // The obligation store's actor guard is only real once it can see the
@@ -2289,14 +2305,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }),
     lifecycleListeners: [
       {
-        // Eagerly generate an avatar on genuine spawn. Root is adopted, so it
-        // never reaches this listener and continues to use its fixed image.
-        onSpawn: ({ actorId }) =>
-          kickAvatarGeneration(actorId, {
-            apiKey: config.geminiApiKey ?? "",
-            rootId,
-            log: (m) => console.log(`[avatar] ${m}`),
-          }),
         onRetire: ({ actorId }) => {
           teardownActorMcp(actorId);
         },
@@ -2853,13 +2861,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
     mesh.deliverReadyHeadAttention(
       ownerId,
-      head === null ? null : { id: head.id, intent: head.intent },
+      head === null
+        ? null
+        : { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
       previousHeadId,
       sequence
     );
   };
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
+  };
+  responsiveReadySink = (obligation, actingPrincipal) => {
+    mesh.deliverResponsiveReadyAttention(
+      obligation.ownerId,
+      { id: obligation.id, intent: obligation.intent, readyCount: obligation.readyCount },
+      actingPrincipal === obligation.ownerId
+    );
   };
 
   const rootControl = new RootControlService({
@@ -3430,6 +3447,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
+  try {
+    mesh.reconcileResponsiveReadyAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
@@ -3447,18 +3469,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       });
     }
   }
-
-  // One-time avatar backfill : generate a cached avatar for every currently
-  // live actor that lacks one, so existing actors get an avatar without waiting to
-  // respawn. Strictly fire-and-forget — the root and already-cached handles are
-  // no-ops inside the generator, and any failure is isolated to a log line.
-  backfillAvatars(
-    actors
-      .list()
-      .filter((r) => r.status === "active")
-      .map((r) => r.id),
-    { apiKey: config.geminiApiKey ?? "", rootId, log: (m) => console.log(`[avatar] ${m}`) }
-  );
 
   // ── Inbound edges → root inbox ──
   const webhookPort = config.webhook?.port ?? 9742;
@@ -3700,6 +3710,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             if (!runId) return null;
             const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
             return obligationId ? getRepositories().obligations.get(obligationId) : null;
+          },
+          selectedInboxItemsForActor: (actorId) => {
+            const runId = runAccounting.activeRunId(actorId);
+            if (!runId) return null;
+            const entryIds = getRepositories().actorRuns.activeFocusEntryIds(runId);
+            if (!entryIds || entryIds.length === 0) return null;
+            const entries: InboxEntry[] = [];
+            for (const id of new Set(entryIds)) {
+              const entry = getRepositories().inbox.read(actorId, id);
+              if (entry && entry.handledAt === null) entries.push(entry);
+            }
+            return entries.length > 0 ? entries : null;
           },
           rootControl,
           // The configured root identity  — display handle + avatar

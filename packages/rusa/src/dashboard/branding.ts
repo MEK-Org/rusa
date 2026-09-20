@@ -129,6 +129,18 @@ export function applyBrandingToHtml(html: string, branding: DashboardBranding): 
 }
 
 /**
+ * Remove the PWA manifest link from an otherwise public shell.
+ *
+ * Authenticated instances fetch a root-branded manifest only after sign-in.
+ * Keeping this transformation at the serving boundary preserves normal PWA
+ * behavior for local mode while ensuring an anonymous auth-mode shell does not
+ * cache its expected 401 as the manifest result.
+ */
+export function removeManifestLink(html: string): string {
+  return html.replace(/[ \t]*<link\b(?=[^>]*\brel\s*=\s*["']manifest["'])[^>]*>\s*\n?/gi, "");
+}
+
+/**
  * Rewrite the built `manifest.json` for this instance: the installed PWA's name
  * and, when the root has its own image, its icon.
  *

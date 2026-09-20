@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import type { ActorRuntimeStateDelta } from "../actor/actor-mesh.js";
+import type { AvatarGenerationEvent } from "../avatar/avatars.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { LiveOutputBuffer, SseHub } from "./sse.js";
 
@@ -141,6 +142,27 @@ describe("SseHub", () => {
     expect(res.dataFrames()[1]).toContain("event: actor_runtime_state");
     expect(res.dataFrames()[1]).toContain('"revision":5');
     hub.close();
+  });
+
+  it("relays lazy avatar generation lifecycle as avatar frames to mesh clients", () => {
+    let listener: ((event: AvatarGenerationEvent) => void) | undefined;
+    const avatarGeneration = {
+      onStateChange: (next: typeof listener) => {
+        listener = next;
+        return () => {
+          listener = undefined;
+        };
+      },
+    };
+    const hub = new SseHub(new MeshEventEmitter(), { avatarGeneration });
+    const res = connect(hub, null);
+
+    listener?.({ actorId: "a", state: "generating" });
+    expect(res.dataFrames().at(-1)).toBe(
+      'event: avatar\ndata: {"actorId":"a","state":"generating"}\n\n'
+    );
+    hub.close();
+    expect(listener).toBeUndefined();
   });
 
   it("delivers mesh_event to every client regardless of actor filter", () => {

@@ -34,6 +34,8 @@ ThreadDto makeThread(
   int? queuePosition,
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
+  InboxEntryDto? selectedInboxItem,
+  int? moreInboxItemsCount,
   String? voiceName,
   int? pacingIntervalMs,
 }) => ThreadDto(
@@ -61,10 +63,34 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
+  selectedInboxItem: selectedInboxItem,
+  moreInboxItemsCount: moreInboxItemsCount,
   voiceConfig: voiceName == null
       ? null
       : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
   pacingIntervalMs: pacingIntervalMs,
+);
+
+InboxEntryDto makeInboxEntry(
+  String id, {
+  String actorId = 'actor-1',
+  String source = 'chat',
+  String deliveredAt = '2026-09-01T10:00:00.000Z',
+  String type = 'message',
+  String? content,
+  String? priority,
+  ReferenceDto? reference,
+}) => InboxEntryDto(
+  id: id,
+  actorId: actorId,
+  source: source,
+  deliveredAt: deliveredAt,
+  payload: {
+    'type': type,
+    'priority': ?priority,
+    'content': ?content,
+  },
+  reference: reference,
 );
 
 MeshEvent makeEvent(
@@ -1219,6 +1245,7 @@ class FakeStream implements MeshStreamSource {
   final runtimeHelloCtrl = StreamController<RuntimeHello>.broadcast();
   final runtimeStatesCtrl =
       StreamController<ActorRuntimeStateDelta>.broadcast();
+  final avatarCtrl = StreamController<AvatarGenerationUpdate>.broadcast();
   final connectCalls = <List<String>>[];
 
   @override
@@ -1231,6 +1258,8 @@ class FakeStream implements MeshStreamSource {
   Stream<RuntimeHello> get runtimeHello => runtimeHelloCtrl.stream;
   @override
   Stream<ActorRuntimeStateDelta> get runtimeStates => runtimeStatesCtrl.stream;
+  @override
+  Stream<AvatarGenerationUpdate> get avatarUpdates => avatarCtrl.stream;
   @override
   void connect(List<String> actors) => connectCalls.add(actors);
   @override

@@ -349,6 +349,187 @@ describe("MeshEventRepository", () => {
     });
   });
 
+  describe("listEventsWindow (distiller bounded replay, #537)", () => {
+    const stamp = (n: number) => `2026-06-18T00:00:${String(n).padStart(2, "0")}.000Z`;
+
+    it("returns every actor's events in the half-open [since, until), oldest-first", () => {
+      repo.record({ kind: "run_start", actorId: "a", detail: "before", ts: stamp(0) });
+      repo.record({ kind: "run_start", actorId: "b", detail: "edge", ts: stamp(1) });
+      repo.record({ kind: "run_end", actorId: "c", detail: "mid", ts: stamp(2) });
+      repo.record({ kind: "run_start", actorId: "a", detail: "until", ts: stamp(3) });
+
+      const page = repo.listEventsWindow({ since: stamp(1), until: stamp(3), limit: 50 });
+      expect(page.events.map((e) => e.detail)).toEqual(["edge", "mid"]);
+      expect(page).toMatchObject({ hasMore: false, nextCursor: null });
+    });
+
+    it("orders by ts, not insertion order, and leaves until open when omitted", () => {
+      repo.record({ kind: "run_start", actorId: "a", detail: "late", ts: stamp(5) });
+      repo.record({ kind: "run_start", actorId: "b", detail: "early", ts: stamp(1) });
+
+      const page = repo.listEventsWindow({ since: stamp(0), limit: 50 });
+      expect(page.events.map((e) => e.detail)).toEqual(["early", "late"]);
+    });
+
+    it("pages with a cursor that resumes exactly after the last served event", () => {
+      for (let i = 0; i < 5; i++)
+        repo.record({ kind: "run_start", actorId: "a", detail: String(i), ts: stamp(i) });
+
+      const first = repo.listEventsWindow({ since: stamp(0), until: stamp(5), limit: 2 });
+      expect(first.events.map((e) => e.detail)).toEqual(["0", "1"]);
+      expect(first.hasMore).toBe(true);
+      expect(first.nextCursor).not.toBeNull();
+
+      const second = repo.listEventsWindow({
+        since: stamp(0),
+        until: stamp(5),
+        limit: 2,
+        after: first.nextCursor,
+      });
+      expect(second.events.map((e) => e.detail)).toEqual(["2", "3"]);
+      expect(second.hasMore).toBe(true);
+
+      const third = repo.listEventsWindow({
+        since: stamp(0),
+        until: stamp(5),
+        limit: 2,
+        after: second.nextCursor,
+      });
+      expect(third.events.map((e) => e.detail)).toEqual(["4"]);
+      expect(third).toMatchObject({ hasMore: false, nextCursor: null });
+    });
+
+    it("neither drops nor repeats events that share a timestamp across a page edge", () => {
+      // Three events on one stamp with a page size of two: a cursor keyed on ts
+      // alone would either re-serve all three or skip the third.
+      for (const detail of ["x", "y", "z"])
+        repo.record({ kind: "run_start", actorId: detail, detail, ts: stamp(1) });
+      repo.record({ kind: "run_start", actorId: "w", detail: "w", ts: stamp(2) });
+
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      do {
+        const page = repo.listEventsWindow({
+          since: stamp(0),
+          until: stamp(3),
+          limit: 2,
+          after: cursor,
+        });
+        seen.push(...page.events.map((e) => e.detail ?? ""));
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+      expect(seen).toEqual(["x", "y", "z", "w"]);
+    });
+
+    it("returns an empty exhausted page for a non-positive limit or an empty window", () => {
+      repo.record({ kind: "run_start", actorId: "a", ts: stamp(1) });
+      const empty = { events: [], hasMore: false, nextCursor: null };
+      expect(repo.listEventsWindow({ since: stamp(0), limit: 0 })).toEqual(empty);
+      expect(repo.listEventsWindow({ since: stamp(2), limit: 10 })).toEqual(empty);
+      expect(repo.listEventsWindow({ since: stamp(0), until: stamp(1), limit: 10 })).toEqual(empty);
+    });
+
+    it("rejects a malformed cursor instead of silently restarting the window", () => {
+      expect(() => repo.listEventsWindow({ since: stamp(0), limit: 10, after: "junk" })).toThrow(
+        /malformed event cursor/
+      );
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|-1` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|0` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|1.5` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|abc` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}|1e2` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: `${stamp(0)}| 3` })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: "not-an-iso|1" })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({ since: stamp(0), limit: 10, after: "2026-09-1|1" })
+      ).toThrow(/malformed event cursor/);
+      expect(() => repo.listEventsWindow({ since: stamp(0), limit: 10, after: "zzz|1" })).toThrow(
+        /malformed event cursor/
+      );
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-99-99T00:00:00.000Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-02-31T00:00:00.000Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(0),
+          limit: 10,
+          after: "2026-06-18T00:00:00Z|1",
+        })
+      ).toThrow(/malformed event cursor/);
+      // Fabricated cursor outside the requested window: earlier than since
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(2),
+          until: stamp(5),
+          limit: 10,
+          after: `${stamp(1)}|1`,
+        })
+      ).toThrow(/earlier than window since/);
+      // Fabricated cursor outside the requested window: at or later than until
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(1),
+          until: stamp(3),
+          limit: 10,
+          after: `${stamp(3)}|1`,
+        })
+      ).toThrow(/at or later than window until/);
+      expect(() =>
+        repo.listEventsWindow({
+          since: stamp(1),
+          until: stamp(3),
+          limit: 10,
+          after: `${stamp(4)}|1`,
+        })
+      ).toThrow(/at or later than window until/);
+    });
+
+    it("resolves a spine-participating event's body from mesh_chat, like every other read", () => {
+      db.prepare(
+        `INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
+         VALUES (?, ?, ?, ?, ?, NULL)`
+      ).run("m1", stamp(1), "a", "b", "the message");
+      repo.record({
+        kind: "message_sent",
+        actorId: "b",
+        payload: JSON.stringify({ messageId: "m1" }),
+        body: "stale copy",
+        ts: stamp(1),
+      });
+
+      const page = repo.listEventsWindow({ since: stamp(0), limit: 10 });
+      expect(page.events[0]?.body).toBe("the message");
+    });
+  });
+
   describe("countEventsSince", () => {
     beforeEach(() => {
       repo.record({ kind: "message_sent", actorId: "a", ts: "2026-06-10T00:00:00.000Z" });

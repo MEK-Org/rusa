@@ -43,6 +43,7 @@ import { actorVoiceConfig } from "./0044_actor_voice_config.js";
 import { obligationHistory } from "./0045_obligation_history.js";
 import { actorExperiments } from "./0047_actor_experiments.js";
 import { portableContextSnapshots } from "./0048_portable_context_snapshots.js";
+import { obligationResponsive } from "./0049_obligation_responsive.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -98,4 +99,5 @@ export const migrations: Migration[] = [
   obligationHistory,
   actorExperiments,
   portableContextSnapshots,
+  obligationResponsive,
 ];

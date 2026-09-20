@@ -22,6 +22,7 @@ type ObligationServerRepository = Pick<
   | "attachArtifact"
   | "listArtifacts"
   | "movePriorityInternal"
+  | "markResponsive"
   | "reassign"
   | "reparent"
   | "setRecurrence"
@@ -325,7 +326,7 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side. `responsive` marks the obligation (and everything filed under it) responsive: when it becomes ready or is assigned ready, its owner gets immediately responsive inbox attention that may preempt an in-flight run.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
         title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
@@ -333,6 +334,7 @@ export function createObligationsMcpServer(
         intent: z.string().nullable().optional(),
         external_ref: z.string().trim().min(1).nullable().optional(),
         priority: z.number().finite().nullable().optional(),
+        responsive: z.literal(true).nullable().optional(),
         recurrence: z
           .union([
             z.object({ policy: z.literal("cron"), cronExpr: z.string().trim().min(1) }),
@@ -353,6 +355,7 @@ export function createObligationsMcpServer(
       intent,
       external_ref,
       priority,
+      responsive,
       recurrence,
       blocked_by,
     }) => {
@@ -374,6 +377,7 @@ export function createObligationsMcpServer(
           intent: intent ?? null,
           externalRef: external_ref ?? null,
           priority: priority ?? null,
+          responsive: responsive ?? null,
           recurrence: recurrence ?? null,
           blockedBy: blocked_by,
           // Bound by the server from this server's actor identity, exactly like
@@ -540,6 +544,27 @@ export function createObligationsMcpServer(
           attachedBy: actorId,
         });
         return toolOk({ artifact });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "mark_obligation_responsive",
+    {
+      title: "Mark an existing obligation responsive",
+      description:
+        "Marks a live obligation and every descendant responsive. If ready work newly becomes responsive, its owner gets immediately responsive inbox attention; this may preempt an in-flight run where the inbox model admits it.",
+      inputSchema: { id: z.string().trim().min(1) },
+    },
+    async ({ id }) => {
+      try {
+        const current = repository.get(id);
+        if (!current) throw new Error("obligation not found");
+        if (!canManage(current))
+          throw new Error("not authorized to mark this obligation responsive");
+        return toolOk({ obligation: repository.markResponsive(id, actorId) });
       } catch (err) {
         return toolError(err);
       }

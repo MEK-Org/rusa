@@ -64,6 +64,12 @@ export interface InboxStore {
   /** Append new entries, returning only rows inserted by this call. Duplicate ids are no-ops. */
   append(entries: InboxAppendInput[]): InboxEntry[];
   list(actorId: string, options?: InboxListOptions): InboxPage;
+  /**
+   * Exact queue-card candidate across every unhandled entry, ordered responsive
+   * first, then delivered timestamp and id. Optional while non-SQL test stores
+   * retain the portable paginated fallback in the dashboard.
+   */
+  selectPrioritizedUnhandled?(actorId: string): InboxEntry | null;
   read(actorId: string, entryId: string): InboxEntry | null;
   countUnhandled(actorId: string, options?: { responsiveOnly?: boolean }): number;
   /** Each actor with pending work, promoted when any pending entry is responsive. */

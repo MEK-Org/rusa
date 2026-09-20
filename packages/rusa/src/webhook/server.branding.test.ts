@@ -15,10 +15,10 @@ const INDEX_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta name="apple-mobile-web-app-title" content="Rusa">
+  <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
   <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
   <title>Rusa</title>
-  <link rel="manifest" href="manifest.json">
 </head>
 <body></body>
 </html>
@@ -105,6 +105,7 @@ describe("dashboard branding from the configured root actor", () => {
     const res = await get("/");
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain("<title>Rusa</title>");
+    expect(res.body).toContain('rel="manifest"');
   });
 
   it("keeps the built name for the default root-actor handle", async () => {

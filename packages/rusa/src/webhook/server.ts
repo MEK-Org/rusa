@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
+import { AvatarGenerationCoordinator } from "../avatar/avatars.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
 import {
   type DashboardDataDeps,
@@ -23,6 +24,7 @@ import { createDashboardAuth, type DashboardAuth } from "../dashboard/auth.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
+  removeManifestLink,
   resolveDashboardBranding,
 } from "../dashboard/branding.js";
 import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/iu-reports-api.js";
@@ -152,6 +154,8 @@ export interface DashboardMeshRefs {
   providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
   /** Active-run inbox focus projection; see `DashboardDataDeps`. */
   selectedObligationForActor?: DashboardDataDeps["selectedObligationForActor"];
+  /** Active-run selected inbox items projection; see `DashboardDataDeps`. */
+  selectedInboxItemsForActor?: DashboardDataDeps["selectedInboxItemsForActor"];
   /** This instance's configured root identity ; see `DashboardDataDeps`. */
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
@@ -306,44 +310,21 @@ export function createDashboardRequestHandler(
         return;
       }
 
-      if (req.method === "GET" && pathname === "/dashboard-auth.js") {
-        const asset = getDashboardAsset(pathname);
-        if (!asset) {
-          res.writeHead(503, { "Content-Type": "text/plain" });
-          res.end("Dashboard assets are missing; rebuild Rusa");
-          return;
-        }
-        res.writeHead(200, {
-          "Content-Type": "application/javascript",
-          "Cache-Control": "no-cache",
-        });
-        res.end(asset.body);
-        return;
-      }
       if (auth && (await auth.handle(req, res, pathname))) return;
       if (!auth && req.method === "GET" && pathname === "/api/auth/config") {
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.end(JSON.stringify({ enabled: false }));
         return;
       }
-      // The public shell contains no instance name, avatar, or dashboard data.
-      if (
-        auth &&
-        serveUi &&
-        req.method === "GET" &&
-        !pathname.startsWith("/api/") &&
-        (pathname === "/index.html" || !getDashboardAsset(pathname))
-      ) {
-        res.writeHead(200, {
-          "Content-Type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store",
-        });
-        res.end(
-          '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rusa</title><base href="/"></head><body><script src="/dashboard-auth.js" defer></script></body></html>'
-        );
-        return;
-      }
-      if (auth && !(await auth.authorize(req, res))) return;
+      // Flutter owns the login surface, so its public bundle must be available
+      // before an authenticated request exists. All dashboard data remains under
+      // `/api/` and therefore retains the server-side cookie boundary.
+      if (auth && pathname.startsWith("/api/") && !(await auth.authorize(req, res))) return;
+      // The manifest is deliberately the one static exception: the public shell
+      // stays generic, while Flutter fetches this branded manifest after a user
+      // has signed in. An unauthenticated manifest request carries no instance
+      // metadata and is rejected rather than revealing it.
+      if (auth && pathname === "/manifest.json" && !(await auth.authorize(req, res))) return;
       if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
         auth.guardStream(req, res);
       }
@@ -406,7 +387,10 @@ export function createDashboardRequestHandler(
         // This instance's own name and face (#48), from the configured root
         // actor. Resolved per request, not once at startup, because an operator can
         // upload a new root image from the dashboard while the server runs.
-        const branding = resolveDashboardBranding(options.mesh?.rootIdentity);
+        const branding =
+          auth && pathname !== "/manifest.json"
+            ? resolveDashboardBranding(undefined)
+            : resolveDashboardBranding(options.mesh?.rootIdentity);
 
         // The manifest carries the installed PWA's name and icon, so it is rewritten
         // rather than served verbatim.
@@ -437,7 +421,11 @@ export function createDashboardRequestHandler(
         // refresh keeps working — when the Flutter assets have been built.
         if (hasDashboardAsset("index.html")) {
           try {
-            const html = applyBrandingToHtml(getDashboardHtml(), branding);
+            const brandedHtml = applyBrandingToHtml(getDashboardHtml(), branding);
+            // The local dashboard keeps its normal manifest link. In auth mode
+            // the generic anonymous shell must not fetch an instance-branded
+            // manifest before Flutter has established a session.
+            const html = auth ? removeManifestLink(brandedHtml) : brandedHtml;
             res.writeHead(200, {
               "Content-Type": "text/html; charset=utf-8",
               // The title and icon links are branded per request; see above.
@@ -587,8 +575,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
+  // One coordinator per process: the avatar route starts attempts on it and the
+  // SSE hub relays their outcome, so single-flight and the UI's ring agree.
+  const avatarGeneration = options.mesh ? new AvatarGenerationCoordinator() : undefined;
   const sseHub = options.mesh
-    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh })
+    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh, avatarGeneration })
     : null;
   const dataDeps: DashboardDataDeps | null =
     options.mesh && sseHub
@@ -609,8 +600,10 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           queuedThreadIds: options.mesh.queuedThreadIds,
           providerQueueSnapshots: options.mesh.providerQueueSnapshots,
           selectedObligationForActor: options.mesh.selectedObligationForActor,
+          selectedInboxItemsForActor: options.mesh.selectedInboxItemsForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
+          avatarGeneration,
           supportedVoices: options.mesh.supportedVoices,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,

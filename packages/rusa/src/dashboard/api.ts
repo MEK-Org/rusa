@@ -4,10 +4,11 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
+import type { InboxEntry, InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
+  type AvatarGenerationCoordinator,
   generateAvatarForce,
   isRootHandle,
   type RootAvatarIdentity,
@@ -27,7 +28,7 @@ import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import { resolveSoleActiveUser } from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
-import { resolveReferenceSync } from "../references/resolve.js";
+import { type ResolvedReference, resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
@@ -37,6 +38,7 @@ import {
   voiceConfigSchema,
 } from "../voice/voice-config.js";
 import { getDashboardRequestPrincipal } from "./auth.js";
+import { selectPrioritizedInboxItem } from "./inbox-selection.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -107,6 +109,11 @@ export interface DashboardDataDeps {
    */
   selectedObligationForActor?: (actorId: string) => Obligation | null;
   /**
+   * Selected inbox items for an actor's active run. When no obligation is selected,
+   * the dashboard selects one of these items using responsive-first then earliest order.
+   */
+  selectedInboxItemsForActor?: (actorId: string) => InboxEntry[] | null;
+  /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
    * set in config. Optional: absent (or fields unset) reproduces today's
@@ -120,6 +127,13 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  /**
+   * Process-local one-attempt state for first-display avatar generation. The
+   * live mesh server injects the single instance it also wires into the SSE
+   * hub; when absent (a UI-only server) missing avatars simply stay 404 and
+   * nothing can spend provider quota.
+   */
+  avatarGeneration?: AvatarGenerationCoordinator;
   supportedVoices?: readonly SupportedVoice[];
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
@@ -193,6 +207,11 @@ function charterPreview(charter: string): string {
   return `${points.slice(0, CHARTER_PREVIEW_CHARS).join("").trimEnd()}\u2026`;
 }
 
+type ResolvedInboxEntry = InboxEntry & {
+  reference?: ResolvedReference;
+};
+type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
+
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
   id: string;
@@ -234,6 +253,14 @@ interface ThreadDto {
   eligibleAt?: number | null;
   /** The active run's selected inbox-focus obligation, when one exists. */
   selectedObligation?: Obligation;
+  /**
+   * For a running actor with selected inbox items but no selected obligation,
+   * or a queued actor with unhandled inbox items: the top inbox item chosen
+   * responsive-first then earliest.
+   */
+  selectedInboxItem?: ResolvedInboxEntry;
+  /** Additional inbox items beyond the one shown, when more exist. */
+  moreInboxItemsCount?: number;
   /**
    * The actor's persisted walkie-talkie voice, or null when it follows the
    * instance-wide default (every actor without a stored `voice_config`).
@@ -472,9 +499,12 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
  * resolving it here would show the wrong entity. Every other payload keeps
  * its raw JSON, which is the honest rendering until that has a resolver.
  */
-async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
-  const entries = await Promise.all(
-    page.entries.map(async (entry) => {
+async function resolveInboxPage(
+  page: InboxPage,
+  deps: DashboardDataDeps
+): Promise<ResolvedInboxPage> {
+  const entries: ResolvedInboxEntry[] = await Promise.all(
+    page.entries.map(async (entry): Promise<ResolvedInboxEntry> => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
         messageId?: unknown;
       };
@@ -1423,15 +1453,27 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar , keyed by
-  // the unique thread id (the root id serves the fixed bundled image).
-  // Filesystem-backed and independent of the live mesh, so it's served even when
-  // `deps` is null (a UI-only server). 404 when nothing is cached yet so the UI
-  // falls back to its placeholder.
+  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar, keyed by the
+  // unique thread id (the root id serves the fixed bundled image). Filesystem-
+  // backed, so it's served even when `deps` is null (a UI-only server). A
+  // missing image is always an immediate 404 so the UI falls back to its
+  // placeholder; for a live actor it additionally starts (or joins) the one
+  // background generation attempt, whose outcome reaches the dashboard as an
+  // `avatar` SSE frame rather than by holding this response open. Unknown and
+  // retired ids never spend provider quota.
   if (pathname.startsWith(AVATAR_PREFIX)) {
     const key = avatarKeyFromPath(pathname);
     const avatar = key ? readAvatar(key, deps?.rootIdentity) : null;
     if (!avatar) {
+      if (key && deps?.avatarGeneration && deps.actors.get(key)?.status === "active") {
+        // Never rejects: the coordinator logs and settles every failure itself.
+        void deps.avatarGeneration.request(key, {
+          apiKey: deps.geminiApiKey ?? "",
+          rootHandle: deps.rootIdentity?.handle,
+          rootId: deps.rootIdentity?.id,
+          log: (message) => deps.logger?.warn("avatar_lazy_generation_failed", { key, message }),
+        });
+      }
       res.writeHead(404, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
@@ -1507,59 +1549,115 @@ export async function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    const threads: ThreadDto[] = actors.list().map((r) => {
-      let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
-      if (runtime) {
-        runState = runtime.states.get(r.id) ?? "idle";
-      } else if (running.has(r.id)) {
-        runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
-      } else if (queued.has(r.id)) {
-        runState = "queued";
-      }
-      const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
-      // Durable inbox focus is created only after a run starts. A queued
-      // reservation deliberately has no focus from the prior run (or a
-      // speculative next one) to project.
-      const selectedObligation =
-        runState === "running" || runState === "winding_down"
-          ? (deps.selectedObligationForActor?.(r.id) ?? null)
+    const threads: ThreadDto[] = await Promise.all(
+      actors.list().map(async (r) => {
+        let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
+        if (runtime) {
+          runState = runtime.states.get(r.id) ?? "idle";
+        } else if (running.has(r.id)) {
+          runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
+        } else if (queued.has(r.id)) {
+          runState = "queued";
+        }
+        const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
+        // Durable inbox focus is created only after a run starts. A queued
+        // reservation deliberately has no focus from the prior run (or a
+        // speculative next one) to project.
+        const selectedObligation =
+          runState === "running" || runState === "winding_down"
+            ? (deps.selectedObligationForActor?.(r.id) ?? null)
+            : null;
+
+        let inboxSelection: { item: InboxEntry; moreCount?: number } | null = null;
+        if (runState === "running" || runState === "winding_down") {
+          if (!selectedObligation) {
+            const items = deps.selectedInboxItemsForActor?.(r.id);
+            if (items && items.length > 0) {
+              inboxSelection = selectPrioritizedInboxItem(items);
+            }
+          }
+        } else if (runState === "queued") {
+          const inbox = deps.inbox;
+          const prioritized = inbox?.selectPrioritizedUnhandled?.(r.id);
+          if (prioritized && inbox) {
+            inboxSelection = {
+              item: prioritized,
+              moreCount: Math.max(0, inbox.countUnhandled(r.id) - 1),
+            };
+          } else if (inbox) {
+            // Non-SQL stores may not expose the exact query above. Read every
+            // bounded page so this fallback still honors the public heuristic.
+            const entries: InboxEntry[] = [];
+            let cursor: string | undefined;
+            let unhandledCount = 0;
+            do {
+              const page = inbox.list(r.id, {
+                status: "unhandled",
+                limit: 100,
+                cursor,
+              });
+              entries.push(...page.entries);
+              unhandledCount = page.unhandledCount;
+              cursor = page.nextCursor ?? undefined;
+            } while (cursor);
+            inboxSelection = selectPrioritizedInboxItem(entries, unhandledCount);
+          }
+        }
+
+        const selectedInboxItem = inboxSelection
+          ? (
+              await resolveInboxPage(
+                { entries: [inboxSelection.item], unhandledCount: 1, nextCursor: null },
+                deps
+              )
+            ).entries[0]
           : null;
-      return {
-        id: r.id,
-        handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
-        parentId: r.parentId,
-        status: r.status,
-        executionTarget: r.executionTarget ?? null,
-        provider: r.modelConfig?.[0]?.provider ?? null,
-        model: r.modelConfig?.[0]?.model ?? null,
-        effort: r.modelConfig?.[0]?.effort ?? null,
-        desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
-        ...(r.desiredModelConfig !== undefined
-          ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
-          : {}),
-        desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
-        modelConfig: r.modelConfig ?? [],
-        ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
-        ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
-        ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
-        charterPreview: charterPreview(r.charter),
-        title: r.title ?? summarizeCharter(r.charter),
-        createdAt: r.createdAt,
-        runState,
-        chatDisabled: r.status === "retired",
-        lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
-        estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
-        pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
-        selectedProvider: selection?.provider ?? null,
-        selectedLane: selection?.lane ?? null,
-        selectedModel: selection?.model ?? null,
-        selectedEffort: selection?.effort ?? null,
-        eligibleAt: selection?.eligibleAt ?? null,
-        ...(selectedObligation ? { selectedObligation } : {}),
-        voiceConfig: r.voiceConfig ?? null,
-      };
-    });
+        const moreInboxItemsCount =
+          inboxSelection && inboxSelection.moreCount !== undefined && inboxSelection.moreCount > 0
+            ? inboxSelection.moreCount
+            : undefined;
+
+        return {
+          id: r.id,
+          handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
+          parentId: r.parentId,
+          status: r.status,
+          executionTarget: r.executionTarget ?? null,
+          provider: r.modelConfig?.[0]?.provider ?? null,
+          model: r.modelConfig?.[0]?.model ?? null,
+          effort: r.modelConfig?.[0]?.effort ?? null,
+          desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
+          ...(r.desiredModelConfig !== undefined
+            ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
+            : {}),
+          desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
+          modelConfig: r.modelConfig ?? [],
+          ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
+          ...(r.desiredModelConfig !== undefined
+            ? { desiredModelConfig: r.desiredModelConfig }
+            : {}),
+          ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
+          charterPreview: charterPreview(r.charter),
+          title: r.title ?? summarizeCharter(r.charter),
+          createdAt: r.createdAt,
+          runState,
+          chatDisabled: r.status === "retired",
+          lastActiveAt: lastActiveByActor.get(r.id) ?? null,
+          queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
+          estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+          pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
+          selectedProvider: selection?.provider ?? null,
+          selectedLane: selection?.lane ?? null,
+          selectedModel: selection?.model ?? null,
+          selectedEffort: selection?.effort ?? null,
+          eligibleAt: selection?.eligibleAt ?? null,
+          ...(selectedObligation ? { selectedObligation } : {}),
+          voiceConfig: r.voiceConfig ?? null,
+          ...(selectedInboxItem ? { selectedInboxItem } : {}),
+          ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
+        };
+      })
+    );
     const schedulerHealth = deps.schedulerHealth?.();
     const userPrincipalId = viewingUserPrincipalId(req, deps.principals);
     sendJson(res, 200, {
@@ -1587,8 +1685,7 @@ export async function handleMeshApiRequest(
       sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
       return true;
     }
-    const rawActors = parseActors(url);
-    const actors = resolveChatQueryActors(rawActors, deps, req);
+    const actors = parseActors(url);
     const conversation = url.searchParams.get("conversation") === "true";
     const page = meshEvents.listEventsByActors(actors, {
       limit: clampLimit(url),

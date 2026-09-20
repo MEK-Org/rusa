@@ -1403,6 +1403,132 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(callCountBefore);
   });
 
+  it("delivers responsive ready-head attention as a responsive entry (#531)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(
+      mesh.deliverReadyHeadAttention(
+        "root",
+        { id: "ob-1", intent: "ship it", responsive: true },
+        null
+      )
+    ).toBe(true);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-1",
+      priority: "responsive",
+    });
+
+    // A non-responsive head keeps ordinary payload and nudge (regression).
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "later" }, "ob-1")).toBe(
+      true
+    );
+    await tick();
+    const second = rootEntries().find((entry) => entry.source === "obligation:ob-2");
+    expect(second?.payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-2" });
+    expect(second?.payload.priority).toBeUndefined();
+  });
+
+  it("delivers responsive-ready attention behind the head exactly once, and reconciles idempotently", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(
+      mesh.deliverResponsiveReadyAttention("root", { id: "ob-9", intent: "hotfix behind the head" })
+    ).toBe(true);
+    await tick();
+
+    const entries = rootEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].source).toBe("obligation:ob-9");
+    expect(entries[0].payload).toMatchObject({
+      type: "obligation.ready_responsive",
+      obligationId: "ob-9",
+      intent: "hotfix behind the head",
+      priority: "responsive",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    // Same transition again — and this is also what a restart replay looks like.
+    expect(
+      mesh.deliverResponsiveReadyAttention("root", { id: "ob-9", intent: "hotfix behind the head" })
+    ).toBe(false);
+    expect(rootEntries()).toHaveLength(1);
+
+    // Boot reconciliation derives the same fact set and replays through the
+    // same idempotent path: already delivered, so no duplicate, no extra wake.
+    const callsBefore = fake("root").calls.length;
+    mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-9", ownerId: "root", intent: "hotfix behind the head" },
+      ],
+    });
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callsBefore);
+
+    // A fact the live path missed (e.g. lost across a crash) is repaired.
+    mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-9", ownerId: "root", intent: "hotfix behind the head" },
+        { id: "ob-10", ownerId: "root", intent: "missed hotfix" },
+      ],
+    });
+    await tick();
+    expect(rootEntries()).toHaveLength(2);
+    expect(rootEntries().some((entry) => entry.source === "obligation:ob-10")).toBe(true);
+  });
+
+  it("announces each ready episode separately behind a persistent head (#531)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // Episode 1 delivers once.
+    expect(
+      mesh.deliverResponsiveReadyAttention("root", {
+        id: "ob-9",
+        intent: "hotfix behind the head",
+        readyCount: 1,
+      })
+    ).toBe(true);
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+
+    // A replay of the same committed episode — what a restart reconcile sees —
+    // is silent.
+    mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-9", ownerId: "root", intent: "hotfix behind the head", readyCount: 1 },
+      ],
+    });
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+
+    // Episode 2 — the obligation re-armed ready behind the same persistent
+    // head — is a distinct entry, not swallowed by episode 1's handled key.
+    expect(
+      mesh.deliverResponsiveReadyAttention("root", {
+        id: "ob-9",
+        intent: "hotfix behind the head",
+        readyCount: 2,
+      })
+    ).toBe(true);
+    await tick();
+    expect(rootEntries()).toHaveLength(2);
+    expect(rootEntries()[1].payload).toMatchObject({
+      type: "obligation.ready_responsive",
+      obligationId: "ob-9",
+      priority: "responsive",
+    });
+  });
+
   it("is idempotent when transition-based attention was already delivered before restart", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });

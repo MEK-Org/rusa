@@ -924,7 +924,10 @@ export class ActorMesh {
    */
   private readonly runHeadNet = new Map<
     string,
-    { from: string | null; to: { id: string; intent: string | null } | null }
+    {
+      from: string | null;
+      to: { id: string; intent: string | null; responsive?: boolean } | null;
+    }
   >();
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
@@ -1289,7 +1292,7 @@ export class ActorMesh {
       sequence: number;
     }>;
     readyHeads?(): Iterable<[string, string]>;
-    get(id: string): { id: string; intent: string | null } | null;
+    get(id: string): { id: string; intent: string | null; effectiveResponsive?: boolean } | null;
   }): void {
     if (!this.inboxStore) return;
     try {
@@ -1308,7 +1311,7 @@ export class ActorMesh {
           if (!head) continue;
           this.deliverReadyHeadAttention(
             actorId,
-            { id: head.id, intent: head.intent },
+            { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
             previousHeadId,
             sequence
           );
@@ -1321,7 +1324,12 @@ export class ActorMesh {
           if (!record || record.status !== "active") continue;
           const head = obligations.get(headId);
           if (!head) continue;
-          this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null, null);
+          this.deliverReadyHeadAttention(
+            actorId,
+            { id: head.id, intent: head.intent, responsive: head.effectiveResponsive },
+            null,
+            null
+          );
         }
       }
     } catch (err) {
@@ -1468,6 +1476,11 @@ export class ActorMesh {
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
+    // Note: STRICT_OBLIGATION_HANDLING_EXPERIMENT intentionally tracks only the
+    // actor's queue head (obligation.ready_head), asserting closure on that top
+    // commitment before clean yield. Behind-head responsive work
+    // (obligation.ready_responsive) alerts the actor of urgent work without
+    // asserting head-closure semantics on yield unless the actor selects it as head.
     const headObligationIds = this.isEnrolledInExperiment(
       actorId,
       STRICT_OBLIGATION_HANDLING_EXPERIMENT
@@ -1645,7 +1658,7 @@ export class ActorMesh {
   deliverReadyHeadAttention(
     actorId: string,
     /** The new head, or null when the owner no longer has one. */
-    head: { id: string; intent: string | null } | null,
+    head: { id: string; intent: string | null; responsive?: boolean } | null,
     previousHeadId: string | null = null,
     sequence: number | null = null
   ): boolean {
@@ -1664,7 +1677,7 @@ export class ActorMesh {
 
   private appendReadyHeadEntry(
     actorId: string,
-    head: { id: string; intent: string | null },
+    head: { id: string; intent: string | null; responsive?: boolean },
     previousHeadId: string | null,
     sequence: number | null = null
   ): boolean {
@@ -1678,6 +1691,7 @@ export class ActorMesh {
       `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
       actorId
     );
+    const responsive = head.responsive === true;
     const entries = this.inboxStore.append([
       {
         id: entryId,
@@ -1687,14 +1701,111 @@ export class ActorMesh {
           type: "obligation.ready_head",
           obligationId: head.id,
           intent: head.intent ?? undefined,
+          // A responsive head's attention is immediately responsive work:
+          // it preempts where the inbox model admits preemption (see
+          // notifyInboxChanged's responsive nudge below).
+          ...(responsive ? { priority: "responsive" as const } : {}),
         } as unknown as InboxPayload,
       },
     ]);
     if (entries.length === 0) {
       return false;
     }
-    this.notifyInboxChanged(actorId);
+    this.notifyInboxChanged(actorId, responsive ? { priority: "responsive" } : {});
     return true;
+  }
+
+  /**
+   * Durable attention for a responsive obligation that became ready behind its
+   * owner's queue head (#531). The head path announces a new head; this path
+   * covers the responsive work that lands behind one, which would otherwise
+   * wait for the head to clear before the owner ever heard about it.
+   *
+   * The dedupe key is per (obligation, ready episode) — one announcement per
+   * ready episode, the same one-shot contract as
+   * {@link deliverPrerequisiteCancelledAttention} with the episode counter
+   * standing in for the permanent cancelled fact. A permanent per-obligation
+   * key would be exactly-once but not live: a recurring responsive obligation
+   * re-armed behind a persistent head, or a non-recurring one cycling
+   * waiting→ready more than once, would re-arm into a key the owner already
+   * handled and never be announced again. Keying on the obligation's
+   * `readyCount` makes every new episode a distinct entry; a replay of the
+   * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
+   */
+  deliverResponsiveReadyAttention(
+    ownerId: string,
+    obligation: { id: string; intent: string | null; readyCount?: number },
+    /**
+     * The owner made its own obligation ready mid-run: it is already running
+     * and will see the obligation in its queue, so a normal follow-up nudge
+     * joins the run instead of preempting it. Any other cause is responsive
+     * and preempts — the v1 interrupt the inbox model admits.
+     */
+    selfCausedMidRun = false
+  ): boolean {
+    if (!this.inboxStore) return false;
+    const actorId = this.resolveThreadId(ownerId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-ready-responsive:${obligation.id}${episodeKey}`,
+      actorId
+    );
+    const entries = this.inboxStore.append([
+      {
+        id: entryId,
+        actorId,
+        source: `obligation:${obligation.id}`,
+        payload: {
+          type: "obligation.ready_responsive",
+          obligationId: obligation.id,
+          intent: obligation.intent ?? undefined,
+          priority: "responsive",
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
+      this.notifyInboxChanged(actorId);
+    } else {
+      this.notifyInboxChanged(actorId, { priority: "responsive" });
+    }
+    return true;
+  }
+
+  /**
+   * Boot recovery for responsive-ready attention (#531). The fact set is
+   * always recoverable from obligation state (ready, responsive-resolved,
+   * actor-owned, behind the owner's head), so this replays that query through
+   * the same idempotent delivery path used at the moment of transition —
+   * `append` is `ON CONFLICT(id) DO NOTHING`, so a transition already delivered
+   * is a silent no-op.
+   */
+  reconcileResponsiveReadyAttention(obligations: {
+    listResponsiveReadyAttention(): Iterable<{
+      id: string;
+      ownerId: string;
+      intent: string | null;
+      readyCount?: number;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const obligation of obligations.listResponsiveReadyAttention()) {
+        if (obligation.ownerId.startsWith("human:") || obligation.ownerId.startsWith("system:")) {
+          continue;
+        }
+        const actorId = this.resolveThreadId(obligation.ownerId);
+        const record = this.actors.get(actorId);
+        if (!record || record.status !== "active") continue;
+        this.deliverResponsiveReadyAttention(obligation.ownerId, obligation);
+      }
+    } catch (err) {
+      this.log(
+        `responsive-ready reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   /**

@@ -56,6 +56,29 @@ export interface Obligation {
   /** Obligation whose explicit priority supplies effectivePriority. */
   prioritySourceId: string;
   /**
+   * Locally marks this row responsive (#531). Null does not override ancestry:
+   * a descendant of responsive work stays responsive.
+   */
+  responsive: boolean | null;
+  /**
+   * Whether this obligation (or an ancestor it inherits from) is responsive:
+   * ready/assignment attention for it is delivered as immediately responsive
+   * inbox work. Resolved dynamically from ancestry, the same way
+   * {@link effectivePriority} is — reparenting into or out of a responsive
+   * subtree changes this with no write to the row.
+   */
+  effectiveResponsive: boolean;
+  /**
+   * How many times this obligation has transitioned into `ready` (0 = never).
+   * Initialized to 1 at migration 0049 for rows already in `ready`, 0 for unready rows.
+   * Each transition starts a new episode of responsive attention: the
+   * behind-head announcement is deduped per (obligation, episode), so a
+   * recurring responsive obligation re-armed behind a persistent head, or a
+   * non-recurring one cycling waiting→ready more than once, announces once per
+   * episode instead of being swallowed by the previous episode's dedupe key.
+   */
+  readyCount: number;
+  /**
    * When this obligation was created (ISO-8601). `null` only for rows that
    * predate the timestamp columns and have no recoverable creation time —
    * never a stand-in for "now".

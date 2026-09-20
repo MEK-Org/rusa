@@ -6,6 +6,7 @@ import 'package:web/web.dart' as web;
 
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'session.dart';
 import 'session_events_web.dart';
 
 /// Browser `EventSource` implementation of [MeshStreamSource].
@@ -17,11 +18,15 @@ import 'session_events_web.dart';
 /// safe. The `: connected` / `: heartbeat` comment frames are ignored by the
 /// browser automatically.
 class WebEventSourceStream implements MeshStreamSource {
+  WebEventSourceStream(this._session);
+
+  final DashboardSession _session;
   final _mesh = StreamController<MeshEvent>.broadcast();
   final _live = StreamController<LiveOutputChunk>.broadcast();
   final _elided = StreamController<void>.broadcast();
   final _runtimeHello = StreamController<RuntimeHello>.broadcast();
   final _runtimeStates = StreamController<ActorRuntimeStateDelta>.broadcast();
+  final _avatarUpdates = StreamController<AvatarGenerationUpdate>.broadcast();
   SessionEventSource? _es;
 
   @override
@@ -34,6 +39,8 @@ class WebEventSourceStream implements MeshStreamSource {
   Stream<RuntimeHello> get runtimeHello => _runtimeHello.stream;
   @override
   Stream<ActorRuntimeStateDelta> get runtimeStates => _runtimeStates.stream;
+  @override
+  Stream<AvatarGenerationUpdate> get avatarUpdates => _avatarUpdates.stream;
 
   @override
   void connect(List<String> actors) {
@@ -41,7 +48,7 @@ class WebEventSourceStream implements MeshStreamSource {
     final qs = actors.isEmpty
         ? ''
         : '?actors=${Uri.encodeQueryComponent(actors.join(','))}';
-    final es = SessionEventSource('/api/mesh/stream$qs');
+    final es = SessionEventSource('/api/mesh/stream$qs', _session);
     es.addEventListener(
       'mesh_event',
       _listener((data) {
@@ -75,6 +82,16 @@ class WebEventSourceStream implements MeshStreamSource {
         );
       }),
     );
+    es.addEventListener(
+      'avatar',
+      _listener((data) {
+        _avatarUpdates.add(
+          AvatarGenerationUpdate.fromJson(
+            jsonDecode(data) as Map<String, dynamic>,
+          ),
+        );
+      }),
+    );
     _es = es;
   }
 
@@ -101,5 +118,6 @@ class WebEventSourceStream implements MeshStreamSource {
     _elided.close();
     _runtimeHello.close();
     _runtimeStates.close();
+    _avatarUpdates.close();
   }
 }

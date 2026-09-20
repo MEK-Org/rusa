@@ -274,7 +274,9 @@ class DashboardStore {
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
-  final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(const []);
+  final _supportedVoices = BehaviorSubject<List<SupportedVoiceDto>>.seeded(
+    const [],
+  );
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
@@ -309,12 +311,15 @@ class DashboardStore {
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
 
-  /// Bumped on every successful avatar upload/generate  so
-  /// `ActorAvatar`/`AvatarLightbox` can cache-bust their image URL — both
-  /// Flutter's `ImageCache` and the browser's HTTP cache key on the exact
-  /// URL, and the avatar route otherwise serves the same
-  /// `/api/mesh/avatar/<id>.png` path forever.
+  /// Ticks whenever any actor's avatar state changes so `ActorAvatar` /
+  /// `AvatarLightbox` rebuild and read [avatarVersion] / [isAvatarGenerating].
+  /// Versions are per actor: an upload, a manual generate, or a lazy `ready`
+  /// frame only cache-busts that one image URL (both Flutter's `ImageCache`
+  /// and the browser key on the exact URL, and the avatar route otherwise
+  /// serves the same `/api/mesh/avatar/<id>.png` path forever).
   final _avatarEpoch = BehaviorSubject<int>.seeded(0);
+  final _avatarVersions = <String, int>{};
+  final _generatingAvatars = <String>{};
   final _focusedObligationId = BehaviorSubject<String?>.seeded(null);
   final _detailPanelIndex = BehaviorSubject<int>.seeded(0);
   final _obligationRefreshes = PublishSubject<String?>();
@@ -343,7 +348,8 @@ class DashboardStore {
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
-  ValueStream<List<SupportedVoiceDto>> get supportedVoices => _supportedVoices.stream;
+  ValueStream<List<SupportedVoiceDto>> get supportedVoices =>
+      _supportedVoices.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
@@ -367,6 +373,12 @@ class DashboardStore {
   ValueStream<String?> get error => _error.stream;
   ValueStream<bool> get walkieActive => _walkieActive.stream;
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
+
+  /// Cache-busting version for one actor's avatar URL (0 = never changed).
+  int avatarVersion(String id) => _avatarVersions[id] ?? 0;
+
+  /// True while the server reports a lazy first-display generation in flight.
+  bool isAvatarGenerating(String id) => _generatingAvatars.contains(id);
   ValueStream<String?> get focusedObligationId => _focusedObligationId.stream;
   ValueStream<int> get detailPanelIndex => _detailPanelIndex.stream;
 
@@ -391,11 +403,8 @@ class DashboardStore {
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
   /// Resolves an actor/thread/principal id to a display label.
-  String actorDisplay(String id) => actorDisplayLabel(
-        id,
-        (i) => actor(i)?.handle,
-        isHuman,
-      );
+  String actorDisplay(String id) =>
+      actorDisplayLabel(id, (i) => actor(i)?.handle, isHuman);
 
   /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
   /// dialog), which keep showing the raw id for an actor the mesh view does
@@ -430,6 +439,7 @@ class DashboardStore {
     _subs.add(_stream.elided.listen((_) => _onElided()));
     _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
     _subs.add(_stream.runtimeStates.listen(_onRuntimeState));
+    _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
@@ -1070,7 +1080,7 @@ class DashboardStore {
         base64Encode(picked.bytes),
         picked.contentType,
       );
-      _avatarEpoch.add(_avatarEpoch.value + 1);
+      _bumpAvatarVersion(id);
       _error.add(null);
     } catch (e) {
       _error.add('$e');
@@ -1085,11 +1095,36 @@ class DashboardStore {
   Future<void> generateAvatar(String id) async {
     try {
       await _api.generateAvatar(id);
-      _avatarEpoch.add(_avatarEpoch.value + 1);
+      _bumpAvatarVersion(id);
       _error.add(null);
     } catch (e) {
       _error.add('$e');
       rethrow;
+    }
+  }
+
+  void _bumpAvatarVersion(String id) {
+    _avatarVersions[id] = avatarVersion(id) + 1;
+    _tickAvatars();
+  }
+
+  void _tickAvatars() {
+    if (!_avatarEpoch.isClosed) _avatarEpoch.add(_avatarEpoch.value + 1);
+  }
+
+  /// Lazy generation lifecycle from the server. `generating` shows the ring;
+  /// `ready` re-requests that one image (the first request was a 404 that the
+  /// server answered immediately); `failed` settles on the fallback with no
+  /// client-side retry — a manual Generate remains the only way to try again.
+  void _onAvatarUpdate(AvatarGenerationUpdate update) {
+    switch (update.state) {
+      case AvatarGenerationState.generating:
+        if (_generatingAvatars.add(update.actorId)) _tickAvatars();
+      case AvatarGenerationState.ready:
+        _generatingAvatars.remove(update.actorId);
+        _bumpAvatarVersion(update.actorId);
+      case AvatarGenerationState.failed:
+        if (_generatingAvatars.remove(update.actorId)) _tickAvatars();
     }
   }
 
@@ -1269,9 +1304,11 @@ class DashboardStore {
         if (sel.length == 1) {
           final selectedId = sel.first;
           final userPrincipalId = _dashboardConfig.value?.userPrincipalId;
-          final isHumanSender = actorId == 'human:operator' ||
+          final isHumanSender =
+              actorId == 'human:operator' ||
               (userPrincipalId != null && actorId == userPrincipalId);
-          final isHumanRecipient = recipientId == 'human:operator' ||
+          final isHumanRecipient =
+              recipientId == 'human:operator' ||
               (userPrincipalId != null && recipientId == userPrincipalId);
           if ((actorId == selectedId && isHumanRecipient) ||
               (isHumanSender && recipientId == selectedId)) {
@@ -1400,6 +1437,12 @@ class DashboardStore {
         selectedObligation: clearsSelectedObligation
             ? null
             : existing.thread.selectedObligation,
+        selectedInboxItem: clearsSelectedObligation
+            ? null
+            : existing.thread.selectedInboxItem,
+        moreInboxItemsCount: clearsSelectedObligation
+            ? null
+            : existing.thread.moreInboxItemsCount,
       ),
       runState: delta.runState,
     );

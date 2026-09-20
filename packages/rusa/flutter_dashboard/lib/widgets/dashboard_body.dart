@@ -30,11 +30,13 @@ class DashboardBody extends StatefulWidget {
     this.understandingBuilder,
     this.reportsBuilder,
     this.onLogout,
+    this.onNavigation,
     this.profilePhotoUrl,
   });
 
   final DashboardStore store;
   final VoidCallback? onLogout;
+  final Future<void> Function()? onNavigation;
   final String? profilePhotoUrl;
 
   /// Builds the Integrated Understanding view shown when its nav item is active.
@@ -90,6 +92,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           _view,
           focusedObligationId: id,
           focusedActorId: widget.store.primary.valueOrNull,
+          onNavigation: widget.onNavigation,
         );
       }
     });
@@ -100,6 +103,7 @@ class _DashboardBodyState extends State<DashboardBody> {
           _view,
           focusedObligationId: widget.store.focusedObligationId.valueOrNull,
           focusedActorId: id,
+          onNavigation: widget.onNavigation,
         );
       }
     });
@@ -133,6 +137,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       view,
       focusedObligationId: widget.store.focusedObligationId.valueOrNull,
       focusedActorId: widget.store.primary.valueOrNull,
+      onNavigation: widget.onNavigation,
     );
   }
 

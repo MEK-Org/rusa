@@ -14,12 +14,14 @@ import 'status_dot.dart';
 /// the image codec sniffs the bytes). The image is masked to a circle with a
 /// subtle border.
 ///
-/// Availability is best-effort: an avatar is generated asynchronously on spawn,
-/// so it may not exist yet (404) on first sighting. While the image loads — or
-/// if it 404s / fails — a graceful silhouette placeholder shows instead, so the
-/// UI never blocks on avatar availability. The tree pairs this with the live
-/// status dot, so run-state is always visible even before the image resolves.
-/// Retired actors render muted.
+/// A missing avatar is an immediate 404 (the fallback silhouette) that also
+/// starts one server-side generation attempt for a live actor. The server
+/// reports that attempt over the SSE stream: while it is generating, the store
+/// shows an edge progress ring over the silhouette; on `ready` the store bumps
+/// this actor's URL version and the new image fades in; on `failed` the ring
+/// simply goes away — there is no client-side retry. The tree pairs this with
+/// the live status dot, so run-state is always visible. Retired actors render
+/// muted.
 class ActorAvatar extends StatelessWidget {
   const ActorAvatar({
     super.key,
@@ -36,8 +38,9 @@ class ActorAvatar extends StatelessWidget {
 
   /// Optional store . When present, the lightbox opened from this
   /// avatar offers an upload control (root excluded — it stays
-  /// config-driven via `rootActor.avatar`) and re-fetches past the browser's
-  /// URL-keyed image cache after a successful upload.
+  /// config-driven via `rootActor.avatar`), re-fetches past the browser's
+  /// URL-keyed image cache after a successful upload, and drives the
+  /// generating ring from the server's `avatar` SSE frames.
   final DashboardStore? store;
 
   @override
@@ -45,25 +48,46 @@ class ActorAvatar extends StatelessWidget {
     return StreamBuilder<int>(
       stream: store?.avatarEpoch,
       initialData: 0,
-      builder: (context, snapshot) {
+      builder: (context, _) {
         // Relative to the page origin (Uri.base) so the same build works on
         // localhost and behind `tailscale serve`, matching DashboardApi.
-        final epoch = snapshot.data ?? 0;
+        final version = store?.avatarVersion(id) ?? 0;
+        final generating = store?.isAvatarGenerating(id) ?? false;
         final url = Uri.base
-            .resolve('/api/mesh/avatar/$id.png${epoch > 0 ? '?v=$epoch' : ''}')
+            .resolve(
+              '/api/mesh/avatar/$id.png${version > 0 ? '?v=$version' : ''}',
+            )
             .toString();
 
         final image = Image.network(
           url,
+          // A new version (upload, manual generate, or lazy `ready`) must start
+          // from a clean image state rather than inherit the previous URL's
+          // error, so the replacement image fades in instead of snapping.
+          key: ValueKey(url),
           width: size,
           height: size,
           fit: BoxFit.cover,
           // Keep the last frame during a rebuild so the avatar never flickers
           // when the tree re-renders on SSE updates.
           gaplessPlayback: true,
-          loadingBuilder: (_, child, progress) =>
-              progress == null ? child : _placeholder(),
-          errorBuilder: (_, _, _) => _placeholder(),
+          frameBuilder: (_, child, frame, wasSynchronouslyLoaded) {
+            // An in-memory-cached image needs no transition. Otherwise the
+            // silhouette sits underneath and the decoded frame fades over it.
+            if (wasSynchronouslyLoaded) return child;
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                _avatarPlaceholder(id, size),
+                AnimatedOpacity(
+                  opacity: frame == null ? 0 : 1,
+                  duration: const Duration(milliseconds: 200),
+                  child: child,
+                ),
+              ],
+            );
+          },
+          errorBuilder: (_, _, _) => _avatarPlaceholder(id, size),
         );
 
         // A true circle, with no flat tangent edges. A circular `BoxDecoration`
@@ -74,7 +98,27 @@ class ActorAvatar extends StatelessWidget {
         // it edge-to-edge. The border is a separate circular ring painted over
         // the masked image's rim.
         Widget avatar = ClipOval(
-          child: SizedBox(width: size, height: size, child: image),
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                image,
+                // The ring means exactly one thing: the server is generating
+                // this avatar right now. Ordinary loads of a cached image
+                // never show it.
+                if (generating)
+                  Padding(
+                    padding: const EdgeInsets.all(1.5),
+                    child: CircularProgressIndicator(
+                      strokeWidth: size >= 20 ? 2 : 1,
+                      semanticsLabel: 'Generating avatar',
+                    ),
+                  ),
+              ],
+            ),
+          ),
         );
         if (retired) avatar = Opacity(opacity: 0.55, child: avatar);
 
@@ -111,18 +155,19 @@ class ActorAvatar extends StatelessWidget {
       },
     );
   }
-
-  /// Neutral silhouette shown until the image resolves (or if it never does).
-  Widget _placeholder() => Container(
-    color: MeshColors.bgTertiary,
-    alignment: Alignment.center,
-    child: Icon(
-      id == 'human:operator' ? Icons.person : Icons.pets,
-      size: size * 0.55,
-      color: MeshColors.textMuted,
-    ),
-  );
 }
+
+/// Neutral silhouette shown until the image resolves, or after its one lazy
+/// request fails. The error path deliberately has no retry mechanism.
+Widget _avatarPlaceholder(String id, double size) => Container(
+  color: MeshColors.bgTertiary,
+  alignment: Alignment.center,
+  child: Icon(
+    id == 'human:operator' ? Icons.person : Icons.pets,
+    size: size * 0.55,
+    color: MeshColors.textMuted,
+  ),
+);
 
 /// The hierarchy's actor identity marker: a circular avatar with its live run
 /// state overlaid at the lower-right corner. Overview rows use this same widget
@@ -235,27 +280,28 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                     Flexible(
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8.0),
-                      child: StreamBuilder<int>(
-                        stream: widget.store?.avatarEpoch,
-                        initialData: 0,
-                        builder: (context, snapshot) {
-                          final epoch = snapshot.data ?? 0;
-                          final url = Uri.base
-                              .resolve(
-                                '/api/mesh/avatar/${widget.id}.png${epoch > 0 ? '?v=$epoch' : ''}',
-                              )
-                              .toString();
-                          return Image.network(
-                            url,
-                            fit: BoxFit.contain,
-                            gaplessPlayback: true,
-                            loadingBuilder: (_, child, progress) =>
-                                progress == null ? child : _placeholder(),
-                            errorBuilder: (_, _, _) => _placeholder(),
-                          );
-                        },
+                        child: StreamBuilder<int>(
+                          stream: widget.store?.avatarEpoch,
+                          initialData: 0,
+                          builder: (context, _) {
+                            final version =
+                                widget.store?.avatarVersion(widget.id) ?? 0;
+                            final url = Uri.base
+                                .resolve(
+                                  '/api/mesh/avatar/${widget.id}.png${version > 0 ? '?v=$version' : ''}',
+                                )
+                                .toString();
+                            return Image.network(
+                              url,
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                              loadingBuilder: (_, child, progress) =>
+                                  progress == null ? child : _placeholder(),
+                              errorBuilder: (_, _, _) => _placeholder(),
+                            );
+                          },
+                        ),
                       ),
-                    ),
                     ),
                     if (_canEditAvatar) ...[
                       const SizedBox(height: 16),
@@ -263,12 +309,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _upload,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _upload,
                             icon: _uploading
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.upload, size: 18),
                             label: Text(
@@ -281,12 +331,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                           ),
                           const SizedBox(width: 8),
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _generate,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _generate,
                             icon: _generating
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.auto_awesome, size: 18),
                             label: Text(
