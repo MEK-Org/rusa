@@ -35,12 +35,9 @@ export class ProviderStderrCapture {
   }
 }
 
-/**
- * Provider stderr is untrusted process output. Keep useful error text while
- * removing common credential forms before it becomes durable actor history.
- */
-export function sanitizeProviderStderr(stderr: string): string {
-  return sanitizeFailureText(stderr)
+/** Remove common credential forms while keeping the surrounding error text. */
+export function redactProviderCredentials(text: string): string {
+  return text
     .replace(/\b(authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+/gi, "$1[redacted]")
     .replace(
       /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|password)\s*[=:]\s*)[^\s,;]+/gi,
@@ -53,15 +50,32 @@ export function sanitizeProviderStderr(stderr: string): string {
 }
 
 /**
+ * Provider stderr is untrusted process output. Keep useful error text while
+ * removing prompt payloads and credential forms before it becomes durable
+ * actor history.
+ */
+export function sanitizeProviderStderr(stderr: string): string {
+  return redactProviderCredentials(sanitizeFailureText(stderr));
+}
+
+/**
  * Successful output remains exactly provider-owned. Failed subprocess exits
  * gain a clearly delimited, sanitized diagnostic in the existing bounded run
  * output field, avoiding a second persistence schema.
+ *
+ * Providers fold stderr into their raw output when no response text was
+ * parsed, so the failed output can already carry the same credential the
+ * appended block redacts. The whole failed output is therefore
+ * credential-redacted too; only the failed path is touched, so the successful
+ * run's output stays byte-for-byte what the provider returned.
  */
 export function appendFailedProviderStderr(result: RunResult, stderr: string): RunResult {
-  if (result.success || result.exitCode === 0 || !stderr) return result;
+  if (result.success || result.exitCode === 0) return result;
+  const output = redactProviderCredentials(result.output);
+  if (!stderr) return { ...result, output };
   return {
     ...result,
-    output: [result.output, "--- provider stderr (sanitized) ---", stderr]
+    output: [output, "--- provider stderr (sanitized) ---", stderr]
       .filter((part) => part.length > 0)
       .join("\n\n"),
   };

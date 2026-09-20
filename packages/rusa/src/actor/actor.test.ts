@@ -134,11 +134,13 @@ describe("Actor", () => {
       name: "kimi",
       providerName: "kimi",
       run: async (opts) => {
-        opts.onStderr?.(
+        const stderr =
           `provider.auth_error: 403 You've reached your 5-hour usage limit\n` +
-            `Authorization: Bearer synthetic-provider-token\n${"x".repeat(20_000)}`
-        );
-        return { success: false, output: "partial response", exitCode: 1 };
+          `Authorization: Bearer synthetic-provider-token\n${"x".repeat(20_000)}`;
+        opts.onStderr?.(stderr);
+        // Providers fold stderr into their raw output when no response text was
+        // parsed, so the failed output itself already carries the credential.
+        return { success: false, output: `partial response\n${stderr}`, exitCode: 1 };
       },
     };
 
@@ -151,9 +153,11 @@ describe("Actor", () => {
     await flush();
 
     const failedOutput = runs.listRecentCompleted("a1", 1)[0]?.output ?? "";
+    expect(failedOutput).toContain("partial response");
     expect(failedOutput).toContain("provider.auth_error: 403");
     expect(failedOutput).toContain("provider stderr truncated");
     expect(failedOutput).not.toContain("synthetic-provider-token");
+    expect(failedOutput).toContain("Authorization: Bearer [redacted]");
 
     const success: CodingProvider = {
       name: "kimi",

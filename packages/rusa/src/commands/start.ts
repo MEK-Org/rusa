@@ -2586,6 +2586,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
         // Which declared candidate actually ran, for the failure-notice label.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        // `lastSelected` is fixed at `onStart`; a fallback attempt can change
+        // the provider mid-run, and the 403 report below must name the one
+        // that actually produced the terminal result.
         let lastAttemptProvider = lastSelected.provider;
         ctx.lifecycle.add({
           onStart: (event) => {
@@ -2662,8 +2665,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // Kimi's authenticated CLI response is provider ground truth. A
             // rendered quota scrape may lag it, so publish the explicit
             // five-hour exhaustion before another local admission can use the
-            // stale lane. The coordinator retains the canonical observation;
-            // a later successful scrape is its recovery evidence.
+            // stale lane. The coordinator holds the observation until the
+            // window's reset passes or the panel shows the next window.
+            //
+            // Known gap (#582): this reads the terminal result only. When a
+            // fallback candidate succeeds after a Kimi attempt hit the 403,
+            // the run is a success and the 403 is not published here.
             if (
               lastAttemptProvider === "kimi" &&
               !result.success &&

@@ -126,7 +126,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     }
   });
 
-  it("accepts a host-reported Kimi five-hour 403 as authoritative until a later successful scrape recovers", async () => {
+  it("holds a host-reported Kimi five-hour 403 against a lagging scrape until the panel's window rolls over", async () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -161,15 +161,33 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       exhaustedUntil: resetAtIso,
     });
 
-    const recovered = {
+    // The same panel still reporting capacity for the same window is the
+    // lagging reading the live 403 disproved; it must not re-admit Kimi.
+    const lagging = {
       ...available,
       scrapedAt: "2030-01-01T00:02:00.000Z",
       limits: [{ ...available.limits[0], percentLeft: 80 }],
     };
+    const laggingId = store.recordRaw({
+      provider: "kimi",
+      scrapedAt: lagging.scrapedAt,
+      rawOutput: "lagging panel",
+    });
+    store.recordParsed(laggingId, lagging, lagging);
+    expect(await client.getThrottle("kimi")).toMatchObject({
+      expired: true,
+      exhaustedUntil: resetAtIso,
+    });
+
+    const recovered = {
+      ...available,
+      scrapedAt: "2030-01-01T00:07:00.000Z",
+      limits: [{ ...available.limits[0], resetAtIso: "2030-01-01T10:00:00.000Z" }],
+    };
     const recoveryId = store.recordRaw({
       provider: "kimi",
       scrapedAt: recovered.scrapedAt,
-      rawOutput: "recovered panel",
+      rawOutput: "next-window panel",
     });
     store.recordParsed(recoveryId, recovered, recovered);
 

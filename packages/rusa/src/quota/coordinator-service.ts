@@ -265,6 +265,12 @@ export class QuotaCoordinatorService {
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
 
+    // The one POST on this socket, and deliberately outside `/v1/` so the
+    // GET-only public contract below (§5.2 / Criterion 7) stays intact. The
+    // host cannot write this observation itself: the coordinator daemon is the
+    // sole writer of the quota database and owns the controller advance and
+    // publish that must follow the write, so the host reports the live 403
+    // and the daemon records it (#565).
     if (pathname === KIMI_FIVE_HOUR_LIMIT_REPORT_PATH) {
       await this.recordKimiFiveHourLimit(req, res, serviceInfo);
       return;

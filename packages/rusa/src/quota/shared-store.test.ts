@@ -10,6 +10,7 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
+  KIMI_LIVE_FIVE_HOUR_403_LABEL,
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_MAX_STEP_SECONDS,
@@ -56,14 +57,20 @@ function recordObservation(
 }
 
 describe("SharedQuotaStore canonical observations", () => {
-  it("lets an authoritative Kimi five-hour 403 override a contradictory scrape, then accepts a later recovery", () => {
+  function newestKimiFiveHour(store: SharedQuotaStore, sinceIso: string) {
+    return store
+      .listCanonicalSince("kimi", sinceIso)
+      .filter((row) => row.kind === "five_hour")
+      .at(-1);
+  }
+
+  it("holds an authoritative Kimi five-hour 403 against lagging panel readings until the panel's window rolls over", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-kimi-live-403-"));
     roots.push(root);
     const store = new SharedQuotaStore(join(root, "shared.db"));
     try {
       const scrapedAt = "2030-01-01T00:00:00.000Z";
       const exhaustedAt = "2030-01-01T00:01:00.000Z";
-      const recoveredAt = "2030-01-01T00:02:00.000Z";
       const resetAtIso = "2030-01-01T05:00:00.000Z";
 
       recordObservation(store, "kimi", scrapedAt, 100, resetAtIso, "five_hour", "5-hour");
@@ -77,16 +84,149 @@ describe("SharedQuotaStore canonical observations", () => {
         expect.objectContaining({ kind: "five_hour", percentLeft: 0 }),
       ]);
 
-      // A later successful provider reading is authoritative recovery, even
-      // when it lands in the same five-minute storage slot as the failure.
-      recordObservation(store, "kimi", recoveredAt, 75, resetAtIso, "five_hour", "5-hour");
+      // The same lagging panel one minute later (same storage slot), then in
+      // the next slot, then with sub-tolerance reset jitter: none of these is
+      // recovery evidence because none shows the provider's window rolling over.
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:02:00.000Z",
+        75,
+        resetAtIso,
+        "five_hour",
+        "5-hour"
+      );
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:07:00.000Z",
+        75,
+        resetAtIso,
+        "five_hour",
+        "5-hour"
+      );
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:12:00.000Z",
+        80,
+        "2030-01-01T05:00:30.000Z",
+        "five_hour",
+        "5-hour"
+      );
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: true,
+        exhaustedUntil: resetAtIso,
+      });
+      expect(newestKimiFiveHour(store, scrapedAt)).toMatchObject({
+        label: KIMI_LIVE_FIVE_HOUR_403_LABEL,
+        percentLeft: 0,
+        resetAtIso,
+      });
+
+      // A panel whose reset has advanced into the next window is the
+      // provider's own clock reporting recovery.
+      const nextWindowResetAtIso = "2030-01-01T10:00:00.000Z";
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:17:00.000Z",
+        100,
+        nextWindowResetAtIso,
+        "five_hour",
+        "5-hour"
+      );
       expect(store.getProviderThrottle("kimi")).toMatchObject({
         expired: false,
         exhaustedUntil: null,
       });
-      expect(store.getLatestSnapshot("kimi")?.limits).toEqual([
-        expect.objectContaining({ kind: "five_hour", percentLeft: 75 }),
-      ]);
+      expect(newestKimiFiveHour(store, scrapedAt)).toMatchObject({
+        label: "5-hour",
+        percentLeft: 100,
+        resetAtIso: nextWindowResetAtIso,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("clears an authoritative Kimi five-hour 403 once its recorded reset passes", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-kimi-live-403-reset-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    vi.useFakeTimers({ now: Date.parse("2030-01-01T00:00:30.000Z") });
+    try {
+      const resetAtIso = "2030-01-01T05:00:00.000Z";
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:00:00.000Z",
+        100,
+        resetAtIso,
+        "five_hour",
+        "5-hour"
+      );
+      store.recordAuthoritativeKimiFiveHourLimit("2030-01-01T00:01:00.000Z");
+      expect(store.getProviderThrottle("kimi")).toMatchObject({ expired: true });
+
+      vi.setSystemTime(Date.parse("2030-01-01T05:00:01.000Z"));
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: false,
+        exhaustedUntil: null,
+      });
+
+      // The first panel reading after the reset is ordinary evidence again,
+      // even though it lands in the same five-minute slot as the reset.
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T05:02:00.000Z",
+        100,
+        "2030-01-01T10:00:00.000Z",
+        "five_hour",
+        "5-hour"
+      );
+      expect(newestKimiFiveHour(store, "2030-01-01T00:00:00.000Z")).toMatchObject({
+        label: "5-hour",
+        percentLeft: 100,
+      });
+    } finally {
+      vi.useRealTimers();
+      store.close();
+    }
+  });
+
+  it("trusts a later panel's earlier reset clock to shorten a cold-start Kimi 403 lockout without restoring capacity", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-kimi-live-403-cold-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const exhaustedAt = "2030-01-01T00:01:00.000Z";
+      store.recordAuthoritativeKimiFiveHourLimit(exhaustedAt);
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: true,
+        exhaustedUntil: "2030-01-01T05:01:00.000Z",
+      });
+
+      const panelResetAtIso = "2030-01-01T02:00:00.000Z";
+      recordObservation(
+        store,
+        "kimi",
+        "2030-01-01T00:06:00.000Z",
+        60,
+        panelResetAtIso,
+        "five_hour",
+        "5-hour"
+      );
+      expect(store.getProviderThrottle("kimi")).toMatchObject({
+        expired: true,
+        exhaustedUntil: panelResetAtIso,
+      });
+      expect(newestKimiFiveHour(store, exhaustedAt)).toMatchObject({
+        label: KIMI_LIVE_FIVE_HOUR_403_LABEL,
+        percentLeft: 0,
+        resetAtIso: panelResetAtIso,
+      });
     } finally {
       store.close();
     }
