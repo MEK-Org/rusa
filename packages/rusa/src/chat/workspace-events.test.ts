@@ -6,6 +6,14 @@ const TOPIC = "projects/p/topics/chat-events";
 const CHAT_TARGET = "//chat.googleapis.com/spaces/-";
 const MESSAGE_CREATED = "google.workspace.chat.message.v1.created";
 
+const SECOND = 1_000;
+const MINUTE = 60 * SECOND;
+const HOUR = 60 * MINUTE;
+/** The subscriber's own constants, restated so a test reads as wall-clock. */
+const TTL_MS = 4 * HOUR;
+const FIRST_RETRY_MS = 5 * SECOND;
+const MAX_RETRY_MS = 5 * MINUTE;
+
 interface FakeSub {
   name: string;
   state: string;
@@ -31,6 +39,10 @@ function jsonResponse(status: number, body?: unknown): Response {
 class FakeWeApi {
   subs: FakeSub[];
   calls: Call[] = [];
+  /** When set, PATCH (renew) answers with this status instead of succeeding. */
+  renewStatus: number | null = null;
+  /** When set, POST /subscriptions (create) answers with this status instead. */
+  createStatus: number | null = null;
   private seq = 0;
 
   constructor(initial: FakeSub[] = []) {
@@ -50,6 +62,7 @@ class FakeWeApi {
       return jsonResponse(200, { subscriptions: this.subs });
     }
     if (method === "POST" && path === "/subscriptions") {
+      if (this.createStatus !== null) return jsonResponse(this.createStatus, { error: "create" });
       this.subs.push({
         name: `subscriptions/new-${this.seq++}`,
         state: "ACTIVE",
@@ -60,8 +73,8 @@ class FakeWeApi {
     const name = path.replace(/^\//, "").replace(/:reactivate$/, "");
     const sub = this.subs.find((s) => s.name === name);
     if (method === "PATCH") {
+      if (this.renewStatus !== null) return jsonResponse(this.renewStatus, { error: "renew" });
       if (!sub) return jsonResponse(404, { error: "not found" });
-      if (sub.state === "EXPIRED") return jsonResponse(400, { error: "subscription expired" });
       return jsonResponse(200, { name: "operations/patch" });
     }
     if (method === "POST" && path.endsWith(":reactivate")) {
@@ -75,20 +88,40 @@ class FakeWeApi {
     return jsonResponse(404, { error: "not found" });
   };
 
-  countWhere(pred: (c: Call) => boolean): number {
-    return this.calls.filter(pred).length;
+  count(method: string, path?: string): number {
+    return this.calls.filter((c) => c.method === method && (!path || c.path === path)).length;
   }
+}
+
+function activeSub(name: string): FakeSub {
+  return { name, state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } };
+}
+
+interface LogRecord {
+  level: string;
+  event: string;
+  fields?: Record<string, unknown>;
+}
+
+function captureLogger(): { logger: Logger; records: LogRecord[] } {
+  const records: LogRecord[] = [];
+  const at = (level: string) => (event: string, fields?: Record<string, unknown>) => {
+    records.push({ level, event, fields });
+  };
+  const logger = {
+    debug: at("debug"),
+    info: at("info"),
+    warn: at("warn"),
+    error: at("error"),
+    child: () => logger,
+  } as unknown as Logger;
+  return { logger, records };
 }
 
 function makeSubscriber(
   api: FakeWeApi,
   overrides: Partial<{
     renewIntervalMs: number;
-    retryBackoffMs: number;
-    maxRetryBackoffMs: number;
-    expectedTtlSeconds: number;
-    alertCooldownMs: number;
-    now: () => number;
     logger: Logger;
     onLapseAlert: (alert: WorkspaceEventsLapseAlert) => Promise<void> | void;
   }> = {}
@@ -97,14 +130,7 @@ function makeSubscriber(
     topic: TOPIC,
     getToken: async () => "fake-token",
     fetchImpl: api.fetch,
-    renewIntervalMs: overrides.renewIntervalMs,
-    retryBackoffMs: overrides.retryBackoffMs,
-    maxRetryBackoffMs: overrides.maxRetryBackoffMs,
-    expectedTtlSeconds: overrides.expectedTtlSeconds,
-    alertCooldownMs: overrides.alertCooldownMs,
-    now: overrides.now,
-    logger: overrides.logger,
-    onLapseAlert: overrides.onLapseAlert,
+    ...overrides,
   });
 }
 
@@ -113,14 +139,16 @@ describe("WorkspaceEventsSubscriber", () => {
 
   it("creates a subscription when none exists", async () => {
     const api = new FakeWeApi([]);
-    const sub = makeSubscriber(api);
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
     await sub.start();
     await sub.close();
 
-    expect(api.countWhere((c) => c.method === "POST" && c.path === "/subscriptions")).toBe(1);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
     expect(api.subs).toHaveLength(1);
     expect(api.subs[0]?.notificationEndpoint.pubsubTopic).toBe(TOPIC);
     expect(sub.currentSubscription).toBe(api.subs[0]?.name);
+    expect(records.map((r) => r.event)).toEqual(["chat_subscription_created"]);
 
     // The created subscription carries the fields the pull source depends on.
     const created = api.calls.find((c) => c.method === "POST" && c.path === "/subscriptions");
@@ -134,19 +162,13 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("renews (does not recreate) an existing active subscription", async () => {
-    const api = new FakeWeApi([
-      {
-        name: "subscriptions/existing",
-        state: "ACTIVE",
-        notificationEndpoint: { pubsubTopic: TOPIC },
-      },
-    ]);
+    const api = new FakeWeApi([activeSub("subscriptions/existing")]);
     const sub = makeSubscriber(api);
     await sub.start();
     await sub.close();
 
-    expect(api.countWhere((c) => c.method === "POST" && c.path === "/subscriptions")).toBe(0);
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(1);
+    expect(api.count("POST", "/subscriptions")).toBe(0);
+    expect(api.count("PATCH")).toBe(1);
     const patch = api.calls.find((c) => c.method === "PATCH");
     expect(patch?.path).toContain("subscriptions/existing");
     expect(patch?.body).toEqual({ ttl: "14400s" });
@@ -154,19 +176,13 @@ describe("WorkspaceEventsSubscriber", () => {
   });
 
   it("reactivates a suspended subscription before renewing", async () => {
-    const api = new FakeWeApi([
-      {
-        name: "subscriptions/susp",
-        state: "SUSPENDED",
-        notificationEndpoint: { pubsubTopic: TOPIC },
-      },
-    ]);
+    const api = new FakeWeApi([{ ...activeSub("subscriptions/susp"), state: "SUSPENDED" }]);
     const sub = makeSubscriber(api);
     await sub.start();
     await sub.close();
 
-    expect(api.countWhere((c) => c.path.endsWith(":reactivate"))).toBe(1);
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(1);
+    expect(api.calls.filter((c) => c.path.endsWith(":reactivate"))).toHaveLength(1);
+    expect(api.count("PATCH")).toBe(1);
   });
 
   it("ignores subscriptions pointed at a different topic", async () => {
@@ -182,255 +198,307 @@ describe("WorkspaceEventsSubscriber", () => {
     await sub.close();
 
     // No match for our topic → it creates one rather than adopting the foreign one.
-    expect(api.countWhere((c) => c.method === "POST" && c.path === "/subscriptions")).toBe(1);
-    expect(api.countWhere((c) => c.method === "DELETE")).toBe(0);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(api.count("DELETE")).toBe(0);
   });
 
   it("prunes duplicate subscriptions for our topic", async () => {
     const api = new FakeWeApi([
-      { name: "subscriptions/a", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
-      { name: "subscriptions/b", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
-      { name: "subscriptions/c", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
+      activeSub("subscriptions/a"),
+      activeSub("subscriptions/b"),
+      activeSub("subscriptions/c"),
     ]);
-    const sub = makeSubscriber(api);
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
     await sub.start();
     await sub.close();
 
-    expect(api.countWhere((c) => c.method === "DELETE")).toBe(2);
+    expect(api.count("DELETE")).toBe(2);
     expect(api.subs.map((s) => s.name)).toEqual(["subscriptions/a"]);
+    expect(sub.currentSubscription).toBe("subscriptions/a");
+    expect(records.filter((r) => r.event === "chat_subscription_pruned")).toEqual([
+      {
+        level: "info",
+        event: "chat_subscription_pruned",
+        fields: { topic: TOPIC, subscriptionName: "subscriptions/b", reason: "duplicate" },
+      },
+      {
+        level: "info",
+        event: "chat_subscription_pruned",
+        fields: { topic: TOPIC, subscriptionName: "subscriptions/c", reason: "duplicate" },
+      },
+    ]);
+  });
+
+  it("logs a failed prune as a failure, not as pruned", async () => {
+    const api = new FakeWeApi([activeSub("subscriptions/a"), activeSub("subscriptions/b")]);
+    const inner = api.fetch;
+    api.fetch = async (url, init) =>
+      init?.method === "DELETE" ? jsonResponse(500, { error: "boom" }) : inner(url, init);
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+    await sub.start();
+    await sub.close();
+
+    expect(records.map((r) => r.event)).toEqual([
+      "chat_subscription_prune_failed",
+      "chat_subscription_renewed",
+    ]);
     expect(sub.currentSubscription).toBe("subscriptions/a");
   });
 
   it("renews again when the renewal timer fires", async () => {
     vi.useFakeTimers();
-    const api = new FakeWeApi([
-      { name: "subscriptions/x", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
-    ]);
+    const api = new FakeWeApi([activeSub("subscriptions/x")]);
     const sub = makeSubscriber(api, { renewIntervalMs: 1000 });
     await sub.start();
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(1);
+    expect(api.count("PATCH")).toBe(1);
 
     await vi.advanceTimersByTimeAsync(1000);
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(2);
+    expect(api.count("PATCH")).toBe(2);
 
     await vi.advanceTimersByTimeAsync(1000);
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(3);
+    expect(api.count("PATCH")).toBe(3);
 
     await sub.close();
     await vi.advanceTimersByTimeAsync(5000);
-    expect(api.countWhere((c) => c.method === "PATCH")).toBe(3); // no more after close
+    expect(api.count("PATCH")).toBe(3); // no more after close
   });
 
-  it("surfaces an HTTP error from start()", async () => {
-    const api = new FakeWeApi([]);
-    api.fetch = async () => jsonResponse(403, { error: "forbidden" });
-    const sub = makeSubscriber(api);
-    await expect(sub.start()).rejects.toThrow(/HTTP 403/);
-    await sub.close();
-  });
-
-  it("retries a boot-time create failure and recovers without a restart", async () => {
+  it("resolves start() after a failed first pass and retries until create succeeds", async () => {
     vi.useFakeTimers();
     const api = new FakeWeApi([]);
-    let failuresRemaining = 1;
-    let postAttempts = 0;
-    const fetch = api.fetch;
-    api.fetch = async (url, init) => {
-      if (failuresRemaining > 0 && init?.method === "POST") {
-        failuresRemaining--;
-        postAttempts++;
-        return jsonResponse(503, { error: "unavailable" });
-      }
-      if (init?.method === "POST") postAttempts++;
-      return fetch(url, init);
-    };
-    const sub = makeSubscriber(api, { retryBackoffMs: 100 });
+    api.createStatus = 503;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
 
-    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
+    await sub.start();
     expect(sub.currentSubscription).toBeNull();
-    await vi.advanceTimersByTimeAsync(100);
-
-    expect(sub.currentSubscription).toBe("subscriptions/new-0");
-    expect(postAttempts).toBe(2);
-    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
-    await sub.close();
-  });
-
-  it("retries a boot-time renew failure with bounded exponential backoff", async () => {
-    vi.useFakeTimers();
-    const api = new FakeWeApi([
+    expect(records).toEqual([
       {
-        name: "subscriptions/existing",
-        state: "ACTIVE",
-        notificationEndpoint: { pubsubTopic: TOPIC },
+        level: "warn",
+        event: "chat_subscription_boot_failed",
+        fields: expect.objectContaining({ topic: TOPIC, retryInMs: FIRST_RETRY_MS }),
       },
     ]);
-    let failuresRemaining = 2;
-    let patchAttempts = 0;
-    const fetch = api.fetch;
-    api.fetch = async (url, init) => {
-      if (failuresRemaining > 0 && init?.method === "PATCH") {
-        failuresRemaining--;
-        patchAttempts++;
-        return jsonResponse(503, { error: "unavailable" });
-      }
-      if (init?.method === "PATCH") patchAttempts++;
-      return fetch(url, init);
-    };
-    const retryDelays: number[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: () => {},
-      warn: (event: string, fields?: Record<string, unknown>) => {
-        if (event.includes("failed")) retryDelays.push(fields?.retryInMs as number);
-      },
-      error: () => {},
-      child: () => logger,
-    };
-    const sub = makeSubscriber(api, {
-      retryBackoffMs: 100,
-      maxRetryBackoffMs: 200,
-      logger,
+    expect((records[0]?.fields?.err as Error).message).toMatch(/HTTP 503/);
+
+    // Still failing at the first retry; the second retry waits twice as long.
+    await vi.advanceTimersByTimeAsync(FIRST_RETRY_MS);
+    expect(api.count("POST", "/subscriptions")).toBe(2);
+    expect(records.at(-1)).toMatchObject({
+      event: "chat_subscription_retry_failed",
+      fields: { retryInMs: 2 * FIRST_RETRY_MS },
     });
 
-    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
-    await vi.advanceTimersByTimeAsync(100);
-    await vi.advanceTimersByTimeAsync(200);
+    api.createStatus = null;
+    await vi.advanceTimersByTimeAsync(2 * FIRST_RETRY_MS);
+    expect(sub.currentSubscription).toBe("subscriptions/new-0");
+    expect(api.count("POST", "/subscriptions")).toBe(3);
+    expect(records.at(-1)?.event).toBe("chat_subscription_created");
+    await sub.close();
+  });
 
+  it("backs off exponentially to a ceiling and starts over after a success", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([activeSub("subscriptions/existing")]);
+    api.renewStatus = 503;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
+    const retryDelays = () =>
+      records.filter((r) => r.event.endsWith("_failed")).map((r) => r.fields?.retryInMs as number);
+
+    await sub.start();
+    for (const delay of [5, 10, 20, 40, 80, 160, 300, 300].map((s) => s * SECOND)) {
+      expect(retryDelays().at(-1)).toBe(delay);
+      await vi.advanceTimersByTimeAsync(delay);
+    }
+    expect(retryDelays().at(-1)).toBe(MAX_RETRY_MS);
     expect(sub.currentSubscription).toBe("subscriptions/existing");
-    expect(patchAttempts).toBe(3);
-    expect(retryDelays).toEqual([100, 200]);
+
+    // Recovery: the next retry renews, and the loop returns to the renewal cadence.
+    api.renewStatus = null;
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
+    expect(records.at(-1)?.event).toBe("chat_subscription_renewed");
+    const patchesAfterRecovery = api.count("PATCH");
+    await vi.advanceTimersByTimeAsync(TTL_MS / 2 - SECOND);
+    expect(api.count("PATCH")).toBe(patchesAfterRecovery);
+
+    // A later failure starts the backoff from the beginning again.
+    api.renewStatus = 503;
+    await vi.advanceTimersByTimeAsync(SECOND);
+    expect(records.at(-1)).toMatchObject({
+      event: "chat_subscription_retry_failed",
+      fields: { retryInMs: FIRST_RETRY_MS },
+    });
     await sub.close();
   });
 
   it("recreates a missing subscription on a later renewal tick", async () => {
     vi.useFakeTimers();
-    const api = new FakeWeApi([
-      { name: "subscriptions/old", state: "ACTIVE", notificationEndpoint: { pubsubTopic: TOPIC } },
-    ]);
-    const sub = makeSubscriber(api, { renewIntervalMs: 100 });
+    const api = new FakeWeApi([activeSub("subscriptions/old")]);
+    const sub = makeSubscriber(api);
     await sub.start();
     api.subs = [];
 
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(TTL_MS / 2);
 
     expect(sub.currentSubscription).toBe("subscriptions/new-0");
-    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
     await sub.close();
   });
 
-  it("recreates an expired subscription instead of attempting to renew it", async () => {
+  it("prunes an expired subscription and creates a fresh one instead of renewing it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.parse("2026-09-19T12:00:00.000Z"));
     const api = new FakeWeApi([
-      {
-        name: "subscriptions/expired",
-        state: "ACTIVE",
-        expireTime: "2026-09-19T10:00:00.000Z",
-        notificationEndpoint: { pubsubTopic: TOPIC },
-      },
+      { ...activeSub("subscriptions/expired"), expireTime: "2026-09-19T10:00:00.000Z" },
     ]);
-    const sub = makeSubscriber(api, { now: () => Date.parse("2026-09-19T12:00:00.000Z") });
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
 
     await sub.start();
 
     expect(sub.currentSubscription).toBe("subscriptions/new-0");
-    expect(api.countWhere((call) => call.method === "PATCH")).toBe(0);
-    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    expect(api.count("PATCH")).toBe(0);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(api.subs.map((s) => s.name)).toEqual(["subscriptions/new-0"]);
+    expect(records[0]).toMatchObject({
+      event: "chat_subscription_pruned",
+      fields: { subscriptionName: "subscriptions/expired", reason: "lapsed" },
+    });
     await sub.close();
   });
 
   it("recreates when renewal reports that the subscription is missing", async () => {
-    const api = new FakeWeApi([
-      {
-        name: "subscriptions/missing",
-        state: "ACTIVE",
-        notificationEndpoint: { pubsubTopic: TOPIC },
-      },
-    ]);
-    const fetch = api.fetch;
-    api.fetch = async (url, init) =>
-      init?.method === "PATCH" ? jsonResponse(404, { error: "not found" }) : fetch(url, init);
-    const sub = makeSubscriber(api);
+    const api = new FakeWeApi([activeSub("subscriptions/missing")]);
+    api.renewStatus = 404;
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger });
 
     await sub.start();
 
     expect(sub.currentSubscription).toBe("subscriptions/new-0");
-    expect(api.countWhere((call) => call.method === "POST")).toBe(1);
+    expect(api.count("POST", "/subscriptions")).toBe(1);
+    expect(records.map((r) => r.event)).toEqual([
+      "chat_subscription_renew_missing_recreating",
+      "chat_subscription_recreated",
+    ]);
     await sub.close();
   });
 
-  it("alerts once per cooldown when no active subscription persists past its TTL", async () => {
+  it("alerts once per hour after a TTL without a confirmed renewal, even while the subscription stays listed", async () => {
     vi.useFakeTimers();
-    let clock = 0;
     const alerts: WorkspaceEventsLapseAlert[] = [];
-    const api = new FakeWeApi([]);
-    api.fetch = async () => jsonResponse(503, { error: "unavailable" });
+    // The subscription keeps appearing in list() but every renewal fails with a
+    // shape the subscriber does not recognise as "gone": only a confirmed
+    // renewal may count as activity, or this lapse would never be reported.
+    const api = new FakeWeApi([activeSub("subscriptions/stuck")]);
+    api.renewStatus = 500;
+    const { logger, records } = captureLogger();
     const sub = makeSubscriber(api, {
-      retryBackoffMs: 1000,
-      maxRetryBackoffMs: 4000,
-      expectedTtlSeconds: 10,
-      alertCooldownMs: 5000,
-      now: () => clock,
+      logger,
       onLapseAlert: (alert) => {
         alerts.push(alert);
       },
     });
+    await sub.start();
 
-    await expect(sub.start()).rejects.toThrow(/HTTP 503/);
-    clock = 11_000;
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(TTL_MS);
+    expect(alerts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatchObject({ topic: TOPIC, subscriptionName: null, elapsedSeconds: 11 });
+    expect(alerts[0]).toMatchObject({
+      topic: TOPIC,
+      subscriptionName: "subscriptions/stuck",
+      expectedTtlSeconds: 14400,
+    });
+    expect(alerts[0]?.elapsedSeconds).toBeGreaterThanOrEqual(14400);
+    expect(alerts[0]?.message).toContain("subscriptions/stuck");
+    expect(records.filter((r) => r.event === "chat_subscription_lapsed")).toHaveLength(1);
 
-    clock = 12_000;
-    await vi.advanceTimersByTimeAsync(2000);
+    // Bounded: the retries keep going, the alert does not repeat inside the hour.
+    await vi.advanceTimersByTimeAsync(HOUR - MAX_RETRY_MS);
     expect(alerts).toHaveLength(1);
-
-    clock = 17_000;
-    await vi.advanceTimersByTimeAsync(4000);
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
     expect(alerts).toHaveLength(2);
+
+    // A confirmed renewal ends the lapse; a later one is reported afresh.
+    api.renewStatus = null;
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
+    expect(records.at(-1)?.event).toBe("chat_subscription_renewed");
+    api.renewStatus = 500;
+    await vi.advanceTimersByTimeAsync(TTL_MS + MAX_RETRY_MS);
+    expect(alerts).toHaveLength(3);
+    await sub.close();
+  });
+
+  it("alerts with no subscription name when nothing was ever created", async () => {
+    vi.useFakeTimers();
+    const alerts: WorkspaceEventsLapseAlert[] = [];
+    const api = new FakeWeApi([]);
+    api.fetch = async () => jsonResponse(503, { error: "unavailable" });
+    const sub = makeSubscriber(api, {
+      onLapseAlert: (alert) => {
+        alerts.push(alert);
+      },
+    });
+    await sub.start();
+
+    await vi.advanceTimersByTimeAsync(TTL_MS + MAX_RETRY_MS);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ subscriptionName: null });
+    expect(alerts[0]?.message).toContain("last subscription: none");
+    await sub.close();
+  });
+
+  it("keeps retrying when the alert sink itself fails", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const api = new FakeWeApi([]);
+    api.fetch = async () => {
+      attempts++;
+      return jsonResponse(503, { error: "unavailable" });
+    };
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, {
+      logger,
+      onLapseAlert: async () => {
+        throw new Error("mesh unavailable");
+      },
+    });
+    await sub.start();
+
+    await vi.advanceTimersByTimeAsync(TTL_MS + MAX_RETRY_MS);
+    expect(records.filter((r) => r.event === "chat_subscription_lapse_alert_failed")).toHaveLength(
+      1
+    );
+    const attemptsSoFar = attempts;
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
+    expect(attempts).toBe(attemptsSoFar + 1);
     await sub.close();
   });
 
   it("only renews and never alerts while the subscription is healthy", async () => {
     vi.useFakeTimers();
     const alerts: WorkspaceEventsLapseAlert[] = [];
-    const api = new FakeWeApi([
-      {
-        name: "subscriptions/stable",
-        state: "ACTIVE",
-        notificationEndpoint: { pubsubTopic: TOPIC },
-      },
-    ]);
+    const api = new FakeWeApi([activeSub("subscriptions/stable")]);
+    const { logger, records } = captureLogger();
     const sub = makeSubscriber(api, {
-      renewIntervalMs: 100,
+      logger,
       onLapseAlert: (alert) => {
         alerts.push(alert);
       },
     });
 
     await sub.start();
-    await vi.advanceTimersByTimeAsync(300);
+    await vi.advanceTimersByTimeAsync(12 * HOUR);
 
-    expect(api.countWhere((call) => call.method === "POST")).toBe(0);
-    expect(api.countWhere((call) => call.method === "PATCH")).toBe(4);
+    expect(api.count("POST", "/subscriptions")).toBe(0);
+    expect(api.count("DELETE")).toBe(0);
+    expect(api.count("PATCH")).toBe(7); // boot + one renewal every 2h
     expect(alerts).toEqual([]);
-    await sub.close();
-  });
-
-  it("emits structured lifecycle logs", async () => {
-    const logs: string[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: (event: string) => logs.push(event),
-      warn: () => {},
-      error: () => {},
-      child: () => logger,
-    };
-    const sub = makeSubscriber(new FakeWeApi([]), { logger });
-
-    await sub.start();
-
-    expect(logs).toContain("chat_subscription_created");
+    expect(new Set(records.map((r) => r.event))).toEqual(new Set(["chat_subscription_renewed"]));
     await sub.close();
   });
 });

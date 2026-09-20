@@ -3923,9 +3923,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const identity = loadGchatIdentity(config.chat.gchatConfigDir);
 
         // Keep the Workspace Events subscription alive (4h TTL) so messages keep
-        // flowing into the Pub/Sub topic the pull source reads. Best-effort: a
-        // failure here may just mean a still-live subscription, so we log and
-        // continue rather than disabling chat.
+        // flowing into the Pub/Sub topic the pull source reads.
         const oauth = new GchatOAuth(config.chat.gchatConfigDir);
         const topic = `projects/${config.chat.projectId}/topics/${config.chat.topic ?? "chat-events"}`;
         const chatLogger = log.child({ component: "chat" });
@@ -3961,23 +3959,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         weSubscriber = new WorkspaceEventsSubscriber({
           topic,
           getToken: () => oauth.token(),
-          log: (m) => console.log(`[chat] events: ${m}`),
           logger: chatLogger,
           onLapseAlert,
         });
-        try {
-          await weSubscriber.start();
-          chatLogger.info("chat_events_subscription_active", {
-            topic,
-            subscriptionName: weSubscriber.currentSubscription,
-          });
-          console.log(`[chat] events subscription active → ${topic}`);
-        } catch (err) {
-          chatLogger.warn("chat_events_subscription_boot_failed", { topic, err, continuing: true });
-          console.warn(
-            `[chat] events subscription failed (continuing): ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        // Resolves whether or not the first pass succeeded: the subscriber logs
+        // `chat_subscription_*` records and keeps retrying with backoff, so a
+        // failure here never blocks the puller below.
+        await weSubscriber.start();
 
         chatSource = new PubsubChatSource({
           projectId: config.chat.projectId,

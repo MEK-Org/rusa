@@ -12,15 +12,22 @@ const MESSAGE_CREATED = "google.workspace.chat.message.v1.created";
  * mode (it's 7 days without the resource, but we need the text in-band, see
  * `normalize.ts`). We renew well inside this window.
  */
-export const MAX_TTL_SECONDS = 4 * 3600;
+const MAX_TTL_SECONDS = 4 * 3600;
 const TTL = `${MAX_TTL_SECONDS}s`;
 
 /** Renew at half the TTL → ~2h of slack before a missed tick would let it lapse. */
 const DEFAULT_RENEW_INTERVAL_MS = (MAX_TTL_SECONDS / 2) * 1000;
-const DEFAULT_RETRY_BACKOFF_MS = 5_000;
-const DEFAULT_MAX_RETRY_BACKOFF_MS = 5 * 60_000;
-const DEFAULT_ALERT_COOLDOWN_MS = 60 * 60_000;
+/** Retry a failed pass at 5s, doubling to a 5m ceiling, until a pass succeeds. */
+const RETRY_BACKOFF_MS = 5_000;
+const MAX_RETRY_BACKOFF_MS = 5 * 60_000;
+/** Repeat the lapse alert at most hourly while recovery keeps failing. */
+const ALERT_COOLDOWN_MS = 60 * 60_000;
 
+/**
+ * The fields of the API's `Subscription` resource this module reads. `state` is
+ * `STATE_UNSPECIFIED | ACTIVE | SUSPENDED | DELETED`; `expireTime` is output-only
+ * and always present on a listed subscription.
+ */
 interface WeSubscription {
   name?: string;
   state?: string;
@@ -45,78 +52,65 @@ export interface WorkspaceEventsSubscriberOptions {
   getToken: () => Promise<string>;
   /** Override the renewal cadence (default: half the 4h TTL). */
   renewIntervalMs?: number;
-  log?: (msg: string) => void;
-  /** Structured lifecycle logs; the legacy log callback remains for CLI output. */
+  /** Structured lifecycle records (`chat_subscription_*`). */
   logger?: Logger;
   /** Injectable for tests; defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
-  /** Expected subscription TTL in seconds. */
-  expectedTtlSeconds?: number;
-  /** Minimum time between repeated delivery-gap alerts. */
-  alertCooldownMs?: number;
-  /** Called for a bounded alert once the subscription has been absent for a TTL. */
+  /**
+   * Called once a full TTL has passed without a confirmed create or renew, i.e.
+   * once delivery has certainly lapsed. Repeats at most hourly until recovery.
+   */
   onLapseAlert?: (alert: WorkspaceEventsLapseAlert) => Promise<void> | void;
-  /** Injectable clock for deterministic lapse tests. */
-  now?: () => number;
-  /** Initial and capped exponential retry delays after a failed ensure. */
-  retryBackoffMs?: number;
-  maxRetryBackoffMs?: number;
 }
 
 /**
  * Keeps a Google **Workspace Events** subscription alive so chat messages keep
  * flowing into our Pub/Sub topic (consumed by {@link PubsubChatSource}).
  *
- * The subscription has a hard 4h TTL (`includeResource: true`). Failed setup
- * keeps a single bounded-backoff retry loop alive, and every later pass lists
- * subscriptions afresh so a missing or expired resource is recreated.
+ * The subscription has a hard 4h TTL (`includeResource: true`) and silently
+ * stops delivering once it lapses, so this owns the renewal loop. Each pass of
+ * {@link ensure} re-lists the user's subscriptions and converges on exactly one
+ * live subscription: adopting and renewing a live one, reactivating a suspended
+ * one, pruning duplicates and expired leftovers, and creating one when none is
+ * usable. A failed pass is retried with bounded backoff rather than waiting for
+ * the next renewal slot, and a full TTL without a confirmed create/renew raises
+ * {@link WorkspaceEventsSubscriberOptions.onLapseAlert}.
  */
 export class WorkspaceEventsSubscriber {
-  private readonly log: (msg: string) => void;
   private readonly logger?: Logger;
   private readonly fetchImpl: typeof fetch;
   private readonly renewIntervalMs: number;
-  private readonly expectedTtlSeconds: number;
-  private readonly alertCooldownMs: number;
-  private readonly initialBackoffMs: number;
-  private readonly maxBackoffMs: number;
-  private readonly now: () => number;
-  private readonly startedAt: number;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
-  private nextRetryMs: number;
+  private nextRetryMs = RETRY_BACKOFF_MS;
   /** The subscription we're currently keeping alive (resource name). */
   private subscriptionName: string | null = null;
-  /** Last point at which the Workspace API confirmed that an active subscription exists. */
-  private lastKnownActiveAt: number | null = null;
+  /**
+   * When the API last confirmed a subscription with a fresh TTL (a successful
+   * create or renew). Merely seeing one listed does not count: a listed
+   * subscription whose renewals keep failing is exactly the lapse this must
+   * detect, so only confirmations may advance it.
+   */
+  private lastConfirmedActiveAt: number;
   private lastAlertAt: number | null = null;
 
   constructor(private readonly opts: WorkspaceEventsSubscriberOptions) {
-    this.log = opts.log ?? (() => {});
     this.logger = opts.logger;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.renewIntervalMs = opts.renewIntervalMs ?? DEFAULT_RENEW_INTERVAL_MS;
-    this.expectedTtlSeconds = opts.expectedTtlSeconds ?? MAX_TTL_SECONDS;
-    this.alertCooldownMs = opts.alertCooldownMs ?? DEFAULT_ALERT_COOLDOWN_MS;
-    this.initialBackoffMs = opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
-    this.maxBackoffMs = opts.maxRetryBackoffMs ?? DEFAULT_MAX_RETRY_BACKOFF_MS;
-    this.now = opts.now ?? Date.now;
-    this.startedAt = this.now();
-    this.nextRetryMs = this.initialBackoffMs;
+    this.lastConfirmedActiveAt = Date.now();
   }
 
-  /** Ensure a live subscription exists, then keep renewing it on a timer. */
+  /**
+   * Run the first pass and keep the renewal loop alive. Resolves even when the
+   * first pass fails: the failure is logged and retried with backoff, so the
+   * caller can carry on wiring chat without a fatal/ignore choice. Read
+   * {@link currentSubscription} to see whether a subscription is live yet.
+   */
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    try {
-      await this.ensure();
-      this.nextRetryMs = this.initialBackoffMs;
-      this.schedule(this.renewIntervalMs);
-    } catch (err) {
-      await this.handleFailure(err, true);
-      throw err;
-    }
+    await this.tick(true);
   }
 
   async close(): Promise<void> {
@@ -135,75 +129,56 @@ export class WorkspaceEventsSubscriber {
   private schedule(delayMs: number): void {
     if (!this.running) return;
     if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => void this.tick(), delayMs);
+    this.timer = setTimeout(() => void this.tick(false), delayMs);
     this.timer.unref?.();
   }
 
-  private async tick(): Promise<void> {
+  private async tick(boot: boolean): Promise<void> {
     if (!this.running) return;
     try {
       await this.ensure();
-      this.nextRetryMs = this.initialBackoffMs;
+      this.nextRetryMs = RETRY_BACKOFF_MS;
       this.schedule(this.renewIntervalMs);
     } catch (err) {
-      await this.handleFailure(err, false);
+      const retryInMs = this.nextRetryMs;
+      this.nextRetryMs = Math.min(retryInMs * 2, MAX_RETRY_BACKOFF_MS);
+      this.logger?.warn(boot ? "chat_subscription_boot_failed" : "chat_subscription_retry_failed", {
+        topic: this.opts.topic,
+        subscriptionName: this.subscriptionName,
+        err,
+        retryInMs,
+      });
+      // Arm the retry before delivering the alert so a slow alert sink cannot
+      // hold recovery back.
+      this.schedule(retryInMs);
+      await this.alertIfLapsed();
     }
   }
 
-  private async handleFailure(err: unknown, boot: boolean): Promise<void> {
-    const retryInMs = this.nextRetryMs;
-    this.emitLog(
-      "warn",
-      boot ? "chat_subscription_boot_failed" : "chat_subscription_retry_failed",
-      { topic: this.opts.topic, subscriptionName: this.subscriptionName, err, retryInMs },
-      `${boot ? "events subscription setup" : "subscription renewal"} failed: ${errMsg(err)}; retrying in ${Math.round(retryInMs / 1000)}s`
-    );
-    await this.alertIfLapsed();
-    this.nextRetryMs = Math.min(retryInMs * 2, this.maxBackoffMs);
-    this.schedule(retryInMs);
-  }
-
   private async alertIfLapsed(): Promise<void> {
-    const now = this.now();
-    const activeSince = this.lastKnownActiveAt ?? this.startedAt;
-    const elapsedSeconds = Math.floor((now - activeSince) / 1_000);
-    if (elapsedSeconds < this.expectedTtlSeconds) return;
-    if (this.lastAlertAt !== null && now - this.lastAlertAt < this.alertCooldownMs) return;
+    const now = Date.now();
+    const elapsedSeconds = Math.floor((now - this.lastConfirmedActiveAt) / 1_000);
+    if (elapsedSeconds < MAX_TTL_SECONDS) return;
+    if (this.lastAlertAt !== null && now - this.lastAlertAt < ALERT_COOLDOWN_MS) return;
 
     this.lastAlertAt = now;
-    const message = formatLapseMessage({
-      topic: this.opts.topic,
-      subscriptionName: this.subscriptionName,
-      expectedTtlSeconds: this.expectedTtlSeconds,
-      elapsedSeconds,
-    });
     const alert: WorkspaceEventsLapseAlert = {
       topic: this.opts.topic,
       subscriptionName: this.subscriptionName,
-      expectedTtlSeconds: this.expectedTtlSeconds,
+      expectedTtlSeconds: MAX_TTL_SECONDS,
       elapsedSeconds,
-      message,
+      message: formatLapseMessage(this.opts.topic, this.subscriptionName, elapsedSeconds),
     };
-    this.emitLog(
-      "error",
-      "chat_subscription_lapsed",
-      {
-        topic: alert.topic,
-        subscriptionName: alert.subscriptionName,
-        elapsedSeconds,
-        expectedTtlSeconds: alert.expectedTtlSeconds,
-      },
-      message
-    );
+    this.logger?.error("chat_subscription_lapsed", {
+      topic: alert.topic,
+      subscriptionName: alert.subscriptionName,
+      elapsedSeconds,
+      expectedTtlSeconds: alert.expectedTtlSeconds,
+    });
     try {
       await this.opts.onLapseAlert?.(alert);
     } catch (err) {
-      this.emitLog(
-        "warn",
-        "chat_subscription_lapse_alert_failed",
-        { topic: this.opts.topic, err },
-        `failed to emit subscription lapse alert: ${errMsg(err)}`
-      );
+      this.logger?.warn("chat_subscription_lapse_alert_failed", { topic: this.opts.topic, err });
     }
   }
 
@@ -213,25 +188,28 @@ export class WorkspaceEventsSubscriber {
    */
   private async ensure(): Promise<void> {
     const matches = await this.list();
-    const keep = matches.find((subscription) => !isLapsed(subscription, this.now()));
+    const now = Date.now();
+    const keep = matches.find((subscription) => !isLapsed(subscription, now));
 
-    // Prune duplicates — multiple live subscriptions double-deliver messages.
+    // Prune the rest: duplicates double-deliver every message, and an expired
+    // subscription can't be renewed (the API refuses a TTL update past expiry).
     for (const extra of matches) {
-      if (extra !== keep && extra.name) {
-        await this.delete(extra.name).catch((err) =>
-          this.emitLog(
-            "warn",
-            "chat_subscription_prune_duplicate_failed",
-            { topic: this.opts.topic, subscriptionName: extra.name, err },
-            `failed to prune duplicate ${extra.name}: ${errMsg(err)}`
-          )
-        );
-        this.emitLog(
-          "info",
-          "chat_subscription_pruned_duplicate",
-          { topic: this.opts.topic, subscriptionName: extra.name },
-          `pruned duplicate subscription ${extra.name}`
-        );
+      if (extra === keep || !extra.name) continue;
+      const reason = isLapsed(extra, now) ? "lapsed" : "duplicate";
+      try {
+        await this.delete(extra.name);
+        this.logger?.info("chat_subscription_pruned", {
+          topic: this.opts.topic,
+          subscriptionName: extra.name,
+          reason,
+        });
+      } catch (err) {
+        this.logger?.warn("chat_subscription_prune_failed", {
+          topic: this.opts.topic,
+          subscriptionName: extra.name,
+          reason,
+          err,
+        });
       }
     }
 
@@ -240,61 +218,44 @@ export class WorkspaceEventsSubscriber {
       const previousNames = new Set(
         matches.flatMap((subscription) => (subscription.name ? [subscription.name] : []))
       );
-      const created = await this.create(previousNames);
-      this.subscriptionName = created;
-      this.noteActive(created, "chat_subscription_created", `created subscription ${created}`);
+      this.confirmActive(await this.create(previousNames), "chat_subscription_created");
       return;
     }
 
     this.subscriptionName = keep.name;
-    this.lastKnownActiveAt = this.now();
     if (keep.state === "SUSPENDED") {
       await this.reactivate(keep.name);
-      this.emitLog(
-        "info",
-        "chat_subscription_reactivated",
-        { topic: this.opts.topic, subscriptionName: keep.name },
-        `reactivated suspended subscription ${keep.name}`
-      );
+      this.logger?.info("chat_subscription_reactivated", {
+        topic: this.opts.topic,
+        subscriptionName: keep.name,
+      });
     }
 
     try {
       await this.renew(keep.name);
-      this.noteActive(
-        keep.name,
-        "chat_subscription_renewed",
-        `renewed subscription ${keep.name} (ttl ${TTL})`
-      );
+      this.confirmActive(keep.name, "chat_subscription_renewed");
     } catch (err) {
-      if (!shouldRecreateAfterRenewFailure(err)) throw err;
-      this.emitLog(
-        "warn",
-        "chat_subscription_renew_missing_recreating",
-        { topic: this.opts.topic, subscriptionName: keep.name, err },
-        `renewal found ${keep.name} missing or expired; recreating`
-      );
+      // A listed subscription the API no longer knows (404) is replaced right
+      // away. Any other renew failure is retried with backoff: if the
+      // subscription really has lapsed, its `expireTime` moves it onto the
+      // prune-and-create path on the next pass.
+      if (!(err instanceof WorkspaceEventsRequestError && err.status === 404)) throw err;
+      this.logger?.warn("chat_subscription_renew_missing_recreating", {
+        topic: this.opts.topic,
+        subscriptionName: keep.name,
+        err,
+      });
       this.subscriptionName = null;
-      await this.delete(keep.name).catch(() => {});
-      const created = await this.create(new Set([keep.name]));
-      this.subscriptionName = created;
-      this.noteActive(created, "chat_subscription_recreated", `recreated subscription ${created}`);
+      this.confirmActive(await this.create(new Set([keep.name])), "chat_subscription_recreated");
     }
   }
 
-  private noteActive(subscriptionName: string, event: string, message: string): void {
-    this.lastKnownActiveAt = this.now();
+  /** Record an API-confirmed create/renew: the only thing that resets lapse tracking. */
+  private confirmActive(subscriptionName: string, event: string): void {
+    this.subscriptionName = subscriptionName;
+    this.lastConfirmedActiveAt = Date.now();
     this.lastAlertAt = null;
-    this.emitLog("info", event, { topic: this.opts.topic, subscriptionName, ttl: TTL }, message);
-  }
-
-  private emitLog(
-    level: "debug" | "info" | "warn" | "error",
-    event: string,
-    fields: Record<string, unknown>,
-    message: string
-  ): void {
-    this.logger?.[level](event, fields);
-    this.log(message);
+    this.logger?.info(event, { topic: this.opts.topic, subscriptionName, ttl: TTL });
   }
 
   /** List the user's subscriptions for our event type/target and topic. */
@@ -368,26 +329,18 @@ class WorkspaceEventsRequestError extends Error {
   }
 }
 
+/** A listed subscription that can no longer deliver: deleted, or past its `expireTime`. */
 function isLapsed(subscription: WeSubscription, now: number): boolean {
-  if (!subscription.name || subscription.state === "EXPIRED" || subscription.state === "DELETED")
-    return true;
+  if (!subscription.name || subscription.state === "DELETED") return true;
   if (!subscription.expireTime) return false;
   const expiresAt = Date.parse(subscription.expireTime);
   return Number.isFinite(expiresAt) && expiresAt <= now;
 }
 
-function shouldRecreateAfterRenewFailure(err: unknown): boolean {
-  if (!(err instanceof WorkspaceEventsRequestError)) return false;
-  return (
-    err.status === 404 || (err.status === 400 && /(expired|lapsed|not found)/i.test(err.message))
-  );
-}
-
-function formatLapseMessage(opts: Omit<WorkspaceEventsLapseAlert, "message">): string {
-  const subscription = opts.subscriptionName ?? "none";
-  return `Google Workspace Events subscription lapse detected for ${opts.topic} (last subscription: ${subscription}; no active subscription for ${opts.elapsedSeconds}s, expected TTL ${opts.expectedTtlSeconds}s). Chat delivery to the mesh may be interrupted until recovery succeeds.`;
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+function formatLapseMessage(
+  topic: string,
+  subscriptionName: string | null,
+  elapsedSeconds: number
+): string {
+  return `Google Workspace Events subscription lapse detected for ${topic} (last subscription: ${subscriptionName ?? "none"}; no confirmed subscription for ${elapsedSeconds}s, TTL ${MAX_TTL_SECONDS}s). Chat delivery to the mesh may be interrupted until recovery succeeds.`;
 }
