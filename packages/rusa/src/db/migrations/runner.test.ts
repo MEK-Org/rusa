@@ -105,7 +105,15 @@ describe("Database Migration System", () => {
       "0047_actor_experiments",
       "0048_portable_context_snapshots",
       "0049_obligation_responsive",
+      "0050_drop_obligation_ready_heads",
     ]);
+
+    const tableNames = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
+        name: string;
+      }>
+    ).map((t) => t.name);
+    expect(tableNames).not.toContain("obligation_ready_heads");
 
     const meshEventsColumns = (
       db.prepare("PRAGMA table_info(mesh_events)").all() as Array<{ name: string }>
@@ -166,6 +174,36 @@ describe("Database Migration System", () => {
       db.prepare("SELECT COUNT(*) as cnt FROM _migrations").get() as { cnt: number }
     ).cnt;
     expect(countAfter).toBe(countBefore);
+
+    db.close();
+  });
+
+  it("can rehearse the production runner through a migration", () => {
+    const db = new Database(dbPath);
+
+    runMigrations(db, { throughId: "0049_obligation_responsive" });
+    expect(
+      db.prepare("SELECT id FROM _migrations WHERE id = '0050_drop_obligation_ready_heads'").get()
+    ).toBeUndefined();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get()
+    ).toBeDefined();
+
+    runMigrations(db);
+    expect(
+      db.prepare("SELECT id FROM _migrations WHERE id = '0050_drop_obligation_ready_heads'").get()
+    ).toBeDefined();
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get()
+    ).toBeUndefined();
 
     db.close();
   });

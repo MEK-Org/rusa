@@ -16,6 +16,7 @@ import { obligationDependencies } from "../db/migrations/0037_obligation_depende
 import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoint.js";
 import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
+import { dropObligationReadyHeads } from "../db/migrations/0050_drop_obligation_ready_heads.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
@@ -53,6 +54,7 @@ describe("obligations MCP", () => {
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
     obligationResponsive.up(db);
+    dropObligationReadyHeads.up(db);
     repository = new ObligationRepository(db);
   });
 
@@ -323,8 +325,12 @@ describe("obligations MCP", () => {
     }
 
     expect(
-      db.prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = ?").all(user.id)
-    ).toEqual([]);
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'obligation_ready_heads'"
+        )
+        .get()
+    ).toBeUndefined();
   });
 
   it("records the actor's stated reason on the terminal transition", async () => {
