@@ -512,7 +512,7 @@ describe("monolithic follower instance", () => {
     );
   });
 
-  it("books a retained queued admission as start-cancelled if a fresh admission replaces it on reconnect", async () => {
+  it("books a retained queued admission as start-cancelled for the old run id if a fresh admission arrives before state", async () => {
     const pacer = new ProviderPacer(0);
     pacer.deferUntil(Date.now() + 600);
     const h = setup({ pacer });
@@ -529,45 +529,81 @@ describe("monolithic follower instance", () => {
     h.remote.close();
     await h.runtime(id).exited;
 
-    // Reconnect without inviting resume (simulate follower reconnecting without resumeAdmission)
-    const reconnect = h.reconnect();
+    // Intercept follower dispatch so the leader channel can be driven directly before state
     const origDispatch = h.follower.dispatch.bind(h.follower);
+    let blockDispatch = true;
     h.follower.dispatch = (envelope) => {
-      if (envelope.message.type === "init") {
-        envelope.message.bootstrap.resumeAdmission = false;
-      }
+      if (blockDispatch) return;
       origDispatch(envelope);
     };
-
+    const reconnect = h.reconnect();
     h.runtime(id).attachHost(reconnect.createHost(id));
-    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
 
-    // Queue fresh work on the reconnected follower
-    h.mesh.sendMessage(id, "Next run work", "root");
-
-    // Follower re-queues fresh work and runs
-    await waitUntil(() =>
-      h.events.some((event) => event.actorId === id && event.event.type === "runStart")
-    );
-    const started = h.events.find(
-      (event) => event.actorId === id && event.event.type === "runStart"
-    )?.event;
-    expect(started?.type === "runStart" && started.runId).toBeTruthy();
-    expect(started?.type === "runStart" && started.runId).not.toBe(oldRunId);
+    // Feed the channel directly before any post-reattach state report:
+    // 1. ready
+    // 2. queued for a replacement run id (advances queuedRunId)
+    // 3. non-resume admit request (triggers cancelRetainedAdmission with queuedRunId !== retained.runId)
+    const replacementRunId = "fresh-replacement-run-id";
+    reconnect.receive({ actorId: id, message: { type: "ready", pid: process.pid } });
+    reconnect.receive({
+      actorId: id,
+      message: { type: "queued", runId: replacementRunId, mode: "ordinary", responsive: false },
+    });
+    reconnect.receive({
+      actorId: id,
+      message: {
+        type: "request",
+        requestId: 99,
+        request: {
+          op: "admit",
+          candidates: [{ provider: "instance-fixture", model: "scripted" }],
+          responsive: false,
+          mode: "ordinary",
+        },
+      },
+    });
 
     // The old retained admission was cancelled and booked as abandoned start-cancelled
-    expect(h.meshEvents).toContainEqual(
-      expect.objectContaining({
-        kind: "run_abandoned",
-        actorId: id,
-        detail: "start-cancelled",
-      })
-    );
+    // via cancelRetainedAdmission's emit branch, specifically preserving oldRunId
     await waitUntil(() =>
-      h.events.some(
+      h.meshEvents.some(
         (event) =>
-          event.actorId === id && event.event.type === "result" && event.event.result.success
+          event.kind === "run_abandoned" &&
+          event.actorId === id &&
+          event.detail === "start-cancelled"
       )
+    );
+    const abandoned = h.meshEvents.find(
+      (event) => event.kind === "run_abandoned" && event.actorId === id
+    );
+    expect(abandoned).toBeDefined();
+    expect(JSON.parse(abandoned?.payload ?? "{}")).toEqual({
+      started: false,
+      runId: oldRunId,
+    });
+
+    blockDispatch = false;
+    h.follower.dispatch = origDispatch;
+    reconnect.receive({ actorId: id, message: { type: "exit", code: 0, signal: null } });
+  });
+
+  it("logs a warning and ignores attachHost if called after close", async () => {
+    const h = setup();
+    const id = h.spawn("Attach after close");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    h.runtime(id).close();
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({
+        event: "remote_attach_after_close",
+        fields: expect.objectContaining({ actorId: id }),
+      })
     );
   });
 

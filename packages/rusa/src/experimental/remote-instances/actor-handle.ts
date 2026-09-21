@@ -141,7 +141,13 @@ export class ActorHandle implements MeshActor {
   }
 
   attachHost(newChannel: ActorChannel): void {
-    if (this.terminated) return;
+    if (this.terminated) {
+      this.log.warn("remote_attach_after_close", {
+        actorId: this.id,
+        target: this.opts.target ?? newChannel.nodeId,
+      });
+      return;
+    }
     this.channel.removeAllListeners();
     this.channel = newChannel;
     this.closed = false;
@@ -316,6 +322,11 @@ export class ActorHandle implements MeshActor {
       requestId: retained.requestId,
     });
     // Only the run the ticket was reserved for; a later run owns its own end.
+    // Under standard follower runtime initialize(), the first post-reattach state
+    // report is sent synchronously and drops an unclaimed ticket while queuedRunId
+    // still equals retained.runId. The direct onEnd emit below defensively handles
+    // out-of-order protocol arrivals (e.g. an unannounced queued run or out-of-band
+    // fresh admission) where queuedRunId advanced before this cancellation ran.
     if (this.queuedRunId === retained.runId) {
       return this.endQueuedRun("start-cancelled", false);
     }

@@ -108,7 +108,10 @@ export function createHarness(options: {
               kind: "run_abandoned",
               actorId: context.record.id,
               detail: event.terminal.reason,
-              payload: JSON.stringify({ started: event.terminal.started }),
+              payload: JSON.stringify({
+                started: event.terminal.started,
+                runId: event.runId,
+              }),
             });
           }
         },
