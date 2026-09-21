@@ -37,6 +37,21 @@ if (!existsSync(flutterAppDir)) {
   throw new Error(`Flutter dashboard app missing at ${flutterAppDir}`);
 }
 
+// Build from a clean context every time. A warm `.dart_tool/flutter_build`
+// cache can hand `flutter build web` a web_plugin_registrant.dart generated for
+// the previous release's plugin set, so a release that adds web plugins ships
+// a dashboard that never registers them and fails at startup (#591). Removing
+// the generated state directly is narrower and cheaper than `flutter clean`,
+// which spawns another process and also touches unrelated platform dirs.
+for (const generated of [
+  ".dart_tool",
+  "build",
+  ".flutter-plugins",
+  ".flutter-plugins-dependencies",
+]) {
+  rmSync(resolve(flutterAppDir, generated), { recursive: true, force: true });
+}
+
 const resolved = resolveFlutterCommand();
 const flutterProc = spawn(resolved.cmd, [...resolved.args, "build", "web", "--release"], {
   cwd: flutterAppDir,
