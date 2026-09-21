@@ -34,7 +34,12 @@ import {
   type EventSourceOwnershipDiagnostic,
   type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
-import { type MeshProviderGate, type QueuedSelection, RunManager } from "../runtime/run-manager.js";
+import {
+  type MeshProviderGate,
+  type QueuedSelection,
+  RunManager,
+  VOICE_INBOX_PAYLOAD_TYPE,
+} from "../runtime/run-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -465,9 +470,6 @@ export interface MechanicalInboxForensics {
   exitCode?: number;
   status?: string;
 }
-
-/** Re-exported for existing importers; owned by {@link RunManager}. */
-export type { QueuedSelection } from "../runtime/run-manager.js";
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
@@ -3044,7 +3046,7 @@ export class ActorMesh {
           actorId: toId,
           source: `mesh:${fromId}`,
           payload: {
-            type: isVoice ? "human.voice" : "human.message",
+            type: isVoice ? VOICE_INBOX_PAYLOAD_TYPE : "human.message",
             priority: "responsive",
             messageId,
             fromId,

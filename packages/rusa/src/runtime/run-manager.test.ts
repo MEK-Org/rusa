@@ -238,7 +238,11 @@ describe("RunManager", () => {
 
       // The same promotion `actorsWithUnhandled()` reports for the whole mesh,
       // derived per actor. The caller still said only the actor's name.
-      expect(h.manager.durableWork("a1")).toEqual({ priority: "responsive" });
+      // No run has absorbed the responsive entry yet, so it is still arriving.
+      expect(h.manager.durableWork("a1")).toEqual({
+        priority: "responsive",
+        unseenResponsive: true,
+      });
       expect(h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
@@ -263,12 +267,29 @@ describe("RunManager", () => {
       expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: at.getTime() }]);
     });
 
-    it("leaves voice timing off when the newest responsive entry is not voice", () => {
+    it("recovers voice timing from a memo sitting behind a newer responsive entry", () => {
       const h = setup();
       const actor = live(h, "a1");
       append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
       append("a1", { type: "human.message", priority: "responsive" }, new Date(2_000));
 
+      // Recovery — a reattach, a resume sweep — is exactly where the memo is
+      // most likely to sit behind a newer responsive row, so voice timing is
+      // read from the memo itself rather than from whatever arrived last.
+      h.manager.dispatch("a1");
+      expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: 1_000 }]);
+    });
+
+    it("leaves voice timing off once the memo has been absorbed by an opportunity", () => {
+      const h = setup();
+      const actor = live(h, "a1");
+      append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
+      inbox.markSeen("a1");
+      append("a1", { type: "github.issue" }, new Date(2_000));
+
+      // The quick-start and coalesce-kill belong to the memo's own delivery.
+      // A later ordinary delivery must not replay them against the run that
+      // already holds the memo.
       h.manager.dispatch("a1");
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
     });
@@ -395,6 +416,38 @@ describe("RunManager", () => {
       expect(h.preempted).toEqual([]);
     });
 
+    it("does not replace a run over responsive work that run already absorbed", () => {
+      const h = setup();
+      const actor = live(h, "a1");
+      actor.preemptPhase = "running";
+      append("a1", { type: "human.message", priority: "responsive" });
+
+      // The operator's message starts a run, which absorbs it. The row stays
+      // unhandled for almost the whole run, because an actor marks its work
+      // handled at the end.
+      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(actor.preemptions).toBe(1);
+      inbox.markSeen("a1");
+
+      // Ordinary traffic arriving mid-run — a child reporting in — must not
+      // abort the run it is arriving behind. Left unguarded, the replacement
+      // run re-selects the same entries and the next ordinary delivery aborts
+      // that one too, so steady child traffic starves the operator's message.
+      append("a1", { type: "mesh.message" });
+      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(actor.preemptions).toBe(1);
+      expect(h.preempted).toEqual([["a1", "running"]]);
+
+      // Genuinely new responsive work still replaces the run.
+      append("a1", { type: "human.message", priority: "responsive" });
+      expect(h.manager.dispatch("a1")).toBe(true);
+      expect(actor.preemptions).toBe(2);
+      expect(h.preempted).toEqual([
+        ["a1", "running"],
+        ["a1", "running"],
+      ]);
+    });
+
     it("joins an active run instead of replacing it, at the same priority", () => {
       const h = setup();
       const actor = live(h, "a1");
@@ -430,6 +483,23 @@ describe("RunManager", () => {
 
       expect(h.manager.dispatch("a1")).toBe(true);
       expect(actor.nudges).toEqual([{ priority: "responsive" }]);
+    });
+
+    it("holds ordinary work arriving behind responsive work the session already holds", () => {
+      const h = setup({ isVoiceSessionActive: () => true });
+      const actor = live(h, "a1");
+      append("a1", { type: "human.voice", priority: "responsive" });
+      expect(h.manager.dispatch("a1")).toBe(true);
+      inbox.markSeen("a1");
+
+      // The memo is still unhandled, so the actor's durable priority is still
+      // responsive — but nothing responsive has *arrived*. Admitting an
+      // execution opportunity per ordinary delivery is exactly the traffic the
+      // hold exists to keep out of the conversation.
+      append("a1", { type: "github.issue" });
+      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(actor.nudges).toHaveLength(1);
+      expect(h.logs).toContain("dispatch(a1) held — active voice session");
     });
 
     it("releases the held work on the next dispatch once the session ends", () => {

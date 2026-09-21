@@ -1591,6 +1591,55 @@ describe("ActorMesh", () => {
     });
   });
 
+  it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // The running actor closed a prerequisite and made its own obligation
+    // ready. The entry is durably responsive, so it is scheduled and admitted
+    // as responsive — but the actor will see it in its own worklist, so the
+    // run it is already doing is not thrown away.
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+    ).toBe(true);
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(2);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(true);
+  });
+
   it("never lets inbox dedupe suppress a genuine repeated transition delivered by a restarted mesh (#513)", async () => {
     const inboxStore = createMemoryInboxStore();
     const actors = new InMemoryActorRepository();
@@ -2210,10 +2259,6 @@ describe("ActorMesh", () => {
     await tick();
     expect(fake(source).calls.length).toBeGreaterThan(0);
     const targetCallsBeforeRelease = fake(target).calls.length;
-    // The recipient consumes the responsive handoff first. Until it does, its
-    // durable state still says responsive, and responsive work is exempt from
-    // the voice hold — so this is what leaves only ordinary work behind.
-    if (handoff) inboxStore.markHandled(target, [handoff.id]);
     inboxStore.append([
       { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
@@ -2400,6 +2445,64 @@ describe("ActorMesh", () => {
     const unhandled = inboxStore.entries.filter((e) => e.actorId === worker && !e.handledAt);
     expect(unhandled).toHaveLength(2);
     expect(unhandled.map((e) => e.payload.type)).toEqual(["mesh.message", "system.disk"]);
+  });
+
+  it("does not let ordinary traffic abort the run already working the operator's message", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "done" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // The operator's message starts a responsive run. It stays unhandled for
+    // the whole run: an actor marks its work handled at the end.
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "mesh:human:operator",
+        payload: { type: "human.message", priority: "responsive" },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(firstSignal?.aborted).toBe(false);
+
+    // Three children report in while that run is still going. Each delivery is
+    // ordinary work arriving behind responsive work the run already holds, so
+    // none of them is a reason to throw the run away and start over.
+    for (const child of ["c1", "c2", "c3"]) {
+      inboxStore.append([
+        { actorId: worker, source: `mesh:${child}`, payload: payload("mesh.message") },
+      ]);
+      mesh.dispatch(worker);
+    }
+
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // The ordinary work is not lost: it is durable, and the run in flight ends
+    // with exactly one coalesced follow-up.
+    resolveFirst({ success: true, exitCode: 0, output: "operator answered" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(2);
   });
 
   it("delivers responsive inbox work to an idle actor without a preemption event", async () => {

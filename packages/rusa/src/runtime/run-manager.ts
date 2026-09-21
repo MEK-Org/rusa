@@ -10,10 +10,11 @@ import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxRepository } from "../repositories/inbox-repository.js";
 
 /**
- * The durable payload type a voice memo is delivered under. Voice keeps its
- * quick-start and coalesce-kill timing, and the fact that the pending work is
- * voice is itself durable, so dispatch reads it from the entry rather than
- * receiving it as an argument.
+ * The durable payload type a voice memo is delivered under, written by the
+ * human-message producer and read back here. Voice keeps its quick-start and
+ * coalesce-kill timing, and the fact that the pending work is voice is itself
+ * durable, so dispatch reads it from the entry rather than receiving it as an
+ * argument.
  */
 export const VOICE_INBOX_PAYLOAD_TYPE = "human.voice";
 
@@ -71,16 +72,38 @@ export type MeshProviderGate = <T>(
 export interface DurableDispatchWork {
   /** Promoted to responsive when any unhandled entry is responsive. */
   priority: "normal" | "responsive";
-  /** Delivery time of the newest pending voice entry, when one is pending. */
+  /**
+   * Whether responsive work is pending that no accepted execution opportunity
+   * has absorbed yet — `seen` is stamped as a run is admitted, so this is the
+   * durable reading of "responsive work has just arrived", as opposed to
+   * "responsive work is still open in the run already doing it".
+   *
+   * Priority does not depend on it: an actor holding a pending responsive
+   * entry is responsive, exactly as `actorsWithUnhandled()` reports it. The
+   * two things that must not fire for work a run already holds do: replacing
+   * that run, and passing the voice hold.
+   */
+  unseenResponsive?: boolean;
+  /** Delivery time of the newest pending voice memo no run has absorbed. */
   voiceAt?: number;
 }
+
+/**
+ * How many pending responsive entries one dispatch reads. Ordered newest
+ * first, so the bound only bites on an actor holding more unhandled responsive
+ * work than the repository will page at once — far past any real backlog — and
+ * when it does, the oldest entries read as absorbed, which holds ordinary work
+ * and declines to replace a run rather than the reverse.
+ */
+const PENDING_RESPONSIVE_SCAN = 100;
 
 export interface RunManagerOptions {
   /**
    * The durable worklist. It is the only source of whether an actor has work
-   * and what that work's priority is. A mesh built without one (an isolated
-   * embedding) has no durable state to read, so an advisory poke is taken at
-   * face value as ordinary work.
+   * and what that work's priority is. Every production composition supplies
+   * one; a mesh built without it is a unit test that never exercises inbox
+   * persistence, and has no durable state to read, so an advisory poke is
+   * taken at face value as ordinary work.
    */
   inbox?: InboxRepository;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
@@ -181,9 +204,11 @@ export class RunManager {
    *
    * Returns whether this call requested an execution opportunity. An actor
    * with no durable work is a no-op; a retired or non-live actor is refused;
-   * an ordinary poke during a voice session is held until the session ends.
-   * Responsive work replaces an in-flight run — operator control, human
-   * messages and `runNow` all mean "now".
+   * a poke carrying nothing but ordinary work is held for the duration of a
+   * voice session. Responsive work that has not yet reached a run replaces the
+   * one in flight — operator control, human messages and `runNow` all mean
+   * "now" — while responsive work that run already absorbed leaves it alone,
+   * so ordinary traffic arriving behind it cannot restart it indefinitely.
    */
   dispatch(actorId: string): boolean {
     return this.dispatchInternal(actorId, { preempt: true });
@@ -218,23 +243,36 @@ export class RunManager {
     const inbox = this.inbox;
     if (!inbox) return { priority: "normal" };
     if (inbox.countUnhandled(actorId, { responsiveOnly: true }) > 0) {
-      const voiceAt = this.pendingVoiceAt(actorId);
-      return voiceAt === undefined
-        ? { priority: "responsive" }
-        : { priority: "responsive", voiceAt };
+      return { priority: "responsive", ...this.pendingResponsive(actorId) };
     }
     return inbox.countUnhandled(actorId) > 0 ? { priority: "normal" } : null;
   }
 
-  private pendingVoiceAt(actorId: string): number | undefined {
-    const newest = this.inbox?.list(actorId, {
-      status: "unhandled",
-      responsiveOnly: true,
-      limit: 1,
-    }).entries[0];
-    if (newest?.payload.type !== VOICE_INBOX_PAYLOAD_TYPE) return undefined;
-    const at = newest.deliveredAt.getTime();
-    return Number.isFinite(at) ? at : undefined;
+  /**
+   * The two things a dispatch needs about pending responsive work beyond the
+   * fact that it exists — whether any of it is unabsorbed, and when the newest
+   * unabsorbed voice memo was delivered — read out of one indexed page, so the
+   * responsive path costs no more than reading voice timing alone did.
+   */
+  private pendingResponsive(actorId: string): { unseenResponsive: boolean; voiceAt?: number } {
+    const pending =
+      this.inbox?.list(actorId, {
+        status: "unhandled",
+        responsiveOnly: true,
+        limit: PENDING_RESPONSIVE_SCAN,
+      }).entries ?? [];
+    const unseen = pending.filter((entry) => entry.seenAt === null);
+    // Newest first, so this is the newest memo the actor still owes a
+    // quick start to. Reading it by payload type rather than by "is the newest
+    // pending entry a memo" is what keeps the timing recoverable on a reattach
+    // or resume sweep, where the memo is most likely to sit behind a newer
+    // responsive row it arrived with.
+    const at = unseen.find((entry) => entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE)?.deliveredAt;
+    const voiceAt = at?.getTime();
+    return {
+      unseenResponsive: unseen.length > 0,
+      ...(voiceAt !== undefined && Number.isFinite(voiceAt) ? { voiceAt } : {}),
+    };
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -256,16 +294,21 @@ export class RunManager {
       return false;
     }
     const nudge = dispatchNudge(work);
-    if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
+    // Responsive work an accepted opportunity already absorbed is not work
+    // arriving: the run that holds it is the one in flight. Only work that has
+    // yet to reach a run earns the two things responsive delivery does beyond
+    // scheduling — passing the voice hold, and replacing the active run.
+    const responsiveArrived = isResponsiveNudge(nudge) && work.unseenResponsive !== false;
+    if (!responsiveArrived && this.isVoiceSessionActive(actorId)) {
       // The entry is already durable. It must wait for the session-end
       // dispatch rather than adding an ordinary execution opportunity behind
-      // the voice conversation. Responsive work passes the hold whether or not
-      // it may preempt, so a non-owner's event copy is admitted behind the
-      // voice session's own run rather than held with ordinary work.
+      // the voice conversation. Arriving responsive work passes the hold
+      // whether or not it may preempt, so a non-owner's event copy is admitted
+      // behind the voice session's own run rather than held with ordinary work.
       this.log(`dispatch(${actorId}) held — active voice session`);
       return false;
     }
-    if (isResponsiveNudge(nudge) && opts.preempt) {
+    if (responsiveArrived && opts.preempt) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
     }
