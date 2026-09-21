@@ -6,7 +6,11 @@ import { resolveFlutterCommand } from "./flutter-resolver.mjs";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(thisDir, "..");
-const flutterAppDir = resolve(packageRoot, "flutter_dashboard");
+// RUSA_FLUTTER_APP_DIR lets tests point the build at a fixture app; default
+// the checked-in dashboard.
+const flutterAppDir = process.env.RUSA_FLUTTER_APP_DIR
+  ? resolve(process.env.RUSA_FLUTTER_APP_DIR)
+  : resolve(packageRoot, "flutter_dashboard");
 const flutterBuildDir = resolve(flutterAppDir, "build/web");
 // RUSA_DIST_DIR lets the `update` tool stage into dist.new ; default dist.
 const distDir = process.env.RUSA_DIST_DIR
