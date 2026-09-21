@@ -163,7 +163,12 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       if (options.source !== undefined) {
         matched = matched.filter((entry) => entry.source === options.source);
       }
+      if (options.responsiveOnly) {
+        matched = matched.filter((entry) => entry.payload.priority === "responsive");
+      }
+      // Newest first, as SqliteInboxRepository's `delivered_at DESC` ordering is.
       matched = [...matched].reverse();
+      if (options.limit !== undefined) matched = matched.slice(0, options.limit);
       return {
         entries: matched,
         unhandledCount: entries.filter(
@@ -951,6 +956,7 @@ describe("ActorMesh", () => {
         { actorId: "not-live", priority: "normal" as const },
       ],
       countUnhandled: (actorId: string) => (actorId === "t1" ? 1 : 0),
+      list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
       markSeen: () => [],
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
@@ -967,22 +973,25 @@ describe("ActorMesh", () => {
 
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
-    expect(logs).toContain("inbox_changed for not-live not nudged — no live actor");
+    expect(logs).toContain("dispatch(not-live) refused — no live actor");
   });
 
-  it("re-derives a remote reattach nudge from the durable inbox (#568)", () => {
+  it("re-derives a remote reattach dispatch from the durable inbox (#568)", () => {
     const inboxStore = createMemoryInboxStore();
-    const { mesh } = setup({ inboxStore });
+    const { mesh, logs } = setup({ inboxStore });
     const id = mesh.spawn({ charter: "remote", parentId: "root" });
 
-    // Nothing unhandled: an ordinary nudge, so an idle follower is not woken as responsive.
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    // Nothing unhandled: the reattach dispatch is advisory and finds no work,
+    // so an idle follower is not woken at all.
+    expect(mesh.dispatch(id)).toBe(false);
+    expect(logs).toContain(`dispatch(${id}) is a no-op — no durable work`);
 
     inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    expect(mesh.dispatch(id)).toBe(true);
 
     // A responsive item the follower never observed (delivered during a
-    // transport gap) is what makes the reattach nudge responsive.
+    // transport gap) is what makes the reattach dispatch responsive. The caller
+    // still says nothing about priority; the durable entry does.
     const [urgent] = inboxStore.append([
       {
         actorId: id,
@@ -990,10 +999,14 @@ describe("ActorMesh", () => {
         payload: { ...payload("mesh.message"), priority: "responsive" },
       },
     ]);
-    expect(mesh.durableInboxNudge(id)).toEqual({ priority: "responsive" });
+    expect(mesh.dispatch(id)).toBe(true);
 
     inboxStore.markHandled(id, [urgent.id]);
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    inboxStore.markHandled(
+      id,
+      inboxStore.entries.filter((e) => e.actorId === id && e.handledAt === null).map((e) => e.id)
+    );
+    expect(mesh.dispatch(id)).toBe(false);
   });
 
   it("coalesces inbox changes during a run into one dirty follow-up", async () => {
@@ -2074,7 +2087,7 @@ describe("ActorMesh", () => {
         payload: { type: "github.issue" },
       },
     ]);
-    expect(mesh.notifyInboxChanged(worker)).toBe(false);
+    expect(mesh.dispatch(worker)).toBe(false);
     mesh.deliverWake(worker, "cron maintenance");
     await tick();
 
@@ -2164,7 +2177,7 @@ describe("ActorMesh", () => {
     const [sourceNormal] = inboxStore.append([
       { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.notifyInboxChanged(source)).toBe(false);
+    expect(mesh.dispatch(source)).toBe(false);
 
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
@@ -2197,10 +2210,14 @@ describe("ActorMesh", () => {
     await tick();
     expect(fake(source).calls.length).toBeGreaterThan(0);
     const targetCallsBeforeRelease = fake(target).calls.length;
+    // The recipient consumes the responsive handoff first. Until it does, its
+    // durable state still says responsive, and responsive work is exempt from
+    // the voice hold — so this is what leaves only ordinary work behind.
+    if (handoff) inboxStore.markHandled(target, [handoff.id]);
     inboxStore.append([
       { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.notifyInboxChanged(target)).toBe(false);
+    expect(mesh.dispatch(target)).toBe(false);
     holder = "";
     expect(mesh.notifyVoiceSessionEnded(target)).toBe(true);
     await tick();
@@ -2343,7 +2360,7 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
     inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
-    mesh.notifyInboxChanged(worker);
+    mesh.dispatch(worker);
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
     expect(firstSignal?.aborted).toBe(false);
@@ -2355,7 +2372,7 @@ describe("ActorMesh", () => {
         payload: { type: "system.disk", priority: "responsive" },
       },
     ]);
-    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    mesh.dispatch(worker);
 
     expect(firstSignal?.aborted).toBe(true);
     expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
@@ -2398,7 +2415,7 @@ describe("ActorMesh", () => {
         payload: { type: "system.disk", priority: "responsive" },
       },
     ]);
-    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    mesh.dispatch(worker);
     await tick();
 
     expect(fake(worker).calls).toHaveLength(1);
@@ -6650,7 +6667,13 @@ describe("ActorMesh", () => {
             handledAt: null,
           }));
         },
-        countUnhandled: () => appended.length,
+        // Honours responsiveOnly: these entries carry no priority, so dispatch
+        // must read them as ordinary work and debounce rather than quick-start.
+        countUnhandled: (_actorId: string, options: { responsiveOnly?: boolean } = {}) =>
+          appended.filter(
+            (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
+          ).length,
+        list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -6773,6 +6796,8 @@ describe("ActorMesh", () => {
             handledAt: null,
           }));
         },
+        countUnhandled: () => appended.length,
+        list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
         markSeen: () => [],
       } as unknown as InboxRepository;
 
@@ -7370,7 +7395,7 @@ describe("ActorMesh", () => {
       });
       const startRun = async (actorId: string) => {
         inboxStore.append([{ actorId, source: "mesh:root", payload: payload("mesh.message") }]);
-        harness.mesh.notifyInboxChanged(actorId);
+        harness.mesh.dispatch(actorId);
         await harness.tick();
         expect(runs.get(actorId)).toBe(1);
         expect(signals.get(actorId)?.aborted).toBe(false);
@@ -8618,7 +8643,7 @@ describe("ActorMesh", () => {
           payload: { type: "task", content: "initial task" },
         },
       ]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
 
       expect(mesh.activeRunState(worker)).toEqual({ actorId: worker, phase: "running" });
@@ -8670,7 +8695,7 @@ describe("ActorMesh", () => {
           payload: { type: "task", content: "initial task" },
         },
       ]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
 
       expect(mesh.activeRunState(worker)).toEqual({ actorId: worker, phase: "running" });
@@ -8740,7 +8765,7 @@ describe("ActorMesh", () => {
       });
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       inboxStore.append([{ actorId: worker, source: "root", payload: payload("task") }]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
       expect(fake(worker).calls).toHaveLength(1);
       expect(signal?.aborted).toBe(false);
@@ -9161,8 +9186,8 @@ describe("ActorMesh", () => {
       expect(activeRoute.principal).toBe(worker);
       expect(activeRoute.isLive).toBe(true);
 
-      // Worker is retired/dead and no longer in live set
-      (env.mesh as unknown as { live: Set<string> }).live.delete(worker);
+      // Worker is retired/dead and no longer in the RunManager's live registry
+      (env.mesh as unknown as { runs: { forget(id: string): void } }).runs.forget(worker);
 
       const deadRoute = env.mesh.resolveEffectiveRoute(issueRef);
       // Route is uncovered because subscriber is dead and has no live ancestor owner
