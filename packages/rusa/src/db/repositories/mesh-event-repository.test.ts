@@ -1,7 +1,9 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../migrations/runner.js";
+import { MeshChatRepository } from "./mesh-chat-repository.js";
 import { MeshEventRepository } from "./mesh-event-repository.js";
+import { PrincipalRepository } from "./principal-repository.js";
 
 describe("MeshEventRepository", () => {
   let db: Database.Database;
@@ -173,7 +175,7 @@ describe("MeshEventRepository", () => {
     });
   });
 
-  describe("listEventsSince (distiller forward read)", () => {
+  describe("listEventsSince (forward window read)", () => {
     it("returns all-actors events with ts >= since, oldest-first", () => {
       repo.record({
         kind: "run_start",
@@ -232,11 +234,9 @@ describe("MeshEventRepository", () => {
         ts: "2026-06-21T00:00:00.000Z",
       });
 
-      const { events } = repo.listEventsSince(
-        "2026-06-17T00:00:00.000Z",
-        50,
-        "2026-06-20T00:00:00.000Z"
-      );
+      const { events } = repo.listEventsSince("2026-06-17T00:00:00.000Z", 50, {
+        until: "2026-06-20T00:00:00.000Z",
+      });
       expect(events.map((e) => e.detail)).toEqual(["in"]); // "edge" excluded (until is exclusive)
     });
 
@@ -272,9 +272,9 @@ describe("MeshEventRepository", () => {
         ts: "2026-06-18T00:00:02.000Z",
       });
 
-      const { events } = repo.listEventsSince("2026-06-17T00:00:00.000Z", 50, undefined, [
-        "run_yielded",
-      ]);
+      const { events } = repo.listEventsSince("2026-06-17T00:00:00.000Z", 50, {
+        kinds: ["run_yielded"],
+      });
       expect(events.map((e) => e.detail)).toEqual(["yield-event"]);
     });
 
@@ -303,14 +303,54 @@ describe("MeshEventRepository", () => {
       expect(eventsAsc.map((e) => e.detail)).toEqual(["oldest", "middle"]);
 
       // Descending: newest-first
-      const { events: eventsDesc } = repo.listEventsSince(
-        "2026-06-17T00:00:00.000Z",
-        2,
-        undefined,
-        undefined,
-        "desc"
-      );
+      const { events: eventsDesc } = repo.listEventsSince("2026-06-17T00:00:00.000Z", 2, {
+        order: "desc",
+      });
       expect(eventsDesc.map((e) => e.detail)).toEqual(["newest", "middle"]);
+    });
+
+    it("scopes message events to the human viewer, like the actor-filtered read (#590)", () => {
+      const principals = new PrincipalRepository(db);
+      const chat = new MeshChatRepository(db);
+      const alice = principals.createUser({
+        email: "alice@example.com",
+        createdAt: "2026-06-17T00:00:00.000Z",
+      }).id;
+      const bob = principals.createUser({
+        email: "bob@example.com",
+        createdAt: "2026-06-17T00:00:00.000Z",
+      }).id;
+      // One actor answering two humans, plus actor↔actor traffic and a
+      // non-message event, all inside one `since` window.
+      const message = (from: string, to: string, body: string, ts: string) => {
+        const messageId = chat.record({ senderId: from, recipientId: to, body, ts });
+        repo.record({
+          kind: "message_sent",
+          actorId: from,
+          payload: JSON.stringify({ messageId, to }),
+          ts,
+        });
+      };
+      message("actor-1", alice, "to alice", "2026-06-18T00:00:00.000Z");
+      message("actor-1", bob, "to bob", "2026-06-18T00:00:01.000Z");
+      message("actor-1", "actor-2", "to peer", "2026-06-18T00:00:02.000Z");
+      repo.record({
+        kind: "run_start",
+        actorId: "actor-1",
+        detail: "shared",
+        ts: "2026-06-18T00:00:03.000Z",
+      });
+
+      const window = (humanViewerIds: readonly string[]) =>
+        repo
+          .listEventsSince("2026-06-17T00:00:00.000Z", 50, { humanViewerIds })
+          .events.map((e) => e.body ?? e.detail);
+      expect(window([alice])).toEqual(["to alice", "to peer", "shared"]);
+      expect(window([bob])).toEqual(["to bob", "to peer", "shared"]);
+      // A viewer who cannot be identified reads actor↔actor traffic alone.
+      expect(window([])).toEqual(["to peer", "shared"]);
+      // Omitting the scope is the unscoped read the distiller-style callers use.
+      expect(repo.listEventsSince("2026-06-17T00:00:00.000Z", 50).events).toHaveLength(4);
     });
   });
 

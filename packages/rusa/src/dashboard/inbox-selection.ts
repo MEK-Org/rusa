@@ -1,4 +1,4 @@
-import type { InboxEntry } from "../actor/inbox-store.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 
 /**
  * Compare two inbox entries by priority:

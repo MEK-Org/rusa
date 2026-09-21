@@ -39,7 +39,15 @@ export class ActorHandle implements MeshActor {
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
-  private gates = new Map<number, { handle: RunStartHandle<void>; release: () => void }>();
+  private gates = new Map<
+    number,
+    {
+      handle: RunStartHandle<void>;
+      release: () => void;
+      /** Priority the leader actually admitted, which a promotion can raise after the request. */
+      admission: { responsive: boolean };
+    }
+  >();
   private startupTimer?: ReturnType<typeof setTimeout>;
   /** True between the leader admitting a run and that same run's terminal accounting. */
   private runOpen = false;
@@ -48,6 +56,22 @@ export class ActorHandle implements MeshActor {
   private startedRunId: string | undefined;
   private queuedMode: ActorRunMode | undefined;
   private receiveChain: Promise<void> | undefined;
+  /** Responsive displacement asked for while the follower's state was unknown. */
+  private pendingPreempt = false;
+  /** True from reattach until the follower reports which run, if any, survived the gap. */
+  private stateStale = false;
+  /**
+   * Resolves with that first report. The mesh preempts before it nudges, and a
+   * wake that overtook the deferred preempt would have its dirty bit cancelled
+   * by it, so wakes wait here until the preempt decision has been sent.
+   */
+  private stateSettled: Promise<void> = Promise.resolve();
+  private settleState: (() => void) | undefined;
+  /** Promotion requested between the follower's queued report and its admission request. */
+  private pendingQueuedPromotion = false;
+  private preemptSequence = 0;
+  /** The one unanswered preempt; later responsive items coalesce behind its answer. */
+  private outstandingPreempt: number | undefined;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -93,6 +117,7 @@ export class ActorHandle implements MeshActor {
         clearTimeout(this.startupTimer);
         const error = new Error(`Remote actor exited (${signal ?? code})`);
         rejectReady(error);
+        this.settleState?.();
         if (!this.closed) this.fail(error);
         this.releaseGates();
         this.state = "idle";
@@ -106,6 +131,13 @@ export class ActorHandle implements MeshActor {
     this.channel.removeAllListeners();
     this.channel = newChannel;
     this.closed = false;
+    // The follower kept its Actor across the gap; its first state report says
+    // whether a run admitted before the loss is still in flight.
+    this.stateStale = true;
+    this.settleState?.();
+    this.stateSettled = new Promise((resolve) => {
+      this.settleState = resolve;
+    });
     this.bindChannel(newChannel);
     const freshSnapshot = this.opts.snapshot();
     const sessionId = freshSnapshot.record.sessionId ?? this.opts.bootstrap.sessionId;
@@ -132,12 +164,12 @@ export class ActorHandle implements MeshActor {
   }
 
   requestRun(nudge?: RunNudge): void {
-    if (this.closed) return;
     void this.ready
+      .then(() => this.stateSettled)
       .then(() => {
-        if (!this.closed) this.send({ type: "wake", nudge });
+        if (this.closed || !this.send({ type: "wake", nudge })) this.reportDroppedWake(nudge);
       })
-      .catch(() => {});
+      .catch(() => this.reportDroppedWake(nudge));
   }
   declareYield(status?: string, note?: string): void {
     // Fence parent-hosted tools immediately when the mesh accepts yield_run.
@@ -147,9 +179,25 @@ export class ActorHandle implements MeshActor {
   markUnkillable(): void {
     this.send({ type: "unkillable" });
   }
-  // The synchronous preemption contract cannot truthfully acknowledge child execution.
-  // Keep responsive preemption unsupported until that contract becomes asynchronous.
+  /**
+   * A follower confirms effective preemption asynchronously. Returning false
+   * here keeps ActorMesh from writing `run_preempted` before that confirmation.
+   * Queued admissions are a leader-owned resource, so they can be promoted
+   * directly without asking the follower to guess at a promise-backed gate.
+   */
   preemptForResponsive(): { preempted: false } {
+    if (this.closed || !this.channel.connected || this.stateStale) {
+      // A run admitted before a transport loss may still be executing on the
+      // follower (#381). Decide against the state it reports after reattaching
+      // rather than against the idle the leader booked at disconnect.
+      this.pendingPreempt = true;
+      this.log.info("remote_preempt_deferred", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      return { preempted: false };
+    }
+    this.applyPreempt();
     return { preempted: false };
   }
 
@@ -157,9 +205,27 @@ export class ActorHandle implements MeshActor {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    this.pendingPreempt = false;
+    this.pendingQueuedPromotion = false;
+    this.outstandingPreempt = undefined;
     // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
+  }
+
+  /** A transport loss is recoverable: keep only what attachHost can still act on. */
+  private disconnect(): void {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.startupTimer);
+    // An unanswered preempt is re-decided against the follower's reattach state.
+    this.pendingPreempt ||= this.outstandingPreempt !== undefined;
+    this.outstandingPreempt = undefined;
+    // The follower's queued admission is rejected on reconnect; its replacement
+    // re-derives priority from the durable inbox, so nothing is left to promote.
+    this.pendingQueuedPromotion = false;
+    // Keep running slots occupied until the remote actor releases them or exits.
+    for (const gate of this.gates.values()) gate.handle.cancel?.();
   }
 
   private releaseGates(): void {
@@ -197,7 +263,11 @@ export class ActorHandle implements MeshActor {
 
   private fail(error: Error): void {
     if (this.closed) return;
-    this.close();
+    // On a live channel the leader is giving up on this follower actor (startup
+    // timeout, fatal, protocol error) and must tell it to stop. A dead channel is
+    // a transport loss that attachHost can still recover.
+    if (this.channel.connected) this.close();
+    else this.disconnect();
     this.opts.onFailure(error);
     // A connection or startup failure is not itself a run outcome. Only a run
     // the leader actually admitted is terminated here, so an idle disconnect or
@@ -267,11 +337,69 @@ export class ActorHandle implements MeshActor {
     });
   }
 
-  private send(message: LeaderCommand): void {
-    if (this.channel.connected)
-      this.channel.send(message, (error) => {
-        if (error) this.fail(error);
-      });
+  /**
+   * The wake itself is not durable state: the inbox entry behind it is, and
+   * the follower's re-register re-derives its priority from there.
+   */
+  private reportDroppedWake(nudge?: RunNudge): void {
+    this.log.warn("remote_wake_dropped", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      priority: nudge?.priority ?? "normal",
+    });
+  }
+
+  /** Displace whatever the follower's latest state report says is in the way. */
+  private applyPreempt(): void {
+    if (this.isQueued) {
+      if (!this.promoteQueuedAdmissions()) this.pendingQueuedPromotion = true;
+    } else if (this.isRunning) {
+      this.sendPreempt();
+    }
+  }
+
+  /** Promote the leader's real admission handle, not the follower's async gate wrapper. */
+  private promoteQueuedAdmissions(): boolean {
+    let promoted = false;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started) continue;
+      gate.admission.responsive = true;
+      gate.handle.promote();
+      promoted = true;
+    }
+    if (promoted) this.logAdmissionPromoted();
+    return promoted;
+  }
+
+  private logAdmissionPromoted(): void {
+    this.log.info("remote_admission_promoted", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+    });
+  }
+
+  /** Ask once; the follower's answer to the open request covers every item behind it. */
+  private sendPreempt(): void {
+    if (this.outstandingPreempt !== undefined) return;
+    const requestId = ++this.preemptSequence;
+    if (!this.send({ type: "preempt", requestId })) {
+      this.pendingPreempt = true;
+      return;
+    }
+    this.outstandingPreempt = requestId;
+    this.log.info("remote_preempt_requested", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId,
+      phase: this.state,
+    });
+  }
+
+  private send(message: LeaderCommand): boolean {
+    if (!this.channel.connected) return false;
+    return this.channel.send(message, (error) => {
+      if (error) this.fail(error);
+    });
   }
 
   private receive(message: ActorEvent): void | Promise<void> {
@@ -285,7 +413,41 @@ export class ActorHandle implements MeshActor {
       case "state":
         this.state = message.state;
         this.yielded = message.yielded;
+        this.stateStale = false;
+        if (message.state !== "queued") this.pendingQueuedPromotion = false;
+        if (this.pendingPreempt) {
+          this.pendingPreempt = false;
+          this.applyPreempt();
+        }
+        // Any wake held since reattach is now ordered behind the preempt decision.
+        this.settleState?.();
         ctx.onRuntimeStateChanged(message.state);
+        break;
+      case "preempted":
+        // Only the open request is answerable; an answer from before a reattach
+        // describes a request this generation already re-decided.
+        if (message.requestId !== this.outstandingPreempt) break;
+        this.outstandingPreempt = undefined;
+        if (message.preempted && message.phase) {
+          ctx.mesh.recordEvent({
+            kind: "run_preempted",
+            actorId: this.id,
+            detail: message.phase,
+            payload: JSON.stringify({ reason: "responsive_notification" }),
+          });
+          this.log.info("remote_preempt_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+            phase: message.phase,
+          });
+        } else {
+          this.log.info("remote_preempt_not_effective", {
+            actorId: this.id,
+            target: this.opts.target ?? this.channel.nodeId,
+            requestId: message.requestId,
+          });
+        }
         break;
       case "session":
         this.opts.saveSession(message.sessionId);
@@ -420,13 +582,21 @@ export class ActorHandle implements MeshActor {
               break;
             case "admit": {
               return (async () => {
+                // A responsive item that landed between the follower's queued
+                // report and this request is admitted at the priority it asked
+                // for, not the one the follower knew about when it asked.
+                const admission = { responsive: request.responsive || this.pendingQueuedPromotion };
+                if (this.pendingQueuedPromotion) {
+                  this.pendingQueuedPromotion = false;
+                  if (!request.responsive) this.logAdmissionPromoted();
+                }
                 // A remote actor's provider gate lives here, not inside the
                 // follower. Recheck host authority immediately before reserving
                 // capacity so ordinary work queued before voice opens cannot
                 // cross the boundary after it changes.
                 if (
                   !(await (ctx.admitRun?.({
-                    responsive: request.responsive,
+                    responsive: admission.responsive,
                     mode: request.mode,
                   }) ?? true))
                 ) {
@@ -446,7 +616,7 @@ export class ActorHandle implements MeshActor {
                     // newly opened voice session.
                     if (
                       !(await (ctx.admitRun?.({
-                        responsive: request.responsive,
+                        responsive: admission.responsive,
                         mode: request.mode,
                       }) ?? true))
                     ) {
@@ -459,14 +629,18 @@ export class ActorHandle implements MeshActor {
                     this.send({
                       type: "reply",
                       requestId,
-                      value: { ...this.opts.snapshot(), selected },
+                      value: {
+                        ...this.opts.snapshot(),
+                        selected,
+                        responsive: admission.responsive,
+                      },
                     });
                     await finished;
                   },
                   request.candidates,
-                  request.responsive
+                  admission.responsive
                 );
-                this.gates.set(requestId, { handle, release });
+                this.gates.set(requestId, { handle, release, admission });
                 void handle.result.catch((error: Error) => {
                   this.gates.delete(requestId);
                   this.send({ type: "reply", requestId, error: error.message });

@@ -4,13 +4,14 @@ import {
   type InboxActorWork,
   type InboxAppendInput,
   type InboxEntry,
+  type InboxItemsAppendedListener,
   type InboxListOptions,
   type InboxPage,
   type InboxPayload,
-  type InboxStore,
+  type InboxRepository,
   type MarkHandledResult,
   validateInboxPayload,
-} from "../../actor/inbox-store.js";
+} from "../../repositories/inbox-repository.js";
 
 interface InboxRow {
   id: string;
@@ -57,15 +58,42 @@ function toEntry(row: InboxRow): InboxEntry {
   };
 }
 
+/**
+ * Receives an error thrown by an `onItemsAppended` listener. The notification
+ * is advisory, so a listener failure is reported here rather than surfaced to
+ * the appending caller, whose write has already committed.
+ */
+export type InboxListenerErrorHandler = (error: unknown) => void;
+
 /** SQLite implementation of the actor inbox persistence seam. */
-export class InboxRepository implements InboxStore {
+export class SqliteInboxRepository implements InboxRepository {
+  private readonly listeners = new Set<InboxItemsAppendedListener>();
+  private onListenerError: InboxListenerErrorHandler = () => {};
+
   constructor(
     private readonly db: Database.Database,
     private readonly now: () => Date = () => new Date()
   ) {}
 
+  /**
+   * Journal listener failures. Set from the composition root the way
+   * `ActorMesh`'s own log is, so a dropped advisory nudge is visible in the
+   * running service rather than only under test; until it is set, a failure is
+   * contained silently and durable recovery remains the authority.
+   */
+  setListenerErrorHandler(handler: InboxListenerErrorHandler): void {
+    this.onListenerError = handler;
+  }
+
   append(inputs: InboxAppendInput[]): InboxEntry[] {
     if (inputs.length === 0) return [];
+    // Inside an enclosing transaction the write would be only a savepoint whose
+    // fate the outer caller decides, so no after-commit notification could be
+    // honest, and a silently deferred row is reconciled only by the next
+    // boot/resume sweep. Refuse before any write rather than defer.
+    if (this.db.inTransaction) {
+      throw new Error("inbox append must not run inside an enclosing transaction");
+    }
     const insert = this.db.prepare(
       `INSERT INTO actor_inbox_entries
         (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
@@ -86,8 +114,8 @@ export class InboxRepository implements InboxStore {
         payload: input.payload,
       };
     });
-    const insertedIds = this.db.transaction(() => {
-      const inserted = new Set<string>();
+    const inserted = this.db.transaction(() => {
+      const insertedRows: InboxEntry[] = [];
       for (const row of rows) {
         const result = insert.run(
           row.id,
@@ -96,13 +124,29 @@ export class InboxRepository implements InboxStore {
           row.deliveredAt.toISOString(),
           JSON.stringify(row.payload)
         );
-        if (result.changes === 1) inserted.add(row.id);
+        if (result.changes === 1) {
+          insertedRows.push({
+            ...row,
+            seenAt: null,
+            handledAt: null,
+            handledNote: null,
+          });
+        }
       }
-      return inserted;
+      return insertedRows;
     })();
-    return rows
-      .filter((row) => insertedIds.has(row.id))
-      .map((row) => ({ ...row, seenAt: null, handledAt: null, handledNote: null }));
+    // Notify only once the rows are durable: the transaction above has
+    // committed, and nothing here is awaited, so the appending caller's own
+    // wake still follows in the same turn.
+    if (inserted.length > 0) this.notifyItemsAppended(inserted);
+    return inserted;
+  }
+
+  onItemsAppended(listener: InboxItemsAppendedListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   list(actorId: string, options: InboxListOptions = {}): InboxPage {
@@ -252,6 +296,26 @@ export class InboxRepository implements InboxStore {
         };
       });
     })();
+  }
+
+  /**
+   * Advisory delivery after commit. A listener that throws must neither undo
+   * the durable write nor starve the listeners after it, so each failure is
+   * contained and reported through `onListenerError`. A failure in the error
+   * reporter itself is similarly contained.
+   */
+  private notifyItemsAppended(items: readonly InboxEntry[]): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(items);
+      } catch (error) {
+        try {
+          this.onListenerError(error);
+        } catch {
+          // A throwing reporter must neither escape append nor starve later listeners.
+        }
+      }
+    }
   }
 
   private actorsWithPending(where: string): InboxActorWork[] {

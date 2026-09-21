@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { InboxEntry } from "../actor/inbox-store.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { compareInboxPriority, selectPrioritizedInboxItem } from "./inbox-selection.js";
 
 function makeEntry(

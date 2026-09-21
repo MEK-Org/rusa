@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
-import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
+import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -33,7 +33,7 @@ export interface InboxMcpRunScope {
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
 export function createInboxMcpServer(
-  store: InboxStore,
+  store: InboxRepository,
   actorId: string,
   runScope?: InboxMcpRunScope
 ): McpServer {

@@ -21,6 +21,11 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import type {
+  InboxEntry,
+  InboxPayload,
+  InboxRepository,
+} from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
   deduplicatedInboxEntryId,
@@ -80,7 +85,6 @@ import {
   STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
-import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
 import {
   DROPPED_MESSAGE_DETAIL,
   type MeshEventSink,
@@ -733,7 +737,7 @@ export interface ActorMeshOptions {
    */
   obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
-  inboxStore?: InboxStore;
+  inboxStore?: InboxRepository;
   /** Optional voice pool for newly spawned actors. */
   supportedVoices?: readonly VoiceDefinition[];
   /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
@@ -882,7 +886,7 @@ export class ActorMesh {
   private readonly obligations?: MeshObligationPort;
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
-  private readonly inboxStore?: InboxStore;
+  private readonly inboxStore?: InboxRepository;
   private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
@@ -1263,6 +1267,20 @@ export class ActorMesh {
       // failure-isolated while making the missed nudge journal-visible.
       this.log(`inbox reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * The nudge a re-attached actor should receive for the work it already holds.
+   * A wake lost in transit is not durable, but the inbox entry behind it is: a
+   * responsive entry still unhandled after the gap earns the responsive wake
+   * (quick start and preemption) it would have had on first delivery.
+   */
+  durableInboxNudge(actorId: string): RunNudge {
+    if (!this.inboxStore) return {};
+    actorId = this.resolveThreadId(actorId);
+    return this.inboxStore.countUnhandled(actorId, { responsiveOnly: true }) > 0
+      ? { priority: "responsive" }
+      : {};
   }
 
   /** Resume recovery: nudge only work that never passed a pre-run halt gate. */
