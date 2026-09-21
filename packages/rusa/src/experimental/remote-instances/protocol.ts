@@ -7,6 +7,9 @@ import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/t
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
 export const INSTANCE_PROTOCOL_VERSION = 4;
+export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
+export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
+  "Coordinator reconnected without the queued admission";
 export interface Bootstrap {
   id: string;
   cwd: string;

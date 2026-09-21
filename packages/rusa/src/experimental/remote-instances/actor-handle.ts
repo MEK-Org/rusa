@@ -7,7 +7,13 @@ import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
-import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
+import {
+  type ActorEvent,
+  type Bootstrap,
+  COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
+  type LeaderCommand,
+  type RunSnapshot,
+} from "./protocol.js";
 
 export interface ActorHandleOptions {
   host: ActorChannel;
@@ -39,6 +45,7 @@ export class ActorHandle implements MeshActor {
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
+  private terminated = false;
   private gates = new Map<
     number,
     {
@@ -134,6 +141,7 @@ export class ActorHandle implements MeshActor {
   }
 
   attachHost(newChannel: ActorChannel): void {
+    if (this.terminated) return;
     this.channel.removeAllListeners();
     this.channel = newChannel;
     this.closed = false;
@@ -217,12 +225,14 @@ export class ActorHandle implements MeshActor {
   }
 
   close(): void {
-    if (this.closed) return;
+    if (this.terminated) return;
+    this.terminated = true;
     this.closed = true;
     clearTimeout(this.startupTimer);
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.outstandingPreempt = undefined;
+    void this.cancelRetainedAdmission();
     // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
@@ -242,9 +252,16 @@ export class ActorHandle implements MeshActor {
       // pacing and concurrency, and a transport loss is not a run outcome. Keep
       // it for the reattach handshake to claim instead of making the run queue
       // again as fresh work (#602).
-      if (!gate.handle.started && this.queuedRunId && !this.retainedAdmission) {
-        this.retainedAdmission = { requestId, runId: this.queuedRunId };
-        continue;
+      if (!gate.handle.started && this.queuedRunId) {
+        if (!this.retainedAdmission) {
+          this.retainedAdmission = { requestId, runId: this.queuedRunId };
+          continue;
+        }
+        this.log.warn("remote_admission_multiple_unstarted", {
+          actorId: this.id,
+          retainedRequestId: this.retainedAdmission.requestId,
+          droppedRequestId: requestId,
+        });
       }
       gate.handle.cancel?.();
     }
@@ -299,8 +316,14 @@ export class ActorHandle implements MeshActor {
       requestId: retained.requestId,
     });
     // Only the run the ticket was reserved for; a later run owns its own end.
-    if (retained.runId !== this.queuedRunId) return;
-    return this.endQueuedRun("start-cancelled", false);
+    if (this.queuedRunId === retained.runId) {
+      return this.endQueuedRun("start-cancelled", false);
+    }
+    return this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId: retained.runId,
+      terminal: { kind: "abandoned", reason: "start-cancelled", started: false },
+    });
   }
 
   private enqueueReceive(message: ActorEvent): void {
@@ -667,7 +690,7 @@ export class ActorHandle implements MeshActor {
                   this.send({
                     type: "reply",
                     requestId,
-                    error: "Coordinator reconnected without the queued admission",
+                    error: COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
                   });
                 }
                 break;

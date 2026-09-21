@@ -3,13 +3,14 @@ import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
 import type { McpServerSpec } from "../../providers/types.js";
-import type {
-  ActorEvent,
-  Bootstrap,
-  LeaderCommand,
-  ProviderFactory,
-  Request,
-  RunSnapshot,
+import {
+  type ActorEvent,
+  type Bootstrap,
+  COORDINATOR_RECONNECTED_ERROR,
+  type LeaderCommand,
+  type ProviderFactory,
+  type Request,
+  type RunSnapshot,
 } from "./protocol.js";
 
 type AdmitRequest = Extract<Request, { op: "admit" }>;
@@ -66,7 +67,7 @@ export function createActorRuntime(
           : undefined;
       for (const [id, call] of pending) {
         if (id === resumed?.id) continue;
-        call.reject(new Error("Coordinator reconnected"));
+        call.reject(new Error(COORDINATOR_RECONNECTED_ERROR));
         pending.delete(id);
       }
       if (bootstrap.mcpServers) {
@@ -159,7 +160,7 @@ export function createActorRuntime(
           } catch (err) {
             if (
               err instanceof Error &&
-              (err.message.includes("Coordinator reconnected") ||
+              (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
                 err.message.includes("Coordinator disconnected"))
             ) {
               throw new RunStartCancelledError();
