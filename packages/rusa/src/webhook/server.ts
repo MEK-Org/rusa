@@ -8,11 +8,7 @@ import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { AvatarGenerationCoordinator } from "../avatar/avatars.js";
 import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
-import {
-  type DashboardDataDeps,
-  handleMeshApiRequest,
-  viewingUserPrincipalId,
-} from "../dashboard/api.js";
+import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
 import {
   getDashboardAsset,
   getDashboardAssetDir,
@@ -25,6 +21,7 @@ import {
   applyBrandingToManifest,
   resolveDashboardBranding,
 } from "../dashboard/branding.js";
+import { viewingUserPrincipalId } from "../dashboard/human-chat-scope.js";
 import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/iu-reports-api.js";
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaApiDeps } from "../dashboard/quota-api.js";
@@ -575,14 +572,19 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   // One coordinator per process: the avatar route starts attempts on it and the
   // SSE hub relays their outcome, so single-flight and the UI's ring agree.
   const avatarGeneration = options.mesh ? new AvatarGenerationCoordinator() : undefined;
+  const principals = options.mesh?.principals ?? options.principals;
   const sseHub = options.mesh
-    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh, avatarGeneration })
+    ? new SseHub(options.mesh.emitter, {
+        runtimeState: options.mesh.mesh,
+        avatarGeneration,
+        principals,
+      })
     : null;
   const dataDeps: DashboardDataDeps | null =
     options.mesh && sseHub
       ? {
           actors: options.mesh.actors,
-          principals: options.mesh.principals ?? options.principals,
+          principals,
           logger: options.logger,
           meshEvents: options.mesh.meshEvents,
           meshChat: options.mesh.meshChat,
@@ -619,7 +621,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
-          principals: options.mesh.principals ?? options.principals,
+          principals,
           logger: log.child({ component: "voice-route" }),
         }
       : null;

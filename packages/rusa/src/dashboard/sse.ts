@@ -1,6 +1,11 @@
 import type { ServerResponse } from "node:http";
 import type { ActorRuntimeStateDelta, ActorRuntimeStateSnapshot } from "../actor/actor-mesh.js";
 import type { AvatarGenerationEvent } from "../avatar/avatars.js";
+import {
+  eventAudience,
+  type HumanChatPrincipalSource,
+  type HumanChatViewer,
+} from "./human-chat-scope.js";
 import type { LiveOutputChunk, MeshEventEmitter } from "./mesh-event-emitter.js";
 
 /**
@@ -104,6 +109,11 @@ class SseClient {
    * `channel` separates the dashboard stream ("mesh": mesh_event + live_output)
    * from the walkie-talkie stream ("voice": reply-TTS announcements only, ISSUE_NUM)
    * — a voice client never receives mesh frames and vice versa.
+   *
+   * `chatViewer`, when present, is the human whose conversations this mesh
+   * client may read: message events about another human principal's
+   * conversation are withheld from it (#590). Absent means unscoped (a caller
+   * that has no principal boundary, such as the root's own tooling).
    */
   constructor(
     private readonly res: ServerResponse,
@@ -114,7 +124,8 @@ class SseClient {
      * it deterministically even on the write-throw path (no req close event). */
     private readonly onClose?: () => void,
     /** Stable leased-session id for targeted voice handoff controls. */
-    readonly voiceSessionId?: string
+    readonly voiceSessionId?: string,
+    readonly chatViewer?: HumanChatViewer
   ) {}
 
   wantsLiveOutput(actorId: string): boolean {
@@ -205,6 +216,12 @@ export interface SseHubOptions {
   avatarGeneration?: {
     onStateChange(listener: (event: AvatarGenerationEvent) => void): () => void;
   };
+  /**
+   * Durable user storage, consulted once per message event to decide which
+   * scoped clients may receive it (#590). Absent reads as "no durable users",
+   * the same footing the HTTP read routes take without principal storage.
+   */
+  principals?: HumanChatPrincipalSource;
 }
 
 /**
@@ -219,6 +236,7 @@ export class SseHub {
   private readonly unsubscribers: Array<() => void> = [];
   private readonly liveBuffer: LiveOutputBuffer;
   private readonly runtimeState: SseHubOptions["runtimeState"];
+  private readonly principals: SseHubOptions["principals"];
 
   private readonly maxClients: number;
   private readonly maxQueuePerClient: number;
@@ -230,6 +248,7 @@ export class SseHub {
     this.maxClients = opts.maxClients ?? DEFAULT_MAX_CLIENTS;
     this.maxQueuePerClient = opts.maxQueuePerClient ?? DEFAULT_MAX_QUEUE;
     this.runtimeState = opts.runtimeState;
+    this.principals = opts.principals;
     this.liveBuffer = new LiveOutputBuffer({ maxChunksPerActor: opts.maxChunksPerActor });
     // One subscription per channel; fan out to the client set. Each per-client
     // write is isolated so one dead socket can't break the emit (which runs
@@ -237,8 +256,11 @@ export class SseHub {
     this.unsubscribers.push(
       this.emitter.onMeshEvent((event) => {
         const text = frame("mesh_event", event);
+        // One audience decision per event, not one principal read per client.
+        const admits = eventAudience(event, this.principals);
         for (const client of this.clients) {
           if (client.channel !== "mesh") continue;
+          if (client.chatViewer && !admits(client.chatViewer)) continue;
           try {
             client.send(text);
           } catch {
@@ -302,10 +324,16 @@ export class SseHub {
   /**
    * Attach a new SSE connection. Writes the SSE headers, registers the client,
    * and wires teardown on socket close/error/abort. Returns false (and 503s) if
-   * the connection cap is reached.
+   * the connection cap is reached. `chatViewer` is the human behind the
+   * connection; message frames about another human's conversation never reach
+   * it (#590).
    */
-  addConnection(res: ServerResponse, actors: Set<string> | null): boolean {
-    return this.attach(res, actors, "mesh");
+  addConnection(
+    res: ServerResponse,
+    actors: Set<string> | null,
+    chatViewer?: HumanChatViewer
+  ): boolean {
+    return this.attach(res, actors, "mesh", undefined, undefined, chatViewer);
   }
 
   /**
@@ -360,7 +388,8 @@ export class SseHub {
     actors: Set<string> | null,
     channel: "mesh" | "voice",
     onClose?: () => void,
-    voiceSessionId?: string
+    voiceSessionId?: string,
+    chatViewer?: HumanChatViewer
   ): boolean {
     if (this.clients.size >= this.maxClients) {
       res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
@@ -390,7 +419,8 @@ export class SseHub {
         this.remove(client);
         onClose?.();
       },
-      voiceSessionId
+      voiceSessionId,
+      chatViewer
     );
     if (channel === "mesh" && this.runtimeState) {
       client.send(frame("hello", { streamId: this.runtimeState.runtimeStateSnapshot().streamId }));
