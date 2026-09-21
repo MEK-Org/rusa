@@ -25,6 +25,12 @@ export interface Bootstrap {
   >;
   /** True when reconnecting to an existing actor runtime (avoids duplicate host error). */
   reconnect?: boolean;
+  /**
+   * True when the leader kept an unstarted admission for this actor across the
+   * transport loss. The follower answers by re-announcing that one pending
+   * request; every other pending call is still rejected on reconnect.
+   */
+  resumeAdmission?: boolean;
 }
 
 export interface RunSnapshot {
@@ -62,6 +68,11 @@ export type Request =
       responsive: boolean;
       /** The final admission check must distinguish ordinary work from session work. */
       mode: ActorRunMode;
+      /**
+       * True when this is the follower re-announcing an admission the leader
+       * retained, under the request id the leader's gate still answers on.
+       */
+      resume?: boolean;
     }
   | { op: "sendMessage"; to: string; body: string };
 

@@ -2,16 +2,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { createHarness, waitUntil } from "./harness.js";
 
 const instances: ReturnType<typeof createHarness>[] = [];
 const dirs: string[] = [];
-function setup(options: { delayMs?: number; failInit?: boolean } = {}) {
+function setup(options: { delayMs?: number; failInit?: boolean; pacer?: ProviderPacer } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
   dirs.push(cwd);
   const h = createHarness({
     cwd,
     delayMs: options.delayMs ?? 25,
+    pacer: options.pacer,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -308,13 +310,16 @@ describe("monolithic follower instance", () => {
     expect(h.meshEvents.some((event) => event.kind === "run_preempted")).toBe(false);
   });
 
-  it("runs a responsive replacement after a queued admission is rejected on reconnect", async () => {
+  it("resumes a promoted queued admission after a lease flap", async () => {
     const h = setup({ delayMs: 1500 });
     const first = h.spawn("Occupy concurrency");
     await waitUntil(() => h.runtime(first).isRunning);
 
     const queued = h.spawn("Await admission");
     await waitUntil(() => h.runtime(queued).isQueued);
+    const queuedRun = h.events.find(
+      (event) => event.actorId === queued && event.event.type === "queued"
+    )?.event;
 
     // Responsive work arrives while awaiting admission
     h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
@@ -323,20 +328,17 @@ describe("monolithic follower instance", () => {
     h.remote.close();
     await h.runtime(queued).exited;
 
-    expect(h.meshEvents).toContainEqual(
-      expect.objectContaining({
-        kind: "run_abandoned",
-        actorId: queued,
-        detail: "start-cancelled",
-      })
-    );
+    // The admission is the leader's own: the transport loss does not end the
+    // run holding it, so nothing is booked as abandoned here.
+    expect(h.meshEvents.filter((event) => event.kind === "run_abandoned")).toEqual([]);
 
     const beforeReattach = h.events.length;
     const reconnect = h.reconnect();
     h.runtime(first).attachHost(reconnect.createHost(first));
     h.runtime(queued).attachHost(reconnect.createHost(queued));
 
-    // Prove a responsive replacement runs after the old admission rejection
+    // The run that starts is the one queued before the flap, still carrying the
+    // responsive priority the leader granted its admission before the loss.
     await waitUntil(() =>
       h.events
         .slice(beforeReattach)
@@ -344,6 +346,12 @@ describe("monolithic follower instance", () => {
           (event) =>
             event.actorId === queued && event.event.type === "runStart" && event.event.responsive
         )
+    );
+    const started = h.events
+      .slice(beforeReattach)
+      .find((event) => event.actorId === queued && event.event.type === "runStart")?.event;
+    expect(started?.type === "runStart" && started.runId).toBe(
+      queuedRun?.type === "queued" && queuedRun.runId
     );
   });
 
@@ -404,6 +412,60 @@ describe("monolithic follower instance", () => {
           (event) =>
             event.actorId === id && event.event.type === "result" && event.event.result.success
         )
+    );
+  });
+
+  it("keeps a queued run waiting in provider pacing across a lease flap", async () => {
+    // The lane is busy until well after the flap, so the run spends the whole
+    // disconnect/reconnect cycle holding a place it has not reached yet.
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 500);
+    const h = setup({ pacer });
+
+    const id = h.spawn("Wait out the pacing gap");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+    const queuedRunId = h.events.find(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )?.event;
+    expect(queuedRunId?.type === "queued" && queuedRunId.runId).toBeTruthy();
+
+    // Lease flap: the transport drops and comes back inside the pacing wait.
+    h.remote.close();
+    await h.runtime(id).exited;
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    // What start.ts does on register: re-derive the wake from the durable inbox.
+    h.mesh.notifyInboxChanged(id);
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    // The run the leader queued before the flap is the run that starts.
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "runStart")
+    );
+    const started = h.events.find(
+      (event) => event.actorId === id && event.event.type === "runStart"
+    )?.event;
+    expect(started?.type === "runStart" && started.runId).toBe(
+      queuedRunId?.type === "queued" && queuedRunId.runId
+    );
+    // A transport loss is not a run outcome, and the admission it interrupted
+    // is the same one: the run never re-entered the pacer as fresh work.
+    expect(h.meshEvents.filter((event) => event.kind === "run_abandoned")).toEqual([]);
+    // The follower asked to be admitted once and then re-announced that same
+    // request after the flap; it never queued behind the pacer as fresh work.
+    const admits = h.events.flatMap((entry) =>
+      entry.event.type === "request" && entry.event.request.op === "admit"
+        ? [{ requestId: entry.event.requestId, resume: entry.event.request.resume === true }]
+        : []
+    );
+    expect(admits).toHaveLength(2);
+    expect(admits[0].resume).toBe(false);
+    expect(admits[1]).toEqual({ requestId: admits[0].requestId, resume: true });
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id && event.event.type === "result" && event.event.result.success
+      )
     );
   });
 

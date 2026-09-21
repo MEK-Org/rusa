@@ -12,6 +12,8 @@ import type {
   RunSnapshot,
 } from "./protocol.js";
 
+type AdmitRequest = Extract<Request, { op: "admit" }>;
+
 /** One ordinary Actor inside the follower process. No process-global handlers or exits. */
 export function createActorRuntime(
   createProvider: ProviderFactory,
@@ -28,6 +30,8 @@ export function createActorRuntime(
   // provider gate. Carry its mode to the leader's final admission boundary.
   let pendingRunMode: ActorRunMode = "ordinary";
   let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
+  /** The admission request in flight, which a reconnecting leader can resume. */
+  let pendingAdmission: { id: number; request: AdmitRequest } | undefined;
   const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0) {
@@ -53,8 +57,18 @@ export function createActorRuntime(
   async function initialize(bootstrap: Bootstrap): Promise<void> {
     if (stopping) return;
     if (actor) {
-      for (const call of pending.values()) call.reject(new Error("Coordinator reconnected"));
-      pending.clear();
+      // The leader can keep one unstarted admission across a transport loss.
+      // That request is still pending here, so re-announcing it is what claims
+      // the ticket; anything else the old connection owed is unrecoverable.
+      const resumed =
+        bootstrap.resumeAdmission && pendingAdmission && pending.has(pendingAdmission.id)
+          ? pendingAdmission
+          : undefined;
+      for (const [id, call] of pending) {
+        if (id === resumed?.id) continue;
+        call.reject(new Error("Coordinator reconnected"));
+        pending.delete(id);
+      }
       if (bootstrap.mcpServers) {
         mcpServers.splice(0, mcpServers.length, ...bootstrap.mcpServers);
       }
@@ -62,6 +76,15 @@ export function createActorRuntime(
         sessionId = bootstrap.sessionId;
       }
       send({ type: "ready", pid: process.pid });
+      // Claim the retained admission before reporting state: the leader drops
+      // an unclaimed ticket at its first post-reattach state report.
+      if (resumed) {
+        send({
+          type: "request",
+          requestId: resumed.id,
+          request: { ...resumed.request, resume: true },
+        });
+      }
       send({ type: "state", state: lastRuntimeState, yielded: actor.isYielded });
       return;
     }
@@ -121,12 +144,14 @@ export function createActorRuntime(
       },
       gate: async (fn, candidates, responsive) => {
         activeGates++;
-        const admission = request<RunSnapshot | { deferred: true }>({
+        const admitRequest: AdmitRequest = {
           op: "admit",
           candidates: [...candidates],
           responsive,
           mode: pendingRunMode,
-        });
+        };
+        const admission = request<RunSnapshot | { deferred: true }>(admitRequest);
+        pendingAdmission = { id: admission.id, request: admitRequest };
         try {
           let admitted: RunSnapshot | { deferred: true };
           try {
@@ -154,6 +179,7 @@ export function createActorRuntime(
           // The leader's pacing gate owns selection; the follower runs what it reserved.
           return await fn(snapshot.selected ?? candidates[0]);
         } finally {
+          if (pendingAdmission?.id === admission.id) pendingAdmission = undefined;
           send({ type: "release", requestId: admission.id });
           activeGates--;
           finishClose();
