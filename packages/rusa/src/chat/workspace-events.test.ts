@@ -14,6 +14,7 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 /** The subscriber's own constants, restated so a test reads as wall-clock. */
 const TTL_MS = 4 * HOUR;
+const RENEW_MS = TTL_MS / 2;
 const FIRST_RETRY_MS = 5 * SECOND;
 const MAX_RETRY_MS = 5 * MINUTE;
 const CREATE_VISIBILITY_WINDOW_MS = MINUTE;
@@ -471,6 +472,108 @@ describe("WorkspaceEventsSubscriber", () => {
     expect(api.count("POST", "/subscriptions")).toBe(3);
     expect(records.at(-1)?.event).toBe("chat_subscription_created");
     await sub.close();
+  });
+
+  it("stops the retry loop on close after a failed first pass", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([]);
+    api.createStatus = 503;
+    const sub = makeSubscriber(api);
+
+    await sub.start();
+    // The retry the failed boot armed is the whole point of the loop; disposal
+    // has to take it back down, or a stopped service keeps calling the API.
+    const callsAtClose = api.calls.length;
+    await sub.close();
+
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+    expect(api.calls).toHaveLength(callsAtClose);
+    expect(sub.currentSubscription).toBeNull();
+  });
+
+  it("close returns with the request in flight still outstanding, and the pass that resumes is inert", async () => {
+    vi.useFakeTimers();
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([activeSub("subscriptions/stuck")]);
+    api.renewStatus = 500;
+    // A request that never answers on its own: shutdown must not wait on it.
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, {
+      logger,
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+
+    await sub.start();
+    // A TTL of failing renewals: the next failed pass is the one that would alert.
+    await vi.advanceTimersByTimeAsync(TTL_MS);
+    expect(alerts).toEqual([]);
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
+    const callsWhileStalled = api.calls.length;
+    const recordsWhileStalled = records.length;
+
+    // Bounded: close comes back while the request is still outstanding.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Inert: the request it was already holding lands, and then nothing — no
+    // follow-up call, no lapse alert, no successor armed. Its failure is a
+    // debug record, not a `*_failed` warn or a `lapsed` error.
+    openGate();
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+    expect(api.calls).toHaveLength(callsWhileStalled + 1);
+    expect(api.calls.at(-1)?.method).toBe("GET");
+    expect(alerts).toEqual([]);
+    expect(
+      records.slice(recordsWhileStalled).map((record) => [record.level, record.event])
+    ).toEqual([["debug", "chat_subscription_pass_abandoned"]]);
+  });
+
+  it("refuses to start again after close, so an abandoned pass is never un-gated", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([activeSub("subscriptions/stuck")]);
+    // Hold the list open across close(): the pass is abandoned mid-request.
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const sub = makeSubscriber(api);
+
+    await sub.start();
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    await vi.advanceTimersByTimeAsync(RENEW_MS);
+    const callsWhileStalled = api.calls.length;
+    await sub.close();
+
+    // A restart on a disposed instance is a no-op: it runs no boot pass of its
+    // own, and it does not flip the gate the abandoned pass is held behind.
+    const restarted = sub.start();
+    openGate();
+    await restarted;
+    await vi.advanceTimersByTimeAsync(4 * RENEW_MS);
+    expect(api.calls).toHaveLength(callsWhileStalled + 1);
+    expect(api.calls.at(-1)?.method).toBe("GET");
   });
 
   it("backs off exponentially to a ceiling and starts over after a success", async () => {
