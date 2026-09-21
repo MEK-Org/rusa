@@ -377,7 +377,7 @@ describe("monolithic follower instance", () => {
     h.remote.close();
     await h.runtime(id).exited;
 
-    // The leader records run_abandoned with start-cancelled, started: false (exact fe5e367d pattern)
+    // The leader records run_abandoned with start-cancelled, started: false (synthetic fixture pattern)
     expect(h.meshEvents).toContainEqual(
       expect.objectContaining({
         kind: "run_abandoned",
