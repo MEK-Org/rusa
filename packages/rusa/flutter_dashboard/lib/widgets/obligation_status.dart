@@ -153,32 +153,35 @@ class ObligationStatusChip extends StatelessWidget {
           border: bordered ? Border.all(color: colors.chipBorder) : null,
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Text(
-          obligationStatusLabel(obligation, state),
-          style: kMonoStyle.copyWith(
-            color: colors.chipForeground,
-            fontSize: 10,
-            fontWeight: bordered ? FontWeight.w600 : FontWeight.w700,
-            letterSpacing: bordered ? 0 : 0.5,
-          ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (obligation.effectiveResponsive) ...[
+              _ResponsiveBolt(
+                obligation: obligation,
+                color: colors.chipForeground,
+                size: 12,
+              ),
+              const SizedBox(width: 2),
+            ],
+            Text(
+              obligationStatusLabel(obligation, state),
+              style: kMonoStyle.copyWith(
+                color: colors.chipForeground,
+                fontSize: 10,
+                fontWeight: bordered ? FontWeight.w600 : FontWeight.w700,
+                letterSpacing: bordered ? 0 : 0.5,
+              ),
+            ),
+          ],
         ),
       );
-      return Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          statusChip,
-          if (obligation.effectiveResponsive) ...[
-            const SizedBox(height: 4),
-            ObligationResponsiveBadge(obligation: obligation),
-          ],
-        ],
-      );
+      return statusChip;
     },
   );
 }
 
-/// The 8px status dot beside a node in the work tree.
+/// The status dot (or responsive bolt) beside a node in the work tree.
 class ObligationStatusDot extends StatelessWidget {
   const ObligationStatusDot({
     super.key,
@@ -193,26 +196,37 @@ class ObligationStatusDot extends StatelessWidget {
   Widget build(BuildContext context) => ObligationPresentationBuilder(
     obligation: obligation,
     store: store,
-    builder: (context, state) => Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(
-        color: ObligationStatusColors.of(state).dot,
-        shape: BoxShape.circle,
-      ),
-    ),
+    builder: (context, state) => obligation.effectiveResponsive
+        ? _ResponsiveBolt(
+            obligation: obligation,
+            color: ObligationStatusColors.of(state).dot,
+            size: 14,
+          )
+        : Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: ObligationStatusColors.of(state).dot,
+              shape: BoxShape.circle,
+            ),
+          ),
   );
 }
 
-/// Responsiveness is a scheduling property, separate from lifecycle status.
-class ObligationResponsiveBadge extends StatelessWidget {
-  const ObligationResponsiveBadge({super.key, required this.obligation});
+/// Responsiveness modifies the status icon while retaining its lifecycle color.
+class _ResponsiveBolt extends StatelessWidget {
+  const _ResponsiveBolt({
+    required this.obligation,
+    required this.color,
+    required this.size,
+  });
 
   final ObligationDto obligation;
+  final Color color;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
-    if (!obligation.effectiveResponsive) return const SizedBox.shrink();
     final label = obligation.responsive == true
         ? 'Responsive: prioritized for immediate attention'
         : 'Responsive: inherited from a parent obligation';
@@ -223,28 +237,7 @@ class ObligationResponsiveBadge extends StatelessWidget {
         container: true,
         label: label,
         excludeSemantics: true,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-          decoration: BoxDecoration(
-            color: const Color(0xFF78350F),
-            borderRadius: BorderRadius.circular(4),
-          ),
-          child: const Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.bolt, size: 12, color: Color(0xFFFBBF24)),
-              SizedBox(width: 2),
-              Text(
-                'RESPONSIVE',
-                style: TextStyle(
-                  fontSize: 9,
-                  fontWeight: FontWeight.w700,
-                  color: Color(0xFFFBBF24),
-                ),
-              ),
-            ],
-          ),
-        ),
+        child: Icon(Icons.bolt, size: size, color: color),
       ),
     );
   }
