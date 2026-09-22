@@ -37,6 +37,13 @@ export interface RunQuotaCoordinatorOptions {
   legacyDatabasePath?: string;
   /** Perform the scheduled stage-3 flip (§8.3) before opening the service-owned database. */
   relocate?: boolean;
+  /** Stage-0 rollout mode: serve copied durable data without collecting new probes. */
+  probeOff?: boolean;
+}
+
+/** A running coordinator, exposed so integration callers can stop it cleanly. */
+export interface RunningQuotaCoordinator {
+  stop(): Promise<void>;
 }
 
 /**
@@ -208,10 +215,13 @@ export function coordinatorProviderLanes(config: RusaConfig): {
   return { configuredProviders, collectionProviders };
 }
 
-export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
+export async function startQuotaCoordinator(
+  opts: RunQuotaCoordinatorOptions = {}
+): Promise<RunningQuotaCoordinator> {
   const log = createLogger({ context: { component: "quota-coordinator" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
+  const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
 
   const socketPath = resolveQuotaCoordinatorSocketPath(config, opts.socketPath);
 
@@ -231,126 +241,148 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
   }
 
   try {
+    loadCoordinatorModelCatalogs(mcHome);
+  } catch (err) {
+    // No catalog is safer than a guessed catalog: parsing then retains only
+    // provider-wide windows. Keep service startup available when an old or
+    // unavailable local model-history DB cannot be read.
+    log.warn("Unable to load durable model catalog; model quota windows will be suppressed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // Check schema version on a bare readonly connection before constructing SharedQuotaStore
+  // so rollback attempts never execute WAL conversions or ALTER/CREATE statements
+  if (existsSync(databasePath)) {
+    const probeDb = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
-      loadCoordinatorModelCatalogs(mcHome);
-    } catch (err) {
-      // No catalog is safer than a guessed catalog: parsing then retains only
-      // provider-wide windows. Keep service startup available when an old or
-      // unavailable local model-history DB cannot be read.
-      log.warn("Unable to load durable model catalog; model quota windows will be suppressed", {
-        error: err instanceof Error ? err.message : String(err),
+      assertQuotaSchemaVersion(probeDb, QUOTA_SCHEMA_VERSION);
+    } finally {
+      probeDb.close();
+    }
+  }
+
+  const maxIntervalSeconds =
+    config.quota?.throttle?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
+  const staleAfterMs = config.quota?.throttle?.tickSeconds
+    ? config.quota.throttle.tickSeconds * 3 * 1000
+    : DEFAULT_STALE_AFTER_MS;
+
+  const store = new SharedQuotaStore(databasePath);
+  const metrics = createQuotaMetrics(log);
+  store.setMetrics(metrics);
+
+  const configuredBackupDir = config.quota?.coordinator?.backupDir?.trim();
+  const backupDir = configuredBackupDir
+    ? isAbsolute(configuredBackupDir)
+      ? configuredBackupDir
+      : resolve(mcHome, configuredBackupDir)
+    : defaultQuotaBackupDir(databasePath);
+  const backupRetention =
+    config.quota?.coordinator?.backupRetention ?? DEFAULT_QUOTA_BACKUP_RETENTION;
+
+  const { configuredProviders, collectionProviders } = coordinatorProviderLanes(config);
+
+  const quotaService = createQuotaService({
+    config,
+    workersDir: join(mcHome, "workers"),
+    scrapeStore: store,
+  });
+  const collection = probeOff
+    ? undefined
+    : new QuotaCollectionLoop({
+        store,
+        quotaService,
+        metrics,
+        providers: collectionProviders,
+        tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
+        maxIntervalSeconds,
+        // The loop publishes the interval and snapshot-age gauges after each
+        // controller step, so it needs the same freshness thresholds the service
+        // serves with; otherwise the gauge and the response would disagree.
+        staleAfterMs,
+        onError: (provider, error) =>
+          log.warn("Quota collection tick failed", {
+            provider,
+            error: error instanceof Error ? error.message : String(error),
+          }),
       });
-    }
-    // Check schema version on a bare readonly connection before constructing SharedQuotaStore
-    // so rollback attempts never execute WAL conversions or ALTER/CREATE statements
-    if (existsSync(databasePath)) {
-      const probeDb = new Database(databasePath, { readonly: true, fileMustExist: true });
-      try {
-        assertQuotaSchemaVersion(probeDb, QUOTA_SCHEMA_VERSION);
-      } finally {
-        probeDb.close();
-      }
-    }
 
-    const maxIntervalSeconds =
-      config.quota?.throttle?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
-    const staleAfterMs = config.quota?.throttle?.tickSeconds
-      ? config.quota.throttle.tickSeconds * 3 * 1000
-      : DEFAULT_STALE_AFTER_MS;
+  const service = new QuotaCoordinatorService({
+    socketPath,
+    store,
+    configuredProviders,
+    maxIntervalSeconds,
+    staleAfterMs,
+    metrics,
+    collectionStats: collection ? () => collection.getAllStats() : undefined,
+  });
+  const backups = new QuotaBackupScheduler({
+    databasePath,
+    backupDir,
+    retain: backupRetention,
+    onBackup: (result) =>
+      log.info("Quota database backed up", {
+        path: result.path,
+        bytes: result.bytes,
+        durationMs: result.durationMs,
+        pruned: result.pruned.length,
+      }),
+    onError: (error) =>
+      log.error("Quota database backup failed", {
+        backupDir,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+  });
 
-    const store = new SharedQuotaStore(databasePath);
-    const metrics = createQuotaMetrics(log);
-    store.setMetrics(metrics);
+  log.info("Starting quota-coordinator service", {
+    socketPath,
+    databasePath,
+    backupDir,
+    probeOff,
+  });
 
-    const configuredBackupDir = config.quota?.coordinator?.backupDir?.trim();
-    const backupDir = configuredBackupDir
-      ? isAbsolute(configuredBackupDir)
-        ? configuredBackupDir
-        : resolve(mcHome, configuredBackupDir)
-      : defaultQuotaBackupDir(databasePath);
-    const backupRetention =
-      config.quota?.coordinator?.backupRetention ?? DEFAULT_QUOTA_BACKUP_RETENTION;
-
-    const { configuredProviders, collectionProviders } = coordinatorProviderLanes(config);
-
-    const quotaService = createQuotaService({
-      config,
-      workersDir: join(mcHome, "workers"),
-      scrapeStore: store,
-    });
-    const collection = new QuotaCollectionLoop({
-      store,
-      quotaService,
-      metrics,
-      providers: collectionProviders,
-      tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
-      maxIntervalSeconds,
-      // The loop publishes the interval and snapshot-age gauges after each
-      // controller step, so it needs the same freshness thresholds the service
-      // serves with; otherwise the gauge and the response would disagree.
-      staleAfterMs,
-      onError: (provider, error) =>
-        log.warn("Quota collection tick failed", {
-          provider,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-    });
-
-    const service = new QuotaCoordinatorService({
-      socketPath,
-      store,
-      configuredProviders,
-      maxIntervalSeconds,
-      staleAfterMs,
-      metrics,
-      collectionStats: () => collection.getAllStats(),
-    });
-    const backups = new QuotaBackupScheduler({
-      databasePath,
-      backupDir,
-      retain: backupRetention,
-      onBackup: (result) =>
-        log.info("Quota database backed up", {
-          path: result.path,
-          bytes: result.bytes,
-          durationMs: result.durationMs,
-          pruned: result.pruned.length,
-        }),
-      onError: (error) =>
-        log.error("Quota database backup failed", {
-          backupDir,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-    });
-
-    log.info("Starting quota-coordinator service", { socketPath, databasePath, backupDir });
-
-    // Order matters, and it is the reverse of what "start the cheap things
-    // first" would suggest. The boot backup runs before the socket is
-    // announced as ready, so the copy it takes is of the database as it was
-    // *before* this process wrote anything to it — which is the copy an
-    // operator restoring after a bad deploy actually wants. Readiness is
-    // logged last for the same reason: a coordinator that says it is ready has
-    // already taken whatever backup this boot owed.
-    await service.start();
+  // Order matters, and it is the reverse of what "start the cheap things
+  // first" would suggest. The boot backup runs before the socket is
+  // announced as ready, so the copy it takes is of the database as it was
+  // *before* this process wrote anything to it — which is the copy an
+  // operator restoring after a bad deploy actually wants. Readiness is
+  // logged last for the same reason: a coordinator that says it is ready has
+  // already taken whatever backup this boot owed.
+  await service.start();
+  if (collection) {
     collection.start();
-    backups.start();
-    log.info("Quota coordinator ready and listening for requests");
+  } else {
+    log.info("Quota probe collection disabled for stage-0 rollout", { probeOff: true });
+  }
+  backups.start();
+  log.info("Quota coordinator ready and listening for requests");
 
-    const shutdown = async () => {
+  return {
+    stop: async () => {
       log.info("Stopping quota-coordinator service...");
       backups.stop();
-      collection.stop();
+      collection?.stop();
       await service.stop();
       store.close();
+    },
+  };
+}
+
+export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
+  try {
+    const running = await startQuotaCoordinator(opts);
+    let stopping = false;
+    const shutdown = async () => {
+      if (stopping) return;
+      stopping = true;
+      await running.stop();
       process.exit(0);
     };
-
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   } catch (err) {
     if (err instanceof SchemaVersionRefusalError) {
-      log.error(err.message);
+      createLogger({ context: { component: "quota-coordinator" } }).error(err.message);
       process.exit(1);
     }
     throw err;
