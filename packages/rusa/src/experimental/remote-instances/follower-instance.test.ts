@@ -133,7 +133,7 @@ describe("monolithic follower instance", () => {
     const id = h.spawn("Replace this run");
     await waitUntil(() => h.runtime(id).isRunning);
 
-    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    h.dispatchResponsive(id);
 
     // The leader has handed a command to its transport, not claimed that an
     // unseen follower/provider abort already happened.
@@ -177,7 +177,7 @@ describe("monolithic follower instance", () => {
     const queued = h.spawn("Promote me");
     await waitUntil(() => h.runtime(queued).isQueued);
 
-    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+    h.dispatchResponsive(queued);
 
     await waitUntil(() =>
       h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
@@ -215,7 +215,7 @@ describe("monolithic follower instance", () => {
     const queued = h.spawn("Promote me before you admit me");
     await waitUntil(() => h.runtime(queued).isQueued && held.length === 1);
 
-    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+    h.dispatchResponsive(queued);
     h.remote.receive = receive;
     for (const event of held.splice(0)) receive(event);
 
@@ -246,7 +246,7 @@ describe("monolithic follower instance", () => {
     // executing the run it admitted. The responsive item arrives in the gap.
     h.remote.close();
     await h.runtime(id).exited;
-    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    h.dispatchResponsive(id);
     // The handle retains nothing: the wake is reported dropped and the
     // preemption is deferred until the follower says what it is doing.
     await waitUntil(() =>
@@ -268,8 +268,9 @@ describe("monolithic follower instance", () => {
     const beforeReattach = h.events.length;
     const reconnect = h.reconnect();
     h.runtime(id).attachHost(reconnect.createHost(id));
-    // What start.ts does on register: re-derive the wake from the durable inbox.
-    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    // What start.ts does on register: a content-free dispatch, which re-reads
+    // the responsive entry the gap left unhandled.
+    h.mesh.dispatch(id);
     await expect(h.runtime(id).ready).resolves.toBe(process.pid);
 
     await waitUntil(() =>
@@ -304,12 +305,12 @@ describe("monolithic follower instance", () => {
     );
     h.remote.close();
     await h.runtime(id).exited;
-    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    h.dispatchResponsive(id);
 
     const beforeReattach = h.events.length;
     const reconnect = h.reconnect();
     h.runtime(id).attachHost(reconnect.createHost(id));
-    h.mesh.notifyInboxChanged(id, { priority: "responsive" });
+    h.mesh.dispatch(id);
     await waitUntil(() =>
       h.events
         .slice(beforeReattach)
@@ -338,7 +339,7 @@ describe("monolithic follower instance", () => {
     )?.event;
 
     // Responsive work arrives while awaiting admission
-    h.mesh.notifyInboxChanged(queued, { priority: "responsive" });
+    h.dispatchResponsive(queued);
 
     // Disconnect while queued awaiting admission
     h.remote.close();
@@ -409,8 +410,9 @@ describe("monolithic follower instance", () => {
     const reconnect = h.reconnect();
     h.runtime(id).attachHost(reconnect.createHost(id));
 
-    // What start.ts does on register: re-derives normal priority wake from durable inbox
-    h.mesh.notifyInboxChanged(id);
+    // What start.ts does on register: a content-free dispatch over the actor's
+    // remaining ordinary work.
+    h.dispatchNormal(id);
 
     // Prove the replacement run executes after the old admission rejection and completes
     await waitUntil(() =>

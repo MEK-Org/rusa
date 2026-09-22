@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import Database from "better-sqlite3";
 import { ActorMesh } from "../../actor/actor-mesh.js";
 import {
   InMemoryEventSourceOwnerStore,
@@ -7,6 +8,8 @@ import {
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import type { MeshEventInput } from "../../actor/mesh-events.js";
 import { type ProviderPacer, submitPoolGate } from "../../actor/provider-pacer.js";
+import { runMigrations } from "../../db/migrations/runner.js";
+import { SqliteInboxRepository } from "../../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../../observability/logger.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
@@ -91,11 +94,18 @@ export function createHarness(options: {
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
   const pacer = options.pacer;
+  // Dispatch reads work and priority back out of durable inbox state, so these
+  // tests need a real store rather than a stub: the production SQLite one over
+  // an in-memory database, which is exactly what a follower leader runs.
+  const inboxDb = new Database(":memory:");
+  runMigrations(inboxDb);
+  const inboxStore = new SqliteInboxRepository(inboxDb);
   // No event seam: these follower tests never route or deliver events, and a
   // mesh without one simply refuses those paths rather than inventing a ladder.
   const mesh = new ActorMesh({
     actors,
     rootId: "root",
+    inboxStore,
     eventSourceOwners,
     eventSourceSubscriptions,
     maxConcurrent: 1,
@@ -184,8 +194,25 @@ export function createHarness(options: {
     new ExternalRootDriver("root")
   );
 
+  /** Durable responsive work, as any real producer would leave it, then dispatch. */
+  const dispatchResponsive = (actorId: string, source = "test:responsive") => {
+    inboxStore.append([
+      { actorId, source, payload: { type: "test.responsive", priority: "responsive" } },
+    ]);
+    return mesh.dispatch(actorId);
+  };
+
+  /** The same, at ordinary priority. */
+  const dispatchNormal = (actorId: string, source = "test:normal") => {
+    inboxStore.append([{ actorId, source, payload: { type: "test.normal" } }]);
+    return mesh.dispatch(actorId);
+  };
+
   return {
     mesh,
+    inboxStore,
+    dispatchResponsive,
+    dispatchNormal,
     actors,
     runtimes,
     messages,
@@ -221,6 +248,7 @@ export function createHarness(options: {
       await Promise.all([...runtimes.values()].map((runtime) => runtime.exited));
       follower.close();
       remote.close();
+      inboxDb.close();
     },
   };
 }

@@ -130,7 +130,6 @@ function setup(
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
-    useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
@@ -172,11 +171,13 @@ function setup(
   const eventDb = new Database(":memory:");
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
+  const chatStore = new MeshChatRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
   });
   mesh = new ActorMesh({
+    recordChat: (entry) => chatStore.record(entry),
     actors: registry,
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
@@ -187,7 +188,7 @@ function setup(
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
-    inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    inboxStore,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -705,7 +706,6 @@ describe("agent-execution MCP server", () => {
     try {
       const obligations = new ObligationRepository(db);
       const { inboxStore, mesh } = setup({
-        useInboxStore: true,
         obligations: {
           findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
           get: (id) => obligations.get(id),
@@ -766,7 +766,6 @@ describe("agent-execution MCP server", () => {
     let holder = "";
     const controls: Array<[string, string]> = [];
     const { inboxStore, mesh } = setup({
-      useInboxStore: true,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
         activeSessionIdFor: (actorId) => {

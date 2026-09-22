@@ -5758,7 +5758,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       createdAt: "2026-09-07T00:02:00.000Z",
     });
 
-    const notifyInboxSpy = vi.spyOn(mesh, "notifyInboxChanged");
+    const dispatchSpy = vi.spyOn(mesh, "dispatch");
 
     // Follower disconnects and re-registers to the same leader (same-leader reconnect)
     await fetch(`http://127.0.0.1:${port}/unregister`, {
@@ -5793,10 +5793,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(reconnect.status).toBe(200);
     const reconnected = (await reconnect.json()) as { session: string };
 
-    // Same-leader reattach nudges inbox recovery on the existing actor at the
-    // priority the durable inbox says it deserves: the responsive item that
-    // landed while the follower was unreachable is what makes it responsive (#568).
-    expect(notifyInboxSpy).toHaveBeenCalledWith("placed-worker", { priority: "responsive" });
+    // Same-leader reattach dispatches the existing actor and says nothing about
+    // priority: the responsive item that landed while the follower was
+    // unreachable is still durable, and reading it back is what makes the
+    // recovered run responsive (#568). The dispatch is accepted, which it is
+    // only because that durable work is there to find.
+    expect(dispatchSpy).toHaveBeenCalledWith("placed-worker");
+    expect(dispatchSpy.mock.results.some((r) => r.value === true)).toBe(true);
 
     // The follower's poll receives both the re-attached actor's fresh init
     // and the retired actor's stop command to prevent runtime orphaning
