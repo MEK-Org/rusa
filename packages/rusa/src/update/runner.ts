@@ -180,6 +180,15 @@ export class GitRunner implements GitSeam {
   remoteSha(branch: string): Promise<string> {
     return this.git("git-remote-sha", ["rev-parse", `${this.remote}/${branch}`]);
   }
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    try {
+      await this.git("git-contains-target", ["merge-base", "--is-ancestor", ancestor, descendant]);
+      return true;
+    } catch (error) {
+      if (error instanceof StepError && error.message.includes("exited 1")) return false;
+      throw error;
+    }
+  }
   async resetHard(ref: string): Promise<void> {
     await this.git("git-reset", ["reset", "--hard", ref]);
   }

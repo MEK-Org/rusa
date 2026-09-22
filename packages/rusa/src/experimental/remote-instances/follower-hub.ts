@@ -8,6 +8,7 @@ import {
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
+import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type {
   ActorEvent,
   FollowerUpdateCommand,
@@ -143,6 +144,9 @@ export class FollowerHub {
   ): FollowerUpdateStatus {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
+    if (follower.isUpdateInProgress()) {
+      throw new Error(`Follower ${followerId} already has an update in progress`);
+    }
     if (
       options?.protocolVersion !== undefined &&
       options.protocolVersion !== follower.protocolVersion
@@ -151,8 +155,11 @@ export class FollowerHub {
         `Incompatible follower protocol version (target: ${options.protocolVersion}, follower: ${follower.protocolVersion})`
       );
     }
-    if (options?.targetSha !== undefined && !/^[a-f0-9]{7,40}$/i.test(options.targetSha)) {
+    if (options?.targetSha !== undefined && !isFullCommitSha(options.targetSha)) {
       throw new Error("Invalid target SHA");
+    }
+    if (options?.branch !== undefined && !isSafeFollowerBranch(options.branch)) {
+      throw new Error("Invalid update branch");
     }
     const updateId = randomBytes(16).toString("hex");
     const status: FollowerUpdateStatus = {
@@ -191,6 +198,30 @@ export class FollowerHub {
       }
     }
     return statuses;
+  }
+  /**
+   * Wait for every currently enrolled follower to acknowledge that it began the
+   * command. This is deliberately bounded: a disconnected follower must not
+   * wedge the leader's own restart, but the timeout is observable to its caller.
+   */
+  async updateAllFollowersAndWait(
+    options?: { targetSha?: string; branch?: string; protocolVersion?: number },
+    timeoutMs = 5000
+  ): Promise<boolean> {
+    const pending: Array<{ follower: RemoteInstance; updateId: string }> = [];
+    for (const [followerId, follower] of this.followers) {
+      try {
+        const status = this.updateFollower(followerId, options);
+        pending.push({ follower, updateId: status.updateId });
+      } catch (err) {
+        this.log.warn("follower_update_all_partial_failure", { followerId, err });
+        return false;
+      }
+    }
+    const accepted = await Promise.all(
+      pending.map(({ follower, updateId }) => follower.waitForUpdateAcceptance(updateId, timeoutMs))
+    );
+    return accepted.every(Boolean);
   }
   getFollowerUpdateStatus(followerId: string): FollowerUpdateStatus | undefined {
     return this.followers.get(followerId)?.updateStatus;
@@ -381,7 +412,7 @@ export class FollowerHub {
         return;
       }
       const commitSha =
-        typeof body.commitSha === "string" && /^[a-f0-9]{7,40}$/i.test(body.commitSha)
+        typeof body.commitSha === "string" && isFullCommitSha(body.commitSha)
           ? body.commitSha
           : undefined;
       const tracker = this.getDedupeTracker(body.id);

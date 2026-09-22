@@ -232,8 +232,8 @@ not require actor coordination or interrupt running actors prematurely.
 
 Follower nodes report their active git `commitSha` and `protocolVersion` upon
 initial enrollment via `POST /register`.
-- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 4). Mismatches fail closed with HTTP 400.
-- Update commands can specify an explicit `targetSha` and enforce protocol compatibility fences (`targetProtocolVersion`). If a target version is incompatible, the follower refuses the update before initiating git changes.
+- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 4). Mismatches fail closed with HTTP 409.
+- Update commands can specify an explicit full SHA-1/SHA-256 `targetSha` and a `protocolVersion` fence. The follower rejects an incompatible protocol, invalid branch, or target outside the fetched branch before checkout.
 
 ### Build and deploy trigger semantics
 
@@ -247,16 +247,16 @@ Follower updates can be triggered via three paths:
    - `GET /api/mesh/followers/:id/update`
    - `POST /api/mesh/followers/update-all`
 3. **Leader Auto-Update Coordination**:
-   - `UpdateOrchestrator` includes a follower coordinator hook (`followerCoordinator`). When the leader successfully builds and applies a self-update, it automatically notifies connected followers to update to the leader's target commit SHA.
+   - `UpdateOrchestrator` includes a follower coordinator hook (`followerCoordinator`). Before its own restart, the leader waits up to five seconds for every connected follower to acknowledge that it began the command; a timeout is surfaced as an update warning rather than silently treated as delivery.
 
 ### Follower-side update execution and safe rollback boundary
 
 When a follower receives a `FollowerUpdateCommand`, it executes `executeFollowerUpdate` in the background:
-- **Phased reporting**: Status transitions through `idle` -> `updating` (`fetching` -> `checking_out` -> `installing_dependencies` -> `building` -> `restarting`) -> `completed`, or on error -> `rolling_back` -> `failed`.
+- **Phased reporting**: Status transitions from `pending` through `fetching`, `building`, `draining`, and `restarting`; terminal non-restart outcomes are `already_current` or `failed`.
 - **Observable status reporting**: Follower status updates are dispatched back to the leader as `$instance` event records (`FollowerUpdateStatusEvent`) over the existing multiplexed event batch channel (`POST /events`), updating the leader's in-memory `FollowerInfo` without interrupting or conflicting with actor-addressed messages.
 - **Staging build isolation**: Followers build into a staging directory (`build/follower.new`) using `RUSA_FOLLOWER_DIST_DIR=build/follower.new`.
-- **Safe rollback boundary**: Active actors continue executing during the update process. If any step (`git fetch`, `git checkout`, `pnpm install`, or `build:follower`) fails or exceeds bounded timeouts, the follower discards the staged build and performs an automatic `git reset --hard <oldSha>` back to its previous known-good commit.
-- **Atomic swap**: Only after a green build succeeds is `build/follower.new` atomically swapped into place (`build/follower`), ensuring that follower code is never left in a broken or partially built state.
+- **Safe rollback boundary**: Active actors continue executing during pull and build. The follower then closes admission and waits up to its configured drain timeout for them to finish before restart; only a timeout permits interruption. If any earlier step (`git fetch`, checkout, `pnpm install`, or `build:follower`) fails or exceeds bounded timeouts, the follower discards the staged build and performs an automatic `git reset --hard <oldSha>` back to its previous known-good commit.
+- **Cutover recovery**: Only after a green build succeeds is `build/follower.new` promoted to `build/follower`. If promotion fails after the old directory moved aside, the implementation restores that old directory before reporting failure.
 
 ## Provider and computer-use support
 

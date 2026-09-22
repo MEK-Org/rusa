@@ -10,6 +10,7 @@ import type { ProviderFactory } from "./protocol.js";
 export class FollowerInstance {
   private actors = new Map<string, ReturnType<typeof createActorRuntime>>();
   private stopped = false;
+  private draining = false;
 
   constructor(
     private readonly home: string,
@@ -29,6 +30,9 @@ export class FollowerInstance {
       this.actors.get(actorId)?.dispatch(message);
       return;
     }
+    // Existing actors may finish normally during an update, but no new actor
+    // is admitted once the follower has begun its bounded quiescence window.
+    if (this.draining) return;
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
     let actor = this.actors.get(actorId);
@@ -60,6 +64,18 @@ export class FollowerInstance {
         actorOptions: { ...message.bootstrap.actorOptions, addDirs: [], sandbox: this.sandbox },
       },
     });
+  }
+
+  beginDrain(): void {
+    this.draining = true;
+  }
+
+  async waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
+    const startedAt = Date.now();
+    while (this.actorIds.length && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return { quiesced: this.actorIds.length === 0, waitedMs: Date.now() - startedAt };
   }
 
   close(): void {

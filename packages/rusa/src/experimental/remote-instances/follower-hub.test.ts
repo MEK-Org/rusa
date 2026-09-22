@@ -507,6 +507,13 @@ describe("leader follower gateway", () => {
           protocolVersion: INSTANCE_PROTOCOL_VERSION + 1,
         })
       ).toThrow("Incompatible follower protocol version");
+
+      expect(() => h.hub.updateFollower("worker-fence", { targetSha: "abcdef0" })).toThrow(
+        "Invalid target SHA"
+      );
+      expect(() => h.hub.updateFollower("worker-fence", { branch: "--upload-pack=bad" })).toThrow(
+        "Invalid update branch"
+      );
     });
 
     it("triggers authenticated update via HTTP and delivers update command via /poll", async () => {
@@ -579,6 +586,54 @@ describe("leader follower gateway", () => {
       const updatedInfo = h.hub.list().find((f) => f.id === "worker-update");
       expect(updatedInfo?.updateStatus?.status).toBe("building");
       expect(updatedInfo?.updateStatus?.step).toBe("build");
+    });
+
+    it("waits for follower acceptance and ignores a stale status while an update is active", async () => {
+      const h = await setup();
+      const identity = await h.register("worker-acceptance");
+      const acceptance = h.hub.updateAllFollowersAndWait(
+        { targetSha: "1111111111111111111111111111111111111111" },
+        1000
+      );
+      const commands = (await (await h.post("/poll", identity)).json()) as Array<{
+        updateId: string;
+      }>;
+      expect(commands).toHaveLength(1);
+      const updateId = commands[0].updateId;
+
+      await h.post("/events", {
+        ...identity,
+        batchId: "acceptance-status",
+        events: [
+          {
+            eventId: "acceptance-status-event",
+            actorId: "$instance",
+            message: { type: "update_status", updateId, status: "fetching", step: "pull" },
+          },
+        ],
+      });
+      await expect(acceptance).resolves.toBe(true);
+
+      await h.post("/events", {
+        ...identity,
+        batchId: "stale-status",
+        events: [
+          {
+            eventId: "stale-status-event",
+            actorId: "$instance",
+            message: {
+              type: "update_status",
+              updateId: "older-update",
+              status: "failed",
+              error: "late event",
+            },
+          },
+        ],
+      });
+      expect(h.hub.getFollowerUpdateStatus("worker-acceptance")).toMatchObject({
+        updateId,
+        status: "fetching",
+      });
     });
   });
 });

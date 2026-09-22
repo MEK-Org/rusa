@@ -3,11 +3,17 @@ import { existsSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { type GitSeam, StepError } from "../../update/orchestrator.js";
 import { runTimedStep } from "../../update/runner.js";
+import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import {
   type FollowerUpdateStatusEvent,
   type FollowerUpdateStep,
   INSTANCE_PROTOCOL_VERSION,
 } from "./protocol.js";
+
+export interface FollowerGitSeam extends GitSeam {
+  /** True only when `ancestor` is reachable from the fetched remote branch. */
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+}
 
 export interface FollowerBuildSeam {
   build(sha: string): Promise<void>;
@@ -22,11 +28,11 @@ export interface FollowerStatusEmitter {
 }
 
 export interface FollowerUpdateDeps {
-  git: GitSeam;
+  git: FollowerGitSeam;
   build: FollowerBuildSeam;
   drain: FollowerDrainSeam;
   emitter: FollowerStatusEmitter;
-  exit: (code: number) => void;
+  exit: (code: number) => Promise<void> | void;
   log?: (msg: string) => void;
 }
 
@@ -49,6 +55,50 @@ export interface FollowerUpdateResult {
   rollbackFailed?: boolean;
 }
 
+export interface FollowerBuildFilesystem {
+  exists(path: string): boolean;
+  rename(from: string, to: string): void;
+  remove(path: string): void;
+}
+
+const productionFilesystem: FollowerBuildFilesystem = {
+  exists: existsSync,
+  rename: renameSync,
+  remove: (path) => rmSync(path, { recursive: true, force: true }),
+};
+
+/**
+ * Promote a green follower artifact while restoring the previous artifact if
+ * promotion fails after the live directory has been moved aside.
+ */
+export function swapFollowerBuildDirectories(
+  live: string,
+  staging: string,
+  filesystem: FollowerBuildFilesystem = productionFilesystem
+): void {
+  const previous = `${live}.old`;
+  filesystem.remove(previous);
+  const hadLive = filesystem.exists(live);
+  try {
+    if (hadLive) filesystem.rename(live, previous);
+    filesystem.rename(staging, live);
+  } catch (error) {
+    if (hadLive && !filesystem.exists(live) && filesystem.exists(previous)) {
+      try {
+        filesystem.rename(previous, live);
+      } catch (restoreError) {
+        const restoreMessage =
+          restoreError instanceof Error ? restoreError.message : String(restoreError);
+        throw new Error(
+          `Follower build promotion failed and the previous artifact could not be restored: ${restoreMessage}`,
+          { cause: error }
+        );
+      }
+    }
+    throw error;
+  }
+}
+
 export class FollowerBuildRunner implements FollowerBuildSeam {
   constructor(
     private readonly packageDir: string,
@@ -58,16 +108,16 @@ export class FollowerBuildRunner implements FollowerBuildSeam {
     },
     private readonly log: (msg: string) => void = () => {},
     private readonly pnpm = "pnpm",
-    private readonly spawnImpl?: typeof spawn
+    private readonly spawnImpl?: typeof spawn,
+    private readonly filesystem: FollowerBuildFilesystem = productionFilesystem
   ) {}
 
   async build(sha: string): Promise<void> {
     const live = join(this.packageDir, "build", "follower");
     const staging = `${live}.new`;
-    const previous = `${live}.old`;
 
     // Start with a clean staging directory. Live build remains untouched.
-    rmSync(staging, { recursive: true, force: true });
+    this.filesystem.remove(staging);
     const env = { ...process.env, RUSA_FOLLOWER_DIST_DIR: staging };
     const common = { cwd: this.packageDir, log: this.log, spawnImpl: this.spawnImpl, env };
 
@@ -81,14 +131,11 @@ export class FollowerBuildRunner implements FollowerBuildSeam {
         timeoutMs: this.timeouts.buildMs,
       });
     } catch (err) {
-      rmSync(staging, { recursive: true, force: true });
+      this.filesystem.remove(staging);
       throw err;
     }
 
-    // Atomic swap: move old out of the way, promote staging
-    rmSync(previous, { recursive: true, force: true });
-    if (existsSync(live)) renameSync(live, previous);
-    renameSync(staging, live);
+    swapFollowerBuildDirectories(live, staging, this.filesystem);
     this.log(`[follower-update] atomically swapped follower build → ${sha.slice(0, 7)}`);
   }
 }
@@ -141,6 +188,26 @@ export async function executeFollowerUpdate(
     step = "pull";
     oldSha = await deps.git.headSha();
     const branch = plan.branch ?? "staging";
+    if (!isSafeFollowerBranch(branch)) {
+      const error = "Invalid update branch";
+      deps.emitter.emitStatus({
+        type: "update_status",
+        updateId: plan.updateId,
+        status: "failed",
+        error,
+      });
+      return { ok: false, error };
+    }
+    if (plan.targetSha !== undefined && !isFullCommitSha(plan.targetSha)) {
+      const error = "Invalid target SHA";
+      deps.emitter.emitStatus({
+        type: "update_status",
+        updateId: plan.updateId,
+        status: "failed",
+        error,
+      });
+      return { ok: false, error };
+    }
     log(`[follower-update] current sha ${oldSha.slice(0, 7)} — fetching origin/${branch}`);
     deps.emitter.emitStatus({
       type: "update_status",
@@ -152,6 +219,13 @@ export async function executeFollowerUpdate(
 
     await deps.git.fetch(branch);
     newSha = plan.targetSha ?? (await deps.git.remoteSha(branch));
+
+    if (!(await deps.git.isAncestor(newSha, `origin/${branch}`))) {
+      throw new StepError(
+        "pull",
+        `Refusing target ${newSha}: it is not reachable from fetched origin/${branch}`
+      );
+    }
 
     if (newSha === oldSha) {
       log(`[follower-update] already at target SHA ${newSha.slice(0, 7)}`);
@@ -209,7 +283,7 @@ export async function executeFollowerUpdate(
       newSha,
     });
 
-    deps.exit(0);
+    await deps.exit(0);
     return {
       ok: true,
       oldSha,

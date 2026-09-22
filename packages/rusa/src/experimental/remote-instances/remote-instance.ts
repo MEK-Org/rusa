@@ -71,6 +71,8 @@ export class RemoteInstance extends EventEmitter {
   poll?: ServerResponse;
   pollTimer?: ReturnType<typeof setTimeout>;
   updateStatus?: FollowerUpdateStatus;
+  private readonly acceptedUpdateIds = new Set<string>();
+  private readonly acceptanceWaiters = new Map<string, Array<(accepted: boolean) => void>>();
 
   constructor(
     readonly id: string,
@@ -108,9 +110,61 @@ export class RemoteInstance extends EventEmitter {
     this.enqueueCommand(update);
   }
 
-  setUpdateStatus(status: FollowerUpdateStatus): void {
+  isUpdateInProgress(): boolean {
+    return ["pending", "fetching", "building", "draining", "restarting"].includes(
+      this.updateStatus?.status ?? ""
+    );
+  }
+
+  setUpdateStatus(status: FollowerUpdateStatus): boolean {
+    // A delayed status from a previous command must not replace the current
+    // command's operator-visible state.
+    if (
+      this.updateStatus &&
+      this.updateStatus.updateId !== status.updateId &&
+      this.isUpdateInProgress()
+    ) {
+      return false;
+    }
     this.updateStatus = status;
+    if (status.status !== "pending") this.markUpdateAccepted(status.updateId);
     this.emit("update_status", status);
+    return true;
+  }
+
+  waitForUpdateAcceptance(updateId: string, timeoutMs: number): Promise<boolean> {
+    if (this.acceptedUpdateIds.has(updateId)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const waiters = this.acceptanceWaiters.get(updateId) ?? [];
+        this.acceptanceWaiters.set(
+          updateId,
+          waiters.filter((waiter) => waiter !== finish)
+        );
+        resolve(false);
+      }, timeoutMs);
+      timer.unref?.();
+      const finish = (accepted: boolean) => {
+        clearTimeout(timer);
+        resolve(accepted);
+      };
+      const waiters = this.acceptanceWaiters.get(updateId) ?? [];
+      waiters.push(finish);
+      this.acceptanceWaiters.set(updateId, waiters);
+    });
+  }
+
+  private markUpdateAccepted(updateId: string): void {
+    this.acceptedUpdateIds.add(updateId);
+    const waiters = this.acceptanceWaiters.get(updateId);
+    this.acceptanceWaiters.delete(updateId);
+    for (const waiter of waiters ?? []) waiter(true);
+  }
+
+  private rejectOutstandingUpdateAcceptances(): void {
+    for (const waiters of this.acceptanceWaiters.values())
+      for (const waiter of waiters) waiter(false);
+    this.acceptanceWaiters.clear();
   }
 
   createHost(actorId: string): ActorChannel {
@@ -191,6 +245,7 @@ export class RemoteInstance extends EventEmitter {
     for (const host of [...this.hosts.values()])
       host.receive({ type: "exit", code: -1, signal: null });
     this.commands.length = 0;
+    this.rejectOutstandingUpdateAcceptances();
   }
 }
 

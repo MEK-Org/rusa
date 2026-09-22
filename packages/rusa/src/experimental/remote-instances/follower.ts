@@ -144,14 +144,22 @@ async function flush(): Promise<void> {
     sending = false;
   }
 }
-async function stop(code: number): Promise<void> {
+async function stop(code: number, flushTerminalStatus = false): Promise<void> {
   if (stopped) return;
-  stopped = true;
-  clearTimeout(sendTimer);
-  instance.close();
+  // `restarting` is the last status the old process can truthfully emit. Flush
+  // it before the shutdown brake rejects events; the force timer keeps a dead
+  // leader connection from delaying restart indefinitely.
   const force = setTimeout(() => {
     process.exit(code);
   }, 1500);
+  if (flushTerminalStatus) {
+    clearTimeout(sendTimer);
+    sendTimer = undefined;
+    await flush();
+  }
+  stopped = true;
+  clearTimeout(sendTimer);
+  instance.close();
   if (session) await post("/unregister", {}).catch(() => {});
   // Give interrupted provider invocations time to unwind, as part of instance shutdown.
   while (instance.actorIds.length) await new Promise((resolve) => setTimeout(resolve, 20));
@@ -254,11 +262,9 @@ async function handleUpdate(command: FollowerUpdateCommand): Promise<void> {
       build: new FollowerBuildRunner(packageDir, undefined, (m) => log.info(m)),
       drain: {
         drain: async (timeoutMs) => {
-          instance.close();
-          const start = Date.now();
-          while (instance.actorIds.length && Date.now() - start < timeoutMs) {
-            await new Promise((r) => setTimeout(r, 50));
-          }
+          instance.beginDrain();
+          const outcome = await instance.waitForQuiescence(timeoutMs);
+          log.info("follower_update_drain_complete", outcome);
         },
       },
       emitter: {
@@ -266,9 +272,7 @@ async function handleUpdate(command: FollowerUpdateCommand): Promise<void> {
           emit("$instance", statusEvent);
         },
       },
-      exit: (code) => {
-        void stop(code);
-      },
+      exit: (code) => stop(code, true),
       log: (m) => log.info(m),
     }
   );

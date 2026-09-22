@@ -1,22 +1,35 @@
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import type { GitSeam } from "../../update/orchestrator.js";
 import { StepError } from "../../update/orchestrator.js";
 import {
   executeFollowerUpdate,
   type FollowerBuildSeam,
   type FollowerDrainSeam,
+  type FollowerGitSeam,
   type FollowerStatusEmitter,
   type FollowerUpdateDeps,
   type FollowerUpdatePlan,
+  swapFollowerBuildDirectories,
 } from "./follower-updater.js";
 import { type FollowerUpdateStatusEvent, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
-function makeFakeGit(overrides: Partial<GitSeam> = {}): GitSeam {
+function makeFakeGit(overrides: Partial<FollowerGitSeam> = {}): FollowerGitSeam {
   return {
     headSha: vi.fn().mockResolvedValue("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     subject: vi.fn().mockResolvedValue("test commit"),
     fetch: vi.fn().mockResolvedValue(undefined),
     remoteSha: vi.fn().mockResolvedValue("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    isAncestor: vi.fn().mockResolvedValue(true),
     resetHard: vi.fn().mockResolvedValue(undefined),
     updateSubmodules: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -59,6 +72,34 @@ function makeDeps(overrides: Partial<FollowerUpdateDeps> = {}): {
 }
 
 describe("executeFollowerUpdate", () => {
+  it("restores the live build if promotion fails after the old build moved aside", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-follower-swap-"));
+    const live = join(root, "follower");
+    const staging = `${live}.new`;
+    try {
+      mkdirSync(live);
+      mkdirSync(staging);
+      writeFileSync(join(live, "artifact"), "old");
+      writeFileSync(join(staging, "artifact"), "new");
+
+      expect(() =>
+        swapFollowerBuildDirectories(live, staging, {
+          exists: existsSync,
+          remove: (path) => rmSync(path, { recursive: true, force: true }),
+          rename: (from, to) => {
+            if (from === staging && to === live) throw new Error("simulated promotion failure");
+            renameSync(from, to);
+          },
+        })
+      ).toThrow("simulated promotion failure");
+
+      expect(readFileSync(join(live, "artifact"), "utf8")).toBe("old");
+      expect(readFileSync(join(staging, "artifact"), "utf8")).toBe("new");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("happy path: pulls, builds, drains, and exits 0 onto new SHA", async () => {
     const { deps, emitted } = makeDeps();
     const plan: FollowerUpdatePlan = {
@@ -130,6 +171,25 @@ describe("executeFollowerUpdate", () => {
     expect(deps.git.fetch).not.toHaveBeenCalled();
     expect(deps.build.build).not.toHaveBeenCalled();
     expect(emitted.map((e) => e.status)).toEqual(["failed"]);
+  });
+
+  it("rejects a target outside the fetched branch before checkout", async () => {
+    const git = makeFakeGit({ isAncestor: vi.fn().mockResolvedValue(false) });
+    const { deps, emitted } = makeDeps({ git });
+
+    const result = await executeFollowerUpdate(
+      {
+        updateId: "unreachable-target",
+        targetSha: "cccccccccccccccccccccccccccccccccccccccc",
+        branch: "staging",
+      },
+      deps
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not reachable");
+    expect(git.resetHard).not.toHaveBeenCalled();
+    expect(emitted.at(-1)).toMatchObject({ status: "failed", step: "pull" });
   });
 
   it("rolls back git checkout cleanly when build fails, keeping live follower unharmed", async () => {
