@@ -172,11 +172,13 @@ function setup(
   const eventDb = new Database(":memory:");
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
+  const chatStore = new MeshChatRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
   });
   mesh = new ActorMesh({
+    recordChat: (entry) => chatStore.record(entry),
     actors: registry,
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
@@ -187,7 +189,7 @@ function setup(
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
-    inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    inboxStore: (opts.useInboxStore ?? true) ? inboxStore : undefined,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,

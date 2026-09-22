@@ -6,8 +6,17 @@ import { type RunNudge, TriggerRunner } from "../actor/trigger-runner.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import type { InboxPayload } from "../repositories/inbox-repository.js";
-import { type MeshProviderGate, type QueuedSelection, RunManager } from "./run-manager.js";
+import {
+  EmptyInboxRepository,
+  type InboxPayload,
+  type InboxRepository,
+} from "../repositories/inbox-repository.js";
+import {
+  type MeshProviderGate,
+  type QueuedSelection,
+  RunManager,
+  type RunManagerInternalPort,
+} from "./run-manager.js";
 
 /**
  * A live actor backed by the real {@link TriggerRunner}, so per-actor debounce,
@@ -152,6 +161,7 @@ describe("RunManager", () => {
     seen: string[];
     logs: string[];
     constructed: ActorRecord[];
+    internalPort?: RunManagerInternalPort;
   }
 
   function setup(
@@ -160,7 +170,7 @@ describe("RunManager", () => {
       providerGate?: MeshProviderGate;
       isVoiceSessionActive?: (actorId: string) => boolean;
       constructActor?: (rec: ActorRecord) => MeshActor;
-      withInbox?: boolean;
+      inbox?: InboxRepository;
       debounceMs?: number;
     } = {}
   ): Harness {
@@ -170,10 +180,14 @@ describe("RunManager", () => {
     const seen: string[] = [];
     const logs: string[] = [];
     const constructed: ActorRecord[] = [];
+    let internalPort: RunManagerInternalPort | undefined;
     const manager = new RunManager({
-      inbox: opts.withInbox === false ? undefined : inbox,
+      inbox: opts.inbox ?? inbox,
       maxConcurrent: opts.maxConcurrent,
       providerGate: opts.providerGate,
+      onInternalPort: (port) => {
+        internalPort = port;
+      },
       constructActor: (rec) => {
         constructed.push(rec);
         if (opts.constructActor) return opts.constructActor(rec);
@@ -187,7 +201,7 @@ describe("RunManager", () => {
       onPreempted: (actorId, phase) => preempted.push([actorId, phase]),
       log: (msg) => logs.push(msg),
     });
-    return { manager, actors, statuses, preempted, seen, logs, constructed };
+    return { manager, actors, statuses, preempted, seen, logs, constructed, internalPort };
   }
 
   /** Register a live actor the way the mesh does, with an active record. */
@@ -308,12 +322,49 @@ describe("RunManager", () => {
       expect(h.logs).toContain("dispatch(gone) refused — no live actor");
     });
 
-    it("takes an advisory poke at face value when no durable store is wired", () => {
-      const h = setup({ withInbox: false });
+    it("pages through unhandled responsive entries past 100 rows to find unseen work and voice timing", () => {
+      const h = setup();
       const actor = live(h, "a1");
 
-      expect(h.manager.dispatch("a1")).toBe(true);
-      expect(actor.nudges).toEqual([{}]);
+      // 1. Append 100 responsive entries with newer timestamps (t=2000..2099)
+      for (let i = 0; i < 100; i++) {
+        append("a1", { type: "human.message", priority: "responsive" }, new Date(2_000 + i));
+      }
+      // 2. Mark them seen so unseen is false on the first page
+      inbox.markSeen("a1");
+
+      // 3. Append older unseen entries with older timestamps (t=1000..1004)
+      append("a1", { type: "human.voice", priority: "responsive" }, new Date(1_000));
+      for (let i = 1; i <= 4; i++) {
+        append("a1", { type: "human.message", priority: "responsive" }, new Date(1_000 + i));
+      }
+
+      // Exact paging must traverse beyond the first 100 rows, discover the unseen work,
+      // and extract the newest unabsorbed voice timing from page 2.
+      expect(h.manager.durableWork("a1")).toEqual({
+        priority: "responsive",
+        unseenResponsive: true,
+        voiceAt: 1_000,
+      });
+
+      h.manager.dispatch("a1");
+      expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: 1_000 }]);
+    });
+
+    it("returns no durable work and no-ops dispatch when backed by an empty inbox repository", () => {
+      const emptyInbox = new EmptyInboxRepository();
+      const h = setup({ inbox: emptyInbox });
+      const actor = live(h, "a1");
+
+      expect(h.manager.durableWork("a1")).toBeNull();
+      expect(h.manager.dispatch("a1")).toBe(false);
+      expect(actor.nudges).toEqual([]);
+    });
+
+    it("exposes dispatch(actorId) as the only public dispatch input on RunManager", () => {
+      expect("dispatchJoiningActiveRun" in RunManager.prototype).toBe(false);
+      const h = setup();
+      expect("dispatchJoiningActiveRun" in h.manager).toBe(false);
     });
   });
 
@@ -448,13 +499,14 @@ describe("RunManager", () => {
       ]);
     });
 
-    it("joins an active run instead of replacing it, at the same priority", () => {
+    it("joins an active run instead of replacing it, via the internal construction port", () => {
       const h = setup();
       const actor = live(h, "a1");
       actor.preemptPhase = "running";
       append("a1", { type: "event.copy", priority: "responsive" });
 
-      expect(h.manager.dispatchJoiningActiveRun("a1")).toBe(true);
+      expect(h.internalPort).toBeDefined();
+      expect(h.internalPort?.dispatchJoiningActiveRun("a1")).toBe(true);
       expect(actor.preemptions).toBe(0);
       expect(h.preempted).toEqual([]);
       // Responsive scheduling and admission are kept; only the abort is not.

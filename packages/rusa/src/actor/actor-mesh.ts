@@ -21,10 +21,11 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import type {
-  InboxEntry,
-  InboxPayload,
-  InboxRepository,
+import {
+  EmptyInboxRepository,
+  type InboxEntry,
+  type InboxPayload,
+  type InboxRepository,
 } from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
@@ -848,6 +849,7 @@ export class ActorMesh {
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
+  private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
   private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
@@ -935,7 +937,7 @@ export class ActorMesh {
     );
     this.secretsDir = opts.secretsDir ?? secretsDirPath();
     this.runs = new RunManager({
-      inbox: opts.inboxStore,
+      inbox: opts.inboxStore ?? new EmptyInboxRepository(),
       maxConcurrent: opts.maxConcurrent,
       providerGate: opts.providerGate,
       rateLimit: opts.rateLimit,
@@ -952,6 +954,9 @@ export class ActorMesh {
           detail: phase,
           payload: JSON.stringify({ reason: "responsive_notification" }),
         });
+      },
+      onInternalPort: (port) => {
+        this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
       },
       log: (msg) => this.log(msg),
     });
@@ -1318,7 +1323,9 @@ export class ActorMesh {
    * one use so "responsive but not preempting" cannot leak into a control path.
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
-    return this.runs.dispatchJoiningActiveRun(this.resolveThreadId(dest));
+    return this.dispatchJoiningActiveRunPort
+      ? this.dispatchJoiningActiveRunPort(this.resolveThreadId(dest))
+      : false;
   }
 
   /** Lifecycle boundary after the halt gate and before scheduler admission. */

@@ -89,23 +89,26 @@ export interface DurableDispatchWork {
 }
 
 /**
- * How many pending responsive entries one dispatch reads. Ordered newest
- * first, so the bound only bites on an actor holding more unhandled responsive
- * work than the repository will page at once — far past any real backlog — and
- * when it does, the oldest entries read as absorbed, which holds ordinary work
- * and declines to replace a run rather than the reverse.
+ * Internal construction-only port for non-preempting joins (event copies to
+ * non-owners and self-caused ready attention mid-run). Exposes the internal
+ * joining dispatch capability without adding a second public dispatch method to
+ * RunManager's public class interface.
  */
-const PENDING_RESPONSIVE_SCAN = 100;
+export interface RunManagerInternalPort {
+  dispatchJoiningActiveRun(actorId: string): boolean;
+}
+
+/**
+ * Maximum page limit supported by {@link InboxRepository.list}.
+ */
+const RESPONSIVE_PAGE_LIMIT = 100;
 
 export interface RunManagerOptions {
   /**
    * The durable worklist. It is the only source of whether an actor has work
-   * and what that work's priority is. Every production composition supplies
-   * one; a mesh built without it is a unit test that never exercises inbox
-   * persistence, and has no durable state to read, so an advisory poke is
-   * taken at face value as ordinary work.
+   * and what that work's priority is.
    */
-  inbox?: InboxRepository;
+  inbox: InboxRepository;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /** Provider pacing; omitted leaves declaration order as the whole policy. */
@@ -129,6 +132,8 @@ export interface RunManagerOptions {
   markInboxSeen?: (actorId: string) => void;
   /** Report that responsive work replaced an in-flight or queued run. */
   onPreempted?: (actorId: string, phase: string) => void;
+  /** Internal construction-only port receiver. */
+  onInternalPort?: (port: RunManagerInternalPort) => void;
   log?: (msg: string) => void;
 }
 
@@ -161,7 +166,7 @@ export class RunManager {
   private readonly live = new Map<string, MeshActor>();
   private readonly selections = new Map<string, QueuedSelection>();
   private readonly limiter: ConcurrencyLimiter;
-  private readonly inbox?: InboxRepository;
+  private readonly inbox: InboxRepository;
   private readonly providerGate: MeshProviderGate;
   private readonly constructActor: (record: ActorRecord) => MeshActor;
   private readonly recordStatus: (actorId: string) => string | undefined;
@@ -172,6 +177,10 @@ export class RunManager {
 
   constructor(opts: RunManagerOptions) {
     this.inbox = opts.inbox;
+    opts.onInternalPort?.({
+      dispatchJoiningActiveRun: (actorId: string) =>
+        this.dispatchInternal(actorId, { preempt: false }),
+    });
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
       opts.providerGate ??
@@ -215,20 +224,6 @@ export class RunManager {
   }
 
   /**
-   * A dispatch that joins the actor's active run instead of replacing it.
-   *
-   * Two producers need this and no others: an event copy delivered to a
-   * recipient that is not the event's effective owner, and an owner that made
-   * its own obligation ready mid-run. Both are responsive work the actor will
-   * see in its own worklist, and neither is a reason to abort work already in
-   * flight. It is separate and narrowly named so "responsive but not
-   * preempting" cannot leak into a control path — and it is still content-free.
-   */
-  dispatchJoiningActiveRun(actorId: string): boolean {
-    return this.dispatchInternal(actorId, { preempt: false });
-  }
-
-  /**
    * What the durable worklist says about this actor, or null when it has no
    * pending work.
    *
@@ -241,7 +236,6 @@ export class RunManager {
    */
   durableWork(actorId: string): DurableDispatchWork | null {
     const inbox = this.inbox;
-    if (!inbox) return { priority: "normal" };
     if (inbox.countUnhandled(actorId, { responsiveOnly: true }) > 0) {
       return { priority: "responsive", ...this.pendingResponsive(actorId) };
     }
@@ -251,27 +245,41 @@ export class RunManager {
   /**
    * The two things a dispatch needs about pending responsive work beyond the
    * fact that it exists — whether any of it is unabsorbed, and when the newest
-   * unabsorbed voice memo was delivered — read out of one indexed page, so the
-   * responsive path costs no more than reading voice timing alone did.
+   * unabsorbed voice memo was delivered — read by paging the repository's
+   * unhandled responsive entries.
    */
   private pendingResponsive(actorId: string): { unseenResponsive: boolean; voiceAt?: number } {
-    const pending =
-      this.inbox?.list(actorId, {
+    let cursor: string | undefined;
+    let unseenResponsive = false;
+    let voiceAt: number | undefined;
+
+    do {
+      const page = this.inbox.list(actorId, {
         status: "unhandled",
         responsiveOnly: true,
-        limit: PENDING_RESPONSIVE_SCAN,
-      }).entries ?? [];
-    const unseen = pending.filter((entry) => entry.seenAt === null);
-    // Newest first, so this is the newest memo the actor still owes a
-    // quick start to. Reading it by payload type rather than by "is the newest
-    // pending entry a memo" is what keeps the timing recoverable on a reattach
-    // or resume sweep, where the memo is most likely to sit behind a newer
-    // responsive row it arrived with.
-    const at = unseen.find((entry) => entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE)?.deliveredAt;
-    const voiceAt = at?.getTime();
+        limit: RESPONSIVE_PAGE_LIMIT,
+        cursor,
+      });
+      for (const entry of page.entries) {
+        if (entry.seenAt === null) {
+          unseenResponsive = true;
+          if (voiceAt === undefined && entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE) {
+            const at = entry.deliveredAt.getTime();
+            if (Number.isFinite(at)) {
+              voiceAt = at;
+            }
+          }
+        }
+      }
+      if (unseenResponsive && voiceAt !== undefined) {
+        break;
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+
     return {
-      unseenResponsive: unseen.length > 0,
-      ...(voiceAt !== undefined && Number.isFinite(voiceAt) ? { voiceAt } : {}),
+      unseenResponsive,
+      ...(voiceAt !== undefined ? { voiceAt } : {}),
     };
   }
 
