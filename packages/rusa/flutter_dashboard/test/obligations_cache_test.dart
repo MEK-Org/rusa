@@ -293,6 +293,16 @@ void main() {
         ),
         isNotNull,
       );
+
+      // The supplied serialized byte count governs the storage-budget boundary:
+      // an otherwise small payload is rejected when the known byte count exceeds the budget.
+      expect(
+        PersistedObligationsSnapshot.fromJson(
+          snapshot.toJson(),
+          serializedByteCount: PersistedObligationsSnapshot.maxSerializedBytes + 1,
+        ),
+        isNull,
+      );
     });
   });
 

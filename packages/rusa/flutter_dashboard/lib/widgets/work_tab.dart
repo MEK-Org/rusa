@@ -394,7 +394,7 @@ class _WorkTabState extends State<WorkTab> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(
-                'Failed to load work queue: $_error',
+                _error!,
                 style: const TextStyle(color: MeshColors.textSecondary),
               ),
               const SizedBox(height: 12),

@@ -1755,6 +1755,48 @@ void main() {
   );
 
   testWidgets(
+    'cold-start load failure with empty cache renders actionable error alone without doubling prefix (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cache = FakeObligationsCache();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
+          ..forestError = Exception('Connection refused');
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await store.init();
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Failed to load work queue:'), findsNothing);
+        expect(find.text('Retry'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     'invalidates cache and reloads on obligation mutation in WorkTab (#505)',
     (tester) async {
       await tester.runAsync(() async {
