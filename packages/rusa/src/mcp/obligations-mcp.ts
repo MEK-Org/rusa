@@ -50,6 +50,8 @@ export interface ObligationsMcpOptions {
   ) => { ok: true; ownerId: string } | { ok: false; error: string };
 
   isFenced?: () => boolean;
+  /** Bound by the composition root; ordinary ownership/ancestry grants do not confer this. */
+  canSetResponsive?: boolean;
   /**
    * Whether this actor may make an owner-authorized mutation to an obligation.
    * Takes only `ownerId` — not the full obligation — so the same check also
@@ -326,7 +328,7 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side. `responsive` marks the obligation (and everything filed under it) responsive: when it becomes ready or is assigned ready, its owner gets immediately responsive inbox attention that may preempt an in-flight run.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side. Only root may start a newly responsive branch; any actor may pass `responsive: true` under an already effectively responsive parent. Children inherit responsiveness automatically. `responsive` marks the obligation (and everything filed under it) responsive: when it becomes ready or is assigned ready, its owner gets immediately responsive inbox attention that may preempt an in-flight run.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
         title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
@@ -369,6 +371,13 @@ export function createObligationsMcpServer(
         // created for (#212).
         if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
           throw new Error("not authorized to manage this obligation's prerequisites");
+        }
+        if (
+          responsive === true &&
+          !options?.canSetResponsive &&
+          !(parent_id && repository.require(parent_id).effectiveResponsive)
+        ) {
+          throw new Error("only root may create newly responsive obligations");
         }
         const obligation = repository.create({
           ownerId: owner.ownerId,
@@ -555,15 +564,15 @@ export function createObligationsMcpServer(
     {
       title: "Mark an existing obligation responsive",
       description:
-        "Marks a live obligation and every descendant responsive. If ready work newly becomes responsive, its owner gets immediately responsive inbox attention; this may preempt an in-flight run where the inbox model admits it.",
+        "Only root may mark a live obligation and every descendant responsive. If ready work newly becomes responsive, its owner gets immediately responsive inbox attention; this may preempt an in-flight run where the inbox model admits it.",
       inputSchema: { id: z.string().trim().min(1) },
     },
     async ({ id }) => {
       try {
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
-        if (!canManage(current))
-          throw new Error("not authorized to mark this obligation responsive");
+        if (!options?.canSetResponsive)
+          throw new Error("only root may mark obligations responsive");
         return toolOk({ obligation: repository.markResponsive(id, actorId) });
       } catch (err) {
         return toolError(err);
@@ -631,7 +640,7 @@ export function createObligationsMcpServer(
     {
       title: "Reparent an obligation",
       description:
-        "Change the parent of an obligation. Preserves stored priority override; a NULL stored priority inherits from the new ancestry. Transactionally re-evaluates old and new parents' waiting/ready states and rejects cycles and self-parenting.",
+        "Change the parent of an obligation. Only root may move non-responsive work into a responsive branch. Preserves stored priority override; a NULL stored priority inherits from the new ancestry. Transactionally re-evaluates old and new parents' waiting/ready states and rejects cycles and self-parenting.",
       inputSchema: {
         id: z.string().trim().min(1),
         parent_id: z.string().trim().min(1).nullable().optional(),
@@ -639,6 +648,15 @@ export function createObligationsMcpServer(
     },
     async ({ id, parent_id }) => {
       try {
+        // Moving ordinary work under a responsive branch is a promotion too.
+        if (
+          !options?.canSetResponsive &&
+          parent_id &&
+          repository.require(parent_id).effectiveResponsive &&
+          !repository.require(id).effectiveResponsive
+        ) {
+          throw new Error("only root may make obligations responsive by reparenting");
+        }
         const obligation = repository.reparent(id, parent_id ?? null, actorId);
         return toolOk({ obligation });
       } catch (err) {
