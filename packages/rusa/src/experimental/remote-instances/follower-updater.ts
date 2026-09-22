@@ -345,6 +345,7 @@ export async function executeFollowerUpdate(
     if (movedToNew && oldSha) {
       try {
         await deps.git.resetHard(oldSha);
+        await deps.git.updateSubmodules();
         log(`[follower-update] rolled checkout back to ${oldSha.slice(0, 7)}`);
       } catch (rbErr) {
         rollbackFailed = true;

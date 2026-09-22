@@ -7,6 +7,7 @@ import { parseArgs } from "node:util";
 import { resolveRepoRoot } from "../../commands/service-instance.js";
 import { createLogger } from "../../observability/logger.js";
 import { GitRunner } from "../../update/runner.js";
+import { FollowerEventQueue } from "./follower-event-queue.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { isFullCommitSha } from "./follower-update-validation.js";
@@ -78,9 +79,7 @@ const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) 
 let session = "";
 let leaderToken: string | undefined;
 let stopped = false;
-const events: FollowerEvent[] = [];
-let pendingBatch: { batchId: string; events: FollowerEvent[] } | undefined;
-let sending = false;
+const eventQueue = new FollowerEventQueue<FollowerEvent>();
 let sendTimer: ReturnType<typeof setTimeout> | undefined;
 
 class FollowerHttpError extends Error {
@@ -106,46 +105,28 @@ async function post<T>(path: string, body: object): Promise<T> {
 }
 function emit(actorId: string, message: FollowerEvent["message"], eventId?: string): void {
   if (stopped) return;
-  events.push({ eventId: eventId ?? randomUUID(), actorId, message });
-  if (!sending && !sendTimer)
+  eventQueue.enqueue({ eventId: eventId ?? randomUUID(), actorId, message });
+  if (!eventQueue.isFlushing && !sendTimer)
     sendTimer = setTimeout(() => {
       sendTimer = undefined;
       void flush();
     }, 5);
 }
 async function flush(): Promise<void> {
-  if (sending || stopped) return;
-  sending = true;
+  if (stopped) return;
   try {
-    while ((pendingBatch || events.length) && !stopped) {
-      if (!pendingBatch) {
-        if (!events.length) break;
-        const count = Math.min(events.length, 100);
-        pendingBatch = {
-          batchId: randomUUID(),
-          events: events.slice(0, count),
-        };
-      }
-      await post("/events", {
-        batchId: pendingBatch.batchId,
-        events: pendingBatch.events,
-      });
-      events.splice(0, pendingBatch.events.length);
-      pendingBatch = undefined;
-    }
+    await eventQueue.flush((batch) => post("/events", batch));
   } catch (error) {
     log.warn("follower_event_flush_failed", { err: error });
     if (error instanceof FollowerHttpError && error.status === 410) {
       session = "";
     }
-    if (!stopped && (pendingBatch || events.length) && !sendTimer) {
+    if (!stopped && eventQueue.hasPending && !sendTimer) {
       sendTimer = setTimeout(() => {
         sendTimer = undefined;
         void flush();
       }, 500);
     }
-  } finally {
-    sending = false;
   }
 }
 async function stop(code: number, flushTerminalStatus = false): Promise<void> {
@@ -202,8 +183,7 @@ async function run(): Promise<void> {
             oldLeaderToken: leaderToken,
             newLeaderToken: registration.leaderToken,
           });
-          pendingBatch = undefined;
-          events.length = 0;
+          eventQueue.clear();
         }
         leaderToken = registration.leaderToken;
         session = registration.session;
@@ -228,7 +208,7 @@ async function run(): Promise<void> {
     }
 
     try {
-      if ((events.length || pendingBatch) && !sending) void flush();
+      if (eventQueue.hasPending && !eventQueue.isFlushing) void flush();
       const commands = await post<FollowerCommand[]>("/poll", {});
       for (const command of commands) {
         if ("actorId" in command) {

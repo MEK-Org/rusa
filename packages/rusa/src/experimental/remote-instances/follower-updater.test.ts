@@ -368,6 +368,36 @@ describe("executeFollowerUpdate", () => {
     expect(result.failedStep).toBe("drain");
     expect(build.rollback).toHaveBeenCalledOnce();
     expect(git.resetHard).toHaveBeenLastCalledWith(oldSha);
+    expect(git.updateSubmodules).toHaveBeenCalledTimes(2);
     expect(emitted.at(-1)).toMatchObject({ status: "failed", step: "drain" });
+  });
+
+  it("reports rollbackFailed when submodule recovery fails after resetting the old checkout", async () => {
+    const oldSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const newSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let submoduleUpdates = 0;
+    const git = makeFakeGit({
+      headSha: vi.fn().mockResolvedValue(oldSha),
+      remoteSha: vi.fn().mockResolvedValue(newSha),
+      updateSubmodules: vi.fn().mockImplementation(async () => {
+        submoduleUpdates++;
+        if (submoduleUpdates === 2) throw new Error("submodule checkout failed");
+      }),
+    });
+    const drain: FollowerDrainSeam = {
+      drain: vi.fn().mockRejectedValue(new StepError("drain", "quiescence failed")),
+    };
+    const { deps, emitted } = makeDeps({ git, drain });
+
+    const result = await executeFollowerUpdate(
+      { updateId: "submodule-rollback", targetSha: newSha },
+      deps
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.rollbackFailed).toBe(true);
+    expect(git.resetHard).toHaveBeenLastCalledWith(oldSha);
+    expect(git.updateSubmodules).toHaveBeenCalledTimes(2);
+    expect(emitted.at(-1)).toMatchObject({ status: "failed", rollbackFailed: true });
   });
 });
