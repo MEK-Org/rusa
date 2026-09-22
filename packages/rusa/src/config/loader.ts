@@ -230,6 +230,11 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
   }
   const rootActor = parsed.rootActor;
+  if ("fallbackModel" in rootActor) {
+    throw new Error(
+      "config.yaml: rootActor.fallbackModel has been removed; for portable roots (context.type: portable), configure the ordered root model pool with set_actor_model instead. Native-session roots do not support multi-entry model pools."
+    );
+  }
   const provider = rootActor.provider?.trim();
   if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
   const capabilityName = providerCapabilityName(provider, parsed);
@@ -264,16 +269,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.understanding.rootNodeId = parsed.understanding.rootNodeId.trim();
   }
-  // ISSUE_NUM: worker-side fallback is removed outright — fallbacks are root-only,
-  // and a worker's parent judges quota exhaustion instead of the worker
-  // silently degrading to a weaker model. Fail loud rather than silently
-  // ignoring a key operators believe is doing something.
+  // Model-only fallback settings are no longer supported: a root recovers using
+  // its ordered configured model pool, while workers report quota exhaustion to
+  // their parent. Fail loud rather than silently ignoring a key operators
+  // believe is doing something.
   for (const [providerName, providerConfig] of Object.entries(parsed.providers)) {
     if (providerConfig && "fallbackModel" in providerConfig) {
       throw new Error(
         `config.yaml: providers.${providerName}.fallbackModel is no longer supported: fallbacks are ` +
-          "root-only; a worker's parent judges quota exhaustion . Remove the key " +
-          "(rootActor.fallbackModel is unaffected)."
+          "the root uses its ordered model pool and workers report quota exhaustion to their parent. " +
+          "Remove the key."
       );
     }
   }
