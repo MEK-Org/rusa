@@ -7,6 +7,6 @@ export default defineConfig({
   },
   format: ["esm"],
   target: "node20",
-  outDir: "build/follower",
+  outDir: process.env.RUSA_FOLLOWER_DIST_DIR ?? "build/follower",
   clean: true,
 });

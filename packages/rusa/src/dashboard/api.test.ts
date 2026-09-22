@@ -831,6 +831,78 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("POST and GET /api/mesh/followers/:id/update manage follower update operations", async () => {
+    const mockUpdateFollower = vi.fn().mockImplementation((_id, opts) => ({
+      updateId: "up-123",
+      status: "pending",
+      newSha: opts?.targetSha,
+      timestamp: "2026-09-22T00:00:00.000Z",
+    }));
+
+    const followerDeps: DashboardDataDeps = {
+      ...deps,
+      getFollowers: () => [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: [],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+          updateStatus: {
+            updateId: "up-123",
+            status: "building",
+            newSha: "abcdef1234567890abcdef1234567890abcdef12",
+            timestamp: "2026-09-22T00:00:01.000Z",
+          },
+        },
+      ],
+      updateFollower: mockUpdateFollower,
+    };
+
+    const { res: postRes } = await call(
+      followerDeps,
+      "POST",
+      "/api/mesh/followers/mac-mini/update",
+      JSON.stringify({ targetSha: "abcdef1234567890abcdef1234567890abcdef12" })
+    );
+    await settled(postRes);
+    expect(postRes.statusCode).toBe(200);
+    expect(JSON.parse(postRes.body)).toEqual({
+      ok: true,
+      followerId: "mac-mini",
+      updateStatus: {
+        updateId: "up-123",
+        status: "pending",
+        newSha: "abcdef1234567890abcdef1234567890abcdef12",
+        timestamp: "2026-09-22T00:00:00.000Z",
+      },
+    });
+    expect(mockUpdateFollower).toHaveBeenCalledWith("mac-mini", {
+      targetSha: "abcdef1234567890abcdef1234567890abcdef12",
+      branch: undefined,
+      protocolVersion: undefined,
+    });
+
+    const { res: getRes } = await call(followerDeps, "GET", "/api/mesh/followers/mac-mini/update");
+    expect(getRes.statusCode).toBe(200);
+    expect(JSON.parse(getRes.body)).toEqual({
+      followerId: "mac-mini",
+      updateStatus: {
+        updateId: "up-123",
+        status: "building",
+        newSha: "abcdef1234567890abcdef1234567890abcdef12",
+        timestamp: "2026-09-22T00:00:01.000Z",
+      },
+    });
+
+    const { res: notFoundRes } = await call(
+      followerDeps,
+      "GET",
+      "/api/mesh/followers/non-existent/update"
+    );
+    expect(notFoundRes.statusCode).toBe(404);
+  });
+
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {
     // Silently falling back to native is the failure mode that matters here: the
     // operator would get an ordinary actor and believe it was portable.

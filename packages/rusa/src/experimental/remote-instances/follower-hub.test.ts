@@ -20,6 +20,10 @@ async function setup() {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+  const get = (path: string) =>
+    fetch(`${origin}${path}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
   const register = async (id: string) => {
     const response = await post("/register", {
       id,
@@ -30,7 +34,7 @@ async function setup() {
     expect(response.status).toBe(200);
     return { id, ...((await response.json()) as { session: string; leaderToken: string }) };
   };
-  return { hub, origin, post, register };
+  return { hub, origin, token, post, get, register };
 }
 
 describe("leader follower gateway", () => {
@@ -468,5 +472,110 @@ describe("leader follower gateway", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  describe("follower update mechanism", () => {
+    it("registers follower with commitSha and includes update metadata in list()", async () => {
+      const h = await setup();
+      const response = await h.post("/register", {
+        id: "worker-sha",
+        platform: "linux",
+        pid: 321,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        commitSha: "1234567890abcdef1234567890abcdef12345678",
+      });
+      expect(response.status).toBe(200);
+
+      const followers = h.hub.list();
+      expect(followers).toHaveLength(1);
+      expect(followers[0].id).toBe("worker-sha");
+      expect(followers[0].commitSha).toBe("1234567890abcdef1234567890abcdef12345678");
+      expect(followers[0].protocolVersion).toBe(INSTANCE_PROTOCOL_VERSION);
+      expect(followers[0].updateStatus).toBeUndefined();
+    });
+
+    it("fences update against disconnected follower or mismatched protocol version", async () => {
+      const h = await setup();
+      await h.register("worker-fence");
+
+      expect(() =>
+        h.hub.updateFollower("unknown", { targetSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
+      ).toThrow("Follower unknown is not connected");
+
+      expect(() =>
+        h.hub.updateFollower("worker-fence", {
+          protocolVersion: INSTANCE_PROTOCOL_VERSION + 1,
+        })
+      ).toThrow("Incompatible follower protocol version");
+    });
+
+    it("triggers authenticated update via HTTP and delivers update command via /poll", async () => {
+      const h = await setup();
+      const identity = await h.register("worker-update");
+
+      // Unauthenticated request fails
+      const unauth = await fetch(`${h.origin}/followers/worker-update/update`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ targetSha: "1111111111111111111111111111111111111111" }),
+      });
+      expect(unauth.status).toBe(401);
+
+      // Authenticated POST triggers update
+      const updateRes = await h.post("/followers/worker-update/update", {
+        targetSha: "1111111111111111111111111111111111111111",
+        branch: "staging",
+      });
+      expect(updateRes.status).toBe(200);
+      const updateJson = (await updateRes.json()) as {
+        ok: boolean;
+        update: { updateId: string; status: string };
+      };
+      expect(updateJson.ok).toBe(true);
+      expect(updateJson.update.status).toBe("pending");
+
+      // GET update status
+      const getRes = await h.get("/followers/worker-update/update");
+      expect(getRes.status).toBe(200);
+      const getJson = (await getRes.json()) as { ok: boolean; status: { updateId: string } };
+      expect(getJson.ok).toBe(true);
+      expect(getJson.status.updateId).toBe(updateJson.update.updateId);
+      // Poll delivers the update command
+      const pollRes = await h.post("/poll", identity);
+      expect(pollRes.status).toBe(200);
+      const commands = (await pollRes.json()) as Array<{
+        type: string;
+        updateId: string;
+        targetSha?: string;
+      }>;
+      expect(commands).toHaveLength(1);
+      expect(commands[0].type).toBe("update");
+      expect(commands[0].updateId).toBe(updateJson.update.updateId);
+      expect(commands[0].targetSha).toBe("1111111111111111111111111111111111111111");
+
+      // Follower posts $instance status event back
+      await h.post("/events", {
+        ...identity,
+        batchId: "status-batch",
+        events: [
+          {
+            eventId: "status-event-1",
+            actorId: "$instance",
+            message: {
+              type: "update_status",
+              updateId: updateJson.update.updateId,
+              status: "building",
+              step: "build",
+              oldSha: "0000000000000000000000000000000000000000",
+              newSha: "1111111111111111111111111111111111111111",
+            },
+          },
+        ],
+      });
+
+      const updatedInfo = h.hub.list().find((f) => f.id === "worker-update");
+      expect(updatedInfo?.updateStatus?.status).toBe("building");
+      expect(updatedInfo?.updateStatus?.step).toBe("build");
+    });
   });
 });

@@ -1,12 +1,16 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { resolveRepoRoot } from "../../commands/service-instance.js";
 import { createLogger } from "../../observability/logger.js";
+import { GitRunner } from "../../update/runner.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
-import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
+import { type FollowerUpdateCommand, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const { values } = parseArgs({
   options: {
@@ -15,6 +19,7 @@ const { values } = parseArgs({
     home: { type: "string" },
     "token-file": { type: "string" },
     sandbox: { type: "string" },
+    "repo-path": { type: "string" },
   },
 });
 if (
@@ -39,6 +44,30 @@ const root = resolve(values.home);
 mkdirSync(join(root, "workers"), { recursive: true });
 // Instance-wide configuration is local; never mutate cwd/env for individual actors.
 process.env.RUSA_HOME = root;
+
+function tryGetCommitSha(dir: string): string | undefined {
+  try {
+    const sha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: dir,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+      encoding: "utf8",
+    }).trim();
+    if (/^[a-f0-9]{7,40}$/i.test(sha)) return sha;
+  } catch {}
+  return undefined;
+}
+
+let repoRoot: string;
+try {
+  repoRoot = values["repo-path"] ? resolve(values["repo-path"]) : resolveRepoRoot();
+} catch {
+  repoRoot = process.cwd();
+}
+const packageDir = existsSync(join(repoRoot, "packages", "rusa"))
+  ? join(repoRoot, "packages", "rusa")
+  : repoRoot;
+
 const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
   emit(event.actorId, event.message, event.eventId)
 );
@@ -151,6 +180,7 @@ async function run(): Promise<void> {
           platform: process.platform,
           pid: process.pid,
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          commitSha: tryGetCommitSha(repoRoot),
         });
         if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
           throw new Error("Incompatible instance protocol; rebuild leader and follower");
@@ -170,6 +200,7 @@ async function run(): Promise<void> {
           leader: leader.origin,
           pid: process.pid,
           sandbox: values.sandbox,
+          commitSha: tryGetCommitSha(repoRoot),
         });
         void flush();
       } catch (error) {
@@ -187,7 +218,13 @@ async function run(): Promise<void> {
     try {
       if ((events.length || pendingBatch) && !sending) void flush();
       const commands = await post<FollowerCommand[]>("/poll", {});
-      for (const command of commands) instance.dispatch(command);
+      for (const command of commands) {
+        if ("actorId" in command) {
+          instance.dispatch(command);
+        } else if (command.type === "update") {
+          void handleUpdate(command);
+        }
+      }
       backoffMs = 500;
     } catch (error) {
       if (stopped) break;
@@ -197,6 +234,45 @@ async function run(): Promise<void> {
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
     }
   }
+}
+
+async function handleUpdate(command: FollowerUpdateCommand): Promise<void> {
+  log.info("follower_update_received", {
+    updateId: command.updateId,
+    targetSha: command.targetSha,
+    branch: command.branch,
+  });
+  await executeFollowerUpdate(
+    {
+      updateId: command.updateId,
+      targetSha: command.targetSha,
+      branch: command.branch,
+      protocolVersion: command.protocolVersion,
+    },
+    {
+      git: new GitRunner(repoRoot),
+      build: new FollowerBuildRunner(packageDir, undefined, (m) => log.info(m)),
+      drain: {
+        drain: async (timeoutMs) => {
+          instance.close();
+          const start = Date.now();
+          while (instance.actorIds.length && Date.now() - start < timeoutMs) {
+            await new Promise((r) => setTimeout(r, 50));
+          }
+        },
+      },
+      emitter: {
+        emitStatus: (statusEvent) => {
+          emit("$instance", statusEvent);
+        },
+      },
+      exit: (code) => {
+        void stop(code);
+      },
+      log: (m) => log.info(m),
+    }
+  );
+  await flush();
 }
 
 try {

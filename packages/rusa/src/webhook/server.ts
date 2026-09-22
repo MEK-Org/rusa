@@ -162,6 +162,8 @@ export interface DashboardMeshRefs {
   slackClient?: DashboardDataDeps["slackClient"];
   issueClient?: DashboardDataDeps["issueClient"];
   getFollowers?: DashboardDataDeps["getFollowers"];
+  updateFollower?: DashboardDataDeps["updateFollower"];
+  updateAllFollowers?: DashboardDataDeps["updateAllFollowers"];
 }
 
 export interface DashboardServerBaseOptions {
@@ -609,6 +611,8 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           slackClient: options.mesh.slackClient,
           issueClient: options.mesh.issueClient,
           getFollowers: options.mesh.getFollowers,
+          updateFollower: options.mesh.updateFollower,
+          updateAllFollowers: options.mesh.updateAllFollowers,
         }
       : null;
   // Walkie-talkie deps : routes need the registry/mesh/hub either way so

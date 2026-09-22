@@ -47,7 +47,7 @@ export function createHarness(options: {
   const wire = (instance: RemoteInstance) => {
     instance.flush = () => {
       for (const command of instance.commands.splice(0))
-        queueMicrotask(() => follower.dispatch(structuredClone(command)));
+        if ("actorId" in command) queueMicrotask(() => follower.dispatch(structuredClone(command)));
     };
   };
   wire(remote);

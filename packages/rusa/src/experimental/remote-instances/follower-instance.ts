@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
-import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
+import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type { ProviderFactory } from "./protocol.js";
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
@@ -22,7 +22,7 @@ export class FollowerInstance {
     return [...this.actors.keys()];
   }
 
-  dispatch({ actorId, message }: FollowerCommand): void {
+  dispatch({ actorId, message }: FollowerActorCommand): void {
     if (this.stopped) return;
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(actorId)) throw new Error("Invalid actor ID");
     if (message.type !== "init") {

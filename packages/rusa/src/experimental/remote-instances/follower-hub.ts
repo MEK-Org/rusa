@@ -8,7 +8,13 @@ import {
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
-import type { ActorEvent, LeaderCommand } from "./protocol.js";
+import type {
+  ActorEvent,
+  FollowerUpdateCommand,
+  FollowerUpdateStatus,
+  FollowerUpdateStatusEvent,
+  LeaderCommand,
+} from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
@@ -19,16 +25,25 @@ export interface FollowerInfo {
   pid: number;
   actors: string[];
   lastSeen: string;
+  commitSha?: string;
+  protocolVersion?: number;
+  updateStatus?: FollowerUpdateStatus;
 }
 
-export interface FollowerCommand {
+export interface FollowerActorCommand {
   actorId: string;
   message: LeaderCommand;
 }
+
+export type FollowerCommand = FollowerActorCommand | FollowerUpdateCommand;
+
 export interface FollowerEvent {
   eventId: string;
   actorId: string;
-  message: ActorEvent | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+  message:
+    | ActorEvent
+    | { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
+    | FollowerUpdateStatusEvent;
 }
 
 export interface FollowerHubOptions {
@@ -117,7 +132,68 @@ export class FollowerHub {
       pid: f.pid,
       actors: [...f.hosts.keys()],
       lastSeen: new Date(f.seen).toISOString(),
+      commitSha: f.commitSha,
+      protocolVersion: f.protocolVersion,
+      updateStatus: f.updateStatus,
     }));
+  }
+  updateFollower(
+    followerId: string,
+    options?: { targetSha?: string; branch?: string; protocolVersion?: number }
+  ): FollowerUpdateStatus {
+    const follower = this.followers.get(followerId);
+    if (!follower) throw new Error(`Follower ${followerId} is not connected`);
+    if (
+      options?.protocolVersion !== undefined &&
+      options.protocolVersion !== follower.protocolVersion
+    ) {
+      throw new Error(
+        `Incompatible follower protocol version (target: ${options.protocolVersion}, follower: ${follower.protocolVersion})`
+      );
+    }
+    if (options?.targetSha !== undefined && !/^[a-f0-9]{7,40}$/i.test(options.targetSha)) {
+      throw new Error("Invalid target SHA");
+    }
+    const updateId = randomBytes(16).toString("hex");
+    const status: FollowerUpdateStatus = {
+      updateId,
+      status: "pending",
+      newSha: options?.targetSha,
+      timestamp: new Date().toISOString(),
+    };
+    follower.setUpdateStatus(status);
+    follower.enqueueUpdate({
+      type: "update",
+      updateId,
+      targetSha: options?.targetSha,
+      branch: options?.branch,
+      protocolVersion: options?.protocolVersion ?? INSTANCE_PROTOCOL_VERSION,
+    });
+    this.log.info("follower_update_triggered", {
+      followerId,
+      updateId,
+      targetSha: options?.targetSha,
+      branch: options?.branch,
+    });
+    return status;
+  }
+  updateAllFollowers(options?: {
+    targetSha?: string;
+    branch?: string;
+    protocolVersion?: number;
+  }): FollowerUpdateStatus[] {
+    const statuses: FollowerUpdateStatus[] = [];
+    for (const followerId of this.followers.keys()) {
+      try {
+        statuses.push(this.updateFollower(followerId, options));
+      } catch (err) {
+        this.log.warn("follower_update_all_partial_failure", { followerId, err });
+      }
+    }
+    return statuses;
+  }
+  getFollowerUpdateStatus(followerId: string): FollowerUpdateStatus | undefined {
+    return this.followers.get(followerId)?.updateStatus;
   }
   createHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
@@ -245,11 +321,48 @@ export class FollowerHub {
       reply(res, 200, this.list());
       return;
     }
+    if (req.method === "GET" && path.startsWith("/followers/") && path.endsWith("/update")) {
+      const followerId = path.slice("/followers/".length, -"/update".length);
+      const status = this.getFollowerUpdateStatus(followerId);
+      if (!status && !this.followers.has(followerId)) {
+        reply(res, 404, { error: `Follower ${followerId} not found` });
+        return;
+      }
+      reply(res, 200, { followerId, updateStatus: status ?? null });
+      return;
+    }
     if (req.method !== "POST") {
       reply(res, 404, {});
       return;
     }
     const body = (await readJson(req)) as Record<string, unknown>;
+    if (path.startsWith("/followers/") && path.endsWith("/update")) {
+      const followerId = path.slice("/followers/".length, -"/update".length);
+      try {
+        const status = this.updateFollower(followerId, {
+          targetSha: typeof body.targetSha === "string" ? body.targetSha : undefined,
+          branch: typeof body.branch === "string" ? body.branch : undefined,
+          protocolVersion:
+            typeof body.protocolVersion === "number" ? body.protocolVersion : undefined,
+        });
+        reply(res, 200, { ok: true, followerId, update: status });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = message.includes("not connected") ? 404 : 400;
+        reply(res, statusCode, { error: message });
+      }
+      return;
+    }
+    if (path === "/followers/update-all") {
+      const statuses = this.updateAllFollowers({
+        targetSha: typeof body.targetSha === "string" ? body.targetSha : undefined,
+        branch: typeof body.branch === "string" ? body.branch : undefined,
+        protocolVersion:
+          typeof body.protocolVersion === "number" ? body.protocolVersion : undefined,
+      });
+      reply(res, 200, { ok: true, updates: statuses });
+      return;
+    }
     if (path === "/register") {
       if (body.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
         reply(res, 409, { error: "Incompatible instance protocol; rebuild leader and follower" });
@@ -267,13 +380,25 @@ export class FollowerHub {
         reply(res, 409, { error: "Follower already connected" });
         return;
       }
+      const commitSha =
+        typeof body.commitSha === "string" && /^[a-f0-9]{7,40}$/i.test(body.commitSha)
+          ? body.commitSha
+          : undefined;
       const tracker = this.getDedupeTracker(body.id);
-      const follower = new RemoteInstance(body.id, body.platform, body.pid, tracker);
+      const follower = new RemoteInstance(
+        body.id,
+        body.platform,
+        body.pid,
+        tracker,
+        commitSha,
+        body.protocolVersion as number
+      );
       this.followers.set(follower.id, follower);
       this.log.info("follower_connected", {
         followerId: follower.id,
         platform: follower.platform,
         pid: follower.pid,
+        commitSha: follower.commitSha,
       });
       this.onRegisterCallback?.(follower);
       reply(res, 200, {

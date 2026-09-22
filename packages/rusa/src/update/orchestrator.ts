@@ -81,6 +81,10 @@ export interface UpdateDeps {
   git: GitSeam;
   build: BuildSeam;
   drain: DrainSeam;
+  /** Optional follower coordinator to trigger remote follower updates upon green build. */
+  followerCoordinator?: {
+    updateAll(targetSha: string): Promise<void> | void;
+  };
   /** Best-effort failure notice (root also gets the result string). Optional. */
   notify?: NotifySeam;
   /**
@@ -249,6 +253,18 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     log(`[update] building ${shortSha(newSha)} (mesh stays live)…`);
     await deps.build.build(newSha);
     log(`[update] build green`);
+
+    // ── 2.5 Coordinate follower updates (if followerCoordinator is present) ──
+    if (deps.followerCoordinator) {
+      try {
+        log(`[update] triggering updates on enrolled followers for ${shortSha(newSha)}…`);
+        await deps.followerCoordinator.updateAll(newSha);
+      } catch (fErr) {
+        log(
+          `[update] follower coordination warning: ${fErr instanceof Error ? fErr.message : String(fErr)}`
+        );
+      }
+    }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
     step = "drain";

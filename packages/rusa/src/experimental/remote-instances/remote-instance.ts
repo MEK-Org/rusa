@@ -3,7 +3,14 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import type { ActorChannel } from "./actor-channel.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
-import type { ActorEvent, LeaderCommand } from "./protocol.js";
+import type {
+  ActorEvent,
+  FollowerUpdateCommand,
+  FollowerUpdateStatus,
+  FollowerUpdateStatusEvent,
+  LeaderCommand,
+} from "./protocol.js";
+import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 /** In-memory deduplication tracker preserving at-most-once delivery across follower reconnects. */
 export class FollowerDedupeTracker {
@@ -56,20 +63,25 @@ export class FollowerDedupeTracker {
 }
 
 /** Leader-side representation of one registered follower generation. */
-export class RemoteInstance {
+export class RemoteInstance extends EventEmitter {
   readonly session = randomBytes(32).toString("hex");
   readonly hosts = new Map<string, InstanceActorChannel>();
   readonly commands: FollowerCommand[] = [];
   seen = Date.now();
   poll?: ServerResponse;
   pollTimer?: ReturnType<typeof setTimeout>;
+  updateStatus?: FollowerUpdateStatus;
 
   constructor(
     readonly id: string,
     readonly platform: string,
     readonly pid: number,
-    private readonly dedupeTracker: FollowerDedupeTracker = new FollowerDedupeTracker()
-  ) {}
+    private readonly dedupeTracker: FollowerDedupeTracker = new FollowerDedupeTracker(),
+    public commitSha?: string,
+    readonly protocolVersion: number = INSTANCE_PROTOCOL_VERSION
+  ) {
+    super();
+  }
 
   hasBatch(batchId: string): boolean {
     return this.dedupeTracker.hasBatch(batchId);
@@ -87,6 +99,20 @@ export class RemoteInstance {
     this.dedupeTracker.recordEvent(eventId);
   }
 
+  enqueueCommand(command: FollowerCommand): void {
+    this.commands.push(command);
+    this.flush();
+  }
+
+  enqueueUpdate(update: FollowerUpdateCommand): void {
+    this.enqueueCommand(update);
+  }
+
+  setUpdateStatus(status: FollowerUpdateStatus): void {
+    this.updateStatus = status;
+    this.emit("update_status", status);
+  }
+
   createHost(actorId: string): ActorChannel {
     if (this.hosts.has(actorId)) throw new Error("Actor already assigned");
     const host = new InstanceActorChannel(this.id, this.pid, (message) => {
@@ -100,10 +126,41 @@ export class RemoteInstance {
 
   receive(event: {
     actorId: string;
-    message: ActorEvent | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+    message:
+      | ActorEvent
+      | { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
+      | FollowerUpdateStatusEvent;
     eventId?: string;
   }): void {
-    this.hosts.get(event.actorId)?.receive(event.message);
+    if (event.actorId === "$instance" || event.actorId === "__instance__") {
+      if (
+        event.message &&
+        typeof event.message === "object" &&
+        "type" in event.message &&
+        event.message.type === "update_status"
+      ) {
+        const msg = event.message as FollowerUpdateStatusEvent;
+        const status: FollowerUpdateStatus = {
+          updateId: msg.updateId,
+          status: msg.status,
+          step: msg.step,
+          error: msg.error,
+          oldSha: msg.oldSha,
+          newSha: msg.newSha,
+          rollbackFailed: msg.rollbackFailed,
+          timestamp: new Date().toISOString(),
+        };
+        this.setUpdateStatus(status);
+      }
+      return;
+    }
+    this.hosts
+      .get(event.actorId)
+      ?.receive(
+        event.message as
+          | ActorEvent
+          | { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
+      );
   }
 
   stopActor(actorId: string): void {
