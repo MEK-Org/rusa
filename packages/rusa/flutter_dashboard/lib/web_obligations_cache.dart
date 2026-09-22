@@ -28,12 +28,17 @@ class WebObligationsCache implements ObligationsCache {
       if (principalId.isEmpty) return null;
       final key = _snapshotKey(scope, principalId);
       final raw = web.window.localStorage.getItem(key);
-      if (raw == null ||
-          raw.isEmpty ||
-          !PersistedObligationsSnapshot.rawFitsStorageBudget(raw)) {
+      if (raw == null || raw.isEmpty) {
         return null;
       }
-      return PersistedObligationsSnapshot.fromJson(jsonDecode(raw));
+      final rawByteCount = PersistedObligationsSnapshot.encodedSize(raw);
+      if (rawByteCount > PersistedObligationsSnapshot.maxSerializedBytes) {
+        return null;
+      }
+      return PersistedObligationsSnapshot.fromJson(
+        jsonDecode(raw),
+        serializedByteCount: rawByteCount,
+      );
     } catch (_) {
       return null;
     }

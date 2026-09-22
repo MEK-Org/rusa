@@ -352,9 +352,9 @@ class _WorkTabState extends State<WorkTab> {
         const SizedBox(width: 8),
         Expanded(
           child: Text(
-            'Failed to refresh: $_error',
+            _error ?? '',
             style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
-            maxLines: 2,
+            maxLines: 3,
             overflow: TextOverflow.ellipsis,
           ),
         ),

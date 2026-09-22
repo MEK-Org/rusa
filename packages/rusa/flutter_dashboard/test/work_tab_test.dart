@@ -1679,6 +1679,8 @@ void main() {
     'retains cached view and displays actionable retry banner when background refresh fails (#505)',
     (tester) async {
       await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(320, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
         final cachedOb = makeObligation(
           'cached-ob-err',
           ownerId: 'root',
@@ -1726,8 +1728,13 @@ void main() {
         // Even though fetch failed, the cached obligation MUST remain visible (no full-page error!)
         expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
 
-        // Actionable error banner and Retry button are displayed
-        expect(find.textContaining('Failed to refresh:'), findsOneWidget);
+        // At narrow width the banner uses the one actionable sentence rather
+        // than a duplicated failure prefix that can clip its guidance.
+        expect(
+          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Failed to refresh:'), findsNothing);
         expect(find.textContaining('Network error during background sync'), findsNothing);
         expect(find.text('Retry'), findsOneWidget);
 

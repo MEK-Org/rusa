@@ -67,9 +67,6 @@ class PersistedObligationsSnapshot {
   /// Encodes this complete capture exactly as it is stored in localStorage.
   String encode() => jsonEncode(toJson());
 
-  /// Whether this complete capture fits the browser-cache budget.
-  bool get fitsStorageBudget => encodedSize(encode()) <= maxSerializedBytes;
-
   /// Lets the browser adapter reject an oversized raw localStorage value before
   /// paying to parse it.
   static bool rawFitsStorageBudget(String raw) =>
@@ -77,12 +74,18 @@ class PersistedObligationsSnapshot {
 
   /// Parses a persisted payload, or returns null when it is from another schema
   /// version, is larger than the budget, or is not the shape this reader
-  /// expects. Never throws.
-  static PersistedObligationsSnapshot? fromJson(Object? decoded) {
+  /// expects. Never throws. Adapters that already measured the serialized
+  /// payload may pass [serializedByteCount] to avoid re-encoding [decoded].
+  /// Callers without that boundary retain the defensive serialized-size check.
+  static PersistedObligationsSnapshot? fromJson(
+    Object? decoded, {
+    int? serializedByteCount,
+  }) {
     try {
       if (decoded is! Map) return null;
       if (decoded['version'] != schemaVersion) return null;
-      if (encodedSize(jsonEncode(decoded)) > maxSerializedBytes) return null;
+      final byteCount = serializedByteCount ?? encodedSize(jsonEncode(decoded));
+      if (byteCount < 0 || byteCount > maxSerializedBytes) return null;
       final scope = decoded['scope'];
       final principalId = decoded['principalId'];
       final savedAt = decoded['savedAt'];

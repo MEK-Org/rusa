@@ -271,7 +271,28 @@ void main() {
         ],
         now: now,
       );
-      expect(snapshot.fitsStorageBudget, isFalse);
+      expect(
+        PersistedObligationsSnapshot.rawFitsStorageBudget(snapshot.encode()),
+        isFalse,
+      );
+    });
+
+    test('uses a known serialized byte count without re-encoding the payload', () {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost',
+        principalId: 'u1',
+        trees: const [],
+        now: now,
+      );
+      final encoded = snapshot.encode();
+
+      expect(
+        PersistedObligationsSnapshot.fromJson(
+          snapshot.toJson(),
+          serializedByteCount: PersistedObligationsSnapshot.encodedSize(encoded),
+        ),
+        isNotNull,
+      );
     });
   });
 
