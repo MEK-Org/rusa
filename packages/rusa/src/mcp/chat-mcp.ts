@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
 import { z } from "zod";
 import { generateHandle } from "../actor/handle-generator.js";
+import { isGchatThreadHead } from "../actor/inbox-hints.js";
 import {
   type ChatClient,
   type ChatSpace,
@@ -12,6 +13,7 @@ import {
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -276,6 +278,82 @@ export interface ChatWriteMcpOptions {
   maxAttachmentBytes?: number;
   /** Directory attachment `filePath`s are confined to; defaults to `process.cwd()`. */
   workDir?: string;
+  /** Currently selected inbox entries for this run, used to deterministically enforce reply routing (#611). */
+  selectedInboxEntries?: readonly InboxEntry[] | (() => readonly InboxEntry[]);
+}
+
+/**
+ * Mechanically resolves outbound Google Chat thread placement based on the
+ * actor's selected inbox work (#611).
+ *
+ * - A selected top-level Google Chat message replies top-level (omitting threadName)
+ *   unless explicitly requested to create a thread.
+ * - A selected reply in an existing thread responds in that same thread.
+ * - Without a matching selected chat entry, caller-supplied threadName is preserved.
+ */
+export function resolveChatReplyThreadName(
+  spaceName: string,
+  callerThreadName: string | undefined,
+  createThread: boolean | undefined,
+  selectedEntries: readonly InboxEntry[] | undefined
+): string | undefined {
+  if (!selectedEntries || selectedEntries.length === 0) {
+    return callerThreadName;
+  }
+
+  let selectedChatEntry: InboxEntry | undefined;
+  for (const entry of selectedEntries) {
+    if (entry.payload.type === "gchat.message" || entry.source.startsWith("chat_space:")) {
+      const payloadSpace =
+        typeof entry.payload.spaceName === "string" && entry.payload.spaceName.trim().length > 0
+          ? entry.payload.spaceName.trim()
+          : typeof entry.payload.threadName === "string" &&
+              entry.payload.threadName.includes("/threads/")
+            ? entry.payload.threadName.trim().split("/threads/")[0]
+            : undefined;
+      if (payloadSpace === spaceName) {
+        selectedChatEntry = entry;
+        break;
+      }
+    }
+  }
+
+  if (!selectedChatEntry && selectedEntries.length === 1) {
+    const single = selectedEntries[0];
+    if (
+      single &&
+      (single.payload.type === "gchat.message" || single.source.startsWith("chat_space:"))
+    ) {
+      selectedChatEntry = single;
+    }
+  }
+
+  if (!selectedChatEntry) {
+    return callerThreadName;
+  }
+
+  const payload = selectedChatEntry.payload;
+  const selectedMessageName =
+    typeof payload.messageName === "string" && payload.messageName.trim().length > 0
+      ? payload.messageName.trim()
+      : undefined;
+  const selectedThreadName =
+    typeof payload.threadName === "string" && payload.threadName.trim().length > 0
+      ? payload.threadName.trim()
+      : undefined;
+
+  const isThreadHead = isGchatThreadHead(selectedMessageName, selectedThreadName);
+
+  if (selectedThreadName && !isThreadHead) {
+    // Existing thread: reply must stay inside this thread
+    return selectedThreadName;
+  }
+
+  // Top-level message: reply top-level (omit threadName) unless explicitly requested
+  if (createThread === true || payload.createThread === true) {
+    return callerThreadName ?? selectedThreadName;
+  }
+  return undefined;
 }
 
 /** Add the terminal Chat footer unless the caller already supplied this exact one. */
@@ -354,6 +432,12 @@ export function createChatWriteMcpServer(
           .string()
           .optional()
           .describe("Thread resource name to reply within; omit to start a new thread"),
+        createThread: z
+          .boolean()
+          .optional()
+          .describe(
+            "Explicitly create a new thread under a selected top-level message; omit or false to reply top-level"
+          ),
         attachments: z
           .array(
             z.object({
@@ -395,7 +479,7 @@ export function createChatWriteMcpServer(
           .describe("Attachments to attach to this message"),
       },
     },
-    async ({ spaceName, text, threadName, attachments }) => {
+    async ({ spaceName, text, threadName, createThread, attachments }) => {
       try {
         if (!isAllowed(spaceName)) {
           throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
@@ -459,8 +543,18 @@ export function createChatWriteMcpServer(
             }
           }
         }
+        const selectedEntries =
+          typeof options.selectedInboxEntries === "function"
+            ? options.selectedInboxEntries()
+            : options.selectedInboxEntries;
+        const effectiveThreadName = resolveChatReplyThreadName(
+          spaceName,
+          threadName,
+          createThread,
+          selectedEntries
+        );
         const res = await chatClient.send(spaceName, signedText(text), {
-          ...(threadName ? { threadName } : {}),
+          ...(effectiveThreadName ? { threadName: effectiveThreadName } : {}),
           ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
         });
         options.onWrite?.(actorId);

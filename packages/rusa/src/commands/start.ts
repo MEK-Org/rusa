@@ -1920,6 +1920,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     slackClient: slackClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
+    selectedInboxEntriesForActor: (actorId) =>
+      mesh
+        .selectedInboxEntries(actorId)
+        .map((id) => inboxStore.read(actorId, id))
+        .filter((e): e is InboxEntry => e !== null),
     // Confines chat-write attachment filePaths to the grantee's workdir — same
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
@@ -3142,6 +3147,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               mesh.markUnkillable(actorId);
             },
             workDir: rootAgentDir,
+            selectedInboxEntries: () =>
+              mesh
+                .selectedInboxEntries(rootId)
+                .map((id) => inboxStore.read(rootId, id))
+                .filter((e): e is InboxEntry => e !== null),
           })
         )
       : undefined;

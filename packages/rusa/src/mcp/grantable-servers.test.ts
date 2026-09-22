@@ -3,7 +3,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryHostJobStore } from "../actor/host-job-store.js";
+import { FakeChatClient } from "../chat/fake.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import type { DistillerState } from "../understanding/distiller-cursor.js";
 import {
   buildGrantableServers,
@@ -441,5 +443,41 @@ describe("grantable capabilities allow-list ", () => {
     // Calling factory with ["*"] should not throw and configure wildcard access
     const writeServer = chatWriteFactory("actor-1", ["*"]);
     expect(writeServer).toBeDefined();
+  });
+
+  it("wires selectedInboxEntriesForActor to chat-write capability", async () => {
+    const fakeChatClient = new FakeChatClient();
+    const topLevelEntry: InboxEntry = {
+      id: "e1",
+      actorId: "actor-1",
+      source: "chat_space:spaces/A",
+      deliveredAt: new Date(),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: {
+        type: "gchat.message",
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      },
+    };
+    const serversWithChat = buildGrantableServers({
+      ...STUB_DEPS,
+      chatClient: fakeChatClient,
+      selectedInboxEntriesForActor: (actorId) => (actorId === "actor-1" ? [topLevelEntry] : []),
+    });
+    const chatWriteFactory = serversWithChat.get("chat-write");
+    if (!chatWriteFactory) throw new Error("expected chat-write factory");
+    const writeServer = chatWriteFactory("actor-1", ["spaces/A"]);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await writeServer.connect(serverTransport);
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(clientTransport);
+    await client.callTool({
+      name: "send_message",
+      arguments: { spaceName: "spaces/A", text: "hi", threadName: "spaces/A/threads/M1" },
+    });
+    expect(fakeChatClient.sent[0]?.threadName).toBeUndefined();
   });
 });

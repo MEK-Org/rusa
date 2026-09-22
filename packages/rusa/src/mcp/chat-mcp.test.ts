@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { createChatReadMcpServer, createChatWriteMcpServer } from "./chat-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -1059,5 +1060,185 @@ describe("chat MCP server", () => {
     expect(parsed.spaces).toEqual([
       { name: "spaces/TARGET", displayName: "Target Space", spaceType: "SPACE" },
     ]);
+  });
+
+  describe("Google Chat reply routing (#611)", () => {
+    const makeEntry = (
+      payload: Record<string, unknown>,
+      source = "chat_space:spaces/A"
+    ): InboxEntry => ({
+      id: "entry-1",
+      actorId: "test",
+      source,
+      deliveredAt: new Date("2026-09-21T10:00:00Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: {
+        type: "gchat.message",
+        ...payload,
+      },
+    });
+
+    it("replies top-level (omits threadName) when selected inbox entry is a top-level message (message id == thread id)", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      // Model passes threadName equal to top-level thread head: should be mechanically stripped
+      const res1 = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "top-level answer",
+          threadName: "spaces/A/threads/M1",
+        },
+      })) as CallToolResult;
+      expect(res1.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBeUndefined();
+
+      // Model omits threadName: stays top-level
+      const res2 = (await client.callTool({
+        name: "send_message",
+        arguments: { spaceName: "spaces/A", text: "another answer" },
+      })) as CallToolResult;
+      expect(res2.isError).toBeFalsy();
+      expect(fake.sent[1]?.threadName).toBeUndefined();
+
+      // Dot-notation message name: spaces/A/messages/M1.M1 with spaces/A/threads/M1
+      const fakeDot = new FakeChatClient();
+      const dotEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1.M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const clientDot = await connect(
+        createChatWriteMcpServer("test", fakeDot, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [dotEntry],
+        })
+      );
+      const resDot = (await clientDot.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "dot notation reply",
+          threadName: "spaces/A/threads/M1",
+        },
+      })) as CallToolResult;
+      expect(resDot.isError).toBeFalsy();
+      expect(fakeDot.sent[0]?.threadName).toBeUndefined();
+    });
+
+    it("creates thread on top-level message when explicitly requested via createThread", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "explicitly new thread",
+          threadName: "spaces/A/threads/M1",
+          createThread: true,
+        },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+    });
+
+    it("replies inside existing thread when selected inbox entry is a thread reply (message id != thread id)", async () => {
+      const fake = new FakeChatClient();
+      const existingThreadEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M2",
+        threadName: "spaces/A/threads/T1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [existingThreadEntry],
+        })
+      );
+
+      // Model provides the threadName: stays in thread
+      const res1 = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "in thread with threadName",
+          threadName: "spaces/A/threads/T1",
+        },
+      })) as CallToolResult;
+      expect(res1.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/T1");
+
+      // Model omits threadName: mechanically routed to stay in thread
+      const res2 = (await client.callTool({
+        name: "send_message",
+        arguments: { spaceName: "spaces/A", text: "in thread omitting threadName" },
+      })) as CallToolResult;
+      expect(res2.isError).toBeFalsy();
+      expect(fake.sent[1]?.threadName).toBe("spaces/A/threads/T1");
+    });
+
+    it("evaluates selectedInboxEntries dynamically via getter function", async () => {
+      const fake = new FakeChatClient();
+      let currentEntries: InboxEntry[] = [];
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: () => currentEntries,
+        })
+      );
+
+      // Initially no selected entries: uses caller's threadName
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "no selection",
+          threadName: "spaces/A/threads/M1",
+        },
+      });
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+
+      // Now set top-level entry: threadName is stripped
+      currentEntries = [
+        makeEntry({
+          spaceName: "spaces/A",
+          messageName: "spaces/A/messages/M1",
+          threadName: "spaces/A/threads/M1",
+        }),
+      ];
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "with selection",
+          threadName: "spaces/A/threads/M1",
+        },
+      });
+      expect(fake.sent[1]?.threadName).toBeUndefined();
+    });
   });
 });
