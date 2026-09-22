@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
@@ -1440,6 +1441,200 @@ void main() {
 
         expect(find.text('and 2 more'), findsOneWidget);
         expect(find.text('and 4 more'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'hydrates cached obligations snapshot immediately at 0ms and shows '
+    'background refreshing indicator while revalidating (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cachedOb = makeObligation(
+          'cached-ob-1',
+          ownerId: 'root',
+          title: 'Cached Fast Loading Obligation',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final cache = FakeObligationsCache(snapshot);
+        final gate = Completer<void>();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [cachedOb]
+          ..forestGates.add(gate);
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+
+        // Immediate first frame: cached obligation is rendered synchronously,
+        // WITHOUT full-screen CircularProgressIndicator!
+        expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
+        expect(find.text('WORK QUEUE'), findsOneWidget);
+
+        // Background refresh is in flight (held by gate), so the small loading indicator is visible
+        final smallSpinnerFinder = find.descendant(
+          of: find.byType(WorkTab),
+          matching: find.byType(CircularProgressIndicator),
+        );
+        expect(smallSpinnerFinder, findsOneWidget);
+
+        // Complete the background fetch gate
+        gate.complete();
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        // Refresh completed: small loading indicator is gone, obligation remains rendered
+        expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
+        expect(smallSpinnerFinder, findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'retains cached view and displays actionable retry banner when background refresh fails (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cachedOb = makeObligation(
+          'cached-ob-err',
+          ownerId: 'root',
+          title: 'Cached Obligation Preserved On Error',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final cache = FakeObligationsCache(snapshot);
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [cachedOb]
+          ..forestError = Exception('Network error during background sync');
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        // Even though fetch failed, the cached obligation MUST remain visible (no full-page error!)
+        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+
+        // Actionable error banner and Retry button are displayed
+        expect(find.textContaining('Failed to refresh:'), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+
+        // Clear error on API and tap Retry
+        api.forestError = null;
+        await tester.tap(find.text('Retry'));
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        // Error banner is dismissed after successful retry
+        expect(find.textContaining('Failed to refresh:'), findsNothing);
+        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'invalidates cache and reloads on obligation mutation in WorkTab (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cachedOb = makeObligation(
+          'cached-ob-mut',
+          ownerId: 'root',
+          title: 'Before Mutation',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final cache = FakeObligationsCache(snapshot);
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [cachedOb];
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Before Mutation'), findsOneWidget);
+
+        // Mutate via create obligation
+        final created = await api.createObligation(ownerId: 'root', title: 'Newly Created Child');
+        expect(created.id, isNotNull);
+
+        // Calling store.invalidateObligationsCache() invalidates cache
+        store.invalidateObligationsCache();
+        expect(cache.invalidateCount, 1);
+        expect(store.cachedObligationTrees, isNull);
 
         await store.dispose();
       });

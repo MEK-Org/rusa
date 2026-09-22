@@ -9,6 +9,7 @@ import 'api.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligations_cache.dart';
 import 'principals.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -158,6 +159,7 @@ class DashboardStore {
     QuotaCache? quotaCache,
     TreePreferencesCache? treePreferencesCache,
     ActorHierarchyCache? actorHierarchyCache,
+    ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
   }) : _api = api,
@@ -167,6 +169,8 @@ class DashboardStore {
            treePreferencesCache ?? const NoopTreePreferencesCache(),
        _actorHierarchyCache =
            actorHierarchyCache ?? const NoopActorHierarchyCache(),
+       _obligationsCache =
+           obligationsCache ?? const NoopObligationsCache(),
        _hierarchyScope = cacheScopeFor(api.base) {
     // Seed the quota subject from the persisted snapshot BEFORE the first frame
     // (ISSUE_NUM ask 4): the header reads `store.quota.valueOrNull` as its
@@ -196,6 +200,7 @@ class DashboardStore {
       _workExpanded = Set.of(savedWorkExpanded);
     }
     _seedActorsFromCache();
+    _seedObligationsFromCache();
   }
 
   /// Paint the previous session's hierarchy before the first frame (#273): the
@@ -219,6 +224,40 @@ class DashboardStore {
     if (cached.threads.isEmpty) return;
     _updateActorStatesFromThreads(cached.threads);
     _actorsStale.add(true);
+  }
+
+  /// Hydrate the previous session's obligations snapshot before the first frame (#505):
+  /// hydrating it here allows the Work tab to render at 0ms on return or reload,
+  /// with authoritative reconciliation refreshing in the background.
+  void _seedObligationsFromCache() {
+    final cached = _obligationsCache.load(scope: _hierarchyScope);
+    if (cached == null) return;
+    if (userPrincipalId != null &&
+        !cached.isUsableAt(
+          scope: _hierarchyScope,
+          principalId: userPrincipalId!,
+          now: DateTime.timestamp(),
+        )) {
+      _obligationsCache.invalidate(
+        scope: _hierarchyScope,
+        principalId: userPrincipalId,
+      );
+      return;
+    }
+    if (!cached.isUsableAt(
+      scope: _hierarchyScope,
+      principalId: cached.principalId,
+      now: DateTime.timestamp(),
+    )) {
+      _obligationsCache.invalidate(
+        scope: _hierarchyScope,
+        principalId: cached.principalId,
+      );
+      return;
+    }
+    if (cached.trees.isEmpty) return;
+    _cachedObligationTrees = cached.trees;
+    _cachedObligationPrincipal = cached.principalId;
   }
 
   /// The server boundary a persisted hierarchy belongs to, as
@@ -254,9 +293,19 @@ class DashboardStore {
   final QuotaCache _quotaCache;
   final TreePreferencesCache _treePreferencesCache;
   final ActorHierarchyCache _actorHierarchyCache;
+  final ObligationsCache _obligationsCache;
   final String _hierarchyScope;
+  List<ObligationTreeDto>? _cachedObligationTrees;
+  String? _cachedObligationPrincipal;
 
   DashboardApi get api => _api;
+  ObligationsCache get obligationsCache => _obligationsCache;
+  List<ObligationTreeDto>? get cachedObligationTrees => _cachedObligationTrees;
+  String? get cachedObligationPrincipal => _cachedObligationPrincipal;
+  String get _effectivePrincipalId =>
+      userPrincipalId ??
+      _cachedObligationPrincipal ??
+      kLegacyOperatorPrincipalId;
 
   /// Walkie-talkie platform deps , wired by the web entrypoint. Null
   /// means the feature is absent (headless harnesses/tests that don't care) —
@@ -455,7 +504,9 @@ class DashboardStore {
 
   Future<void> refreshDashboardConfig() async {
     try {
-      _dashboardConfig.add(await _api.fetchDashboardConfig());
+      final config = await _api.fetchDashboardConfig();
+      _dashboardConfig.add(config);
+      _onPrincipalResolved(config.userPrincipalId);
     } on DashboardApiException catch (e) {
       // Older/static dashboard hosts may not expose this endpoint; the header
       // keeps its weekly per-provider defaults.
@@ -464,6 +515,54 @@ class DashboardStore {
     } catch (e) {
       _error.add('$e');
     }
+  }
+
+  void _onPrincipalResolved(String? resolvedPrincipal) {
+    final effective = resolvedPrincipal ?? kLegacyOperatorPrincipalId;
+    if (_cachedObligationPrincipal != null &&
+        _cachedObligationPrincipal != effective) {
+      _cachedObligationTrees = null;
+      _cachedObligationPrincipal = effective;
+      final cached = _obligationsCache.load(
+        scope: _hierarchyScope,
+        principalId: effective,
+      );
+      if (cached != null &&
+          cached.isUsableAt(
+            scope: _hierarchyScope,
+            principalId: effective,
+            now: DateTime.timestamp(),
+          )) {
+        _cachedObligationTrees = cached.trees;
+      }
+    } else {
+      _cachedObligationPrincipal ??= effective;
+    }
+  }
+
+  /// Persists [trees] as the new last-known successful obligations snapshot (#505).
+  void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
+    _cachedObligationTrees = trees;
+    final principal = _effectivePrincipalId;
+    _cachedObligationPrincipal = principal;
+    _obligationsCache.save(
+      PersistedObligationsSnapshot.capture(
+        scope: _hierarchyScope,
+        principalId: principal,
+        trees: trees,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// Invalidates the cached obligations snapshot so navigation return or reload
+  /// does not regress to known-old state after a mutation (#505).
+  void invalidateObligationsCache() {
+    _cachedObligationTrees = null;
+    _obligationsCache.invalidate(
+      scope: _hierarchyScope,
+      principalId: _cachedObligationPrincipal ?? userPrincipalId,
+    );
   }
 
   Future<void> refreshThreads() async {
@@ -1243,6 +1342,7 @@ class DashboardStore {
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
+      invalidateObligationsCache();
       _obligationRefreshes.add(e.detail);
     }
 

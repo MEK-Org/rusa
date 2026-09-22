@@ -222,6 +222,7 @@ Future<void> showCreateObligationDialog(
                           externalRef: externalRef,
                           priority: priority,
                         );
+                        store.invalidateObligationsCache();
 
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
@@ -372,6 +373,7 @@ Future<void> showReparentObligationDialog(
                       try {
                         final targetParentId = makeRoot ? null : parentIdCtrl.text.trim();
                         await store.api.reparentObligation(obligation.id, parentId: targetParentId);
+                        store.invalidateObligationsCache();
 
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
@@ -479,6 +481,7 @@ Future<void> showReassignObligationDialog(
                         obligation.id,
                         ownerId: resolvedId,
                       );
+                      store.invalidateObligationsCache();
                       if (context.mounted) {
                         Navigator.of(dialogContext).pop();
                         ScaffoldMessenger.of(context).showSnackBar(
@@ -603,6 +606,7 @@ Future<void> showEditExternalRefDialog(
                     });
                     try {
                       await store.api.setObligationExternalRef(obligation.id, controller.text);
+                      store.invalidateObligationsCache();
                       if (dialogContext.mounted) Navigator.of(dialogContext).pop();
                       onUpdated?.call();
                     } catch (e) {
@@ -722,6 +726,7 @@ Future<void> confirmAndSetObligationStatus(
       status,
       note: trimmed.isEmpty ? null : trimmed,
     );
+    store.invalidateObligationsCache();
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Obligation transitioned to $status')),

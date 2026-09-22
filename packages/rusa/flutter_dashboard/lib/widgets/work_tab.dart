@@ -35,6 +35,7 @@ class WorkTab extends StatefulWidget {
 
 class _WorkTabState extends State<WorkTab> {
   bool _loading = true;
+  bool _isBackgroundRefreshing = false;
   String? _error;
   List<ObligationTreeDto> _rootTrees = [];
   late final Set<String> _expandedIds = widget.store.workExpanded;
@@ -62,6 +63,7 @@ class _WorkTabState extends State<WorkTab> {
     try {
       setState(() {
         if (_rootTrees.isEmpty) _loading = true;
+        _isBackgroundRefreshing = _rootTrees.isNotEmpty;
         _error = null;
       });
       final forest = await widget.store.api.fetchObligationForest(
@@ -72,15 +74,23 @@ class _WorkTabState extends State<WorkTab> {
         _rootTrees = forest.trees;
         _fetchedTerminalRoots = includeTerminal;
         _loading = false;
+        _isBackgroundRefreshing = false;
       });
+      widget.store.saveObligationsSnapshot(forest.trees);
       _checkFocusLink();
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
+        _isBackgroundRefreshing = false;
       });
     }
+  }
+
+  void _handleMutation() {
+    widget.store.invalidateObligationsCache();
+    _loadRoots();
   }
 
   void _checkFocusLink() {
@@ -213,6 +223,7 @@ class _WorkTabState extends State<WorkTab> {
           nextId: nextId,
         );
       }
+      widget.store.invalidateObligationsCache();
       await _loadRoots();
     } catch (err) {
       if (context.mounted) {
@@ -229,6 +240,15 @@ class _WorkTabState extends State<WorkTab> {
   @override
   void initState() {
     super.initState();
+    final cached = widget.store.cachedObligationTrees;
+    if (cached != null && cached.isNotEmpty) {
+      _rootTrees = cached;
+      _loading = false;
+      _isBackgroundRefreshing = true;
+    } else {
+      _loading = true;
+      _isBackgroundRefreshing = false;
+    }
     _loadRoots();
     _focusSub = widget.store.focusedObligationId.listen((focusedId) {
       if (focusedId != null && !_loading) {
@@ -236,17 +256,36 @@ class _WorkTabState extends State<WorkTab> {
       }
     });
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
-      _loadRoots();
+      _handleMutation();
     });
     // Owner/creator labels read the viewing principal off the dashboard
     // config, which lands after init returns; a tree drawn before then would
     // name the person "Unknown actor" until something else rebuilt it (#538).
+    // When the principal switches, re-seed or clear the tree accordingly (#505).
     _principalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
         .distinct()
         .skip(1)
-        .listen((_) {
-          if (mounted) setState(() {});
+        .listen((newPrincipalId) {
+          if (mounted) {
+            final cached = widget.store.cachedObligationTrees;
+            if (cached != null && cached.isNotEmpty) {
+              setState(() {
+                _rootTrees = cached;
+                _loading = false;
+                _isBackgroundRefreshing = true;
+                _error = null;
+              });
+            } else {
+              setState(() {
+                _rootTrees = [];
+                _loading = true;
+                _isBackgroundRefreshing = false;
+                _error = null;
+              });
+            }
+            _loadRoots();
+          }
         });
   }
 
@@ -293,14 +332,14 @@ class _WorkTabState extends State<WorkTab> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
+    if (_loading && _rootTrees.isEmpty) {
       return const Scaffold(
         backgroundColor: MeshColors.bgPrimary,
         body: Center(child: CircularProgressIndicator()),
       );
     }
 
-    if (_error != null) {
+    if (_error != null && _rootTrees.isEmpty) {
       return Scaffold(
         backgroundColor: MeshColors.bgPrimary,
         body: Center(
@@ -333,13 +372,67 @@ class _WorkTabState extends State<WorkTab> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   _narrowBackBar(),
+                  if (_error != null && _rootTrees.isNotEmpty)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      margin: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: MeshColors.statusHalted.withAlpha(35),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(
+                          color: MeshColors.statusHalted.withAlpha(80),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.warning_amber_rounded,
+                            size: 16,
+                            color: MeshColors.statusHalted,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Failed to refresh: $_error',
+                              style: const TextStyle(
+                                color: MeshColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          InkWell(
+                            onTap: _loadRoots,
+                            child: const Padding(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              child: Text(
+                                'Retry',
+                                style: TextStyle(
+                                  color: MeshColors.accent,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   const Divider(height: 1, color: MeshColors.border),
                   Expanded(
                     child: _DetailView(
                       obligationId: _selectedObligationId!,
                       store: widget.store,
                       onSelectView: widget.onSelectView,
-                      onMutated: _loadRoots,
+                      onMutated: _handleMutation,
                       openLink: widget.openLink,
                     ),
                   ),
@@ -360,7 +453,7 @@ class _WorkTabState extends State<WorkTab> {
                         obligationId: _selectedObligationId!,
                         store: widget.store,
                         onSelectView: widget.onSelectView,
-                        onMutated: _loadRoots,
+                        onMutated: _handleMutation,
                         openLink: widget.openLink,
                       )
                     : const Center(
@@ -417,14 +510,32 @@ class _WorkTabState extends State<WorkTab> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'WORK QUEUE',
-                style: TextStyle(
-                  color: MeshColors.textSecondary,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.8,
-                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'WORK QUEUE',
+                    style: TextStyle(
+                      color: MeshColors.textSecondary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                  if (_isBackgroundRefreshing) ...[
+                    const SizedBox(width: 8),
+                    const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          MeshColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
               Row(
                 mainAxisSize: MainAxisSize.min,
@@ -445,7 +556,7 @@ class _WorkTabState extends State<WorkTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      onCreated: _loadRoots,
+                      onCreated: _handleMutation,
                     ),
                     tooltip: 'New Root Obligation',
                   ),
@@ -459,6 +570,60 @@ class _WorkTabState extends State<WorkTab> {
             ],
           ),
         ),
+        if (_error != null && _rootTrees.isNotEmpty)
+          Container(
+            padding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 8,
+            ),
+            margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            decoration: BoxDecoration(
+              color: MeshColors.statusHalted.withAlpha(35),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: MeshColors.statusHalted.withAlpha(80),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.warning_amber_rounded,
+                  size: 16,
+                  color: MeshColors.statusHalted,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Failed to refresh: $_error',
+                    style: const TextStyle(
+                      color: MeshColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                InkWell(
+                  onTap: _loadRoots,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    child: Text(
+                      'Retry',
+                      style: TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         const Divider(height: 1, color: MeshColors.border),
         Expanded(
           child: nodes.isEmpty

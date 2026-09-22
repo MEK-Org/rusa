@@ -6,6 +6,7 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/quota_cache.dart';
 import 'package:rusa_dashboard/tree_preferences_cache.dart';
 import 'package:rusa_dashboard/voice_platform.dart';
@@ -185,7 +186,7 @@ ObligationDto makeObligation(
 /// Fake REST API with canned responses; records the actor lists it was queried
 /// with so tests can assert what the store requested.
 class FakeApi extends DashboardApi {
-  FakeApi() : super();
+  FakeApi({super.base}) : super();
   List<ThreadDto> threadsResult = [];
   List<SupportedVoiceDto> supportedVoices = const [];
   QuotaSnapshotDto? quotaResult;
@@ -726,6 +727,7 @@ class FakeApi extends DashboardApi {
   /// gate completes — so mutating [obligationsResult] afterward does not change
   /// what an already in-flight call returns.
   final forestGates = <Completer<void>>[];
+  Object? forestError;
 
   @override
   Future<ObligationForest> fetchObligationForest({
@@ -733,6 +735,9 @@ class FakeApi extends DashboardApi {
     int? offset,
     bool includeTerminalRoots = false,
   }) async {
+    if (forestError != null) {
+      throw forestError!;
+    }
     fetchObligationForestCalls.add((
       includeTerminalRoots: includeTerminalRoots,
     ));
@@ -1075,6 +1080,77 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
     storedShowRetired = null;
     storedActorOrder = null;
     storedWorkExpanded = null;
+    clearCount++;
+  }
+}
+
+/// In-memory [ObligationsCache] for headless store tests — stands in for the browser
+/// localStorage-backed `WebObligationsCache`. Seed [stored] to simulate a prior
+/// session's persisted snapshot; `saveCount`/`invalidateCount`/`clearCount` record write-backs and invalidations.
+class FakeObligationsCache implements ObligationsCache {
+  FakeObligationsCache([this.stored]) {
+    if (stored != null) {
+      _entries['${stored!.scope}.${stored!.principalId}'] = stored!;
+    }
+  }
+
+  PersistedObligationsSnapshot? stored;
+  final Map<String, PersistedObligationsSnapshot> _entries = {};
+  int saveCount = 0;
+  int invalidateCount = 0;
+  int clearCount = 0;
+  int loadCount = 0;
+
+  @override
+  PersistedObligationsSnapshot? load({
+    required String scope,
+    String? principalId,
+  }) {
+    loadCount++;
+    if (principalId != null) {
+      final key = '$scope.$principalId';
+      return _entries[key];
+    }
+    if (stored != null && stored!.scope == scope) {
+      return stored;
+    }
+    for (final snap in _entries.values.toList().reversed) {
+      if (snap.scope == scope) return snap;
+    }
+    return null;
+  }
+
+  @override
+  void save(PersistedObligationsSnapshot snapshot) {
+    stored = snapshot;
+    final key = '${snapshot.scope}.${snapshot.principalId}';
+    _entries[key] = snapshot;
+    saveCount++;
+  }
+
+  @override
+  void invalidate({
+    required String scope,
+    String? principalId,
+  }) {
+    if (principalId != null) {
+      _entries.remove('$scope.$principalId');
+      if (stored?.scope == scope && stored?.principalId == principalId) {
+        stored = null;
+      }
+    } else {
+      _entries.removeWhere((k, _) => k.startsWith('$scope.'));
+      if (stored?.scope == scope) {
+        stored = null;
+      }
+    }
+    invalidateCount++;
+  }
+
+  @override
+  void clear() {
+    stored = null;
+    _entries.clear();
     clearCount++;
   }
 }

@@ -4,6 +4,7 @@ import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
 
 import 'fakes.dart';
@@ -2096,5 +2097,181 @@ void main() {
     expect(retained.map((e) => e.id), isNot(contains('live0'))); // aged out
 
     await store.dispose();
+  });
+
+  group('Obligations browser cache (#505)', () {
+    final now = DateTime.utc(2026, 9, 22, 12);
+    final cachedTree = ObligationTreeDto(
+      obligation: makeObligation('cached-root', title: 'Cached Root Obligation'),
+      children: const [],
+      blockingChildren: const [],
+    );
+
+    test('seeds obligations from the persisted cache at construction — 0ms first paint (#505)', () async {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'test-user',
+        trees: [cachedTree],
+        now: now,
+      );
+      final cache = FakeObligationsCache(snapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
+
+      // Create store with cache
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+
+      // Even before init() or any REST call, cachedObligationTrees is immediately available
+      expect(store.cachedObligationTrees, isNotNull);
+      expect(store.cachedObligationTrees!.length, 1);
+      expect(store.cachedObligationTrees!.first.obligation.id, 'cached-root');
+
+      await store.dispose();
+    });
+
+    test('persists each successful obligations forest snapshot for next cold load (#505)', () async {
+      final cache = FakeObligationsCache();
+      final freshTree = ObligationTreeDto(
+        obligation: makeObligation('fresh-root', title: 'Fresh Root'),
+        children: const [],
+        blockingChildren: const [],
+      );
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-alice',
+        );
+
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      store.saveObligationsSnapshot([freshTree]);
+
+      expect(cache.saveCount, 1);
+      expect(cache.stored, isNotNull);
+      expect(cache.stored!.trees.first.obligation.id, 'fresh-root');
+      expect(cache.stored!.principalId, 'user-alice');
+      expect(cache.stored!.scope, 'http://localhost:4040');
+
+      await store.dispose();
+    });
+
+    test('isolates obligations cache across different authenticated principals (#505)', () async {
+      final aliceSnapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'user-alice',
+        trees: [ObligationTreeDto(obligation: makeObligation('alice-ob'), children: const [], blockingChildren: const [])],
+        now: now,
+      );
+      final cache = FakeObligationsCache(aliceSnapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-bob',
+        );
+
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      // Alice's snapshot must not be served to Bob!
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
+    test('invalidates cache on explicit mutation or SSE checkpoint event (#505)', () async {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'test-user',
+        trees: [cachedTree],
+        now: now,
+      );
+      final cache = FakeObligationsCache(snapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
+      final stream = FakeStream();
+
+      final store = DashboardStore(
+        api: api,
+        stream: stream,
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      expect(cache.invalidateCount, 0);
+
+      // Invalidate explicitly
+      store.invalidateObligationsCache();
+      expect(cache.invalidateCount, 1);
+      expect(store.cachedObligationTrees, isNull);
+
+      // Re-save
+      store.saveObligationsSnapshot([cachedTree]);
+      expect(store.cachedObligationTrees, isNotNull);
+
+      // Deliver SSE checkpoint event
+      stream.meshCtrl.add(
+        makeEvent(
+          'evt-ckpt',
+          'obligation_checkpoint_set',
+          actor: 'worker-1',
+          payload: '{"obligationId":"cached-root"}',
+        ),
+      );
+      await pumpEventQueue();
+
+      // Should have invalidated cache
+      expect(cache.invalidateCount, 2);
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
+    test('measures time to first useful content: cached seed is synchronous (0ms) (#505)', () async {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'test-user',
+        trees: [cachedTree],
+        now: now,
+      );
+      final cache = FakeObligationsCache(snapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
+
+      final stopwatch = Stopwatch()..start();
+      final storeWithCache = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+      final elapsedWithCacheMs = stopwatch.elapsedMilliseconds;
+      stopwatch.stop();
+
+      expect(storeWithCache.cachedObligationTrees, isNotNull);
+      expect(elapsedWithCacheMs, lessThan(50)); // synchronous / instant 0ms first paint
+
+      // Compare with cold start (no cache)
+      final storeCold = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: const NoopObligationsCache(),
+      );
+      expect(storeCold.cachedObligationTrees, isNull);
+
+      await storeWithCache.dispose();
+      await storeCold.dispose();
+    });
   });
 }

@@ -18,6 +18,7 @@ import 'session_web.dart';
 import 'theme.dart';
 import 'voice_web.dart';
 import 'web_actor_hierarchy_cache.dart';
+import 'web_obligations_cache.dart';
 import 'web_quota_cache.dart';
 import 'web_tree_preferences_cache.dart';
 import 'widgets/dashboard_body.dart';
@@ -263,6 +264,7 @@ class _DashboardPageState extends State<DashboardPage> {
       quotaCache: WebQuotaCache(),
       treePreferencesCache: WebTreePreferencesCache(),
       actorHierarchyCache: WebActorHierarchyCache(),
+      obligationsCache: WebObligationsCache(),
       walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );
