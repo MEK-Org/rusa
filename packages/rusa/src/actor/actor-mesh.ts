@@ -95,6 +95,7 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
+import type { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
@@ -717,6 +718,8 @@ export interface ActorMeshOptions {
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
+  /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
+  responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   /**
    * The allow-list of grantable capability names — typically the keys of the
    * wiring's grantable-MCP registry. A grant of any name outside this set is
@@ -856,6 +859,7 @@ export class ActorMesh {
   private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
+  private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
@@ -930,6 +934,7 @@ export class ActorMesh {
     this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
+    this.responsiveInterruption = opts.responsiveInterruption;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
     // any other grantable server — neither advertises nor grants it here.
@@ -960,6 +965,9 @@ export class ActorMesh {
           detail: phase,
           payload: JSON.stringify({ reason: "responsive_notification" }),
         });
+      },
+      onResponsiveArrived: (actorId, entryIds, baseline) => {
+        this.shadowResponsiveInterruptions(actorId, entryIds, baseline);
       },
       onInternalPort: (port) => {
         this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
@@ -1318,6 +1326,75 @@ export class ActorMesh {
    */
   dispatch(actorId: string): boolean {
     return this.runs.dispatch(this.resolveThreadId(actorId));
+  }
+
+  /**
+   * Fire-and-forget shadow decisions after the durable inbox has identified the
+   * exact new rows and before its normal preemption path runs. Only ids cross
+   * this seam: message bodies, issue text, and other operational content stay
+   * in their source stores.
+   */
+  private shadowResponsiveInterruptions(
+    actorId: string,
+    incomingEntryIds: readonly string[],
+    baseline: "interrupt" | "queue"
+  ): void {
+    const classifier = this.responsiveInterruption;
+    const inbox = this.inboxStore;
+    if (!classifier || !inbox || incomingEntryIds.length === 0) return;
+    const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
+    const unhandledIds = this.unhandledInboxEntryIds(actorId);
+    for (const incomingEntryId of incomingEntryIds) {
+      const incoming = inbox.read(actorId, incomingEntryId);
+      // Explicit Run Now is an operator control, not a classifier candidate.
+      // Direct interrupt() does not dispatch at all, preserving its hard path.
+      if (!incoming || incoming.payload.type === "operator.run_now") continue;
+      const pendingEntryIds = unhandledIds.filter(
+        (entryId) => entryId !== incomingEntryId && !selectedEntryIds.includes(entryId)
+      );
+      void classifier
+        .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .then((decision) => {
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "shadow",
+            payload: JSON.stringify({ baseline, decision }),
+          });
+        })
+        .catch(() => {
+          // The policy is observation-only; a defective local fixture cannot
+          // delay or alter a durable responsive delivery.
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "shadow",
+            payload: JSON.stringify({
+              baseline,
+              decision: {
+                incomingEntryId,
+                outcome: "queue",
+                reason: "unavailable",
+              },
+            }),
+          });
+        });
+    }
+  }
+
+  /** Read the entire durable unhandled set; a classifier must not infer a
+   * comparison target from a convenient first page or a racing "latest" row. */
+  private unhandledInboxEntryIds(actorId: string): string[] {
+    const inbox = this.inboxStore;
+    if (!inbox) return [];
+    let cursor: string | undefined;
+    const entryIds: string[] = [];
+    do {
+      const page = inbox.list(actorId, { status: "unhandled", limit: 100, cursor });
+      entryIds.push(...page.entries.map((entry) => entry.id));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return entryIds;
   }
 
   /**

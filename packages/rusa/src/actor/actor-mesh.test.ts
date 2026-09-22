@@ -79,6 +79,7 @@ import {
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -289,6 +290,7 @@ function setup(
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
+    responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
     secretsDir?: string;
   } = {}
 ) {
@@ -364,6 +366,7 @@ function setup(
     retireCleanups: opts.retireCleanups,
     providerGate: opts.providerGate,
     voiceTransferLogger: opts.voiceTransferLogger,
+    responsiveInterruption: opts.responsiveInterruption,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -2458,6 +2461,51 @@ describe("ActorMesh", () => {
     const unhandled = inboxStore.entries.filter((e) => e.actorId === worker && !e.handledAt);
     expect(unhandled).toHaveLength(2);
     expect(unhandled.map((e) => e.payload.type)).toEqual(["mesh.message", "system.disk"]);
+  });
+
+  it("keeps the normal responsive preemption while shadowing a redacted Choice decision", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    const provider = new FakeProvider((opts) => {
+      firstSignal = opts.signal;
+      return new Promise<Partial<RunResult>>(() => {});
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(firstSignal?.aborted).toBe(false);
+
+    mesh.sendHumanMessage(worker, "private operator body", "session-1");
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadow = events.find((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toEqual(
+      expect.objectContaining({
+        actorId: worker,
+        detail: "shadow",
+      })
+    );
+    expect(shadow?.payload).toContain('"outcome":"interrupt"');
+    expect(shadow?.payload).not.toContain("private operator body");
   });
 
   it("does not let ordinary traffic abort the run already working the operator's message", async () => {

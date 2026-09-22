@@ -43,6 +43,15 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
   });
 
+  it("documents the opt-in shadow-only interruption policy", () => {
+    expect(CONFIG_DOCS).toContain("mesh.responsiveInterruption:");
+    expect(CONFIG_DOCS).toContain("mode: shadow");
+    expect(CONFIG_DOCS).toContain("never changes that path in v1");
+    expect(CONFIG_DOCS).toContain(
+      "no\n                           live TypeSafe request or credentials"
+    );
+  });
+
   it("documents disk-alert routing as derived from the sensor, not a separate config knob", () => {
     expect(CONFIG_DOCS).toContain(
       "root is subscribed to\n  responsive system.disk events on exactly the same condition"

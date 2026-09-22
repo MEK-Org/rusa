@@ -201,6 +201,7 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_selected: "ignored",
   run_first_chunk: "ignored",
   run_preempted: "ignored",
+  responsive_interruption_shadow: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",
   // Rejection is rollout observability; it records no commitment progress.

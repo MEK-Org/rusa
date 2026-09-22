@@ -132,6 +132,16 @@ export interface RunManagerOptions {
   markInboxSeen?: (actorId: string) => void;
   /** Report that responsive work replaced an in-flight or queued run. */
   onPreempted?: (actorId: string, phase: string) => void;
+  /**
+   * Observe each newly arrived responsive inbox row before normal preemption.
+   * This is a narrow policy hook, not a second dispatch path: the durable
+   * inbox still decides priority and this callback cannot delay its dispatch.
+   */
+  onResponsiveArrived?: (
+    actorId: string,
+    entryIds: readonly string[],
+    baseline: "interrupt" | "queue"
+  ) => void;
   /** Internal construction-only port receiver. */
   onInternalPort?: (port: RunManagerInternalPort) => void;
   log?: (msg: string) => void;
@@ -173,6 +183,7 @@ export class RunManager {
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly markInboxSeen: (actorId: string) => void;
   private readonly onPreempted: (actorId: string, phase: string) => void;
+  private readonly onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
   private readonly log: (msg: string) => void;
 
   constructor(opts: RunManagerOptions) {
@@ -203,6 +214,7 @@ export class RunManager {
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.markInboxSeen = opts.markInboxSeen ?? (() => {});
     this.onPreempted = opts.onPreempted ?? (() => {});
+    this.onResponsiveArrived = opts.onResponsiveArrived;
     this.log = opts.log ?? (() => {});
   }
 
@@ -237,7 +249,7 @@ export class RunManager {
   durableWork(actorId: string): DurableDispatchWork | null {
     const inbox = this.inbox;
     if (inbox.countUnhandled(actorId, { responsiveOnly: true }) > 0) {
-      return { priority: "responsive", ...this.pendingResponsive(actorId) };
+      return { priority: "responsive", ...dispatchWork(this.pendingResponsive(actorId)) };
     }
     return inbox.countUnhandled(actorId) > 0 ? { priority: "normal" } : null;
   }
@@ -254,9 +266,14 @@ export class RunManager {
    * indexed unseen count plus newest-unseen-voice query belongs in a dedicated
    * repository extension, not a scheduler-side approximation.
    */
-  private pendingResponsive(actorId: string): { unseenResponsive: boolean; voiceAt?: number } {
+  private pendingResponsive(actorId: string): {
+    unseenResponsive: boolean;
+    unseenResponsiveEntryIds?: readonly string[];
+    voiceAt?: number;
+  } {
     let cursor: string | undefined;
     let unseenResponsive = false;
+    const unseenResponsiveEntryIds: string[] = [];
     let voiceAt: number | undefined;
 
     do {
@@ -269,6 +286,7 @@ export class RunManager {
       for (const entry of page.entries) {
         if (entry.seenAt === null) {
           unseenResponsive = true;
+          unseenResponsiveEntryIds.push(entry.id);
           if (voiceAt === undefined && entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE) {
             const at = entry.deliveredAt.getTime();
             if (Number.isFinite(at)) {
@@ -277,14 +295,12 @@ export class RunManager {
           }
         }
       }
-      if (unseenResponsive && voiceAt !== undefined) {
-        break;
-      }
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
 
     return {
       unseenResponsive,
+      ...(unseenResponsiveEntryIds.length > 0 ? { unseenResponsiveEntryIds } : {}),
       ...(voiceAt !== undefined ? { voiceAt } : {}),
     };
   }
@@ -323,8 +339,19 @@ export class RunManager {
       return false;
     }
     if (responsiveArrived && opts.preempt) {
+      this.onResponsiveArrived?.(
+        actorId,
+        this.pendingResponsive(actorId).unseenResponsiveEntryIds ?? [],
+        "interrupt"
+      );
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
+    } else if (responsiveArrived) {
+      this.onResponsiveArrived?.(
+        actorId,
+        this.pendingResponsive(actorId).unseenResponsiveEntryIds ?? [],
+        "queue"
+      );
     }
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
@@ -436,6 +463,16 @@ export class RunManager {
 }
 
 /** The scheduling metadata a dispatch derives from durable state. */
+function dispatchWork(work: {
+  unseenResponsive: boolean;
+  voiceAt?: number;
+}): Pick<DurableDispatchWork, "unseenResponsive" | "voiceAt"> {
+  return {
+    unseenResponsive: work.unseenResponsive,
+    ...(work.voiceAt !== undefined ? { voiceAt: work.voiceAt } : {}),
+  };
+}
+
 function dispatchNudge(work: DurableDispatchWork): RunNudge {
   if (work.priority !== "responsive") return {};
   return work.voiceAt === undefined

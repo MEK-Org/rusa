@@ -88,6 +88,7 @@ import {
 import type { PortableContextStore } from "../actor/portable-context-state.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
+import { ShadowResponsiveInterruptionClassifier } from "../actor/responsive-interruption.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import {
@@ -2289,6 +2290,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     ]),
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
+    responsiveInterruption: config.mesh?.responsiveInterruption
+      ? new ShadowResponsiveInterruptionClassifier({
+          threshold: config.mesh.responsiveInterruption.threshold ?? 0.8,
+        })
+      : undefined,
     providerGate: (fn, candidates, request) => {
       const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
         const lane = providerThrottleKey(c.provider, config);

@@ -805,6 +805,29 @@ describe("loadConfig quota throttle", () => {
   });
 });
 
+describe("loadConfig responsive interruption", () => {
+  it("accepts the opt-in shadow-only policy", () => {
+    const config = loadConfig(
+      writeConfig({
+        mesh: { responsiveInterruption: { mode: "shadow", threshold: 0.8 } },
+      })
+    );
+
+    expect(config.mesh?.responsiveInterruption).toEqual({ mode: "shadow", threshold: 0.8 });
+  });
+
+  it("rejects a behavior-changing mode or invalid threshold", () => {
+    expect(() =>
+      loadConfig(writeConfig({ mesh: { responsiveInterruption: { mode: "enforce" } } }))
+    ).toThrow(/mode must be "shadow"/);
+    expect(() =>
+      loadConfig(
+        writeConfig({ mesh: { responsiveInterruption: { mode: "shadow", threshold: 1.01 } } })
+      )
+    ).toThrow(/threshold must be a number between 0 and 1/);
+  });
+});
+
 describe("loadConfig shared quota store", () => {
   it("normalizes configured provider throttle keys before alias resolution", () => {
     const config = loadConfig(
