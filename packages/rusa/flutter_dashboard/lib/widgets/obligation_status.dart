@@ -144,7 +144,7 @@ class ObligationStatusChip extends StatelessWidget {
     store: store,
     builder: (context, state) {
       final colors = ObligationStatusColors.of(state);
-      return Container(
+      final statusChip = Container(
         padding: bordered
             ? const EdgeInsets.symmetric(horizontal: 7, vertical: 3)
             : const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -153,21 +153,35 @@ class ObligationStatusChip extends StatelessWidget {
           border: bordered ? Border.all(color: colors.chipBorder) : null,
           borderRadius: BorderRadius.circular(4),
         ),
-        child: Text(
-          obligationStatusLabel(obligation, state),
-          style: kMonoStyle.copyWith(
-            color: colors.chipForeground,
-            fontSize: 10,
-            fontWeight: bordered ? FontWeight.w600 : FontWeight.w700,
-            letterSpacing: bordered ? 0 : 0.5,
-          ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (obligation.effectiveResponsive) ...[
+              _ResponsiveBolt(
+                obligation: obligation,
+                color: colors.chipForeground,
+                size: 12,
+              ),
+              const SizedBox(width: 2),
+            ],
+            Text(
+              obligationStatusLabel(obligation, state),
+              style: kMonoStyle.copyWith(
+                color: colors.chipForeground,
+                fontSize: 10,
+                fontWeight: bordered ? FontWeight.w600 : FontWeight.w700,
+                letterSpacing: bordered ? 0 : 0.5,
+              ),
+            ),
+          ],
         ),
       );
+      return statusChip;
     },
   );
 }
 
-/// The 8px status dot beside a node in the work tree.
+/// The status dot (or responsive bolt) beside a node in the work tree.
 class ObligationStatusDot extends StatelessWidget {
   const ObligationStatusDot({
     super.key,
@@ -182,13 +196,49 @@ class ObligationStatusDot extends StatelessWidget {
   Widget build(BuildContext context) => ObligationPresentationBuilder(
     obligation: obligation,
     store: store,
-    builder: (context, state) => Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(
-        color: ObligationStatusColors.of(state).dot,
-        shape: BoxShape.circle,
-      ),
-    ),
+    builder: (context, state) => obligation.effectiveResponsive
+        ? _ResponsiveBolt(
+            obligation: obligation,
+            color: ObligationStatusColors.of(state).dot,
+            size: 14,
+          )
+        : Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: ObligationStatusColors.of(state).dot,
+              shape: BoxShape.circle,
+            ),
+          ),
   );
+}
+
+/// Responsiveness modifies the status icon while retaining its lifecycle color.
+class _ResponsiveBolt extends StatelessWidget {
+  const _ResponsiveBolt({
+    required this.obligation,
+    required this.color,
+    required this.size,
+  });
+
+  final ObligationDto obligation;
+  final Color color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = obligation.responsive == true
+        ? 'Responsive: prioritized for immediate attention'
+        : 'Responsive: inherited from a parent obligation';
+    return Tooltip(
+      message: label,
+      excludeFromSemantics: true,
+      child: Semantics(
+        container: true,
+        label: label,
+        excludeSemantics: true,
+        child: Icon(Icons.bolt, size: size, color: color),
+      ),
+    );
+  }
 }

@@ -6,7 +6,11 @@ import { resolveFlutterCommand } from "./flutter-resolver.mjs";
 
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(thisDir, "..");
-const flutterAppDir = resolve(packageRoot, "flutter_dashboard");
+// RUSA_FLUTTER_APP_DIR lets tests point the build at a fixture app; default
+// the checked-in dashboard.
+const flutterAppDir = process.env.RUSA_FLUTTER_APP_DIR
+  ? resolve(process.env.RUSA_FLUTTER_APP_DIR)
+  : resolve(packageRoot, "flutter_dashboard");
 const flutterBuildDir = resolve(flutterAppDir, "build/web");
 // RUSA_DIST_DIR lets the `update` tool stage into dist.new ; default dist.
 const distDir = process.env.RUSA_DIST_DIR
@@ -31,6 +35,24 @@ const dashboardInstance = dashboardInstances[process.env.RUSA_INSTANCE] ?? dashb
 
 if (!existsSync(flutterAppDir)) {
   throw new Error(`Flutter dashboard app missing at ${flutterAppDir}`);
+}
+if (!existsSync(resolve(flutterAppDir, "pubspec.yaml"))) {
+  throw new Error(`Flutter dashboard app missing pubspec.yaml at ${flutterAppDir}`);
+}
+
+// Build from a clean context every time. A warm `.dart_tool/flutter_build`
+// cache can hand `flutter build web` a web_plugin_registrant.dart generated for
+// the previous release's plugin set, so a release that adds web plugins ships
+// a dashboard that never registers them and fails at startup (#591). Removing
+// the generated state directly is narrower and cheaper than `flutter clean`,
+// which spawns another process and also touches unrelated platform dirs.
+for (const generated of [
+  ".dart_tool",
+  "build",
+  ".flutter-plugins", // legacy Flutter plugin registry; pruned defensively
+  ".flutter-plugins-dependencies",
+]) {
+  rmSync(resolve(flutterAppDir, generated), { recursive: true, force: true });
 }
 
 const resolved = resolveFlutterCommand();

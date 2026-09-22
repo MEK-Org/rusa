@@ -3,6 +3,7 @@ import type { Logger } from "../observability/logger.js";
 import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
+  type WorkspaceEventsSubscriberOptions,
 } from "./workspace-events.js";
 
 const TOPIC = "projects/p/topics/chat-events";
@@ -14,6 +15,7 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 /** The subscriber's own constants, restated so a test reads as wall-clock. */
 const TTL_MS = 4 * HOUR;
+const RENEW_MS = TTL_MS / 2;
 const FIRST_RETRY_MS = 5 * SECOND;
 const MAX_RETRY_MS = 5 * MINUTE;
 const CREATE_VISIBILITY_WINDOW_MS = MINUTE;
@@ -161,14 +163,7 @@ function captureLogger(): { logger: Logger; records: LogRecord[] } {
   return { logger, records };
 }
 
-function makeSubscriber(
-  api: FakeWeApi,
-  overrides: Partial<{
-    renewIntervalMs: number;
-    logger: Logger;
-    onLapse: (event: SystemChatSubscriptionLapseEvent) => Promise<void> | void;
-  }> = {}
-) {
+function makeSubscriber(api: FakeWeApi, overrides: Partial<WorkspaceEventsSubscriberOptions> = {}) {
   return new WorkspaceEventsSubscriber({
     topic: TOPIC,
     getToken: async () => "fake-token",
@@ -471,6 +466,202 @@ describe("WorkspaceEventsSubscriber", () => {
     expect(api.count("POST", "/subscriptions")).toBe(3);
     expect(records.at(-1)?.event).toBe("chat_subscription_created");
     await sub.close();
+  });
+
+  it("stops the retry loop on close after a failed first pass", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([]);
+    api.createStatus = 503;
+    const sub = makeSubscriber(api);
+
+    await sub.start();
+    // The retry the failed boot armed is the whole point of the loop; disposal
+    // has to take it back down, or a stopped service keeps calling the API.
+    const callsAtClose = api.calls.length;
+    await sub.close();
+
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+    expect(api.calls).toHaveLength(callsAtClose);
+    expect(sub.currentSubscription).toBeNull();
+  });
+
+  it("close returns with the request in flight still outstanding, and the pass that resumes is inert", async () => {
+    vi.useFakeTimers();
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([activeSub("subscriptions/stuck")]);
+    api.renewStatus = 500;
+    // A request that never answers on its own: shutdown must not wait on it.
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, {
+      logger,
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+
+    await sub.start();
+    // A TTL of failing renewals: the next failed pass is the one that would alert.
+    await vi.advanceTimersByTimeAsync(TTL_MS);
+    expect(alerts).toEqual([]);
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    await vi.advanceTimersByTimeAsync(MAX_RETRY_MS);
+    const callsWhileStalled = api.calls.length;
+    const recordsWhileStalled = records.length;
+
+    // Bounded: close comes back while the request is still outstanding.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Inert: the request it was already holding lands, and then nothing — no
+    // follow-up call, no lapse alert, no successor armed. Its failure is a
+    // debug record, not a `*_failed` warn or a `lapsed` error.
+    openGate();
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+    expect(api.calls).toHaveLength(callsWhileStalled + 1);
+    expect(api.calls.at(-1)?.method).toBe("GET");
+    expect(alerts).toEqual([]);
+    expect(
+      records.slice(recordsWhileStalled).map((record) => [record.level, record.event])
+    ).toEqual([["debug", "chat_subscription_pass_abandoned"]]);
+  });
+
+  it("refuses to start again after close, so an abandoned pass is never un-gated", async () => {
+    vi.useFakeTimers();
+    const api = new FakeWeApi([activeSub("subscriptions/stuck")]);
+    // Hold the list open across close(): the pass is abandoned mid-request.
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const sub = makeSubscriber(api);
+
+    await sub.start();
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    await vi.advanceTimersByTimeAsync(RENEW_MS);
+    const callsWhileStalled = api.calls.length;
+    await sub.close();
+
+    // A restart on a disposed instance is a no-op: it runs no boot pass of its
+    // own, and it does not flip the gate the abandoned pass is held behind.
+    const restarted = sub.start();
+    openGate();
+    await restarted;
+    await vi.advanceTimersByTimeAsync(4 * RENEW_MS);
+    expect(api.calls).toHaveLength(callsWhileStalled + 1);
+    expect(api.calls.at(-1)?.method).toBe("GET");
+  });
+
+  it("close returns while token acquisition is stalled, and the pass starts no HTTP request after disposal", async () => {
+    vi.useFakeTimers();
+    let openTokenGate: () => void = () => {};
+    let tokenGate: Promise<void> | null = null;
+    const getToken = async () => {
+      if (tokenGate) await tokenGate;
+      return "fake-token";
+    };
+    const api = new FakeWeApi([activeSub("subscriptions/existing")]);
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger, getToken });
+
+    tokenGate = new Promise<void>((resolve) => {
+      openTokenGate = resolve;
+    });
+    const starting = sub.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Bounded: close returns immediately even while getToken() is stalled.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Release getToken(): the resumed pass must NOT start an HTTP request after close().
+    openTokenGate();
+    await starting;
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+
+    // No HTTP requests were dispatched to the API.
+    expect(api.calls).toHaveLength(0);
+    // The pass logged only the debug abandoned record, no warnings or errors.
+    expect(records.map((r) => [r.level, r.event])).toEqual([
+      ["debug", "chat_subscription_pass_abandoned"],
+    ]);
+  });
+
+  it("close after list() with duplicate subscriptions produces no prune warnings and makes no DELETE requests", async () => {
+    vi.useFakeTimers();
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([
+      activeSub("subscriptions/keep"),
+      activeSub("subscriptions/dup1"),
+      activeSub("subscriptions/dup2"),
+    ]);
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, {
+      logger,
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const starting = sub.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Stalled on list(): close returns immediately.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Release list(): returns keep, dup1, dup2.
+    openGate();
+    await starting;
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+
+    // Only the stalled GET was sent; no DELETE or PATCH requests were sent after close.
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0].method).toBe("GET");
+    expect(alerts).toEqual([]);
+    // Post-close silence: no chat_subscription_prune_failed warnings.
+    // Only the single debug abandoned record is emitted.
+    expect(records.map((r) => [r.level, r.event])).toEqual([
+      ["debug", "chat_subscription_pass_abandoned"],
+    ]);
   });
 
   it("backs off exponentially to a ceiling and starts over after a success", async () => {

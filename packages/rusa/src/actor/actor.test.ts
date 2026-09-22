@@ -8,6 +8,8 @@ import type { CodingProvider, RunOptions, RunResult } from "../providers/types.j
 import {
   Actor,
   type ActorOptions,
+  formatPoolExhaustedFailure,
+  type PoolFallbackDiagnostic,
   type RunAbandon,
   WATCHDOG_CEILING_TIMEOUT_MS,
   WATCHDOG_STALL_TIMEOUT_MS,
@@ -915,23 +917,23 @@ describe("Actor", () => {
     expect(seen[0]?.exitCode).toBe(2);
   });
 
-  it("does not classify a failed primary when fallback models are not configured", async () => {
+  it("keeps a first-entry success as a single provider attempt", async () => {
     const provider = new FakeProvider(
-      () => ({ success: false, output: "quota maybe", exitCode: 1 }),
+      () => ({ success: true, output: "done", exitCode: 0 }),
       "primary-model"
     );
+    const recovery = new FakeProvider(undefined, "recovery-model");
     const classify = vi.fn(async () => ({ exhausted: true }));
-    const seen: RunResult[] = [];
+    const diagnostics: unknown[] = [];
     const actor = makeActor(
       {
-        fallback: {
-          models: [],
-          resolveProvider: () => provider,
-          classify,
-        },
-        onRunEnd: (result) => {
-          seen.push(result);
-        },
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "recovery", model: "second" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? recovery : provider),
+        classifyExhaustion: classify,
+        onPoolFallback: (diagnostic) => diagnostics.push(diagnostic),
       },
       provider
     );
@@ -940,9 +942,11 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(classify).not.toHaveBeenCalled();
+    expect(recovery.calls).toHaveLength(0);
+    expect(diagnostics).toEqual([]);
   });
 
-  it("does not fall back when the gated classifier rejects exhaustion", async () => {
+  it("does not enter the remaining pool when the classifier rejects exhaustion", async () => {
     const primary = new FakeProvider(
       () => ({ success: false, output: "ordinary failure", exitCode: 1 }),
       "primary-model"
@@ -951,11 +955,12 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: {
-          models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
-          classify: async () => ({ exhausted: false }),
-        },
+        modelConfig: [
+          { provider: "primary", model: "primary-model" },
+          { provider: "recovery", model: "fallback-model" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
+        classifyExhaustion: async () => ({ exhausted: false }),
         onRunEnd: (result) => {
           seen.push(result);
         },
@@ -970,52 +975,75 @@ describe("Actor", () => {
     expect(seen[0]?.output).toBe("ordinary failure");
   });
 
-  it("falls back on weekly-quota exhaustion and reports only the successful fallback run", async () => {
+  it("recovers through a later configured pool entry in order with intact tuples", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
-      () => ({
-        success: false,
-        output: "Weekly quota exhausted for this model; reset later.",
-        exitCode: 1,
-        model: "fable-5-bound",
-      }),
-      "fable-5"
+      () => ({ success: false, output: "quota exhausted first", exitCode: 1 }),
+      "claude",
+      "claude-opus",
+      "high"
     );
-    const fallbackProvider = new FakeProvider(() => {
-      actor.declareYield();
-      return { output: "fallback ok", model: "backup-model-bound" };
-    }, "backup-model");
-    const seen: RunResult[] = [];
-    const logs: string[] = [];
+    const second = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted second", exitCode: 2 }),
+      "codex",
+      "gpt-5.6-terra",
+      "medium"
+    );
+    const third = new FakeProvider(
+      () => {
+        actor.declareYield();
+        return { output: "recovered", model: "gemini-3.1-pro-bound" };
+      },
+      "agy",
+      "gemini-3.1-pro",
+      "low"
+    );
+    const diagnostics: Array<{
+      attempt: number;
+      failed: RawProviderModelConfig;
+      next: RawProviderModelConfig;
+      remainingAfter: number;
+    }> = [];
     actor = makeActor(
       {
-        fallback: {
-          models: ["backup-model"],
-          resolveProvider: () => fallbackProvider,
-          classify: async (result) => ({
-            exhausted: /quota exhausted/i.test(result.output),
-          }),
-        },
-        log: (chunk) => logs.push(chunk),
-        onRunEnd: (r) => {
-          seen.push(r);
-        },
+        modelConfig: [
+          { provider: "claude", model: "claude-opus", effort: "high" },
+          { provider: "codex", model: "gpt-5.6-terra", effort: "medium" },
+          { provider: "agy", model: "gemini-3.1-pro", effort: "low" },
+        ],
+        resolveProvider: (entry) =>
+          ({ claude: primary, codex: second, agy: third })[entry.provider] ?? primary,
+        classifyExhaustion: async (result) => ({
+          exhausted: result.output.includes("quota exhausted"),
+        }),
+        onPoolFallback: (diagnostic) => diagnostics.push(diagnostic),
       },
       primary
     );
+
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
+
     expect(primary.calls).toHaveLength(1);
-    expect(fallbackProvider.calls).toHaveLength(1);
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.success).toBe(true);
-    expect(seen[0]?.model).toBe("backup-model-bound");
-    expect(logs.join("")).toContain(
-      "primary fable-5 exhausted; continuing on fallback backup-model"
-    );
+    expect(second.calls).toHaveLength(1);
+    expect(third.calls).toHaveLength(1);
+    expect(diagnostics).toMatchObject([
+      {
+        attempt: 2,
+        failed: { provider: "claude", model: "claude-opus", effort: "high" },
+        next: { provider: "codex", model: "gpt-5.6-terra", effort: "medium" },
+        remainingAfter: 1,
+      },
+      {
+        attempt: 3,
+        failed: { provider: "codex", model: "gpt-5.6-terra", effort: "medium" },
+        next: { provider: "agy", model: "gemini-3.1-pro", effort: "low" },
+        remainingAfter: 0,
+      },
+    ]);
   });
 
-  it("reports the fallback provider's actual model and effort before its attempt", async () => {
+  it("reports each pool provider's actual model and effort before its attempt", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
@@ -1032,16 +1060,18 @@ describe("Actor", () => {
       "fallback-model",
       "low"
     );
-    const resolveFallback = vi.fn((_model: string) => fallbackProvider);
+    const resolvePoolEntry = vi.fn((entry: RawProviderModelConfig) =>
+      entry.provider === "fallback-provider" ? fallbackProvider : primary
+    );
     const attempts: RawProviderModelConfig[] = [];
     actor = makeActor(
       {
-        modelConfig: [{ provider: primary.providerName, model: "primary-model", effort: "high" }],
-        fallback: {
-          models: ["fallback-model"],
-          resolveProvider: resolveFallback,
-          classify: async () => ({ exhausted: true }),
-        },
+        modelConfig: [
+          { provider: primary.providerName, model: "primary-model", effort: "high" },
+          { provider: fallbackProvider.providerName, model: "fallback-model", effort: "low" },
+        ],
+        resolveProvider: resolvePoolEntry,
+        classifyExhaustion: async () => ({ exhausted: true }),
         onProviderAttempt: (attempt) =>
           attempts.push({
             provider: attempt.providerName,
@@ -1061,10 +1091,14 @@ describe("Actor", () => {
       { provider: primary.providerName, model: "primary-model", effort: "high" },
       { provider: fallbackProvider.providerName, model: "fallback-model", effort: "low" },
     ]);
-    expect(resolveFallback).toHaveBeenCalledWith("fallback-model");
+    expect(resolvePoolEntry).toHaveBeenLastCalledWith({
+      provider: "fallback-provider",
+      model: "fallback-model",
+      effort: "low",
+    });
   });
 
-  it("reports the fallback's normalized model and effort instead of its raw pin", async () => {
+  it("uses the recovery pool entry rather than a model-only fallback pin", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
       () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
@@ -1080,16 +1114,18 @@ describe("Actor", () => {
       "gpt-5.6-sol",
       "medium"
     );
-    const resolveFallback = vi.fn((_model: string) => fallbackProvider);
+    const resolvePoolEntry = vi.fn((entry: RawProviderModelConfig) =>
+      entry.provider === "codex" ? fallbackProvider : primary
+    );
     const attempts: RawProviderModelConfig[] = [];
     actor = makeActor(
       {
-        modelConfig: [{ provider: primary.providerName, model: "primary-model" }],
-        fallback: {
-          models: ["gpt-5.6-sol medium"],
-          resolveProvider: resolveFallback,
-          classify: async () => ({ exhausted: true }),
-        },
+        modelConfig: [
+          { provider: primary.providerName, model: "primary-model" },
+          { provider: "codex", model: "gpt-5.6-sol", effort: "medium" },
+        ],
+        resolveProvider: resolvePoolEntry,
+        classifyExhaustion: async () => ({ exhausted: true }),
         onProviderAttempt: (attempt) =>
           attempts.push({
             provider: attempt.providerName,
@@ -1103,14 +1139,18 @@ describe("Actor", () => {
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(resolveFallback).toHaveBeenCalledWith("gpt-5.6-sol medium");
+    expect(resolvePoolEntry).toHaveBeenLastCalledWith({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+    });
     expect(attempts).toEqual([
       { provider: primary.providerName, model: "primary-model" },
       { provider: fallbackProvider.providerName, model: "gpt-5.6-sol", effort: "medium" },
     ]);
   });
 
-  it("falls back on the field-reproduced Claude session-limit exhaustion string", async () => {
+  it("uses the next pool entry for a classified Claude session-limit exhaustion", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
       () => ({
@@ -1127,13 +1167,14 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     actor = makeActor(
       {
-        fallback: {
-          models: ["sonnet"],
-          resolveProvider: () => fallbackProvider,
-          classify: async (result) => ({
-            exhausted: deterministicExhaustionFallback(result.output) === "quota",
-          }),
-        },
+        modelConfig: [
+          { provider: "claude-opus", model: "opus" },
+          { provider: "sonnet", model: "sonnet" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "sonnet" ? fallbackProvider : primary),
+        classifyExhaustion: async (result) => ({
+          exhausted: deterministicExhaustionFallback(result.output) === "quota",
+        }),
         onRunEnd: (r) => {
           seen.push(r);
         },
@@ -1147,7 +1188,355 @@ describe("Actor", () => {
     expect(seen[0]?.success).toBe(true);
   });
 
-  it("surfaces a clean both-tiers-exhausted failure when fallback is exhausted too", async () => {
+  it("does not retry a later pool candidate that the gate selected first", async () => {
+    let actor!: Actor;
+    const candidates: RawProviderModelConfig[] = [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "provider-b", model: "model-b" },
+      { provider: "provider-c", model: "model-c" },
+    ];
+    const calls: string[] = [];
+    const providerB = new FakeProvider(
+      () => ({
+        success: false,
+        output: "provider-b exhausted",
+        exitCode: 1,
+      }),
+      "provider-b"
+    );
+    const providerA = new FakeProvider(() => {
+      calls.push("provider-a");
+      actor.declareYield();
+      return { output: "recovered on a" };
+    }, "provider-a");
+    const providerC = new FakeProvider(() => {
+      calls.push("provider-c");
+      return { output: "never reached" };
+    }, "provider-c");
+
+    const seen: RunResult[] = [];
+    actor = makeActor(
+      {
+        modelConfig: candidates,
+        // Gate selects provider-b (index 1) first:
+        gate: (fn, poolCandidates) => {
+          const chosen = poolCandidates[1];
+          if (!chosen) throw new Error("expected candidate at index 1");
+          return fn(chosen);
+        },
+        resolveProvider: (entry) => {
+          if (entry.provider === "provider-b") return providerB;
+          if (entry.provider === "provider-a") return providerA;
+          return providerC;
+        },
+        classifyExhaustion: async (r) => ({
+          exhausted: r.output.includes("exhausted"),
+        }),
+        onRunEnd: (r) => {
+          seen.push(r);
+        },
+      },
+      providerB
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(providerB.calls).toHaveLength(1);
+    expect(calls).toEqual(["provider-a"]);
+    expect(providerC.calls).toHaveLength(0);
+    expect(seen[0]?.success).toBe(true);
+    expect(seen[0]?.output).toBe("recovered on a");
+  });
+
+  it("skips a halted recovery candidate and tries the next configured pool entry", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
+      "primary-model"
+    );
+    const haltedProvider = new FakeProvider(() => ({ output: "should not run" }), "halted-model");
+    const nextProvider = new FakeProvider(() => {
+      actor.declareYield();
+      return { output: "recovered after halt skip", exitCode: 0, success: true };
+    }, "next-model");
+    const diagnostics: PoolFallbackDiagnostic[] = [];
+    const seen: RunResult[] = [];
+
+    actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "halted-p", model: "second" },
+          { provider: "next-p", model: "third" },
+        ],
+        resolveProvider: (entry) => {
+          if (entry.provider === "halted-p") return haltedProvider;
+          if (entry.provider === "next-p") return nextProvider;
+          return primary;
+        },
+        classifyExhaustion: async (r) => ({
+          exhausted: r.output.includes("quota exhausted"),
+        }),
+        recoveryEligibility: (entry) =>
+          entry.provider === "halted-p"
+            ? { eligible: false, reason: "halted" }
+            : { eligible: true },
+        onPoolFallback: (d) => diagnostics.push(d),
+        onRunEnd: (r) => seen.push(r),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls).toHaveLength(1);
+    expect(haltedProvider.calls).toHaveLength(0);
+    expect(nextProvider.calls).toHaveLength(1);
+    expect(seen[0]?.success).toBe(true);
+    expect(seen[0]?.output).toBe("recovered after halt skip");
+    expect(diagnostics).toMatchObject([
+      {
+        attempt: 2,
+        failed: { provider: "primary", model: "first" },
+        next: { provider: "halted-p", model: "second" },
+        remainingAfter: 1,
+        skipReason: "halted",
+      },
+      {
+        attempt: 3,
+        failed: { provider: "primary", model: "first" },
+        next: { provider: "next-p", model: "third" },
+        remainingAfter: 0,
+      },
+    ]);
+    expect(diagnostics[1]?.skipReason).toBeUndefined();
+  });
+
+  it("skips a pacing-ineligible candidate and tries the next configured pool entry", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted primary", exitCode: 1 }),
+      "primary-model"
+    );
+    const pacingProvider = new FakeProvider(() => ({ output: "should not run" }), "pacing-model");
+    const nextProvider = new FakeProvider(() => {
+      actor.declareYield();
+      return { output: "recovered after pacing skip", exitCode: 0, success: true };
+    }, "next-model");
+    const diagnostics: PoolFallbackDiagnostic[] = [];
+    const seen: RunResult[] = [];
+
+    actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "pacing-p", model: "second" },
+          { provider: "next-p", model: "third" },
+        ],
+        resolveProvider: (entry) => {
+          if (entry.provider === "pacing-p") return pacingProvider;
+          if (entry.provider === "next-p") return nextProvider;
+          return primary;
+        },
+        classifyExhaustion: async (r) => ({
+          exhausted: r.output.includes("quota exhausted"),
+        }),
+        recoveryEligibility: (entry) =>
+          entry.provider === "pacing-p"
+            ? { eligible: false, reason: "pacing" }
+            : { eligible: true },
+        onPoolFallback: (d) => diagnostics.push(d),
+        onRunEnd: (r) => seen.push(r),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls).toHaveLength(1);
+    expect(pacingProvider.calls).toHaveLength(0);
+    expect(nextProvider.calls).toHaveLength(1);
+    expect(seen[0]?.success).toBe(true);
+    expect(seen[0]?.output).toBe("recovered after pacing skip");
+    expect(diagnostics[0]).toMatchObject({
+      attempt: 2,
+      failed: { provider: "primary", model: "first" },
+      next: { provider: "pacing-p", model: "second" },
+      remainingAfter: 1,
+      skipReason: "pacing",
+    });
+    expect(diagnostics[1]).toMatchObject({
+      attempt: 3,
+      failed: { provider: "primary", model: "first" },
+      next: { provider: "next-p", model: "third" },
+      remainingAfter: 0,
+    });
+    expect(diagnostics[1]?.skipReason).toBeUndefined();
+  });
+
+  it("retries an entry the gate passed over earlier only when the hook reports it eligible", async () => {
+    let eligible = false;
+    let actor!: Actor;
+    const providerA = new FakeProvider(() => {
+      actor.declareYield();
+      return { success: true, output: "recovered on entry-a", exitCode: 0 };
+    }, "model-a");
+    const providerB = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted on entry-b", exitCode: 1 }),
+      "model-b"
+    );
+
+    const candidates = [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "provider-b", model: "model-b" },
+    ];
+
+    const seen: RunResult[] = [];
+    actor = makeActor(
+      {
+        modelConfig: candidates,
+        gate: (fn, poolCandidates) => {
+          // Gate passed over provider-a at launch and chose provider-b (index 1)
+          const chosen = poolCandidates[1];
+          if (!chosen) throw new Error("expected candidate at index 1");
+          return fn(chosen);
+        },
+        resolveProvider: (entry) => (entry.provider === "provider-a" ? providerA : providerB),
+        classifyExhaustion: async (r) => ({
+          exhausted: r.output.includes("quota exhausted"),
+        }),
+        recoveryEligibility: (entry) =>
+          entry.provider === "provider-a" && !eligible
+            ? { eligible: false, reason: "pacing" }
+            : { eligible: true },
+        onRunEnd: (r) => seen.push(r),
+      },
+      providerB
+    );
+
+    // First attempt with provider-a ineligible (still pacing):
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(providerB.calls).toHaveLength(1);
+    expect(providerA.calls).toHaveLength(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.success).toBe(false);
+    expect(seen[0]?.output).toContain("model pool exhausted");
+    expect(seen[0]?.output).toContain("provider-a:model-a (pacing)");
+
+    // Now provider-a becomes eligible:
+    eligible = true;
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(providerB.calls).toHaveLength(2);
+    expect(providerA.calls).toHaveLength(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.success).toBe(true);
+    expect(seen[1]?.output).toBe("recovered on entry-a");
+  });
+
+  it("surfaces terminal error naming reasons when all remaining pool entries are ineligible", async () => {
+    const primary = new FakeProvider(
+      () => ({
+        success: false,
+        output: "quota exhausted on primary",
+        exitCode: 1,
+      }),
+      "primary-model"
+    );
+    const haltedProvider = new FakeProvider(undefined, "halted-model");
+    const pacingProvider = new FakeProvider(undefined, "pacing-model");
+    const seen: RunResult[] = [];
+
+    const actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "provider-halted", model: "second" },
+          { provider: "provider-pacing", model: "third" },
+        ],
+        resolveProvider: (entry) => {
+          if (entry.provider === "provider-halted") return haltedProvider;
+          if (entry.provider === "provider-pacing") return pacingProvider;
+          return primary;
+        },
+        classifyExhaustion: async () => ({ exhausted: true }),
+        recoveryEligibility: (entry) => {
+          if (entry.provider === "provider-halted") {
+            return { eligible: false, reason: "halted" };
+          }
+          if (entry.provider === "provider-pacing") {
+            return { eligible: false, reason: "pacing" };
+          }
+          return { eligible: true };
+        },
+        onRunEnd: (r) => seen.push(r),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls).toHaveLength(1);
+    expect(haltedProvider.calls).toHaveLength(0);
+    expect(pacingProvider.calls).toHaveLength(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.success).toBe(false);
+    expect(seen[0]?.output).toContain("model pool exhausted");
+    expect(seen[0]?.output).toContain("Attempted in order: primary:first");
+    expect(seen[0]?.output).toContain("provider-halted:second (halted)");
+    expect(seen[0]?.output).toContain("provider-pacing:third (pacing)");
+  });
+
+  it("keeps existing fallback behaviour when recoveryEligibility hook is absent", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted on primary", exitCode: 1 }),
+      "primary-model"
+    );
+    const fallbackProvider = new FakeProvider(() => {
+      actor.declareYield();
+      return { success: true, output: "recovered without hook", exitCode: 0 };
+    }, "fallback-model");
+    const seen: RunResult[] = [];
+
+    actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "recovery", model: "second" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
+        classifyExhaustion: async () => ({ exhausted: true }),
+        onRunEnd: (r) => seen.push(r),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls).toHaveLength(1);
+    expect(fallbackProvider.calls).toHaveLength(1);
+    expect(seen[0]?.success).toBe(true);
+    expect(seen[0]?.output).toBe("recovered without hook");
+  });
+
+  it("surfaces targeted single-entry exhaustion advice mentioning portable precondition", () => {
+    const message = formatPoolExhaustedFailure({
+      attempted: [{ provider: "claude", model: "opus" }],
+    });
+    expect(message).toContain("all 1 configured pool entry");
+    expect(message).toContain("switch to a portable actor (context.type: portable)");
+  });
+
+  it("surfaces an actionable, ordered pool-exhaustion error without provider output", async () => {
     const primary = new FakeProvider(
       () => ({
         success: false,
@@ -1167,11 +1556,12 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: {
-          models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
-          classify: async () => ({ exhausted: true }),
-        },
+        modelConfig: [
+          { provider: "primary", model: "first", effort: "high" },
+          { provider: "recovery", model: "second", effort: "low" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
+        classifyExhaustion: async () => ({ exhausted: true }),
         onRunEnd: (r) => {
           seen.push(r);
         },
@@ -1184,17 +1574,21 @@ describe("Actor", () => {
     expect(fallbackProvider.calls).toHaveLength(1);
     expect(seen).toHaveLength(1);
     expect(seen[0]?.success).toBe(false);
-    expect(seen[0]?.output).toContain("both tiers exhausted");
+    expect(seen[0]?.output).toContain("model pool exhausted");
+    expect(seen[0]?.output).toContain(
+      "Attempted in order: primary:first @ high -> recovery:second @ low."
+    );
+    expect(seen[0]?.output).toContain("Wait for a quota reset");
     expect(seen[0]?.output).not.toContain("RAW PRIMARY");
     expect(seen[0]?.output).not.toContain("RAW FALLBACK");
     expect(seen[0]?.output).not.toContain("secret=");
   });
 
-  // ISSUE_NUM — arbiter: when the fallback fails for a reason that is NOT exhaustion,
-  // the report must still name the primary's exhaustion. Reverting the
+  // When a recovery entry fails for a reason that is NOT exhaustion, the
+  // report must still name the initial entry's exhaustion. Reverting the
   // `formatFallbackRecoveryFailure` wrap in actor.ts back to a bare
   // `return fallbackResult` turns this RED.
-  it("reports the primary's exhaustion when the fallback fails for a non-exhaustion reason ", async () => {
+  it("reports the initial exhaustion when a recovery entry fails for a non-exhaustion reason", async () => {
     const primary = new FakeProvider(
       () => ({
         success: false,
@@ -1217,12 +1611,15 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: {
-          models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
-          // Primary classifies exhausted; the fallback's failure does not.
-          classify: async (r: RunResult) => ({ exhausted: r.output.includes("RAW PRIMARY") }),
-        },
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "recovery", model: "fallback-model" },
+        ],
+        resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
+        // The initial failure classifies exhausted; recovery's failure does not.
+        classifyExhaustion: async (r: RunResult) => ({
+          exhausted: r.output.includes("RAW PRIMARY"),
+        }),
         onRunEnd: (r) => {
           seen.push(r);
         },
@@ -1238,7 +1635,7 @@ describe("Actor", () => {
 
     // The load-bearing fact: the primary ran out of quota. Without it, the reader's
     // first hypothesis is a bad model pin, and the true state is "wait 4 hours".
-    expect(seen[0]?.output).toContain("primary-model exhausted");
+    expect(seen[0]?.output).toContain("primary:first exhausted");
     // The fallback's error is kept as context — it is how a real wiring bug stays
     // findable — but it must not be presented as the cause.
     expect(seen[0]?.output).toContain("recovery failed");
@@ -1249,12 +1646,12 @@ describe("Actor", () => {
     expect(seen[0]?.output).not.toContain("secret=");
   });
 
-  // #433 — a fallback whose model cannot be resolved under the provider the
-  // primary ran on is a configuration failure, not permission to retry under
-  // another tuple. It is still reported exhaustion-first: without this wrap the
+  // A configured recovery entry that cannot be resolved is a configuration
+  // failure, not permission to reinterpret or skip its tuple. It is still
+  // reported exhaustion-first: without this wrap the
   // resolver throw escapes to the terminal boundary as a bare stack and the
   // reader's first hypothesis is again a bad model pin, not "wait for quota".
-  it("reports the primary's exhaustion when the fallback cannot be resolved", async () => {
+  it("reports the initial exhaustion when the next pool entry cannot be resolved", async () => {
     const primary = new FakeProvider(
       () => ({
         success: false,
@@ -1264,7 +1661,8 @@ describe("Actor", () => {
       }),
       "primary-model"
     );
-    const resolveFallback = vi.fn((): CodingProvider => {
+    const resolvePoolEntry = vi.fn((entry: RawProviderModelConfig): CodingProvider => {
+      if (entry.provider === "primary") return primary;
       throw new Error(
         'model pin validation failed for provider "claude": rejected "fallback-model"'
       );
@@ -1272,11 +1670,15 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: {
-          models: ["fallback-model", "never-reached"],
-          resolveProvider: resolveFallback,
-          classify: async (r: RunResult) => ({ exhausted: r.output.includes("RAW PRIMARY") }),
-        },
+        modelConfig: [
+          { provider: "primary", model: "first" },
+          { provider: "recovery", model: "fallback-model" },
+          { provider: "never", model: "never-reached" },
+        ],
+        resolveProvider: resolvePoolEntry,
+        classifyExhaustion: async (r: RunResult) => ({
+          exhausted: r.output.includes("RAW PRIMARY"),
+        }),
         onRunEnd: (r) => {
           seen.push(r);
         },
@@ -1286,13 +1688,13 @@ describe("Actor", () => {
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
     expect(primary.calls).toHaveLength(1);
-    // Resolution failing is terminal for recovery, exactly like a fallback
+    // Resolution failing is terminal for recovery, exactly like a recovery
     // attempt that failed for a non-exhaustion reason: later entries are not
     // tried under some other interpretation.
-    expect(resolveFallback).toHaveBeenCalledTimes(1);
+    expect(resolvePoolEntry).toHaveBeenCalledTimes(2);
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatchObject({ success: false, exitCode: 7, sessionId: "primary-session" });
-    expect(seen[0]?.output).toContain("primary-model exhausted");
+    expect(seen[0]?.output).toContain("primary:first exhausted");
     expect(seen[0]?.output).toContain("recovery failed");
     expect(seen[0]?.output).toContain('model pin validation failed for provider "claude"');
     expect(seen[0]?.output).not.toContain("RAW PRIMARY");
@@ -2415,10 +2817,10 @@ describe("Actor", () => {
 
     // #257 arbiter: a supervisor grace-kill is a cleanup termination, not a
     // capacity failure. Deleting the `graceKilled` short-circuit in
-    // `runWithFallback` turns this RED — the ladder classifies the killed run,
+    // `runWithPoolFallback` turns this RED — the chain classifies the killed run,
     // relaunches on an already-aborted signal, and the run-end output becomes a
     // both-tiers-exhausted summary with the real termination diagnostic gone.
-    it("does not spend the fallback ladder on a supervisor grace-kill", async () => {
+    it("does not spend the root pool on a supervisor grace-kill", async () => {
       let actor!: Actor;
       const onRunEnd = vi.fn();
       const classify = vi.fn(async () => ({ exhausted: true }));
@@ -2439,11 +2841,12 @@ describe("Actor", () => {
       actor = makeActor(
         {
           yieldGraceMs: 5000,
-          fallback: {
-            models: ["fallback-model"],
-            resolveProvider: () => fallbackProvider,
-            classify,
-          },
+          modelConfig: [
+            { provider: "primary", model: "primary-model" },
+            { provider: "recovery", model: "fallback-model" },
+          ],
+          resolveProvider: (entry) => (entry.provider === "recovery" ? fallbackProvider : primary),
+          classifyExhaustion: classify,
           onRunEnd,
         },
         primary

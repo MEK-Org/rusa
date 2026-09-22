@@ -80,7 +80,9 @@ describe("obligations MCP", () => {
   });
 
   it("creates responsive obligations and reports inherited responsiveness", async () => {
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canSetResponsive: true })
+    );
     const parent = (await client.callTool({
       name: "create_obligation",
       arguments: {
@@ -128,10 +130,134 @@ describe("obligations MCP", () => {
     expect(falseMarker.isError).toBe(true);
   });
 
-  it("marks existing work responsive through the MCP", async () => {
+  it.each([
+    "actor-a",
+    "steward",
+    "root",
+  ])("denies responsive writes without the root capability even for %s", async (actorId) => {
+    const existing = repository.create({ ownerId: actorId, title: "ordinary" });
+    const client = await connect(
+      createObligationsMcpServer(repository, actorId, {
+        canManage: () => true,
+      })
+    );
+    const before = db.serialize();
+    const created = await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: actorId, title: "urgent", responsive: true },
+    });
+    expect(created.isError).toBe(true);
+    expect(JSON.stringify(created.content)).toContain("only root");
+    const marked = await client.callTool({
+      name: "mark_obligation_responsive",
+      arguments: { id: existing.id },
+    });
+    expect(marked.isError).toBe(true);
+    expect(JSON.stringify(marked.content)).toContain("only root");
+    expect(db.serialize()).toEqual(before);
+    const ordinary = await client.callTool({
+      name: "create_obligation",
+      arguments: { owner_id: actorId, title: "ordinary child", responsive: null },
+    });
+    expect(ordinary.isError).toBeFalsy();
+  });
+
+  it("allows workers to inherit responsiveness or explicitly mark children of responsive ancestry", async () => {
+    const urgent = repository.create({ ownerId: "actor-a", title: "urgent", responsive: true });
+    const inherited = repository.create({
+      ownerId: "actor-a",
+      title: "inherited",
+      parentId: urgent.id,
+    });
+    const ordinary = repository.create({ ownerId: "actor-a", title: "ordinary" });
+    const worker = await connect(createObligationsMcpServer(repository, "actor-a"));
+    for (const parent of [urgent, inherited]) {
+      for (const responsive of [undefined, true]) {
+        const result = await worker.callTool({
+          name: "create_obligation",
+          arguments: { owner_id: "actor-a", title: "child", parent_id: parent.id, responsive },
+        });
+        expect(result.isError).toBeFalsy();
+        const { obligation } = JSON.parse(
+          (result.content as Array<{ text: string }>)[0]?.text ?? "{}"
+        );
+        expect(obligation).toMatchObject({
+          responsive: responsive ?? null,
+          effectiveResponsive: true,
+        });
+      }
+    }
+    const before = db.serialize();
+    const denied = await worker.callTool({
+      name: "create_obligation",
+      arguments: {
+        owner_id: "actor-a",
+        title: "promotion",
+        parent_id: ordinary.id,
+        responsive: true,
+      },
+    });
+    expect(denied.isError).toBe(true);
+    expect(db.serialize()).toEqual(before);
+  });
+
+  it("reserves reparenting promotions for root and allows ordinary moves", async () => {
+    const urgent = repository.create({ ownerId: "actor-a", title: "urgent", responsive: true });
+    const inherited = repository.create({
+      ownerId: "actor-a",
+      title: "inherited",
+      parentId: urgent.id,
+    });
+    const ordinary = repository.create({ ownerId: "actor-a", title: "ordinary" });
+    const child = repository.create({ ownerId: "actor-a", title: "child", parentId: ordinary.id });
+    const worker = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const before = db.serialize();
+    const denied = await worker.callTool({
+      name: "reparent_obligation",
+      arguments: { id: ordinary.id, parent_id: inherited.id },
+    });
+    expect(denied.isError).toBe(true);
+    expect(db.serialize()).toEqual(before);
+    expect(repository.require(child.id).effectiveResponsive).toBe(false);
+    const root = await connect(
+      createObligationsMcpServer(repository, "opaque-root-id", { canSetResponsive: true })
+    );
+    expect(
+      (
+        await root.callTool({
+          name: "reparent_obligation",
+          arguments: { id: ordinary.id, parent_id: inherited.id },
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(repository.require(child.id).effectiveResponsive).toBe(true);
+    expect(
+      (
+        await worker.callTool({
+          name: "reparent_obligation",
+          arguments: { id: ordinary.id, parent_id: urgent.id },
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(
+      (
+        await worker.callTool({
+          name: "reparent_obligation",
+          arguments: { id: ordinary.id, parent_id: null },
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(repository.require(child.id).effectiveResponsive).toBe(false);
+  });
+
+  it("marks existing work responsive through the root MCP", async () => {
     repository.create({ title: "existing hotfix", id: "hotfix", ownerId: "actor-a" });
     repository.create({ title: "child", id: "child", ownerId: "actor-a", parentId: "hotfix" });
-    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const client = await connect(
+      createObligationsMcpServer(repository, "root-uuid", { canSetResponsive: true })
+    );
 
     const result = (await client.callTool({
       name: "mark_obligation_responsive",

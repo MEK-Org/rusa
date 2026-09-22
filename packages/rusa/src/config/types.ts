@@ -332,14 +332,6 @@ export interface RootActorConfig {
    */
   effort?: string;
   /**
-   * Optional fallback model(s) the root tries, in order, when the primary
-   * `model` is overloaded or unavailable. Keeps a strong root responsive under
-   * transient throttling by degrading that turn to a weaker model instead of
-   * failing. A single id or an ordered list; only honoured by providers that
-   * support it.
-   */
-  fallbackModel?: string | string[];
-  /**
    * Working-memory ownership and policy for the root. Omit for the native,
    * provider-session-backed default; portable roots run stateless and receive
    * mesh-managed context using the same ledger/tail modes as spawned actors.

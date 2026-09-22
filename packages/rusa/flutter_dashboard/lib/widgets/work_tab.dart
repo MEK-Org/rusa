@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../breakpoints.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
@@ -325,7 +326,7 @@ class _WorkTabState extends State<WorkTab> {
       backgroundColor: MeshColors.bgPrimary,
       body: LayoutBuilder(
         builder: (context, constraints) {
-          final isNarrow = constraints.maxWidth < 700;
+          final isNarrow = constraints.maxWidth < kNarrowBreakpoint;
 
           if (isNarrow) {
             if (_selectedObligationId != null) {
@@ -346,13 +347,16 @@ class _WorkTabState extends State<WorkTab> {
                 ],
               );
             }
-            return _sidebar(flattened);
+            return _sidebar(flattened, isNarrow: isNarrow);
           }
 
           return Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              SizedBox(width: 320, child: _sidebar(flattened)),
+              SizedBox(
+                width: 320,
+                child: _sidebar(flattened, isNarrow: isNarrow),
+              ),
               const VerticalDivider(width: 1, color: MeshColors.border),
               Expanded(
                 child: _selectedObligationId != null
@@ -407,7 +411,7 @@ class _WorkTabState extends State<WorkTab> {
     ),
   );
 
-  Widget _sidebar(List<_FlatNode> nodes) => Container(
+  Widget _sidebar(List<_FlatNode> nodes, {required bool isNarrow}) => Container(
     decoration: const BoxDecoration(color: MeshColors.bgSecondary),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -573,6 +577,7 @@ class _WorkTabState extends State<WorkTab> {
                         ),
                       ),
                     );
+                    if (isNarrow) return content;
                     return HierarchyDropTarget<ObligationDto>(
                       canAccept: (dragged, zone) => _canAcceptObligationDrop(
                         dragged,

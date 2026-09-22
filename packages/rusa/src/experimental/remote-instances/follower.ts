@@ -192,7 +192,9 @@ async function run(): Promise<void> {
     } catch (error) {
       if (stopped) break;
       log.warn("follower_poll_failed", { err: error, retryInMs: backoffMs });
-      session = "";
+      if (error instanceof FollowerHttpError && error.status === 410) {
+        session = "";
+      }
       await new Promise((r) => setTimeout(r, backoffMs));
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
     }

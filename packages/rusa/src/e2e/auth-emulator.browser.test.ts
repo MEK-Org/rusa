@@ -88,13 +88,21 @@ it.skipIf(!process.env.RUSA_SHARED_AUTH_EMULATOR_E2E)(
 
 // Requires the real Firebase emulator and am-up --auth-emulator, with built assets.
 it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
-  "authenticates through the emulator popup, renews, and logs out",
+  "authenticates through the emulator popup, survives reload, renews, and signs in again",
   async () => {
     const origin = process.env.RUSA_AUTH_EMULATOR_E2E as string;
     const browser = await chromium.launch({ headless: true });
     try {
       for (const email of ["not-the-operator@example.com", "operator@example.com"]) {
         const context = await browser.newContext();
+        const productionAuthRequests: string[] = [];
+        await context.route(
+          /^https:\/\/(identitytoolkit|securetoken)\.googleapis\.com\//,
+          async (route) => {
+            productionAuthRequests.push(route.request().url());
+            await route.abort();
+          }
+        );
         const page = await context.newPage();
         // Browser fetch honors Secure cookies on loopback; Playwright's Node HTTP client does not.
         const status = (path: string) =>
@@ -111,6 +119,12 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
           await created;
           expect(await status("/api/auth/session")).toBe(200);
           expect(await status("/api/mesh/threads")).toBe(200);
+          await page.reload();
+          await enableFlutterSemantics(page);
+          await page.getByRole("button", { name: "Profile menu" }).waitFor({ timeout: 15_000 });
+          expect(await status("/api/auth/session")).toBe(200);
+          await page.getByText("Running in emulator mode.", { exact: false }).waitFor();
+          expect(productionAuthRequests).toEqual([]);
           const cookie = (await context.cookies()).find(
             (entry) => entry.name === "__Host-rusa_session"
           );
@@ -167,6 +181,14 @@ it.skipIf(!process.env.RUSA_AUTH_EMULATOR_E2E)(
           await page.getByRole("menuitem", { name: "Log out", exact: true }).click();
           await page.getByRole("button", { name: "Sign in with Google", exact: true }).waitFor();
           expect(await status("/api/auth/session")).toBe(401);
+          await page.reload();
+          await enableFlutterSemantics(page);
+          const signedInAgain = sessionCreated(page);
+          await signInThroughPopup(page, email);
+          await signedInAgain;
+          await page.getByRole("button", { name: "Profile menu" }).waitFor();
+          expect(await status("/api/auth/session")).toBe(200);
+          expect(productionAuthRequests).toEqual([]);
         }
         await context.close();
       }
