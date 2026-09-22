@@ -124,6 +124,55 @@ describe("executeFollowerUpdate", () => {
     }
   });
 
+  it("maps the runner's install and build subprocess failures to protocol steps", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-follower-step-"));
+    try {
+      const spawnFailure = (failedArgs: string[]) =>
+        ((_: string, args: string[]) => {
+          const child = new EventEmitter() as EventEmitter & {
+            pid: number;
+            stderr: EventEmitter;
+            kill: () => void;
+          };
+          child.pid = 12345;
+          child.stderr = new EventEmitter();
+          child.kill = () => {};
+          queueMicrotask(() =>
+            child.emit("close", args.join(" ") === failedArgs.join(" ") ? 1 : 0)
+          );
+          return child;
+        }) as never;
+
+      const installRunner = new FollowerBuildRunner(
+        root,
+        { installMs: 1000, buildMs: 1000 },
+        () => {},
+        "pnpm",
+        spawnFailure(["install", "--frozen-lockfile"])
+      );
+      await expect(
+        installRunner.build("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+      ).rejects.toMatchObject({
+        step: "install",
+      });
+
+      const buildRunner = new FollowerBuildRunner(
+        root,
+        { installMs: 1000, buildMs: 1000 },
+        () => {},
+        "pnpm",
+        spawnFailure(["run", "build:follower"])
+      );
+      await expect(
+        buildRunner.build("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+      ).rejects.toMatchObject({
+        step: "build",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores the live build if promotion fails after the old build moved aside", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-follower-swap-"));
     const live = join(root, "follower");
