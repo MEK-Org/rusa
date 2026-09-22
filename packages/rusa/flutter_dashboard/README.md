@@ -26,8 +26,11 @@ pnpm run build:dashboard-ui
 
 This runs `scripts/build-dashboard-ui.mjs`, which:
 
-1. Builds Flutter web (`flutter build web --release`)
-2. Copies `flutter_dashboard/build/web/*` into `dist/dashboard-ui-app/`
+1. Discards generated Flutter state (`.dart_tool/`, `build/`, `.flutter-plugins*`)
+   so every build starts from a clean context and plugin registration is
+   regenerated for the current dependency set
+2. Builds Flutter web (`flutter build web --release`)
+3. Copies `flutter_dashboard/build/web/*` into `dist/dashboard-ui-app/`
 
 The Node dashboard server then serves those files at runtime.
 
