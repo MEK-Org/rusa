@@ -19,28 +19,20 @@ class WebObligationsCache implements ObligationsCache {
     return 'rusa.dashboard.obligations.v${PersistedObligationsSnapshot.schemaVersion}.$sanitizedScope.$sanitizedPrincipal';
   }
 
-  static String _lastPrincipalKey(String scope) {
-    final sanitizedScope = Uri.encodeComponent(scope);
-    return 'rusa.dashboard.obligations.last_principal.v${PersistedObligationsSnapshot.schemaVersion}.$sanitizedScope';
-  }
-
   @override
   PersistedObligationsSnapshot? load({
     required String scope,
-    String? principalId,
+    required String principalId,
   }) {
     try {
-      var effectivePrincipal = principalId;
-      if (effectivePrincipal == null || effectivePrincipal.isEmpty) {
-        effectivePrincipal =
-            web.window.localStorage.getItem(_lastPrincipalKey(scope));
-      }
-      if (effectivePrincipal == null || effectivePrincipal.isEmpty) {
+      if (principalId.isEmpty) return null;
+      final key = _snapshotKey(scope, principalId);
+      final raw = web.window.localStorage.getItem(key);
+      if (raw == null ||
+          raw.isEmpty ||
+          !PersistedObligationsSnapshot.rawFitsStorageBudget(raw)) {
         return null;
       }
-      final key = _snapshotKey(scope, effectivePrincipal);
-      final raw = web.window.localStorage.getItem(key);
-      if (raw == null || raw.isEmpty) return null;
       return PersistedObligationsSnapshot.fromJson(jsonDecode(raw));
     } catch (_) {
       return null;
@@ -50,36 +42,20 @@ class WebObligationsCache implements ObligationsCache {
   @override
   void save(PersistedObligationsSnapshot snapshot) {
     try {
+      final raw = snapshot.encode();
+      if (!PersistedObligationsSnapshot.rawFitsStorageBudget(raw)) return;
       final key = _snapshotKey(snapshot.scope, snapshot.principalId);
-      web.window.localStorage.setItem(key, jsonEncode(snapshot.toJson()));
-      web.window.localStorage.setItem(
-        _lastPrincipalKey(snapshot.scope),
-        snapshot.principalId,
-      );
+      web.window.localStorage.setItem(key, raw);
     } catch (_) {
       // Best-effort: swallow quota or private browsing exceptions.
     }
   }
 
   @override
-  void invalidate({
-    required String scope,
-    String? principalId,
-  }) {
+  void invalidate({required String scope, required String principalId}) {
     try {
-      if (principalId != null && principalId.isNotEmpty) {
-        web.window.localStorage.removeItem(_snapshotKey(scope, principalId));
-        final last = web.window.localStorage.getItem(_lastPrincipalKey(scope));
-        if (last == principalId) {
-          web.window.localStorage.removeItem(_lastPrincipalKey(scope));
-        }
-      } else {
-        final last = web.window.localStorage.getItem(_lastPrincipalKey(scope));
-        if (last != null) {
-          web.window.localStorage.removeItem(_snapshotKey(scope, last));
-          web.window.localStorage.removeItem(_lastPrincipalKey(scope));
-        }
-      }
+      if (principalId.isEmpty) return;
+      web.window.localStorage.removeItem(_snapshotKey(scope, principalId));
     } catch (_) {
       // Best-effort.
     }

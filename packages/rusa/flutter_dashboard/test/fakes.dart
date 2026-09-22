@@ -194,6 +194,7 @@ class FakeApi extends DashboardApi {
   Object? quotaError;
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
+  Completer<DashboardConfigDto>? dashboardConfigGate;
   bool halted = false;
   List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
@@ -350,6 +351,11 @@ class FakeApi extends DashboardApi {
 
   @override
   Future<DashboardConfigDto> fetchDashboardConfig() async {
+    final gate = dashboardConfigGate;
+    if (gate != null) {
+      dashboardConfigGate = null;
+      return gate.future;
+    }
     return dashboardConfigResult ??
         const DashboardConfigDto(quotaProviders: {});
   }
@@ -1104,20 +1110,10 @@ class FakeObligationsCache implements ObligationsCache {
   @override
   PersistedObligationsSnapshot? load({
     required String scope,
-    String? principalId,
+    required String principalId,
   }) {
     loadCount++;
-    if (principalId != null) {
-      final key = '$scope.$principalId';
-      return _entries[key];
-    }
-    if (stored != null && stored!.scope == scope) {
-      return stored;
-    }
-    for (final snap in _entries.values.toList().reversed) {
-      if (snap.scope == scope) return snap;
-    }
-    return null;
+    return _entries['$scope.$principalId'];
   }
 
   @override
@@ -1131,18 +1127,11 @@ class FakeObligationsCache implements ObligationsCache {
   @override
   void invalidate({
     required String scope,
-    String? principalId,
+    required String principalId,
   }) {
-    if (principalId != null) {
-      _entries.remove('$scope.$principalId');
-      if (stored?.scope == scope && stored?.principalId == principalId) {
-        stored = null;
-      }
-    } else {
-      _entries.removeWhere((k, _) => k.startsWith('$scope.'));
-      if (stored?.scope == scope) {
-        stored = null;
-      }
+    _entries.remove('$scope.$principalId');
+    if (stored?.scope == scope && stored?.principalId == principalId) {
+      stored = null;
     }
     invalidateCount++;
   }

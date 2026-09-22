@@ -2107,7 +2107,25 @@ void main() {
       blockingChildren: const [],
     );
 
-    test('seeds obligations from the persisted cache at construction — 0ms first paint (#505)', () async {
+    test('does not expose a persisted snapshot before its principal resolves (#505)', () async {
+      final aliceSnapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'user-alice',
+        trees: [cachedTree],
+        now: now,
+      );
+      final store = DashboardStore(
+        api: FakeApi(base: Uri.parse('http://localhost:4040')),
+        stream: FakeStream(),
+        obligationsCache: FakeObligationsCache(aliceSnapshot),
+      );
+
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
+    test('seeds obligations from the matching cache after principal resolution (#505)', () async {
       final snapshot = PersistedObligationsSnapshot.capture(
         scope: 'http://localhost:4040',
         principalId: 'test-user',
@@ -2115,7 +2133,11 @@ void main() {
         now: now,
       );
       final cache = FakeObligationsCache(snapshot);
-      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'test-user',
+        );
 
       // Create store with cache
       final store = DashboardStore(
@@ -2124,7 +2146,10 @@ void main() {
         obligationsCache: cache,
       );
 
-      // Even before init() or any REST call, cachedObligationTrees is immediately available
+      expect(store.cachedObligationTrees, isNull);
+      await store.init();
+      await pumpEventQueue();
+
       expect(store.cachedObligationTrees, isNotNull);
       expect(store.cachedObligationTrees!.length, 1);
       expect(store.cachedObligationTrees!.first.obligation.id, 'cached-root');
@@ -2200,7 +2225,11 @@ void main() {
         now: now,
       );
       final cache = FakeObligationsCache(snapshot);
-      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'test-user',
+        );
       final stream = FakeStream();
 
       final store = DashboardStore(
@@ -2240,38 +2269,5 @@ void main() {
       await store.dispose();
     });
 
-    test('measures time to first useful content: cached seed is synchronous (0ms) (#505)', () async {
-      final snapshot = PersistedObligationsSnapshot.capture(
-        scope: 'http://localhost:4040',
-        principalId: 'test-user',
-        trees: [cachedTree],
-        now: now,
-      );
-      final cache = FakeObligationsCache(snapshot);
-      final api = FakeApi(base: Uri.parse('http://localhost:4040'));
-
-      final stopwatch = Stopwatch()..start();
-      final storeWithCache = DashboardStore(
-        api: api,
-        stream: FakeStream(),
-        obligationsCache: cache,
-      );
-      final elapsedWithCacheMs = stopwatch.elapsedMilliseconds;
-      stopwatch.stop();
-
-      expect(storeWithCache.cachedObligationTrees, isNotNull);
-      expect(elapsedWithCacheMs, lessThan(50)); // synchronous / instant 0ms first paint
-
-      // Compare with cold start (no cache)
-      final storeCold = DashboardStore(
-        api: api,
-        stream: FakeStream(),
-        obligationsCache: const NoopObligationsCache(),
-      );
-      expect(storeCold.cachedObligationTrees, isNull);
-
-      await storeWithCache.dispose();
-      await storeCold.dispose();
-    });
   });
 }

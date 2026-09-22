@@ -214,15 +214,16 @@ Future<void> showCreateObligationDialog(
                         }
 
                         final bodyText = intentCtrl.text.trim();
-                        await store.api.createObligation(
-                          ownerId: resolvedId,
-                          title: titleCtrl.text.trim(),
-                          parentId: parentId,
-                          intent: bodyText.isEmpty ? null : bodyText,
-                          externalRef: externalRef,
-                          priority: priority,
+                        await store.mutateObligations(
+                          () => store.api.createObligation(
+                            ownerId: resolvedId,
+                            title: titleCtrl.text.trim(),
+                            parentId: parentId,
+                            intent: bodyText.isEmpty ? null : bodyText,
+                            externalRef: externalRef,
+                            priority: priority,
+                          ),
                         );
-                        store.invalidateObligationsCache();
 
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
@@ -372,8 +373,12 @@ Future<void> showReparentObligationDialog(
                       setState(() => isSubmitting = true);
                       try {
                         final targetParentId = makeRoot ? null : parentIdCtrl.text.trim();
-                        await store.api.reparentObligation(obligation.id, parentId: targetParentId);
-                        store.invalidateObligationsCache();
+                        await store.mutateObligations(
+                          () => store.api.reparentObligation(
+                            obligation.id,
+                            parentId: targetParentId,
+                          ),
+                        );
 
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
@@ -605,9 +610,15 @@ Future<void> showEditExternalRefDialog(
                       error = null;
                     });
                     try {
-                      await store.api.setObligationExternalRef(obligation.id, controller.text);
-                      store.invalidateObligationsCache();
-                      if (dialogContext.mounted) Navigator.of(dialogContext).pop();
+                      await store.mutateObligations(
+                        () => store.api.setObligationExternalRef(
+                          obligation.id,
+                          controller.text,
+                        ),
+                      );
+                      if (dialogContext.mounted) {
+                        Navigator.of(dialogContext).pop();
+                      }
                       onUpdated?.call();
                     } catch (e) {
                       // The server owns the grammar, so its complaint is the
@@ -721,12 +732,13 @@ Future<void> confirmAndSetObligationStatus(
     // Blank stays null all the way down: "no reason given" has one
     // representation, and it is not the empty string.
     final trimmed = note.trim();
-    await store.api.setObligationStatus(
-      obligation.id,
-      status,
-      note: trimmed.isEmpty ? null : trimmed,
+    await store.mutateObligations(
+      () => store.api.setObligationStatus(
+        obligation.id,
+        status,
+        note: trimmed.isEmpty ? null : trimmed,
+      ),
     );
-    store.invalidateObligationsCache();
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Obligation transitioned to $status')),

@@ -76,12 +76,17 @@ class _WorkTabState extends State<WorkTab> {
         _loading = false;
         _isBackgroundRefreshing = false;
       });
-      widget.store.saveObligationsSnapshot(forest.trees);
+      // Focus-link and Show Done requests include terminal roots. Persist only
+      // the default terminal-excluding forest so a later default view cannot
+      // paint rows it believes it did not fetch.
+      if (!includeTerminal) {
+        widget.store.saveObligationsSnapshot(forest.trees);
+      }
       _checkFocusLink();
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
-        _error = e.toString();
+        _error = 'We could not refresh the work queue. Check your connection and retry.';
         _loading = false;
         _isBackgroundRefreshing = false;
       });
@@ -199,9 +204,11 @@ class _WorkTabState extends State<WorkTab> {
   ) async {
     try {
       if (zone == HierarchyDropZone.on) {
-        await widget.store.api.reparentObligation(
-          dragged.id,
-          parentId: target.id,
+        await widget.store.mutateObligations(
+          () => widget.store.api.reparentObligation(
+            dragged.id,
+            parentId: target.id,
+          ),
         );
         _expandedIds.add(target.id);
         widget.store.saveWorkExpanded(_expandedIds);
@@ -217,13 +224,14 @@ class _WorkTabState extends State<WorkTab> {
         final nextId = insertIndex == queue.length
             ? null
             : queue[insertIndex].id;
-        await widget.store.api.reorderObligation(
-          dragged.id,
-          previousId: previousId,
-          nextId: nextId,
+        await widget.store.mutateObligations(
+          () => widget.store.api.reorderObligation(
+            dragged.id,
+            previousId: previousId,
+            nextId: nextId,
+          ),
         );
       }
-      widget.store.invalidateObligationsCache();
       await _loadRoots();
     } catch (err) {
       if (context.mounted) {
@@ -241,7 +249,7 @@ class _WorkTabState extends State<WorkTab> {
   void initState() {
     super.initState();
     final cached = widget.store.cachedObligationTrees;
-    if (cached != null && cached.isNotEmpty) {
+    if (cached != null) {
       _rootTrees = cached;
       _loading = false;
       _isBackgroundRefreshing = true;
@@ -269,7 +277,7 @@ class _WorkTabState extends State<WorkTab> {
         .listen((newPrincipalId) {
           if (mounted) {
             final cached = widget.store.cachedObligationTrees;
-            if (cached != null && cached.isNotEmpty) {
+            if (cached != null) {
               setState(() {
                 _rootTrees = cached;
                 _loading = false;
@@ -330,6 +338,45 @@ class _WorkTabState extends State<WorkTab> {
     return result;
   }
 
+  Widget _refreshErrorBanner({required EdgeInsets margin}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    margin: margin,
+    decoration: BoxDecoration(
+      color: MeshColors.statusHalted.withAlpha(35),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: MeshColors.statusHalted.withAlpha(80)),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.warning_amber_rounded, size: 16, color: MeshColors.statusHalted),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            'Failed to refresh: $_error',
+            style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        const SizedBox(width: 8),
+        InkWell(
+          onTap: _loadRoots,
+          child: const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            child: Text(
+              'Retry',
+              style: TextStyle(
+                color: MeshColors.accent,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     if (_loading && _rootTrees.isEmpty) {
@@ -373,59 +420,7 @@ class _WorkTabState extends State<WorkTab> {
                 children: [
                   _narrowBackBar(),
                   if (_error != null && _rootTrees.isNotEmpty)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      margin: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: MeshColors.statusHalted.withAlpha(35),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: MeshColors.statusHalted.withAlpha(80),
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(
-                            Icons.warning_amber_rounded,
-                            size: 16,
-                            color: MeshColors.statusHalted,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'Failed to refresh: $_error',
-                              style: const TextStyle(
-                                color: MeshColors.textSecondary,
-                                fontSize: 12,
-                              ),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          InkWell(
-                            onTap: _loadRoots,
-                            child: const Padding(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 6,
-                                vertical: 2,
-                              ),
-                              child: Text(
-                                'Retry',
-                                style: TextStyle(
-                                  color: MeshColors.accent,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
+                    _refreshErrorBanner(margin: const EdgeInsets.all(8)),
                   const Divider(height: 1, color: MeshColors.border),
                   Expanded(
                     child: _DetailView(
@@ -571,59 +566,7 @@ class _WorkTabState extends State<WorkTab> {
           ),
         ),
         if (_error != null && _rootTrees.isNotEmpty)
-          Container(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 12,
-              vertical: 8,
-            ),
-            margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            decoration: BoxDecoration(
-              color: MeshColors.statusHalted.withAlpha(35),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: MeshColors.statusHalted.withAlpha(80),
-              ),
-            ),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.warning_amber_rounded,
-                  size: 16,
-                  color: MeshColors.statusHalted,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Failed to refresh: $_error',
-                    style: const TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 12,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                InkWell(
-                  onTap: _loadRoots,
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
-                    ),
-                    child: Text(
-                      'Retry',
-                      style: TextStyle(
-                        color: MeshColors.accent,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
+          _refreshErrorBanner(margin: const EdgeInsets.fromLTRB(12, 0, 12, 8)),
         const Divider(height: 1, color: MeshColors.border),
         Expanded(
           child: nodes.isEmpty
@@ -1501,10 +1444,12 @@ class _DetailViewState extends State<_DetailView> {
                           final previousId = i - 2 >= 0 ? list[i - 2].id : null;
                           final nextId = list[i - 1].id;
                           try {
-                            await store.api.reorderObligation(
-                              c.id,
-                              previousId: previousId,
-                              nextId: nextId,
+                            await store.mutateObligations(
+                              () => store.api.reorderObligation(
+                                c.id,
+                                previousId: previousId,
+                                nextId: nextId,
+                              ),
                             );
                             onMutated?.call();
                           } catch (err) {
@@ -1526,10 +1471,12 @@ class _DetailViewState extends State<_DetailView> {
                               ? list[i + 2].id
                               : null;
                           try {
-                            await store.api.reorderObligation(
-                              c.id,
-                              previousId: previousId,
-                              nextId: nextId,
+                            await store.mutateObligations(
+                              () => store.api.reorderObligation(
+                                c.id,
+                                previousId: previousId,
+                                nextId: nextId,
+                              ),
                             );
                             onMutated?.call();
                           } catch (err) {

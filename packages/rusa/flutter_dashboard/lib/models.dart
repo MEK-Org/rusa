@@ -1775,12 +1775,6 @@ class ObligationForest {
   final int total;
   final bool hasMore;
 
-  Map<String, dynamic> toJson() => {
-    'trees': trees.map((t) => t.toJson()).toList(),
-    'total': total,
-    'hasMore': hasMore,
-  };
-
   factory ObligationForest.fromJson(Map<String, dynamic> j) => ObligationForest(
     trees: (j['trees'] as List<dynamic>? ?? const [])
         .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))

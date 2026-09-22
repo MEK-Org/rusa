@@ -633,16 +633,26 @@ void main() {
           status: 'done',
           recurrencePolicy: 'cron',
         );
-        final api = FakeApi()
+        final cache = FakeObligationsCache();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [
             liveRoot,
             quietTerminalRoot,
             recurringTerminalRoot,
-          ];
+          ]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          );
 
-        final store = DashboardStore(api: api, stream: FakeStream());
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
         await store.init();
+        await pumpEventQueue();
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
@@ -661,6 +671,10 @@ void main() {
           api.fetchObligationForestCalls.single.includeTerminalRoots,
           isFalse,
         );
+        expect(
+          cache.stored!.trees.map((tree) => tree.obligation.id),
+          isNot(contains('root-quiet-done')),
+        );
 
         await tester.tap(find.byTooltip('Show Done'));
         await tester.pump();
@@ -671,6 +685,10 @@ void main() {
         expect(
           api.fetchObligationForestCalls.last.includeTerminalRoots,
           isTrue,
+        );
+        expect(
+          cache.stored!.trees.map((tree) => tree.obligation.id),
+          isNot(contains('root-quiet-done')),
         );
 
         await store.dispose();
@@ -1448,8 +1466,7 @@ void main() {
   );
 
   testWidgets(
-    'hydrates cached obligations snapshot immediately at 0ms and shows '
-    'background refreshing indicator while revalidating (#505)',
+    'renders a principal-scoped cached snapshot with a background refresh indicator (#505)',
     (tester) async {
       await tester.runAsync(() async {
         final cachedOb = makeObligation(
@@ -1473,6 +1490,10 @@ void main() {
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [cachedOb]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
           ..forestGates.add(gate);
 
         final store = DashboardStore(
@@ -1481,6 +1502,7 @@ void main() {
           obligationsCache: cache,
         );
         await store.init();
+        await pumpEventQueue();
 
         await tester.pumpWidget(
           MaterialApp(
@@ -1490,8 +1512,8 @@ void main() {
           ),
         );
 
-        // Immediate first frame: cached obligation is rendered synchronously,
-        // WITHOUT full-screen CircularProgressIndicator!
+        // After principal resolution, the cache paints while the forest request
+        // stays in flight; there is no full-screen loading state.
         expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
         expect(find.text('WORK QUEUE'), findsOneWidget);
 
@@ -1511,6 +1533,80 @@ void main() {
         // Refresh completed: small loading indicator is gone, obligation remains rendered
         expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
         expect(smallSpinnerFinder, findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'never renders another principal’s cached obligations while config resolves (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final aliceTree = ObligationTreeDto(
+          obligation: makeObligation('alice-obligation', title: 'Alice private obligation'),
+          children: const [],
+          blockingChildren: const [],
+        );
+        final bobTree = ObligationTreeDto(
+          obligation: makeObligation('bob-obligation', title: 'Bob cached obligation'),
+          children: const [],
+          blockingChildren: const [],
+        );
+        final configGate = Completer<DashboardConfigDto>();
+        final firstForestGate = Completer<void>();
+        final secondForestGate = Completer<void>();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [makeObligation('fresh-bob', title: 'Bob authoritative obligation')]
+          ..dashboardConfigGate = configGate
+          ..forestGates.addAll([firstForestGate, secondForestGate]);
+        final cache = FakeObligationsCache(
+          PersistedObligationsSnapshot.capture(
+            scope: 'http://localhost:4040',
+            principalId: 'user-alice',
+            trees: [aliceTree],
+            now: DateTime.utc(2026, 9, 22, 12),
+          ),
+        )..save(
+          PersistedObligationsSnapshot.capture(
+            scope: 'http://localhost:4040',
+            principalId: 'user-bob',
+            trees: [bobTree],
+            now: DateTime.utc(2026, 9, 22, 12),
+          ),
+        );
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(home: Scaffold(body: WorkTab(store: store, onSelectView: (_) {}))),
+        );
+        await tester.pump();
+        expect(find.text('Alice private obligation'), findsNothing);
+
+        configGate.complete(const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-bob',
+        ));
+        await pumpEventQueue();
+        await tester.pump();
+
+        expect(find.text('Alice private obligation'), findsNothing);
+        expect(find.text('Bob cached obligation'), findsOneWidget);
+
+        firstForestGate.complete();
+        secondForestGate.complete();
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Alice private obligation'), findsNothing);
+        expect(find.text('Bob authoritative obligation'), findsOneWidget);
 
         await store.dispose();
       });
@@ -1541,6 +1637,10 @@ void main() {
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [cachedOb]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
           ..forestError = Exception('Network error during background sync');
 
         final store = DashboardStore(
@@ -1549,6 +1649,7 @@ void main() {
           obligationsCache: cache,
         );
         await store.init();
+        await pumpEventQueue();
 
         await tester.pumpWidget(
           MaterialApp(
@@ -1565,6 +1666,7 @@ void main() {
 
         // Actionable error banner and Retry button are displayed
         expect(find.textContaining('Failed to refresh:'), findsOneWidget);
+        expect(find.textContaining('Network error during background sync'), findsNothing);
         expect(find.text('Retry'), findsOneWidget);
 
         // Clear error on API and tap Retry
@@ -1606,7 +1708,11 @@ void main() {
         final cache = FakeObligationsCache(snapshot);
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [cachedOb];
+          ..obligationsResult = [cachedOb]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          );
 
         final store = DashboardStore(
           api: api,
@@ -1614,6 +1720,7 @@ void main() {
           obligationsCache: cache,
         );
         await store.init();
+        await pumpEventQueue();
 
         await tester.pumpWidget(
           MaterialApp(
@@ -1627,12 +1734,13 @@ void main() {
 
         expect(find.text('Before Mutation'), findsOneWidget);
 
-        // Mutate via create obligation
-        final created = await api.createObligation(ownerId: 'root', title: 'Newly Created Child');
+        // The shared store mutation seam covers callbacks outside WorkTab too.
+        final created = await store.mutateObligations(
+          () => api.createObligation(ownerId: 'root', title: 'Newly Created Child'),
+        );
         expect(created.id, isNotNull);
 
-        // Calling store.invalidateObligationsCache() invalidates cache
-        store.invalidateObligationsCache();
+        // The successful mutation invalidates the principal-scoped snapshot.
         expect(cache.invalidateCount, 1);
         expect(store.cachedObligationTrees, isNull);
 

@@ -57,8 +57,6 @@ void main() {
       principalId: 'user-principal-42',
       trees: [tree],
       now: now,
-      total: 5,
-      hasMore: true,
     );
 
     final encoded = jsonEncode(snapshot.toJson());
@@ -69,8 +67,6 @@ void main() {
     expect(restored!.scope, 'http://localhost:4040');
     expect(restored.principalId, 'user-principal-42');
     expect(restored.savedAt, now.toIso8601String());
-    expect(restored.total, 5);
-    expect(restored.hasMore, isTrue);
     expect(restored.trees.length, 1);
 
     final restoredRoot = restored.trees.first;
@@ -105,7 +101,7 @@ void main() {
 
   group('Isolation and Usability boundaries (#505)', () {
     final snapshot = PersistedObligationsSnapshot.capture(
-      scope: 'https://mesh.corp.internal:8080',
+      scope: 'https://mesh.example.invalid:8080',
       principalId: 'principal-alice',
       trees: [
         ObligationTreeDto(
@@ -120,7 +116,7 @@ void main() {
     test('usable only when scope and principal match exactly and time is fresh', () {
       expect(
         snapshot.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-alice',
           now: now,
         ),
@@ -131,7 +127,7 @@ void main() {
     test('refused across different authenticated principals (no cross-user leak)', () {
       expect(
         snapshot.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-bob',
           now: now,
         ),
@@ -142,7 +138,7 @@ void main() {
     test('refused across different server environments (no cross-instance leak)', () {
       expect(
         snapshot.isUsableAt(
-          scope: 'https://staging.mesh.corp.internal:8080',
+          scope: 'https://staging.mesh.example.invalid:8080',
           principalId: 'principal-alice',
           now: now,
         ),
@@ -154,7 +150,7 @@ void main() {
       final expiredTime = now.add(PersistedObligationsSnapshot.maxAge + const Duration(minutes: 1));
       expect(
         snapshot.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-alice',
           now: expiredTime,
         ),
@@ -164,7 +160,7 @@ void main() {
       final freshTime = now.add(PersistedObligationsSnapshot.maxAge - const Duration(minutes: 1));
       expect(
         snapshot.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-alice',
           now: freshTime,
         ),
@@ -172,13 +168,21 @@ void main() {
       );
     });
 
-    test('refused when clock jumps backwards', () {
-      final beforeSaved = now.subtract(const Duration(minutes: 1));
+    test('tolerates a small backwards clock adjustment but rejects larger skew', () {
+      final withinTolerance = now.subtract(PersistedObligationsSnapshot.maxFutureSkew);
       expect(
         snapshot.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-alice',
-          now: beforeSaved,
+          now: withinTolerance,
+        ),
+        isTrue,
+      );
+      expect(
+        snapshot.isUsableAt(
+          scope: 'https://mesh.example.invalid:8080',
+          principalId: 'principal-alice',
+          now: withinTolerance.subtract(const Duration(milliseconds: 1)),
         ),
         isFalse,
       );
@@ -186,14 +190,14 @@ void main() {
 
     test('refused when savedAt timestamp is malformed', () {
       const malformed = PersistedObligationsSnapshot(
-        scope: 'https://mesh.corp.internal:8080',
+        scope: 'https://mesh.example.invalid:8080',
         principalId: 'principal-alice',
         savedAt: 'invalid-time',
         trees: [],
       );
       expect(
         malformed.isUsableAt(
-          scope: 'https://mesh.corp.internal:8080',
+          scope: 'https://mesh.example.invalid:8080',
           principalId: 'principal-alice',
           now: now,
         ),
@@ -247,6 +251,28 @@ void main() {
       };
       expect(PersistedObligationsSnapshot.fromJson(raw), isNull);
     });
+
+    test('rejects an oversized raw value before decoding', () {
+      final raw = 'x' * (PersistedObligationsSnapshot.maxSerializedBytes + 1);
+      expect(PersistedObligationsSnapshot.rawFitsStorageBudget(raw), isFalse);
+    });
+
+    test('does not offer an oversized capture to the storage adapter', () {
+      final hugeIntent = 'x' * (PersistedObligationsSnapshot.maxSerializedBytes + 100);
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost',
+        principalId: 'u1',
+        trees: [
+          ObligationTreeDto(
+            obligation: makeObligation('huge-write', intent: hugeIntent),
+            children: const [],
+            blockingChildren: const [],
+          ),
+        ],
+        now: now,
+      );
+      expect(snapshot.fitsStorageBudget, isFalse);
+    });
   });
 
   group('NoopObligationsCache', () {
@@ -261,7 +287,7 @@ void main() {
       );
       cache.save(snapshot);
       expect(cache.load(scope: 's', principalId: 'u'), isNull);
-      cache.invalidate(scope: 's');
+      cache.invalidate(scope: 's', principalId: 'u');
       cache.clear();
       expect(cache.load(scope: 's', principalId: 'u'), isNull);
     });
