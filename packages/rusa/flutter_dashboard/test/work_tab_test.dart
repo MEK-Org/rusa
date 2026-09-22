@@ -26,14 +26,17 @@ void main() {
         );
         addTearDown(() => tester.binding.setSurfaceSize(null));
 
-        final obligation = makeObligation(
-          'narrow-no-drag',
-          ownerId: 'root',
-          title: 'Scrollable narrow row',
+        final obligations = List.generate(
+          24,
+          (index) => makeObligation(
+            'narrow-no-drag-$index',
+            ownerId: 'root',
+            title: 'Scrollable narrow row $index',
+          ),
         );
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [obligation];
+          ..obligationsResult = obligations;
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
 
@@ -49,6 +52,17 @@ void main() {
 
         expect(find.byType(Draggable<ObligationDto>), findsNothing);
         expect(find.byType(HierarchyDropTarget<ObligationDto>), findsNothing);
+
+        final scrollable = tester.state<ScrollableState>(
+          find.byType(Scrollable),
+        );
+        expect(scrollable.position.maxScrollExtent, greaterThan(0));
+        await tester.drag(
+          find.text('Scrollable narrow row 0'),
+          const Offset(0, -300),
+        );
+        await tester.pumpAndSettle();
+        expect(scrollable.position.pixels, greaterThan(0));
 
         await store.dispose();
       });
