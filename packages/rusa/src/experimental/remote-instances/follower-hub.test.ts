@@ -537,9 +537,12 @@ describe("leader follower gateway", () => {
       // GET update status
       const getRes = await h.get("/followers/worker-update/update");
       expect(getRes.status).toBe(200);
-      const getJson = (await getRes.json()) as { ok: boolean; status: { updateId: string } };
-      expect(getJson.ok).toBe(true);
-      expect(getJson.status.updateId).toBe(updateJson.update.updateId);
+      const getJson = (await getRes.json()) as {
+        followerId: string;
+        updateStatus: { updateId: string };
+      };
+      expect(getJson.followerId).toBe("worker-update");
+      expect(getJson.updateStatus.updateId).toBe(updateJson.update.updateId);
       // Poll delivers the update command
       const pollRes = await h.post("/poll", identity);
       expect(pollRes.status).toBe(200);
