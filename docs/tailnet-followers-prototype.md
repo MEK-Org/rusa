@@ -242,11 +242,20 @@ Follower updates can be triggered via three paths:
    - `POST /followers/:id/update` - triggers update for a single follower with optional `{ targetSha, branch }`.
    - `GET /followers/:id/update` - queries the last known update status of a follower.
    - `POST /followers/update-all` - triggers updates across all currently connected followers.
+   - `GET /followers/reconciliation` - queries the active automatic update trigger and reconciliation state.
 2. **Dashboard REST API** (loopback control API):
    - `POST /api/mesh/followers/:id/update`
    - `GET /api/mesh/followers/:id/update`
    - `POST /api/mesh/followers/update-all`
-The leader's self-update does not enqueue follower updates before its replacement has booted. Operators use the authenticated gateway or dashboard endpoint after verifying the leader update; this keeps a failed leader self-update from moving followers to an unproven revision.
+   - `GET /api/mesh/followers/reconciliation`
+3. **Automatic leader-update trigger & reconciliation**:
+   - When the leader self-updates green via the `update` tool, `executeUpdate` persists an active `FollowerUpdateTrigger` to `<mcHome>/data/follower-update-trigger.json` immediately before draining and restarting. A failed or timed-out leader build never writes a trigger.
+   - When the replacement leader process boots up, `FollowerHub` loads the active trigger via `FollowerUpdateReconciler`.
+   - As enrolled followers reconnect and register via `POST /register`, the reconciler evaluates their reported `commitSha`:
+     - If `follower.commitSha === trigger.targetSha`: recorded as `success`.
+     - If the follower lags `targetSha`, an update is dispatched via `updateFollower`.
+     - **Fail-stop loop prevention**: If a follower previously reported a failure (`status: "failed"`) for the given `targetSha`, automatic reconciliation skips that follower to avoid endless build/restart loops.
+     - When all connected followers have reached `targetSha`, the trigger is marked completed.
 
 ### Follower-side update execution and safe rollback boundary
 

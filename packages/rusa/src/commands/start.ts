@@ -142,6 +142,7 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
+import { FollowerUpdateTriggerStore } from "../experimental/remote-instances/follower-update-trigger-store.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
@@ -1797,6 +1798,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // best-effort: if the deploy checkout can't be resolved, the mesh still boots
   // without it. Its drainer self-excludes the CALLER's run (whoever holds the
   // grant), not a fixed root id.
+  const followerTriggerStore = new FollowerUpdateTriggerStore(
+    join(mcHome, "data", "follower-update-trigger.json")
+  );
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -1818,6 +1822,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onGreenBuild: (newSha, branch) => {
+          try {
+            followerTriggerStore.createTrigger({
+              targetSha: newSha,
+              branch,
+              source: "leader-update",
+              autoReconcile: true,
+            });
+            console.log(
+              `[update] persisted durable follower update trigger for ${newSha.slice(0, 7)} (${branch})`
+            );
+          } catch (tErr) {
+            console.warn(
+              `[update] failed to persist follower update trigger: ${tErr instanceof Error ? tErr.message : String(tErr)}`
+            );
+          }
+        },
         notify: sendErrorSink
           ? {
               notify: sendErrorSink,
@@ -2069,7 +2090,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log });
+    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
     await followerHub.listen(config.followers.bind, config.followers.port);
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
@@ -3842,6 +3863,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             if (!followerHub) throw new Error("Follower gateway not enabled");
             return followerHub.updateAllFollowers(opts);
           },
+          getFollowerReconciliation: () =>
+            followerHub
+              ? followerHub.getReconciliationStatus()
+              : {
+                  activeTrigger: followerTriggerStore.getActiveTrigger(),
+                  completed: !followerTriggerStore.getActiveTrigger(),
+                },
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),

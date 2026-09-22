@@ -365,4 +365,31 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.restarting).toBe(true);
     expect(exits).toEqual([0]);
   });
+
+  it("invokes onGreenBuild on green build and passes newSha and branch", async () => {
+    const { deps } = makeDeps();
+    const greenCalls: { sha: string; branch: string }[] = [];
+    deps.onGreenBuild = (sha, branch) => {
+      greenCalls.push({ sha, branch });
+    };
+    const res = await executeUpdate(plan({ branch: "staging" }), deps);
+    expect(res.ok).toBe(true);
+    expect(greenCalls).toEqual([{ sha: "1".repeat(40), branch: "staging" }]);
+  });
+
+  it("does not invoke onGreenBuild when build fails", async () => {
+    const { deps } = makeDeps();
+    const greenCalls: { sha: string; branch: string }[] = [];
+    deps.onGreenBuild = (sha, branch) => {
+      greenCalls.push({ sha, branch });
+    };
+    deps.build = {
+      async build() {
+        throw new StepError("build", "compile failed", false);
+      },
+    };
+    const res = await executeUpdate(plan(), deps);
+    expect(res.ok).toBe(false);
+    expect(greenCalls).toHaveLength(0);
+  });
 });

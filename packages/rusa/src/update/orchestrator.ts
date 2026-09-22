@@ -94,6 +94,11 @@ export interface UpdateDeps {
   recordAction?: (text: string) => void;
   /** Injected `process.exit` seam so tests assert the exit without dying. */
   exit: (code: number) => void;
+  /**
+   * Hook invoked immediately after a green build is confirmed, before draining
+   * and restarting (e.g. to persist a follower update trigger across the restart).
+   */
+  onGreenBuild?: (newSha: string, branch: string) => Promise<void> | void;
   log?: (msg: string) => void;
 }
 
@@ -249,6 +254,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     log(`[update] building ${shortSha(newSha)} (mesh stays live)…`);
     await deps.build.build(newSha);
     log(`[update] build green`);
+
+    if (deps.onGreenBuild) {
+      try {
+        await deps.onGreenBuild(newSha, plan.branch);
+      } catch (hookErr) {
+        log(
+          `[update] onGreenBuild hook failed: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`
+        );
+      }
+    }
 
     // ── 3. GATE passed → quiesce + restart. Only now do we touch run-state. ─
     step = "drain";

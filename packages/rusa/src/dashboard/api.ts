@@ -163,6 +163,7 @@ export interface DashboardDataDeps {
     targetSha?: string;
     branch?: string;
   }) => FollowerUpdateStatus[];
+  getFollowerReconciliation?: () => unknown;
 }
 
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
@@ -1680,6 +1681,15 @@ export async function handleMeshApiRequest(
   if (pathname === "/api/mesh/followers") {
     const followers = deps?.getFollowers ? deps.getFollowers() : [];
     sendJson(res, 200, { followers });
+    return true;
+  }
+
+  // GET /api/mesh/followers/reconciliation — get follower update reconciliation status
+  if (pathname === "/api/mesh/followers/reconciliation") {
+    const reconciliation = deps?.getFollowerReconciliation
+      ? deps.getFollowerReconciliation()
+      : null;
+    sendJson(res, 200, { reconciliation });
     return true;
   }
 

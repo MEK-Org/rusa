@@ -8,6 +8,8 @@ import {
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
+import { FollowerUpdateReconciler } from "./follower-update-reconciler.js";
+import type { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type {
   ActorEvent,
@@ -49,6 +51,7 @@ export interface FollowerEvent {
 
 export interface FollowerHubOptions {
   logger?: Logger;
+  triggerStore?: FollowerUpdateTriggerStore;
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -77,7 +80,11 @@ export class FollowerHub {
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
-  private onRegisterCallback?: (follower: RemoteInstance) => void;
+  private onRegisterListeners: ((follower: RemoteInstance) => void)[] = [];
+  private onUpdateStatusListeners: ((followerId: string, status: FollowerUpdateStatus) => void)[] =
+    [];
+  readonly triggerStore?: FollowerUpdateTriggerStore;
+  readonly reconciler?: FollowerUpdateReconciler;
   private sweep = setInterval(() => this.sweepFollowers(), 5000);
   private sweepFollowers(): void {
     const now = Date.now();
@@ -104,10 +111,39 @@ export class FollowerHub {
     if (token.length < 32) throw new Error("Follower token must be at least 32 characters");
     this.log = (opts?.logger ?? nullLogger).child({ component: "follower-gateway" });
     this.sweep.unref();
+    this.triggerStore = opts?.triggerStore;
+    if (this.triggerStore) {
+      this.reconciler = new FollowerUpdateReconciler(this.triggerStore, this, {
+        logger: this.log,
+      });
+    }
   }
 
-  onRegister(callback: (follower: RemoteInstance) => void): void {
-    this.onRegisterCallback = callback;
+  onRegister(callback: (follower: RemoteInstance) => void): () => void {
+    this.onRegisterListeners.push(callback);
+    return () => {
+      const idx = this.onRegisterListeners.indexOf(callback);
+      if (idx >= 0) this.onRegisterListeners.splice(idx, 1);
+    };
+  }
+
+  onUpdateStatus(callback: (followerId: string, status: FollowerUpdateStatus) => void): () => void {
+    this.onUpdateStatusListeners.push(callback);
+    return () => {
+      const idx = this.onUpdateStatusListeners.indexOf(callback);
+      if (idx >= 0) this.onUpdateStatusListeners.splice(idx, 1);
+    };
+  }
+
+  getReconciliationStatus(): { activeTrigger: unknown; completed: boolean } {
+    if (this.reconciler) {
+      return this.reconciler.getStatus();
+    }
+    const active = this.triggerStore?.getActiveTrigger() ?? null;
+    return {
+      activeTrigger: active,
+      completed: active === null,
+    };
   }
   async listen(host: string, port: number): Promise<string> {
     // Never accidentally expose the prototype on every public interface.
@@ -124,6 +160,7 @@ export class FollowerHub {
     const address = this.server.address();
     if (!address || typeof address === "string") throw new Error("No gateway address");
     this.origin = `http://${host}:${address.port}`;
+    this.reconciler?.reconcileAll();
     return this.origin;
   }
   list(): FollowerInfo[] {
@@ -173,6 +210,13 @@ export class FollowerHub {
       targetSha: options?.targetSha,
       branch: options?.branch,
     });
+    for (const listener of this.onUpdateStatusListeners) {
+      try {
+        listener(followerId, status);
+      } catch (err) {
+        this.log.warn("follower_update_status_listener_error", { followerId, err });
+      }
+    }
     return status;
   }
   updateAllFollowers(options?: { targetSha?: string; branch?: string }): FollowerUpdateStatus[] {
@@ -241,6 +285,7 @@ export class FollowerHub {
   }
   async close(): Promise<void> {
     clearInterval(this.sweep);
+    this.reconciler?.close();
     for (const follower of this.followers.values()) this.drop(follower);
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -313,6 +358,10 @@ export class FollowerHub {
     }
     if (req.method === "GET" && path === "/followers") {
       reply(res, 200, this.list());
+      return;
+    }
+    if (req.method === "GET" && path === "/followers/reconciliation") {
+      reply(res, 200, { ok: true, reconciliation: this.getReconciliationStatus() });
       return;
     }
     if (req.method === "GET" && path.startsWith("/followers/") && path.endsWith("/update")) {
@@ -390,7 +439,13 @@ export class FollowerHub {
         pid: follower.pid,
         commitSha: follower.commitSha,
       });
-      this.onRegisterCallback?.(follower);
+      for (const listener of this.onRegisterListeners) {
+        try {
+          listener(follower);
+        } catch (err) {
+          this.log.warn("follower_register_listener_error", { followerId: follower.id, err });
+        }
+      }
       reply(res, 200, {
         session: follower.session,
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
@@ -461,6 +516,21 @@ export class FollowerHub {
         if (follower.hasEvent(event.eventId)) continue;
         follower.recordEvent(event.eventId);
         follower.receive(event);
+        if (event.actorId === "$instance" && event.message?.type === "update_status") {
+          const status = follower.updateStatus;
+          if (status) {
+            for (const listener of this.onUpdateStatusListeners) {
+              try {
+                listener(follower.id, status);
+              } catch (err) {
+                this.log.warn("follower_update_status_listener_error", {
+                  followerId: follower.id,
+                  err,
+                });
+              }
+            }
+          }
+        }
       }
       follower.recordBatch(batchId);
       reply(res, 200, {});
