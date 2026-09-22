@@ -3,6 +3,7 @@ import type { Logger } from "../observability/logger.js";
 import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
+  type WorkspaceEventsSubscriberOptions,
 } from "./workspace-events.js";
 
 const TOPIC = "projects/p/topics/chat-events";
@@ -162,14 +163,7 @@ function captureLogger(): { logger: Logger; records: LogRecord[] } {
   return { logger, records };
 }
 
-function makeSubscriber(
-  api: FakeWeApi,
-  overrides: Partial<{
-    renewIntervalMs: number;
-    logger: Logger;
-    onLapse: (event: SystemChatSubscriptionLapseEvent) => Promise<void> | void;
-  }> = {}
-) {
+function makeSubscriber(api: FakeWeApi, overrides: Partial<WorkspaceEventsSubscriberOptions> = {}) {
   return new WorkspaceEventsSubscriber({
     topic: TOPIC,
     getToken: async () => "fake-token",
@@ -574,6 +568,100 @@ describe("WorkspaceEventsSubscriber", () => {
     await vi.advanceTimersByTimeAsync(4 * RENEW_MS);
     expect(api.calls).toHaveLength(callsWhileStalled + 1);
     expect(api.calls.at(-1)?.method).toBe("GET");
+  });
+
+  it("close returns while token acquisition is stalled, and the pass starts no HTTP request after disposal", async () => {
+    vi.useFakeTimers();
+    let openTokenGate: () => void = () => {};
+    let tokenGate: Promise<void> | null = null;
+    const getToken = async () => {
+      if (tokenGate) await tokenGate;
+      return "fake-token";
+    };
+    const api = new FakeWeApi([activeSub("subscriptions/existing")]);
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, { logger, getToken });
+
+    tokenGate = new Promise<void>((resolve) => {
+      openTokenGate = resolve;
+    });
+    const starting = sub.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Bounded: close returns immediately even while getToken() is stalled.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Release getToken(): the resumed pass must NOT start an HTTP request after close().
+    openTokenGate();
+    await starting;
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+
+    // No HTTP requests were dispatched to the API.
+    expect(api.calls).toHaveLength(0);
+    // The pass logged only the debug abandoned record, no warnings or errors.
+    expect(records.map((r) => [r.level, r.event])).toEqual([
+      ["debug", "chat_subscription_pass_abandoned"],
+    ]);
+  });
+
+  it("close after list() with duplicate subscriptions produces no prune warnings and makes no DELETE requests", async () => {
+    vi.useFakeTimers();
+    const alerts: SystemChatSubscriptionLapseEvent[] = [];
+    const api = new FakeWeApi([
+      activeSub("subscriptions/keep"),
+      activeSub("subscriptions/dup1"),
+      activeSub("subscriptions/dup2"),
+    ]);
+    let openGate: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    const answer = api.fetch;
+    api.fetch = async (url, init) => {
+      if (gate) await gate;
+      return answer(url, init);
+    };
+    const { logger, records } = captureLogger();
+    const sub = makeSubscriber(api, {
+      logger,
+      onLapse: (event) => {
+        alerts.push(event);
+      },
+    });
+
+    gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const starting = sub.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Stalled on list(): close returns immediately.
+    let closed = false;
+    const closing = sub.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(true);
+    await closing;
+
+    // Release list(): returns keep, dup1, dup2.
+    openGate();
+    await starting;
+    await vi.advanceTimersByTimeAsync(4 * MAX_RETRY_MS);
+
+    // Only the stalled GET was sent; no DELETE or PATCH requests were sent after close.
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0].method).toBe("GET");
+    expect(alerts).toEqual([]);
+    // Post-close silence: no chat_subscription_prune_failed warnings.
+    // Only the single debug abandoned record is emitted.
+    expect(records.map((r) => [r.level, r.event])).toEqual([
+      ["debug", "chat_subscription_pass_abandoned"],
+    ]);
   });
 
   it("backs off exponentially to a ceiling and starts over after a success", async () => {

@@ -239,6 +239,7 @@ export class WorkspaceEventsSubscriber {
    */
   private async ensure(): Promise<void> {
     const matches = await this.list();
+    if (!this.running) throw new Error("workspace-events subscriber is closed");
     const now = Date.now();
     // The API does not promise list order, so rank rather than take the first:
     // an ACTIVE subscription is already delivering and beats one that would
@@ -252,6 +253,7 @@ export class WorkspaceEventsSubscriber {
     // only once its reactivation below succeeds.
     const delivering = keep?.state === "ACTIVE" ? [keep] : [];
     for (const extra of matches) {
+      if (!this.running) throw new Error("workspace-events subscriber is closed");
       if (extra === keep || !extra.name) continue;
       const reason = isLapsed(extra, now) ? "lapsed" : "duplicate";
       try {
@@ -262,6 +264,7 @@ export class WorkspaceEventsSubscriber {
           reason,
         });
       } catch (err) {
+        if (!this.running) throw err;
         if (reason === "duplicate" && extra.state === "ACTIVE") delivering.push(extra);
         this.logger?.warn("chat_subscription_prune_failed", {
           topic: this.opts.topic,
@@ -299,6 +302,7 @@ export class WorkspaceEventsSubscriber {
       await this.renew(keep.name);
       this.confirmActive(keep.name, "chat_subscription_renewed");
     } catch (err) {
+      if (!this.running) throw err;
       // A listed subscription the API no longer knows (404) is replaced right
       // away. Any other renew failure is retried with backoff: if the
       // subscription really has lapsed, its `expireTime` moves it onto the
@@ -422,14 +426,16 @@ export class WorkspaceEventsSubscriber {
   private async request(method: string, path: string, body?: unknown): Promise<unknown> {
     // Every outward call a pass makes goes through here, so this is where
     // disposal stops one: a pass that resumes after `close()` — mid-`ensure`,
-    // between a list and the prune it implies — gets no further than its next
-    // request, and the world outside the process sees nothing more from it.
+    // between a list and the prune it implies, or while awaiting a token — gets
+    // no further than its next request step, and the world outside the process
+    // sees nothing more from it.
     // Whatever the pass had already done out there stays done — a subscription
     // it created, a duplicate it had not yet pruned — and the next pass to run
     // against this topic, in this process or the one that replaces it, lists
     // and converges on it like any other leftover.
     if (!this.running) throw new Error("workspace-events subscriber is closed");
     const token = await this.opts.getToken();
+    if (!this.running) throw new Error("workspace-events subscriber is closed");
     const resp = await this.fetchImpl(`${WE_API}${path}`, {
       method,
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
