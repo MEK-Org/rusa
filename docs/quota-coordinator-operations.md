@@ -93,14 +93,53 @@ carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 `lastAttemptAt`, `error`). A coordinator whose probes are broken still passes
 `healthz` — that asymmetry is the point, and drill 2 rehearses it.
 
-### #499 staging proof and the stage-3 handoff
+### Stage-0 probe-off and the #499 staging proof
 
-The shipped coordinator has no probe-off switch, and the shipped client has no
-compare-only mode: configuring its socket selects the normal client path and
-applies the coordinator publication. The probe-off stage and compare-only stage
-in the design are still follow-up work ([#502](https://github.com/MEK-Org/rusa/issues/502)
-and [#503](https://github.com/MEK-Org/rusa/issues/503)); neither was executed by
-#499.
+`rusa quota-coordinator --probe-off` is the shipped stage-0 switch. It opens
+the configured **copied** coordinator database and starts the same socket,
+read, health/readiness, backup, and metric surfaces, but does not construct or
+start `QuotaCollectionLoop`. Therefore it starts no provider CLI probe and
+performs no scrape, parse, or controller write. Normal starts remain probe-on
+by default.
+
+For a one-off foreground check, run:
+
+```bash
+rusa quota-coordinator --home "$RUSA_HOME" --probe-off
+```
+
+For the installed user unit, add a temporary drop-in and restart it:
+
+```bash
+systemctl --user edit <basename>-quota-coordinator.service
+# Add exactly:
+# [Service]
+# Environment=RUSA_QUOTA_COORDINATOR_PROBE_OFF=1
+systemctl --user daemon-reload
+systemctl --user restart <basename>-quota-coordinator.service
+```
+
+The startup record carries `probeOff: true` and the journal records `Quota probe
+collection disabled for stage-0 rollout`. Verify the socket mode, `healthz`,
+`readyz`, seeded `GET /v1/throttle`, seeded `GET /v1/quota`, backups, and
+`quota_service_reads_total`; scrape and controller metrics must not advance.
+
+Precedence is deliberately one-way: the switch is on if *either* the flag or
+the drop-in variable asks for it, so while the drop-in is installed there is no
+command-line way to ask a start for probe-on. That is the intended shape — the
+drop-in is the unit's state, and changing the unit's state is the rollback
+below, not a flag an ad-hoc invocation can quietly win with.
+
+To roll back stage 0 into the normal collection stage, remove the drop-in with
+`systemctl --user revert <basename>-quota-coordinator.service`, then
+`systemctl --user daemon-reload` and restart the unit. The absence of the
+switch is deliberately probe-on; do not leave a probe-off override in place
+when expecting fresh quota observations.
+
+The shipped client still has no compare-only mode: configuring its socket
+selects the normal client path and applies the coordinator publication.
+Compare-only remains follow-up work ([#503](https://github.com/MEK-Org/rusa/issues/503)).
+#499 predates the stage-0 switch and did not execute it.
 
 Instead, #499 used a separate staging coordinator with a fresh staging database
 and its normal probe loop to prove probing outside the instance, then restarted

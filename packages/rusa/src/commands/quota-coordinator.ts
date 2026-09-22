@@ -6,7 +6,7 @@ import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { createQuotaService } from "../mcp/quota-mcp.js";
-import { createLogger } from "../observability/logger.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
@@ -37,6 +37,28 @@ export interface RunQuotaCoordinatorOptions {
   legacyDatabasePath?: string;
   /** Perform the scheduled stage-3 flip (§8.3) before opening the service-owned database. */
   relocate?: boolean;
+  /** Stage-0 rollout mode: serve copied durable data without collecting new probes. */
+  probeOff?: boolean;
+  /**
+   * Cancellation signal for a caller that embeds the coordinator in its own
+   * process. Aborting stops the service cleanly and settles the returned
+   * promise instead of calling `process.exit`.
+   */
+  signal?: AbortSignal;
+  /**
+   * Invoked once startup has fully completed. This is later than "the socket
+   * accepts connections": the boot backup runs after the socket is listening
+   * (see the ordering note at the start sequence below), so a caller that
+   * polls the socket can observe a listening coordinator whose boot backup has
+   * not run yet. This callback cannot.
+   */
+  onReady?: () => void;
+  /**
+   * Logger override. The coordinator's metric surface is logger-backed by
+   * design (see `coordinator-metrics.ts`), so this is also the seam through
+   * which an embedding caller observes emitted metrics.
+   */
+  logger?: Logger;
 }
 
 /**
@@ -208,10 +230,20 @@ export function coordinatorProviderLanes(config: RusaConfig): {
   return { configuredProviders, collectionProviders };
 }
 
+/**
+ * Run the quota coordinator service until it is stopped.
+ *
+ * The returned promise settles on *stop*, not on *started*: with
+ * {@link RunQuotaCoordinatorOptions.signal} it resolves once the abort has
+ * torn the service down, and without one it stays pending until a signal
+ * handler exits the process. Callers that need to act once the coordinator is
+ * up use {@link RunQuotaCoordinatorOptions.onReady}.
+ */
 export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
-  const log = createLogger({ context: { component: "quota-coordinator" } });
+  const log = opts.logger ?? createLogger({ context: { component: "quota-coordinator" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
+  const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
 
   const socketPath = resolveQuotaCoordinatorSocketPath(config, opts.socketPath);
 
@@ -278,23 +310,25 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       workersDir: join(mcHome, "workers"),
       scrapeStore: store,
     });
-    const collection = new QuotaCollectionLoop({
-      store,
-      quotaService,
-      metrics,
-      providers: collectionProviders,
-      tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
-      maxIntervalSeconds,
-      // The loop publishes the interval and snapshot-age gauges after each
-      // controller step, so it needs the same freshness thresholds the service
-      // serves with; otherwise the gauge and the response would disagree.
-      staleAfterMs,
-      onError: (provider, error) =>
-        log.warn("Quota collection tick failed", {
-          provider,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-    });
+    const collection = probeOff
+      ? undefined
+      : new QuotaCollectionLoop({
+          store,
+          quotaService,
+          metrics,
+          providers: collectionProviders,
+          tickMs: (config.quota?.throttle?.tickSeconds ?? 300) * 1000,
+          maxIntervalSeconds,
+          // The loop publishes the interval and snapshot-age gauges after each
+          // controller step, so it needs the same freshness thresholds the service
+          // serves with; otherwise the gauge and the response would disagree.
+          staleAfterMs,
+          onError: (provider, error) =>
+            log.warn("Quota collection tick failed", {
+              provider,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+        });
 
     const service = new QuotaCoordinatorService({
       socketPath,
@@ -303,7 +337,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       maxIntervalSeconds,
       staleAfterMs,
       metrics,
-      collectionStats: () => collection.getAllStats(),
+      collectionStats: collection ? () => collection.getAllStats() : undefined,
     });
     const backups = new QuotaBackupScheduler({
       databasePath,
@@ -323,7 +357,12 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
         }),
     });
 
-    log.info("Starting quota-coordinator service", { socketPath, databasePath, backupDir });
+    log.info("Starting quota-coordinator service", {
+      socketPath,
+      databasePath,
+      backupDir,
+      probeOff,
+    });
 
     // Order matters, and it is the reverse of what "start the cheap things
     // first" would suggest. The boot backup runs before the socket is
@@ -333,24 +372,68 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     // logged last for the same reason: a coordinator that says it is ready has
     // already taken whatever backup this boot owed.
     await service.start();
-    collection.start();
+    if (collection) {
+      collection.start();
+    } else {
+      log.info("Quota probe collection disabled for stage-0 rollout", { probeOff: true });
+    }
     backups.start();
     log.info("Quota coordinator ready and listening for requests");
+    opts.onReady?.();
 
-    const shutdown = async () => {
-      log.info("Stopping quota-coordinator service...");
-      backups.stop();
-      collection.stop();
-      await service.stop();
-      store.close();
-      process.exit(0);
-    };
+    return new Promise<void>((resolvePromise, rejectPromise) => {
+      let stopping = false;
+      const cleanup = async () => {
+        if (stopping) return;
+        stopping = true;
+        removeListeners();
+        try {
+          log.info("Stopping quota-coordinator service...");
+          backups.stop();
+          collection?.stop();
+          await service.stop();
+          store.close();
+        } catch (err) {
+          log.error("Error stopping quota coordinator", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      };
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+      const onSig = async () => {
+        await cleanup();
+        process.exit(0);
+      };
+
+      const onAbort = async () => {
+        await cleanup();
+        resolvePromise();
+      };
+
+      const removeListeners = () => {
+        process.removeListener("SIGINT", onSig);
+        process.removeListener("SIGTERM", onSig);
+        opts.signal?.removeEventListener("abort", onAbort);
+      };
+
+      if (opts.signal?.aborted) {
+        onAbort().catch(rejectPromise);
+        return;
+      }
+
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      process.on("SIGINT", onSig);
+      process.on("SIGTERM", onSig);
+    });
   } catch (err) {
     if (err instanceof SchemaVersionRefusalError) {
       log.error(err.message);
+      // A caller that passed a cancellation signal is embedding the coordinator
+      // in its own process, so refusal has to surface as a rejection it can
+      // observe. The CLI, which owns the process, still exits 1.
+      if (opts.signal) {
+        throw err;
+      }
       process.exit(1);
     }
     throw err;
