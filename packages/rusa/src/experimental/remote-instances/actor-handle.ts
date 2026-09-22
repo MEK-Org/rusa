@@ -7,7 +7,13 @@ import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
-import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
+import {
+  type ActorEvent,
+  type Bootstrap,
+  COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
+  type LeaderCommand,
+  type RunSnapshot,
+} from "./protocol.js";
 
 export interface ActorHandleOptions {
   host: ActorChannel;
@@ -39,6 +45,7 @@ export class ActorHandle implements MeshActor {
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
+  private terminated = false;
   private gates = new Map<
     number,
     {
@@ -72,6 +79,12 @@ export class ActorHandle implements MeshActor {
   private preemptSequence = 0;
   /** The one unanswered preempt; later responsive items coalesce behind its answer. */
   private outstandingPreempt: number | undefined;
+  /**
+   * One admission the leader reserved and the follower never started, kept
+   * across a transport loss. The ticket is this run's place in provider pacing
+   * and concurrency; a replacement admission re-enters both at the tail.
+   */
+  private retainedAdmission: { requestId: number; runId: string } | undefined;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -128,6 +141,13 @@ export class ActorHandle implements MeshActor {
   }
 
   attachHost(newChannel: ActorChannel): void {
+    if (this.terminated) {
+      this.log.warn("remote_attach_after_close", {
+        actorId: this.id,
+        target: this.opts.target ?? newChannel.nodeId,
+      });
+      return;
+    }
     this.channel.removeAllListeners();
     this.channel = newChannel;
     this.closed = false;
@@ -141,6 +161,13 @@ export class ActorHandle implements MeshActor {
     this.bindChannel(newChannel);
     const freshSnapshot = this.opts.snapshot();
     const sessionId = freshSnapshot.record.sessionId ?? this.opts.bootstrap.sessionId;
+    if (this.retainedAdmission) {
+      this.log.info("remote_admission_retained", {
+        actorId: this.id,
+        target: this.opts.target ?? newChannel.nodeId,
+        requestId: this.retainedAdmission.requestId,
+      });
+    }
     this.send({
       type: "init",
       bootstrap: {
@@ -149,6 +176,8 @@ export class ActorHandle implements MeshActor {
         modelConfig: freshSnapshot.record.modelConfig ?? this.opts.bootstrap.modelConfig,
         mcpServers: freshSnapshot.mcpServers,
         reconnect: true,
+        // Invite the follower to re-announce the admission this handle kept.
+        ...(this.retainedAdmission ? { resumeAdmission: true } : {}),
       },
     });
   }
@@ -202,12 +231,14 @@ export class ActorHandle implements MeshActor {
   }
 
   close(): void {
-    if (this.closed) return;
+    if (this.terminated) return;
+    this.terminated = true;
     this.closed = true;
     clearTimeout(this.startupTimer);
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.outstandingPreempt = undefined;
+    void this.cancelRetainedAdmission();
     // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
@@ -221,19 +252,89 @@ export class ActorHandle implements MeshActor {
     // An unanswered preempt is re-decided against the follower's reattach state.
     this.pendingPreempt ||= this.outstandingPreempt !== undefined;
     this.outstandingPreempt = undefined;
-    // The follower's queued admission is rejected on reconnect; its replacement
-    // re-derives priority from the durable inbox, so nothing is left to promote.
-    this.pendingQueuedPromotion = false;
     // Keep running slots occupied until the remote actor releases them or exits.
-    for (const gate of this.gates.values()) gate.handle.cancel?.();
+    for (const [requestId, gate] of this.gates) {
+      // A ticket the follower never started still holds this run's place in
+      // pacing and concurrency, and a transport loss is not a run outcome. Keep
+      // it for the reattach handshake to claim instead of making the run queue
+      // again as fresh work (#602).
+      if (!gate.handle.started && this.queuedRunId) {
+        if (!this.retainedAdmission) {
+          this.retainedAdmission = { requestId, runId: this.queuedRunId };
+          continue;
+        }
+        this.log.warn("remote_admission_multiple_unstarted", {
+          actorId: this.id,
+          retainedRequestId: this.retainedAdmission.requestId,
+          droppedRequestId: requestId,
+        });
+      }
+      gate.handle.cancel?.();
+    }
+    // A promotion asked for before the admission request arrived has nothing
+    // left to apply to once that request is gone; a retained ticket keeps it
+    // live, and the deferred preempt re-promotes it after reattach.
+    if (!this.retainedAdmission) this.pendingQueuedPromotion = false;
   }
 
   private releaseGates(): void {
-    for (const gate of this.gates.values()) {
+    for (const [requestId, gate] of this.gates) {
+      // A retained admission outlives the transport that carried it: only a
+      // claim, a fresh admission, or the leader giving up resolves it.
+      if (requestId === this.retainedAdmission?.requestId) continue;
+      gate.handle.cancel?.();
+      gate.release();
+      this.gates.delete(requestId);
+    }
+  }
+
+  /** The follower reclaimed its ticket; the retained gate still owes the reply. */
+  private claimRetainedAdmission(requestId: number): boolean {
+    if (this.retainedAdmission?.requestId !== requestId) return false;
+    if (!this.gates.has(requestId)) return false;
+    this.retainedAdmission = undefined;
+    this.log.info("remote_admission_resumed", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId,
+    });
+    return true;
+  }
+
+  /**
+   * Give up a retained admission. The run it was holding never started, so the
+   * leader books it here: the follower that would have reported that run's
+   * outcome is either gone or has already moved on to other work.
+   */
+  private cancelRetainedAdmission(): void | Promise<void> {
+    const retained = this.retainedAdmission;
+    if (!retained) return;
+    this.retainedAdmission = undefined;
+    const gate = this.gates.get(retained.requestId);
+    if (gate) {
+      this.gates.delete(retained.requestId);
       gate.handle.cancel?.();
       gate.release();
     }
-    this.gates.clear();
+    this.log.info("remote_admission_dropped", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      requestId: retained.requestId,
+    });
+    // Only the run the ticket was reserved for; a later run owns its own end.
+    // Under standard follower runtime initialize(), the first post-reattach state
+    // report is sent synchronously and drops an unclaimed ticket while queuedRunId
+    // still equals retained.runId. The direct onEnd emit below defensively handles
+    // out-of-order protocol arrivals (e.g. an unannounced queued run or out-of-band
+    // fresh admission) where queuedRunId advanced before this cancellation ran.
+    if (this.queuedRunId === retained.runId) {
+      return this.endQueuedRun("start-cancelled", false);
+    }
+    return this.opts.context.lifecycle.emit("onEnd", {
+      actorId: this.id,
+      runId: retained.runId,
+      terminal: { kind: "abandoned", reason: "start-cancelled", started: false },
+    });
   }
 
   private enqueueReceive(message: ActorEvent): void {
@@ -268,6 +369,9 @@ export class ActorHandle implements MeshActor {
     // a transport loss that attachHost can still recover.
     if (this.channel.connected) this.close();
     else this.disconnect();
+    // A retained admission still owns its run: the claim that resumes it, or the
+    // cancellation that drops it, decides that run's outcome instead.
+    const retained = this.retainedAdmission !== undefined;
     this.opts.onFailure(error);
     // A connection or startup failure is not itself a run outcome. Only a run
     // the leader actually admitted is terminated here, so an idle disconnect or
@@ -275,7 +379,7 @@ export class ActorHandle implements MeshActor {
     const terminate = () => {
       if (this.runOpen) {
         void this.endRun({ success: false, output: error.message, exitCode: -1 });
-      } else if (this.queuedRunId) {
+      } else if (this.queuedRunId && !retained) {
         void this.endQueuedRun("start-cancelled", false);
       }
     };
@@ -410,7 +514,8 @@ export class ActorHandle implements MeshActor {
       case "fatal":
         this.fail(new Error(message.error));
         break;
-      case "state":
+      case "state": {
+        const reattachReport = this.stateStale;
         this.state = message.state;
         this.yielded = message.yielded;
         this.stateStale = false;
@@ -422,7 +527,12 @@ export class ActorHandle implements MeshActor {
         // Any wake held since reattach is now ordered behind the preempt decision.
         this.settleState?.();
         ctx.onRuntimeStateChanged(message.state);
+        // The first report after a reattach is the deadline for claiming a
+        // retained ticket: whatever the follower holds now, it is not the run
+        // that ticket was reserved for.
+        if (reattachReport) return this.cancelRetainedAdmission();
         break;
+      }
       case "preempted":
         // Only the open request is answerable; an answer from before a reattach
         // describes a request this generation already re-decided.
@@ -581,7 +691,24 @@ export class ActorHandle implements MeshActor {
               });
               break;
             case "admit": {
+              if (request.resume) {
+                // A follower re-announcing its pending admission is claiming the
+                // ticket this handle kept for it. The reply still comes from the
+                // retained gate, when pacing and concurrency release it.
+                if (!this.claimRetainedAdmission(requestId)) {
+                  // Nothing left to claim: that run was already booked as
+                  // abandoned here, so the follower must not run under its id.
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    error: COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
+                  });
+                }
+                break;
+              }
               return (async () => {
+                // Any other admission says the retained run is not coming back.
+                await this.cancelRetainedAdmission();
                 // A responsive item that landed between the follower's queued
                 // report and this request is admitted at the priority it asked
                 // for, not the one the follower knew about when it asked.
@@ -644,6 +771,12 @@ export class ActorHandle implements MeshActor {
                 void handle.result.catch((error: Error) => {
                   this.gates.delete(requestId);
                   this.send({ type: "reply", requestId, error: error.message });
+                  // A retained ticket that loses its place (the leader gave up, or
+                  // pacing released it into a dead channel) ends the run it held:
+                  // nothing else is left to report that run's outcome.
+                  if (this.retainedAdmission?.requestId === requestId) {
+                    void this.cancelRetainedAdmission();
+                  }
                 });
               })();
             }
