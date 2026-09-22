@@ -124,6 +124,17 @@ export interface ActorOptions {
    * output, which echoes the prompt and can hold secrets.
    */
   onPoolFallback?: (diagnostic: PoolFallbackDiagnostic) => void;
+  /**
+   * Non-blocking, synchronous probe to verify candidate eligibility during
+   * in-run recovery. Represents the non-blocking half of the admission gate
+   * contract (submitPoolGate's isHalted check plus ProviderPacer.quote), not a
+   * new scheduler: checks whether the candidate provider is halted or
+   * currently pace-deferred without entering an asynchronous wait queue. When
+   * omitted, candidates are treated as eligible.
+   */
+  recoveryEligibility?: (
+    entry: RawProviderModelConfig
+  ) => { eligible: true } | { eligible: false; reason: "halted" | "pacing" };
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
   debounceMs?: number;
   /** Per-run provider timeout. */
@@ -213,10 +224,15 @@ export interface PoolFallbackDiagnostic {
   attempt: number;
   /** Configured pool entry whose invocation just failed. */
   failed: RawProviderModelConfig;
-  /** Configured pool entry recovery will try next. */
+  /** Configured pool entry recovery will try next (or evaluated next). */
   next: RawProviderModelConfig;
   /** Configured entries still untried after {@link next}. */
   remainingAfter: number;
+  /**
+   * When this candidate was skipped rather than attempted (e.g. because it was
+   * halted or pacing-deferred), the reason for skipping. Omitted on live attempts.
+   */
+  skipReason?: "halted" | "pacing";
 }
 
 /**
@@ -1079,13 +1095,11 @@ export class Actor {
    * different provider. The classifier is wired only for the root, so a
    * worker's failures still report as-is.
    *
-   * The recovery chain bypasses admission-time provider pacing: the run is
-   * already actively executing under its watchdog timer and allocated
-   * concurrency slot. Putting an active run to sleep in an asynchronous pacer
-   * queue mid-run would tie up concurrency and risk run timeouts. In-run
-   * fallback is emergency capacity recovery where an immediate live attempt on
-   * configured alternatives takes precedence over potentially stale or lagging
-   * quota-coordinator pacing forecasts ("a live attempt beats a stale forecast").
+   * Recovery honors current halt and pacing eligibility non-blockingly via
+   * {@link ActorOptions.recoveryEligibility}, evaluated per candidate at the
+   * moment the chain reaches it. Ineligible candidates are skipped with a
+   * bounded diagnostic, and recovery never sleeps in a pacer queue mid-run while
+   * holding an active execution slot.
    */
   private async runWithPoolFallback(
     runId: string,
@@ -1116,14 +1130,36 @@ export class Actor {
     const chain = this.opts.modelConfig.filter((entry) => !sameModelConfigEntry(entry, selected));
     let failed = selected;
     let lastResult = result;
+    const attempted: RawProviderModelConfig[] = [selected];
+    const skipped: PoolSkippedEntry[] = [];
+
     for (const [index, entry] of chain.entries()) {
       const attempt = index + 2; // attempt 1 was the gated primary
+      const remainingAfter = chain.length - index - 1;
+
+      const eligibility = this.opts.recoveryEligibility?.(entry) ?? { eligible: true };
+      if (!eligibility.eligible) {
+        this.opts.onPoolFallback?.({
+          runId,
+          attempt,
+          failed: { ...failed },
+          next: { ...entry },
+          remainingAfter,
+          skipReason: eligibility.reason,
+        });
+        this.opts.log?.(
+          `\n[PoolFallback] ${describeModelConfigEntry(entry)} is ineligible (${eligibility.reason}); skipping\n`
+        );
+        skipped.push({ entry: { ...entry }, reason: eligibility.reason });
+        continue;
+      }
+
       this.opts.onPoolFallback?.({
         runId,
         attempt,
         failed: { ...failed },
         next: { ...entry },
-        remainingAfter: chain.length - index - 1,
+        remainingAfter,
       });
       this.opts.log?.(
         `\n[PoolFallback] ${describeModelConfigEntry(failed)} exhausted; trying next configured pool entry ${describeModelConfigEntry(entry)}\n`
@@ -1151,6 +1187,7 @@ export class Actor {
           sessionId: lastResult.sessionId,
         };
       }
+      attempted.push(entry);
       const recoveryResult = await runProvider(provider);
       if (recoveryResult.success) return recoveryResult;
       if (!(await classify(recoveryResult)).exhausted) {
@@ -1174,7 +1211,7 @@ export class Actor {
 
     return {
       success: false,
-      output: formatPoolExhaustedFailure({ attempted: [selected, ...chain] }),
+      output: formatPoolExhaustedFailure({ attempted, skipped }),
       exitCode: lastResult.exitCode || 1,
       sessionId: lastResult.sessionId,
     };
@@ -1200,25 +1237,58 @@ function sameModelConfigEntry(a: RawProviderModelConfig, b: RawProviderModelConf
   );
 }
 
+/** A configured pool entry skipped during recovery without an attempt. */
+export interface PoolSkippedEntry {
+  entry: RawProviderModelConfig;
+  reason: "halted" | "pacing";
+}
+
 /**
- * The terminal report when every configured pool entry was tried and each
- * failed with classified capacity/quota exhaustion. Actionable on purpose:
- * it names the condition, lists what was attempted in order, says what clears
- * it (the providers' reset timers), and what an operator can do about it.
- * Only configured entry tuples are named — raw provider output is never
- * pasted here, because a provider echoes the prompt and the prompt carries
- * secrets.
+ * The terminal report when every configured pool entry was tried or evaluated
+ * and either failed with classified capacity/quota exhaustion or was skipped
+ * as currently ineligible (halted or pacing). Actionable on purpose:
+ * it names the condition, lists what was attempted in order, lists skipped
+ * candidates with their reasons, says what clears the condition (reset timers,
+ * operator unhalt), and what an operator can do about it. Only configured entry
+ * tuples are named — raw provider output is never pasted here, because a provider
+ * echoes the prompt and the prompt carries secrets.
  */
 export function formatPoolExhaustedFailure(input: {
   /** Every entry attempted, launch first, then the chain in tried order. */
   attempted: readonly RawProviderModelConfig[];
+  /** Entries in the recovery chain that were skipped due to halt or pacing. */
+  skipped?: readonly PoolSkippedEntry[];
 }): string {
-  const isSingle = input.attempted.length === 1;
-  return [
-    `model pool exhausted: all ${input.attempted.length} configured pool ${isSingle ? "entry" : "entries"} reported provider capacity/quota exhaustion.`,
-    `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`,
-    isSingle
-      ? "The exhaustion is a provider-side condition that clears on the provider's reset timer. Wait for a quota reset, or switch to a portable actor (context.type: portable) and configure an ordered model pool so recovery has fallback candidates."
-      : "The exhaustion is a provider-side condition that clears on the providers' reset timers; no configured entry has capacity right now. Wait for a quota reset, or configure an additional pool entry that has capacity so recovery has somewhere to go.",
-  ].join("\n");
+  const isSingle = input.attempted.length === 1 && (!input.skipped || input.skipped.length === 0);
+  const lines: string[] = [];
+
+  if (input.skipped && input.skipped.length > 0) {
+    const totalConfigured = input.attempted.length + input.skipped.length;
+    lines.push(
+      `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
+    );
+    lines.push(
+      `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
+    );
+    lines.push(
+      `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`
+    );
+    lines.push(
+      "The exhaustion and pacing states are provider-side conditions that clear on reset timers or operator unhalt; no configured entry has capacity right now. Wait for a quota reset, unhalt the provider, or configure an additional pool entry that has capacity so recovery has somewhere to go."
+    );
+  } else {
+    lines.push(
+      `model pool exhausted: all ${input.attempted.length} configured pool ${isSingle ? "entry" : "entries"} reported provider capacity/quota exhaustion.`
+    );
+    lines.push(
+      `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
+    );
+    lines.push(
+      isSingle
+        ? "The exhaustion is a provider-side condition that clears on the provider's reset timer. Wait for a quota reset, or switch to a portable actor (context.type: portable) and configure an ordered model pool so recovery has fallback candidates."
+        : "The exhaustion is a provider-side condition that clears on the providers' reset timers; no configured entry has capacity right now. Wait for a quota reset, or configure an additional pool entry that has capacity so recovery has somewhere to go."
+    );
+  }
+
+  return lines.join("\n");
 }

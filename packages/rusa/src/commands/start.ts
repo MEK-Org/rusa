@@ -3331,7 +3331,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     lifecycle: rootLifecycle,
     classifyExhaustion,
-    onPoolFallback: ({ runId, attempt, failed, next, remainingAfter }) => {
+    onPoolFallback: ({ runId, attempt, failed, next, remainingAfter, skipReason }) => {
       // A pool is capped at validation time and these fields are configured
       // tuple labels/counts only: retain a compact diagnostic without placing
       // provider output (which can echo prompts) in observability logs.
@@ -3340,7 +3340,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         failed: describeModelConfigEntry(failed),
         next: describeModelConfigEntry(next),
         remainingAfter,
+        ...(skipReason ? { skipReason } : {}),
       });
+    },
+    recoveryEligibility: (entry) => {
+      if (isProviderHalted(entry.provider)) {
+        return { eligible: false, reason: "halted" };
+      }
+      const now = Date.now();
+      const lane = providerThrottleKey(entry.provider, config);
+      if (pacerFor(lane).quote(now) > now) {
+        return { eligible: false, reason: "pacing" };
+      }
+      return { eligible: true };
     },
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
