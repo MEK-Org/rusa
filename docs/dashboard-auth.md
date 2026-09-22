@@ -235,6 +235,14 @@ of another email, protected data, navigation renewal, and logout:
 RUSA_AUTH_EMULATOR_E2E=http://127.0.0.1:8183 pnpm --filter rusa exec vitest run src/e2e/auth-emulator.browser.test.ts src/e2e/auth-emulator.test.ts
 ```
 
+The dashboard's emulator pre-init bridge deliberately pins `firebase_core_web`
+and `firebase_auth_web`: it must configure the Auth emulator before FlutterFire
+initializes its registered Auth service, using the latter's `initializeAuth`
+recipe. The ordinary Flutter Dashboard workflow compiles that bridge but does
+not provision this live emulator/browser regression. When changing either pin,
+review the matching FlutterFire implementation and run the command above before
+merging.
+
 Ctrl-C stops each service. The e2e instance root printed at startup is retained;
 `pnpm e2e am-down --root <printed-root>` stops it and removes its disposable data.
 Emulator users are in memory and disappear when the emulator stops.

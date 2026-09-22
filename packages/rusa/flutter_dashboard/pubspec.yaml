@@ -34,7 +34,10 @@ dependencies:
     sdk: flutter
   firebase_auth: ^6.7.0
   firebase_core: ^4.15.0
-  firebase_core_web: ^3.12.0
+  # The emulator pre-init bridge matches these web implementations exactly.
+  # Change either only with the documented live-emulator browser regression.
+  firebase_auth_web: 6.3.0
+  firebase_core_web: 3.12.0
   go_router: ^14.8.1
   http: ^1.5.0
   intl: ^0.20.2
