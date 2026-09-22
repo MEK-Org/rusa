@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import {
   existsSync,
   mkdirSync,
@@ -13,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import { StepError } from "../../update/orchestrator.js";
 import {
   executeFollowerUpdate,
+  FollowerBuildRunner,
   type FollowerBuildSeam,
   type FollowerDrainSeam,
   type FollowerGitSeam,
@@ -21,7 +23,7 @@ import {
   type FollowerUpdatePlan,
   swapFollowerBuildDirectories,
 } from "./follower-updater.js";
-import { type FollowerUpdateStatusEvent, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import type { FollowerUpdateStatusEvent } from "./protocol.js";
 
 function makeFakeGit(overrides: Partial<FollowerGitSeam> = {}): FollowerGitSeam {
   return {
@@ -47,9 +49,10 @@ function makeDeps(overrides: Partial<FollowerUpdateDeps> = {}): {
   const git = makeFakeGit();
   const build: FollowerBuildSeam = {
     build: vi.fn().mockResolvedValue(undefined),
+    rollback: vi.fn().mockResolvedValue(undefined),
   };
   const drain: FollowerDrainSeam = {
-    drain: vi.fn().mockResolvedValue(undefined),
+    drain: vi.fn().mockResolvedValue({ quiesced: true, waitedMs: 0 }),
   };
   const emitter: FollowerStatusEmitter = {
     emitStatus: (event) => emitted.push(event),
@@ -72,6 +75,55 @@ function makeDeps(overrides: Partial<FollowerUpdateDeps> = {}): {
 }
 
 describe("executeFollowerUpdate", () => {
+  it("promotes with the production build runner and can restore its prior artifact", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-follower-build-"));
+    const live = join(root, "build", "follower");
+    const spawned: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    try {
+      mkdirSync(live, { recursive: true });
+      writeFileSync(join(live, "artifact"), "old");
+      const spawnImpl = ((_cmd: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+        spawned.push({ args, env: options.env });
+        const child = new EventEmitter() as EventEmitter & {
+          pid: number;
+          stderr: EventEmitter;
+          kill: () => void;
+        };
+        child.pid = 12345;
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        queueMicrotask(() => {
+          if (args[1] === "build:follower") {
+            const staging = options.env?.RUSA_FOLLOWER_DIST_DIR;
+            if (!staging) throw new Error("missing follower staging directory");
+            mkdirSync(staging, { recursive: true });
+            writeFileSync(join(staging, "artifact"), "new");
+          }
+          child.emit("close", 0);
+        });
+        return child;
+      }) as never;
+      const runner = new FollowerBuildRunner(
+        root,
+        { installMs: 1000, buildMs: 1000 },
+        () => {},
+        "pnpm",
+        spawnImpl
+      );
+
+      await runner.build("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+      expect(readFileSync(join(live, "artifact"), "utf8")).toBe("new");
+      expect(readFileSync(`${live}.old/artifact`, "utf8")).toBe("old");
+      expect(spawned).toHaveLength(2);
+      expect(spawned[1].env?.RUSA_FOLLOWER_DIST_DIR).toBe(`${live}.new`);
+
+      runner.rollback();
+      expect(readFileSync(join(live, "artifact"), "utf8")).toBe("old");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores the live build if promotion fails after the old build moved aside", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-follower-swap-"));
     const live = join(root, "follower");
@@ -106,7 +158,6 @@ describe("executeFollowerUpdate", () => {
       updateId: "update-1",
       targetSha: "cccccccccccccccccccccccccccccccccccccccc",
       branch: "staging",
-      protocolVersion: INSTANCE_PROTOCOL_VERSION,
     };
 
     let exitedCode: number | null = null;
@@ -157,22 +208,6 @@ describe("executeFollowerUpdate", () => {
     expect(emitted.map((e) => e.status)).toEqual(["fetching", "already_current"]);
   });
 
-  it("fences incompatible protocol version without pulling or building", async () => {
-    const { deps, emitted } = makeDeps();
-    const plan: FollowerUpdatePlan = {
-      updateId: "update-fenced",
-      protocolVersion: INSTANCE_PROTOCOL_VERSION + 99,
-    };
-
-    const result = await executeFollowerUpdate(plan, deps);
-
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain("Incompatible protocol version");
-    expect(deps.git.fetch).not.toHaveBeenCalled();
-    expect(deps.build.build).not.toHaveBeenCalled();
-    expect(emitted.map((e) => e.status)).toEqual(["failed"]);
-  });
-
   it("rejects a target outside the fetched branch before checkout", async () => {
     const git = makeFakeGit({ isAncestor: vi.fn().mockResolvedValue(false) });
     const { deps, emitted } = makeDeps({ git });
@@ -201,6 +236,7 @@ describe("executeFollowerUpdate", () => {
     });
     const build: FollowerBuildSeam = {
       build: vi.fn().mockRejectedValue(new StepError("build", "compile syntax error")),
+      rollback: vi.fn().mockResolvedValue(undefined),
     };
 
     const { deps, emitted } = makeDeps({ git, build });
@@ -242,6 +278,7 @@ describe("executeFollowerUpdate", () => {
     });
     const build: FollowerBuildSeam = {
       build: vi.fn().mockRejectedValue(new StepError("build", "build error")),
+      rollback: vi.fn().mockResolvedValue(undefined),
     };
 
     const { deps, emitted } = makeDeps({ git, build });
@@ -258,5 +295,30 @@ describe("executeFollowerUpdate", () => {
     const lastEvent = emitted.at(-1);
     expect(lastEvent?.status).toBe("failed");
     expect(lastEvent?.rollbackFailed).toBe(true);
+  });
+
+  it("restores both checkout and artifact when draining fails after promotion", async () => {
+    const oldSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const newSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const git = makeFakeGit({
+      headSha: vi.fn().mockResolvedValue(oldSha),
+      remoteSha: vi.fn().mockResolvedValue(newSha),
+    });
+    const build: FollowerBuildSeam = {
+      build: vi.fn().mockResolvedValue(undefined),
+      rollback: vi.fn().mockResolvedValue(undefined),
+    };
+    const drain: FollowerDrainSeam = {
+      drain: vi.fn().mockRejectedValue(new StepError("drain", "quiescence failed")),
+    };
+    const { deps, emitted } = makeDeps({ git, build, drain });
+
+    const result = await executeFollowerUpdate({ updateId: "drain-fail", targetSha: newSha }, deps);
+
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("drain");
+    expect(build.rollback).toHaveBeenCalledOnce();
+    expect(git.resetHard).toHaveBeenLastCalledWith(oldSha);
+    expect(emitted.at(-1)).toMatchObject({ status: "failed", step: "drain" });
   });
 });

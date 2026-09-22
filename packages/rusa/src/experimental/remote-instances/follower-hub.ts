@@ -140,20 +140,12 @@ export class FollowerHub {
   }
   updateFollower(
     followerId: string,
-    options?: { targetSha?: string; branch?: string; protocolVersion?: number }
+    options?: { targetSha?: string; branch?: string }
   ): FollowerUpdateStatus {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
     if (follower.isUpdateInProgress()) {
       throw new Error(`Follower ${followerId} already has an update in progress`);
-    }
-    if (
-      options?.protocolVersion !== undefined &&
-      options.protocolVersion !== follower.protocolVersion
-    ) {
-      throw new Error(
-        `Incompatible follower protocol version (target: ${options.protocolVersion}, follower: ${follower.protocolVersion})`
-      );
     }
     if (options?.targetSha !== undefined && !isFullCommitSha(options.targetSha)) {
       throw new Error("Invalid target SHA");
@@ -174,7 +166,6 @@ export class FollowerHub {
       updateId,
       targetSha: options?.targetSha,
       branch: options?.branch,
-      protocolVersion: options?.protocolVersion ?? INSTANCE_PROTOCOL_VERSION,
     });
     this.log.info("follower_update_triggered", {
       followerId,
@@ -184,11 +175,7 @@ export class FollowerHub {
     });
     return status;
   }
-  updateAllFollowers(options?: {
-    targetSha?: string;
-    branch?: string;
-    protocolVersion?: number;
-  }): FollowerUpdateStatus[] {
+  updateAllFollowers(options?: { targetSha?: string; branch?: string }): FollowerUpdateStatus[] {
     const statuses: FollowerUpdateStatus[] = [];
     for (const followerId of this.followers.keys()) {
       try {
@@ -198,30 +185,6 @@ export class FollowerHub {
       }
     }
     return statuses;
-  }
-  /**
-   * Wait for every currently enrolled follower to acknowledge that it began the
-   * command. This is deliberately bounded: a disconnected follower must not
-   * wedge the leader's own restart, but the timeout is observable to its caller.
-   */
-  async updateAllFollowersAndWait(
-    options?: { targetSha?: string; branch?: string; protocolVersion?: number },
-    timeoutMs = 5000
-  ): Promise<boolean> {
-    const pending: Array<{ follower: RemoteInstance; updateId: string }> = [];
-    for (const [followerId, follower] of this.followers) {
-      try {
-        const status = this.updateFollower(followerId, options);
-        pending.push({ follower, updateId: status.updateId });
-      } catch (err) {
-        this.log.warn("follower_update_all_partial_failure", { followerId, err });
-        return false;
-      }
-    }
-    const accepted = await Promise.all(
-      pending.map(({ follower, updateId }) => follower.waitForUpdateAcceptance(updateId, timeoutMs))
-    );
-    return accepted.every(Boolean);
   }
   getFollowerUpdateStatus(followerId: string): FollowerUpdateStatus | undefined {
     return this.followers.get(followerId)?.updateStatus;
@@ -373,8 +336,6 @@ export class FollowerHub {
         const status = this.updateFollower(followerId, {
           targetSha: typeof body.targetSha === "string" ? body.targetSha : undefined,
           branch: typeof body.branch === "string" ? body.branch : undefined,
-          protocolVersion:
-            typeof body.protocolVersion === "number" ? body.protocolVersion : undefined,
         });
         reply(res, 200, { ok: true, followerId, update: status });
       } catch (err) {
@@ -388,8 +349,6 @@ export class FollowerHub {
       const statuses = this.updateAllFollowers({
         targetSha: typeof body.targetSha === "string" ? body.targetSha : undefined,
         branch: typeof body.branch === "string" ? body.branch : undefined,
-        protocolVersion:
-          typeof body.protocolVersion === "number" ? body.protocolVersion : undefined,
       });
       reply(res, 200, { ok: true, updates: statuses });
       return;

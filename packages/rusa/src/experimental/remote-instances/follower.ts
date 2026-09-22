@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -9,6 +9,7 @@ import { createLogger } from "../../observability/logger.js";
 import { GitRunner } from "../../update/runner.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
+import { isFullCommitSha } from "./follower-update-validation.js";
 import { executeFollowerUpdate, FollowerBuildRunner } from "./follower-updater.js";
 import { type FollowerUpdateCommand, INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
@@ -53,20 +54,23 @@ function tryGetCommitSha(dir: string): string | undefined {
       timeout: 5000,
       encoding: "utf8",
     }).trim();
-    if (/^[a-f0-9]{7,40}$/i.test(sha)) return sha;
+    if (isFullCommitSha(sha)) return sha;
   } catch {}
   return undefined;
 }
 
-let repoRoot: string;
+const repoRoot = values["repo-path"] ? resolveRepoRoot(values["repo-path"]) : resolveRepoRoot();
+const packageDir = join(repoRoot, "packages", "rusa");
 try {
-  repoRoot = values["repo-path"] ? resolve(values["repo-path"]) : resolveRepoRoot();
+  const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as {
+    name?: unknown;
+  };
+  if (manifest.name !== "rusa") throw new Error("unexpected package name");
 } catch {
-  repoRoot = process.cwd();
+  throw new Error(
+    `Refusing follower update outside a rusa checkout: expected ${join(packageDir, "package.json")}`
+  );
 }
-const packageDir = existsSync(join(repoRoot, "packages", "rusa"))
-  ? join(repoRoot, "packages", "rusa")
-  : repoRoot;
 
 const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
   emit(event.actorId, event.message, event.eventId)
@@ -255,7 +259,6 @@ async function handleUpdate(command: FollowerUpdateCommand): Promise<void> {
       updateId: command.updateId,
       targetSha: command.targetSha,
       branch: command.branch,
-      protocolVersion: command.protocolVersion,
     },
     {
       git: new GitRunner(repoRoot),
@@ -265,6 +268,7 @@ async function handleUpdate(command: FollowerUpdateCommand): Promise<void> {
           instance.beginDrain();
           const outcome = await instance.waitForQuiescence(timeoutMs);
           log.info("follower_update_drain_complete", outcome);
+          return outcome;
         },
       },
       emitter: {

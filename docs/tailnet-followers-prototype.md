@@ -233,7 +233,7 @@ not require actor coordination or interrupt running actors prematurely.
 Follower nodes report their active git `commitSha` and `protocolVersion` upon
 initial enrollment via `POST /register`.
 - Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 4). Mismatches fail closed with HTTP 409.
-- Update commands can specify an explicit full SHA-1/SHA-256 `targetSha` and a `protocolVersion` fence. The follower rejects an incompatible protocol, invalid branch, or target outside the fetched branch before checkout.
+- Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
 
 ### Build and deploy trigger semantics
 
@@ -246,8 +246,7 @@ Follower updates can be triggered via three paths:
    - `POST /api/mesh/followers/:id/update`
    - `GET /api/mesh/followers/:id/update`
    - `POST /api/mesh/followers/update-all`
-3. **Leader Auto-Update Coordination**:
-   - `UpdateOrchestrator` includes a follower coordinator hook (`followerCoordinator`). Before its own restart, the leader waits up to five seconds for every connected follower to acknowledge that it began the command; a timeout is surfaced as an update warning rather than silently treated as delivery.
+The leader's self-update does not enqueue follower updates before its replacement has booted. Operators use the authenticated gateway or dashboard endpoint after verifying the leader update; this keeps a failed leader self-update from moving followers to an unproven revision.
 
 ### Follower-side update execution and safe rollback boundary
 
@@ -255,7 +254,7 @@ When a follower receives a `FollowerUpdateCommand`, it executes `executeFollower
 - **Phased reporting**: Status transitions from `pending` through `fetching`, `building`, `draining`, and `restarting`; terminal non-restart outcomes are `already_current` or `failed`.
 - **Observable status reporting**: Follower status updates are dispatched back to the leader as `$instance` event records (`FollowerUpdateStatusEvent`) over the existing multiplexed event batch channel (`POST /events`), updating the leader's in-memory `FollowerInfo` without interrupting or conflicting with actor-addressed messages.
 - **Staging build isolation**: Followers build into a staging directory (`build/follower.new`) using `RUSA_FOLLOWER_DIST_DIR=build/follower.new`.
-- **Safe rollback boundary**: Active actors continue executing during pull and build. The follower then closes admission and waits up to its configured drain timeout for them to finish before restart; only a timeout permits interruption. If any earlier step (`git fetch`, checkout, `pnpm install`, or `build:follower`) fails or exceeds bounded timeouts, the follower discards the staged build and performs an automatic `git reset --hard <oldSha>` back to its previous known-good commit.
+- **Safe rollback boundary**: Active actors continue executing during pull and build. The follower then closes admission and waits up to its configured drain timeout for them to finish before restart; only a timeout permits interruption. If any later step fails after a green artifact promotion (including drain or a returning restart hook), the follower restores both the previous artifact and `git reset --hard <oldSha>`. A rollback failure is surfaced in the final failed status.
 - **Cutover recovery**: Only after a green build succeeds is `build/follower.new` promoted to `build/follower`. If promotion fails after the old directory moved aside, the implementation restores that old directory before reporting failure.
 
 ## Provider and computer-use support

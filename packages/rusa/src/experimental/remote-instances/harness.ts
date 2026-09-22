@@ -47,7 +47,24 @@ export function createHarness(options: {
   const wire = (instance: RemoteInstance) => {
     instance.flush = () => {
       for (const command of instance.commands.splice(0))
-        if ("actorId" in command) queueMicrotask(() => follower.dispatch(structuredClone(command)));
+        if ("actorId" in command) {
+          queueMicrotask(() => follower.dispatch(structuredClone(command)));
+        } else {
+          // This in-process fixture shares the leader checkout. Running an update
+          // here could reset the test source tree, so surface an explicit failed
+          // status instead of silently discarding the command.
+          queueMicrotask(() =>
+            instance.receive({
+              actorId: "$instance",
+              message: {
+                type: "update_status",
+                updateId: command.updateId,
+                status: "failed",
+                error: "Follower updates require an isolated follower process",
+              },
+            })
+          );
+        }
     };
   };
   wire(remote);

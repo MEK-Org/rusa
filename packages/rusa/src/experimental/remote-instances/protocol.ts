@@ -127,7 +127,6 @@ export type FollowerUpdateStatusPhase =
   | "building"
   | "draining"
   | "restarting"
-  | "success"
   | "failed"
   | "already_current";
 
@@ -149,7 +148,6 @@ export interface FollowerUpdateCommand {
   updateId: string;
   targetSha?: string;
   branch?: string;
-  protocolVersion?: number;
 }
 
 export interface FollowerUpdateStatusEvent {

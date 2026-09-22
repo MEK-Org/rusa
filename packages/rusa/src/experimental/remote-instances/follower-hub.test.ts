@@ -494,19 +494,13 @@ describe("leader follower gateway", () => {
       expect(followers[0].updateStatus).toBeUndefined();
     });
 
-    it("fences update against disconnected follower or mismatched protocol version", async () => {
+    it("fences update against disconnected followers and unsafe revisions", async () => {
       const h = await setup();
       await h.register("worker-fence");
 
       expect(() =>
         h.hub.updateFollower("unknown", { targetSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
       ).toThrow("Follower unknown is not connected");
-
-      expect(() =>
-        h.hub.updateFollower("worker-fence", {
-          protocolVersion: INSTANCE_PROTOCOL_VERSION + 1,
-        })
-      ).toThrow("Incompatible follower protocol version");
 
       expect(() => h.hub.updateFollower("worker-fence", { targetSha: "abcdef0" })).toThrow(
         "Invalid target SHA"
@@ -588,18 +582,18 @@ describe("leader follower gateway", () => {
       expect(updatedInfo?.updateStatus?.step).toBe("build");
     });
 
-    it("waits for follower acceptance and ignores a stale status while an update is active", async () => {
+    it("ignores a stale status while an update is active", async () => {
       const h = await setup();
       const identity = await h.register("worker-acceptance");
-      const acceptance = h.hub.updateAllFollowersAndWait(
-        { targetSha: "1111111111111111111111111111111111111111" },
-        1000
-      );
+      const pending = h.hub.updateFollower("worker-acceptance", {
+        targetSha: "1111111111111111111111111111111111111111",
+      });
       const commands = (await (await h.post("/poll", identity)).json()) as Array<{
         updateId: string;
       }>;
       expect(commands).toHaveLength(1);
-      const updateId = commands[0].updateId;
+      expect(commands[0].updateId).toBe(pending.updateId);
+      const updateId = pending.updateId;
 
       await h.post("/events", {
         ...identity,
@@ -612,8 +606,6 @@ describe("leader follower gateway", () => {
           },
         ],
       });
-      await expect(acceptance).resolves.toBe(true);
-
       await h.post("/events", {
         ...identity,
         batchId: "stale-status",

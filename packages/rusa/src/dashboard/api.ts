@@ -157,12 +157,11 @@ export interface DashboardDataDeps {
   getFollowers?: () => FollowerInfo[];
   updateFollower?: (
     followerId: string,
-    options?: { targetSha?: string; branch?: string; protocolVersion?: number }
+    options?: { targetSha?: string; branch?: string }
   ) => FollowerUpdateStatus;
   updateAllFollowers?: (options?: {
     targetSha?: string;
     branch?: string;
-    protocolVersion?: number;
   }) => FollowerUpdateStatus[];
 }
 
@@ -780,8 +779,6 @@ export async function handleMeshApiRequest(
             const status = updateFollower(followerId, {
               targetSha: typeof parsed.targetSha === "string" ? parsed.targetSha : undefined,
               branch: typeof parsed.branch === "string" ? parsed.branch : undefined,
-              protocolVersion:
-                typeof parsed.protocolVersion === "number" ? parsed.protocolVersion : undefined,
             });
             sendJson(res, 200, { ok: true, followerId, updateStatus: status });
           } catch (err) {
@@ -819,8 +816,6 @@ export async function handleMeshApiRequest(
             const statuses = updateAllFollowers({
               targetSha: typeof parsed.targetSha === "string" ? parsed.targetSha : undefined,
               branch: typeof parsed.branch === "string" ? parsed.branch : undefined,
-              protocolVersion:
-                typeof parsed.protocolVersion === "number" ? parsed.protocolVersion : undefined,
             });
             sendJson(res, 200, { ok: true, updates: statuses });
           } catch (err) {

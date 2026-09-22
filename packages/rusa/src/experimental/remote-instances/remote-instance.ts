@@ -63,7 +63,7 @@ export class FollowerDedupeTracker {
 }
 
 /** Leader-side representation of one registered follower generation. */
-export class RemoteInstance extends EventEmitter {
+export class RemoteInstance {
   readonly session = randomBytes(32).toString("hex");
   readonly hosts = new Map<string, InstanceActorChannel>();
   readonly commands: FollowerCommand[] = [];
@@ -71,8 +71,6 @@ export class RemoteInstance extends EventEmitter {
   poll?: ServerResponse;
   pollTimer?: ReturnType<typeof setTimeout>;
   updateStatus?: FollowerUpdateStatus;
-  private readonly acceptedUpdateIds = new Set<string>();
-  private readonly acceptanceWaiters = new Map<string, Array<(accepted: boolean) => void>>();
 
   constructor(
     readonly id: string,
@@ -81,9 +79,7 @@ export class RemoteInstance extends EventEmitter {
     private readonly dedupeTracker: FollowerDedupeTracker = new FollowerDedupeTracker(),
     public commitSha?: string,
     readonly protocolVersion: number = INSTANCE_PROTOCOL_VERSION
-  ) {
-    super();
-  }
+  ) {}
 
   hasBatch(batchId: string): boolean {
     return this.dedupeTracker.hasBatch(batchId);
@@ -127,44 +123,7 @@ export class RemoteInstance extends EventEmitter {
       return false;
     }
     this.updateStatus = status;
-    if (status.status !== "pending") this.markUpdateAccepted(status.updateId);
-    this.emit("update_status", status);
     return true;
-  }
-
-  waitForUpdateAcceptance(updateId: string, timeoutMs: number): Promise<boolean> {
-    if (this.acceptedUpdateIds.has(updateId)) return Promise.resolve(true);
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        const waiters = this.acceptanceWaiters.get(updateId) ?? [];
-        this.acceptanceWaiters.set(
-          updateId,
-          waiters.filter((waiter) => waiter !== finish)
-        );
-        resolve(false);
-      }, timeoutMs);
-      timer.unref?.();
-      const finish = (accepted: boolean) => {
-        clearTimeout(timer);
-        resolve(accepted);
-      };
-      const waiters = this.acceptanceWaiters.get(updateId) ?? [];
-      waiters.push(finish);
-      this.acceptanceWaiters.set(updateId, waiters);
-    });
-  }
-
-  private markUpdateAccepted(updateId: string): void {
-    this.acceptedUpdateIds.add(updateId);
-    const waiters = this.acceptanceWaiters.get(updateId);
-    this.acceptanceWaiters.delete(updateId);
-    for (const waiter of waiters ?? []) waiter(true);
-  }
-
-  private rejectOutstandingUpdateAcceptances(): void {
-    for (const waiters of this.acceptanceWaiters.values())
-      for (const waiter of waiters) waiter(false);
-    this.acceptanceWaiters.clear();
   }
 
   createHost(actorId: string): ActorChannel {
@@ -186,7 +145,7 @@ export class RemoteInstance extends EventEmitter {
       | FollowerUpdateStatusEvent;
     eventId?: string;
   }): void {
-    if (event.actorId === "$instance" || event.actorId === "__instance__") {
+    if (event.actorId === "$instance") {
       if (
         event.message &&
         typeof event.message === "object" &&
@@ -245,7 +204,6 @@ export class RemoteInstance extends EventEmitter {
     for (const host of [...this.hosts.values()])
       host.receive({ type: "exit", code: -1, signal: null });
     this.commands.length = 0;
-    this.rejectOutstandingUpdateAcceptances();
   }
 }
 

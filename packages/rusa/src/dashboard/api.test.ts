@@ -880,7 +880,6 @@ describe("handleMeshApiRequest", () => {
     expect(mockUpdateFollower).toHaveBeenCalledWith("mac-mini", {
       targetSha: "abcdef1234567890abcdef1234567890abcdef12",
       branch: undefined,
-      protocolVersion: undefined,
     });
 
     const { res: getRes } = await call(followerDeps, "GET", "/api/mesh/followers/mac-mini/update");

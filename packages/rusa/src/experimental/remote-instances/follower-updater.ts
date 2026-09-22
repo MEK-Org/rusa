@@ -4,11 +4,7 @@ import { join } from "node:path";
 import { type GitSeam, StepError } from "../../update/orchestrator.js";
 import { runTimedStep } from "../../update/runner.js";
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
-import {
-  type FollowerUpdateStatusEvent,
-  type FollowerUpdateStep,
-  INSTANCE_PROTOCOL_VERSION,
-} from "./protocol.js";
+import type { FollowerUpdateStatusEvent, FollowerUpdateStep } from "./protocol.js";
 
 export interface FollowerGitSeam extends GitSeam {
   /** True only when `ancestor` is reachable from the fetched remote branch. */
@@ -17,10 +13,12 @@ export interface FollowerGitSeam extends GitSeam {
 
 export interface FollowerBuildSeam {
   build(sha: string): Promise<void>;
+  /** Restore the artifact retained by a completed build promotion. */
+  rollback(): Promise<void> | void;
 }
 
 export interface FollowerDrainSeam {
-  drain(timeoutMs: number): Promise<void>;
+  drain(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }>;
 }
 
 export interface FollowerStatusEmitter {
@@ -40,7 +38,6 @@ export interface FollowerUpdatePlan {
   updateId: string;
   targetSha?: string;
   branch?: string;
-  protocolVersion?: number;
   drainTimeoutMs?: number;
 }
 
@@ -99,6 +96,31 @@ export function swapFollowerBuildDirectories(
   }
 }
 
+/** Restore the last promoted follower artifact after a later update step fails. */
+export function restoreFollowerBuildDirectories(
+  live: string,
+  filesystem: FollowerBuildFilesystem = productionFilesystem
+): void {
+  const previous = `${live}.old`;
+  const failed = `${live}.failed`;
+  if (!filesystem.exists(previous)) {
+    throw new Error("Follower build rollback is unavailable: no previous artifact exists");
+  }
+  filesystem.remove(failed);
+  if (filesystem.exists(live)) filesystem.rename(live, failed);
+  try {
+    filesystem.rename(previous, live);
+  } catch (error) {
+    // Preserve the newer artifact for diagnosis if restoring the old one failed.
+    if (!filesystem.exists(live) && filesystem.exists(failed)) {
+      try {
+        filesystem.rename(failed, live);
+      } catch {}
+    }
+    throw error;
+  }
+}
+
 export class FollowerBuildRunner implements FollowerBuildSeam {
   constructor(
     private readonly packageDir: string,
@@ -132,18 +154,35 @@ export class FollowerBuildRunner implements FollowerBuildSeam {
       });
     } catch (err) {
       this.filesystem.remove(staging);
+      if (err instanceof StepError) {
+        const step: FollowerUpdateStep = err.step === "install" ? "install" : "build";
+        throw new StepError(step, err.message, err.timedOut);
+      }
       throw err;
     }
 
     swapFollowerBuildDirectories(live, staging, this.filesystem);
     this.log(`[follower-update] atomically swapped follower build → ${sha.slice(0, 7)}`);
   }
+
+  rollback(): void {
+    const live = join(this.packageDir, "build", "follower");
+    restoreFollowerBuildDirectories(live, this.filesystem);
+  }
 }
 
 let isFollowerUpdating = false;
 
-export function isFollowerUpdateInProgress(): boolean {
-  return isFollowerUpdating;
+function stepFromError(error: StepError, fallback: FollowerUpdateStep): FollowerUpdateStep {
+  switch (error.step) {
+    case "pull":
+    case "install":
+    case "build":
+    case "drain":
+      return error.step;
+    default:
+      return fallback;
+  }
 }
 
 export async function executeFollowerUpdate(
@@ -168,22 +207,10 @@ export async function executeFollowerUpdate(
   let oldSha = "";
   let newSha = "";
   let movedToNew = false;
+  let promotedBuild = false;
   let rollbackFailed = false;
 
   try {
-    // ── Version & Compatibility Fencing ──
-    if (plan.protocolVersion !== undefined && plan.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
-      const error = `Incompatible protocol version: target ${plan.protocolVersion} !== follower ${INSTANCE_PROTOCOL_VERSION}`;
-      log(`[follower-update] fenced: ${error}`);
-      deps.emitter.emitStatus({
-        type: "update_status",
-        updateId: plan.updateId,
-        status: "failed",
-        error,
-      });
-      return { ok: false, error };
-    }
-
     // ── 1. Pull & Resolve Commit ──
     step = "pull";
     oldSha = await deps.git.headSha();
@@ -257,6 +284,7 @@ export async function executeFollowerUpdate(
     });
 
     await deps.build.build(newSha);
+    promotedBuild = true;
     log(`[follower-update] build green`);
 
     // ── 3. Drain in-flight actors ──
@@ -271,7 +299,11 @@ export async function executeFollowerUpdate(
       newSha,
     });
 
-    await deps.drain.drain(plan.drainTimeoutMs ?? 5000);
+    const drain = await deps.drain.drain(plan.drainTimeoutMs ?? 5000);
+    log(
+      `[follower-update] drained after ${drain.waitedMs}ms` +
+        (drain.quiesced ? " (quiesced)" : " (timeout — restart may interrupt remaining actors)")
+    );
 
     // ── 4. Restart onto fresh build ──
     log(`[follower-update] restarting onto ${newSha.slice(0, 7)}`);
@@ -292,11 +324,24 @@ export async function executeFollowerUpdate(
     };
   } catch (err) {
     const isStep = err instanceof StepError;
-    const failedStep = (isStep ? (err.step as FollowerUpdateStep) : step) ?? step;
+    const failedStep = isStep ? stepFromError(err, step) : step;
     const error = err instanceof Error ? err.message : String(err);
     log(`[follower-update] FAILED at ${failedStep}: ${error}`);
 
-    // Roll back checkout if moved
+    // The build promotion precedes draining, so a drain or restart failure must
+    // restore both the checkout and the previous boot artifact.
+    if (promotedBuild) {
+      try {
+        await deps.build.rollback();
+        log("[follower-update] restored previous follower build artifact");
+      } catch (rbErr) {
+        rollbackFailed = true;
+        const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
+        log(`[follower-update] WARNING: artifact rollback failed: ${rbMsg}`);
+      }
+    }
+
+    // Roll back checkout if moved.
     if (movedToNew && oldSha) {
       try {
         await deps.git.resetHard(oldSha);
