@@ -246,7 +246,13 @@ export class RunManager {
    * The two things a dispatch needs about pending responsive work beyond the
    * fact that it exists — whether any of it is unabsorbed, and when the newest
    * unabsorbed voice memo was delivered — read by paging the repository's
-   * unhandled responsive entries.
+   * unhandled responsive entries. This is exact rather than a fixed-window
+   * approximation: a backdated unseen row can fall after newer seen rows.
+   * The current repository contract computes a count with each page, so a
+   * large responsive backlog costs multiple queries. That is an accepted
+   * consequence of keeping #387 within the existing repository interface; an
+   * indexed unseen count plus newest-unseen-voice query belongs in a dedicated
+   * repository extension, not a scheduler-side approximation.
    */
   private pendingResponsive(actorId: string): { unseenResponsive: boolean; voiceAt?: number } {
     let cursor: string | undefined;

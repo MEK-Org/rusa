@@ -1009,6 +1009,19 @@ describe("ActorMesh", () => {
     expect(mesh.dispatch(id)).toBe(false);
   });
 
+  it("warns when constructed without durable inbox storage", () => {
+    const logs: string[] = [];
+    new ActorMesh({
+      actors: new InMemoryActorRepository(),
+      log: (message) => logs.push(message),
+      createActor: () => ({}) as unknown as Actor,
+    });
+
+    expect(logs).toContain(
+      "ActorMesh constructed without an inboxStore; dispatch is disabled until durable inbox storage is wired"
+    );
+  });
+
   it("coalesces inbox changes during a run into one dirty follow-up", async () => {
     const d = deferredProvider();
     const { mesh, tick } = setup({ sharedProvider: d.provider });

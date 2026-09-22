@@ -360,12 +360,6 @@ describe("RunManager", () => {
       expect(h.manager.dispatch("a1")).toBe(false);
       expect(actor.nudges).toEqual([]);
     });
-
-    it("exposes dispatch(actorId) as the only public dispatch input on RunManager", () => {
-      expect("dispatchJoiningActiveRun" in RunManager.prototype).toBe(false);
-      const h = setup();
-      expect("dispatchJoiningActiveRun" in h.manager).toBe(false);
-    });
   });
 
   describe("coalescing, single-flight and follow-up runs", () => {

@@ -130,7 +130,6 @@ function setup(
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
-    useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
@@ -189,7 +188,7 @@ function setup(
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
-    inboxStore: (opts.useInboxStore ?? true) ? inboxStore : undefined,
+    inboxStore,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -707,7 +706,6 @@ describe("agent-execution MCP server", () => {
     try {
       const obligations = new ObligationRepository(db);
       const { inboxStore, mesh } = setup({
-        useInboxStore: true,
         obligations: {
           findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
           get: (id) => obligations.get(id),
@@ -768,7 +766,6 @@ describe("agent-execution MCP server", () => {
     let holder = "";
     const controls: Array<[string, string]> = [];
     const { inboxStore, mesh } = setup({
-      useInboxStore: true,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
         activeSessionIdFor: (actorId) => {

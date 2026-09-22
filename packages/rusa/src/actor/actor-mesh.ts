@@ -923,6 +923,7 @@ export class ActorMesh {
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
+    this.log = opts.log ?? (() => {});
     this.supportedVoices = opts.supportedVoices ?? [];
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.voiceSessionTransfer = opts.voiceSessionTransfer;
@@ -936,6 +937,11 @@ export class ActorMesh {
       [...(opts.grantableCapabilities ?? [])].filter((cap) => !HOST_GLOBAL_CAPABILITIES.has(cap))
     );
     this.secretsDir = opts.secretsDir ?? secretsDirPath();
+    if (!opts.inboxStore) {
+      this.log(
+        "ActorMesh constructed without an inboxStore; dispatch is disabled until durable inbox storage is wired"
+      );
+    }
     this.runs = new RunManager({
       inbox: opts.inboxStore ?? new EmptyInboxRepository(),
       maxConcurrent: opts.maxConcurrent,
@@ -981,7 +987,6 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
-    this.log = opts.log ?? (() => {});
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
