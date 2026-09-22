@@ -1464,8 +1464,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
   const rootProviderName = rootActor.provider;
-  const isProviderHalted = (providerName?: string) =>
-    haltSwitch.isHalted(providerName ?? rootProviderName);
+  const isProviderHalted = (providerName?: string, modelName?: string) =>
+    haltSwitch.isHalted(providerName ?? rootProviderName, modelName);
   let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   if (haltSwitch.hasActiveHalt()) {
     const why = haltSwitch.reason();
@@ -2306,7 +2306,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        isHalted: (c) => isProviderHalted(c.provider),
+        isHalted: (c) => isProviderHalted(c.provider, c.model),
         onSelected: request.threadId
           ? (selection) => {
               const provider = selection.candidate.provider;
@@ -3369,7 +3369,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       });
     },
     recoveryEligibility: (entry) => {
-      if (isProviderHalted(entry.provider)) {
+      if (isProviderHalted(entry.provider, entry.model)) {
         return { eligible: false, reason: "halted" };
       }
       const now = Date.now();
@@ -3382,18 +3382,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
     beforeRun: ({ mode }): boolean => {
+      // Gate on the pool that would launch — desired-if-staged, else current —
+      // before committing it, exactly as the worker beforeRun does, so a staged
+      // move onto a halted provider never mutates `modelConfig` for a run that
+      // never launches. Root declaring a pool is halted only when *every* entry
+      // is; reading just the first entry suppressed the whole actor while an
+      // unhalted fallback was available (#625). No declared pool falls back to
+      // root's own single provider.
+      const rootPoolHalted = mesh.launchPoolHalted(rootId);
+      const allHalted = rootPoolHalted ?? isProviderHalted(rootProviderName, rootActor.model);
+      if (allHalted || gracefulShutdown.isShuttingDown()) {
+        return false;
+      }
       // Same dispatch-time apply as the worker beforeRun (#199, extended to
       // pools): a pool staged while root was queued/idle must land before
       // this run's own gate()/admission and run_start, not at the end of
-      // the run after. Root's declared pool may hold several ordered
-      // entries (see the `modelConfig` comment on root's Actor construction
-      // above); the halt gate reads the first, the entry that launches first.
+      // the run after.
       mesh.applyPendingModel(rootId);
-      const rootRecord = actors.get(rootId);
-      const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
-      if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
-        return false;
-      }
       if (mode === "yield-elicitation") return true;
       const watermark = root.getInterruptedWatermark?.();
       if (watermark) {
@@ -3948,9 +3953,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const cancelled = mesh.cancelHaltedQueuedRuns();
         scheduleHaltExpiry(haltCommand.until);
         console.warn(`[mesh] ⛔ HALT engaged via chat by ${who}`);
-        const scope = haltCommand.providers?.length
-          ? `provider${haltCommand.providers.length === 1 ? "" : "s"} ${haltCommand.providers.join(", ")}`
-          : "all actor runs";
+        const parts: string[] = [];
+        if (haltCommand.providers?.length) {
+          parts.push(
+            `provider${haltCommand.providers.length === 1 ? "" : "s"} ${haltCommand.providers.join(", ")}`
+          );
+        }
+        if (haltCommand.models?.length) {
+          parts.push(
+            `model${haltCommand.models.length === 1 ? "" : "s"} ${haltCommand.models.join(", ")}`
+          );
+        }
+        const scope = parts.length ? parts.join(" and ") : "all actor runs";
         const expiry = haltCommand.until ? ` until ${haltCommand.until}` : "";
         const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
         void cc

@@ -358,6 +358,43 @@ describe("ProviderPacer", () => {
       expect(started).toEqual(["b"]);
     });
 
+    it("excludes a halted candidate from normal selection before quota pacing, preserving candidate order (#625)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const a = laneFor("a", 0);
+      const b = laneFor("b", 0);
+      const c = laneFor("c", 0);
+      const handle = submitPoolGate(async (config: string) => config, [a, b, c], {
+        isHalted: (config) => config === "a",
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("b");
+    });
+
+    it("evaluates isHalted with candidate tuple to support model-scoped halts (#625)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const m1 = {
+        config: { provider: "claude", model: "sonnet" },
+        lane: "claude:sonnet",
+        pacer: new ProviderPacer(0, () => Date.now()),
+      };
+      const m2 = {
+        config: { provider: "claude", model: "opus" },
+        lane: "claude:opus",
+        pacer: new ProviderPacer(0, () => Date.now()),
+      };
+      const handle = submitPoolGate(
+        async (config: { provider: string; model: string }) => config.model,
+        [m1, m2],
+        {
+          isHalted: (config) => config.provider === "claude" && config.model === "sonnet",
+          enqueueNormal: (fn) => mesh.enqueue(fn),
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("opus");
+    });
+
     it("responsive requests choose the same earliest available healthy candidate as normal admission while bypassing pacing", async () => {
       const mesh = new ConcurrencyLimiter(1);
       const a = laneFor("a", 10_000);

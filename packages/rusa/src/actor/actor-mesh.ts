@@ -566,7 +566,7 @@ export interface ActorMeshOptions {
    * returns true the run is skipped (and, being a skip, won't self-continue), so
    * the mesh quiesces within one run-cycle. Defaults to never-halted.
    */
-  isHalted?: (provider?: string) => boolean;
+  isHalted?: (provider?: string, model?: string) => boolean;
   /**
    * Second, independent run-gate term consulted in every worker's `beforeRun`:
    * the in-memory graceful-shutdown brake (see {@link GracefulShutdown}). Kept
@@ -804,7 +804,7 @@ export class ActorMesh {
   ) => ProviderModelConfig[];
   /** The execution coordinator: live actors, construction, dispatch, admission. */
   private readonly runs: RunManager;
-  private readonly isHalted: (provider?: string) => boolean;
+  private readonly isHalted: (provider?: string, model?: string) => boolean;
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
   private readonly now: () => string;
@@ -947,6 +947,7 @@ export class ActorMesh {
       maxConcurrent: opts.maxConcurrent,
       providerGate: opts.providerGate,
       rateLimit: opts.rateLimit,
+      isHalted: opts.isHalted,
       constructActor: (record) => this.createActor(this.factoryContext(record)),
       recordStatus: (actorId) => this.actors.get(actorId)?.status,
       isVoiceSessionActive: (actorId) => this.isVoiceSessionActive(actorId),
@@ -4407,10 +4408,24 @@ export class ActorMesh {
     return rec?.desiredModelConfig ?? rec?.modelConfig;
   }
 
+  /**
+   * The halt verdict for the pool that would launch next, or `undefined` when
+   * the actor declares no pool and the caller must fall back to its own single
+   * provider. Public — like {@link applyPendingModel} — because the
+   * externally-constructed root has to apply the same rule workers get from
+   * {@link workerCallbacks}, and root drifting from that rule is what let a
+   * halted first entry suppress a whole multi-model actor (#625).
+   */
+  launchPoolHalted(id: string): boolean | undefined {
+    const config = this.launchModelConfig(id);
+    if (!config || config.length === 0) return undefined;
+    return this.allCandidatesHalted(config);
+  }
+
   /** True only when every declared candidate in the pool is halted. */
   private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
     if (!modelConfig || modelConfig.length === 0) return false;
-    return modelConfig.every((c) => this.isHalted(c.provider));
+    return modelConfig.every((c) => this.isHalted(c.provider, c.model));
   }
 
   /**
@@ -4427,7 +4442,7 @@ export class ActorMesh {
     for (const [id, actor] of this.runs.liveEntries()) {
       const selection = this.runs.selectionFor(id);
       const halted = selection
-        ? this.isHalted(selection.provider)
+        ? this.isHalted(selection.provider, selection.model)
         : this.allCandidatesHalted(this.launchModelConfig(id));
       if (halted && actor.cancelQueuedRun?.()) {
         cancelled.push(id);

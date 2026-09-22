@@ -94,6 +94,22 @@ describe("HaltSwitch", () => {
     expect(halt.isHalted("claude")).toBe(true);
     expect(halt.reason()).toBe("operator maintenance");
   });
+
+  it("applies model-scoped halts, blocking only matching entries", () => {
+    const halt = new HaltSwitch(file);
+    expect(
+      halt.halt("model issue", {
+        providers: ["claude"],
+        models: ["claude-sonnet-4-6"],
+      })
+    ).toBe(true);
+    expect(halt.hasActiveHalt()).toBe(true);
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude")).toBe(false); // provider as a whole is not halted
+    expect(halt.isHalted("claude", "claude-sonnet-4-6")).toBe(true);
+    expect(halt.isHalted("claude", "claude-opus-4-6")).toBe(false);
+    expect(halt.isHalted("codex", "claude-sonnet-4-6")).toBe(false);
+  });
 });
 
 describe("parseHaltCommand", () => {
@@ -107,7 +123,21 @@ describe("parseHaltCommand", () => {
   it("accepts the pause alias and rejects unknown or malformed atoms", () => {
     expect(parseHaltCommand("/pause")).toEqual({});
     expect(() => parseHaltCommand("/halt provider:")).toThrow(/invalid halt option/);
-    expect(() => parseHaltCommand("/halt model:claude")).toThrow(/unknown halt option/);
+    expect(() => parseHaltCommand("/halt model:")).toThrow(/invalid halt option/);
+    expect(() => parseHaltCommand("/halt foo:bar")).toThrow(/unknown halt option/);
     expect(parseHaltCommand("please halt")).toBeNull();
+  });
+
+  it("parses model and models options", () => {
+    expect(parseHaltCommand("/halt model:claude-sonnet-4-6")).toEqual({
+      models: ["claude-sonnet-4-6"],
+    });
+    expect(parseHaltCommand("/halt provider:claude model:claude-sonnet-4-6")).toEqual({
+      providers: ["claude"],
+      models: ["claude-sonnet-4-6"],
+    });
+    expect(parseHaltCommand("/halt models:claude-sonnet-4-6,codex-5.2")).toEqual({
+      models: ["claude-sonnet-4-6", "codex-5.2"],
+    });
   });
 });
