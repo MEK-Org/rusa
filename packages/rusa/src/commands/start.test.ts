@@ -4744,6 +4744,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // halt scoped to claude must still block dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
     halt.resume();
 
     // Halt the OLD provider (antigravity) instead — root is no longer

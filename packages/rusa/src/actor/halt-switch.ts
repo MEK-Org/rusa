@@ -49,7 +49,11 @@ export class HaltSwitch {
       !state.providers?.length || state.providers.includes(normalizeProvider(provider));
     if (!providerMatches) return false;
     if (state.models?.length) {
-      if (!model) return false;
+      // A model-scoped hold is a brake: a caller that cannot identify its
+      // selected model must not run on the held provider. Normal selection
+      // always carries a validated model; this protects less-specific callers
+      // while they are brought to that same boundary.
+      if (!model) return true;
       return state.models.includes(normalizeModel(model));
     }
     return true;
@@ -152,11 +156,11 @@ export function parseHaltCommand(text: string): HaltCommand | null {
     }
     const key = atom.slice(0, separator).toLowerCase();
     const value = atom.slice(separator + 1);
-    if (key === "provider" || key === "providers") {
+    if (key === "provider") {
       const providers = value.split(",").map(normalizeProvider).filter(Boolean);
       if (providers.length === 0) throw new Error("provider list cannot be empty");
       result.providers = [...new Set(providers)];
-    } else if (key === "model" || key === "models") {
+    } else if (key === "model") {
       const models = value.split(",").map(normalizeModel).filter(Boolean);
       if (models.length === 0) throw new Error("model list cannot be empty");
       result.models = [...new Set(models)];
@@ -167,6 +171,9 @@ export function parseHaltCommand(text: string): HaltCommand | null {
     } else {
       throw new Error(`unknown halt option "${key}"`);
     }
+  }
+  if (result.models?.length && !result.providers?.length) {
+    throw new Error("model-scoped halt requires a provider");
   }
   return result;
 }

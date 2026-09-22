@@ -113,8 +113,6 @@ export interface RunManagerOptions {
   maxConcurrent?: number;
   /** Provider pacing; omitted leaves declaration order as the whole policy. */
   providerGate?: MeshProviderGate;
-  /** True iff an active sentinel applies to provider/model. */
-  isHalted?: (provider?: string, model?: string) => boolean;
   /**
    * Legacy promise-only rate gate, consulted only when no {@link providerGate}
    * is wired. Retained for embedders that do not need start promotion.
@@ -188,11 +186,8 @@ export class RunManager {
       opts.providerGate ??
       ((fn, candidates, admissionOpts) => {
         // No real pacing wired (e.g. an isolated test mesh): declaration order
-        // among unhalted candidates is the whole policy.
-        const unhalted = opts.isHalted
-          ? candidates.filter((c) => !opts.isHalted?.(c.provider, c.model))
-          : candidates;
-        const selected = (unhalted.length > 0 ? unhalted : candidates)[0];
+        // is the whole policy, matching a fixed single-choice actor's behavior.
+        const selected = candidates[0];
         const run = () => fn(selected);
         if (opts.rateLimit) {
           const result = opts.rateLimit(

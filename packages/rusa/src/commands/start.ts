@@ -3382,23 +3382,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
     beforeRun: ({ mode }): boolean => {
-      // Gate on the pool that would launch — desired-if-staged, else current —
-      // before committing it, exactly as the worker beforeRun does, so a staged
-      // move onto a halted provider never mutates `modelConfig` for a run that
-      // never launches. Root declaring a pool is halted only when *every* entry
-      // is; reading just the first entry suppressed the whole actor while an
-      // unhalted fallback was available (#625). No declared pool falls back to
-      // root's own single provider.
-      const rootPoolHalted = mesh.launchPoolHalted(rootId);
-      const allHalted = rootPoolHalted ?? isProviderHalted(rootProviderName, rootActor.model);
-      if (allHalted || gracefulShutdown.isShuttingDown()) {
-        return false;
-      }
-      // Same dispatch-time apply as the worker beforeRun (#199, extended to
-      // pools): a pool staged while root was queued/idle must land before
-      // this run's own gate()/admission and run_start, not at the end of
-      // the run after.
-      mesh.applyPendingModel(rootId);
+      if (!mesh.prepareRun(rootId)) return false;
       if (mode === "yield-elicitation") return true;
       const watermark = root.getInterruptedWatermark?.();
       if (watermark) {

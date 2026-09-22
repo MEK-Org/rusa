@@ -6182,66 +6182,6 @@ describe("ActorMesh", () => {
       // Relative order of [pool-b, pool-c] preserved: pool-b chosen
       expect(selectedProviders).toEqual(["pool-b"]);
     });
-
-    // The four cases above wire an explicit pool gate, which is what production
-    // does. A mesh with no pacing wired falls back to declaration order as the
-    // whole policy, so that default must skip held entries too (#625).
-    it("skips a held entry in the default no-pacing selection policy (#625)", async () => {
-      const selectedProviders: string[] = [];
-      const liveActors = new Map<string, Actor>();
-      const halted = new Set<string>();
-
-      const { mesh, registry, tick } = setup({
-        maxConcurrent: 1,
-        isHalted: (provider) => (provider ? halted.has(provider) : false),
-        createActor: (ctx) => {
-          let actor!: Actor;
-          actor = new Actor({
-            id: ctx.record.id,
-            cwd: `/tmp/${ctx.record.id}`,
-            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
-            resolveProvider: (selected) => ({
-              name: selected.provider,
-              providerName: selected.provider,
-              run: async () => {
-                selectedProviders.push(selected.provider);
-                actor.declareYield();
-                return { success: true, exitCode: 0, output: "ok" };
-              },
-            }),
-            mcpServers: [],
-            loadSessionId: () => ctx.getRecord()?.sessionId,
-            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
-            buildPrompt: () => ({ prompt: "work" }),
-            gate: ctx.gate,
-            beforeRun: ctx.beforeRun,
-            lifecycle: ctx.lifecycle,
-            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-            debounceMs: DEBOUNCE,
-          });
-          liveActors.set(ctx.record.id, actor);
-          return actor;
-        },
-      });
-
-      const worker = mesh.spawn({
-        charter: "worker",
-        parentId: "root",
-        modelConfig: [
-          { provider: "pool-a", model: "model-a" },
-          { provider: "pool-b", model: "model-b" },
-        ],
-        context: { type: "portable", mode: "ledger" },
-      });
-
-      halted.add("pool-a");
-
-      mesh.sendMessage(worker, "fresh message", "root");
-      await tick();
-
-      expect(selectedProviders).toEqual(["pool-b"]);
-    });
   });
 
   // #347 responsive promotion retains the normal admission choice. A queued

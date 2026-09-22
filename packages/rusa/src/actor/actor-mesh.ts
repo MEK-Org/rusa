@@ -947,7 +947,6 @@ export class ActorMesh {
       maxConcurrent: opts.maxConcurrent,
       providerGate: opts.providerGate,
       rateLimit: opts.rateLimit,
-      isHalted: opts.isHalted,
       constructActor: (record) => this.createActor(this.factoryContext(record)),
       recordStatus: (actorId) => this.actors.get(actorId)?.status,
       isVoiceSessionActive: (actorId) => this.isVoiceSessionActive(actorId),
@@ -4408,24 +4407,26 @@ export class ActorMesh {
     return rec?.desiredModelConfig ?? rec?.modelConfig;
   }
 
-  /**
-   * The halt verdict for the pool that would launch next, or `undefined` when
-   * the actor declares no pool and the caller must fall back to its own single
-   * provider. Public — like {@link applyPendingModel} — because the
-   * externally-constructed root has to apply the same rule workers get from
-   * {@link workerCallbacks}, and root drifting from that rule is what let a
-   * halted first entry suppress a whole multi-model actor (#625).
-   */
-  launchPoolHalted(id: string): boolean | undefined {
-    const config = this.launchModelConfig(id);
-    if (!config || config.length === 0) return undefined;
-    return this.allCandidatesHalted(config);
-  }
-
   /** True only when every declared candidate in the pool is halted. */
   private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
     if (!modelConfig || modelConfig.length === 0) return false;
     return modelConfig.every((c) => this.isHalted(c.provider, c.model));
+  }
+
+  /**
+   * Apply the shared pre-run admission rule used by the externally constructed
+   * root and every mesh-created actor. It checks the staged-or-current pool
+   * before committing it, so an all-held staged pool is left intact for a
+   * future eligible run; a pool with any unheld candidate remains schedulable.
+   */
+  prepareRun(id: string): boolean {
+    const rec = this.actors.get(id);
+    if (!rec || rec.status !== "active") return false;
+    if (this.allCandidatesHalted(this.launchModelConfig(id)) || this.isShuttingDown()) {
+      return false;
+    }
+    this.applyPendingModel(id);
+    return true;
   }
 
   /**
@@ -4471,22 +4472,7 @@ export class ActorMesh {
       lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
-        const rec = this.actors.get(record.id);
-        if (!rec || rec.status !== "active") {
-          return false;
-        }
-        // Halt gate consults the pool this dispatch will actually launch —
-        // desired-if-staged, else current (#169) — without yet committing
-        // it, so a staged move onto a halted provider never mutates
-        // `modelConfig` for a run that never launches.
-        if (this.allCandidatesHalted(this.launchModelConfig(record.id)) || this.isShuttingDown()) {
-          return false;
-        }
-        // Apply a pool staged while idle/queued before this dispatch's own
-        // gate()/admission reads the declared pool (#199, extended to pools):
-        // an in-flight run's beforeRun never re-fires for that same run, so
-        // this only ever lands on a fresh dispatch, never mid-run.
-        this.applyPendingModel(record.id);
+        if (!this.prepareRun(record.id)) return false;
         if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
         const actor = this.runs.liveActor(record.id);

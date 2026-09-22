@@ -105,7 +105,9 @@ describe("HaltSwitch", () => {
     ).toBe(true);
     expect(halt.hasActiveHalt()).toBe(true);
     expect(halt.isHalted()).toBe(false);
-    expect(halt.isHalted("claude")).toBe(false); // provider as a whole is not halted
+    // A caller without a selected model must stop rather than run on a model
+    // it cannot prove is outside the scoped hold.
+    expect(halt.isHalted("claude")).toBe(true);
     expect(halt.isHalted("claude", "claude-sonnet-4-6")).toBe(true);
     expect(halt.isHalted("claude", "claude-opus-4-6")).toBe(false);
     expect(halt.isHalted("codex", "claude-sonnet-4-6")).toBe(false);
@@ -128,16 +130,13 @@ describe("parseHaltCommand", () => {
     expect(parseHaltCommand("please halt")).toBeNull();
   });
 
-  it("parses model and models options", () => {
-    expect(parseHaltCommand("/halt model:claude-sonnet-4-6")).toEqual({
-      models: ["claude-sonnet-4-6"],
-    });
+  it("parses a provider-bound model option", () => {
     expect(parseHaltCommand("/halt provider:claude model:claude-sonnet-4-6")).toEqual({
       providers: ["claude"],
       models: ["claude-sonnet-4-6"],
     });
-    expect(parseHaltCommand("/halt models:claude-sonnet-4-6,codex-5.2")).toEqual({
-      models: ["claude-sonnet-4-6", "codex-5.2"],
-    });
+    expect(() => parseHaltCommand("/halt model:claude-sonnet-4-6")).toThrow(/requires a provider/);
+    expect(() => parseHaltCommand("/halt providers:claude")).toThrow(/unknown halt option/);
+    expect(() => parseHaltCommand("/halt models:claude-sonnet-4-6")).toThrow(/unknown halt option/);
   });
 });
