@@ -465,6 +465,7 @@ export class PullRequestHeadAdvancedError extends Error {
 const API_BASE = "https://api.github.com";
 const ASYNC_MERGE_POLL_INTERVAL_MS = 1_000;
 const ASYNC_MERGE_MAX_POLLS = 60;
+const ASYNC_MERGE_TIMEOUT_SECONDS = (ASYNC_MERGE_MAX_POLLS * ASYNC_MERGE_POLL_INTERVAL_MS) / 1_000;
 
 interface AsyncMergeResponse {
   status: string;
@@ -993,7 +994,7 @@ export class GitHubIssueClient implements IssueClient {
               "but its stack metadata could not be read; refusing an unvalidated stack merge."
           );
         }
-        this.requireNoOpenLowerStackEntries(opts, stack.position, stack.entries);
+        this.requireLowerStackEntriesMerged(opts, stack.position, stack.entries);
         const sha = await this.mergePullRequestAsync(opts);
         if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
         return sha;
@@ -1077,30 +1078,39 @@ export class GitHubIssueClient implements IssueClient {
     };
   }
 
-  private requireNoOpenLowerStackEntries(
+  private requireLowerStackEntriesMerged(
     opts: MergePullRequestOptions,
     position: number,
     entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
   ): void {
-    const openLowerEntries = entries.filter((entry) => {
+    const unmergedLowerEntries = entries.filter((entry) => {
       if (entry.position >= position) return false;
       const state = entry.pullRequest?.state?.toUpperCase();
-      return state !== "CLOSED" && state !== "MERGED";
+      return state !== "MERGED";
     });
-    if (openLowerEntries.length > 0) {
+    if (unmergedLowerEntries.length > 0) {
       throw new Error(
         `Refusing to merge ${opts.repo}#${opts.prNumber}: lower stack position(s) ` +
-          `${openLowerEntries.map((entry) => entry.position).join(", ")} are still open. ` +
-          "Merge or close every lower pull request first."
+          `${unmergedLowerEntries.map((entry) => entry.position).join(", ")} are not merged. ` +
+          "Merge every lower pull request first."
       );
     }
   }
 
+  /**
+   * GitHub rejects PUT /pulls/{number}/merge with 403 when the PR belongs to a
+   * stack. The REST API does not provide a machine-readable error code enum or
+   * discriminator field for this condition, returning only HTTP 403 Forbidden
+   * with the message below. Substring matching distinguishes this from other 403s
+   * (e.g. branch protection, insufficient permissions) without paying upfront
+   * GraphQL query costs for standard unstacked merges.
+   */
   private isLegacyStackMergeRejection(err: unknown): err is GitHubApiError {
     return (
       err instanceof GitHubApiError &&
       err.status === 403 &&
-      err.message.includes("Merging stacked PRs via this endpoint is not supported")
+      (err.message.includes("Merging stacked PRs via this endpoint is not supported") ||
+        err.body.includes("Merging stacked PRs via this endpoint is not supported"))
     );
   }
 
@@ -1180,7 +1190,7 @@ export class GitHubIssueClient implements IssueClient {
       if (pollCount >= ASYNC_MERGE_MAX_POLLS) {
         throw new Error(
           `Asynchronous merge polling timed out for ${opts.repo}#${opts.prNumber} after ` +
-            `${ASYNC_MERGE_MAX_POLLS} polls.`
+            `${ASYNC_MERGE_TIMEOUT_SECONDS} seconds.`
         );
       }
       await new Promise<void>((resolve) => setTimeout(resolve, ASYNC_MERGE_POLL_INTERVAL_MS));

@@ -996,7 +996,7 @@ describe("GitHubIssueClient", () => {
     });
   });
 
-  it("falls back to async for a later static stack position once lower entries are merged or closed", async () => {
+  it("falls back to async for a later static stack position once lower entries are merged", async () => {
     vi.useFakeTimers();
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/12`]: {
@@ -1019,7 +1019,7 @@ describe("GitHubIssueClient", () => {
                     totalCount: 3,
                     nodes: [
                       { position: 1, pullRequest: { number: 10, state: "MERGED" } },
-                      { position: 2, pullRequest: { number: 11, state: "CLOSED" } },
+                      { position: 2, pullRequest: { number: 11, state: "MERGED" } },
                       { position: 3, pullRequest: { number: 12, state: "OPEN" } },
                     ],
                   },
@@ -1085,25 +1085,9 @@ describe("GitHubIssueClient", () => {
     });
   });
 
-  it("falls back to the asynchronous endpoint after the legacy stacked-merge rejection", async () => {
+  it("falls back to async merge after legacy rejection, handling immediate and already-accepted merges", async () => {
+    vi.useFakeTimers();
     const requests = installFetch({
-      "POST /graphql": {
-        json: {
-          data: {
-            repository: {
-              pullRequest: {
-                stack: {
-                  entries: {
-                    totalCount: 1,
-                    nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
-                  },
-                },
-                stackEntry: { position: 1 },
-              },
-            },
-          },
-        },
-      },
       [`PUT /repos/${REPO}/pulls/12/merge`]: {
         status: 403,
         json: {
@@ -1111,14 +1095,72 @@ describe("GitHubIssueClient", () => {
             "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
         },
       },
+      "POST /graphql": {
+        responses: [
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: {
+                      entries: {
+                        totalCount: 1,
+                        nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
+                      },
+                    },
+                    stackEntry: { position: 1 },
+                  },
+                },
+              },
+            },
+          },
+          {
+            json: {
+              data: {
+                repository: {
+                  pullRequest: {
+                    stack: {
+                      entries: {
+                        totalCount: 1,
+                        nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
+                      },
+                    },
+                    stackEntry: { position: 1 },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
       [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
-        status: 200,
-        json: { status: "merged", details: { sha: "fallback-stack-merge-sha" } },
+        responses: [
+          {
+            status: 200,
+            json: { status: "merged", details: { sha: "fallback-stack-merge-sha" } },
+          },
+          {
+            status: 409,
+            json: {
+              status: "pending",
+              details: {
+                uuid: "existing-merge-uuid",
+                expected_head_sha: "evaluated-head-sha",
+              },
+            },
+          },
+        ],
+      },
+      [`GET /repos/${REPO}/pulls/12/merge-async/existing-merge-uuid`]: {
+        json: { status: "merged", details: { sha: "existing-stack-merge-sha" } },
       },
     });
 
+    const client = new GitHubIssueClient();
+
+    // 1. Immediate resolution on merge-async
     await expect(
-      new GitHubIssueClient().mergePullRequest({
+      client.mergePullRequest({
         repo: REPO,
         prNumber: 12,
         method: "squash",
@@ -1127,61 +1169,14 @@ describe("GitHubIssueClient", () => {
       })
     ).resolves.toBe("fallback-stack-merge-sha");
 
-    expect(requests.map((request) => [request.method, request.path])).toEqual([
-      ["PUT", `/repos/${REPO}/pulls/12/merge`],
-      ["POST", "/graphql"],
-      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
-    ]);
     expect(requests[2].body).toEqual({
       merge_method: "squash",
       merge_action: "direct_merge",
       sha: "evaluated-head-sha",
     });
-  });
 
-  it("polls an already-accepted asynchronous stack merge to its terminal result", async () => {
-    vi.useFakeTimers();
-    const requests = installFetch({
-      "POST /graphql": {
-        json: {
-          data: {
-            repository: {
-              pullRequest: {
-                stack: {
-                  entries: {
-                    totalCount: 1,
-                    nodes: [{ position: 1, pullRequest: { number: 12, state: "OPEN" } }],
-                  },
-                },
-                stackEntry: { position: 1 },
-              },
-            },
-          },
-        },
-      },
-      [`PUT /repos/${REPO}/pulls/12/merge`]: {
-        status: 403,
-        json: {
-          message:
-            "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
-        },
-      },
-      [`PUT /repos/${REPO}/pulls/12/merge-async`]: {
-        status: 409,
-        json: {
-          status: "pending",
-          details: {
-            uuid: "existing-merge-uuid",
-            expected_head_sha: "evaluated-head-sha",
-          },
-        },
-      },
-      [`GET /repos/${REPO}/pulls/12/merge-async/existing-merge-uuid`]: {
-        json: { status: "merged", details: { sha: "existing-stack-merge-sha" } },
-      },
-    });
-
-    const merge = new GitHubIssueClient().mergePullRequest({
+    // 2. Joining an already-accepted merge (409) and polling to completion
+    const merge = client.mergePullRequest({
       repo: REPO,
       prNumber: 12,
       method: "squash",
@@ -1192,6 +1187,9 @@ describe("GitHubIssueClient", () => {
 
     await expect(merge).resolves.toBe("existing-stack-merge-sha");
     expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      ["POST", "/graphql"],
+      ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
       ["PUT", `/repos/${REPO}/pulls/12/merge`],
       ["POST", "/graphql"],
       ["PUT", `/repos/${REPO}/pulls/12/merge-async`],
@@ -1291,7 +1289,52 @@ describe("GitHubIssueClient", () => {
         method: "squash",
         deleteBranch: false,
       })
-    ).rejects.toThrow("lower stack position(s) 1 are still open");
+    ).rejects.toThrow("lower stack position(s) 1 are not merged");
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["PUT", `/repos/${REPO}/pulls/12/merge`],
+      ["POST", "/graphql"],
+    ]);
+  });
+
+  it("refuses a stack merge when a lower static position is closed without being merged", async () => {
+    const requests = installFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            repository: {
+              pullRequest: {
+                stack: {
+                  entries: {
+                    totalCount: 2,
+                    nodes: [
+                      { position: 1, pullRequest: { number: 11, state: "CLOSED" } },
+                      { position: 2, pullRequest: { number: 12, state: "OPEN" } },
+                    ],
+                  },
+                },
+                stackEntry: { position: 2 },
+              },
+            },
+          },
+        },
+      },
+      [`PUT /repos/${REPO}/pulls/12/merge`]: {
+        status: 403,
+        json: {
+          message:
+            "Merging stacked PRs via this endpoint is not supported. Use the asynchronous merge endpoint instead.",
+        },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().mergePullRequest({
+        repo: REPO,
+        prNumber: 12,
+        method: "squash",
+        deleteBranch: false,
+      })
+    ).rejects.toThrow("lower stack position(s) 1 are not merged");
     expect(requests.map((request) => [request.method, request.path])).toEqual([
       ["PUT", `/repos/${REPO}/pulls/12/merge`],
       ["POST", "/graphql"],
@@ -1423,7 +1466,7 @@ describe("GitHubIssueClient", () => {
         method: "squash",
         deleteBranch: false,
       })
-    ).rejects.toThrow("lower stack position(s) 1 are still open");
+    ).rejects.toThrow("lower stack position(s) 1 are not merged");
 
     await expect(
       client.mergePullRequest({
@@ -1566,7 +1609,7 @@ describe("GitHubIssueClient", () => {
       deleteBranch: false,
     });
     const rejection = expect(merge).rejects.toThrow(
-      "Asynchronous merge polling timed out for test-org/test-repo#12 after 60 polls"
+      "Asynchronous merge polling timed out for test-org/test-repo#12 after 60 seconds"
     );
     await vi.advanceTimersByTimeAsync(60_000);
 
