@@ -205,6 +205,11 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_coalesced: "ignored",
   // Rejection is rollout observability; it records no commitment progress.
   run_yield_rejected: "ignored",
+  // The mesh refusing to schedule an actor whose model class no longer
+  // resolves is the scheduler acting on configuration, not the actor opening
+  // or closing a commitment. The refusal is visible on the actor's own record
+  // and in the dashboard.
+  actor_model_class_unresolved: "ignored",
   stamp_invalid: "ignored",
   // The decider's other events in the same run (`run_start`, `run_yielded`) are
   // what say it was working; withdrawing one scheduled delivery neither opens

@@ -82,8 +82,10 @@ function fromRow(row: ModelClassRow): ModelClass {
 /**
  * SQLite source of truth for model classes. Every lookup reads the committed
  * row directly: a successful `set_model_class` affects the next class
- * selection in this process without a mesh restart, while actor records retain
- * the concrete pool already resolved for them.
+ * selection in this process without a mesh restart, and a class-bound actor's
+ * pool with it — actor records hold a reference to the class, never a copy of
+ * its entries, so an edit here is the edit those actors see (#626). An
+ * explicitly declared pool is a durable snapshot and is unaffected.
  */
 export class ModelClassRepository {
   constructor(private readonly db: Database.Database) {}

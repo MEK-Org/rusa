@@ -56,9 +56,9 @@ export interface RootBootModelConfig {
  * scalar `rootActor` file fields only seed a record that carries no pool at
  * all: a fresh database, or a legacy document that predates the required
  * provider/model contract and is read back as unset. `modelClass` is not
- * decided here: the repository only reads it off a document that also carries
- * a non-empty pool, so a preserved pool keeps its class through the record
- * merge and a seeded one never had a class to lose.
+ * decided here: a class-bound root's pool arrives already resolved from the
+ * live class row (#626), so preserving it preserves the class's current
+ * definition, and a seeded record never had a class to lose.
  *
  * `preflight` runs once per validated entry (the caller instantiates the
  * provider, as worker spawn does for its pool) so an adapter the build lacks
@@ -79,7 +79,20 @@ export function resolveRootBootModelConfig(input: {
   preflight?: (entry: ProviderModelConfig) => void;
 }): RootBootModelConfig {
   const { config, rootId, portable, preflight } = input;
-  const persisted = input.actors.get(rootId)?.modelConfig;
+  const rootRecord = input.actors.get(rootId);
+  // A class-bound root resolves its pool from the class row like any other
+  // actor, so `persisted` below is already the class's current definition. When
+  // that class is missing, deleted, empty or invalid there is no pool at all —
+  // and falling through to the configured tuple would boot root on a selection
+  // nobody chose, the same silent substitution this module exists to prevent
+  // (#626).
+  if (rootRecord?.modelClassError !== undefined) {
+    throw new RootModelConfigStartupError(
+      `root actor '${rootId}' is bound to model class "${rootRecord.modelClass}", which cannot be resolved: ${rootRecord.modelClassError}`,
+      "redefine that model class with set_model_class, or re-pin root to an explicit pool by replacing the root row's model_config in the actors table; startup never falls back to the configured rootActor tuple for a class-bound root"
+    );
+  }
+  const persisted = rootRecord?.modelConfig;
   const resolve = (pool: readonly RawProviderModelConfig[]): ProviderModelConfig[] => {
     const modelConfig = validateModelConfigPool(config, [...pool], { portable });
     for (const entry of modelConfig) preflight?.(entry);

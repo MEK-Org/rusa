@@ -4967,30 +4967,94 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ]);
     });
 
-    it("keeps the persisted pool's class provenance through a restart", async () => {
-      await persistOperatorPool();
-      // A class-bearing (v3) document only ever carries a non-empty pool, so
-      // the merge onto the existing row is what keeps the class: startup
-      // decides the pool and leaves the class alone.
+    // Bind root to a model class by hand, the way a class selection would have
+    // left the row, optionally through a legacy v3 document that still carries
+    // the copy #626 stopped writing.
+    const bindRootToClass = (
+      name: string,
+      definition: ProviderModelConfig[] | undefined,
+      opts?: { legacyV3Pool?: ProviderModelConfig[] }
+    ): void => {
       const db = new Database(join(homeDir, "data", "mesh.db"));
       try {
+        if (definition) {
+          db.prepare(
+            `INSERT INTO model_classes (name, definition_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET definition_json = excluded.definition_json`
+          ).run(
+            name,
+            JSON.stringify({ version: 1, modelConfig: definition }),
+            "2026-09-22T00:00:00.000Z",
+            "2026-09-22T00:00:00.000Z"
+          );
+        }
         db.prepare("UPDATE actors SET model_config = ? WHERE id = ?").run(
-          JSON.stringify({ schemaVersion: 3, entries: operatorPool, modelClass: "frontier" }),
+          opts?.legacyV3Pool
+            ? JSON.stringify({ schemaVersion: 3, entries: opts.legacyV3Pool, modelClass: name })
+            : JSON.stringify({ schemaVersion: 4, modelClass: name }),
           "root"
         );
       } finally {
         db.close();
       }
+    };
+
+    it("boots a class-bound root on the class's current definition and keeps the row reference-only", async () => {
+      await persistOperatorPool();
+      // The legacy v3 copy is deliberately a pool root must NOT boot on: the
+      // class row is the only authority once the actor is class-bound (#626).
+      bindRootToClass("frontier", operatorPool, {
+        legacyV3Pool: [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }],
+      });
 
       const mesh = await boot();
 
       expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
       expect(mesh.actors.get("root")?.modelClass).toBe("frontier");
-      expect(readRootModelConfigRow()).toEqual({
-        schemaVersion: 3,
-        entries: operatorPool,
-        modelClass: "frontier",
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      // Adopting root rewrites its own row, dropping the superseded copy.
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });
+
+      // A class edit reaches root's record with no restart and no rewrite,
+      // while the already-launched root keeps the pool it launched on.
+      const edited = [{ provider: "claude", model: "claude-sonnet-5", effort: "low" }];
+      bindRootToClass("frontier", edited);
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(edited);
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });
+    });
+
+    it("refuses to boot a class-bound root whose class cannot be resolved, leaving the row untouched", async () => {
+      await persistOperatorPool();
+      // Bound to a class nobody has defined — the deleted-class case, which
+      // must not quietly fall back to the configured rootActor tuple.
+      bindRootToClass("frontier", undefined);
+      logCapture.lines.length = 0;
+      let ready = false;
+
+      await runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
       });
+
+      expect(ready).toBe(false);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          level: "error",
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(
+            /bound to model class "frontier", which cannot be resolved/
+          ),
+          action: expect.stringMatching(/redefine that model class with set_model_class/),
+        },
+      ]);
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });
     });
 
     it("does not replace a persisted pool with a changed scalar rootActor tuple", async () => {

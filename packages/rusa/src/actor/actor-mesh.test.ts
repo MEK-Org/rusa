@@ -1183,6 +1183,73 @@ describe("ActorMesh", () => {
     expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
   });
 
+  it("refuses to dispatch a class-bound actor whose class no longer resolves, reporting it once", async () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry, fake, tick } = setup({ events: (event) => events.push(event) });
+    const id = mesh.spawn({ charter: "do work", parentId: "root" });
+    // The shape the repository reads back once the class row is gone: the
+    // binding survives, the pool does not.
+    registry.patch(id, {
+      modelClass: "fast",
+      modelConfig: undefined,
+      modelClassError: 'unknown model class "fast" — no runtime model classes are defined',
+    });
+
+    mesh.sendMessage(id, "begin", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+
+    // A second wake reports the same reason again but does not re-journal it.
+    mesh.sendMessage(id, "begin again", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+    expect(events.filter((e) => e.kind === "actor_model_class_unresolved")).toEqual([
+      {
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: 'unknown model class "fast" — no runtime model classes are defined',
+      },
+    ]);
+
+    // Redefining the class heals the binding without touching the actor row.
+    registry.patch(id, {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      modelClassError: undefined,
+    });
+    mesh.sendMessage(id, "now run", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(1);
+  });
+
+  it("hands a class-bound actor its class's current definition at the dispatch boundary", async () => {
+    const applied: Array<{ id: string; pool: ProviderModelConfig[] }> = [];
+    const { mesh, registry, tick } = setup({
+      onModelSet: (id, pool) => applied.push({ id, pool: [...pool] }),
+    });
+    const classConfigured = mesh.spawn({ charter: "class-bound", parentId: "root" });
+    const explicit = mesh.spawn({ charter: "explicit", parentId: "root" });
+    registry.patch(classConfigured, {
+      modelClass: "fast",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+    });
+    registry.patch(explicit, { modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }] });
+    applied.length = 0;
+
+    // A class edit reaches the record by read-through; the live actor still
+    // holds the pool it was constructed with until its next dispatch (#626).
+    registry.patch(classConfigured, { modelConfig: [{ provider: "claude", model: "edited" }] });
+    registry.patch(explicit, { modelConfig: [{ provider: "claude", model: "edited" }] });
+    mesh.sendMessage(classConfigured, "run", "root");
+    mesh.sendMessage(explicit, "run", "root");
+    await tick();
+
+    expect(applied).toEqual([
+      { id: classConfigured, pool: [{ provider: "claude", model: "edited" }] },
+    ]);
+    // Nothing was staged, so no model-set event was journalled for the refresh.
+    expect(registry.get(classConfigured)?.desiredModelConfig).toBeUndefined();
+  });
+
   it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {
     const { mesh, registry } = setup({
       validateSpawn: (request) => {

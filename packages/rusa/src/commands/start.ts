@@ -2433,6 +2433,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // candidate before registering MCP servers so a resolution failure can't leave
       // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
       // to the root provider.
+      //
+      // A class-bound actor whose class is missing or invalid also arrives with no
+      // pool, but only at rehydration — a spawn validates its class first. The
+      // fallback below is a placeholder for an actor that will not run: the pre-run
+      // gate refuses it while the binding is broken, and the moment the class
+      // resolves again the dispatch boundary hands it the real pool (#626). Report
+      // it here so a restart surfaces the broken binding without waiting for a wake.
+      mesh.modelClassFailure(id);
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
           provider: rootActor.provider,

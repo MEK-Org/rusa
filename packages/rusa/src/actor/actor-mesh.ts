@@ -825,6 +825,20 @@ export class ActorMesh {
     actorId: string,
     capability: string
   ) => Promise<void> | void;
+  /**
+   * The last unresolved-class reason reported per actor, so a permanently
+   * broken binding emits one event rather than one per dispatch attempt.
+   * Cleared when the class resolves again.
+   */
+  private readonly reportedModelClassFailures = new Map<string, string>();
+  /**
+   * The class pool last handed to each live actor, so the dispatch-boundary
+   * refresh re-publishes only after the class actually changed. Without it a
+   * single dispatch would push the same pool at every boundary that calls
+   * {@link applyPendingModel}.
+   */
+  private readonly publishedClassPools = new Map<string, string>();
+
   private readonly onModelSet?: (
     actorId: string,
     modelConfig: ProviderModelConfig[],
@@ -3888,6 +3902,9 @@ export class ActorMesh {
     });
     if (record) this.runRetireCleanups(record);
     this.lifecycles.delete(id);
+    // Per-actor model-class bookkeeping dies with the actor.
+    this.publishedClassPools.delete(id);
+    this.reportedModelClassFailures.delete(id);
     this.log(`retired ${id}`);
   }
 
@@ -4165,31 +4182,103 @@ export class ActorMesh {
    */
   applyPendingModel(id: string): void {
     const record = this.actors.get(id);
-    if (!record || record.desiredModelConfig === undefined) return;
+    if (!record) return;
+    if (record.desiredModelConfig === undefined) {
+      this.refreshClassBoundPool(id, record);
+      return;
+    }
 
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
+    const boundClass = record.desiredModelClass;
 
     this.actors.patch(id, {
       modelConfig: newModelConfig,
-      modelClass: record.desiredModelClass,
+      modelClass: boundClass,
       desiredModelConfig: undefined,
       desiredModelClass: undefined,
     });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
-    if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
+    if (boundClass !== undefined) {
+      // A class binding persists the reference, not the pool the selection
+      // resolved to, so the pool is whatever the class says now — verify the
+      // binding landed and publish the live definition rather than a snapshot
+      // that a concurrent class edit may already have overtaken (#626).
+      if (verified.modelClass !== boundClass) {
+        throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
+      }
+      if (!verified.modelConfig) {
+        throw new Error(
+          `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
+        );
+      }
+    } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
 
-    this.onModelSet?.(id, newModelConfig, verified);
+    const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+    // Keep the refresh bookkeeping in step: this pool is now the live actor's,
+    // whether it came from a class binding or an explicit pin.
+    if (boundClass !== undefined) {
+      this.publishedClassPools.set(id, JSON.stringify(appliedModelConfig));
+    } else {
+      this.publishedClassPools.delete(id);
+    }
+    this.onModelSet?.(id, appliedModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(newModelConfig)}`,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
     });
+  }
+
+  /**
+   * Hand a class-bound actor's current class definition to the live actor
+   * object at its dispatch boundary.
+   *
+   * The record already reads through to the class row, so nothing durable
+   * changes here — but a running actor caches the pool it was constructed
+   * with, and without this refresh an edit made after construction would not
+   * reach the actor's next run (#626). An unresolvable class is left to the
+   * pre-run gate, which refuses the run outright.
+   */
+  private refreshClassBoundPool(id: string, record: ActorRecord): void {
+    if (record.modelClass === undefined || !record.modelConfig) return;
+    if (!this.runs.liveActor(id)?.setModelConfig) return;
+    const pool = JSON.stringify(record.modelConfig);
+    if (this.publishedClassPools.get(id) === pool) return;
+    this.publishedClassPools.set(id, pool);
+    this.onModelSet?.(id, record.modelConfig, record);
+  }
+
+  /**
+   * Why a class-bound actor cannot be scheduled right now, or undefined when
+   * its class resolves (or it declares an explicit pool).
+   *
+   * Public because the externally-constructed root gates its own dispatch and
+   * must refuse on the same terms as every mesh-created actor: running a
+   * class-bound actor whose class is gone means running the stale pool the
+   * live actor still holds, which is precisely what binding to a class is
+   * supposed to rule out (#626).
+   */
+  modelClassFailure(id: string): string | undefined {
+    const reason = this.actors.get(id)?.modelClassError;
+    if (reason === undefined) {
+      this.reportedModelClassFailures.delete(id);
+      return undefined;
+    }
+    if (this.reportedModelClassFailures.get(id) !== reason) {
+      this.reportedModelClassFailures.set(id, reason);
+      this.recordEvent({
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: reason,
+      });
+    }
+    return reason;
   }
 
   /**
