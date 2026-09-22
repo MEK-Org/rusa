@@ -36,6 +36,9 @@ const dashboardInstance = dashboardInstances[process.env.RUSA_INSTANCE] ?? dashb
 if (!existsSync(flutterAppDir)) {
   throw new Error(`Flutter dashboard app missing at ${flutterAppDir}`);
 }
+if (!existsSync(resolve(flutterAppDir, "pubspec.yaml"))) {
+  throw new Error(`Flutter dashboard app missing pubspec.yaml at ${flutterAppDir}`);
+}
 
 // Build from a clean context every time. A warm `.dart_tool/flutter_build`
 // cache can hand `flutter build web` a web_plugin_registrant.dart generated for
@@ -46,7 +49,7 @@ if (!existsSync(flutterAppDir)) {
 for (const generated of [
   ".dart_tool",
   "build",
-  ".flutter-plugins",
+  ".flutter-plugins", // legacy Flutter plugin registry; pruned defensively
   ".flutter-plugins-dependencies",
 ]) {
   rmSync(resolve(flutterAppDir, generated), { recursive: true, force: true });
