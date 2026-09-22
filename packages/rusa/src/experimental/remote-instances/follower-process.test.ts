@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { beforeAll, expect, it } from "vitest";
@@ -651,3 +651,182 @@ it("survives synthetic leader restart with follower auto-reconnect, actor re-att
     rmSync(home, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("retains follower session across 20s-hold vs 25s-abort race without duplicate registration purgatory, while explicit 410 re-registers", async () => {
+  const home = mkdtempSync(join(tmpdir(), "rusa-follower-race-"));
+  const token = randomBytes(32).toString("hex");
+  const tokenFile = join(home, "token");
+  writeFileSync(tokenFile, token, { mode: 0o600 });
+
+  const hub = new FollowerHub(token);
+  const hubOrigin = await hub.listen("127.0.0.1", 0);
+  const hubPort = Number(new URL(hubOrigin).port);
+
+  let registerCount = 0;
+  const pollSessions: string[] = [];
+  let heldPoll: ServerResponse | undefined;
+
+  const proxy = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const rawBody = Buffer.concat(chunks);
+    const body =
+      rawBody.length > 0 ? (JSON.parse(rawBody.toString()) as Record<string, unknown>) : {};
+    const path = req.url ?? "/";
+    let dropPollResponse = false;
+
+    if (path === "/register") {
+      registerCount++;
+    } else if (path === "/poll") {
+      if (typeof body.session === "string") {
+        pollSessions.push(body.session);
+      }
+      if (pollSessions.length === 2) {
+        // The leader completes its 20-second long poll, but a lost response
+        // leaves the follower waiting until its 25-second client timeout.
+        dropPollResponse = true;
+        res.on("close", () => {
+          heldPoll = undefined;
+        });
+      } else if (pollSessions.length > 2) {
+        heldPoll = res;
+        return;
+      }
+    }
+
+    const headers = { ...req.headers, host: `127.0.0.1:${hubPort}` };
+    const upstream = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: hubPort,
+        path: req.url,
+        method: req.method,
+        headers,
+      },
+      (incoming) => {
+        if (dropPollResponse) {
+          incoming.resume();
+          return;
+        }
+        res.writeHead(incoming.statusCode ?? 502, incoming.headers);
+        incoming.pipe(res);
+      }
+    );
+    upstream.on("error", () => {
+      if (!res.headersSent) res.writeHead(502).end();
+      else res.destroy();
+    });
+    upstream.end(rawBody);
+  });
+
+  function respondToHeldPoll(status: number, error: string): void {
+    const response = heldPoll;
+    if (!response) throw new Error("Expected a held follower poll");
+    heldPoll = undefined;
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error }));
+  }
+
+  await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+  const proxyPort = (proxy.address() as { port: number }).port;
+  const proxyOrigin = `http://127.0.0.1:${proxyPort}`;
+
+  const child = spawn(
+    process.execPath,
+    [
+      resolve("build/follower/follower.js"),
+      "--leader",
+      proxyOrigin,
+      "--id",
+      "test-race",
+      "--home",
+      home,
+      "--token-file",
+      tokenFile,
+      "--sandbox",
+      "none",
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  const exited = once(child, "exit");
+  let logs = "";
+  child.stdout.on("data", (chunk) => {
+    logs += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    logs += chunk;
+  });
+
+  try {
+    await waitUntil(() => hub.list().length === 1);
+    expect(registerCount).toBe(1);
+    await waitUntil(() => pollSessions.length > 0);
+    const initialSession = pollSessions[0];
+    expect(initialSession).toBeTruthy();
+
+    const channel = hub.createHost("test-race", "actor-1");
+    let channelExited = false;
+    channel.on("exit", () => {
+      channelExited = true;
+    });
+    const ready = once(channel, "message");
+    channel.send(
+      {
+        type: "init",
+        bootstrap: {
+          id: "actor-1",
+          cwd: "/ignored",
+          providerOptions: { name: "fake", providers: { fake: { type: "fake" } } },
+        },
+      },
+      (error) => {
+        if (error) throw error;
+      }
+    );
+    expect((await ready)[0]).toEqual({ type: "ready", pid: child.pid });
+
+    await waitUntil(
+      () => registerCount > 1 || pollSessions.filter((s) => s === initialSession).length >= 3,
+      30_000
+    );
+    expect(registerCount).toBe(1);
+    expect(pollSessions.filter((s) => s === initialSession).length).toBeGreaterThanOrEqual(3);
+    expect(channelExited).toBe(false);
+
+    respondToHeldPoll(409, "Poll already pending");
+    await waitUntil(
+      () => registerCount > 1 || pollSessions.filter((s) => s === initialSession).length >= 4,
+      4000
+    );
+    expect(registerCount).toBe(1);
+    expect(pollSessions.filter((s) => s === initialSession).length).toBeGreaterThanOrEqual(4);
+    expect(channelExited).toBe(false);
+
+    const unregisterResp = await fetch(new URL("/unregister", hubOrigin), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "test-race", session: initialSession }),
+    });
+    expect(unregisterResp.status).toBe(200);
+
+    respondToHeldPoll(410, "Session expired");
+    await waitUntil(() => registerCount >= 2, 5000);
+    expect(registerCount).toBe(2);
+    await waitUntil(() => pollSessions.some((s) => s !== initialSession), 5000);
+
+    child.kill("SIGTERM");
+    await exited;
+    expect(child.exitCode).toBe(0);
+  } catch (error) {
+    throw new Error(`${String(error)}\nFollower logs:\n${logs}`);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    proxy.closeAllConnections();
+    await new Promise<void>((r) => proxy.close(() => r()));
+    await hub.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 50_000);
