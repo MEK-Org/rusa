@@ -3834,6 +3834,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
           getFollowers: () => (followerHub ? followerHub.list() : []),
+          updateFollower: (id, opts) => {
+            if (!followerHub) throw new Error("Follower gateway not enabled");
+            return followerHub.updateFollower(id, opts);
+          },
+          updateAllFollowers: (opts) => {
+            if (!followerHub) throw new Error("Follower gateway not enabled");
+            return followerHub.updateAllFollowers(opts);
+          },
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),

@@ -19,8 +19,8 @@ Leader Node process                       Follower Node process
 
 The earlier local-process demo, per-actor Node entrypoint, and `--worker-runtime`
 mode have been removed. Protocol version 3 requires rebuilding both ends;
-old followers are rejected at enrollment. Existing running instances are not
-automatically upgraded or restarted.
+old followers are rejected at enrollment. Follower instances can be updated
+via the mesh control plane without actor coordination (see Follower updates below).
 
 The follower gateway can be hosted either persistently in `rusa start` (for staging
 and production) via `config.yaml`, or in a disposable E2E instance via `rusa am-up`.
@@ -222,6 +222,40 @@ Before enabling placement, take the normal `mesh.db` backup for the deploy. Once
 has been written, do not roll the database back to a pre-v2 binary: that binary strictly rejects
 the newer document. Roll forward with a fix, or restore the pre-rollout database snapshot as a
 coordinated service rollback. There is no SQL migration to reverse.
+
+## Follower updates and lifecycle management
+
+Followers support an explicit, authenticated mesh-level update mechanism that does
+not require actor coordination or interrupt running actors prematurely.
+
+### Compatibility and version fencing
+
+Follower nodes report their active git `commitSha` and `protocolVersion` upon
+initial enrollment via `POST /register`.
+- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 4). Mismatches fail closed with HTTP 409.
+- Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
+
+### Build and deploy trigger semantics
+
+Follower updates can be triggered via three paths:
+1. **FollowerHub Gateway API** (authenticated via enrollment bearer token):
+   - `POST /followers/:id/update` - triggers update for a single follower with optional `{ targetSha, branch }`.
+   - `GET /followers/:id/update` - queries the last known update status of a follower.
+   - `POST /followers/update-all` - triggers updates across all currently connected followers.
+2. **Dashboard REST API** (loopback control API):
+   - `POST /api/mesh/followers/:id/update`
+   - `GET /api/mesh/followers/:id/update`
+   - `POST /api/mesh/followers/update-all`
+The leader's self-update does not enqueue follower updates before its replacement has booted. Operators use the authenticated gateway or dashboard endpoint after verifying the leader update; this keeps a failed leader self-update from moving followers to an unproven revision.
+
+### Follower-side update execution and safe rollback boundary
+
+When a follower receives a `FollowerUpdateCommand`, it executes `executeFollowerUpdate` in the background:
+- **Phased reporting**: Status transitions from `pending` through `fetching`, `building`, `draining`, and `restarting`; terminal non-restart outcomes are `already_current` or `failed`.
+- **Observable status reporting**: Follower status updates are dispatched back to the leader as `$instance` event records (`FollowerUpdateStatusEvent`) over the existing multiplexed event batch channel (`POST /events`), updating the leader's in-memory `FollowerInfo` without interrupting or conflicting with actor-addressed messages.
+- **Staging build isolation**: Followers build into a staging directory (`build/follower.new`) using `RUSA_FOLLOWER_DIST_DIR=build/follower.new`.
+- **Safe rollback boundary**: Active actors continue executing during pull and build. The follower then closes admission and waits up to its configured drain timeout for them to finish before restart; only a timeout permits interruption. If any later step fails after a green artifact promotion (including drain or a returning restart hook), the follower restores both the previous artifact and `git reset --hard <oldSha>`. A rollback failure is surfaced in the final failed status.
+- **Cutover recovery**: Only after a green build succeeds is `build/follower.new` promoted to `build/follower`. If promotion fails after the old directory moved aside, the implementation restores that old directory before reporting failure.
 
 ## Provider and computer-use support
 

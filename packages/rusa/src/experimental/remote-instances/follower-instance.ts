@@ -3,13 +3,14 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
-import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
+import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
 import type { ProviderFactory } from "./protocol.js";
 
 /** Execution half of an instance: many ordinary Actors, one Node process. */
 export class FollowerInstance {
   private actors = new Map<string, ReturnType<typeof createActorRuntime>>();
   private stopped = false;
+  private draining = false;
 
   constructor(
     private readonly home: string,
@@ -22,13 +23,16 @@ export class FollowerInstance {
     return [...this.actors.keys()];
   }
 
-  dispatch({ actorId, message }: FollowerCommand): void {
+  dispatch({ actorId, message }: FollowerActorCommand): void {
     if (this.stopped) return;
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(actorId)) throw new Error("Invalid actor ID");
     if (message.type !== "init") {
       this.actors.get(actorId)?.dispatch(message);
       return;
     }
+    // Existing actors may finish normally during an update, but no new actor
+    // is admitted once the follower has begun its bounded quiescence window.
+    if (this.draining) return;
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
     let actor = this.actors.get(actorId);
@@ -60,6 +64,18 @@ export class FollowerInstance {
         actorOptions: { ...message.bootstrap.actorOptions, addDirs: [], sandbox: this.sandbox },
       },
     });
+  }
+
+  beginDrain(): void {
+    this.draining = true;
+  }
+
+  async waitForQuiescence(timeoutMs: number): Promise<{ quiesced: boolean; waitedMs: number }> {
+    const startedAt = Date.now();
+    while (this.actorIds.length && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return { quiesced: this.actorIds.length === 0, waitedMs: Date.now() - startedAt };
   }
 
   close(): void {

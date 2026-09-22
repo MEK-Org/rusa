@@ -120,3 +120,43 @@ export type ActorEvent =
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
   | { type: "fatal"; error: string };
+
+export type FollowerUpdateStatusPhase =
+  | "pending"
+  | "fetching"
+  | "building"
+  | "draining"
+  | "restarting"
+  | "failed"
+  | "already_current";
+
+export type FollowerUpdateStep = "pull" | "install" | "build" | "drain";
+
+export interface FollowerUpdateStatus {
+  updateId: string;
+  status: FollowerUpdateStatusPhase;
+  step?: FollowerUpdateStep;
+  error?: string;
+  oldSha?: string;
+  newSha?: string;
+  rollbackFailed?: boolean;
+  timestamp: string;
+}
+
+export interface FollowerUpdateCommand {
+  type: "update";
+  updateId: string;
+  targetSha?: string;
+  branch?: string;
+}
+
+export interface FollowerUpdateStatusEvent {
+  type: "update_status";
+  updateId: string;
+  status: FollowerUpdateStatusPhase;
+  step?: FollowerUpdateStep;
+  error?: string;
+  oldSha?: string;
+  newSha?: string;
+  rollbackFailed?: boolean;
+}

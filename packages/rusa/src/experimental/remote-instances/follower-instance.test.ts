@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
+import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
 
 const instances: ReturnType<typeof createHarness>[] = [];
@@ -29,6 +30,21 @@ afterEach(async () => {
 });
 
 describe("monolithic follower instance", () => {
+  it("closes admission before waiting for active actors to quiesce", async () => {
+    const follower = new FollowerInstance("/tmp/rusa-follower-drain", false, () => {});
+    follower.beginDrain();
+    follower.dispatch({
+      actorId: "new-during-drain",
+      message: {
+        type: "init",
+        bootstrap: { id: "new-during-drain", cwd: "/tmp/rusa-follower-drain" },
+      },
+    });
+
+    expect(follower.actorIds).toEqual([]);
+    await expect(follower.waitForQuiescence(20)).resolves.toMatchObject({ quiesced: true });
+  });
+
   it("hosts multiple Actors in one PID and retires one without stopping its sibling", async () => {
     const h = setup();
     const first = h.spawn("First charter");
