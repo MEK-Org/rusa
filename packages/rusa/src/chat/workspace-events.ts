@@ -94,6 +94,12 @@ export class WorkspaceEventsSubscriber {
   private readonly renewIntervalMs: number;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  /**
+   * Set by `close()` and never cleared: a subscriber is disposed once. Keeping
+   * `running` from ever going true again is what keeps a pass abandoned at
+   * close gated for good (see {@link request}).
+   */
+  private closed = false;
   private nextRetryMs = RETRY_BACKOFF_MS;
   /** The subscription we're currently keeping alive (resource name). */
   private subscriptionName: string | null = null;
@@ -124,12 +130,22 @@ export class WorkspaceEventsSubscriber {
    * {@link currentSubscription} to see whether a subscription is live yet.
    */
   async start(): Promise<void> {
-    if (this.running) return;
+    if (this.running || this.closed) return;
     this.running = true;
     await this.tick(true);
   }
 
+  /**
+   * Stop maintenance. Returns at once, whatever the pass in flight is doing:
+   * shutdown never waits on a Workspace Events request, stalled or not. Letting
+   * the pass go is safe because from here on it is inert — its next `request()`
+   * is refused, its failure arms no retry and raises no lapse, and `start()`
+   * will not run this instance again, so the pass can never be un-gated. What it
+   * may still do in-process is finish bookkeeping for a request that had
+   * already answered before close; nothing more leaves the process.
+   */
   async close(): Promise<void> {
+    this.closed = true;
     this.running = false;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -149,6 +165,11 @@ export class WorkspaceEventsSubscriber {
     this.timer.unref?.();
   }
 
+  /**
+   * One maintenance pass. Passes never overlap: the next timer is armed only
+   * once a pass has ended (either branch below), and `start()` runs at most one
+   * boot pass per instance.
+   */
   private async tick(boot: boolean): Promise<void> {
     if (!this.running) return;
     try {
@@ -156,6 +177,19 @@ export class WorkspaceEventsSubscriber {
       this.nextRetryMs = RETRY_BACKOFF_MS;
       this.schedule(this.renewIntervalMs);
     } catch (err) {
+      // A pass that outlived its subscriber stops here. `schedule()` would
+      // already refuse the retry; what this adds is silence where it belongs:
+      // after close nothing is expected to keep delivering, so a lapse this
+      // pass would report is shutdown, not news, and pages nobody. A debug
+      // record keeps the abandoned pass visible to anyone reading a shutdown.
+      if (!this.running) {
+        this.logger?.debug("chat_subscription_pass_abandoned", {
+          topic: this.opts.topic,
+          subscriptionName: this.subscriptionName,
+          err,
+        });
+        return;
+      }
       const retryInMs = this.nextRetryMs;
       this.nextRetryMs = Math.min(retryInMs * 2, MAX_RETRY_BACKOFF_MS);
       this.logger?.warn(boot ? "chat_subscription_boot_failed" : "chat_subscription_retry_failed", {
@@ -205,6 +239,7 @@ export class WorkspaceEventsSubscriber {
    */
   private async ensure(): Promise<void> {
     const matches = await this.list();
+    if (!this.running) throw new Error("workspace-events subscriber is closed");
     const now = Date.now();
     // The API does not promise list order, so rank rather than take the first:
     // an ACTIVE subscription is already delivering and beats one that would
@@ -218,6 +253,7 @@ export class WorkspaceEventsSubscriber {
     // only once its reactivation below succeeds.
     const delivering = keep?.state === "ACTIVE" ? [keep] : [];
     for (const extra of matches) {
+      if (!this.running) throw new Error("workspace-events subscriber is closed");
       if (extra === keep || !extra.name) continue;
       const reason = isLapsed(extra, now) ? "lapsed" : "duplicate";
       try {
@@ -228,6 +264,7 @@ export class WorkspaceEventsSubscriber {
           reason,
         });
       } catch (err) {
+        if (!this.running) throw err;
         if (reason === "duplicate" && extra.state === "ACTIVE") delivering.push(extra);
         this.logger?.warn("chat_subscription_prune_failed", {
           topic: this.opts.topic,
@@ -265,6 +302,7 @@ export class WorkspaceEventsSubscriber {
       await this.renew(keep.name);
       this.confirmActive(keep.name, "chat_subscription_renewed");
     } catch (err) {
+      if (!this.running) throw err;
       // A listed subscription the API no longer knows (404) is replaced right
       // away. Any other renew failure is retried with backoff: if the
       // subscription really has lapsed, its `expireTime` moves it onto the
@@ -386,7 +424,18 @@ export class WorkspaceEventsSubscriber {
   }
 
   private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+    // Every outward call a pass makes goes through here, so this is where
+    // disposal stops one: a pass that resumes after `close()` — mid-`ensure`,
+    // between a list and the prune it implies, or while awaiting a token — gets
+    // no further than its next request step, and the world outside the process
+    // sees nothing more from it.
+    // Whatever the pass had already done out there stays done — a subscription
+    // it created, a duplicate it had not yet pruned — and the next pass to run
+    // against this topic, in this process or the one that replaces it, lists
+    // and converges on it like any other leftover.
+    if (!this.running) throw new Error("workspace-events subscriber is closed");
     const token = await this.opts.getToken();
+    if (!this.running) throw new Error("workspace-events subscriber is closed");
     const resp = await this.fetchImpl(`${WE_API}${path}`, {
       method,
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
