@@ -12,6 +12,7 @@ import {
   MEDIA_TOKEN_RE,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
+import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { formatVisibleActorSignature } from "./actor-signature.js";
@@ -280,6 +281,22 @@ export interface ChatWriteMcpOptions {
   workDir?: string;
   /** Currently selected inbox entries for this run, used to deterministically enforce reply routing (#611). */
   selectedInboxEntries?: readonly InboxEntry[] | (() => readonly InboxEntry[]);
+  /** Optional structured logger for reply routing diagnostics. */
+  logger?: Logger;
+}
+
+function extractChatSpace(entry: InboxEntry): string | undefined {
+  const payload = entry.payload;
+  if (typeof payload?.spaceName === "string" && payload.spaceName.trim().length > 0) {
+    return payload.spaceName.trim();
+  }
+  if (typeof payload?.threadName === "string" && payload.threadName.includes("/threads/")) {
+    return payload.threadName.trim().split("/threads/")[0];
+  }
+  if (typeof entry.source === "string" && entry.source.startsWith("chat_space:")) {
+    return entry.source.slice("chat_space:".length).trim();
+  }
+  return undefined;
 }
 
 /**
@@ -287,72 +304,147 @@ export interface ChatWriteMcpOptions {
  * actor's selected inbox work (#611).
  *
  * - A selected top-level Google Chat message replies top-level (omitting threadName)
- *   unless explicitly requested to create a thread.
+ *   unless explicitly requested to create a thread via `createThread: true`.
  * - A selected reply in an existing thread responds in that same thread.
- * - Without a matching selected chat entry, caller-supplied threadName is preserved.
+ * - Supplying a threadName that does not match any selected entry in this space is
+ *   preserved as an intentional send to a different thread.
+ * - When multiple chat entries in this space disagree or are mixed, omitting threadName
+ *   leaves routing untouched rather than guessing.
  */
 export function resolveChatReplyThreadName(
   spaceName: string,
   callerThreadName: string | undefined,
   createThread: boolean | undefined,
-  selectedEntries: readonly InboxEntry[] | undefined
+  selectedEntries: readonly InboxEntry[] | undefined,
+  logger?: Logger
 ): string | undefined {
   if (!selectedEntries || selectedEntries.length === 0) {
     return callerThreadName;
   }
 
-  let selectedChatEntry: InboxEntry | undefined;
-  for (const entry of selectedEntries) {
-    if (entry.payload.type === "gchat.message" || entry.source.startsWith("chat_space:")) {
-      const payloadSpace =
-        typeof entry.payload.spaceName === "string" && entry.payload.spaceName.trim().length > 0
-          ? entry.payload.spaceName.trim()
-          : typeof entry.payload.threadName === "string" &&
-              entry.payload.threadName.includes("/threads/")
-            ? entry.payload.threadName.trim().split("/threads/")[0]
-            : undefined;
-      if (payloadSpace === spaceName) {
-        selectedChatEntry = entry;
-        break;
-      }
+  // Find all selected chat entries belonging to spaceName
+  const matchingEntries = selectedEntries.filter((entry) => {
+    if (entry.payload?.type === "gchat.message" || entry.source?.startsWith("chat_space:")) {
+      return extractChatSpace(entry) === spaceName;
     }
-  }
+    return false;
+  });
 
-  if (!selectedChatEntry && selectedEntries.length === 1) {
-    const single = selectedEntries[0];
-    if (
-      single &&
-      (single.payload.type === "gchat.message" || single.source.startsWith("chat_space:"))
-    ) {
-      selectedChatEntry = single;
-    }
-  }
-
-  if (!selectedChatEntry) {
+  if (matchingEntries.length === 0) {
     return callerThreadName;
   }
 
-  const payload = selectedChatEntry.payload;
-  const selectedMessageName =
-    typeof payload.messageName === "string" && payload.messageName.trim().length > 0
-      ? payload.messageName.trim()
-      : undefined;
-  const selectedThreadName =
-    typeof payload.threadName === "string" && payload.threadName.trim().length > 0
-      ? payload.threadName.trim()
+  const parsedEntries = matchingEntries.map((entry) => {
+    const payload = entry.payload;
+    const messageName =
+      typeof payload?.messageName === "string" && payload.messageName.trim().length > 0
+        ? payload.messageName.trim()
+        : undefined;
+    const threadName =
+      typeof payload?.threadName === "string" && payload.threadName.trim().length > 0
+        ? payload.threadName.trim()
+        : undefined;
+    const isExistingThread =
+      typeof threadName === "string" &&
+      threadName.length > 0 &&
+      !isGchatThreadHead(messageName, threadName);
+    const isThreadHead = !isExistingThread;
+    return { entry, messageName, threadName, isThreadHead, isExistingThread };
+  });
+
+  const trimmedCallerThread =
+    typeof callerThreadName === "string" && callerThreadName.trim().length > 0
+      ? callerThreadName.trim()
       : undefined;
 
-  const isThreadHead = isGchatThreadHead(selectedMessageName, selectedThreadName);
-
-  if (selectedThreadName && !isThreadHead) {
-    // Existing thread: reply must stay inside this thread
-    return selectedThreadName;
+  // If caller explicitly requested to create a thread under a selected top-level message
+  if (createThread === true) {
+    const topLevelEntries = parsedEntries.filter((e) => e.isThreadHead && e.threadName);
+    if (topLevelEntries.length === 1 && topLevelEntries[0]?.threadName) {
+      const headThread = topLevelEntries[0].threadName;
+      if (trimmedCallerThread && trimmedCallerThread !== headThread) {
+        logger?.info("chat_reply_thread_overridden", {
+          spaceName,
+          callerThreadName: trimmedCallerThread,
+          effectiveThreadName: headThread,
+          reason: "create_thread_under_selected_head",
+        });
+      }
+      return headThread;
+    }
+    if (topLevelEntries.length > 1) {
+      const firstThread = topLevelEntries[0]?.threadName;
+      if (firstThread && topLevelEntries.every((e) => e.threadName === firstThread)) {
+        if (trimmedCallerThread && trimmedCallerThread !== firstThread) {
+          logger?.info("chat_reply_thread_overridden", {
+            spaceName,
+            callerThreadName: trimmedCallerThread,
+            effectiveThreadName: firstThread,
+            reason: "create_thread_under_selected_head",
+          });
+        }
+        return firstThread;
+      }
+      logger?.warn("chat_reply_ambiguous_create_thread", {
+        spaceName,
+        matchingCount: topLevelEntries.length,
+      });
+      return trimmedCallerThread;
+    }
+    return trimmedCallerThread;
   }
 
-  // Top-level message: reply top-level (omit threadName) unless explicitly requested
-  if (createThread === true || payload.createThread === true) {
-    return callerThreadName ?? selectedThreadName;
+  // Case 1: Caller specified a threadName
+  if (trimmedCallerThread !== undefined) {
+    const matchingTarget = parsedEntries.find((e) => e.threadName === trimmedCallerThread);
+
+    if (!matchingTarget) {
+      // Caller deliberately targeted a different thread not in the current selection.
+      // Preserve callerThreadName without overriding it.
+      return trimmedCallerThread;
+    }
+
+    if (matchingTarget.isThreadHead) {
+      // Caller passed the top-level message's thread handle without createThread: true.
+      // Mechanically strip threadName to reply top-level (#611).
+      logger?.info("chat_reply_thread_overridden", {
+        spaceName,
+        callerThreadName: trimmedCallerThread,
+        effectiveThreadName: undefined,
+        reason: "selected_toplevel_message",
+      });
+      return undefined;
+    }
+
+    // Selected entry is an existing thread reply and matches caller's thread.
+    return matchingTarget.threadName;
   }
+
+  // Case 2: Caller omitted threadName
+  // All entries are top-level messages -> reply top-level (omit threadName)
+  if (parsedEntries.every((e) => e.isThreadHead)) {
+    return undefined;
+  }
+
+  // All entries are in the same existing thread -> reply in that thread
+  const firstThread = parsedEntries[0]?.threadName;
+  if (
+    firstThread &&
+    parsedEntries.every((e) => e.isExistingThread && e.threadName === firstThread)
+  ) {
+    logger?.info("chat_reply_assigned_thread", {
+      spaceName,
+      effectiveThreadName: firstThread,
+      reason: "selected_thread_entry",
+    });
+    return firstThread;
+  }
+
+  // Ambiguous: mixed or disagreeing selected entries in this space.
+  logger?.warn("chat_reply_ambiguous_selection", {
+    spaceName,
+    matchingCount: parsedEntries.length,
+  });
   return undefined;
 }
 
@@ -431,12 +523,14 @@ export function createChatWriteMcpServer(
         threadName: z
           .string()
           .optional()
-          .describe("Thread resource name to reply within; omit to start a new thread"),
+          .describe(
+            "Thread resource name to reply within. If an inbox entry is selected for this space, reply routing automatically targets that message/thread: top-level entries reply top-level (threadName omitted), and in-thread entries reply in-thread (threadName filled in). Supplying a different existing thread targets that thread."
+          ),
         createThread: z
           .boolean()
           .optional()
           .describe(
-            "Explicitly create a new thread under a selected top-level message; omit or false to reply top-level"
+            "When replying to a selected top-level message, set to true to explicitly create a new thread under it instead of replying top-level. Has no effect if no top-level message is selected."
           ),
         attachments: z
           .array(
@@ -551,7 +645,8 @@ export function createChatWriteMcpServer(
           spaceName,
           threadName,
           createThread,
-          selectedEntries
+          selectedEntries,
+          options.logger
         );
         const res = await chatClient.send(spaceName, signedText(text), {
           ...(effectiveThreadName ? { threadName: effectiveThreadName } : {}),

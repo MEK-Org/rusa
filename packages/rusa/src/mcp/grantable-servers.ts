@@ -3,6 +3,7 @@ import type { CalendarClientProvider } from "../calendar/calendar-client.js";
 import type { ChatClient } from "../chat/types.js";
 import type { DriveClient } from "../drive/drive-client.js";
 import type { GmailClient } from "../email/gmail-client.js";
+import type { Logger } from "../observability/logger.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { McpServerSpec } from "../providers/types.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
@@ -76,6 +77,8 @@ export interface GrantableServerDeps {
   getRunSelectionForActor: (actorId: string) => RawProviderModelConfig | undefined;
   /** Currently selected inbox entries for an actor run, used to route replies (#611). */
   selectedInboxEntriesForActor?: (actorId: string) => readonly InboxEntry[];
+  /** Optional structured logger for diagnostics. */
+  logger?: Logger;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
   driveClients: DriveClient;
@@ -210,6 +213,7 @@ export function buildGrantableServers(
         selectedInboxEntries: deps.selectedInboxEntriesForActor
           ? () => deps.selectedInboxEntriesForActor?.(selfId) ?? []
           : undefined,
+        logger: deps.logger,
       });
     });
   }
