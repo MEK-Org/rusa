@@ -6,7 +6,7 @@ import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { createQuotaService } from "../mcp/quota-mcp.js";
-import { createLogger } from "../observability/logger.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
@@ -39,11 +39,12 @@ export interface RunQuotaCoordinatorOptions {
   relocate?: boolean;
   /** Stage-0 rollout mode: serve copied durable data without collecting new probes. */
   probeOff?: boolean;
-}
-
-/** A running coordinator, exposed so integration callers can stop it cleanly. */
-export interface RunningQuotaCoordinator {
-  stop(): Promise<void>;
+  /** Optional cancellation signal to stop the running coordinator cleanly without process.exit. */
+  signal?: AbortSignal;
+  /** Optional callback invoked once the coordinator socket is listening and background loops are active. */
+  onReady?: () => void;
+  /** Optional logger override for tests or custom logging sinks. */
+  logger?: Logger;
 }
 
 /**
@@ -215,10 +216,8 @@ export function coordinatorProviderLanes(config: RusaConfig): {
   return { configuredProviders, collectionProviders };
 }
 
-export async function startQuotaCoordinator(
-  opts: RunQuotaCoordinatorOptions = {}
-): Promise<RunningQuotaCoordinator> {
-  const log = createLogger({ context: { component: "quota-coordinator" } });
+export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
+  const log = opts.logger ?? createLogger({ context: { component: "quota-coordinator" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
   const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
@@ -256,6 +255,15 @@ export async function startQuotaCoordinator(
     const probeDb = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
       assertQuotaSchemaVersion(probeDb, QUOTA_SCHEMA_VERSION);
+    } catch (err) {
+      if (err instanceof SchemaVersionRefusalError) {
+        log.error(err.message);
+        if (opts.signal) {
+          throw err;
+        }
+        process.exit(1);
+      }
+      throw err;
     } finally {
       probeDb.close();
     }
@@ -356,35 +364,50 @@ export async function startQuotaCoordinator(
   }
   backups.start();
   log.info("Quota coordinator ready and listening for requests");
+  opts.onReady?.();
 
-  return {
-    stop: async () => {
-      log.info("Stopping quota-coordinator service...");
-      backups.stop();
-      collection?.stop();
-      await service.stop();
-      store.close();
-    },
-  };
-}
-
-export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {}): Promise<void> {
-  try {
-    const running = await startQuotaCoordinator(opts);
+  return new Promise<void>((resolvePromise, rejectPromise) => {
     let stopping = false;
-    const shutdown = async () => {
+    const cleanup = async () => {
       if (stopping) return;
       stopping = true;
-      await running.stop();
+      removeListeners();
+      try {
+        log.info("Stopping quota-coordinator service...");
+        backups.stop();
+        collection?.stop();
+        await service.stop();
+        store.close();
+      } catch (err) {
+        log.error("Error stopping quota coordinator", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
+    const onSig = async () => {
+      await cleanup();
       process.exit(0);
     };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-  } catch (err) {
-    if (err instanceof SchemaVersionRefusalError) {
-      createLogger({ context: { component: "quota-coordinator" } }).error(err.message);
-      process.exit(1);
+
+    const onAbort = async () => {
+      await cleanup();
+      resolvePromise();
+    };
+
+    const removeListeners = () => {
+      process.removeListener("SIGINT", onSig);
+      process.removeListener("SIGTERM", onSig);
+      opts.signal?.removeEventListener("abort", onAbort);
+    };
+
+    if (opts.signal?.aborted) {
+      onAbort().catch(rejectPromise);
+      return;
     }
-    throw err;
-  }
+
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    process.on("SIGINT", onSig);
+    process.on("SIGTERM", onSig);
+  });
 }

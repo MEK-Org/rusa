@@ -6,15 +6,12 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { createLogger } from "../observability/logger.js";
 import { QuotaCollectionLoop } from "../quota/coordinator-collection.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { DEFAULT_OLD_QUOTA_DB_NAME, DEFAULT_RELOCATED_QUOTA_DB_NAME } from "../quota/relocate.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
-import {
-  coordinatorProviderLanes,
-  runQuotaCoordinator,
-  startQuotaCoordinator,
-} from "./quota-coordinator.js";
+import { coordinatorProviderLanes, runQuotaCoordinator } from "./quota-coordinator.js";
 
 const testDirs: string[] = [];
 
@@ -256,15 +253,54 @@ quota:
 `
     );
 
+    // Snapshot pre-startup seeded raw/parsed/controller rows directly from SQLite.
+    const dbBefore = new Database(databasePath, { readonly: true });
+    const scrapesBefore = dbBefore.prepare("SELECT * FROM quota_scrapes ORDER BY id").all();
+    const observationsBefore = dbBefore
+      .prepare("SELECT * FROM quota_observations ORDER BY provider, kind, observed_slot")
+      .all();
+    dbBefore.close();
+
     // A regression cannot reach a provider CLI during this test: the command
     // name is deliberately absent from this temporary PATH.
     vi.stubEnv("PATH", join(home, "empty-path"));
     const collectionStart = vi.spyOn(QuotaCollectionLoop.prototype, "start");
     const controllerAdvance = vi.spyOn(SharedQuotaStore.prototype, "advancePendingController");
-    const running = await startQuotaCoordinator({ home, probeOff: true });
+    const recordRaw = vi.spyOn(SharedQuotaStore.prototype, "recordRaw");
+    const recordParsed = vi.spyOn(SharedQuotaStore.prototype, "recordParsed");
+
+    // Capture emitted quota metrics across the entire service run.
+    const emittedMetrics: Array<{
+      metric: string;
+      type: string;
+      value: number;
+      [key: string]: unknown;
+    }> = [];
+    const testLogger = createLogger({ context: { component: "quota-coordinator" } });
+    vi.spyOn(testLogger, "info").mockImplementation(
+      (event: string, context?: Record<string, unknown>) => {
+        if (event === "quota_metric" && context) {
+          emittedMetrics.push(context as { metric: string; type: string; value: number });
+        }
+      }
+    );
+
+    const abortController = new AbortController();
+    let ready: () => void;
+    const isReady = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+
+    const runner = runQuotaCoordinator({
+      home,
+      probeOff: true,
+      signal: abortController.signal,
+      onReady: () => ready(),
+      logger: testLogger,
+    });
+
+    await isReady;
     try {
-      expect(collectionStart).not.toHaveBeenCalled();
-      expect(controllerAdvance).not.toHaveBeenCalled();
       await expect(request(socketPath, "/v1/healthz")).resolves.toMatchObject({ status: 200 });
       await expect(request(socketPath, "/v1/readyz")).resolves.toMatchObject({ status: 200 });
       await expect(request(socketPath, "/v1/throttle?provider=claude")).resolves.toMatchObject({
@@ -275,8 +311,56 @@ quota:
         json: expect.objectContaining({ status: "available" }),
       });
       expect(readdirSync(backupDir).some((name) => /^quota-.*\.db$/.test(name))).toBe(true);
+
+      // Verify zero probes or controller writes occurred
+      expect(collectionStart).not.toHaveBeenCalled();
+      expect(controllerAdvance).not.toHaveBeenCalled();
+      expect(recordRaw).not.toHaveBeenCalled();
+      expect(recordParsed).not.toHaveBeenCalled();
+
+      // Verify durable seeded database content was not modified in any way
+      const dbAfter = new Database(databasePath, { readonly: true });
+      const scrapesAfter = dbAfter.prepare("SELECT * FROM quota_scrapes ORDER BY id").all();
+      const observationsAfter = dbAfter
+        .prepare("SELECT * FROM quota_observations ORDER BY provider, kind, observed_slot")
+        .all();
+      dbAfter.close();
+      expect(scrapesAfter).toEqual(scrapesBefore);
+      expect(observationsAfter).toEqual(observationsBefore);
+
+      // Verify read metrics were emitted for each request
+      const readMetrics = emittedMetrics.filter((m) => m.metric === "quota_service_reads_total");
+      expect(readMetrics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            metric: "quota_service_reads_total",
+            path: "/v1/healthz",
+            status: 200,
+          }),
+          expect.objectContaining({
+            metric: "quota_service_reads_total",
+            path: "/v1/readyz",
+            status: 200,
+          }),
+          expect.objectContaining({
+            metric: "quota_service_reads_total",
+            path: "/v1/throttle",
+            status: 200,
+          }),
+          expect.objectContaining({
+            metric: "quota_service_reads_total",
+            path: "/v1/quota",
+            status: 200,
+          }),
+        ])
+      );
+
+      // Verify no scrape, parse, observation, or controller metrics were emitted
+      const nonReadMetrics = emittedMetrics.filter((m) => m.metric !== "quota_service_reads_total");
+      expect(nonReadMetrics).toHaveLength(0);
     } finally {
-      await running.stop();
+      abortController.abort();
+      await runner;
     }
   });
 
@@ -310,11 +394,24 @@ quota:
     const collectionStart = vi
       .spyOn(QuotaCollectionLoop.prototype, "start")
       .mockImplementation(() => {});
-    const running = await startQuotaCoordinator({ home });
+    const abortController = new AbortController();
+    let ready: () => void;
+    const isReady = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+
+    const runner = runQuotaCoordinator({
+      home,
+      signal: abortController.signal,
+      onReady: () => ready(),
+    });
+
+    await isReady;
     try {
       expect(collectionStart).toHaveBeenCalledOnce();
     } finally {
-      await running.stop();
+      abortController.abort();
+      await runner;
     }
   });
 });
