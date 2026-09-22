@@ -31,7 +31,7 @@ void main() {
   );
 
   for (final marker in [true, null]) {
-    testWidgets('responsive row shows status and accessible badge ($marker)', (
+    testWidgets('responsive row shows status with accessible bolt ($marker)', (
       tester,
     ) async {
       tester.view.physicalSize = const Size(360, 800);
@@ -51,7 +51,15 @@ void main() {
         ),
       );
       expect(find.text('READY'), findsOneWidget);
-      expect(find.text('RESPONSIVE'), findsOneWidget);
+      expect(find.text('RESPONSIVE'), findsNothing);
+      expect(find.byIcon(Icons.bolt), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(ObligationStatusChip),
+          matching: find.byIcon(Icons.bolt),
+        ),
+        findsOneWidget,
+      );
       expect(
         find.bySemanticsLabel(
           marker == true
@@ -67,7 +75,7 @@ void main() {
     });
   }
 
-  testWidgets('ordinary obligations have no responsive badge', (tester) async {
+  testWidgets('ordinary obligations have no responsive bolt', (tester) async {
     final store = DashboardStore(api: FakeApi(), stream: FakeStream());
     await tester.pumpWidget(
       MaterialApp(
@@ -78,6 +86,7 @@ void main() {
     );
     expect(find.text('READY'), findsOneWidget);
     expect(find.text('RESPONSIVE'), findsNothing);
+    expect(find.byIcon(Icons.bolt), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
     await store.dispose();
   });
@@ -99,11 +108,24 @@ void main() {
       );
       await tester.pump();
       await tester.pump();
-      expect(find.byType(ObligationResponsiveBadge), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(ObligationStatusDot),
+          matching: find.byIcon(Icons.bolt),
+        ),
+        findsOneWidget,
+      );
       await tester.tap(find.text(item.heading));
       await tester.pump();
       await tester.pump();
-      expect(find.text('RESPONSIVE'), findsWidgets);
+      expect(find.text('RESPONSIVE'), findsNothing);
+      expect(
+        find.descendant(
+          of: find.byType(ObligationStatusChip),
+          matching: find.byIcon(Icons.bolt),
+        ),
+        findsOneWidget,
+      );
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       await store.dispose();
