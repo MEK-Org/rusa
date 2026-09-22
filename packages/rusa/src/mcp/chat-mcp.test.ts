@@ -1364,6 +1364,42 @@ describe("chat MCP server", () => {
       expect(fake.sent[2]?.threadName).toBeUndefined();
     });
 
+    it("keeps an explicit thread reply in-thread when a selected head shares its handle", async () => {
+      const head = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const reply = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M7",
+        threadName: "spaces/A/threads/M1",
+      });
+
+      for (const selectedInboxEntries of [
+        [head, reply],
+        [reply, head],
+      ]) {
+        const fake = new FakeChatClient();
+        const client = await connect(
+          createChatWriteMcpServer("test", fake, {
+            allowedSpaces: ["spaces/A"],
+            selectedInboxEntries,
+          })
+        );
+
+        await client.callTool({
+          name: "send_message",
+          arguments: {
+            spaceName: "spaces/A",
+            text: "reply in selected thread",
+            threadName: "spaces/A/threads/M1",
+          },
+        });
+        expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+      }
+    });
+
     it("makes selected head authoritative when createThread: true is passed with mismatched threadName", async () => {
       const fake = new FakeChatClient();
       const topLevelEntry = makeEntry({

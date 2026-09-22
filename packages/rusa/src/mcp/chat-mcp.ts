@@ -396,7 +396,11 @@ export function resolveChatReplyThreadName(
 
   // Case 1: Caller specified a threadName
   if (trimmedCallerThread !== undefined) {
-    const matchingTarget = parsedEntries.find((e) => e.threadName === trimmedCallerThread);
+    const matchingTargets = parsedEntries.filter((e) => e.threadName === trimmedCallerThread);
+    // A selected top-level message and a later reply can share one thread
+    // handle. For an explicit handle, retain the in-thread intent regardless
+    // of selection order; only a head-only match replies top-level.
+    const matchingTarget = matchingTargets.find((e) => e.isExistingThread) ?? matchingTargets[0];
 
     if (!matchingTarget) {
       // Caller deliberately targeted a different thread not in the current selection.
