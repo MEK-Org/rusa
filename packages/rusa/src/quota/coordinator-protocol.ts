@@ -9,13 +9,14 @@ export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 /**
- * Operator write routes (#573). They live under `/internal/` because every
- * `/v1/` path is GET-only by contract (design §5.2, Criterion 7); the socket's
- * file mode is the whole of their authorization, exactly as it is for the
- * read surface.
+ * Operator write routes (#573). They are ordinary `/v1/` paths: design §5.2,
+ * Criterion 7 states the allowed method per path rather than declaring the
+ * whole of v1 read-only, so a POST route no longer has to sit outside the
+ * version prefix in order to exist. The socket's file mode is the whole of
+ * their authorization, exactly as it is for the read surface.
  */
-export const QUOTA_READING_MODE_PATH = "/internal/quota/reading-mode";
-export const MANUAL_QUOTA_OBSERVATION_PATH = "/internal/quota/observations";
+export const QUOTA_READING_MODE_PATH = "/v1/quota/reading-mode";
+export const MANUAL_QUOTA_OBSERVATION_PATH = "/v1/quota/observations";
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;

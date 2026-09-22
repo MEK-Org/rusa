@@ -95,11 +95,12 @@ carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 
 ### Runtime manual quota readings
 
-Every `/v1/` path stays GET-only (design §5.2, Criterion 7). The two write
-routes therefore live under `/internal/`. The coordinator socket remains the
-authorization boundary: these write calls are available only to a process that
-can use the mode-`0600` Unix socket. There is no network listener and no
-additional bearer token. Every provider starts in `scrape` mode. Switching mode
+The two write routes are `POST /v1/quota/reading-mode` and
+`POST /v1/quota/observations`; every other `/v1/` path is still GET-only
+(design §5.2, Criterion 7, revision 10). The coordinator socket is the
+authorization boundary, not the path: these write calls are available only to a
+process that can use the mode-`0600` Unix socket. There is no network listener
+and no additional bearer token. Every provider starts in `scrape` mode. Switching mode
 returns a monotonically increasing `generation`; keep that value with the source
 reading and send it back on the observation write. It fences an observation
 delayed across a mode transition, and it fences a scrape that was already in
@@ -113,7 +114,7 @@ quota_socket="$XDG_RUNTIME_DIR/rusa-quota/coordinator.sock"
 # Stop collection and accept external observations. Record generation from the response.
 curl --unix-socket "$quota_socket" -sS -X POST \
   -H 'Content-Type: application/json' \
-  http://localhost/internal/quota/reading-mode \
+  http://localhost/v1/quota/reading-mode \
   --data '{"provider":"claude","mode":"manual"}'
 # {"provider":"claude","mode":"manual","generation":1,...}
 
@@ -122,7 +123,7 @@ curl --unix-socket "$quota_socket" -sS -X POST \
 curl --unix-socket "$quota_socket" -sS -X POST \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: claude-usage-2026-09-20T03:30:00Z' \
-  http://localhost/internal/quota/observations \
+  http://localhost/v1/quota/observations \
   --data '{
     "provider":"claude",
     "generation":1,
@@ -142,7 +143,7 @@ curl --unix-socket "$quota_socket" -sS -X POST \
 # real transition; wait for a new successful scrape before treating it as fresh.
 curl --unix-socket "$quota_socket" -sS -X POST \
   -H 'Content-Type: application/json' \
-  http://localhost/internal/quota/reading-mode \
+  http://localhost/v1/quota/reading-mode \
   --data '{"provider":"claude","mode":"scrape"}'
 ```
 

@@ -118,6 +118,16 @@ would have to respect, and nothing more.
   Q7 — which deliberately refused to invent a duration — carries the
   write-quiesce window measured by the drill it named as the place the number
   would come from.
+- **Revision 10 reverses the read-only path rule, and nothing else.** §5.2's
+  "every v1 path is a `GET`" was written when v1 had no writes; #573's operator
+  writes then had to live under an `/internal/` prefix to keep it true, which
+  asserted a public-versus-internal split among consumers that does not exist —
+  the socket's file mode, not the path, is the authorization boundary (§5.3).
+  Review of PR #583 ruled the original read-only requirement reversed, so the
+  method contract is now stated per path (§5.2, criterion 7), the writes are
+  `POST /v1/quota/reading-mode` and `POST /v1/quota/observations`, and
+  `/internal/` is gone. The read surface, its bodies, and every other guarantee
+  in §5 are untouched.
 
 ## Contents
 
@@ -561,6 +571,11 @@ Within Option 2, v1 is deliberately narrow:
   wire contract rather than a convention.
 - **Its client surface is read-only.** Five GETs, no POST, no PUT, no DELETE
   (§5.5). Everything that mutates quota state is internal to the process.
+  *Amended by revision 10:* #573 adds two POST paths for the operator to hand
+  the daemon a manually read panel value. They are operator control over the
+  socket, not a client surface — no quota consumer calls them, and the daemon
+  is still the only writer of quota state — so the property this section is
+  claiming survives, but "no POST anywhere" no longer states it accurately.
 - **It arbitrates nothing.** No leases, no reservations, no gating. Clients read
   a published interval and pace themselves with it, exactly as they pace
   themselves with the persisted interval today (`start.ts:1289-1293`).
@@ -661,9 +676,19 @@ one published throttle, as they do now.
   `$XDG_RUNTIME_DIR/rusa-quota/coordinator.sock`, mode `0600`, owned by the
   service user. Under Option 3 this is a TCP listener instead; nothing else in
   this section changes.
-- **Framing:** HTTP/1.1 + JSON. Paths are prefixed `/v1/`. **Every v1 path is a
-  `GET`.** Any other method on any v1 path is `405`, unconditionally, and that
-  is a contract statement rather than an implementation detail (criterion 7).
+- **Framing:** HTTP/1.1 + JSON. Paths are prefixed `/v1/`. **Each v1 path
+  declares one allowed method.** Every read path is a `GET`; the two operator
+  write paths of #573 (`POST /v1/quota/reading-mode`,
+  `POST /v1/quota/observations`) are `POST`. Any other method on any v1 path is
+  `405` with an `Allow` naming that path's method, and that is a contract
+  statement rather than an implementation detail (criterion 7). Revision 10
+  replaces the earlier unconditional "every v1 path is a `GET`" rule: it was
+  written when v1 was read-only, and the coordinator's later need for operator
+  writes was pushing them onto an `/internal/` prefix that drew a
+  public-versus-internal consumer distinction no consumer actually has
+  (ruling on PR #583, review 5269637828). The read surface is unchanged, and
+  the method contract is still machine-checked by enumeration rather than by
+  listing paths in a test.
 - **Versioning rides on every response, and there is no handshake path.**
   Every v1 response carries `"service": { "protocolMajor", "protocolMinor",
   "serverVersion", "serverTime" }`. Revision 8 removes the separate
@@ -1839,12 +1864,16 @@ right foundation for 1 and 8.
    successful read has nothing to retain — this criterion fails without rule 0.
    Run the same assertion for a service that is up but answers with a mismatched
    `service.protocolMajor`, which reaches the same state by a different route.
-7. **The surface is read-only.** For every v1 path, `POST`, `PUT`, `PATCH` and
-   `DELETE` all return 405, and no v1 path accepts a request body. Assert this by
-   enumerating the served routes rather than by listing paths in the test, so a
-   later mutating endpoint fails the criterion instead of quietly passing it.
-   This is the machine-checkable form of §8.4's "consumers are not the source of
-   what they consume".
+7. **Each path serves exactly one method.** For every read path, `POST`, `PUT`,
+   `PATCH` and `DELETE` all return 405, and no read path accepts a request body;
+   for every operator write path, every method other than `POST` returns 405.
+   Assert this by enumerating both route sets rather than by listing paths in the
+   test, and assert the sets are disjoint, so a later mutating endpoint has to be
+   declared as one — it can neither appear as a method exception on a read path
+   nor be served without being enumerated. The read surface staying free of
+   mutation is the machine-checkable form of §8.4's "consumers are not the source
+   of what they consume"; the write paths are operator control, reached only
+   through the mode-`0600` socket (§5.3), not a consumer surface.
 8. **Old-writer exclusion is mechanical.** With the database renamed and a
    directory at the old path, a build containing **no** service awareness fails
    at open with `SQLITE_CANTOPEN`, writes nothing, and — because its throttle

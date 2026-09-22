@@ -16,7 +16,7 @@ import {
   QUOTA_READING_MODE_PATH,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
-import { QuotaCoordinatorService, SERVED_ROUTES } from "./coordinator-service.js";
+import { QuotaCoordinatorService, SERVED_ROUTES, WRITE_ROUTES } from "./coordinator-service.js";
 import { QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError } from "./schema-guard.js";
 import { type PersistedQuotaProviderStatus, SharedQuotaStore } from "./shared-store.js";
 
@@ -131,9 +131,17 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       expect([200, 503].includes(getWithBody.status)).toBe(true);
     }
 
-    // The operator writes live under `/internal/`, outside `/v1/`, and are POST-only.
-    for (const writeRoute of [QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH]) {
-      expect(writeRoute.startsWith("/internal/")).toBe(true);
+    // The operator writes are ordinary `/v1/` paths that are POST-only: the 405
+    // rule is per path, not "every v1 path is a GET" (design §5.2, criterion 7).
+    // Enumerate them the same way, and hold the two sets apart, so a later
+    // mutating endpoint has to be declared rather than smuggled onto a read path.
+    expect([...WRITE_ROUTES]).toEqual([QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH]);
+    for (const writeRoute of WRITE_ROUTES) {
+      expect((SERVED_ROUTES as readonly string[]).includes(writeRoute)).toBe(false);
+    }
+
+    for (const writeRoute of WRITE_ROUTES) {
+      expect(writeRoute.startsWith("/v1/")).toBe(true);
       for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
         const res = await makeRequest(socketPath, writeRoute, method);
         expect(res.status, `Expected 405 for ${method} on ${writeRoute}`).toBe(405);

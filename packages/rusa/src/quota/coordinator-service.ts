@@ -33,6 +33,7 @@ import {
 import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
 import type { QuotaReadingMode, SharedQuotaStore } from "./shared-store.js";
 
+/** The GET-only read surface. */
 export const SERVED_ROUTES = [
   "/v1/throttle",
   "/v1/quota",
@@ -40,6 +41,23 @@ export const SERVED_ROUTES = [
   "/v1/healthz",
   "/v1/readyz",
 ] as const;
+
+/**
+ * The POST-only operator write surface (#573). Declared beside the read
+ * surface because Criterion 7 is checked by enumerating routes: a new mutating
+ * endpoint has to be added here to be served, and the contract test asserts the
+ * two sets stay disjoint, so it cannot quietly appear as a method exception on
+ * a read path instead.
+ */
+export const WRITE_ROUTES = [QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH] as const;
+
+/** True for a path this service routes, read or write; the metric label set. */
+function isRoutedPath(pathname: string): boolean {
+  return (
+    (SERVED_ROUTES as readonly string[]).includes(pathname) ||
+    (WRITE_ROUTES as readonly string[]).includes(pathname)
+  );
+}
 
 /**
  * Write-contract policy for the operator routes. Neither value is derived
@@ -243,7 +261,7 @@ export class QuotaCoordinatorService {
       // distinct query a client happens to send.
       const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
       this.metrics.counter(QUOTA_SERVICE_METRICS.readsTotal, {
-        path: (SERVED_ROUTES as readonly string[]).includes(pathname) ? pathname : "unrouted",
+        path: isRoutedPath(pathname) ? pathname : "unrouted",
         status: res.statusCode,
       });
     }
@@ -325,12 +343,13 @@ export class QuotaCoordinatorService {
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
 
-    // The operator write routes (#573) live outside `/v1/` so the GET-only
-    // public contract below (§5.2 / Criterion 7) stays intact. The coordinator
-    // daemon is the sole writer of the quota database and owns the controller
-    // advance and publish that must follow the write, so the operator reports
-    // the reading and the daemon records it; the socket's file mode is the
-    // whole of their authorization.
+    // The operator write routes (#573) are checked before the GET-only rule
+    // below, because §5.2 / Criterion 7 fixes the allowed method per path: these
+    // two are POST-only, every other v1 path is GET-only. The coordinator daemon
+    // is the sole writer of the quota database and owns the controller advance
+    // and publish that must follow the write, so the operator reports the
+    // reading and the daemon records it; the socket's file mode is the whole of
+    // their authorization.
     if (pathname === QUOTA_READING_MODE_PATH || pathname === MANUAL_QUOTA_OBSERVATION_PATH) {
       if (req.method !== "POST") {
         this.sendError(
@@ -353,8 +372,8 @@ export class QuotaCoordinatorService {
       return;
     }
 
-    // Per §5.2 and Criterion 7: Every v1 path is a GET.
-    // Any other method on any v1 path returns 405 unconditionally, and no v1 path accepts a body.
+    // Per §5.2 and Criterion 7: every v1 path other than the two write routes
+    // above is a GET. Any other method returns 405, and no GET path reads a body.
     if (pathname.startsWith("/v1/")) {
       if (req.method !== "GET") {
         this.sendError(
@@ -362,7 +381,7 @@ export class QuotaCoordinatorService {
           405,
           {
             code: "method_not_allowed",
-            message: `Method ${req.method} not allowed on v1 endpoints; only GET is permitted`,
+            message: `Method ${req.method} not allowed on ${pathname}; only GET is permitted`,
             retryable: false,
           },
           { Allow: "GET" }
