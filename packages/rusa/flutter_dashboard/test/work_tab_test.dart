@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
+import 'package:rusa_dashboard/widgets/hierarchy_drag_drop.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/obligation_status.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
@@ -15,6 +17,94 @@ import 'package:rusa_dashboard/widgets/work_tab.dart';
 import 'fakes.dart';
 
 void main() {
+  testWidgets(
+    'disables obligation-tree drag and drop below the narrow breakpoint (#612)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(
+          const Size(kNarrowBreakpoint - 1, 800),
+        );
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final obligations = List.generate(
+          24,
+          (index) => makeObligation(
+            'narrow-no-drag-$index',
+            ownerId: 'root',
+            title: 'Scrollable narrow row $index',
+          ),
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = obligations;
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byType(Draggable<ObligationDto>), findsNothing);
+        expect(find.byType(HierarchyDropTarget<ObligationDto>), findsNothing);
+
+        final scrollable = tester.state<ScrollableState>(
+          find.byType(Scrollable),
+        );
+        expect(scrollable.position.maxScrollExtent, greaterThan(0));
+        await tester.drag(
+          find.text('Scrollable narrow row 0'),
+          const Offset(0, -300),
+        );
+        await tester.pumpAndSettle();
+        expect(scrollable.position.pixels, greaterThan(0));
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'keeps obligation-tree drag and drop at the narrow breakpoint (#612)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(kNarrowBreakpoint, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final obligation = makeObligation(
+          'desktop-drag',
+          ownerId: 'root',
+          title: 'Desktop draggable row',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [obligation];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byType(Draggable<ObligationDto>), findsOneWidget);
+        expect(find.byType(HierarchyDropTarget<ObligationDto>), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('shows the creator handle when the obligation has one', (
     tester,
   ) async {
