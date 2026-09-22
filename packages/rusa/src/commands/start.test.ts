@@ -1745,6 +1745,38 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     expect(names(root)).toContain("obligations");
     expect(names(worker)).toContain("obligations");
+
+    const call = async (actor: Actor, name: string, args: Record<string, unknown>) => {
+      const servers = (
+        actor as unknown as {
+          opts: { mcpServers: Array<{ name: string; url: string }> };
+        }
+      ).opts.mcpServers;
+      const url = servers.find((entry) => entry.name === "obligations")?.url;
+      if (!url) throw new Error("obligations MCP missing");
+      const client = new Client({ name: "responsive-permission", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close();
+      }
+    };
+    const args = { title: "urgent", owner_id: worker.id, responsive: true };
+    expect((await call(worker as Actor, "create_obligation", args)).isError).toBe(true);
+    expect((await call(root, "create_obligation", args)).isError).toBeFalsy();
+    const ordinary = getRepositories().obligations.create({
+      title: "ordinary",
+      ownerId: worker.id,
+    });
+    expect(
+      (await call(worker as Actor, "mark_obligation_responsive", { id: ordinary.id })).isError
+    ).toBe(true);
+    expect(getRepositories().obligations.require(ordinary.id).effectiveResponsive).toBe(false);
+    expect(
+      (await call(root, "mark_obligation_responsive", { id: ordinary.id })).isError
+    ).toBeFalsy();
+    expect(getRepositories().obligations.require(ordinary.id).effectiveResponsive).toBe(true);
   });
 
   it("wires lifecycle abandonment through both production actor factories", async () => {

@@ -532,6 +532,10 @@ class _WorkTabState extends State<WorkTab> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
+                                  if (node.obligation.effectiveResponsive)
+                                    ObligationResponsiveBadge(
+                                      obligation: node.obligation,
+                                    ),
                                   Text(
                                     node.obligation.heading,
                                     maxLines: 1,

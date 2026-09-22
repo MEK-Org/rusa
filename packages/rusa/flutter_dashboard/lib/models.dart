@@ -1518,6 +1518,8 @@ class ObligationDto {
     this.priority,
     required this.effectivePriority,
     this.prioritySourceId,
+    this.responsive,
+    this.effectiveResponsive = false,
     this.terminalNote,
     this.resolutionRef,
     this.recurrencePolicy,
@@ -1554,6 +1556,10 @@ class ObligationDto {
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
+
+  /// Explicit marker and the server-derived inherited value.
+  final bool? responsive;
+  final bool effectiveResponsive;
 
   /// Which attached artifact settled this obligation, as a `kind:value` ref.
   /// Distinct from [externalRef], which is an identity claim.
@@ -1672,6 +1678,8 @@ class ObligationDto {
       priority: (j['priority'] as num?)?.toDouble(),
       effectivePriority: (j['effectivePriority'] as num?)?.toDouble() ?? 0.0,
       prioritySourceId: j['prioritySourceId'] as String?,
+      responsive: j['responsive'] as bool?,
+      effectiveResponsive: j['effectiveResponsive'] as bool? ?? false,
       terminalNote: j['terminalNote'] as String?,
       resolutionRef: j['resolutionRef'] as String?,
       recurrencePolicy: j['recurrencePolicy'] as String?,

@@ -144,7 +144,7 @@ class ObligationStatusChip extends StatelessWidget {
     store: store,
     builder: (context, state) {
       final colors = ObligationStatusColors.of(state);
-      return Container(
+      final statusChip = Container(
         padding: bordered
             ? const EdgeInsets.symmetric(horizontal: 7, vertical: 3)
             : const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -162,6 +162,17 @@ class ObligationStatusChip extends StatelessWidget {
             letterSpacing: bordered ? 0 : 0.5,
           ),
         ),
+      );
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          statusChip,
+          if (obligation.effectiveResponsive) ...[
+            const SizedBox(height: 4),
+            ObligationResponsiveBadge(obligation: obligation),
+          ],
+        ],
       );
     },
   );
@@ -191,4 +202,50 @@ class ObligationStatusDot extends StatelessWidget {
       ),
     ),
   );
+}
+
+/// Responsiveness is a scheduling property, separate from lifecycle status.
+class ObligationResponsiveBadge extends StatelessWidget {
+  const ObligationResponsiveBadge({super.key, required this.obligation});
+
+  final ObligationDto obligation;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!obligation.effectiveResponsive) return const SizedBox.shrink();
+    final label = obligation.responsive == true
+        ? 'Responsive: prioritized for immediate attention'
+        : 'Responsive: inherited from a parent obligation';
+    return Tooltip(
+      message: label,
+      excludeFromSemantics: true,
+      child: Semantics(
+        container: true,
+        label: label,
+        excludeSemantics: true,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+          decoration: BoxDecoration(
+            color: const Color(0xFF78350F),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.bolt, size: 12, color: Color(0xFFFBBF24)),
+              SizedBox(width: 2),
+              Text(
+                'RESPONSIVE',
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFFFBBF24),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
