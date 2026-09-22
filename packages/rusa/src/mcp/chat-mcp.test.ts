@@ -7,7 +7,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { FakeChatClient } from "../chat/fake.js";
-import { createChatReadMcpServer, createChatWriteMcpServer } from "./chat-mcp.js";
+import type { Logger } from "../observability/logger.js";
+import type { InboxEntry } from "../repositories/inbox-repository.js";
+import {
+  createChatReadMcpServer,
+  createChatWriteMcpServer,
+  resolveChatReplyThreadName,
+} from "./chat-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -1059,5 +1065,504 @@ describe("chat MCP server", () => {
     expect(parsed.spaces).toEqual([
       { name: "spaces/TARGET", displayName: "Target Space", spaceType: "SPACE" },
     ]);
+  });
+
+  describe("Google Chat reply routing (#611)", () => {
+    const makeEntry = (
+      payload: Record<string, unknown>,
+      source = "chat_space:spaces/A"
+    ): InboxEntry => ({
+      id: "entry-1",
+      actorId: "test",
+      source,
+      deliveredAt: new Date("2026-09-21T10:00:00Z"),
+      seenAt: null,
+      handledAt: null,
+      handledNote: null,
+      payload: {
+        type: "gchat.message",
+        ...payload,
+      },
+    });
+
+    it("replies top-level (omits threadName) when selected inbox entry is a top-level message (message id == thread id)", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      // Model passes threadName equal to top-level thread head: should be mechanically stripped
+      const res1 = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "top-level answer",
+          threadName: "spaces/A/threads/M1",
+        },
+      })) as CallToolResult;
+      expect(res1.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBeUndefined();
+
+      // Model omits threadName: stays top-level
+      const res2 = (await client.callTool({
+        name: "send_message",
+        arguments: { spaceName: "spaces/A", text: "another answer" },
+      })) as CallToolResult;
+      expect(res2.isError).toBeFalsy();
+      expect(fake.sent[1]?.threadName).toBeUndefined();
+
+      // Dot-notation message name: spaces/A/messages/M1.M1 with spaces/A/threads/M1
+      const fakeDot = new FakeChatClient();
+      const dotEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1.M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const clientDot = await connect(
+        createChatWriteMcpServer("test", fakeDot, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [dotEntry],
+        })
+      );
+      const resDot = (await clientDot.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "dot notation reply",
+          threadName: "spaces/A/threads/M1",
+        },
+      })) as CallToolResult;
+      expect(resDot.isError).toBeFalsy();
+      expect(fakeDot.sent[0]?.threadName).toBeUndefined();
+    });
+
+    it("creates thread on top-level message when explicitly requested via createThread", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "explicitly new thread",
+          threadName: "spaces/A/threads/M1",
+          createThread: true,
+        },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+    });
+
+    it("replies inside existing thread when selected inbox entry is a thread reply (message id != thread id)", async () => {
+      const fake = new FakeChatClient();
+      const existingThreadEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M2",
+        threadName: "spaces/A/threads/T1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [existingThreadEntry],
+        })
+      );
+
+      // Model provides the threadName: stays in thread
+      const res1 = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "in thread with threadName",
+          threadName: "spaces/A/threads/T1",
+        },
+      })) as CallToolResult;
+      expect(res1.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/T1");
+
+      // Model omits threadName: mechanically routed to stay in thread
+      const res2 = (await client.callTool({
+        name: "send_message",
+        arguments: { spaceName: "spaces/A", text: "in thread omitting threadName" },
+      })) as CallToolResult;
+      expect(res2.isError).toBeFalsy();
+      expect(fake.sent[1]?.threadName).toBe("spaces/A/threads/T1");
+    });
+
+    it("evaluates selectedInboxEntries dynamically via getter function", async () => {
+      const fake = new FakeChatClient();
+      let currentEntries: InboxEntry[] = [];
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: () => currentEntries,
+        })
+      );
+
+      // Initially no selected entries: uses caller's threadName
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "no selection",
+          threadName: "spaces/A/threads/M1",
+        },
+      });
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+
+      // Now set top-level entry: threadName is stripped
+      currentEntries = [
+        makeEntry({
+          spaceName: "spaces/A",
+          messageName: "spaces/A/messages/M1",
+          threadName: "spaces/A/threads/M1",
+        }),
+      ];
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "with selection",
+          threadName: "spaces/A/threads/M1",
+        },
+      });
+      expect(fake.sent[1]?.threadName).toBeUndefined();
+    });
+
+    it("preserves caller's threadName when targeting a different existing thread in the same space", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      // Caller deliberately supplies a different thread: must NOT be stripped
+      const res = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "replying to a different thread",
+          threadName: "spaces/A/threads/OTHER",
+        },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/OTHER");
+    });
+
+    it("does not let selected entry in space B affect send to space A", async () => {
+      const fake = new FakeChatClient();
+      const spaceBEntry = makeEntry(
+        {
+          spaceName: "spaces/B",
+          messageName: "spaces/B/messages/B1",
+          threadName: "spaces/B/threads/B1",
+        },
+        "chat_space:spaces/B"
+      );
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A", "spaces/B"],
+          selectedInboxEntries: [spaceBEntry],
+        })
+      );
+
+      // Send to space A with threadName: preserved, not affected by space B
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "msg in space A",
+          threadName: "spaces/A/threads/A1",
+        },
+      });
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/A1");
+
+      // Send to space A without threadName: preserved as undefined (not overridden by space B)
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "top-level in space A",
+        },
+      });
+      expect(fake.sent[1]?.threadName).toBeUndefined();
+    });
+
+    it("handles multiple selected entries in the same space correctly", async () => {
+      const fake = new FakeChatClient();
+      const entryT1 = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/T1",
+      });
+      const entryT2 = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M2",
+        threadName: "spaces/A/threads/T2",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [entryT1, entryT2],
+        })
+      );
+
+      // Caller specifies T2: routes to T2, not the first entry T1
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "reply to T2",
+          threadName: "spaces/A/threads/T2",
+        },
+      });
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/T2");
+
+      // Caller specifies T1: routes to T1
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "reply to T1",
+          threadName: "spaces/A/threads/T1",
+        },
+      });
+      expect(fake.sent[1]?.threadName).toBe("spaces/A/threads/T1");
+
+      // Caller omits threadName: disagreeing entries mean ambiguous -> leaves threadName undefined
+      await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "ambiguous reply",
+        },
+      });
+      expect(fake.sent[2]?.threadName).toBeUndefined();
+    });
+
+    it("keeps an explicit thread reply in-thread when a selected head shares its handle", async () => {
+      const head = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const reply = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M7",
+        threadName: "spaces/A/threads/M1",
+      });
+
+      for (const selectedInboxEntries of [
+        [head, reply],
+        [reply, head],
+      ]) {
+        const fake = new FakeChatClient();
+        const client = await connect(
+          createChatWriteMcpServer("test", fake, {
+            allowedSpaces: ["spaces/A"],
+            selectedInboxEntries,
+          })
+        );
+
+        await client.callTool({
+          name: "send_message",
+          arguments: {
+            spaceName: "spaces/A",
+            text: "reply in selected thread",
+            threadName: "spaces/A/threads/M1",
+          },
+        });
+        expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+      }
+    });
+
+    it("makes selected head authoritative when createThread: true is passed with mismatched threadName", async () => {
+      const fake = new FakeChatClient();
+      const topLevelEntry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const client = await connect(
+        createChatWriteMcpServer("test", fake, {
+          allowedSpaces: ["spaces/A"],
+          selectedInboxEntries: [topLevelEntry],
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "send_message",
+        arguments: {
+          spaceName: "spaces/A",
+          text: "start thread on selected message",
+          threadName: "spaces/A/threads/MISMATCHED",
+          createThread: true,
+        },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(fake.sent[0]?.threadName).toBe("spaces/A/threads/M1");
+    });
+  });
+
+  describe("resolveChatReplyThreadName pure unit tests", () => {
+    function makeEntry(
+      payload: Record<string, unknown>,
+      source = "chat_space:spaces/A"
+    ): InboxEntry {
+      return {
+        id: "entry-1",
+        actorId: "test",
+        source,
+        deliveredAt: new Date("2026-09-21T10:00:00Z"),
+        seenAt: null,
+        handledAt: null,
+        handledNote: null,
+        payload: {
+          type: "gchat.message",
+          ...payload,
+        },
+      };
+    }
+
+    function mockLogger(
+      logs: { level: string; event: string; fields?: Record<string, unknown> }[]
+    ): Logger {
+      const write = (level: string) => (event: string, fields?: Record<string, unknown>) =>
+        logs.push({ level, event, fields });
+      const logger = {
+        debug: write("debug"),
+        info: write("info"),
+        warn: write("warn"),
+        error: write("error"),
+        child: () => logger,
+      } as unknown as Logger;
+      return logger;
+    }
+
+    it("strips threadName when caller passes top-level head thread handle and logs override", () => {
+      const logs: { level: string; event: string; fields?: Record<string, unknown> }[] = [];
+      const logger = mockLogger(logs);
+      const entry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+
+      const res = resolveChatReplyThreadName(
+        "spaces/A",
+        "spaces/A/threads/M1",
+        false,
+        [entry],
+        logger
+      );
+      expect(res).toBeUndefined();
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toEqual({
+        level: "info",
+        event: "chat_reply_thread_overridden",
+        fields: {
+          spaceName: "spaces/A",
+          callerThreadName: "spaces/A/threads/M1",
+          effectiveThreadName: undefined,
+          reason: "selected_toplevel_message",
+        },
+      });
+    });
+
+    it("preserves caller's threadName when caller targets a different thread than selected top-level message", () => {
+      const entry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+
+      const res = resolveChatReplyThreadName("spaces/A", "spaces/A/threads/OTHER", false, [entry]);
+      expect(res).toBe("spaces/A/threads/OTHER");
+    });
+
+    it("assigns threadName when replying to existing thread and logs assignment", () => {
+      const logs: { level: string; event: string; fields?: Record<string, unknown> }[] = [];
+      const logger = mockLogger(logs);
+      const entry = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M2",
+        threadName: "spaces/A/threads/T1",
+      });
+
+      const res = resolveChatReplyThreadName("spaces/A", undefined, false, [entry], logger);
+      expect(res).toBe("spaces/A/threads/T1");
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toEqual({
+        level: "info",
+        event: "chat_reply_assigned_thread",
+        fields: {
+          spaceName: "spaces/A",
+          effectiveThreadName: "spaces/A/threads/T1",
+          reason: "selected_thread_entry",
+        },
+      });
+    });
+
+    it("ignores selected entries belonging to different spaces", () => {
+      const entry = makeEntry(
+        {
+          spaceName: "spaces/B",
+          messageName: "spaces/B/messages/B1",
+          threadName: "spaces/B/threads/B1",
+        },
+        "chat_space:spaces/B"
+      );
+
+      // Caller provided thread in spaces/A: preserved
+      expect(resolveChatReplyThreadName("spaces/A", "spaces/A/threads/A1", false, [entry])).toBe(
+        "spaces/A/threads/A1"
+      );
+      // Caller omitted thread in spaces/A: stays undefined
+      expect(resolveChatReplyThreadName("spaces/A", undefined, false, [entry])).toBeUndefined();
+    });
+
+    it("treats disagreeing entries in same space as ambiguous when threadName omitted", () => {
+      const logs: { level: string; event: string; fields?: Record<string, unknown> }[] = [];
+      const logger = mockLogger(logs);
+      const e1 = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M1",
+        threadName: "spaces/A/threads/M1",
+      });
+      const e2 = makeEntry({
+        spaceName: "spaces/A",
+        messageName: "spaces/A/messages/M2",
+        threadName: "spaces/A/threads/T1",
+      });
+
+      const res = resolveChatReplyThreadName("spaces/A", undefined, false, [e1, e2], logger);
+      expect(res).toBeUndefined();
+      expect(logs).toHaveLength(1);
+      expect(logs[0]?.event).toBe("chat_reply_ambiguous_selection");
+    });
   });
 });

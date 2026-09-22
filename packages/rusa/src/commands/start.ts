@@ -853,6 +853,21 @@ export function logRunEnd(logger: Logger, result: RunResult): void {
 }
 
 /**
+ * Creates an accessor that resolves an actor's currently selected inbox entries
+ * from the mesh selection and durable inbox store (#611).
+ */
+export function createSelectedInboxEntriesAccessor(
+  mesh: { selectedInboxEntries: (actorId: string) => readonly string[] },
+  inboxStore: { read: (actorId: string, id: string) => InboxEntry | null }
+): (actorId: string) => readonly InboxEntry[] {
+  return (actorId: string) =>
+    mesh
+      .selectedInboxEntries(actorId)
+      .map((id) => inboxStore.read(actorId, id))
+      .filter((e): e is InboxEntry => e !== null);
+}
+
+/**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
  * Inbound GitHub webhooks and Google Chat messages wake the root, which runs the
@@ -1850,6 +1865,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     actors,
     runningThreadIds: () => mesh.activeRunThreadIds(),
   };
+  const selectedInboxEntriesForActor = createSelectedInboxEntriesAccessor(
+    { selectedInboxEntries: (actorId) => mesh.selectedInboxEntries(actorId) },
+    inboxStore
+  );
   const grantableServers = buildGrantableServers({
     // The nightly-report producer  writes the run-journal / rendered reports /
     // index.json instance-side under <mcHome>/iu-distiller/reports/ — colocated with the
@@ -1919,6 +1938,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     slackClient: slackClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
+    selectedInboxEntriesForActor,
+    logger: log,
     // Confines chat-write attachment filePaths to the grantee's workdir — same
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
@@ -3142,6 +3163,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               mesh.markUnkillable(actorId);
             },
             workDir: rootAgentDir,
+            selectedInboxEntries: () => selectedInboxEntriesForActor(rootId),
+            logger: log,
           })
         )
       : undefined;
