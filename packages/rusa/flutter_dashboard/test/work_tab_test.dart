@@ -1466,9 +1466,10 @@ void main() {
   );
 
   testWidgets(
-    'renders a principal-scoped cached snapshot with a background refresh indicator (#505)',
+    'measures cached and cold first useful content against the same delayed forest response (#505)',
     (tester) async {
       await tester.runAsync(() async {
+        const forestResponseDelay = Duration(seconds: 2);
         final cachedOb = makeObligation(
           'cached-ob-1',
           ownerId: 'root',
@@ -1485,56 +1486,117 @@ void main() {
           trees: [cachedTree],
           now: DateTime.utc(2026, 9, 22, 12),
         );
-        final cache = FakeObligationsCache(snapshot);
-        final gate = Completer<void>();
-        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
-          ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [cachedOb]
-          ..dashboardConfigResult = const DashboardConfigDto(
-            quotaProviders: {},
-            userPrincipalId: 'test-user',
-          )
-          ..forestGates.add(gate);
-
-        final store = DashboardStore(
-          api: api,
-          stream: FakeStream(),
-          obligationsCache: cache,
+        final serverOb = makeObligation(
+          'server-ob-1',
+          ownerId: 'root',
+          title: 'Authoritative Obligation After Refresh',
         );
-        await store.init();
-        await pumpEventQueue();
 
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: WorkTab(store: store, onSelectView: (_) {}),
+        Future<Duration> measureFirstUsefulContent({
+          required ObligationsCache cache,
+          required String firstUsefulTitle,
+          required bool expectBeforeForestResponse,
+        }) async {
+          final gate = Completer<void>();
+          final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+            ..threadsResult = [makeThread('root')]
+            ..obligationsResult = [serverOb]
+            ..dashboardConfigResult = const DashboardConfigDto(
+              quotaProviders: {},
+              userPrincipalId: 'test-user',
+            )
+            ..forestGates.add(gate);
+          final store = DashboardStore(
+            api: api,
+            stream: FakeStream(),
+            obligationsCache: cache,
+          );
+
+          await store.init();
+          await store.dashboardConfig.firstWhere(
+            (config) => config?.userPrincipalId == 'test-user',
+          );
+          if (expectBeforeForestResponse) {
+            expect(store.cachedObligationTrees, isNotNull);
+          }
+          // Both measurements start at the same point: the Work tab begins
+          // rendering after the authenticated principal has resolved. That
+          // keeps the comparison focused on the forest response the cache
+          // avoids waiting for, rather than timing an unrelated config call.
+          final stopwatch = Stopwatch()..start();
+          final forestResponse = Future<void>.delayed(
+            forestResponseDelay,
+            gate.complete,
+          );
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
             ),
-          ),
+          );
+          await tester.pump();
+
+          // This is the rendered first-useful-content observation: the forest
+          // request is still held below, so a cache hit must already be visible
+          // and a cold load cannot yet show the server result.
+          if (expectBeforeForestResponse) {
+            expect(find.text(firstUsefulTitle), findsOneWidget);
+            expect(find.text('WORK QUEUE'), findsOneWidget);
+            expect(
+              find.descendant(
+                of: find.byType(WorkTab),
+                matching: find.byType(CircularProgressIndicator),
+              ),
+              findsOneWidget,
+            );
+            stopwatch.stop();
+          } else {
+            expect(find.text(firstUsefulTitle), findsNothing);
+          }
+
+          await forestResponse;
+          await pumpEventQueue();
+          await tester.pump();
+          await tester.pump();
+
+          if (!expectBeforeForestResponse) stopwatch.stop();
+          expect(
+            find.text('Authoritative Obligation After Refresh'),
+            findsOneWidget,
+          );
+
+          final elapsed = stopwatch.elapsed;
+          await store.dispose();
+          await tester.pumpWidget(const SizedBox.shrink());
+          await tester.pump();
+          return elapsed;
+        }
+
+        final cachedFirstUseful = await measureFirstUsefulContent(
+          cache: FakeObligationsCache(snapshot),
+          firstUsefulTitle: 'Cached Fast Loading Obligation',
+          expectBeforeForestResponse: true,
+        );
+        final coldFirstUseful = await measureFirstUsefulContent(
+          cache: FakeObligationsCache(),
+          firstUsefulTitle: 'Authoritative Obligation After Refresh',
+          expectBeforeForestResponse: false,
         );
 
-        // After principal resolution, the cache paints while the forest request
-        // stays in flight; there is no full-screen loading state.
-        expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
-        expect(find.text('WORK QUEUE'), findsOneWidget);
-
-        // Background refresh is in flight (held by gate), so the small loading indicator is visible
-        final smallSpinnerFinder = find.descendant(
-          of: find.byType(WorkTab),
-          matching: find.byType(CircularProgressIndicator),
+        // The cold control is the pre-cache path: it cannot render useful
+        // obligations until the controlled forest response arrives.
+        // The cached path is observed in a rendered frame before that response.
+        expect(cachedFirstUseful, lessThan(forestResponseDelay));
+        expect(coldFirstUseful, greaterThanOrEqualTo(forestResponseDelay));
+        expect(coldFirstUseful, greaterThan(cachedFirstUseful));
+        // Keep the actual before/after values in the test output so the PR can
+        // report observed evidence without presenting a fabricated fixed time.
+        // ignore: avoid_print
+        print(
+          'first useful content (#505, controlled ${forestResponseDelay.inMilliseconds}ms forest): '
+          'cached=${cachedFirstUseful.inMilliseconds}ms, cold=${coldFirstUseful.inMilliseconds}ms',
         );
-        expect(smallSpinnerFinder, findsOneWidget);
-
-        // Complete the background fetch gate
-        gate.complete();
-        await pumpEventQueue();
-        await tester.pump();
-        await tester.pump();
-
-        // Refresh completed: small loading indicator is gone, obligation remains rendered
-        expect(find.text('Cached Fast Loading Obligation'), findsOneWidget);
-        expect(smallSpinnerFinder, findsNothing);
-
-        await store.dispose();
       });
     },
   );
