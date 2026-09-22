@@ -124,6 +124,12 @@ collection disabled for stage-0 rollout`. Verify the socket mode, `healthz`,
 `readyz`, seeded `GET /v1/throttle`, seeded `GET /v1/quota`, backups, and
 `quota_service_reads_total`; scrape and controller metrics must not advance.
 
+Precedence is deliberately one-way: the switch is on if *either* the flag or
+the drop-in variable asks for it, so while the drop-in is installed there is no
+command-line way to ask a start for probe-on. That is the intended shape — the
+drop-in is the unit's state, and changing the unit's state is the rollback
+below, not a flag an ad-hoc invocation can quietly win with.
+
 To roll back stage 0 into the normal collection stage, remove the drop-in with
 `systemctl --user revert <basename>-quota-coordinator.service`, then
 `systemctl --user daemon-reload` and restart the unit. The absence of the

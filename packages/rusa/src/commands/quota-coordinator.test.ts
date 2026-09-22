@@ -8,6 +8,7 @@ import type { RusaConfig } from "../config/types.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { createLogger } from "../observability/logger.js";
 import { QuotaCollectionLoop } from "../quota/coordinator-collection.js";
+import { QUOTA_METRIC_EVENT, QUOTA_SERVICE_METRICS } from "../quota/coordinator-metrics.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { DEFAULT_OLD_QUOTA_DB_NAME, DEFAULT_RELOCATED_QUOTA_DB_NAME } from "../quota/relocate.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
@@ -279,7 +280,7 @@ quota:
     const testLogger = createLogger({ context: { component: "quota-coordinator" } });
     vi.spyOn(testLogger, "info").mockImplementation(
       (event: string, context?: Record<string, unknown>) => {
-        if (event === "quota_metric" && context) {
+        if (event === QUOTA_METRIC_EVENT && context) {
           emittedMetrics.push(context as { metric: string; type: string; value: number });
         }
       }
@@ -329,26 +330,28 @@ quota:
       expect(observationsAfter).toEqual(observationsBefore);
 
       // Verify read metrics were emitted for each request
-      const readMetrics = emittedMetrics.filter((m) => m.metric === "quota_service_reads_total");
+      const readMetrics = emittedMetrics.filter(
+        (m) => m.metric === QUOTA_SERVICE_METRICS.readsTotal
+      );
       expect(readMetrics).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            metric: "quota_service_reads_total",
+            metric: QUOTA_SERVICE_METRICS.readsTotal,
             path: "/v1/healthz",
             status: 200,
           }),
           expect.objectContaining({
-            metric: "quota_service_reads_total",
+            metric: QUOTA_SERVICE_METRICS.readsTotal,
             path: "/v1/readyz",
             status: 200,
           }),
           expect.objectContaining({
-            metric: "quota_service_reads_total",
+            metric: QUOTA_SERVICE_METRICS.readsTotal,
             path: "/v1/throttle",
             status: 200,
           }),
           expect.objectContaining({
-            metric: "quota_service_reads_total",
+            metric: QUOTA_SERVICE_METRICS.readsTotal,
             path: "/v1/quota",
             status: 200,
           }),
@@ -356,7 +359,9 @@ quota:
       );
 
       // Verify no scrape, parse, observation, or controller metrics were emitted
-      const nonReadMetrics = emittedMetrics.filter((m) => m.metric !== "quota_service_reads_total");
+      const nonReadMetrics = emittedMetrics.filter(
+        (m) => m.metric !== QUOTA_SERVICE_METRICS.readsTotal
+      );
       expect(nonReadMetrics).toHaveLength(0);
     } finally {
       abortController.abort();
@@ -391,6 +396,7 @@ quota:
 `
     );
 
+    vi.stubEnv("RUSA_QUOTA_COORDINATOR_PROBE_OFF", "0");
     const collectionStart = vi
       .spyOn(QuotaCollectionLoop.prototype, "start")
       .mockImplementation(() => {});
@@ -409,6 +415,61 @@ quota:
     await isReady;
     try {
       expect(collectionStart).toHaveBeenCalledOnce();
+    } finally {
+      abortController.abort();
+      await runner;
+    }
+  });
+
+  it("disables probe collection from the operator drop-in environment variable alone", async () => {
+    const home = join(
+      tmpdir(),
+      `rusa-coord-probe-off-env-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const databasePath = join(home, "data", "quota-coordinator.db");
+    mkdirSync(join(home, "data"), { recursive: true });
+    testDirs.push(home);
+    seedQuotaSnapshot(databasePath);
+    writeFileSync(
+      join(home, "config.yaml"),
+      `
+github:
+  account: mock-bot
+rootActor:
+  provider: claude
+  model: claude-3-5-sonnet
+providers:
+  claude:
+    cliCommand: claude
+quota:
+  coordinator:
+    socketPath: ${join(home, "coordinator.sock")}
+    databasePath: ${databasePath}
+`
+    );
+
+    // The runbook's control is the drop-in variable, not the flag: exercise it
+    // with no `probeOff` option, so a wrong name or accepted value here fails
+    // here rather than as a healthy-looking process that probes in production.
+    vi.stubEnv("RUSA_QUOTA_COORDINATOR_PROBE_OFF", "1");
+    const collectionStart = vi
+      .spyOn(QuotaCollectionLoop.prototype, "start")
+      .mockImplementation(() => {});
+    const abortController = new AbortController();
+    let ready: () => void;
+    const isReady = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+
+    const runner = runQuotaCoordinator({
+      home,
+      signal: abortController.signal,
+      onReady: () => ready(),
+    });
+
+    await isReady;
+    try {
+      expect(collectionStart).not.toHaveBeenCalled();
     } finally {
       abortController.abort();
       await runner;
