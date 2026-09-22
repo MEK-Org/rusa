@@ -1,11 +1,55 @@
 import 'dart:convert';
+import 'dart:js_interop';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_core_web/firebase_core_web.dart';
 import 'package:http/http.dart' as http;
 import 'package:web/web.dart' as web;
 
 import 'session.dart';
+
+@JS('firebase_core.initializeApp')
+external JSObject _initializeJsApp(_FirebaseAppOptions options);
+
+@JS('firebase_auth.initializeAuth')
+external JSObject _initializeJsAuth(JSObject app, _FirebaseAuthOptions options);
+
+@JS('firebase_auth.connectAuthEmulator')
+external void _connectJsAuthEmulator(JSObject auth, JSString origin);
+
+@JS('firebase_auth.debugErrorMap')
+external JSAny? get _debugErrorMap;
+
+@JS('firebase_auth.indexedDBLocalPersistence')
+external JSAny? get _indexedDbLocalPersistence;
+
+@JS('firebase_auth.browserLocalPersistence')
+external JSAny? get _browserLocalPersistence;
+
+@JS('firebase_auth.browserSessionPersistence')
+external JSAny? get _browserSessionPersistence;
+
+@JS('firebase_auth.browserPopupRedirectResolver')
+external JSAny? get _browserPopupRedirectResolver;
+
+extension type _FirebaseAppOptions._(JSObject _) implements JSObject {
+  external _FirebaseAppOptions({
+    required String apiKey,
+    required String appId,
+    required String authDomain,
+    required String messagingSenderId,
+    required String projectId,
+  });
+}
+
+extension type _FirebaseAuthOptions._(JSObject _) implements JSObject {
+  external _FirebaseAuthOptions({
+    JSAny? errorMap,
+    JSArray<JSAny?>? persistence,
+    JSAny? popupRedirectResolver,
+  });
+}
 
 class _FirebaseSessionUser implements SessionUser {
   _FirebaseSessionUser(this._user);
@@ -68,6 +112,48 @@ String _firebaseWebMetadata(Map<String, dynamic> config, String name) {
   return value is String ? value : '';
 }
 
+class _FirebaseConfiguration {
+  const _FirebaseConfiguration({
+    required this.apiKey,
+    required this.appId,
+    required this.authDomain,
+    required this.messagingSenderId,
+    required this.projectId,
+  });
+
+  factory _FirebaseConfiguration.fromJson(Map<String, dynamic> json) {
+    return _FirebaseConfiguration(
+      apiKey: _firebaseValue(json, 'apiKey'),
+      appId: _firebaseWebMetadata(json, 'appId'),
+      authDomain: _firebaseValue(json, 'authDomain'),
+      messagingSenderId: _firebaseWebMetadata(json, 'messagingSenderId'),
+      projectId: _firebaseValue(json, 'projectId'),
+    );
+  }
+
+  final String apiKey;
+  final String appId;
+  final String authDomain;
+  final String messagingSenderId;
+  final String projectId;
+
+  FirebaseOptions get flutterOptions => FirebaseOptions(
+    apiKey: apiKey,
+    appId: appId,
+    messagingSenderId: messagingSenderId,
+    projectId: projectId,
+    authDomain: authDomain,
+  );
+
+  _FirebaseAppOptions get jsOptions => _FirebaseAppOptions(
+    apiKey: apiKey,
+    appId: appId,
+    authDomain: authDomain,
+    messagingSenderId: messagingSenderId,
+    projectId: projectId,
+  );
+}
+
 Future<DashboardSession> bootstrapDashboardSession() async {
   final response = await http.get(
     Uri.base.resolve('/api/auth/config'),
@@ -86,18 +172,13 @@ Future<DashboardSession> bootstrapDashboardSession() async {
     throw StateError('Dashboard authentication configuration is unavailable');
   }
 
-  await Firebase.initializeApp(
-    options: FirebaseOptions(
-      apiKey: _firebaseValue(firebase, 'apiKey'),
-      appId: _firebaseWebMetadata(firebase, 'appId'),
-      messagingSenderId: _firebaseWebMetadata(firebase, 'messagingSenderId'),
-      projectId: _firebaseValue(firebase, 'projectId'),
-      authDomain: _firebaseValue(firebase, 'authDomain'),
-    ),
-  );
-  final auth = FirebaseAuth.instance;
+  final firebaseConfiguration = _FirebaseConfiguration.fromJson(firebase);
   final emulator = config['emulatorUrl'];
-  if (emulator != null) _connectAuthEmulator(auth, emulator);
+  if (emulator != null) {
+    await _configureAuthEmulator(emulator, firebaseConfiguration);
+  }
+  await Firebase.initializeApp(options: firebaseConfiguration.flutterOptions);
+  final auth = FirebaseAuth.instance;
   await auth.setPersistence(Persistence.LOCAL);
   final session = FirebaseDashboardSession(
     _FirebaseSessionAuth(auth),
@@ -109,15 +190,59 @@ Future<DashboardSession> bootstrapDashboardSession() async {
   return session;
 }
 
-void _connectAuthEmulator(FirebaseAuth auth, Object value) {
+Future<void> _configureAuthEmulator(
+  Object value,
+  _FirebaseConfiguration firebase,
+) async {
   if (value is! String) {
-    throw StateError('Dashboard Firebase configuration is unavailable');
+    throw StateError(
+      'Dashboard Firebase emulator URL must be an http(s) origin with host and port',
+    );
   }
   final emulator = Uri.tryParse(value);
-  if (emulator == null || emulator.host.isEmpty || !emulator.hasPort) {
-    throw StateError('Dashboard Firebase configuration is unavailable');
+  final supportedScheme =
+      emulator?.scheme == 'http' || emulator?.scheme == 'https';
+  if (emulator == null ||
+      !supportedScheme ||
+      emulator.host.isEmpty ||
+      !emulator.hasPort ||
+      emulator.userInfo.isNotEmpty) {
+    throw StateError(
+      'Dashboard Firebase emulator URL must be an http(s) origin with host and port',
+    );
   }
-  auth.useAuthEmulator(emulator.host, emulator.port);
+  try {
+    // The runtime config is not available to index.html, and FlutterFire
+    // creates Auth while initializing its registered service. Prepare the
+    // emulator first, using its exact pinned loader globals and Auth recipe.
+    final core = FirebaseCoreWeb();
+    // ignore: invalid_use_of_visible_for_testing_member
+    final sdkBase =
+        // ignore: invalid_use_of_visible_for_testing_member
+        'https://www.gstatic.com/firebasejs/${core.firebaseSDKVersion}';
+    // ignore: invalid_use_of_visible_for_testing_member
+    await core.injectSrcScript('$sdkBase/firebase-app.js', 'firebase_core');
+    // ignore: invalid_use_of_visible_for_testing_member
+    await core.injectSrcScript('$sdkBase/firebase-auth.js', 'firebase_auth');
+    final app = _initializeJsApp(firebase.jsOptions);
+    // Matches firebase_auth_web 6.3.0's getAuthInstance exactly; its later
+    // delegate call reuses this initialized Auth instance.
+    final options = _FirebaseAuthOptions(
+      errorMap: _debugErrorMap,
+      persistence: [
+        _indexedDbLocalPersistence,
+        _browserLocalPersistence,
+        _browserSessionPersistence,
+      ].toJS,
+      popupRedirectResolver: _browserPopupRedirectResolver,
+    );
+    final auth = _initializeJsAuth(app, options);
+    _connectJsAuthEmulator(auth, emulator.origin.toJS);
+  } catch (_) {
+    throw StateError(
+      'Dashboard Firebase emulator bridge failed to initialize; verify pinned FlutterFire web packages and run the documented emulator browser regression',
+    );
+  }
 }
 
 String? _csrfToken() {
