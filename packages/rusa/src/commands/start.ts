@@ -1830,13 +1830,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               source: "leader-update",
               autoReconcile: true,
             });
-            console.log(
-              `[update] persisted durable follower update trigger for ${newSha.slice(0, 7)} (${branch})`
-            );
+            log.info("follower_update_trigger_persisted", {
+              targetSha: newSha,
+              branch,
+            });
           } catch (tErr) {
-            console.warn(
-              `[update] failed to persist follower update trigger: ${tErr instanceof Error ? tErr.message : String(tErr)}`
-            );
+            log.warn("follower_update_trigger_persist_failed", {
+              targetSha: newSha,
+              branch,
+              err: tErr,
+            });
           }
         },
         notify: sendErrorSink
