@@ -79,7 +79,7 @@ const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) 
 let session = "";
 let leaderToken: string | undefined;
 let stopped = false;
-const eventQueue = new FollowerEventQueue<FollowerEvent>();
+const eventQueue = new FollowerEventQueue();
 let sendTimer: ReturnType<typeof setTimeout> | undefined;
 
 class FollowerHttpError extends Error {

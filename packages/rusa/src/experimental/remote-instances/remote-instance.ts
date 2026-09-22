@@ -8,9 +8,18 @@ import type {
   FollowerUpdateCommand,
   FollowerUpdateStatus,
   FollowerUpdateStatusEvent,
+  FollowerUpdateStatusPhase,
   LeaderCommand,
 } from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+
+const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
+  "pending",
+  "fetching",
+  "building",
+  "draining",
+  "restarting",
+] satisfies readonly FollowerUpdateStatusPhase[]);
 
 /** In-memory deduplication tracker preserving at-most-once delivery across follower reconnects. */
 export class FollowerDedupeTracker {
@@ -107,9 +116,8 @@ export class RemoteInstance {
   }
 
   isUpdateInProgress(): boolean {
-    return ["pending", "fetching", "building", "draining", "restarting"].includes(
-      this.updateStatus?.status ?? ""
-    );
+    const status = this.updateStatus?.status;
+    return status !== undefined && ACTIVE_UPDATE_PHASES.has(status);
   }
 
   setUpdateStatus(status: FollowerUpdateStatus): boolean {

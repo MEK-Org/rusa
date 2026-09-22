@@ -185,7 +185,7 @@ export class GitRunner implements GitSeam {
       await this.git("git-contains-target", ["merge-base", "--is-ancestor", ancestor, descendant]);
       return true;
     } catch (error) {
-      if (error instanceof StepError && error.message.includes("exited 1")) return false;
+      if (error instanceof StepError && /exited 1(?:\D|$)/.test(error.message)) return false;
       throw error;
     }
   }

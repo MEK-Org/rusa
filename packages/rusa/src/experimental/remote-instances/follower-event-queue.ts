@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type { FollowerEvent } from "./follower-hub.js";
 
-export interface FollowerEventBatch<T> {
+interface FollowerEventBatch {
   batchId: string;
-  events: T[];
+  events: FollowerEvent[];
 }
 
 /**
@@ -10,12 +11,12 @@ export interface FollowerEventBatch<T> {
  * A second flush joins the in-flight delivery so terminal statuses cannot be
  * skipped while an earlier `/events` request is still pending.
  */
-export class FollowerEventQueue<T> {
-  private readonly events: T[] = [];
-  private pendingBatch: FollowerEventBatch<T> | undefined;
+export class FollowerEventQueue {
+  private readonly events: FollowerEvent[] = [];
+  private pendingBatch: FollowerEventBatch | undefined;
   private inFlight: Promise<void> | undefined;
 
-  enqueue(event: T): void {
+  enqueue(event: FollowerEvent): void {
     this.events.push(event);
   }
 
@@ -32,7 +33,7 @@ export class FollowerEventQueue<T> {
     this.events.length = 0;
   }
 
-  async flush(deliver: (batch: FollowerEventBatch<T>) => Promise<void>): Promise<void> {
+  async flush(deliver: (batch: FollowerEventBatch) => Promise<void>): Promise<void> {
     if (this.inFlight) return this.inFlight;
 
     const delivery = this.deliverPending(deliver);
@@ -45,7 +46,7 @@ export class FollowerEventQueue<T> {
   }
 
   private async deliverPending(
-    deliver: (batch: FollowerEventBatch<T>) => Promise<void>
+    deliver: (batch: FollowerEventBatch) => Promise<void>
   ): Promise<void> {
     while (this.pendingBatch || this.events.length) {
       if (!this.pendingBatch) {
