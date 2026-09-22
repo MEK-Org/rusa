@@ -1692,6 +1692,33 @@ class ObligationDto {
       hasCompletionHistory: j['hasCompletionHistory'] as bool? ?? false,
     );
   }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    if (parentId != null) 'parentId': parentId,
+    'ownerId': ownerId,
+    if (title != null) 'title': title,
+    if (creatorId != null) 'creatorId': creatorId,
+    if (createdAt != null) 'createdAt': createdAt,
+    if (updatedAt != null) 'updatedAt': updatedAt,
+    if (intent != null) 'intent': intent,
+    if (externalRef != null) 'externalRef': externalRef,
+    'status': status,
+    if (priority != null) 'priority': priority,
+    'effectivePriority': effectivePriority,
+    if (prioritySourceId != null) 'prioritySourceId': prioritySourceId,
+    if (terminalNote != null) 'terminalNote': terminalNote,
+    if (resolutionRef != null) 'resolutionRef': resolutionRef,
+    if (recurrencePolicy != null) 'recurrencePolicy': recurrencePolicy,
+    if (recurrenceCron != null) 'recurrenceCron': recurrenceCron,
+    if (recurrenceIntervalSeconds != null)
+      'recurrenceIntervalSeconds': recurrenceIntervalSeconds,
+    if (nextReadyAt != null) 'nextReadyAt': nextReadyAt,
+    if (checkpoint != null) 'checkpoint': checkpoint,
+    if (checkpointAt != null) 'checkpointAt': checkpointAt,
+    if (checkpointBy != null) 'checkpointBy': checkpointBy,
+    if (hasCompletionHistory) 'hasCompletionHistory': hasCompletionHistory,
+  };
 }
 
 class ObligationPage {
@@ -1724,6 +1751,12 @@ class ObligationTreeDto {
   final ObligationDto obligation;
   final List<ObligationTreeDto> children;
   final List<ObligationDto> blockingChildren;
+
+  Map<String, dynamic> toJson() => {
+    'obligation': obligation.toJson(),
+    'children': children.map((c) => c.toJson()).toList(),
+    'blockingChildren': blockingChildren.map((b) => b.toJson()).toList(),
+  };
 
   factory ObligationTreeDto.fromJson(Map<String, dynamic> j) =>
       ObligationTreeDto(

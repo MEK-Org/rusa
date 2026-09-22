@@ -9,6 +9,7 @@ import 'api.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligations_cache.dart';
 import 'principals.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -158,6 +159,7 @@ class DashboardStore {
     QuotaCache? quotaCache,
     TreePreferencesCache? treePreferencesCache,
     ActorHierarchyCache? actorHierarchyCache,
+    ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
   }) : _api = api,
@@ -167,6 +169,7 @@ class DashboardStore {
            treePreferencesCache ?? const NoopTreePreferencesCache(),
        _actorHierarchyCache =
            actorHierarchyCache ?? const NoopActorHierarchyCache(),
+       _obligationsCache = obligationsCache ?? const NoopObligationsCache(),
        _hierarchyScope = cacheScopeFor(api.base) {
     // Seed the quota subject from the persisted snapshot BEFORE the first frame
     // (ISSUE_NUM ask 4): the header reads `store.quota.valueOrNull` as its
@@ -221,6 +224,31 @@ class DashboardStore {
     _actorsStale.add(true);
   }
 
+  /// Hydrates only the snapshot belonging to an already-resolved viewer (#505).
+  /// A browser can retain another person's localStorage entries after logout, so
+  /// no persisted obligations are exposed before dashboard configuration names
+  /// the authenticated principal.
+  void _seedObligationsFromCache(String principalId) {
+    final cached = _obligationsCache.load(
+      scope: _hierarchyScope,
+      principalId: principalId,
+    );
+    if (cached == null) return;
+    if (!cached.isUsableAt(
+      scope: _hierarchyScope,
+      principalId: principalId,
+      now: DateTime.timestamp(),
+    )) {
+      _obligationsCache.invalidate(
+        scope: _hierarchyScope,
+        principalId: principalId,
+      );
+      return;
+    }
+    _cachedObligationTrees = cached.trees;
+    _cachedObligationPrincipal = principalId;
+  }
+
   /// The server boundary a persisted hierarchy belongs to, as
   /// `scheme://host[:port]` of the API base.
   ///
@@ -254,9 +282,15 @@ class DashboardStore {
   final QuotaCache _quotaCache;
   final TreePreferencesCache _treePreferencesCache;
   final ActorHierarchyCache _actorHierarchyCache;
+  final ObligationsCache _obligationsCache;
   final String _hierarchyScope;
+  List<ObligationTreeDto>? _cachedObligationTrees;
+  String? _cachedObligationPrincipal;
 
   DashboardApi get api => _api;
+  ObligationsCache get obligationsCache => _obligationsCache;
+  List<ObligationTreeDto>? get cachedObligationTrees => _cachedObligationTrees;
+  String? get cachedObligationPrincipal => _cachedObligationPrincipal;
 
   /// Walkie-talkie platform deps , wired by the web entrypoint. Null
   /// means the feature is absent (headless harnesses/tests that don't care) —
@@ -455,7 +489,11 @@ class DashboardStore {
 
   Future<void> refreshDashboardConfig() async {
     try {
-      _dashboardConfig.add(await _api.fetchDashboardConfig());
+      final config = await _api.fetchDashboardConfig();
+      _onPrincipalResolved(config.userPrincipalId);
+      // WorkTab listens to this subject. Publish only after the cache is
+      // reconciled, so no listener can render a previous principal's trees.
+      _dashboardConfig.add(config);
     } on DashboardApiException catch (e) {
       // Older/static dashboard hosts may not expose this endpoint; the header
       // keeps its weekly per-provider defaults.
@@ -464,6 +502,51 @@ class DashboardStore {
     } catch (e) {
       _error.add('$e');
     }
+  }
+
+  void _onPrincipalResolved(String? resolvedPrincipal) {
+    _cachedObligationTrees = null;
+    _cachedObligationPrincipal = resolvedPrincipal;
+    if (resolvedPrincipal == null || resolvedPrincipal.isEmpty) return;
+    _seedObligationsFromCache(resolvedPrincipal);
+  }
+
+  /// Persists [trees] as the new last-known successful obligations snapshot (#505).
+  void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
+    final principal = userPrincipalId;
+    // A capture without an authenticated principal is unsafe to replay later.
+    if (principal == null || principal.isEmpty) return;
+    _cachedObligationTrees = trees;
+    _cachedObligationPrincipal = principal;
+    _obligationsCache.save(
+      PersistedObligationsSnapshot.capture(
+        scope: _hierarchyScope,
+        principalId: principal,
+        trees: trees,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// Invalidates the cached obligations snapshot so navigation return or reload
+  /// does not regress to known-old state after a mutation (#505).
+  void invalidateObligationsCache() {
+    final principal = _cachedObligationPrincipal ?? userPrincipalId;
+    _cachedObligationTrees = null;
+    _cachedObligationPrincipal = principal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.invalidate(
+      scope: _hierarchyScope,
+      principalId: principal,
+    );
+  }
+
+  /// Runs an obligation-changing API operation and prevents a later Work-tab
+  /// return from reviving the old persisted forest.
+  Future<T> mutateObligations<T>(Future<T> Function() operation) async {
+    final result = await operation();
+    invalidateObligationsCache();
+    return result;
   }
 
   Future<void> refreshThreads() async {
@@ -1243,6 +1326,7 @@ class DashboardStore {
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
+      invalidateObligationsCache();
       _obligationRefreshes.add(e.detail);
     }
 

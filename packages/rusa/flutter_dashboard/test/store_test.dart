@@ -4,6 +4,7 @@ import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
 
 import 'fakes.dart';
@@ -2096,5 +2097,177 @@ void main() {
     expect(retained.map((e) => e.id), isNot(contains('live0'))); // aged out
 
     await store.dispose();
+  });
+
+  group('Obligations browser cache (#505)', () {
+    final now = DateTime.utc(2026, 9, 22, 12);
+    final cachedTree = ObligationTreeDto(
+      obligation: makeObligation('cached-root', title: 'Cached Root Obligation'),
+      children: const [],
+      blockingChildren: const [],
+    );
+
+    test('does not expose a persisted snapshot before its principal resolves (#505)', () async {
+      final aliceSnapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'user-alice',
+        trees: [cachedTree],
+        now: now,
+      );
+      final store = DashboardStore(
+        api: FakeApi(base: Uri.parse('http://localhost:4040')),
+        stream: FakeStream(),
+        obligationsCache: FakeObligationsCache(aliceSnapshot),
+      );
+
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
+    test('seeds obligations from the matching cache after principal resolution (#505)', () async {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'test-user',
+        trees: [cachedTree],
+        now: now,
+      );
+      final cache = FakeObligationsCache(snapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'test-user',
+        );
+
+      // Create store with cache
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+
+      expect(store.cachedObligationTrees, isNull);
+      await store.init();
+      await pumpEventQueue();
+
+      expect(store.cachedObligationTrees, isNotNull);
+      expect(store.cachedObligationTrees!.length, 1);
+      expect(store.cachedObligationTrees!.first.obligation.id, 'cached-root');
+
+      await store.dispose();
+    });
+
+    test('persists each successful obligations forest snapshot for next cold load (#505)', () async {
+      final cache = FakeObligationsCache();
+      final freshTree = ObligationTreeDto(
+        obligation: makeObligation('fresh-root', title: 'Fresh Root'),
+        children: const [],
+        blockingChildren: const [],
+      );
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-alice',
+        );
+
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      store.saveObligationsSnapshot([freshTree]);
+
+      expect(cache.saveCount, 1);
+      expect(cache.stored, isNotNull);
+      expect(cache.stored!.trees.first.obligation.id, 'fresh-root');
+      expect(cache.stored!.principalId, 'user-alice');
+      expect(cache.stored!.scope, 'http://localhost:4040');
+
+      await store.dispose();
+    });
+
+    test('isolates obligations cache across different authenticated principals (#505)', () async {
+      final aliceSnapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'user-alice',
+        trees: [ObligationTreeDto(obligation: makeObligation('alice-ob'), children: const [], blockingChildren: const [])],
+        now: now,
+      );
+      final cache = FakeObligationsCache(aliceSnapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-bob',
+        );
+
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      // Alice's snapshot must not be served to Bob!
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
+    test('invalidates cache on explicit mutation or SSE checkpoint event (#505)', () async {
+      final snapshot = PersistedObligationsSnapshot.capture(
+        scope: 'http://localhost:4040',
+        principalId: 'test-user',
+        trees: [cachedTree],
+        now: now,
+      );
+      final cache = FakeObligationsCache(snapshot);
+      final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+        ..dashboardConfigResult = const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'test-user',
+        );
+      final stream = FakeStream();
+
+      final store = DashboardStore(
+        api: api,
+        stream: stream,
+        obligationsCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      expect(cache.invalidateCount, 0);
+
+      // Invalidate explicitly
+      store.invalidateObligationsCache();
+      expect(cache.invalidateCount, 1);
+      expect(store.cachedObligationTrees, isNull);
+
+      // Re-save
+      store.saveObligationsSnapshot([cachedTree]);
+      expect(store.cachedObligationTrees, isNotNull);
+
+      // Deliver SSE checkpoint event
+      stream.meshCtrl.add(
+        makeEvent(
+          'evt-ckpt',
+          'obligation_checkpoint_set',
+          actor: 'worker-1',
+          payload: '{"obligationId":"cached-root"}',
+        ),
+      );
+      await pumpEventQueue();
+
+      // Should have invalidated cache
+      expect(cache.invalidateCount, 2);
+      expect(store.cachedObligationTrees, isNull);
+
+      await store.dispose();
+    });
+
   });
 }

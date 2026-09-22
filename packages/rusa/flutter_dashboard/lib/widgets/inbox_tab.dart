@@ -351,10 +351,12 @@ class _InboxTabState extends State<InboxTab> {
               final previousId = index - 2 >= 0 ? items[index - 2].id : null;
               final nextId = items[index - 1].id;
               try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
+                await widget.store.mutateObligations(
+                  () => widget.store.api.reorderObligation(
+                    o.id,
+                    previousId: previousId,
+                    nextId: nextId,
+                  ),
                 );
                 _refresh();
               } catch (err) {
@@ -376,10 +378,12 @@ class _InboxTabState extends State<InboxTab> {
                   ? items[index + 2].id
                   : null;
               try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
+                await widget.store.mutateObligations(
+                  () => widget.store.api.reorderObligation(
+                    o.id,
+                    previousId: previousId,
+                    nextId: nextId,
+                  ),
                 );
                 _refresh();
               } catch (err) {
