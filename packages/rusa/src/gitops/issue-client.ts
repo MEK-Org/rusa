@@ -423,7 +423,7 @@ export class GitHubApiError extends Error {
     readonly status: number,
     readonly method: string,
     readonly path: string,
-    readonly body: string
+    body: string
   ) {
     super(`GitHub API ${method} ${path} failed with ${status}: ${body.slice(0, 500)}`);
     this.name = "GitHubApiError";
@@ -470,7 +470,6 @@ const ASYNC_MERGE_TIMEOUT_SECONDS = (ASYNC_MERGE_MAX_POLLS * ASYNC_MERGE_POLL_IN
 interface AsyncMergeResponse {
   status: string;
   details?: {
-    expected_head_sha?: string;
     message?: string;
     sha?: string;
     uuid?: string;
@@ -971,6 +970,16 @@ export class GitHubIssueClient implements IssueClient {
     const headRef = opts.deleteBranch
       ? (await this.getPullRequestDetails(opts.repo, opts.prNumber)).headRef
       : undefined;
+    // GitHub exposes stack membership through PullRequest.stack/stackEntry in
+    // GraphQL. Preflighting keeps the position guard authoritative and avoids
+    // inferring stack membership from a REST error message.
+    const stack = await this.getPullRequestStack(opts.repo, opts.prNumber);
+    if (stack !== null) {
+      this.requireLowerStackEntriesMerged(opts, stack.position, stack.entries);
+      const sha = await this.mergePullRequestAsync(opts);
+      if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
+      return sha;
+    }
 
     try {
       const result = await this.api<{ sha: string }>(
@@ -983,29 +992,12 @@ export class GitHubIssueClient implements IssueClient {
         }
       );
 
-      if (headRef) await this.deleteMergedHeadBranch(opts.repo, headRef);
+      if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
       return result.sha;
     } catch (err) {
-      if (this.isLegacyStackMergeRejection(err)) {
-        const stack = await this.getPullRequestStack(opts.repo, opts.prNumber);
-        if (stack === null) {
-          throw new Error(
-            `GitHub reported ${opts.repo}#${opts.prNumber} as a stacked pull request, ` +
-              "but its stack metadata could not be read; refusing an unvalidated stack merge."
-          );
-        }
-        this.requireLowerStackEntriesMerged(opts, stack.position, stack.entries);
-        const sha = await this.mergePullRequestAsync(opts);
-        if (headRef) await this.deleteMergedHeadBranchIfNoOpenDependents(opts.repo, headRef);
-        return sha;
-      }
-      if (
-        err instanceof GitHubApiError &&
-        err.status === 409 &&
-        opts.expectedHeadSha &&
-        err.message.includes("Head branch was modified")
-      ) {
-        throw new PullRequestHeadAdvancedError(opts.repo, opts.prNumber, opts.expectedHeadSha, err);
+      const expectedHeadSha = opts.expectedHeadSha;
+      if (expectedHeadSha && this.isHeadAdvancedMergeRejection(err, expectedHeadSha)) {
+        throw new PullRequestHeadAdvancedError(opts.repo, opts.prNumber, expectedHeadSha, err);
       }
       throw err;
     }
@@ -1083,6 +1075,8 @@ export class GitHubIssueClient implements IssueClient {
     position: number,
     entries: Array<{ position: number; pullRequest: { number: number; state: string } | null }>
   ): void {
+    // PullRequestStackEntry.position is documented as 1 closest to the base
+    // branch, with larger positions stacked above it.
     const unmergedLowerEntries = entries.filter((entry) => {
       if (entry.position >= position) return false;
       const state = entry.pullRequest?.state?.toUpperCase();
@@ -1097,20 +1091,15 @@ export class GitHubIssueClient implements IssueClient {
     }
   }
 
-  /**
-   * GitHub rejects PUT /pulls/{number}/merge with 403 when the PR belongs to a
-   * stack. The REST API does not provide a machine-readable error code enum or
-   * discriminator field for this condition, returning only HTTP 403 Forbidden
-   * with the message below. Substring matching distinguishes this from other 403s
-   * (e.g. branch protection, insufficient permissions) without paying upfront
-   * GraphQL query costs for standard unstacked merges.
-   */
-  private isLegacyStackMergeRejection(err: unknown): err is GitHubApiError {
+  private isHeadAdvancedMergeRejection(
+    err: unknown,
+    expectedHeadSha: string | undefined
+  ): err is GitHubApiError {
     return (
       err instanceof GitHubApiError &&
-      err.status === 403 &&
-      (err.message.includes("Merging stacked PRs via this endpoint is not supported") ||
-        err.body.includes("Merging stacked PRs via this endpoint is not supported"))
+      err.status === 409 &&
+      expectedHeadSha !== undefined &&
+      err.message.includes("Head branch was modified")
     );
   }
 
@@ -1128,32 +1117,13 @@ export class GitHubIssueClient implements IssueClient {
       );
       return this.awaitAsyncMergeResult(opts, result);
     } catch (err) {
-      // A 409 carries the UUID of an async request GitHub already accepted for
-      // this PR. Its outcome is still unknown, so join that request and wait
-      // for its terminal result rather than treating an in-progress merge as a failure.
-      if (err instanceof GitHubApiError && err.status === 409) {
-        try {
-          const existing = JSON.parse(err.body) as AsyncMergeResponse;
-          const existingExpectedHeadSha = existing.details?.expected_head_sha;
-          if (opts.expectedHeadSha && existingExpectedHeadSha !== opts.expectedHeadSha) {
-            if (existingExpectedHeadSha) {
-              throw new PullRequestHeadAdvancedError(
-                opts.repo,
-                opts.prNumber,
-                opts.expectedHeadSha,
-                err
-              );
-            }
-            throw new Error(
-              `GitHub returned an existing asynchronous merge for ${opts.repo}#${opts.prNumber} ` +
-                "without its expected head SHA; refusing to join an unverified merge."
-            );
-          }
-          return this.awaitAsyncMergeResult(opts, existing);
-        } catch (parseError) {
-          if (!(parseError instanceof SyntaxError)) throw parseError;
-        }
+      const expectedHeadSha = opts.expectedHeadSha;
+      if (expectedHeadSha && this.isHeadAdvancedMergeRejection(err, expectedHeadSha)) {
+        throw new PullRequestHeadAdvancedError(opts.repo, opts.prNumber, expectedHeadSha, err);
       }
+      // GitHub documents 409 as an existing async request whose merge options
+      // may differ. Its result does not establish an equivalent commit message,
+      // so never report that unknown operation as this caller's success.
       throw err;
     }
   }
@@ -1190,7 +1160,8 @@ export class GitHubIssueClient implements IssueClient {
       if (pollCount >= ASYNC_MERGE_MAX_POLLS) {
         throw new Error(
           `Asynchronous merge polling timed out for ${opts.repo}#${opts.prNumber} after ` +
-            `${ASYNC_MERGE_TIMEOUT_SECONDS} seconds.`
+            `${ASYNC_MERGE_TIMEOUT_SECONDS} seconds for request ${uuid}; GitHub may still complete it. ` +
+            `Query /repos/${opts.repo}/pulls/${opts.prNumber}/merge-async/${uuid} for its result.`
         );
       }
       await new Promise<void>((resolve) => setTimeout(resolve, ASYNC_MERGE_POLL_INTERVAL_MS));
