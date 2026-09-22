@@ -6,6 +6,7 @@ import {
 } from "../../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import type { MeshEventInput } from "../../actor/mesh-events.js";
+import { type ProviderPacer, submitPoolGate } from "../../actor/provider-pacer.js";
 import type { LogFields, Logger } from "../../observability/logger.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
@@ -27,6 +28,11 @@ export function createHarness(options: {
   cwd: string;
   delayMs?: number;
   providerFactory?: ProviderFactory;
+  /**
+   * Leader-side provider pacing. Supplied only by tests about a run that waits
+   * to be admitted; without it the mesh keeps its unpaced default gate.
+   */
+  pacer?: ProviderPacer;
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -67,6 +73,7 @@ export function createHarness(options: {
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  const pacer = options.pacer;
   // No event seam: these follower tests never route or deliver events, and a
   // mesh without one simply refuses those paths rather than inventing a ladder.
   const mesh = new ActorMesh({
@@ -77,6 +84,16 @@ export function createHarness(options: {
     maxConcurrent: 1,
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
+    ...(pacer
+      ? {
+          providerGate: (fn, candidates, request) =>
+            submitPoolGate(fn, [{ config: candidates[0], lane: "instance-fixture", pacer }], {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+            }),
+        }
+      : {}),
     recordChat: (message) => {
       messages.push({ fromId: message.senderId, toId: message.recipientId, body: message.body });
       return `message-${messages.length}`;
@@ -91,7 +108,10 @@ export function createHarness(options: {
               kind: "run_abandoned",
               actorId: context.record.id,
               detail: event.terminal.reason,
-              payload: JSON.stringify({ started: event.terminal.started }),
+              payload: JSON.stringify({
+                started: event.terminal.started,
+                runId: event.runId,
+              }),
             });
           }
         },
