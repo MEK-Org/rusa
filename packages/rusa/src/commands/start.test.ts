@@ -4555,23 +4555,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       "Claude 3.5 Sonnet"
     );
 
-    // Valid target provider + model stages for the next run boundary.
+    // Valid target provider + model applies at once on the idle worker (#652).
     activeMesh.setActorModel(
       portableWorkerId,
       { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
       "root"
     );
-    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("antigravity");
     expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
-      "Claude 3.5 Sonnet"
-    );
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.provider).toBe(
-      "antigravity"
-    );
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.model).toBe(
       "Gemini 3.7 Flash"
     );
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.effort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.effort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig).toBeUndefined();
 
     // Invalid model for target provider fails validation
     expect(() => {
@@ -4590,19 +4585,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "root"
       );
     }).toThrow(/conflicting reasoning efforts/);
-    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
-      "Claude 3.5 Sonnet"
-    );
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.model).toBe(
-      "Gemini 3.7 Flash"
-    );
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.effort).toBe("high");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.provider).toBe(
-      "antigravity"
-    );
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]).toMatchObject({
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig).toBeUndefined();
   });
 
-  it("root's run_start records the live model after a pool staged while idle, not the value frozen when root was built (#199 amend gap 1, extended to pools)", async () => {
+  it("root's run_start records the live model after a pool set while idle, not the value frozen when root was built (#199 amend gap 1, extended to pools)", async () => {
     // A prior test in this file registers a real "antigravity"/"agy" model
     // catalog via setProviderModelCatalog and never clears it; that module-level
     // state otherwise leaks into this test and rejects the pin below.
@@ -4626,16 +4617,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!rootActor) throw new Error("root actor not ready");
     const originalModel = activeMesh.actors.get("root")?.modelConfig?.[0]?.model;
 
-    // Stage a new model on root while idle. Per #199 (extended to pools),
-    // this must apply inside beforeRun at root's very next dispatch — before
-    // that run's own gate()/run_start — not merely sit staged past this run.
+    // Set a new model on root while idle. It applies and persists at once
+    // (#652), so root's very next dispatch — its own gate()/run_start — runs
+    // on it.
     activeMesh.setActorModel(
       "root",
       { provider: "antigravity", model: "Gemini 4.1 Ultra (High)" },
       "root"
     );
-    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe(originalModel);
-    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig).toBeUndefined();
 
     // Invoke the production beforeRun closure, then the root's lifecycle
     // fanout, without driving a provider/gate/queue cycle.
@@ -4728,10 +4719,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
     ).opts;
 
-    // Stage a move to claude while root is idle on antigravity.
+    // Move idle root from antigravity to claude; it applies at once (#652).
     activeMesh.setActorModel("root", { provider: "claude", model: "claude-sonnet-5" }, "root");
-    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
-    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig).toBeUndefined();
 
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
@@ -4741,8 +4732,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // halt scoped to claude must still block dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
-    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
-    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("claude");
     halt.resume();
 
     // Halt the OLD provider (antigravity) instead — root is no longer
@@ -4880,15 +4870,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     };
 
-    // Boot on the file tuple, move root to the operator pool through the same
-    // set/apply path production uses, and stop — the database now carries the
+    // Boot on the file tuple, move idle root to the operator pool through the
+    // same set path production uses, and stop — the database now carries the
     // pool and the service is down, exactly the state a restart starts from.
+    // No run or message follows the set: an idle actor's change is applied
+    // and persisted on the spot (#652).
     const persistOperatorPool = async (): Promise<void> => {
       const mesh = await boot();
       expect(mesh.actors.get("root")?.modelConfig).toEqual([bootTuple]);
       mesh.setActorModel("root", operatorPool, "root");
-      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
       expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(mesh.actors.get("root")?.desiredModelConfig).toBeUndefined();
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      expect(readRootModelConfigRow()).toMatchObject({ entries: operatorPool });
       expect(modelSetEvents()).toHaveLength(1);
       await shutdownFn?.();
       shutdownFn = undefined;
@@ -4932,6 +4926,37 @@ describe("runStart webhook event routing (Phase 4)", () => {
           action: expect.stringMatching(/set_actor_model/),
         },
       ]);
+    });
+
+    it("applies a pool set mid-run when the run ends and keeps it across a restart (#652)", async () => {
+      const mesh = await boot();
+      const rootActor = mesh.get("root");
+      if (!rootActor) throw new Error("root actor not ready");
+      const running = vi.spyOn(rootActor, "isRunning", "get").mockReturnValue(true);
+
+      // In flight: the run keeps the pool it launched on.
+      mesh.setActorModel("root", operatorPool, "root");
+      expect(mesh.actors.get("root")?.modelConfig).toEqual([bootTuple]);
+      expect(mesh.actors.get("root")?.desiredModelConfig).toEqual(operatorPool);
+      expect(readRootModelConfigRow()).toMatchObject({ entries: [bootTuple] });
+      expect(modelSetEvents()).toHaveLength(0);
+
+      // The run ends and root stays idle: no further dispatch is needed for
+      // the change to be live and durable.
+      running.mockReturnValue(false);
+      mesh.finishInboxRun("root");
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(mesh.actors.get("root")?.desiredModelConfig).toBeUndefined();
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      expect(readRootModelConfigRow()).toMatchObject({ entries: operatorPool });
+      expect(modelSetEvents()).toHaveLength(1);
+      await shutdownFn?.();
+      shutdownFn = undefined;
+
+      const restarted = await boot();
+      expect(restarted.actors.get("root")?.modelConfig).toEqual(operatorPool);
+      expect(liveRootPool(restarted)).toEqual(operatorPool);
+      expect(modelSetEvents()).toHaveLength(1);
     });
 
     it("keeps an upgraded database on the tuple its last boot wrote, not the tuple the file now says", async () => {
