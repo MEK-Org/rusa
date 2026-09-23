@@ -2,7 +2,12 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { findUnpooledHaltModels, HaltSwitch, parseHaltCommand } from "./halt-switch.js";
+import {
+  findUnpooledHaltModels,
+  HALT_SYNTAX_HELP,
+  HaltSwitch,
+  parseHaltCommand,
+} from "./halt-switch.js";
 
 describe("HaltSwitch", () => {
   let dir: string;
@@ -173,12 +178,31 @@ describe("findUnpooledHaltModels", () => {
   });
 
   it("still reports the miss when the provider has no pool at all", () => {
-    // The handler rejects an unconfigured provider before the hold is placed,
-    // so an empty pool means a configured provider no live actor is using.
-    // "No current or staged pool names it" is true there and worth saying: the
-    // hold is placed either way, and staying silent is the #630 failure --- an
-    // acknowledgement that reads exactly like a correct one. There is nothing
-    // to suggest, so the finding carries no hints.
+    // The handler rejects an unconfigured provider before it reaches here, so
+    // an empty pool means a configured provider no live actor is using. Every
+    // name is unmatched there, and the caller refuses the command --- but it
+    // has nothing to suggest, so the finding carries no hints and the caller
+    // says why instead.
     expect(findUnpooledHaltModels(["anything"], [])).toEqual([{ model: "anything", nearest: [] }]);
+  });
+});
+
+describe("HALT_SYNTAX_HELP", () => {
+  it("shows the provider-scoped and model-scoped forms an operator can retype", () => {
+    // What a rejected command is answered with, so the operator does not have
+    // to guess the grammar back from an error message.
+    expect(HALT_SYNTAX_HELP).toContain("/halt provider:");
+    expect(HALT_SYNTAX_HELP).toContain("model:");
+    expect(HALT_SYNTAX_HELP).toContain("until:");
+  });
+
+  it("stays true to the grammar it documents", () => {
+    // The help is prose next to the parser; a form it advertises must parse.
+    expect(parseHaltCommand("/halt")).toEqual({});
+    expect(parseHaltCommand("/halt provider:claude")).toEqual({ providers: ["claude"] });
+    expect(parseHaltCommand("/halt provider:claude model:claude-opus-5")).toEqual({
+      providers: ["claude"],
+      models: ["claude-opus-5"],
+    });
   });
 });

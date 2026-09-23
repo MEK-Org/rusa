@@ -141,6 +141,17 @@ export class HaltSwitch {
   }
 }
 
+/**
+ * The `/halt` forms an operator can retype, quoted back when a command fails
+ * to parse. It lives beside {@link parseHaltCommand} so the grammar and its
+ * description cannot drift apart.
+ */
+export const HALT_SYNTAX_HELP =
+  "Valid syntax: `/halt` (every provider), `/halt provider:<p>[,<p2>]`" +
+  " (provider-wide), `/halt provider:<p> model:<m>[,<m2>]` (model-scoped —" +
+  " `model:` always needs a `provider:`). Any form also takes" +
+  " `until:<ISO-8601 timestamp>`.";
+
 /** Parse `/halt` atoms without involving an actor/LLM. */
 export function parseHaltCommand(text: string): HaltCommand | null {
   const match = text.trim().match(/^\/(?:halt|pause)(?:\s+(.*))?$/i);
@@ -202,20 +213,21 @@ const NEAREST_POOL_ENTRIES = 2;
  * The `models` that no entry of `pooled` names, each with the closest pool
  * entries to offer back.
  *
- * This is advisory and never a gate: halting a model that is not yet pooled is
- * deliberate — an operator staging a rollout wants the hold in place *before*
- * the model appears, so the first run on it cannot start. The caller places
- * the halt as asked and uses this only to say what the mesh can presently see.
+ * This gates the halt. A model the mesh cannot see is a model no run will ever
+ * resolve to, so a hold on it stops nothing while occupying the single halt
+ * sentinel — which is #630: the typo'd hold has to be `/resume`d before the
+ * corrected one is accepted. The caller places no hold when this returns
+ * findings and hands `nearest` back as what to retype instead.
  *
  * Comparison is case-insensitive because {@link parseHaltCommand} lowercases
  * what was typed while a pool keeps the provider's own casing; a literal
- * compare would warn about models that are in fact held.
+ * compare would refuse models that are in fact launchable.
  *
- * An empty `pooled` still reports every name. The handler rejects a provider
- * that is not configured before it places the hold, so no pool here means a
- * configured provider no live actor is presently using — and "no current or
- * staged pool names it" is exactly as true there as anywhere else. Such a
- * finding carries no `nearest`, because there is nothing to suggest.
+ * An empty `pooled` reports every name. The handler rejects a provider that is
+ * not configured before reaching here, so no pool means a configured provider
+ * no live actor is presently using; every model is unknown there and none can
+ * be held. Such a finding carries no `nearest` — the caller says the pool is
+ * empty rather than quoting a bare name back with nothing to act on.
  */
 export function findUnpooledHaltModels(
   models: readonly string[],

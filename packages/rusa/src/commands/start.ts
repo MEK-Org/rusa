@@ -54,6 +54,7 @@ import {
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
 import {
   findUnpooledHaltModels,
+  HALT_SYNTAX_HELP,
   type HaltCommand,
   HaltSwitch,
   parseHaltCommand,
@@ -3906,7 +3907,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         void cc
           .send(
             msg.spaceName,
-            `⛔ Halt command rejected: ${err instanceof Error ? err.message : String(err)}.`
+            `⛔ Halt command rejected: ${err instanceof Error ? err.message : String(err)}.` +
+              ` ${HALT_SYNTAX_HELP}`
           )
           .catch(() => {});
         return;
@@ -3927,6 +3929,42 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         if (haltCommand.until && Date.parse(haltCommand.until) <= Date.now()) {
           void cc
             .send(msg.spaceName, "⛔ Halt command rejected: until must be in the future.")
+            .catch(() => {});
+          return;
+        }
+        // A `model:` scope the mesh cannot see is a hold no run will ever meet,
+        // and taking the single halt sentinel for it is #630: the corrected
+        // halt is then refused until the inert one is resumed. Refuse instead,
+        // and offer back what to retype. This sits above `haltSwitch.halt`
+        // deliberately — below it, the sentinel, the queued-run flush, and the
+        // expiry timer would all have happened for a command being declined.
+        const pooled = (haltCommand.providers ?? []).flatMap((provider) =>
+          mesh.pooledModelsForProvider(provider)
+        );
+        const unpooled = findUnpooledHaltModels(haltCommand.models ?? [], pooled);
+        if (unpooled.length > 0) {
+          const providerScope = (haltCommand.providers ?? []).join(", ");
+          const named = unpooled
+            .map((u) =>
+              u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
+            )
+            .join(", ");
+          // With nothing to suggest, the useful fact is *why*: an idle
+          // provider, not a misspelled model.
+          const why = pooled.length ? "" : ` ${providerScope} has no pooled models right now.`;
+          // A comma list is refused whole. Holding the half that matched would
+          // leave a named scope unheld while the acknowledgement implied
+          // otherwise, and the operator retypes the whole command anyway.
+          const partial =
+            unpooled.length < (haltCommand.models?.length ?? 0)
+              ? " No hold was placed, including for the models that did match."
+              : " No hold was placed.";
+          void cc
+            .send(
+              msg.spaceName,
+              `⛔ Halt command rejected: no current or staged pool for ${providerScope}` +
+                ` names ${named}.${why}${partial}`
+            )
             .catch(() => {});
           return;
         }
@@ -3956,36 +3994,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const scope = parts.length ? parts.join(" and ") : "all actor runs";
         const expiry = haltCommand.until ? ` until ${haltCommand.until}` : "";
         const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
-        // A `model:` scope nothing can launch on is inert for every caller that
-        // names its model, so the acknowledgement would otherwise claim a scope
-        // that was never taken. Say so — but the hold still stands as asked,
-        // because holding a model before it is pooled is a deliberate way to
-        // stage a rollout.
-        const unpooled = findUnpooledHaltModels(
-          haltCommand.models ?? [],
-          (haltCommand.providers ?? []).flatMap((provider) =>
-            mesh.pooledModelsForProvider(provider)
-          )
-        );
-        const named = unpooled
-          .map((u) =>
-            u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
-          )
-          .join(", ");
-        // Advisory, never a gate: the hold is already placed above. Holding a
-        // model before it is pooled is how a rollout is staged, so this reports
-        // what the mesh can presently see and leaves the decision alone.
-        const warning = unpooled.length
-          ? ` ⚠️ ${named} — no current or staged pool names` +
-            ` ${unpooled.length === 1 ? "it" : "them"}. The hold stands and will bite if the` +
-            " model appears, but until then it stops only callers that cannot name a model," +
-            " and this halt must be resumed before a differently-spelled one can replace it."
-          : "";
         void cc
-          .send(
-            msg.spaceName,
-            `⛔ Halted ${scope}${expiry}.${flushed} Send /resume to continue.${warning}`
-          )
+          .send(msg.spaceName, `⛔ Halted ${scope}${expiry}.${flushed} Send /resume to continue.`)
           .catch(() => {});
         return;
       }

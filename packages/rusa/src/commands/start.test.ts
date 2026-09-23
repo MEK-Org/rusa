@@ -3135,7 +3135,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
-  it("warns when a halt's model: matches no current or staged pool, and still places the hold", async () => {
+  it("refuses a halt whose model: matches no current or staged pool, and places no hold", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     const config = {
@@ -3177,42 +3177,102 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
-    // A transposed suffix: no run will ever resolve to this name, so the hold
-    // is inert for every caller that can name its model.
+    // A transposed suffix: no run will ever resolve to this name, so a hold on
+    // it would be inert for every caller that can name its model.
     await message("/halt provider:claude model:claude-sonnet-5-hihg", "messages/halt-typo");
     const typoAck = chatClient.sent.at(-1)?.text ?? "";
-    expect(typoAck).toContain("Halted");
+    expect(typoAck).toContain("rejected");
     expect(typoAck).toContain("claude-sonnet-5-hihg");
     expect(typoAck).toContain("no current or staged pool");
-    // The closest pool entry is offered back, and the hold stands as asked.
-    expect(typoAck).toContain("claude-sonnet-5");
-    expect(halt.isHalted("claude", "claude-sonnet-5-hihg")).toBe(true);
-    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
-
-    await message("/resume", "messages/resume-typo");
+    // The closest pool entry is what the operator retypes.
+    expect(typoAck).toContain("closest: claude-sonnet-5");
+    // No hold at all: not on the misspelling, not on anything.
     expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5-hihg")).toBe(false);
 
-    // The corrected halt names a pooled model and draws no warning.
+    // #630's sharp end. The refusal never took the single sentinel, so the
+    // corrected halt lands immediately --- with no /resume in between.
     await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-correct");
     const correctAck = chatClient.sent.at(-1)?.text ?? "";
     expect(correctAck).toContain("Halted");
-    expect(correctAck).not.toContain("no current or staged pool");
+    expect(correctAck).not.toContain("rejected");
     expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
 
     await message("/resume", "messages/resume-correct");
+    expect(halt.isHalted()).toBe(false);
 
     // `codex` is configured but no live actor is using it, so its pool is
-    // empty. The handler rejected an *unconfigured* provider long before this
-    // point, so silence here would be the #630 failure again --- an
-    // acknowledgement indistinguishable from a correct one. It warns, with no
-    // "closest:" list, because an empty pool has nothing to suggest.
+    // empty and every name is unmatched. There is nothing to suggest, so the
+    // refusal says why rather than quoting a bare name back.
     await message("/halt provider:codex model:gpt-5-codx", "messages/halt-unpooled-provider");
     const unpooledAck = chatClient.sent.at(-1)?.text ?? "";
-    expect(unpooledAck).toContain("Halted");
+    expect(unpooledAck).toContain("rejected");
     expect(unpooledAck).toContain("gpt-5-codx");
-    expect(unpooledAck).toContain("no current or staged pool");
+    expect(unpooledAck).toContain("codex has no pooled models right now");
     expect(unpooledAck).not.toContain("closest:");
-    expect(halt.isHalted("codex", "gpt-5-codx")).toBe(true);
+    expect(halt.isHalted()).toBe(false);
+
+    // A comma list is refused whole. Holding the half that matched would leave
+    // the operator believing a scope they named is held when it is not.
+    await message(
+      "/halt provider:claude model:claude-sonnet-5,claude-sonnet-5-hihg",
+      "messages/halt-partial-list"
+    );
+    const partialAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(partialAck).toContain("rejected");
+    expect(partialAck).toContain("claude-sonnet-5-hihg");
+    expect(partialAck).toContain("No hold was placed");
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+  });
+
+  it("answers an unparseable /halt with the syntax it accepts", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    const config = {
+      github: { account: "mock-bot" },
+      providers: { claude: { cliCommand: "claude" } },
+      rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      chat: {
+        projectId: "test",
+        subscription: "test",
+        pubsubKeyPath: "/dev/null",
+        gchat: "all",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    await chatSource.emit({
+      name: "messages/halt-typo-option",
+      spaceName: "spaces/test",
+      spaceType: "DIRECT_MESSAGE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/halt models:claude-sonnet-5",
+      mentionsSelf: false,
+      isDirectMessage: true,
+    });
+    const rejection = chatClient.sent.at(-1)?.text ?? "";
+    expect(rejection).toContain("unknown halt option");
+    // The operator mistyped the grammar, so the reply carries the grammar:
+    // both the provider-wide and the model-scoped form.
+    expect(rejection).toContain("/halt provider:");
+    expect(rejection).toContain("model:");
+    expect(new HaltSwitch(join(homeDir, "HALT")).isHalted()).toBe(false);
   });
 
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
