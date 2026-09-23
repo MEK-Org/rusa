@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
+import { buildE2EConfig } from "../e2e/provision.js";
 import type { Logger } from "../observability/logger.js";
 import type { DurableEventDelivery } from "../runtime/event-manager.js";
 import {
@@ -34,6 +35,16 @@ const delivered: DurableEventDelivery = {
 const uncovered: DurableEventDelivery = { entries: [], ownerIds: [] };
 
 describe("configuredRootEventSources and the disk sensor agree", () => {
+  it("keeps explicitly requested E2E chat sources while disabling host disk alerts", () => {
+    const config = buildE2EConfig({
+      scratchPath: "/tmp/rusa-e2e-scratch",
+      chat: { projectId: "e2e", subscription: "e2e", pubsubKeyPath: "/dev/null" },
+    });
+
+    expect(config.observability?.diskAlert).toEqual({ enabled: false });
+    expect(configuredRootEventSources(config)).toContain("gchat:spaces");
+  });
+
   it("covers system:events when no observability block is configured at all", () => {
     // The production shape that dropped every alert: sensor on by default, and
     // the subscription only implied when the block was present.
