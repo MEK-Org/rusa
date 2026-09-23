@@ -60,6 +60,12 @@ class _FirebaseSessionUser implements SessionUser {
   String? get photoUrl => _user.photoURL;
 
   @override
+  String? get displayName => _user.displayName;
+
+  @override
+  String? get email => _user.email;
+
+  @override
   Future<String> getIdToken({bool forceRefresh = false}) async {
     final token = await _user.getIdToken(forceRefresh);
     if (token == null) throw StateError('Firebase did not provide an ID token');

@@ -231,7 +231,7 @@ class _ChatTabState extends State<ChatTab> {
                             (userPrincipalId != null &&
                                 senderId == userPrincipalId);
                         final senderHandle = isPrimarySender
-                            ? 'Operator'
+                            ? widget.store.operatorDisplayLabel
                             : (handles[senderId] ?? senderId);
 
                         return _MessageBubble(

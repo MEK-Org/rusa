@@ -22,7 +22,7 @@ Future<void> showCreateObligationDialog(
   // resolves to on submit is the durable one whenever the server knows it.
   final ownerIdCtrl = TextEditingController(
     text: isViewerPrincipal(defaultOwnerId, viewerPrincipalId)
-        ? kOperatorDisplayHandle
+        ? store.operatorDisplayName ?? kOperatorDisplayHandle
         : defaultOwnerId ?? '',
   );
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
@@ -204,7 +204,7 @@ Future<void> showCreateObligationDialog(
 
                         final typedText = ownerIdCtrl.text.trim();
                         String resolvedId;
-                        if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                        if (isOperatorOwnerText(typedText, viewerPrincipalId, store.operatorDisplayName)) {
                           resolvedId = viewerOwnerId(viewerPrincipalId);
                         } else {
                           final matches = store.actorStates.value.actors.values
@@ -473,7 +473,7 @@ Future<void> showReassignObligationDialog(
                     try {
                       final typedText = ownerIdCtrl.text.trim();
                       String resolvedId;
-                      if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                      if (isOperatorOwnerText(typedText, viewerPrincipalId, store.operatorDisplayName)) {
                         resolvedId = viewerOwnerId(viewerPrincipalId);
                       } else {
                         final matches = store.actorStates.value.actors.values

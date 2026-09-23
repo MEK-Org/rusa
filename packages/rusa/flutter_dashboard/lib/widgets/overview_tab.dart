@@ -2,7 +2,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
-import '../actor_display.dart';
 import '../breakpoints.dart';
 import '../models.dart';
 import '../principals.dart';
@@ -1226,11 +1225,7 @@ class _OverviewTabState extends State<OverviewTab> {
       style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
     );
     final handle = Text(
-      actorDisplayLabel(
-        actorId,
-        (id) => widget.store.actor(id)?.handle,
-        widget.store.isHuman,
-      ),
+      widget.store.actorDisplay(actorId),
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
       style: kMonoStyle.copyWith(

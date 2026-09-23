@@ -35,7 +35,7 @@ class OwnerSelector extends StatelessWidget {
           OwnerOption(
             kind: 'human',
             id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
-            handle: kOperatorDisplayHandle,
+            handle: store.operatorDisplayName ?? kOperatorDisplayHandle,
           ),
         ];
         final all = [...humans, ...actors];

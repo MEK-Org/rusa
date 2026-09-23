@@ -92,6 +92,8 @@ class InboxItemRow extends StatelessWidget {
     return ReferencePreview(
       reference: entry.reference!,
       lookupActorHandle: (id) => store.actor(id)?.handle,
+      isHuman: store.isHuman,
+      humanDisplayName: store.operatorDisplayName,
       openLink: openLink,
       margin: EdgeInsets.zero,
       action: action,
@@ -188,6 +190,8 @@ class InboxItemRow extends StatelessWidget {
               ReferencePreview(
                 reference: entry.reference!,
                 lookupActorHandle: (id) => store.actor(id)?.handle,
+                isHuman: store.isHuman,
+                humanDisplayName: store.operatorDisplayName,
                 openLink: openLink,
               )
             else

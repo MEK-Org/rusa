@@ -12,6 +12,8 @@ enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
   String? get photoUrl;
+  String? get displayName;
+  String? get email;
   Future<String> getIdToken({bool forceRefresh = false});
 }
 
@@ -29,6 +31,7 @@ abstract class DashboardSession extends ChangeNotifier
   DashboardSessionStatus get status;
   bool get isIdle;
   String? get profilePhotoUrl;
+  String get operatorDisplayName;
   String? get browserTitle;
   String? get errorMessage;
 
@@ -56,6 +59,9 @@ class LocalDashboardSession extends DashboardSession {
 
   @override
   String? get profilePhotoUrl => null;
+
+  @override
+  String get operatorDisplayName => 'Operator';
 
   @override
   String? get browserTitle => null;
@@ -128,6 +134,12 @@ class FirebaseDashboardSession extends DashboardSession {
 
   @override
   String? get profilePhotoUrl => _user?.photoUrl;
+
+  @override
+  String get operatorDisplayName {
+    final user = _user ?? _auth.currentUser;
+    return _firstProfileLabel(user?.displayName, user?.email);
+  }
 
   @override
   String? get browserTitle => _browserTitle;
@@ -336,4 +348,14 @@ class FirebaseDashboardSession extends DashboardSession {
     _client.close();
     super.dispose();
   }
+}
+
+/// Profile fields are display-only. Principal identity and authorization remain
+/// server-owned; the dashboard falls back rather than exposing a raw id.
+String _firstProfileLabel(String? displayName, String? email) {
+  for (final value in [displayName, email]) {
+    final trimmed = value?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+  }
+  return 'Operator';
 }

@@ -32,12 +32,14 @@ class DashboardBody extends StatefulWidget {
     this.onLogout,
     this.onNavigation,
     this.profilePhotoUrl,
+    this.profileDisplayName,
   });
 
   final DashboardStore store;
   final VoidCallback? onLogout;
   final Future<void> Function()? onNavigation;
   final String? profilePhotoUrl;
+  final String? profileDisplayName;
 
   /// Builds the Integrated Understanding view shown when its nav item is active.
   /// Injected by the web entrypoint (main.dart) so THIS file stays free of the
@@ -174,6 +176,7 @@ class _DashboardBodyState extends State<DashboardBody> {
                 ),
                 onLogout: widget.onLogout,
                 profilePhotoUrl: widget.profilePhotoUrl,
+                profileDisplayName: widget.profileDisplayName,
               ),
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
@@ -199,6 +202,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       return MeshHeader(
         onLogout: widget.onLogout,
         profilePhotoUrl: widget.profilePhotoUrl,
+        profileDisplayName: widget.profileDisplayName,
         store: widget.store,
         selected: _view,
         onSelect: _selectView,

@@ -265,6 +265,7 @@ class _DashboardPageState extends State<DashboardPage> {
       treePreferencesCache: WebTreePreferencesCache(),
       actorHierarchyCache: WebActorHierarchyCache(),
       obligationsCache: WebObligationsCache(),
+      operatorDisplayName: widget.session.operatorDisplayName,
       walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );
@@ -297,6 +298,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   : null,
               onNavigation: widget.session.visit,
               profilePhotoUrl: widget.session.profilePhotoUrl,
+              profileDisplayName: widget.session.operatorDisplayName,
               store: _store,
               understandingBuilder: (_) => IuTreeBody(session: widget.session),
               reportsBuilder: (_) => IuReportsBody(store: _store),

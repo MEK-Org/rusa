@@ -922,6 +922,7 @@ class _DetailViewState extends State<_DetailView> {
                 obligation: o,
                 lookupHandle: (id) => store.actor(id)?.handle,
                 isHuman: (id) => store.isHuman(id),
+                humanDisplayName: store.operatorDisplayName,
                 selectable: true,
               ),
             ],
@@ -946,6 +947,7 @@ class _DetailViewState extends State<_DetailView> {
                   attachedBy: artifact.attachedBy,
                   lookupActorHandle: (id) => store.actor(id)?.handle,
                   isHuman: (id) => store.isHuman(id),
+                  humanDisplayName: store.operatorDisplayName,
                   openLink: openLink,
                 ),
               const SizedBox(height: 16),
@@ -1342,6 +1344,8 @@ class _DetailViewState extends State<_DetailView> {
       reference: reference,
       action: edit,
       lookupActorHandle: (id) => store.actor(id)?.handle,
+      isHuman: store.isHuman,
+      humanDisplayName: store.operatorDisplayName,
       openLink: openLink,
     );
   }

@@ -110,4 +110,21 @@ void main() {
     expect(find.byIcon(Icons.person_outline), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('drawer account renders the authenticated display name', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ProfileMenu(
+            displayName: 'Ada Lovelace',
+            onLogout: () {},
+            showLabel: true,
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('Ada Lovelace'), findsOneWidget);
+    expect(find.text('Account'), findsNothing);
+  });
 }

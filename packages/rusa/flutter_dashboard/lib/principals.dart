@@ -39,10 +39,18 @@ bool isViewerPrincipal(String? id, String? userPrincipalId) =>
     id != null && viewerPrincipalIds(userPrincipalId).contains(id);
 
 /// Whether typed owner text means "the viewing person" rather than an actor.
-bool isOperatorOwnerText(String text, String? userPrincipalId) {
+/// The legacy handles remain accepted while the authenticated profile label is
+/// only a display affordance that resolves back to the same durable principal.
+bool isOperatorOwnerText(
+  String text,
+  String? userPrincipalId, [
+  String? operatorDisplayName,
+]) {
   final t = text.trim();
+  final profileLabel = operatorDisplayName?.trim();
   return t == 'operator' ||
       t == kOperatorDisplayHandle ||
+      (profileLabel != null && profileLabel.isNotEmpty && t == profileLabel) ||
       isViewerPrincipal(t, userPrincipalId);
 }
 

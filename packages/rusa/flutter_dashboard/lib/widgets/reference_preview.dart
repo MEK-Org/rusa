@@ -15,6 +15,7 @@ class ReferencePreview extends StatefulWidget {
     this.attachedBy,
     this.lookupActorHandle,
     this.isHuman,
+    this.humanDisplayName,
     this.openLink = openInNewTab,
     this.action,
     this.margin = const EdgeInsets.only(bottom: 10),
@@ -57,6 +58,7 @@ class ReferencePreview extends StatefulWidget {
 
   /// Whether an id belongs to a human operator.
   final bool Function(String id)? isHuman;
+  final String? humanDisplayName;
 
   /// Opens a reference's url. Injectable so tests can assert exactly what
   /// gets opened without touching a real browser/platform channel.
@@ -92,7 +94,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
   bool _overflows = false;
 
   String _handle(String id) =>
-      actorDisplayLabel(id, widget.lookupActorHandle, widget.isHuman);
+      actorDisplayLabel(id, widget.lookupActorHandle, widget.isHuman, widget.humanDisplayName);
 
   @override
   Widget build(BuildContext context) {

@@ -619,6 +619,8 @@ class _InboxTabState extends State<InboxTab> {
               ReferencePreview(
                 reference: reference!,
                 lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                isHuman: widget.store.isHuman,
+                humanDisplayName: widget.store.operatorDisplayName,
                 openLink: widget.openLink,
                 margin: EdgeInsets.zero,
                 action: handled ? null : _dismissButton(e),
@@ -681,6 +683,8 @@ class _InboxTabState extends State<InboxTab> {
                 ReferencePreview(
                   reference: reference,
                   lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                  isHuman: widget.store.isHuman,
+                  humanDisplayName: widget.store.operatorDisplayName,
                   openLink: widget.openLink,
                 )
               else

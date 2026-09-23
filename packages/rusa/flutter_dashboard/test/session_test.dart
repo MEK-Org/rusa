@@ -7,12 +7,18 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/session.dart';
 
 class _User implements SessionUser {
-  _User(this.token, {this.photoUrl});
+  _User(this.token, {this.photoUrl, this.displayName, this.email});
 
   final String token;
 
   @override
   final String? photoUrl;
+
+  @override
+  final String? displayName;
+
+  @override
+  final String? email;
 
   @override
   Future<String> getIdToken({bool forceRefresh = false}) async => token;
@@ -443,6 +449,18 @@ void main() {
 
     expect(session.status, DashboardSessionStatus.local);
     expect(session.isIdle, isFalse);
+  });
+
+  test('profile display label prefers name, then email, then Operator', () {
+    final named = FirebaseDashboardSession(_Auth(_User('token', displayName: 'Ada Lovelace')));
+    final emailed = FirebaseDashboardSession(
+      _Auth(_User('token', displayName: ' ', email: 'ada@example.test')),
+    );
+    final unnamed = FirebaseDashboardSession(_Auth(_User('token')));
+
+    expect(named.operatorDisplayName, 'Ada Lovelace');
+    expect(emailed.operatorDisplayName, 'ada@example.test');
+    expect(unnamed.operatorDisplayName, 'Operator');
   });
 
   test(
