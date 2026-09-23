@@ -1127,13 +1127,15 @@ function assertDatabaseIdentityPreserved(opts: {
  * coordinator's database file is left exactly where it is, and is named here so
  * an operator can see what it was.
  *
- * A unit is removed only after it is observed to have stopped. A failed
- * `disable --now` whose result was discarded would delete the unit file out
- * from under a still-running duplicate and then report it retired, leaving two
- * coordinators probing the same providers — the exact condition this migration
- * exists to end, in the one state where nothing on the host records it any
- * more. So a stop failure ends the install instead, before the new unit is
- * reloaded and started; re-running after stopping it by hand is idempotent.
+ * A unit is removed only after all duplicate candidates are observed to have
+ * stopped. A failed `disable --now` whose result was discarded would delete
+ * the unit file out from under a still-running duplicate and then report it
+ * retired, leaving two coordinators probing the same providers — the exact
+ * condition this migration exists to end, in the one state where nothing on the
+ * host records it any more. Stopping happens across every candidate first; if
+ * any fails to stop, the install ends without deleting any unit files, leaving
+ * the host untouched and naming the command to run by hand. Re-running after
+ * stopping it by hand is idempotent.
  *
  * `stopUnit` is the seam a test drives this through: the decision of what to
  * retire, the removal, and the reporting are the parts worth exercising, and
@@ -1147,23 +1149,11 @@ export function retireEnvironmentDerivedCoordinators(
     runQuietly("systemctl", ["--user", "disable", "--now", unit])
 ): string[] {
   const { removeUnits } = planCoordinatorTransition(installedUnitNames);
-  const retired: string[] = [];
   const unstoppable: string[] = [];
   for (const unit of removeUnits) {
-    const unitPath = join(systemdUserDir, unit);
-    const retiredHome = existsSync(unitPath)
-      ? readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME")
-      : null;
     if (!stopUnit(unit)) {
       unstoppable.push(unit);
       console.warn(`⚠️  Could not stop ${unit}; leaving its unit file in place`);
-      continue;
-    }
-    rmSync(unitPath, { force: true });
-    retired.push(unit);
-    console.log(`✓ Retired duplicate pool coordinator ${unit}`);
-    if (retiredHome) {
-      console.log(`  its home ${retiredHome} and any database under it are left untouched on disk`);
     }
   }
   if (unstoppable.length > 0) {
@@ -1173,6 +1163,20 @@ export function retireEnvironmentDerivedCoordinators(
         "than starting a second one alongside it. Stop them by hand " +
         `(systemctl --user disable --now ${unstoppable[0]}) and re-run; nothing was deleted.`
     );
+  }
+
+  const retired: string[] = [];
+  for (const unit of removeUnits) {
+    const unitPath = join(systemdUserDir, unit);
+    const retiredHome = existsSync(unitPath)
+      ? readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME")
+      : null;
+    rmSync(unitPath, { force: true });
+    retired.push(unit);
+    console.log(`✓ Retired duplicate pool coordinator ${unit}`);
+    if (retiredHome) {
+      console.log(`  its home ${retiredHome} and any database under it are left untouched on disk`);
+    }
   }
   return retired;
 }

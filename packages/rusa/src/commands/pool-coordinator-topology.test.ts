@@ -183,7 +183,9 @@ describe("two client instances, one pool coordinator", () => {
 
     // Deleting the unit file of a duplicate that is still running would leave
     // two coordinators probing the same providers with nothing on the host left
-    // to say so — the condition this whole transition exists to end.
+    // to say so — the condition this whole transition exists to end. Stopping
+    // happens across every duplicate before any unit file is removed, so a stop
+    // failure leaves the host untouched.
     expect(() =>
       retireEnvironmentDerivedCoordinators(systemdUserDir, unitNames(), (unit) => {
         stopped.push(unit);
@@ -192,7 +194,9 @@ describe("two client instances, one pool coordinator", () => {
     ).toThrow(/Could not stop and disable rusa-staging-quota-coordinator\.service/);
 
     expect(stopped).toContain("rusa-staging-quota-coordinator.service");
+    // Nothing was deleted: both the service and its alert companion survive.
     expect(unitNames()).toContain("rusa-staging-quota-coordinator.service");
+    expect(unitNames()).toContain("rusa-staging-quota-coordinator-alert.service");
   });
 
   it("adopts the surviving coordinator's home, so the pool database does not move", () => {
