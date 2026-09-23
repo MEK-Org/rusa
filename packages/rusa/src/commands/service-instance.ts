@@ -177,12 +177,79 @@ export function resolvePathEnvForUnit(): string {
 }
 
 /**
- * Read the `PATH` a unit file assigns to the service it describes.
+ * Split one systemd environment string into its `NAME=value` assignments.
  *
- * systemd resolves repeated assignments to one variable last-wins, so the last
- * `Environment=PATH=` line is the one the service actually runs with. Both the
- * bare and double-quoted spellings are accepted because both are legal and an
- * operator drop-in may use either; `install-service` itself writes the bare form.
+ * `Environment=` sets several variables on one line, and either the whole
+ * assignment or just its value may be double-quoted — `Environment="PATH=/a"`
+ * and `Environment=PATH="/a"` are both legal and mean the same thing. Splitting
+ * on whitespace outside quotes handles both, and a PATH segment containing a
+ * space (which must be quoted) survives.
+ */
+function splitEnvironmentAssignments(raw: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const ch of raw.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+    } else if (ch === "\\") {
+      escaped = true;
+    } else if (ch === '"') {
+      quoted = !quoted;
+    } else if (!quoted && /\s/.test(ch)) {
+      if (current) out.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current) out.push(current);
+  return out;
+}
+
+/** The last `PATH=` among these assignments — last-wins, as systemd resolves it. */
+function lastPathAssignment(assignments: readonly string[]): string | null {
+  let found: string | null = null;
+  for (const assignment of assignments) {
+    if (assignment.startsWith("PATH=")) found = assignment.slice("PATH=".length);
+  }
+  return found ? found : null;
+}
+
+/**
+ * Ask systemd for the `PATH` a loaded unit will actually run with.
+ *
+ * This is the authoritative answer and the reason it is asked first: `systemctl
+ * show` returns the *effective* environment, with `<unit>.d/*.conf` drop-ins
+ * folded in, repeated assignments resolved last-wins, and quoting and
+ * multi-variable lines already parsed. Reading the unit file sees none of that,
+ * so a provider-capable `PATH` that lives in a drop-in — an established
+ * operator mechanism here — would be missed entirely.
+ *
+ * Returns null when systemd cannot answer (no user manager, or the unit is not
+ * loaded), which is why `readUnitPathEnv` remains as a fallback.
+ */
+export function readSystemdUnitPathEnv(unitName: string): string | null {
+  try {
+    const raw = execFileSync(
+      "systemctl",
+      ["--user", "show", "-p", "Environment", "--value", unitName],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }
+    );
+    return lastPathAssignment(splitEnvironmentAssignments(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the `PATH` a unit file assigns, as a fallback for when systemd cannot say.
+ *
+ * Drop-ins are deliberately out of scope here: merging `<unit>.d/*.conf` by hand
+ * would be reimplementing what `readSystemdUnitPathEnv` already gets for free,
+ * and this path only runs when that one could not answer at all.
  *
  * Returns null when the unit assigns no `PATH`, which is a real case — a unit
  * written before this directive existed inherits systemd's `/usr/bin:/bin`.
@@ -190,9 +257,12 @@ export function resolvePathEnvForUnit(): string {
 export function readUnitPathEnv(unitContents: string): string | null {
   let found: string | null = null;
   for (const line of unitContents.split("\n")) {
-    const match = /^\s*Environment=(?:"PATH=([^"]*)"|PATH=(.*))$/.exec(line.trimEnd());
-    if (!match) continue;
-    found = (match[1] ?? match[2] ?? "").trim();
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("Environment=")) continue;
+    const fromLine = lastPathAssignment(
+      splitEnvironmentAssignments(trimmed.slice("Environment=".length))
+    );
+    if (fromLine) found = fromLine;
   }
   return found ? found : null;
 }
@@ -200,7 +270,12 @@ export function readUnitPathEnv(unitContents: string): string | null {
 /** Where a probe `PATH` came from, so the installer can say so rather than imply it. */
 export interface ProbePathEnv {
   path: string;
-  source: "instance-unit" | "process";
+  /**
+   * `instance-unit-systemd` is the effective environment including drop-ins;
+   * `instance-unit-file` is the unit text alone, taken only when systemd could
+   * not answer; `process` is the installing shell, which is what #525 is about.
+   */
+  source: "instance-unit-systemd" | "instance-unit-file" | "process";
 }
 
 /**
@@ -215,13 +290,28 @@ export interface ProbePathEnv {
  *
  * The installed instance unit is the durable source of truth instead. It is on
  * disk, it is the environment the instance already resolves provider CLIs in,
- * and it does not change when the installing shell does. The process `PATH` is
- * the fallback for the one case where there is no such unit yet — a coordinator
- * installed before any instance — and the caller reports which one it used.
+ * and it does not change when the installing shell does. systemd is asked for
+ * it first so drop-ins count; the unit text is the fallback for a host whose
+ * user manager cannot answer. The process `PATH` is the last resort, for the
+ * one case where there is no instance unit yet — a coordinator installed before
+ * any instance — and the caller reports which of the three it used.
+ *
+ * `instanceUnitContents` being null means no instance unit is installed, so
+ * systemd is not asked: `systemctl show` answers for an unknown unit with an
+ * empty environment rather than an error, which would be indistinguishable from
+ * a unit that assigns no `PATH`.
  */
-export function resolveProbePathEnv(instanceUnitContents: string | null): ProbePathEnv {
-  const fromUnit = instanceUnitContents ? readUnitPathEnv(instanceUnitContents) : null;
-  if (fromUnit) return { path: fromUnit, source: "instance-unit" };
+export function resolveProbePathEnv(
+  unitName: string,
+  instanceUnitContents: string | null,
+  readSystemdPath: (unit: string) => string | null = readSystemdUnitPathEnv
+): ProbePathEnv {
+  if (instanceUnitContents !== null) {
+    const fromSystemd = readSystemdPath(unitName);
+    if (fromSystemd) return { path: fromSystemd, source: "instance-unit-systemd" };
+    const fromFile = readUnitPathEnv(instanceUnitContents);
+    if (fromFile) return { path: fromFile, source: "instance-unit-file" };
+  }
   return { path: resolvePathEnvForUnit(), source: "process" };
 }
 

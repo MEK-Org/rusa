@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { buildTmuxScript } from "../providers/codex-status-scrape.js";
-import { buildQuotaCoordinatorUnit, configuredProviderCommands } from "./install-service.js";
+import {
+  buildQuotaCoordinatorUnit,
+  configuredProviderCommands,
+  describeProbePathSource,
+} from "./install-service.js";
 import { readUnitPathEnv, resolveProbePathEnv } from "./service-instance.js";
 
 /**
@@ -95,7 +99,9 @@ describe("the quota coordinator's probe PATH reaches the tmux-launched CLI (#525
   }
 
   function coordinatorUnitPath(instanceUnit: string | null): string {
-    const probePath = resolveProbePathEnv(instanceUnit);
+    // systemd is stubbed out so these run the same on a host without a user
+    // manager; the drop-in-aware path has its own tests in service-instance.
+    const probePath = resolveProbePathEnv("rusa-staging.service", instanceUnit, () => null);
     const unit = buildQuotaCoordinatorUnit({
       description: "Rusa Quota Coordinator",
       mcHome: join(dir, "home"),
@@ -168,5 +174,35 @@ describe("the quota coordinator's probe PATH reaches the tmux-launched CLI (#525
     } as unknown as RusaConfig;
 
     expect(configuredProviderCommands(config)).toEqual(["codex", "claude", "kimi"]);
+  });
+
+  describe("describeProbePathSource", () => {
+    const unit = "rusa-staging.service";
+
+    it("does not claim the instance unit is absent when it is installed but assigns no PATH", () => {
+      // A host upgrading from an older instance unit lands here: the coordinator
+      // gets built from the installing shell's PATH — the #525 failure exactly —
+      // and telling the operator the unit is missing sends them looking for a
+      // file that is sitting right there.
+      const line = describeProbePathSource({ path: "/usr/bin", source: "process" }, unit, true);
+
+      expect(line).not.toContain("installed yet");
+      expect(line).toContain("assigns no PATH of its own");
+    });
+
+    it("says the unit is absent only when it actually is", () => {
+      expect(
+        describeProbePathSource({ path: "/usr/bin", source: "process" }, unit, false)
+      ).toContain(`no ${unit} installed yet`);
+    });
+
+    it("distinguishes the systemd-resolved PATH from the unit text alone", () => {
+      expect(
+        describeProbePathSource({ path: "/a", source: "instance-unit-systemd" }, unit, true)
+      ).toContain("drop-ins included");
+      expect(
+        describeProbePathSource({ path: "/a", source: "instance-unit-file" }, unit, true)
+      ).toContain("drop-in PATH was not seen");
+    });
   });
 });

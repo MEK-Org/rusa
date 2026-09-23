@@ -736,7 +736,7 @@ function preflightProbeEnvironment(
   mcHome: string,
   probePath: ProbePathEnv,
   providerCommands: readonly string[]
-): { workersDir: string } {
+): { workersDir: string; missingProviderCommands: string[] } {
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
   try {
@@ -757,15 +757,49 @@ function preflightProbeEnvironment(
     }
   }
 
-  for (const command of providerCommands) {
-    if (!resolveExecutableOnPath(command, probePath.path)) {
-      console.warn(
-        `⚠️  Provider CLI ${command} not found on the service PATH — the probe ` +
-          "launches it through tmux, so its scrapes will fail"
-      );
-    }
+  // A provider CLI missing under the process fallback is unsurprising — that
+  // PATH was never the instance's. Missing from the *instance unit's* PATH is a
+  // stranger state: the instance itself cannot launch that provider either, so
+  // the thing to fix is the instance, not the coordinator.
+  const missingProviderCommands = providerCommands.filter(
+    (command) => !resolveExecutableOnPath(command, probePath.path)
+  );
+  for (const command of missingProviderCommands) {
+    console.warn(
+      `⚠️  Provider CLI ${command} not found on the service PATH — the probe ` +
+        "launches it through tmux, so its scrapes will fail" +
+        (probePath.source === "process"
+          ? ""
+          : "; the instance unit cannot launch it either, so fix the instance first")
+    );
   }
-  return { workersDir };
+  return { workersDir, missingProviderCommands };
+}
+
+/**
+ * Say where the probe `PATH` came from, in terms that are true of each case.
+ *
+ * The whole argument for printing this is that the choice is never silent, so
+ * the three sources have to read differently. Falling back to the shell because
+ * the unit assigns no `PATH` is the case an operator most needs to act on — a
+ * host upgrading from an older instance unit — and it is not the same as having
+ * no instance unit at all.
+ */
+export function describeProbePathSource(
+  probePath: ProbePathEnv,
+  unitName: string,
+  instanceUnitInstalled: boolean
+): string {
+  switch (probePath.source) {
+    case "instance-unit-systemd":
+      return `taken from ${unitName} as systemd resolves it (drop-ins included)`;
+    case "instance-unit-file":
+      return `taken from the ${unitName} unit file (systemd could not report it; any drop-in PATH was not seen)`;
+    default:
+      return instanceUnitInstalled
+        ? `from this shell — ${unitName} assigns no PATH of its own; reinstall the instance to give it one`
+        : `from this shell (no ${unitName} installed yet)`;
+  }
 }
 
 /**
@@ -824,13 +858,14 @@ export async function runInstallQuotaCoordinator(opts?: {
   const instanceUnitContents = existsSync(instanceUnitPath)
     ? readFileSync(instanceUnitPath, "utf-8")
     : null;
-  const probePath = resolveProbePathEnv(instanceUnitContents);
+  const probePath = resolveProbePathEnv(instance.serviceUnit, instanceUnitContents);
   const userPath = probePath.path;
 
-  const { workersDir } = preflightProbeEnvironment(
+  const providerCommands = configuredProviderCommands(config);
+  const { workersDir, missingProviderCommands } = preflightProbeEnvironment(
     instance.mcHome,
     probePath,
-    configuredProviderCommands(config)
+    providerCommands
   );
 
   const executableSource = resolveExecutableSource(deploymentMode, opts?.repoPath);
@@ -908,9 +943,14 @@ export async function runInstallQuotaCoordinator(opts?: {
   );
   console.log(`- Workers dir: ${workersDir}`);
   console.log(
-    probePath.source === "instance-unit"
-      ? `- Probe PATH: taken from ${instance.serviceUnit}`
-      : `- Probe PATH: from this shell (no ${instance.serviceUnit} installed yet)`
+    `- Probe PATH: ${describeProbePathSource(probePath, instance.serviceUnit, instanceUnitContents !== null)}`
+  );
+  console.log(
+    `- Provider CLIs: ${providerCommands.length - missingProviderCommands.length} of ` +
+      `${providerCommands.length} resolved on that PATH` +
+      (missingProviderCommands.length > 0
+        ? ` (missing: ${missingProviderCommands.join(", ")})`
+        : "")
   );
   console.log(`- Status: systemctl --user status ${names.serviceUnit}`);
   console.log(`- Logs: journalctl --user -u ${names.serviceUnit} -f`);
