@@ -113,6 +113,11 @@ export type MeshEventKind =
   // phase; payload = { reason: "responsive_notification" }. The displaced
   // opportunity still closes normally through run_end or run_abandoned.
   | "run_preempted"
+  // Shadow-only JEV interruption observation. `actorId` is the recipient;
+  // payload holds the baseline disposition and a redacted decision snapshot
+  // containing durable inbox ids, closed choices, confidence and threshold —
+  // never message bodies or other operational content.
+  | "responsive_interruption_shadow"
   // A portable-context v2 ledger folded one or more inbound messages. `actorId`
   // is the remembered actor; detail/body carry generation/count metadata only.
   | "portable_context_compacted"

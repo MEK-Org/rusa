@@ -95,6 +95,7 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
+import type { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
@@ -717,6 +718,8 @@ export interface ActorMeshOptions {
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
+  /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
+  responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   /**
    * The allow-list of grantable capability names — typically the keys of the
    * wiring's grantable-MCP registry. A grant of any name outside this set is
@@ -856,6 +859,7 @@ export class ActorMesh {
   private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
+  private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
@@ -930,6 +934,7 @@ export class ActorMesh {
     this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
+    this.responsiveInterruption = opts.responsiveInterruption;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
     // any other grantable server — neither advertises nor grants it here.
@@ -961,6 +966,21 @@ export class ActorMesh {
           payload: JSON.stringify({ reason: "responsive_notification" }),
         });
       },
+      // Only wired when a classifier exists. The hook's presence is what
+      // switches `RunManager` into collecting rows, so supplying it
+      // unconditionally would make every deployment pay for an observer that
+      // has nothing to observe — and would strand the default-path early exit.
+      ...(this.responsiveInterruption
+        ? {
+            onResponsiveArrived: (
+              actorId: string,
+              entries: readonly InboxEntry[],
+              baseline: "interrupt" | "queue"
+            ) => {
+              this.shadowResponsiveInterruptions(actorId, entries, baseline);
+            },
+          }
+        : {}),
       onInternalPort: (port) => {
         this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
       },
@@ -1318,6 +1338,74 @@ export class ActorMesh {
    */
   dispatch(actorId: string): boolean {
     return this.runs.dispatch(this.resolveThreadId(actorId));
+  }
+
+  /**
+   * Fire-and-forget shadow decisions over the exact rows the durable inbox
+   * identified as newly arrived, before its normal preemption path runs. Only
+   * ids cross this seam: message bodies, issue text, and other operational
+   * content stay in their source stores.
+   *
+   * The comparison sets are read synchronously, before the `void`, because
+   * they describe the actor's state at the moment the row arrived. Deferring
+   * the read past the await boundary would let the run this dispatch is about
+   * to preempt change its own selection first, and the decision would then be
+   * scored against a world that the arrival had already altered.
+   */
+  private shadowResponsiveInterruptions(
+    actorId: string,
+    incoming: readonly InboxEntry[],
+    baseline: "interrupt" | "queue"
+  ): void {
+    const classifier = this.responsiveInterruption;
+    if (!classifier || incoming.length === 0) return;
+    const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
+    // Unselected rows are only ever the fallback for an actor holding no
+    // selection, so a selection spares the full unhandled scan entirely.
+    const pendingEntryIds =
+      selectedEntryIds.length > 0 ? [] : this.unselectedInboxEntryIds(actorId, selectedEntryIds);
+    for (const entry of incoming) {
+      // Explicit Run Now is an operator control, not a classifier candidate.
+      // Direct interrupt() does not dispatch at all, preserving its hard path.
+      if (entry.payload.type === "operator.run_now") continue;
+      const incomingEntryId = entry.id;
+      void classifier
+        .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .then((decision) => {
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "shadow",
+            payload: JSON.stringify({ baseline, decision }),
+          });
+        })
+        .catch(() => {
+          // `evaluate` resolves rather than throws, so this arm covers only a
+          // failure to record the observation. It emits no decision — one
+          // audit shape means a consumer parses one schema — and exists so a
+          // fire-and-forget promise cannot reject unhandled.
+          this.log(`responsive interruption shadow observation failed for ${incomingEntryId}`);
+        });
+    }
+  }
+
+  /** Read the entire durable unhandled set minus the selected rows; a
+   * classifier must not infer a comparison target from a convenient first page
+   * or a racing "latest" row. */
+  private unselectedInboxEntryIds(actorId: string, selectedEntryIds: readonly string[]): string[] {
+    const inbox = this.inboxStore;
+    if (!inbox) return [];
+    const selected = new Set(selectedEntryIds);
+    let cursor: string | undefined;
+    const entryIds: string[] = [];
+    do {
+      const page = inbox.list(actorId, { status: "unhandled", limit: 100, cursor });
+      for (const entry of page.entries) {
+        if (!selected.has(entry.id)) entryIds.push(entry.id);
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return entryIds;
   }
 
   /**

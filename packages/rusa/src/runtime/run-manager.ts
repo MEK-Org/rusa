@@ -7,7 +7,7 @@ import {
 } from "../actor/concurrency-limiter.js";
 import { isResponsiveNudge, type RunNudge } from "../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import type { InboxRepository } from "../repositories/inbox-repository.js";
+import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 
 /**
  * The durable payload type a voice memo is delivered under, written by the
@@ -84,6 +84,13 @@ export interface DurableDispatchWork {
    * that run, and passing the voice hold.
    */
   unseenResponsive?: boolean;
+  /**
+   * The unabsorbed responsive rows themselves, collected only when a policy
+   * hook asked to observe them. They are the same rows that set
+   * `unseenResponsive`, read once, so an observer records the entries that
+   * actually caused this dispatch rather than a later re-read of the table.
+   */
+  unseenResponsiveEntries?: readonly InboxEntry[];
   /** Delivery time of the newest pending voice memo no run has absorbed. */
   voiceAt?: number;
 }
@@ -132,6 +139,16 @@ export interface RunManagerOptions {
   markInboxSeen?: (actorId: string) => void;
   /** Report that responsive work replaced an in-flight or queued run. */
   onPreempted?: (actorId: string, phase: string) => void;
+  /**
+   * Observe each newly arrived responsive inbox row before normal preemption.
+   * This is a narrow policy hook, not a second dispatch path: the durable
+   * inbox still decides priority and this callback cannot delay its dispatch.
+   */
+  onResponsiveArrived?: (
+    actorId: string,
+    entries: readonly InboxEntry[],
+    baseline: "interrupt" | "queue"
+  ) => void;
   /** Internal construction-only port receiver. */
   onInternalPort?: (port: RunManagerInternalPort) => void;
   log?: (msg: string) => void;
@@ -173,6 +190,18 @@ export class RunManager {
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly markInboxSeen: (actorId: string) => void;
   private readonly onPreempted: (actorId: string, phase: string) => void;
+  private readonly onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
+  /**
+   * Entry ids already handed to `onResponsiveArrived`. A row stays unseen
+   * until a run admits it, so without this a second delivery poke re-reports
+   * the first row alongside the new one — which would inflate exactly the
+   * false-preemption counts this observation exists to measure. Pruned to the
+   * still-unabsorbed set on every dispatch, so one actor's set cannot outgrow
+   * its inbox — and cleared in `release`/`forget`/`closeAll` alongside `live`
+   * and `selections`, so a mesh that churns workers does not accumulate one
+   * stranded set per retired actor.
+   */
+  private readonly observedResponsive = new Map<string, Set<string>>();
   private readonly log: (msg: string) => void;
 
   constructor(opts: RunManagerOptions) {
@@ -203,6 +232,7 @@ export class RunManager {
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.markInboxSeen = opts.markInboxSeen ?? (() => {});
     this.onPreempted = opts.onPreempted ?? (() => {});
+    this.onResponsiveArrived = opts.onResponsiveArrived;
     this.log = opts.log ?? (() => {});
   }
 
@@ -254,9 +284,18 @@ export class RunManager {
    * indexed unseen count plus newest-unseen-voice query belongs in a dedicated
    * repository extension, not a scheduler-side approximation.
    */
-  private pendingResponsive(actorId: string): { unseenResponsive: boolean; voiceAt?: number } {
+  private pendingResponsive(actorId: string): {
+    unseenResponsive: boolean;
+    unseenResponsiveEntries?: readonly InboxEntry[];
+    voiceAt?: number;
+  } {
+    // Only an observer wants the rows themselves, and collecting them costs
+    // the early exit below. A deployment with no policy hook pages exactly
+    // what it always did.
+    const collect = this.onResponsiveArrived !== undefined;
     let cursor: string | undefined;
     let unseenResponsive = false;
+    const unseenResponsiveEntries: InboxEntry[] = [];
     let voiceAt: number | undefined;
 
     do {
@@ -269,6 +308,7 @@ export class RunManager {
       for (const entry of page.entries) {
         if (entry.seenAt === null) {
           unseenResponsive = true;
+          if (collect) unseenResponsiveEntries.push(entry);
           if (voiceAt === undefined && entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE) {
             const at = entry.deliveredAt.getTime();
             if (Number.isFinite(at)) {
@@ -277,7 +317,7 @@ export class RunManager {
           }
         }
       }
-      if (unseenResponsive && voiceAt !== undefined) {
+      if (!collect && unseenResponsive && voiceAt !== undefined) {
         break;
       }
       cursor = page.nextCursor ?? undefined;
@@ -285,8 +325,35 @@ export class RunManager {
 
     return {
       unseenResponsive,
+      ...(unseenResponsiveEntries.length > 0 ? { unseenResponsiveEntries } : {}),
       ...(voiceAt !== undefined ? { voiceAt } : {}),
     };
+  }
+
+  /**
+   * Report each newly arrived responsive row to the policy hook exactly once,
+   * using the rows this dispatch already read.
+   */
+  private observeResponsiveArrival(
+    actorId: string,
+    work: DurableDispatchWork,
+    baseline: "interrupt" | "queue"
+  ): void {
+    const observe = this.onResponsiveArrived;
+    if (!observe) return;
+    const entries = work.unseenResponsiveEntries ?? [];
+    const pending = new Set(entries.map((entry) => entry.id));
+    // Drop ids that have since been absorbed or handled before testing, so a
+    // row that comes back unseen is a genuinely new arrival.
+    const observed = this.observedResponsive.get(actorId) ?? new Set<string>();
+    for (const id of observed) {
+      if (!pending.has(id)) observed.delete(id);
+    }
+    const arrived = entries.filter((entry) => !observed.has(entry.id));
+    for (const entry of arrived) observed.add(entry.id);
+    if (observed.size > 0) this.observedResponsive.set(actorId, observed);
+    else this.observedResponsive.delete(actorId);
+    if (arrived.length > 0) observe(actorId, arrived, baseline);
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -321,6 +388,9 @@ export class RunManager {
       // behind the voice session's own run rather than held with ordinary work.
       this.log(`dispatch(${actorId}) held — active voice session`);
       return false;
+    }
+    if (responsiveArrived) {
+      this.observeResponsiveArrival(actorId, work, opts.preempt ? "interrupt" : "queue");
     }
     if (responsiveArrived && opts.preempt) {
       const preemption = target.preemptForResponsive();
@@ -377,12 +447,14 @@ export class RunManager {
     this.live.get(actorId)?.close();
     this.live.delete(actorId);
     this.selections.delete(actorId);
+    this.observedResponsive.delete(actorId);
   }
 
   /** Forget one actor without closing it — a construction that failed to land. */
   forget(actorId: string): void {
     this.live.delete(actorId);
     this.selections.delete(actorId);
+    this.observedResponsive.delete(actorId);
   }
 
   /**
@@ -393,6 +465,7 @@ export class RunManager {
     for (const actor of this.live.values()) actor.close();
     this.live.clear();
     this.selections.clear();
+    this.observedResponsive.clear();
   }
 
   // --------------------------------------------------------------- admission

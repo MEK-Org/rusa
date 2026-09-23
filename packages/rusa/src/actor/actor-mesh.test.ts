@@ -79,6 +79,7 @@ import {
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -289,6 +290,7 @@ function setup(
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
+    responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
     secretsDir?: string;
   } = {}
 ) {
@@ -364,6 +366,7 @@ function setup(
     retireCleanups: opts.retireCleanups,
     providerGate: opts.providerGate,
     voiceTransferLogger: opts.voiceTransferLogger,
+    responsiveInterruption: opts.responsiveInterruption,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -2458,6 +2461,138 @@ describe("ActorMesh", () => {
     const unhandled = inboxStore.entries.filter((e) => e.actorId === worker && !e.handledAt);
     expect(unhandled).toHaveLength(2);
     expect(unhandled.map((e) => e.payload.type)).toEqual(["mesh.message", "system.disk"]);
+  });
+
+  it("keeps the normal responsive preemption while shadowing a redacted Choice decision", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    const provider = new FakeProvider((opts) => {
+      firstSignal = opts.signal;
+      return new Promise<Partial<RunResult>>(() => {});
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(firstSignal?.aborted).toBe(false);
+
+    mesh.sendHumanMessage(worker, "private operator body", "session-1");
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadow = events.find((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toEqual(
+      expect.objectContaining({
+        actorId: worker,
+        detail: "shadow",
+      })
+    );
+    expect(shadow?.payload).toContain('"outcome":"interrupt"');
+    expect(shadow?.payload).not.toContain("private operator body");
+  });
+
+  it("leaves the dispatch path untouched when no classifier is configured", async () => {
+    // The seam is described as inert without a classifier, so the thing to pin
+    // is the wiring rather than the absence of events: a mesh that wires the
+    // hook unconditionally makes `RunManager` collect rows and strands the
+    // default path's early exit in every deployment, none of which has one.
+    const base = createMemoryInboxStore();
+    let responsiveLists = 0;
+    const inboxStore: typeof base = {
+      ...base,
+      list: (actorId, options = {}) => {
+        if (options.responsiveOnly) responsiveLists++;
+        // Page the responsive scan one row at a time, as the real repository
+        // does past its limit, so a caller that cannot exit early pays for it.
+        const page = base.list(actorId, { ...options, limit: undefined });
+        if (!options.responsiveOnly) return page;
+        const start = options.cursor ? Number(options.cursor) : 0;
+        const entries = page.entries.slice(start, start + 1);
+        return {
+          ...page,
+          entries,
+          nextCursor: start + 1 < page.entries.length ? String(start + 1) : null,
+        };
+      },
+    };
+
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Newest first, so the voice memo is the first row the scan reads and a
+    // deployment with no observer has both its answers after one page.
+    mesh.sendHumanMessage(worker, "older operator body", "session-1");
+    await tick();
+
+    // Measure the voice memo's own dispatch: it is the newest row, so the scan
+    // has both its answers after one page and stops. A collecting deployment
+    // has to read the older row too, and pays a page for it.
+    responsiveLists = 0;
+    mesh.sendHumanMessage(worker, "voice body", "session-1", { voice: true });
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events.some((event) => event.kind === "responsive_interruption_shadow")).toBe(false);
+    expect(responsiveLists).toBe(1);
+  });
+
+  it("observes each arriving responsive row once across repeated delivery pokes", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // No run is admitted, so neither row is ever marked seen: a second poke
+    // re-reads the first row alongside the second.
+    mesh.sendHumanMessage(worker, "first operator body", "session-1");
+    await tick();
+    mesh.sendHumanMessage(worker, "second operator body", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const observed = events
+      .filter((event) => event.kind === "responsive_interruption_shadow")
+      .map((event) => JSON.parse(event.payload ?? "{}").decision.incomingEntryId as string);
+    expect(observed).toHaveLength(new Set(observed).size);
+    expect(observed).toHaveLength(2);
   });
 
   it("does not let ordinary traffic abort the run already working the operator's message", async () => {
