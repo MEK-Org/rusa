@@ -35,14 +35,38 @@ const delivered: DurableEventDelivery = {
 const uncovered: DurableEventDelivery = { entries: [], ownerIds: [] };
 
 describe("configuredRootEventSources and the disk sensor agree", () => {
-  it("keeps explicitly requested E2E chat sources while disabling host disk alerts", () => {
+  it("keeps an explicitly configured E2E Slack source while dropping system:events", () => {
+    // The interference #574 reports was observed in the Slack integration e2e:
+    // the root owned `system:events` only because the sensor defaults on, and an
+    // unrelated host `system.disk` alert woke it mid-run. Slack is the branch
+    // that shows the fix end to end, because Slack raises no host alarms of its
+    // own — the explicitly requested source survives and the host one is gone.
+    const config = buildE2EConfig({
+      scratchPath: "/tmp/rusa-e2e-scratch",
+      slack: { appTokenPath: "/dev/null", botTokenPath: "/dev/null" },
+    });
+
+    expect(config.observability?.diskAlert).toEqual({ enabled: false });
+    const sources = configuredRootEventSources(config);
+    expect(sources).toContain("slack:channels");
+    expect(sources).not.toContain("system:events");
+  });
+
+  it("keeps the E2E chat source and the lapse alert's own system:events cover", () => {
+    // Chat is the deliberate contrast. `hostAlarmProducerActive` stays true for
+    // a chat-configured root because the subscription keeper's lapse alert
+    // (#578) is a second `system:events` producer, so silencing the disk sensor
+    // must not take that subscription away.
     const config = buildE2EConfig({
       scratchPath: "/tmp/rusa-e2e-scratch",
       chat: { projectId: "e2e", subscription: "e2e", pubsubKeyPath: "/dev/null" },
     });
 
     expect(config.observability?.diskAlert).toEqual({ enabled: false });
-    expect(configuredRootEventSources(config)).toContain("gchat:spaces");
+    const sources = configuredRootEventSources(config);
+    expect(sources).toContain("gchat:spaces");
+    expect(sources).toContain("system:events");
+    expect(diskAlertUncovered(config, sources)).toBe(false);
   });
 
   it("covers system:events when no observability block is configured at all", () => {
