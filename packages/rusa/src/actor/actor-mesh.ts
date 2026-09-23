@@ -853,6 +853,11 @@ export class ActorMesh {
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
   private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
+  /**
+   * Recipients of durably committed inbox rows that nothing has woken yet.
+   * See {@link scheduleAppendedWork}.
+   */
+  private readonly appendWakesOwed = new Set<string>();
   private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
@@ -1011,6 +1016,14 @@ export class ActorMesh {
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
     this.eventManager = opts.eventManager;
+    if (opts.inboxStore) {
+      // Deliberately not retained for unsubscription: the mesh has no teardown
+      // boundary today, so this subscription's lifetime is the mesh's own,
+      // which is the process's. Giving the mesh a disposer is its own change.
+      opts.inboxStore.onItemsAppended((items) => {
+        this.scheduleAppendedWork(items);
+      });
+    }
   }
 
   /**
@@ -1337,7 +1350,9 @@ export class ActorMesh {
    * caller of this method can turn preemption off.
    */
   dispatch(actorId: string): boolean {
-    return this.runs.dispatch(this.resolveThreadId(actorId));
+    const resolved = this.resolveThreadId(actorId);
+    this.appendWakesOwed.delete(resolved);
+    return this.runs.dispatch(resolved);
   }
 
   /**
@@ -1409,16 +1424,69 @@ export class ActorMesh {
   }
 
   /**
-   * Event fan-out's dispatch. Only the event's effective owner may have its
-   * active run replaced; every other recipient's copy keeps responsive
-   * scheduling and admission but joins that actor's run as a follow-up instead
-   * of aborting work the event does not belong to. Private and named for its
-   * one use so "responsive but not preempting" cannot leak into a control path.
+   * The dispatch that schedules without interrupting. Responsive work still
+   * passes the voice hold and is admitted; what it does not do is replace a
+   * run already in flight. Private and named so "responsive but not
+   * preempting" cannot leak into a control path — its one caller is event
+   * fan-out, where only an event's effective owner may have its active run
+   * replaced.
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
-    return this.dispatchJoiningActiveRunPort
-      ? this.dispatchJoiningActiveRunPort(this.resolveThreadId(dest))
-      : false;
+    const resolved = this.resolveThreadId(dest);
+    this.appendWakesOwed.delete(resolved);
+    return this.dispatchJoiningActiveRunPort ? this.dispatchJoiningActiveRunPort(resolved) : false;
+  }
+
+  /**
+   * The seam between a durable inbox write and scheduling (#388).
+   *
+   * Every row `append` commits leaves its recipient owed one content-free
+   * {@link dispatch}, so no appending path can make work durable and then
+   * leave it unscheduled. The notification is advisory by the store's
+   * contract — losing one costs latency, not correctness, because
+   * {@link reconcileInbox} replays the same fact out of `actorsWithUnhandled()`
+   * at boot.
+   *
+   * The debt is settled by whoever reaches the actor first, and this pays only
+   * what nobody else did. Every appending path in the mesh still wakes its own
+   * recipient in the same turn, some of them deliberately without preempting —
+   * an event copy delivered to a recipient that is not its effective owner is
+   * entitled to join the run in flight rather than replace it — and those
+   * wakes clear the debt, which is what stops a second dispatch from
+   * cancelling and re-queueing the run the first one just admitted. What is
+   * left over is the case this exists for: work that became durable with no
+   * one scheduling it, which now runs instead of waiting for the next boot.
+   *
+   * Deferring to a microtask is what gives the appending turn its chance, and
+   * the store's contract asks a listener to stay cheap and hand off rather
+   * than block the appender.
+   */
+  private scheduleAppendedWork(items: readonly InboxEntry[]): void {
+    let owed = false;
+    for (const item of items) {
+      // Keyed the way the two dispatches key their deletes, so a row addressed
+      // to "root" and a dispatch of the concrete root id are the same debt.
+      const actorId = this.resolveThreadId(item.actorId);
+      if (this.appendWakesOwed.has(actorId)) continue;
+      this.appendWakesOwed.add(actorId);
+      owed = true;
+    }
+    if (!owed) return;
+    queueMicrotask(() => {
+      const unpaid = [...this.appendWakesOwed];
+      this.appendWakesOwed.clear();
+      for (const actorId of unpaid) {
+        try {
+          this.dispatch(actorId);
+        } catch (err) {
+          // An advisory wake is never allowed to become the appender's
+          // problem, and boot reconciliation still covers what it missed.
+          this.log(
+            `inbox notification dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    });
   }
 
   /** Lifecycle boundary after the halt gate and before scheduler admission. */
