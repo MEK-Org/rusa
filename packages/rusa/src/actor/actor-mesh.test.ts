@@ -3053,64 +3053,6 @@ describe("ActorMesh", () => {
     expect(last).toContain("code reviewer (high-tier)");
   });
 
-  it("pooledModelsForProvider reports current and staged pools, and never a retired thread's", () => {
-    const { mesh } = setup();
-    const portable = { type: "portable", mode: "ledger" } as const;
-    mesh.spawn({
-      charter: "current",
-      parentId: "root",
-      modelConfig: { provider: "provider-a", model: "model-a" },
-      context: portable,
-    });
-    const staged = mesh.spawn({
-      charter: "staged",
-      parentId: "root",
-      modelConfig: { provider: "provider-a", model: "model-b" },
-      context: portable,
-    });
-    const gone = mesh.spawn({
-      charter: "gone",
-      parentId: "root",
-      modelConfig: { provider: "provider-a", model: "model-retired" },
-      context: portable,
-    });
-
-    // A staged replacement is the pool the next run launches on, so a hold has
-    // to bite there too; the pool it replaces still governs a run in flight.
-    mesh.setActorModel(staged, { provider: "provider-a", model: "model-c" }, "root");
-    // A retired thread can never launch, so naming its model would tell an
-    // operator a hold bites where it cannot.
-    mesh.retire(gone);
-
-    expect(mesh.pooledModelsForProvider("provider-a")).toEqual(["model-a", "model-b", "model-c"]);
-    expect(mesh.pooledModelsForProvider("provider-b")).toEqual([]);
-  });
-
-  it("pooledModelsForProvider normalizes provider names and aliases", () => {
-    const { mesh } = setup();
-    const portable = { type: "portable", mode: "ledger" } as const;
-    mesh.spawn({
-      charter: "agy-keyed",
-      parentId: "root",
-      modelConfig: { provider: "agy", model: "gemini-2.5-pro" },
-      context: portable,
-    });
-    mesh.spawn({
-      charter: "cased-provider",
-      parentId: "root",
-      modelConfig: { provider: "Claude", model: "claude-sonnet-5" },
-      context: portable,
-    });
-
-    // Alias folding: "agy" pool entry matches query for "antigravity" and vice versa.
-    expect(mesh.pooledModelsForProvider("antigravity")).toEqual(["gemini-2.5-pro"]);
-    expect(mesh.pooledModelsForProvider("agy")).toEqual(["gemini-2.5-pro"]);
-
-    // Case insensitivity: "Claude" pool entry matches query for "claude".
-    expect(mesh.pooledModelsForProvider("claude")).toEqual(["claude-sonnet-5"]);
-    expect(mesh.pooledModelsForProvider("CLAUDE")).toEqual(["claude-sonnet-5"]);
-  });
-
   it("calls onRetire for every node in a retired subtree", async () => {
     const retired: string[] = [];
     const { mesh, tick } = setup({ onRetire: (r) => retired.push(r.id) });

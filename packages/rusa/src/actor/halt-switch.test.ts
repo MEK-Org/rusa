@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  findUnpooledHaltModels,
+  findUncataloguedHaltModels,
   HALT_SYNTAX_HELP,
   HaltSwitch,
   parseHaltCommand,
@@ -146,44 +146,54 @@ describe("parseHaltCommand", () => {
   });
 });
 
-describe("findUnpooledHaltModels", () => {
-  const pool = ["claude-opus-5", "Claude-Sonnet-5", "gemini-2.5-flash"];
+describe("findUncataloguedHaltModels", () => {
+  const catalog = ["claude-opus-5", "Claude-Sonnet-5", "gemini-2.5-flash"];
 
-  it("finds the model no pool entry names and offers the closest entries", () => {
-    expect(findUnpooledHaltModels(["claude-opus-5-hihg"], pool)).toEqual([
+  it("finds the model no catalog entry names and offers the closest entries", () => {
+    expect(findUncataloguedHaltModels(["claude-opus-5-hihg"], catalog)).toEqual([
       { model: "claude-opus-5-hihg", nearest: ["claude-opus-5", "Claude-Sonnet-5"] },
     ]);
   });
 
-  it("matches a pool entry case-insensitively, because the parser lowercases what was typed", () => {
-    // `/halt provider:claude model:claude-sonnet-5` arrives here lowercased;
-    // a pool configured with mixed-casing like "Claude-Sonnet-5" would otherwise
-    // warn about a model that is in fact held.
-    expect(findUnpooledHaltModels(["claude-sonnet-5"], pool)).toEqual([]);
+  it("matches a catalog entry case-insensitively, because the parser lowercases what was typed", () => {
+    // `/halt provider:claude model:claude-sonnet-5` arrives here lowercased; a
+    // catalog carrying the provider's own casing like "Claude-Sonnet-5" would
+    // otherwise refuse a model that is in fact launchable.
+    expect(findUncataloguedHaltModels(["claude-sonnet-5"], catalog)).toEqual([]);
+  });
+
+  it("accepts a catalogued model no actor is running, since the catalog outlives an idle provider", () => {
+    // The premise this function was rebuilt on: `model_scrapes` restores the
+    // catalog at startup, so a real model stays knowable while every pool that
+    // uses it is idle. Nothing here consults a pool, and a pre-emptive hold on
+    // an unused model is accepted for exactly that reason.
+    expect(findUncataloguedHaltModels(["gemini-2.5-flash"], catalog)).toEqual([]);
   });
 
   it("reports every unmatched model and keeps the operator's spelling", () => {
-    expect(findUnpooledHaltModels(["claude-opus-5", "gpt-5-codex"], pool)).toEqual([
+    expect(findUncataloguedHaltModels(["claude-opus-5", "gpt-5-codex"], catalog)).toEqual([
       { model: "gpt-5-codex", nearest: ["claude-opus-5", "Claude-Sonnet-5"] },
     ]);
   });
 
-  it("offers distinct nearest models when pools differ only in casing", () => {
+  it("offers distinct nearest models when catalog entries differ only in casing", () => {
     expect(
-      findUnpooledHaltModels(
+      findUncataloguedHaltModels(
         ["claude-sonnet-5-hihg"],
         ["claude-sonnet-5", "Claude-Sonnet-5", "claude-opus-5"]
       )
     ).toEqual([{ model: "claude-sonnet-5-hihg", nearest: ["claude-sonnet-5", "claude-opus-5"] }]);
   });
 
-  it("still reports the miss when the provider has no pool at all", () => {
+  it("still reports the miss when the provider has no catalog at all", () => {
     // The handler rejects an unconfigured provider before it reaches here, so
-    // an empty pool means a configured provider no live actor is using. Every
-    // name is unmatched there, and the caller refuses the command --- but it
-    // has nothing to suggest, so the finding carries no hints and the caller
-    // says why instead.
-    expect(findUnpooledHaltModels(["anything"], [])).toEqual([{ model: "anything", nearest: [] }]);
+    // an empty list means a configured provider whose models have never been
+    // scraped. Nothing there can be proven launchable, so the caller refuses
+    // --- but it has nothing to suggest, so the finding carries no hints and
+    // the caller says why instead.
+    expect(findUncataloguedHaltModels(["anything"], [])).toEqual([
+      { model: "anything", nearest: [] },
+    ]);
   });
 });
 

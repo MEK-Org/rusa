@@ -3135,7 +3135,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
-  it("refuses a halt whose model: matches no current or staged pool, and places no hold", async () => {
+  it("validates /halt model: against the provider's scraped catalog, not the live pools", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     const config = {
@@ -3164,6 +3164,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     await readyPromise;
+    // What a CLI scrape left behind, restored at startup from `model_scrapes`.
+    // `claude-opus-5` is in the catalog and in no actor's pool: only the root
+    // runs, and it runs claude-sonnet-5. `codex` gets no catalog at all.
+    setProviderModelCatalog("claude", [
+      { displayLabel: "Claude Sonnet 5", identifier: "claude-sonnet-5", passable: true },
+      { displayLabel: "Claude Opus 5", identifier: "claude-opus-5", passable: true },
+    ]);
     const message = (text: string, name: string) =>
       chatSource.emit({
         name,
@@ -3177,14 +3184,26 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
-    // A transposed suffix: no run will ever resolve to this name, so a hold on
-    // it would be inert for every caller that can name its model.
+    // The premise this gate was rebuilt on. Nothing is running claude-opus-5,
+    // so a pool-based check would have refused this --- but the provider knows
+    // the model, and holding it before a rollout is exactly what an operator
+    // wants to do. It is accepted.
+    await message("/halt provider:claude model:claude-opus-5", "messages/halt-idle-model");
+    const idleAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(idleAck).toContain("Halted");
+    expect(idleAck).not.toContain("rejected");
+    expect(halt.isHalted("claude", "claude-opus-5")).toBe(true);
+    await message("/resume", "messages/resume-idle");
+    expect(halt.isHalted()).toBe(false);
+
+    // A transposed suffix: no run can ever be launched on this name, so a hold
+    // on it would be inert for every caller that can name its model.
     await message("/halt provider:claude model:claude-sonnet-5-hihg", "messages/halt-typo");
     const typoAck = chatClient.sent.at(-1)?.text ?? "";
     expect(typoAck).toContain("rejected");
     expect(typoAck).toContain("claude-sonnet-5-hihg");
-    expect(typoAck).toContain("no current or staged pool");
-    // The closest pool entry is what the operator retypes.
+    expect(typoAck).toContain("the model catalog for claude does not list");
+    // The closest catalog entry is what the operator retypes.
     expect(typoAck).toContain("closest: claude-sonnet-5");
     // No hold at all: not on the misspelling, not on anything.
     expect(halt.isHalted()).toBe(false);
@@ -3201,15 +3220,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/resume", "messages/resume-correct");
     expect(halt.isHalted()).toBe(false);
 
-    // `codex` is configured but no live actor is using it, so its pool is
-    // empty and every name is unmatched. There is nothing to suggest, so the
+    // `codex` is configured but has never been scraped, so nothing can be
+    // proven launchable there. There is nothing to suggest either, so the
     // refusal says why rather than quoting a bare name back.
-    await message("/halt provider:codex model:gpt-5-codx", "messages/halt-unpooled-provider");
-    const unpooledAck = chatClient.sent.at(-1)?.text ?? "";
-    expect(unpooledAck).toContain("rejected");
-    expect(unpooledAck).toContain("gpt-5-codx");
-    expect(unpooledAck).toContain("codex has no pooled models right now");
-    expect(unpooledAck).not.toContain("closest:");
+    await message("/halt provider:codex model:gpt-5-codx", "messages/halt-unscraped-provider");
+    const unscrapedAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(unscrapedAck).toContain("rejected");
+    expect(unscrapedAck).toContain("gpt-5-codx");
+    expect(unscrapedAck).toContain("No model catalog has been scraped for codex");
+    expect(unscrapedAck).not.toContain("closest:");
     expect(halt.isHalted()).toBe(false);
 
     // A comma list is refused whole. Holding the half that matched would leave
@@ -3224,6 +3243,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(partialAck).toContain("No hold was placed");
     expect(halt.isHalted()).toBe(false);
     expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+
+    clearProviderModelCatalog();
   });
 
   it("answers an unparseable /halt with the syntax it accepts", async () => {

@@ -398,6 +398,35 @@ export function populateModelCatalogsFromDb(repo: {
   }
 }
 
+/**
+ * Every value this provider's scraped catalog will actually accept as a
+ * `--model` pin, or `undefined` when no catalog has been scraped for it.
+ *
+ * This is the single definition of "a model name this provider knows". It is
+ * what {@link validateModelPin} quotes back on rejection and what the
+ * `/halt provider:<p> model:<m>` gate validates against, so an operator can
+ * never be told a name is acceptable by one and unknown by the other.
+ *
+ * Display labels are included alongside identifiers because `validateModelPin`
+ * matches either — except for Kimi, whose CLI takes only the config key
+ * (identifier) and never the friendly `display_name`, so advertising a Kimi
+ * display label would offer a pin that fails to launch.
+ */
+export function acceptableModelPins(provider: string): readonly string[] | undefined {
+  const entries = getProviderModelCatalog(provider);
+  if (!entries) return undefined;
+  const fields: readonly ModelCommandLineField[] =
+    provider === "kimi" ? ["identifier"] : ["displayLabel", "identifier"];
+  return [
+    ...new Set(
+      entries
+        .filter((entry) => entry.passable !== false)
+        .flatMap((entry) => fields.map((field) => entry[field]))
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+    ),
+  ];
+}
+
 export type ModelPinValidation =
   | { status: "accepted"; efforts?: string[] }
   | { status: "unknown"; warning: string };
@@ -406,6 +435,12 @@ export type ModelPinValidation =
  * Validate locally before constructing a provider. Absent and empty catalogs
  * are unknown and remain permissive until live enumeration lands.
  * Accepts both slug identifiers (e.g. gemini-3.1-pro-high) and display labels (e.g. Gemini 3.1 Pro (High)) .
+ *
+ * The `/halt provider:<p> model:<m>` gate shares this function's vocabulary via
+ * {@link acceptableModelPins} but deliberately *refuses* on an absent or empty
+ * catalog rather than allowing it through. The asymmetry is intended: a pin that
+ * turns out wrong fails one launch loudly, whereas a halt that turns out wrong
+ * silently disarms the brake and then blocks the corrected command.
  */
 export function validateModelPin(provider: string, pin: string): ModelPinValidation {
   const descriptor = PROVIDER_MODEL_DESCRIPTORS[provider];
@@ -442,11 +477,7 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
     }
   }
   if (!isMatch) {
-    const acceptable = Array.from(
-      new Set(
-        passableEntries.flatMap((entry) => [entry.displayLabel, entry.identifier]).filter(Boolean)
-      )
-    );
+    const acceptable = acceptableModelPins(provider) ?? [];
     throw new Error(
       `model pin validation failed for provider "${provider}": rejected "${pin}"; acceptable values: ${acceptable.length > 0 ? acceptable.map((value) => `"${value}"`).join(", ") : "(none)"}`
     );

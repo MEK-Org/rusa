@@ -53,7 +53,7 @@ import {
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
 import {
-  findUnpooledHaltModels,
+  findUncataloguedHaltModels,
   HALT_SYNTAX_HELP,
   type HaltCommand,
   HaltSwitch,
@@ -213,7 +213,11 @@ import {
 import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
-import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import {
+  acceptableModelPins,
+  ingestKimiHostModels,
+  populateModelCatalogsFromDb,
+} from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import {
   describeModelConfigEntry,
@@ -3932,38 +3936,47 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             .catch(() => {});
           return;
         }
-        // A `model:` scope the mesh cannot see is a hold no run will ever meet,
-        // and taking the single halt sentinel for it is #630: the corrected
-        // halt is then refused until the inert one is resumed. Refuse instead,
-        // and offer back what to retype. This sits above `haltSwitch.halt`
-        // deliberately — below it, the sentinel, the queued-run flush, and the
-        // expiry timer would all have happened for a command being declined.
-        const pooled = (haltCommand.providers ?? []).flatMap((provider) =>
-          mesh.pooledModelsForProvider(provider)
+        // A `model:` scope the provider's catalog does not list is a hold no
+        // run can ever meet, and taking the single halt sentinel for it is
+        // #630: the corrected halt is then refused until the inert one is
+        // resumed. Refuse instead, and offer back what to retype. This sits
+        // above `haltSwitch.halt` deliberately — below it, the sentinel, the
+        // queued-run flush, and the expiry timer would all have happened for a
+        // command being declined.
+        //
+        // The catalog, not the live pools: Rusa restores provider catalogs from
+        // durable `model_scrapes` at startup and refreshes them from CLI
+        // scrapes, so an idle provider still knows its models. Gating on which
+        // models some actor happens to be running would refuse a perfectly
+        // legitimate pre-emptive halt for no reason but timing.
+        const catalogued = (haltCommand.providers ?? []).flatMap(
+          (provider) => acceptableModelPins(provider) ?? []
         );
-        const unpooled = findUnpooledHaltModels(haltCommand.models ?? [], pooled);
-        if (unpooled.length > 0) {
+        const uncatalogued = findUncataloguedHaltModels(haltCommand.models ?? [], catalogued);
+        if (uncatalogued.length > 0) {
           const providerScope = (haltCommand.providers ?? []).join(", ");
-          const named = unpooled
+          const named = uncatalogued
             .map((u) =>
               u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
             )
             .join(", ");
-          // With nothing to suggest, the useful fact is *why*: an idle
-          // provider, not a misspelled model.
-          const why = pooled.length ? "" : ` ${providerScope} has no pooled models right now.`;
+          // With nothing to suggest, the useful fact is *why*: a provider whose
+          // models have never been scraped, not a misspelled name.
+          const why = catalogued.length
+            ? ""
+            : ` No model catalog has been scraped for ${providerScope}.`;
           // A comma list is refused whole. Holding the half that matched would
           // leave a named scope unheld while the acknowledgement implied
           // otherwise, and the operator retypes the whole command anyway.
           const partial =
-            unpooled.length < (haltCommand.models?.length ?? 0)
+            uncatalogued.length < (haltCommand.models?.length ?? 0)
               ? " No hold was placed, including for the models that did match."
               : " No hold was placed.";
           void cc
             .send(
               msg.spaceName,
-              `⛔ Halt command rejected: no current or staged pool for ${providerScope}` +
-                ` names ${named}.${why}${partial}`
+              `⛔ Halt command rejected: the model catalog for ${providerScope} does not` +
+                ` list ${named}.${why}${partial}`
             )
             .catch(() => {});
           return;
