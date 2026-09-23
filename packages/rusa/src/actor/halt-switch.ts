@@ -189,7 +189,7 @@ export function parseHaltCommand(text: string): HaltCommand | null {
   return result;
 }
 
-export function normalizeProvider(provider: string): string {
+function normalizeProvider(provider: string): string {
   const normalized = provider.trim().toLowerCase();
   return normalized === "agy" ? "antigravity" : normalized;
 }

@@ -3945,10 +3945,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // command being declined.
         //
         // The catalog, not the live pools: Rusa restores provider catalogs from
-        // durable `model_scrapes` at startup and refreshes them from CLI
-        // scrapes, so an idle provider still knows its models. Gating on which
-        // models some actor happens to be running would refuse a perfectly
-        // legitimate pre-emptive halt for no reason but timing.
+        // durable `model_scrapes` at startup, so an idle provider still knows
+        // its models. Gating on which models some actor happens to be running
+        // would refuse a perfectly legitimate pre-emptive halt for no reason
+        // but timing. Not every provider has a probe that refreshes its row —
+        // claude has none, so its catalog is only whatever rows the operator
+        // has recorded, and a mesh with none refuses every model-scoped claude
+        // halt. That is the rule as asked for (#630): a model the database
+        // does not list is refused, and the provider-wide halt stays open.
         const catalogued = (haltCommand.providers ?? []).flatMap(
           (provider) => acceptableModelPins(provider) ?? []
         );
@@ -3960,11 +3964,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
             )
             .join(", ");
-          // With nothing to suggest, the useful fact is *why*: a provider whose
-          // models have never been scraped, not a misspelled name.
+          // With nothing to suggest, the useful facts are *why* — a provider
+          // with no recorded models, not a misspelled name — and what still
+          // works.
           const why = catalogued.length
             ? ""
-            : ` No model catalog has been scraped for ${providerScope}.`;
+            : ` No model catalog is recorded for ${providerScope}; /halt provider:${(haltCommand.providers ?? []).join(",")} halts the whole provider.`;
           // A comma list is refused whole. Holding the half that matched would
           // leave a named scope unheld while the acknowledgement implied
           // otherwise, and the operator retypes the whole command anyway.

@@ -3140,7 +3140,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const chatSource = new FakeChatSource();
     const config = {
       github: { account: "mock-bot" },
-      providers: { claude: { cliCommand: "claude" }, codex: { cliCommand: "codex" } },
+      providers: { claude: { cliCommand: "claude" } },
       rootActor: { provider: "claude", model: "claude-sonnet-5" },
       chat: {
         projectId: "test",
@@ -3151,6 +3151,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    // Claude has no model probe; its catalog on a live mesh is a durable
+    // `model_scrapes` row, which startup restores. Seed exactly that, so the
+    // gate below reads the catalog through the production restore path.
+    // `claude-opus-5` is in the catalog and in no actor's pool: only the root
+    // runs, and it runs claude-sonnet-5.
+    initDb(homeDir);
+    const scrapes = getRepositories().modelScrapes;
+    const scrapeId = scrapes.recordRaw({
+      provider: "claude",
+      scrapedAt: new Date().toISOString(),
+      rawOutput: "recorded claude model list",
+    });
+    scrapes.recordParsed(scrapeId, [
+      { displayLabel: "Claude Sonnet 5", identifier: "claude-sonnet-5", passable: true },
+      { displayLabel: "Claude Opus 5", identifier: "claude-opus-5", passable: true },
+    ]);
+    closeDb();
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
         e2e: {
@@ -3164,13 +3181,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     });
     await readyPromise;
-    // What a CLI scrape left behind, restored at startup from `model_scrapes`.
-    // `claude-opus-5` is in the catalog and in no actor's pool: only the root
-    // runs, and it runs claude-sonnet-5. `codex` gets no catalog at all.
-    setProviderModelCatalog("claude", [
-      { displayLabel: "Claude Sonnet 5", identifier: "claude-sonnet-5", passable: true },
-      { displayLabel: "Claude Opus 5", identifier: "claude-opus-5", passable: true },
-    ]);
     const message = (text: string, name: string) =>
       chatSource.emit({
         name,
@@ -3220,17 +3230,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await message("/resume", "messages/resume-correct");
     expect(halt.isHalted()).toBe(false);
 
-    // `codex` is configured but has never been scraped, so nothing can be
-    // proven launchable there. There is nothing to suggest either, so the
-    // refusal says why rather than quoting a bare name back.
-    await message("/halt provider:codex model:gpt-5-codx", "messages/halt-unscraped-provider");
-    const unscrapedAck = chatClient.sent.at(-1)?.text ?? "";
-    expect(unscrapedAck).toContain("rejected");
-    expect(unscrapedAck).toContain("gpt-5-codx");
-    expect(unscrapedAck).toContain("No model catalog has been scraped for codex");
-    expect(unscrapedAck).not.toContain("closest:");
-    expect(halt.isHalted()).toBe(false);
-
     // A comma list is refused whole. Holding the half that matched would leave
     // the operator believing a scope they named is held when it is not.
     await message(
@@ -3245,6 +3244,65 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
 
     clearProviderModelCatalog();
+  });
+
+  it("refuses a model-scoped claude halt on a mesh with no recorded claude catalog", async () => {
+    clearProviderModelCatalog();
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    const config = {
+      github: { account: "mock-bot" },
+      providers: { claude: { cliCommand: "claude" } },
+      rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      chat: {
+        projectId: "test",
+        subscription: "test",
+        pubsubKeyPath: "/dev/null",
+        gchat: "all",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    const message = (text: string, name: string) =>
+      chatSource.emit({
+        name,
+        spaceName: "spaces/test",
+        spaceType: "DIRECT_MESSAGE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text,
+        mentionsSelf: false,
+        isDirectMessage: true,
+      });
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // A fresh install: no probe fills claude's catalog and no row has been
+    // recorded, so even the root's own model is unlisted. Refused by design,
+    // and the refusal says why and names the halt that still works.
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-uncatalogued");
+    const ack = chatClient.sent.at(-1)?.text ?? "";
+    expect(ack).toContain("rejected");
+    expect(ack).toContain("No model catalog is recorded for claude");
+    expect(ack).toContain("/halt provider:claude halts the whole provider");
+    expect(ack).not.toContain("closest:");
+    expect(halt.isHalted()).toBe(false);
+
+    await message("/halt provider:claude", "messages/halt-provider-wide");
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    expect(halt.isHalted("claude")).toBe(true);
   });
 
   it("answers an unparseable /halt with the syntax it accepts", async () => {
