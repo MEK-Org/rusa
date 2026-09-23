@@ -65,7 +65,8 @@ export type ModelConfigInput = ConcreteModelConfigInput | ModelClassReference;
  */
 export interface ModelClassStore {
   get(name: string): { modelConfig: ProviderModelConfig[] } | undefined;
-  list(): Array<{ name: string }>;
+  /** Lists names without decoding class definitions. */
+  names(): string[];
 }
 
 export function isModelClassReference(input: unknown): input is ModelClassReference {
@@ -118,12 +119,21 @@ export function lookupModelClassPool(
   if (name.trim() !== name) {
     return { error: "model class reference must not have leading or trailing whitespace" };
   }
-  const defined = classes.get(name);
+  let defined: { modelConfig: ProviderModelConfig[] } | undefined;
+  try {
+    defined = classes.get(name);
+  } catch {
+    // A corrupt definition must fail only the actor bound to it. In particular,
+    // a read-time class lookup cannot turn one bad row into a failed actor list.
+    return { error: `model class "${name}" is invalid or unreadable` };
+  }
   if (!defined) {
-    const known = classes
-      .list()
-      .map((entry) => entry.name)
-      .sort();
+    let known: string[];
+    try {
+      known = classes.names().sort();
+    } catch {
+      return { error: `model class "${name}" could not be looked up` };
+    }
     return {
       error:
         known.length > 0

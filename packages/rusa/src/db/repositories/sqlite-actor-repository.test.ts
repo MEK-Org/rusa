@@ -181,6 +181,43 @@ describe("SqliteActorRepository", () => {
     ).toEqual(["root", "worker"]);
   });
 
+  it("contains corrupt model-class definitions to the bound actor", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "broken",
+      charter: "Broken class binding",
+      parentId: "root",
+      modelClass: "broken-class",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    repository.upsert({
+      id: "missing",
+      charter: "Missing class binding",
+      parentId: "root",
+      modelClass: "missing-class",
+      status: "active",
+      createdAt: "2026-09-03T13:02:00.000Z",
+    });
+    classes.upsert("broken-class", [{ provider: "codex", model: "gpt-fast" }], NOW);
+    db.prepare("UPDATE model_classes SET definition_json = ? WHERE name = 'broken-class'").run(
+      "not-json"
+    );
+
+    // A corrupt referenced row and an unrelated corrupt row must both be
+    // reported on the individual binding; neither may make the actor list fail.
+    expect(repository.get("broken")?.modelClassError).toMatch(/broken-class.*invalid/i);
+    expect(repository.get("missing")?.modelClassError).toMatch(
+      /unknown model class "missing-class"/
+    );
+    expect(
+      repository
+        .list()
+        .map((actor) => actor.id)
+        .sort()
+    ).toEqual(["broken", "missing", "root"]);
+  });
+
   it("ignores the duplicated pool on an existing v3 row without converting it", () => {
     classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
     repository.upsert(root);
@@ -247,6 +284,12 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("root")?.modelConfig).toEqual([
       { provider: "claude", model: "claude-pinned" },
     ]);
+  });
+
+  it("refuses to silently drop an explicit model selection for a missing row", () => {
+    expect(() => repository.setModelSelection("missing", { modelClass: "fast" })).toThrow(
+      /cannot set model selection on unknown actor 'missing'/
+    );
   });
 
   it("rejects a malformed v4 class reference at the consumption boundary", () => {

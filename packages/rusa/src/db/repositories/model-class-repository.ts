@@ -111,6 +111,19 @@ export class ModelClassRepository {
     ).map(fromRow);
   }
 
+  /**
+   * Names-only lookup for an unknown-class diagnostic. Unlike {@link list},
+   * this intentionally never decodes a sibling's definition: one corrupt
+   * class must not prevent another actor's broken reference from being shown.
+   */
+  names(): string[] {
+    return (
+      this.db.prepare("SELECT name FROM model_classes ORDER BY name ASC").all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+  }
+
   /** Full replacement, preserving ordered candidate semantics exactly as supplied. */
   upsert(name: string, modelConfig: readonly ProviderModelConfig[], at: string): void {
     const definition: StoredDefinition = {

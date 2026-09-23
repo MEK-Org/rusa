@@ -2404,15 +2404,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       refreshLiveActorMcp(actorId);
     },
     onModelSet: (actorId, newModelConfig) => {
-      try {
-        const liveActor = mesh.get(actorId);
-        if (liveActor && typeof liveActor.setModelConfig === "function") {
-          liveActor.setModelConfig(newModelConfig);
-        }
-      } catch (err) {
-        console.warn(
-          `[mesh] failed to update live modelConfig for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
-        );
+      const liveActor = mesh.get(actorId);
+      if (liveActor && typeof liveActor.setModelConfig === "function") {
+        // Let ActorMesh retain a failed publication as retryable. Swallowing
+        // this exception here would make its class-pool cache claim success
+        // while the live actor continued to run its old pool (#626).
+        liveActor.setModelConfig(newModelConfig);
       }
     },
     // Recreate the private working directory for the revived actor
@@ -2440,7 +2437,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // gate refuses it while the binding is broken, and the moment the class
       // resolves again the dispatch boundary hands it the real pool (#626). Report
       // it here so a restart surfaces the broken binding without waiting for a wake.
-      mesh.modelClassFailure(id);
+      mesh.reportModelClassFailure(id);
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
           provider: rootActor.provider,

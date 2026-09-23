@@ -1,5 +1,9 @@
 import type { ActorRecord } from "../actor/actor-record.js";
-import type { ActorRepository, ModelSelectionChange } from "./actor-repository.js";
+import type {
+  ActorRecordPatch,
+  ActorRepository,
+  ModelSelectionChange,
+} from "./actor-repository.js";
 
 /** Lightweight repository adapter for isolated tests and embedders without SQLite. */
 export class InMemoryActorRepository implements ActorRepository {
@@ -22,7 +26,7 @@ export class InMemoryActorRepository implements ActorRepository {
     return this.list().filter((record) => record.parentId === parentId);
   }
 
-  patch(id: string, changes: Partial<Omit<ActorRecord, "id">>): void {
+  patch(id: string, changes: ActorRecordPatch): void {
     const existing = this.records.get(id);
     if (existing) this.upsert({ ...existing, ...changes, id });
   }
@@ -32,6 +36,14 @@ export class InMemoryActorRepository implements ActorRepository {
    * no stored encoding for an explicit model-configuration change to restate.
    */
   setModelSelection(id: string, changes: ModelSelectionChange): void {
-    this.patch(id, changes);
+    const existing = this.records.get(id);
+    if (!existing)
+      throw new Error(
+        `InMemoryActorRepository: cannot set model selection on unknown actor '${id}'`
+      );
+    // `modelClassError` is a read-time projection in SQLite, never durable.
+    // Mirror that fresh read when a test adapter applies a selection.
+    const { modelClassError: _discardedProjection, ...stored } = existing;
+    this.upsert({ ...stored, ...changes, id });
   }
 }

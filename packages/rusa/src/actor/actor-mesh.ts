@@ -4222,14 +4222,15 @@ export class ActorMesh {
     }
 
     const appliedModelConfig = verified.modelConfig ?? newModelConfig;
-    // Keep the refresh bookkeeping in step: this pool is now the live actor's,
-    // whether it came from a class binding or an explicit pin.
+    // Publish before marking the pool delivered. The production callback updates
+    // the live Actor and can fail; recording first would suppress every retry
+    // while the durable record and dashboard show a pool the live actor lacks.
+    this.onModelSet?.(id, appliedModelConfig, verified);
     if (boundClass !== undefined) {
       this.publishedClassPools.set(id, JSON.stringify(appliedModelConfig));
     } else {
       this.publishedClassPools.delete(id);
     }
-    this.onModelSet?.(id, appliedModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
@@ -4253,26 +4254,23 @@ export class ActorMesh {
     if (!this.runs.liveActor(id)?.setModelConfig) return;
     const pool = JSON.stringify(record.modelConfig);
     if (this.publishedClassPools.get(id) === pool) return;
-    this.publishedClassPools.set(id, pool);
     this.onModelSet?.(id, record.modelConfig, record);
+    // Do not suppress a retry until the live actor accepted the current pool.
+    this.publishedClassPools.set(id, pool);
   }
 
   /**
-   * Why a class-bound actor cannot be scheduled right now, or undefined when
-   * its class resolves (or it declares an explicit pool).
-   *
-   * Public because the externally-constructed root gates its own dispatch and
-   * must refuse on the same terms as every mesh-created actor: running a
-   * class-bound actor whose class is gone means running the stale pool the
-   * live actor still holds, which is precisely what binding to a class is
-   * supposed to rule out (#626).
+   * Pure read of why a class-bound actor cannot be scheduled. Querying this
+   * never emits an event, so dashboard and diagnostic callers can inspect the
+   * record without changing its timeline.
    */
-  modelClassFailure(id: string): string | undefined {
-    const reason = this.actors.get(id)?.modelClassError;
-    if (reason === undefined) {
-      this.reportedModelClassFailures.delete(id);
-      return undefined;
-    }
+  modelClassError(id: string): string | undefined {
+    return this.actors.get(id)?.modelClassError;
+  }
+
+  /** Record a coalesced visible failure at a boot or dispatch refusal site. */
+  reportModelClassFailure(id: string, reason = this.modelClassError(id)): void {
+    if (reason === undefined) return;
     if (this.reportedModelClassFailures.get(id) !== reason) {
       this.reportedModelClassFailures.set(id, reason);
       this.recordEvent({
@@ -4281,7 +4279,11 @@ export class ActorMesh {
         detail: reason,
       });
     }
-    return reason;
+  }
+
+  /** Forget a prior visible failure after the class resolves again. */
+  clearModelClassFailure(id: string): void {
+    if (this.reportedModelClassFailures.has(id)) this.reportedModelClassFailures.delete(id);
   }
 
   /**
@@ -4518,6 +4520,15 @@ export class ActorMesh {
       return false;
     }
     this.applyPendingModel(id);
+    // A staged rebind or explicit pin is the supported repair path for a
+    // broken current class. Apply it before inspecting the current binding so
+    // an idle actor can repair itself on its next dispatch (#626).
+    const modelClassError = this.modelClassError(id);
+    if (modelClassError !== undefined) {
+      this.reportModelClassFailure(id, modelClassError);
+      return false;
+    }
+    this.clearModelClassFailure(id);
     return true;
   }
 

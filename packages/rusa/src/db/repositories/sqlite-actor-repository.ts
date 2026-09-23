@@ -7,7 +7,11 @@ import {
   type ModelClassStore,
   type ProviderModelConfig,
 } from "../../providers/model-config.js";
-import type { ActorRepository, ModelSelectionChange } from "../../repositories/actor-repository.js";
+import type {
+  ActorRecordPatch,
+  ActorRepository,
+  ModelSelectionChange,
+} from "../../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../../voice/voice-config.js";
 import { ModelClassRepository } from "./model-class-repository.js";
@@ -103,8 +107,8 @@ const modelConfigClassReferenceSchema = z
   .strict();
 
 // v1, v2 and v3 all remain readable so existing records stay valid. Class-bound
-// documents are written as v4; a v3 record keeps its copied pool on disk until
-// its row is next written, and that copy is ignored on read.
+// documents are written as v4; a v3 record's copied pool remains encoded until
+// an explicit model-configuration change, and is ignored on every read.
 const modelConfigDocumentSchema = z.union([
   modelConfigClassReferenceSchema,
   modelConfigClassSchema,
@@ -180,11 +184,9 @@ function parseDocument<T>(
  * write back, which matters because reads hand callers a pool resolved from the
  * class row and an ordinary `patch` would otherwise persist it (#626).
  *
- * Only an explicit model-configuration change reaches this function for a row
- * that already holds a class-bearing document; see
- * {@link keepStoredModelConfig}. A row converts from v3 to v4 when its model
- * configuration is deliberately changed, never incidentally and never in a
- * sweep.
+ * A row converts from v3 to v4 only when its model configuration is
+ * deliberately changed, never incidentally and never in a sweep. Incidental
+ * writes preserve the stored document through {@link keepStoredModelConfig}.
  */
 function buildModelConfig(record: ActorRecord): string | null {
   if (record.modelClass !== undefined) {
@@ -214,9 +216,10 @@ function buildModelConfig(record: ActorRecord): string | null {
  * model-configuration changes, which matters for rollback: an older binary
  * cannot read a v4 document, so a row must not acquire one by accident.
  *
- * Kept only when the stored document binds exactly the class the record still
- * names, so a genuine rebind — or a move to an explicit pool — still falls
- * through and is written in the current shape.
+ * The class match protects generic record replacement: ordinary root adoption
+ * retains the existing binding, while a record deliberately re-bound to a
+ * different class falls through. Explicit model changes use
+ * `setModelSelection` and always restate independently of this predicate.
  */
 function keepStoredModelConfig(record: ActorRecord, stored: string | null): string | undefined {
   if (stored === null || record.modelClass === undefined) return undefined;
@@ -240,9 +243,9 @@ function keepStoredModelConfig(record: ActorRecord, stored: string | null): stri
  * A class-bound document resolves its pool from the class store here, on every
  * read, which is what keeps a class-bound actor from disagreeing with its own
  * class (#626). A v3 record's copied entries are deliberately ignored: the
- * class row is the authority, and the copy disappears the next time that row is
- * written. An unresolvable class yields `modelClassError` and no pool, never a
- * stale one.
+ * class row is the authority. The copy stays encoded until an explicit
+ * model-configuration change rewrites that actor, but never becomes a stale
+ * fallback. An unresolvable class yields `modelClassError` and no pool.
  *
  * For unversioned legacy documents predating #169: a single optional
  * provider/model/effort is migrated on read into a one-entry pool. A legacy
@@ -455,7 +458,10 @@ export class SqliteActorRepository implements ActorRepository {
    */
   setModelSelection(id: string, changes: ModelSelectionChange): void {
     const record = this.get(id);
-    if (record) this.write({ ...record, ...changes, id }, { restateModelConfig: true });
+    if (!record) {
+      throw new Error(`SqliteActorRepository: cannot set model selection on unknown actor '${id}'`);
+    }
+    this.write({ ...record, ...changes, id }, { restateModelConfig: true });
   }
 
   private write(record: ActorRecord, opts?: { restateModelConfig?: boolean }): void {
@@ -565,7 +571,7 @@ export class SqliteActorRepository implements ActorRepository {
     ).map((row) => this.fromRow(row));
   }
 
-  patch(id: string, changes: Partial<Omit<ActorRecord, "id">>): void {
+  patch(id: string, changes: ActorRecordPatch): void {
     const record = this.get(id);
     if (record) this.upsert({ ...record, ...changes, id });
   }

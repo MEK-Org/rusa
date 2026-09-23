@@ -3100,6 +3100,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       name === "review"
         ? { modelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }] }
         : undefined,
+    names: () => ["review"],
     list: () => [{ name: "review" }],
   };
 
@@ -3197,7 +3198,10 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
   it("set_actor_model still fills an omitted model from the current pool for a concrete partial update", async () => {
     const { mesh, registry } = setup(productionHooks());
-    registry.patch("root", {
+    const root = registry.get("root");
+    if (!root) throw new Error("root record missing");
+    registry.upsert({
+      ...root,
       modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
       context: { type: "portable", mode: "ledger" },
     });
@@ -3242,7 +3246,10 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
   it("set_actor_model lets the root stage its own portable provider and model", async () => {
     const { mesh, registry } = setup();
-    registry.patch("root", {
+    const root = registry.get("root");
+    if (!root) throw new Error("root record missing");
+    registry.upsert({
+      ...root,
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });
