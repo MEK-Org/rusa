@@ -134,7 +134,9 @@ would have to respect, and nothing more.
   `/internal/` is gone. The GET read surface and its bodies are unchanged, but
   the former claim that socket access can only read is removed: `0600` now
   authorizes both reads and those operator writes, with no per-request role or
-  caller identity.
+  caller identity. §11.2's v2 forecast is re-aimed to match: v2's novelty is not
+  mutation — v1 has that — but *client-facing* mutation whose rows bind other
+  clients, which is what makes per-caller identity load-bearing.
 
 ## Contents
 
@@ -2056,12 +2058,20 @@ future design, not as a design:
    client with no grant does not start a normal run — refusal fails closed at
    once, silence defers and then fails closed. Responsive launches are never
    blocked.
-10. **v2 reintroduces three things v1 removed**, and they should be planned as
-    reintroductions rather than met as surprises: a mutating surface (so §5.3's
-    "the worst a client can do is read" ends, and authorization returns);
-    fail-closed semantics (turning a service outage from a freshness problem into
-    an availability one); and reservation in the launch path, which inverts
-    today's pacer-then-mesh-queue order (`provider-pacer.ts:238-269`).
+10. **v2 changes three things v1 settled**, and they should be planned as
+    changes rather than met as surprises. **Who may mutate, and on whose
+    behalf.** v1 already mutates: the two operator POSTs of §5.2 write reading
+    mode and manual readings, authorized by nothing but the `0600` socket. That
+    holds because each is an out-of-band correction to the pool's own view of a
+    provider, so the only question the transport has to answer is whether the
+    caller is the service user. A reservation is not that: an ordinary client
+    writes it on its own launch path, and the row binds every *other* client's
+    launches, so v2 has to know which client holds a hold and may release it —
+    per-caller identity that §5.3's single file permission deliberately does not
+    carry. **Fail-closed semantics**, turning a service outage from a freshness
+    problem into an availability one. And **reservation in the launch path**,
+    which inverts today's pacer-then-mesh-queue order
+    (`provider-pacer.ts:238-269`).
 
 What v1 leaves in place for that work: the service process, the socket, the
 per-response version block and the client-side refusal it enables (§5.2), the
