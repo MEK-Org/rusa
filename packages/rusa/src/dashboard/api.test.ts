@@ -20,6 +20,7 @@ import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
+import { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
 import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createLogger } from "../observability/logger.js";
@@ -28,7 +29,7 @@ import {
   inventoryLegacyReferences,
 } from "../principals/legacy-migration.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
-import type { ReferenceCacheService } from "../references/cache-service.js";
+import { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
@@ -2170,10 +2171,59 @@ describe("handleMeshApiRequest", () => {
     expect(closed?.eventReference).toBeUndefined();
   });
 
-  it("GET /api/mesh/inbox leaves a Google Chat space source unresolved (no per-message reference)", async () => {
-    // A chat event's `source` is the containing space (routing granularity),
-    // not the specific message — resolving it here would show the wrong
-    // entity, so this stays out of scope and keeps its raw payload.
+  it("GET /api/mesh/inbox resolves a Google Chat entry to its message card through the artifact resolver (#654)", async () => {
+    // Shaped like `normalizeChatEvent`'s output: `source` is the containing
+    // space (routing granularity), so the card must come from the message
+    // the payload names, not from the space.
+    inbox.append([
+      {
+        id: "gchat-inbox-entry",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/AAAA123/messages/BBBB",
+          spaceName: "spaces/AAAA123",
+          senderName: "users/1",
+          priority: "responsive",
+        },
+      },
+    ]);
+    const getMessage = vi.fn(async (name: string) => ({
+      name,
+      text: "Can you look at the flaky deploy?",
+      sender: { displayName: "Operator" },
+      createTime: "2026-09-23T15:00:00.000Z",
+    }));
+    const getSpace = vi.fn();
+    deps = {
+      ...deps,
+      // The real cache service, as the obligation-artifact path uses it.
+      referenceCache: new ReferenceCacheService({ repo: new ReferenceCacheRepository(db) }),
+      chatClient: { getMessage, getSpace } as unknown as DashboardDataDeps["chatClient"],
+    };
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    expect(getMessage).toHaveBeenCalledWith("spaces/AAAA123/messages/BBBB");
+    expect(getSpace).not.toHaveBeenCalled();
+    expect(entry.reference).toMatchObject({
+      ref: "gchat:spaces/AAAA123/messages/BBBB",
+      scheme: "gchat",
+      unavailable: null,
+      entity: { type: "gchat_message", contents: "Can you look at the flaky deploy?" },
+    });
+    // Only the reference is added; the stored payload is passed through.
+    expect(entry.payload).toMatchObject({
+      type: "gchat.message",
+      messageName: "spaces/AAAA123/messages/BBBB",
+    });
+    expect(entry.eventReference).toBeUndefined();
+  });
+
+  it("GET /api/mesh/inbox names the Google Chat message, never the space, when it cannot resolve it", async () => {
+    // No referenceCache/chatClient is wired in this suite's deps: the entry
+    // still points at its own message, reported unavailable.
     inbox.append([
       {
         id: "gchat-inbox-entry",
@@ -2185,7 +2235,31 @@ describe("handleMeshApiRequest", () => {
 
     const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     const entry = JSON.parse(res.body).entries[0];
-    expect(entry.reference).toBeUndefined();
+    expect(entry.reference).toMatchObject({ ref: "gchat:spaces/AAAA123/messages/BBBB" });
+    expect(entry.reference.unavailable).toBeTruthy();
+    expect(entry.reference.entity).toBeUndefined();
+  });
+
+  it("GET /api/mesh/inbox leaves a Google Chat entry without a well-formed message name unresolved", async () => {
+    inbox.append([
+      {
+        id: "gchat-no-message",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message" },
+      },
+      {
+        id: "gchat-space-only",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message", messageName: "spaces/AAAA123" },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entries = JSON.parse(res.body).entries as Array<{ reference?: unknown }>;
+    expect(entries).toHaveLength(2);
+    for (const entry of entries) expect(entry.reference).toBeUndefined();
   });
 
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {

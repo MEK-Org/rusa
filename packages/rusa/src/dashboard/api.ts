@@ -168,6 +168,7 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
+import { parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -525,22 +526,52 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 }
 
 /**
- * Inbox entries intentionally store lightweight pointers. The dashboard is the
- * presentation boundary, so resolve a mesh-message pointer, or a GitHub source
- * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
- * the event was about), here and never leak an opaque id or an unlinked
- * `github:` label into the UI payload.
+ * The `gchat:spaces/S/messages/M` reference a Google Chat inbox entry is
+ * about, or undefined when its payload names no well-formed message.
  *
- * Google Chat sources are deliberately left alone: a chat event's `source` is
- * the containing space (routing granularity), not the specific message, so
- * resolving it here would show the wrong entity. Every other payload keeps
- * its raw JSON, which is the honest rendering until that has a resolver.
+ * A chat event's `source` is the containing space (routing granularity), so
+ * resolving that would show the wrong entity; the message itself is the
+ * payload's `messageName`, which is Google's resource name and so already
+ * the reference path.
+ */
+function gchatInboxMessageReference(payload: InboxPayload): string | undefined {
+  if (payload.type !== "gchat.message" || typeof payload.messageName !== "string") {
+    return undefined;
+  }
+  try {
+    const reference = parseReference(`gchat:${payload.messageName}`);
+    const [spaces, , messages] = reference.segments;
+    return reference.segments.length === 4 && spaces === "spaces" && messages === "messages"
+      ? reference.key
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Inbox entries intentionally store lightweight pointers. The dashboard is the
+ * presentation boundary, so resolve a mesh-message pointer, a GitHub source
+ * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
+ * the event was about), or the Google Chat message a chat event carries, here
+ * and never leak an opaque id or an unlinked label into the UI payload.
+ * Every other payload keeps its raw JSON, which is the honest rendering until
+ * that has a resolver.
  */
 async function resolveInboxPage(
   page: InboxPage,
   deps: DashboardDataDeps,
   chatScope: HumanChatScope
 ): Promise<ResolvedInboxPage> {
+  // Same cache/resolver an obligation's cited artifacts use, so an external
+  // inbox entry gets the identical rich preview and "open in new tab" link
+  // rather than a second rendering path.
+  const resolve = (ref: string) =>
+    deps.referenceCache
+      ? deps.referenceCache
+          .get(ref, deps)
+          .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+      : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
@@ -570,15 +601,6 @@ async function resolveInboxPage(
         };
       }
       if (entry.source.startsWith("github:")) {
-        // Same cache/resolver an obligation's cited artifacts use, so a
-        // GitHub-sourced inbox entry gets the identical rich preview and
-        // "open in new tab" link rather than a second rendering path.
-        const resolve = (ref: string) =>
-          deps.referenceCache
-            ? deps.referenceCache
-                .get(ref, deps)
-                .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
-            : resolveReferenceSync(ref, { meshChat: deps.meshChat });
         // A comment or review is resolved alongside the issue/PR it arrived
         // through, so the card can show what was said and what it was said on.
         const eventRef = githubInboxEventReference(entry.source, entry.payload);
@@ -588,6 +610,8 @@ async function resolveInboxPage(
         ]);
         return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
       }
+      const chatMessage = gchatInboxMessageReference(entry.payload);
+      if (chatMessage) return { ...entry, reference: await resolve(chatMessage) };
       return entry;
     })
   );
