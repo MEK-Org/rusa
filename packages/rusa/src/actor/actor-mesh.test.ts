@@ -84,6 +84,21 @@ import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
 
+/**
+ * Test-only raw-row replacement. `patch` deliberately cannot alter model
+ * selection; these cases model what a repository read can surface after a
+ * class row changes or becomes invalid.
+ */
+function replaceRecord(
+  registry: InMemoryActorRepository,
+  id: string,
+  changes: Partial<ActorRecord>
+): void {
+  const record = registry.get(id);
+  if (!record) throw new Error(`actor record ${id} missing`);
+  registry.upsert({ ...record, ...changes });
+}
+
 function captureLogger(records: Array<Record<string, unknown>>): Logger {
   let logger!: Logger;
   const write = (level: string, event: string, fields: Record<string, unknown> = {}) => {
@@ -1184,6 +1199,224 @@ describe("ActorMesh", () => {
     mesh.sendMessage(classConfigured, "apply explicit pin", "root");
     await tick();
     expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
+  });
+
+  it("refuses to dispatch a class-bound actor whose class no longer resolves, reporting it once", async () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry, fake, tick } = setup({ events: (event) => events.push(event) });
+    const id = mesh.spawn({ charter: "do work", parentId: "root" });
+    // The shape the repository reads back once the class row is gone: the
+    // binding survives, the pool does not.
+    replaceRecord(registry, id, {
+      modelClass: "fast",
+      modelConfig: undefined,
+      modelClassError: 'unknown model class "fast" — no runtime model classes are defined',
+    });
+
+    mesh.sendMessage(id, "begin", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+
+    // A second wake reports the same reason again but does not re-journal it.
+    mesh.sendMessage(id, "begin again", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+    expect(events.filter((e) => e.kind === "actor_model_class_unresolved")).toEqual([
+      {
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: 'unknown model class "fast" — no runtime model classes are defined',
+      },
+    ]);
+
+    // Redefining the class heals the binding without touching the actor row.
+    replaceRecord(registry, id, {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      modelClassError: undefined,
+    });
+    mesh.sendMessage(id, "now run", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(1);
+  });
+
+  it("applies a staged repair before refusing an unresolved class binding", async () => {
+    const resolve = (input: SpawnRequest["modelConfig"]): ProviderModelConfig[] => {
+      if (isModelClassReference(input)) {
+        if (input.class === "healthy") return [{ provider: "codex", model: "gpt-healthy" }];
+        throw new Error(`unknown class ${input.class}`);
+      }
+      const concrete = assertConcreteModelConfig(input);
+      return (Array.isArray(concrete) ? concrete : [concrete]).map((entry) => ({
+        provider: entry.provider,
+        model: entry.model ?? "missing-model",
+        effort: entry.effort,
+      }));
+    };
+    const { mesh, registry, fake, tick } = setup({
+      validateModel: (_record, input) => resolve(input),
+    });
+    const classRepair = mesh.spawn({ charter: "class repair", parentId: "root" });
+    const explicitRepair = mesh.spawn({ charter: "explicit repair", parentId: "root" });
+    for (const id of [classRepair, explicitRepair]) {
+      replaceRecord(registry, id, {
+        modelClass: "deleted",
+        modelConfig: undefined,
+        modelClassError: 'unknown model class "deleted" — no runtime model classes are defined',
+      });
+    }
+
+    mesh.setActorModel(classRepair, { class: "healthy" }, "root");
+    mesh.setActorModel(explicitRepair, { provider: "codex", model: "gpt-pinned" }, "root");
+    mesh.sendMessage(classRepair, "repair class", "root");
+    mesh.sendMessage(explicitRepair, "repair pin", "root");
+    await tick();
+
+    expect(fake(classRepair).calls).toHaveLength(1);
+    expect(fake(explicitRepair).calls).toHaveLength(1);
+    expect(registry.get(classRepair)).toMatchObject({
+      modelClass: "healthy",
+      modelConfig: [{ provider: "codex", model: "gpt-healthy" }],
+    });
+    expect(registry.get(explicitRepair)).toMatchObject({
+      modelClass: undefined,
+      modelConfig: [{ provider: "codex", model: "gpt-pinned" }],
+    });
+  });
+
+  it("hands a class-bound actor its class's current definition at the dispatch boundary", async () => {
+    const applied: Array<{ id: string; pool: ProviderModelConfig[] }> = [];
+    const { mesh, registry, tick } = setup({
+      onModelSet: (id, pool) => applied.push({ id, pool: [...pool] }),
+    });
+    const classConfigured = mesh.spawn({ charter: "class-bound", parentId: "root" });
+    const explicit = mesh.spawn({ charter: "explicit", parentId: "root" });
+    replaceRecord(registry, classConfigured, {
+      modelClass: "fast",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+    });
+    replaceRecord(registry, explicit, {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+    });
+    applied.length = 0;
+
+    // A class edit reaches the record by read-through; the live actor still
+    // holds the pool it was constructed with until its next dispatch (#626).
+    replaceRecord(registry, classConfigured, {
+      modelConfig: [{ provider: "claude", model: "edited" }],
+    });
+    replaceRecord(registry, explicit, { modelConfig: [{ provider: "claude", model: "edited" }] });
+    mesh.sendMessage(classConfigured, "run", "root");
+    mesh.sendMessage(explicit, "run", "root");
+    await tick();
+
+    // Every publication is for the class-bound actor and carries the class's
+    // current definition; the explicit-pool actor is never published to. The
+    // count is deliberately not pinned: the refresh runs at each dispatch
+    // boundary and the assignment it makes is idempotent.
+    expect(applied.length).toBeGreaterThan(0);
+    expect(applied).toEqual(
+      applied.map(() => ({
+        id: classConfigured,
+        pool: [{ provider: "claude", model: "edited" }],
+      }))
+    );
+    // Nothing was staged, so no model-set event was journalled for the refresh.
+    expect(registry.get(classConfigured)?.desiredModelConfig).toBeUndefined();
+  });
+
+  it("launches the edited class tuple only on the run after an already-launched tuple", async () => {
+    const attempts: RawProviderModelConfig[] = [];
+    const completions: Array<() => void> = [];
+    let liveMesh!: ActorMesh;
+    const { mesh, registry, tick } = setup({
+      onModelSet: (id, pool) => liveMesh.get(id)?.setModelConfig?.(pool),
+      createActor: (ctx) => {
+        let actor!: Actor;
+        actor = new Actor({
+          id: ctx.record.id,
+          cwd: `/tmp/${ctx.record.id}`,
+          modelConfig: ctx.record.modelConfig ?? [{ provider: "codex", model: "initial" }],
+          resolveProvider: (selected) =>
+            new FakeProvider(
+              () => {
+                actor.declareYield();
+                return new Promise((resolve) =>
+                  completions.push(() => resolve({ success: true, output: "", exitCode: 0 }))
+                );
+              },
+              selected.provider,
+              selected.model,
+              selected.effort
+            ),
+          onProviderAttempt: (provider) =>
+            attempts.push({
+              provider: provider.providerName,
+              model: provider.model,
+              effort: provider.effort,
+            }),
+          mcpServers: [],
+          loadSessionId: () => ctx.getRecord()?.sessionId,
+          saveSessionId: (sessionId) => ctx.mesh.actors.patch(ctx.record.id, { sessionId }),
+          buildPrompt: () => ({ prompt: "Work from your inbox." }),
+          gate: ctx.gate,
+          beforeRun: ctx.beforeRun,
+          admitRun: ctx.admitRun,
+          lifecycle: ctx.lifecycle,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+          debounceMs: DEBOUNCE,
+        });
+        return actor;
+      },
+    });
+    liveMesh = mesh;
+    const id = mesh.spawn({ charter: "class-bound", parentId: "root" });
+    const oldTuple = { provider: "codex", model: "gpt-old", effort: "low" };
+    const editedTuple = { provider: "claude", model: "claude-edited", effort: "high" };
+    const initialRecord = registry.get(id);
+    if (!initialRecord) throw new Error("spawned actor record missing");
+    registry.upsert({ ...initialRecord, modelClass: "fast", modelConfig: [oldTuple] });
+    mesh.applyPendingModel(id);
+
+    mesh.sendMessage(id, "launch old class", "root");
+    await tick();
+    expect(attempts).toEqual([oldTuple]);
+
+    // The class edit appears on a fresh record read while the old provider
+    // attempt remains live. It must not rewrite that launched attempt.
+    const classBoundRecord = registry.get(id);
+    if (!classBoundRecord) throw new Error("class-bound actor record missing");
+    registry.upsert({ ...classBoundRecord, modelConfig: [editedTuple] });
+    expect(attempts).toEqual([oldTuple]);
+    completions.shift()?.();
+    await tick();
+
+    mesh.sendMessage(id, "launch edited class", "root");
+    await tick();
+    expect(attempts).toEqual([oldTuple, editedTuple]);
+    completions.shift()?.();
+    await tick();
+  });
+
+  it("keeps inspection of a class error separate from the refusal event", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry } = setup({ events: (event) => events.push(event) });
+    const id = mesh.spawn({ charter: "inspect broken class", parentId: "root" });
+    const record = registry.get(id);
+    if (!record) throw new Error("spawned actor record missing");
+    registry.upsert({
+      ...record,
+      modelClass: "missing",
+      modelConfig: undefined,
+      modelClassError: 'unknown model class "missing" — no runtime model classes are defined',
+    });
+
+    expect(mesh.modelClassError(id)).toMatch(/unknown model class/);
+    expect(events.filter((event) => event.kind === "actor_model_class_unresolved")).toEqual([]);
+    mesh.reportModelClassFailure(id);
+    expect(events).toContainEqual(
+      expect.objectContaining({ kind: "actor_model_class_unresolved", actorId: id })
+    );
   });
 
   it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {
@@ -4709,7 +4942,7 @@ describe("ActorMesh", () => {
       onModelSet: (actorId, modelConfig, record) =>
         modelSets.push({ actorId, newModel: modelConfig[0]?.model, record }),
     });
-    registry.patch("root", {
+    replaceRecord(registry, "root", {
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });

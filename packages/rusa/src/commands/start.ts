@@ -2404,15 +2404,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       refreshLiveActorMcp(actorId);
     },
     onModelSet: (actorId, newModelConfig) => {
-      try {
-        const liveActor = mesh.get(actorId);
-        if (liveActor && typeof liveActor.setModelConfig === "function") {
-          liveActor.setModelConfig(newModelConfig);
-        }
-      } catch (err) {
-        console.warn(
-          `[mesh] failed to update live modelConfig for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
-        );
+      const liveActor = mesh.get(actorId);
+      if (liveActor && typeof liveActor.setModelConfig === "function") {
+        // One idempotent assignment on the live actor: a class-bound actor is
+        // re-published at every dispatch boundary, so this adopts the class's
+        // current definition for the run about to start (#626).
+        liveActor.setModelConfig(newModelConfig);
       }
     },
     // Recreate the private working directory for the revived actor
@@ -2433,6 +2430,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // candidate before registering MCP servers so a resolution failure can't leave
       // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
       // to the root provider.
+      //
+      // A class-bound actor whose class is missing or invalid also arrives with no
+      // pool, but only at rehydration — a spawn validates its class first. The
+      // fallback below is a placeholder for an actor that will not run: the pre-run
+      // gate refuses it while the binding is broken, and the moment the class
+      // resolves again the dispatch boundary hands it the real pool (#626). Report
+      // it here so a restart surfaces the broken binding without waiting for a wake.
+      mesh.reportModelClassFailure(id);
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
           provider: rootActor.provider,

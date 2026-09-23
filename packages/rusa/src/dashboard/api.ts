@@ -266,6 +266,12 @@ interface ThreadDto {
   modelConfig: ProviderModelConfig[];
   /** Named class that produced the declared snapshot, if it was class-configured. */
   modelClass?: string;
+  /**
+   * Why {@link modelClass} could not be resolved, when it could not be. The
+   * pool is empty in that case rather than stale, so the panel has to say why
+   * instead of showing nothing.
+   */
+  modelClassError?: string;
   /** Pending full-pool replacement staged for the next run boundary, if any. */
   desiredModelConfig?: ProviderModelConfig[];
   /** Named class that produced the pending snapshot, if it was class-configured. */
@@ -1819,6 +1825,7 @@ export async function handleMeshApiRequest(
           desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
           modelConfig: r.modelConfig ?? [],
           ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
+          ...(r.modelClassError !== undefined ? { modelClassError: r.modelClassError } : {}),
           ...(r.desiredModelConfig !== undefined
             ? { desiredModelConfig: r.desiredModelConfig }
             : {}),

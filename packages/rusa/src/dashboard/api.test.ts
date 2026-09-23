@@ -1211,6 +1211,33 @@ describe("handleMeshApiRequest", () => {
     expect(Object.hasOwn(explicit, "modelClass")).toBe(false);
   });
 
+  it("GET /api/mesh/threads surfaces a class binding the runtime cannot resolve", async () => {
+    // The repository's read-through shape for a deleted class: the binding
+    // survives, the pool does not. The dashboard is where an operator finds
+    // out, so the reason must reach the payload rather than being flattened
+    // into "no model" (#626).
+    actors.upsert({
+      ...rec(UUID_A, "root", "active"),
+      modelClass: "fast",
+      modelClassError: 'unknown model class "fast" — runtime classes: careful',
+    });
+    actors.upsert({
+      ...rec(UUID_B, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+      modelClass: "careful",
+    });
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const broken = threads.find((t: { id: string }) => t.id === UUID_A);
+    const healthy = threads.find((t: { id: string }) => t.id === UUID_B);
+    expect(broken.modelClass).toBe("fast");
+    expect(broken.modelClassError).toBe('unknown model class "fast" — runtime classes: careful');
+    // No pool resolved, so the row publishes no model to run on.
+    expect(broken.model).toBeNull();
+    expect(Object.hasOwn(healthy, "modelClassError")).toBe(false);
+  });
+
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
     actors.upsert({
       ...rec(UUID_A, "root", "active"),

@@ -72,7 +72,10 @@ export class Repositories {
     // Constructed before the actor repository, which writes an actor's principal
     // in the same transaction as the actor row.
     this.principals = new PrincipalRepository(db);
-    this.actors = new SqliteActorRepository(db, this.principals);
+    // Constructed before the actor repository, which resolves a class-bound
+    // actor's pool from the live class row on every read.
+    this.modelClasses = new ModelClassRepository(db);
+    this.actors = new SqliteActorRepository(db, this.principals, this.modelClasses);
     this.capabilityGrants = new DbCapabilityGrantStore(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
     this.experimentEnrollments = new DbExperimentEnrollmentStore(db);
@@ -88,7 +91,6 @@ export class Repositories {
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
-    this.modelClasses = new ModelClassRepository(db);
     this.obligations = new ObligationRepository(db);
     this.obligations.setPrincipalKind((principalId) => this.principals.get(principalId)?.kind);
     this.portableContext = new DbPortableContextStore(db);

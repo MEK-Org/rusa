@@ -2,10 +2,19 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
-import type { ProviderModelConfig } from "../../providers/model-config.js";
-import type { ActorRepository } from "../../repositories/actor-repository.js";
+import {
+  lookupModelClassPool,
+  type ModelClassStore,
+  type ProviderModelConfig,
+} from "../../providers/model-config.js";
+import type {
+  ActorRecordPatch,
+  ActorRepository,
+  ModelSelectionChange,
+} from "../../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../../voice/voice-config.js";
+import { ModelClassRepository } from "./model-class-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
 
 type ActorRow = {
@@ -40,6 +49,12 @@ const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
 const MODEL_CONFIG_POOL_SCHEMA_VERSION = 2 as const;
 /** schemaVersion for a pool with declared model-class provenance. */
 const MODEL_CONFIG_CLASS_SCHEMA_VERSION = 3 as const;
+/**
+ * schemaVersion for a class-bound actor's reference-only document: the class
+ * name and nothing else (#626). v3 wrote the resolved pool beside the name,
+ * which is what let an actor disagree with its own class after an edit.
+ */
+const MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION = 4 as const;
 
 const legacyModelConfigSchema = z
   .object({
@@ -81,10 +96,21 @@ const modelConfigClassSchema = z
   })
   .strict();
 
-// v1 and v2 remain readable so existing records stay valid. New class-bearing
-// documents are v3; a v2 parser therefore never mistakes them for malformed
-// v2 records with an unrecognized member.
+const modelConfigClassReferenceSchema = z
+  .object({
+    schemaVersion: z.literal(MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION),
+    // Deliberately the whole document. There is no `entries` member to fall
+    // back to, which is what makes "the class row is authoritative" a fact
+    // about the data rather than a rule readers have to remember.
+    modelClass: z.string().min(1),
+  })
+  .strict();
+
+// v1, v2 and v3 all remain readable so existing records stay valid. Class-bound
+// documents are written as v4; a v3 record's copied pool remains encoded until
+// an explicit model-configuration change, and is ignored on every read.
 const modelConfigDocumentSchema = z.union([
+  modelConfigClassReferenceSchema,
   modelConfigClassSchema,
   modelConfigPoolSchema,
   legacyModelConfigSchema,
@@ -149,30 +175,77 @@ function parseDocument<T>(
   }
 }
 
-/** Builds the versioned model-config document, or null when the pool is unset/empty. */
+/**
+ * Builds the versioned model-config document, or null when the pool is
+ * unset/empty.
+ *
+ * A class-bound record persists its reference and nothing else, so there is no
+ * second copy of the class definition to go stale — and no resolved pool to
+ * write back, which matters because reads hand callers a pool resolved from the
+ * class row and an ordinary `patch` would otherwise persist it (#626).
+ *
+ * A row converts from v3 to v4 only when its model configuration is
+ * deliberately changed, never incidentally and never in a sweep. Incidental
+ * writes preserve the stored document through {@link keepStoredModelConfig}.
+ */
 function buildModelConfig(record: ActorRecord): string | null {
+  if (record.modelClass !== undefined) {
+    return JSON.stringify({
+      schemaVersion: MODEL_CONFIG_CLASS_REFERENCE_SCHEMA_VERSION,
+      modelClass: record.modelClass,
+    });
+  }
   if (!record.modelConfig || record.modelConfig.length === 0) return null;
   const entries = record.modelConfig.map((entry) => ({
     provider: entry.provider,
     model: entry.model,
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
-  return JSON.stringify(
-    record.modelClass === undefined
-      ? { schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries }
-      : {
-          schemaVersion: MODEL_CONFIG_CLASS_SCHEMA_VERSION,
-          entries,
-          modelClass: record.modelClass,
-        }
-  );
+  return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
+}
+
+/**
+ * The stored `model_config` text to keep verbatim on an incidental write, or
+ * undefined when the write must restate the document.
+ *
+ * An incidental write — a session id, a title, a parent change — carries a
+ * record whose `modelConfig` is a *read-time projection* of the class row, so
+ * restating the document on such a write would both discard the row's existing
+ * encoding and convert v3 rows to v4 as a side effect of unrelated traffic
+ * (#626). Keeping the stored text is what confines the v4 cut to deliberate
+ * model-configuration changes, which matters for rollback: an older binary
+ * cannot read a v4 document, so a row must not acquire one by accident.
+ *
+ * The class match protects generic record replacement: ordinary root adoption
+ * retains the existing binding, while a record deliberately re-bound to a
+ * different class falls through. Explicit model changes use
+ * `setModelSelection` and always restate independently of this predicate.
+ */
+function keepStoredModelConfig(record: ActorRecord, stored: string | null): string | undefined {
+  if (stored === null || record.modelClass === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const storedClass = (parsed as { modelClass?: unknown }).modelClass;
+  return storedClass === record.modelClass ? stored : undefined;
 }
 
 /**
  * Parses the `model_config` document. Versioned documents (v2 explicit pools,
- * v3 class-bearing records) are validated strictly; an invalid versioned
- * payload throws fail-closed so corrupted configuration is never silently
- * executed.
+ * v3 class-bearing records, v4 class references) are validated strictly; an
+ * invalid versioned payload throws fail-closed so corrupted configuration is
+ * never silently executed.
+ *
+ * A class-bound document resolves its pool from the class store here, on every
+ * read, which is what keeps a class-bound actor from disagreeing with its own
+ * class (#626). A v3 record's copied entries are deliberately ignored: the
+ * class row is the authority. The copy stays encoded until an explicit
+ * model-configuration change rewrites that actor, but never becomes a stale
+ * fallback. An unresolvable class yields `modelClassError` and no pool.
  *
  * For unversioned legacy documents predating #169: a single optional
  * provider/model/effort is migrated on read into a one-entry pool. A legacy
@@ -182,15 +255,19 @@ function buildModelConfig(record: ActorRecord): string | null {
  */
 function parseModelConfig(
   actorId: string,
-  json: string | null
-): Pick<ActorRecord, "modelConfig" | "modelClass"> {
+  json: string | null,
+  classes: ModelClassStore
+): Pick<ActorRecord, "modelConfig" | "modelClass" | "modelClassError"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "model_config", json, modelConfigDocumentSchema);
+  if ("modelClass" in parsed) {
+    const resolved = lookupModelClassPool(classes, parsed.modelClass);
+    return resolved.error !== undefined
+      ? { modelClass: parsed.modelClass, modelClassError: resolved.error }
+      : { modelClass: parsed.modelClass, modelConfig: resolved.modelConfig };
+  }
   if ("entries" in parsed) {
-    return {
-      modelConfig: parsed.entries,
-      ...("modelClass" in parsed ? { modelClass: parsed.modelClass } : {}),
-    };
+    return { modelConfig: parsed.entries };
   }
   if (parsed.provider !== undefined && parsed.model !== undefined) {
     return {
@@ -358,7 +435,14 @@ export class SqliteActorRepository implements ActorRepository {
 
   constructor(
     db: Database.Database,
-    private readonly principals: PrincipalRepository = new PrincipalRepository(db)
+    private readonly principals: PrincipalRepository = new PrincipalRepository(db),
+    /**
+     * Read surface for the runtime class definitions a class-bound actor's pool
+     * is resolved from on every read (#626). Defaulted from the same database
+     * so no construction site can accidentally leave an actor repository that
+     * cannot resolve the bindings it stores.
+     */
+    private readonly modelClasses: ModelClassStore = new ModelClassRepository(db)
   ) {
     this.db = db;
   }
@@ -367,7 +451,20 @@ export class SqliteActorRepository implements ActorRepository {
     this.write(record);
   }
 
-  private write(record: ActorRecord): void {
+  /**
+   * The one write allowed to restate an existing row's model-config document,
+   * per the {@link ActorRepository} contract. Everything else preserves the
+   * stored encoding.
+   */
+  setModelSelection(id: string, changes: ModelSelectionChange): void {
+    const record = this.get(id);
+    if (!record) {
+      throw new Error(`SqliteActorRepository: cannot set model selection on unknown actor '${id}'`);
+    }
+    this.write({ ...record, ...changes, id }, { restateModelConfig: true });
+  }
+
+  private write(record: ActorRecord, opts?: { restateModelConfig?: boolean }): void {
     const isRoot = record.isRoot === true;
     if (record.parentId === null && !isRoot) {
       throw new Error(
@@ -382,14 +479,18 @@ export class SqliteActorRepository implements ActorRepository {
     }
 
     this.db.transaction(() => {
+      // One read of the prior row serves both the retirement timestamp and the
+      // stored model-config document an incidental write must preserve.
+      const prior = this.db
+        .prepare("SELECT retired_at, model_config FROM actors WHERE id = ?")
+        .get(record.id) as { retired_at: string | null; model_config: string | null } | undefined;
       const retiredAt =
-        record.status === "active"
-          ? null
-          : ((
-              this.db.prepare("SELECT retired_at FROM actors WHERE id = ?").get(record.id) as
-                | { retired_at: string | null }
-                | undefined
-            )?.retired_at ?? new Date().toISOString());
+        record.status === "active" ? null : (prior?.retired_at ?? new Date().toISOString());
+      const modelConfigJson =
+        opts?.restateModelConfig === true
+          ? buildModelConfig(record)
+          : (keepStoredModelConfig(record, prior?.model_config ?? null) ??
+            buildModelConfig(record));
 
       this.db
         .prepare(`INSERT INTO actors (
@@ -403,7 +504,7 @@ export class SqliteActorRepository implements ActorRepository {
           record.id,
           record.charter,
           record.parentId,
-          buildModelConfig(record),
+          modelConfigJson,
           buildContextConfig(record),
           buildVoiceConfig(record),
           record.title ?? null,
@@ -470,7 +571,7 @@ export class SqliteActorRepository implements ActorRepository {
     ).map((row) => this.fromRow(row));
   }
 
-  patch(id: string, changes: Partial<Omit<ActorRecord, "id">>): void {
+  patch(id: string, changes: ActorRecordPatch): void {
     const record = this.get(id);
     if (record) this.upsert({ ...record, ...changes, id });
   }
@@ -504,7 +605,7 @@ export class SqliteActorRepository implements ActorRepository {
       parentId: row.parent_id,
       status: row.retired_at === null ? "active" : "retired",
       createdAt: row.created_at,
-      ...parseModelConfig(row.id, row.model_config),
+      ...parseModelConfig(row.id, row.model_config, this.modelClasses),
       ...parseContextConfig(row.id, row.context_config),
       ...parseVoiceConfig(row.id, row.voice_config),
       ...(row.title === null ? {} : { title: row.title }),

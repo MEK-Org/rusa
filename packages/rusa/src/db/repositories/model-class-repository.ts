@@ -82,8 +82,10 @@ function fromRow(row: ModelClassRow): ModelClass {
 /**
  * SQLite source of truth for model classes. Every lookup reads the committed
  * row directly: a successful `set_model_class` affects the next class
- * selection in this process without a mesh restart, while actor records retain
- * the concrete pool already resolved for them.
+ * selection in this process without a mesh restart, and a class-bound actor's
+ * pool with it — actor records hold a reference to the class, never a copy of
+ * its entries, so an edit here is the edit those actors see (#626). An
+ * explicitly declared pool is a durable snapshot and is unaffected.
  */
 export class ModelClassRepository {
   constructor(private readonly db: Database.Database) {}
@@ -107,6 +109,19 @@ export class ModelClassRepository {
         )
         .all() as ModelClassRow[]
     ).map(fromRow);
+  }
+
+  /**
+   * Names-only lookup for an unknown-class diagnostic. Unlike {@link list},
+   * this intentionally never decodes a sibling's definition: one corrupt
+   * class must not prevent another actor's broken reference from being shown.
+   */
+  names(): string[] {
+    return (
+      this.db.prepare("SELECT name FROM model_classes ORDER BY name ASC").all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
   }
 
   /** Full replacement, preserving ordered candidate semantics exactly as supplied. */

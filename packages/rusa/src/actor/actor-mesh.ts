@@ -828,6 +828,12 @@ export class ActorMesh {
     actorId: string,
     capability: string
   ) => Promise<void> | void;
+  /**
+   * The last unresolved-class reason reported per actor, so a permanently
+   * broken binding emits one event rather than one per dispatch attempt.
+   * Cleared when the class resolves again.
+   */
+  private readonly reportedModelClassFailures = new Map<string, string>();
   private readonly onModelSet?: (
     actorId: string,
     modelConfig: ProviderModelConfig[],
@@ -3976,6 +3982,8 @@ export class ActorMesh {
     });
     if (record) this.runRetireCleanups(record);
     this.lifecycles.delete(id);
+    // Per-actor model-class bookkeeping dies with the actor.
+    this.reportedModelClassFailures.delete(id);
     this.log(`retired ${id}`);
   }
 
@@ -4253,31 +4261,103 @@ export class ActorMesh {
    */
   applyPendingModel(id: string): void {
     const record = this.actors.get(id);
-    if (!record || record.desiredModelConfig === undefined) return;
+    if (!record) return;
+    if (record.desiredModelConfig === undefined) {
+      this.refreshClassBoundPool(id, record);
+      return;
+    }
 
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
+    const boundClass = record.desiredModelClass;
 
-    this.actors.patch(id, {
+    // The one deliberate model-configuration write: it restates the row's
+    // model-config document, which an ordinary `patch` deliberately does not
+    // (#626).
+    this.actors.setModelSelection(id, {
       modelConfig: newModelConfig,
-      modelClass: record.desiredModelClass,
+      modelClass: boundClass,
       desiredModelConfig: undefined,
       desiredModelClass: undefined,
     });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
-    if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
+    if (boundClass !== undefined) {
+      // A class binding persists the reference, not the pool the selection
+      // resolved to, so the pool is whatever the class says now — verify the
+      // binding landed and publish the live definition rather than a snapshot
+      // that a concurrent class edit may already have overtaken (#626).
+      if (verified.modelClass !== boundClass) {
+        throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
+      }
+      if (!verified.modelConfig) {
+        throw new Error(
+          `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
+        );
+      }
+    } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
 
-    this.onModelSet?.(id, newModelConfig, verified);
+    const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+    // Publish before journalling. The durable `actor_model_set` event below is
+    // the record that this pool reached the actor, so a publication that threw
+    // must not leave that claim behind.
+    this.onModelSet?.(id, appliedModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(newModelConfig)}`,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
     });
+  }
+
+  /**
+   * Hand a class-bound actor's current class definition to the live actor
+   * object at its dispatch boundary.
+   *
+   * The record already reads through to the class row, so nothing durable
+   * changes here — but a running actor caches the pool it was constructed
+   * with, and without this refresh an edit made after construction would not
+   * reach the actor's next run (#626). An unresolvable class is left to the
+   * pre-run gate, which refuses the run outright.
+   */
+  private refreshClassBoundPool(id: string, record: ActorRecord): void {
+    if (record.modelClass === undefined || !record.modelConfig) return;
+    if (!this.runs.liveActor(id)?.setModelConfig) return;
+    // Unconditional: the publication is one idempotent field assignment on the
+    // live actor, so republishing an unchanged pool costs less than the
+    // bookkeeping that would skip it, and every dispatch boundary re-asserts
+    // the class's current definition.
+    this.onModelSet?.(id, record.modelConfig, record);
+  }
+
+  /**
+   * Pure read of why a class-bound actor cannot be scheduled. Querying this
+   * never emits an event, so dashboard and diagnostic callers can inspect the
+   * record without changing its timeline.
+   */
+  modelClassError(id: string): string | undefined {
+    return this.actors.get(id)?.modelClassError;
+  }
+
+  /** Record a coalesced visible failure at a boot or dispatch refusal site. */
+  reportModelClassFailure(id: string, reason = this.modelClassError(id)): void {
+    if (reason === undefined) return;
+    if (this.reportedModelClassFailures.get(id) !== reason) {
+      this.reportedModelClassFailures.set(id, reason);
+      this.recordEvent({
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: reason,
+      });
+    }
+  }
+
+  /** Forget a prior visible failure after the class resolves again. */
+  clearModelClassFailure(id: string): void {
+    if (this.reportedModelClassFailures.has(id)) this.reportedModelClassFailures.delete(id);
   }
 
   /**
@@ -4514,6 +4594,15 @@ export class ActorMesh {
       return false;
     }
     this.applyPendingModel(id);
+    // A staged rebind or explicit pin is the supported repair path for a
+    // broken current class. Apply it before inspecting the current binding so
+    // an idle actor can repair itself on its next dispatch (#626).
+    const modelClassError = this.modelClassError(id);
+    if (modelClassError !== undefined) {
+      this.reportModelClassFailure(id, modelClassError);
+      return false;
+    }
+    this.clearModelClassFailure(id);
     return true;
   }
 

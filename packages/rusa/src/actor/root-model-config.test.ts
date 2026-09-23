@@ -59,6 +59,32 @@ describe("resolveRootBootModelConfig", () => {
     expect(preflighted).toEqual(pool);
   });
 
+  it("refuses a class-bound root whose class cannot be resolved instead of seeding from the file", () => {
+    // What the repository hands back for a deleted/empty/invalid class: the
+    // binding is intact, the pool is gone. Seeding from `bootstrap` here would
+    // boot root on a tuple nobody selected (#626).
+    const actors = repositoryWith(
+      rootRecord({ modelClass: "frontier", modelClassError: 'unknown model class "frontier"' })
+    );
+    const preflighted: ProviderModelConfig[] = [];
+
+    const call = () =>
+      resolveRootBootModelConfig({
+        config: bothProviders,
+        actors,
+        rootId: "root",
+        bootstrap,
+        portable: true,
+        preflight: (entry) => preflighted.push(entry),
+      });
+
+    expect(call).toThrow(RootModelConfigStartupError);
+    expect(call).toThrow(
+      /bound to model class "frontier", which cannot be resolved: unknown model class "frontier"/
+    );
+    expect(preflighted).toEqual([]);
+  });
+
   it("seeds from the configured tuple when the record has no persisted pool", () => {
     const actors = repositoryWith(rootRecord());
 

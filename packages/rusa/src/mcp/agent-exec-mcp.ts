@@ -975,7 +975,7 @@ export function createAgentExecMcpServer(
         {
           title: "Create or replace a runtime model class (model-admin)",
           description:
-            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Requires the model-admin capability.",
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Actors bound to this class by reference follow the new definition: dashboard and API reads show it at once, and each actor picks it up on its next run, while an already-launched run keeps the tuple it started on. Actors holding an explicit concrete pool are unaffected. A class definition cannot reference another class. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
             model_config: concreteModelConfigSchema.describe(
@@ -1009,7 +1009,7 @@ export function createAgentExecMcpServer(
         {
           title: "Delete a runtime model class (model-admin)",
           description:
-            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Requires the model-admin capability.",
+            "Delete a model class from mesh.db. Future class references to it fail as unknown, and any actor still bound to this class by reference stops resolving a pool at all: it is refused at its next dispatch, and a class-bound root refuses to boot. Rebind those actors (set_actor_model with an explicit pool or another class) before deleting. Actors holding an explicit concrete pool are unaffected. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact class name to delete."),
           },

@@ -65,7 +65,8 @@ export type ModelConfigInput = ConcreteModelConfigInput | ModelClassReference;
  */
 export interface ModelClassStore {
   get(name: string): { modelConfig: ProviderModelConfig[] } | undefined;
-  list(): Array<{ name: string }>;
+  /** Lists names without decoding class definitions. */
+  names(): string[];
 }
 
 export function isModelClassReference(input: unknown): input is ModelClassReference {
@@ -89,14 +90,77 @@ export function assertConcreteModelConfig(input: ModelConfigInput): ConcreteMode
 }
 
 /**
+ * The outcome of looking one model class up in the runtime store: its current
+ * ordered pool, or the reason it could not be resolved.
+ */
+export type ModelClassLookup =
+  | { modelConfig: ProviderModelConfig[]; error?: undefined }
+  | { modelConfig?: undefined; error: string };
+
+/**
+ * Look a model class name up in the runtime store without throwing — the same
+ * checks and the same wording as {@link resolveModelClasses}, returned instead
+ * of raised.
+ *
+ * Read paths need this shape. A class-bound actor resolves its pool on every
+ * record read (#626), and one deleted class must surface as that actor's own
+ * visible failure rather than an exception that takes the whole actor listing
+ * down with it. The throwing resolver, used at the ingress boundaries where a
+ * bad reference should refuse the request outright, is written in terms of it
+ * so the two can never drift apart.
+ */
+export function lookupModelClassPool(
+  classes: ModelClassStore,
+  name: string | undefined
+): ModelClassLookup {
+  if (!name?.trim()) {
+    return { error: "model class reference is missing a class name" };
+  }
+  if (name.trim() !== name) {
+    return { error: "model class reference must not have leading or trailing whitespace" };
+  }
+  let defined: { modelConfig: ProviderModelConfig[] } | undefined;
+  try {
+    defined = classes.get(name);
+  } catch {
+    // A corrupt definition must fail only the actor bound to it. In particular,
+    // a read-time class lookup cannot turn one bad row into a failed actor list.
+    return { error: `model class "${name}" is invalid or unreadable` };
+  }
+  if (!defined) {
+    let known: string[];
+    try {
+      known = classes.names().sort();
+    } catch {
+      return { error: `model class "${name}" could not be looked up` };
+    }
+    return {
+      error:
+        known.length > 0
+          ? `unknown model class "${name}" — runtime classes: ${known.join(", ")}`
+          : `unknown model class "${name}" — no runtime model classes are defined`,
+    };
+  }
+  if (defined.modelConfig.length === 0) {
+    return {
+      error: `model class "${name}" is empty — a class must declare at least one provider/model entry`,
+    };
+  }
+  return { modelConfig: defined.modelConfig.map((entry) => ({ ...entry })) };
+}
+
+/**
  * Resolve a named model class reference into the concrete pool committed in the
  * runtime store, and pass concrete input through untouched (by identity, so no
- * path is silently renormalized). This is the single resolution boundary: each
- * ingress resolves once, up front, and everything downstream sees only tuples.
+ * path is silently renormalized). This is the single resolution boundary for
+ * *ingress*: a spawn or `set_actor_model` resolves once, up front, so the
+ * request is validated against real tuples and refused outright if the class is
+ * unusable.
  *
- * The returned pool is a copy taken at resolution time — that copy is what gets
- * validated and persisted, so a later runtime edit changes only what *new*
- * selections resolve to.
+ * The returned pool is a copy taken at resolution time. For a class-bound
+ * actor that copy is validated and then discarded rather than persisted: the
+ * class row stays the one authority, and the actor's record re-resolves it on
+ * every read (#626).
  */
 export function resolveModelClasses(
   classes: ModelClassStore,
@@ -114,31 +178,9 @@ export function resolveModelClasses(
     }
     return input;
   }
-  const name = input.class?.trim();
-  if (!name) {
-    throw new Error("model class reference is missing a class name");
-  }
-  if (name !== input.class) {
-    throw new Error("model class reference must not have leading or trailing whitespace");
-  }
-  const defined = classes.get(name);
-  if (!defined) {
-    const known = classes
-      .list()
-      .map((entry) => entry.name)
-      .sort();
-    throw new Error(
-      known.length > 0
-        ? `unknown model class "${name}" — runtime classes: ${known.join(", ")}`
-        : `unknown model class "${name}" — no runtime model classes are defined`
-    );
-  }
-  if (defined.modelConfig.length === 0) {
-    throw new Error(
-      `model class "${name}" is empty — a class must declare at least one provider/model entry`
-    );
-  }
-  return defined.modelConfig.map((entry) => ({ ...entry }));
+  const found = lookupModelClassPool(classes, input.class);
+  if (found.error !== undefined) throw new Error(found.error);
+  return found.modelConfig;
 }
 
 /**

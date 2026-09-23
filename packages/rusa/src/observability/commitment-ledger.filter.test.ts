@@ -45,6 +45,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   actor_reparented: 0,
   actor_charter_set: 0,
   actor_model_set: 0,
+  actor_model_class_unresolved: 0,
   run_queued: 0,
   run_selected: 0,
   run_start: 0,
