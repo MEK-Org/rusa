@@ -41,6 +41,11 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
     // unrelated host `system.disk` alert woke it mid-run. Slack is the branch
     // that shows the fix end to end, because Slack raises no host alarms of its
     // own — the explicitly requested source survives and the host one is gone.
+    // There is deliberately no chat twin of this case: chat configures a second
+    // `system:events` producer (#578's lapse alert), so a generated chat root
+    // keeps the subscription and cannot show the drop. The rule that it must
+    // keep it is already pinned below, on a config built by hand so the failure
+    // localizes to start.ts rather than to the E2E generator.
     const config = buildE2EConfig({
       scratchPath: "/tmp/rusa-e2e-scratch",
       slack: { appTokenPath: "/dev/null", botTokenPath: "/dev/null" },
@@ -50,23 +55,6 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
     const sources = configuredRootEventSources(config);
     expect(sources).toContain("slack:channels");
     expect(sources).not.toContain("system:events");
-  });
-
-  it("keeps the E2E chat source and the lapse alert's own system:events cover", () => {
-    // Chat is the deliberate contrast. `hostAlarmProducerActive` stays true for
-    // a chat-configured root because the subscription keeper's lapse alert
-    // (#578) is a second `system:events` producer, so silencing the disk sensor
-    // must not take that subscription away.
-    const config = buildE2EConfig({
-      scratchPath: "/tmp/rusa-e2e-scratch",
-      chat: { projectId: "e2e", subscription: "e2e", pubsubKeyPath: "/dev/null" },
-    });
-
-    expect(config.observability?.diskAlert).toEqual({ enabled: false });
-    const sources = configuredRootEventSources(config);
-    expect(sources).toContain("gchat:spaces");
-    expect(sources).toContain("system:events");
-    expect(diskAlertUncovered(config, sources)).toBe(false);
   });
 
   it("covers system:events when no observability block is configured at all", () => {
