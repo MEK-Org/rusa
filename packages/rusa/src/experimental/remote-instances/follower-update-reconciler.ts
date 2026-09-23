@@ -29,8 +29,8 @@ export interface FollowerUpdateReconcilerOptions {
 }
 
 export interface ReconciliationStatus {
-  /** "none" = no trigger was ever written; "active" = outstanding; "completed" = closed out. */
-  state: "none" | "active" | "completed";
+  /** "none" = no trigger is present; "active" = outstanding. */
+  state: "none" | "active";
   activeTrigger: FollowerUpdateTrigger | null;
   /** Every follower currently connected is on the target. Says nothing about offline ones. */
   allConnectedCurrent: boolean;
@@ -81,17 +81,16 @@ export class FollowerUpdateReconciler {
   /**
    * Reconciliation state for operators.
    *
-   * `state` distinguishes the three situations that a single `completed` boolean used to
-   * collapse: no trigger was ever written, a trigger is still outstanding, or one was
-   * explicitly closed out. `allConnectedCurrent` is an observation about the followers the
-   * leader can currently see — it is deliberately not a claim about every enrolled
-   * follower, because the leader has no durable roster.
+   * `state` distinguishes whether an active trigger is present ("active") or not ("none").
+   * `allConnectedCurrent` is an observation about the followers the leader can currently
+   * see — it is deliberately not a claim about every enrolled follower, because the leader
+   * has no durable roster.
    */
   getStatus(): ReconciliationStatus {
     const trigger = this.store.getActiveTrigger();
     if (!trigger) {
       return {
-        state: this.store.load() ? "completed" : "none",
+        state: "none",
         activeTrigger: null,
         allConnectedCurrent: false,
         armed: this.armed,

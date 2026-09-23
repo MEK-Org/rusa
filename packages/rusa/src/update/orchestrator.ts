@@ -95,10 +95,6 @@ export interface UpdateDeps {
   /** Injected `process.exit` seam so tests assert the exit without dying. */
   exit: (code: number) => void;
   /**
-   * Hook invoked immediately after a green build is confirmed, before draining
-   * and restarting (e.g. to persist a follower update trigger across the restart).
-   */
-  /**
    * Fires after the update is committed and drained, immediately before the restart exit.
    *
    * Deliberately not at build-green: a failure in a later step rolls the checkout back to

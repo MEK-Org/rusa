@@ -82,7 +82,6 @@ describe("FollowerUpdateTriggerStore", () => {
     // The trigger stays active: the leader keeps no enrollment roster, so "every follower
     // we can see is current" cannot establish that every enrolled follower is.
     expect(store.getActiveTrigger()).not.toBeNull();
-    expect(store.load()?.completedAt).toBeUndefined();
   });
 
   it("does not report all-current while any named follower still lags", () => {
@@ -93,14 +92,37 @@ describe("FollowerUpdateTriggerStore", () => {
     expect(store.allCurrent(["f1", "f2"])).toBe(false);
   });
 
-  it("markCompleted still retires a trigger when something explicitly closes it out", () => {
-    const sha = "c2".repeat(20);
-    store.createTrigger({ targetSha: sha, branch: "staging" });
+  it("rejects a document whose targetSha or branch is not operationally valid", () => {
+    const base = {
+      version: FOLLOWER_UPDATE_TRIGGER_VERSION,
+      triggerId: "t1",
+      createdAt: new Date().toISOString(),
+      attempts: {},
+    };
 
-    store.markCompleted();
+    // Short or non-hex targetSha
+    writeFileSync(
+      storePath,
+      JSON.stringify({ ...base, targetSha: "abc", branch: "staging" }),
+      "utf-8"
+    );
+    const shortShaResult = store.read();
+    expect(shortShaResult.kind).toBe("invalid");
+    expect(shortShaResult.kind === "invalid" && shortShaResult.reason).toContain(
+      "invalid 'targetSha'"
+    );
 
-    expect(store.getActiveTrigger()).toBeNull();
-    expect(store.load()?.completedAt).toBeDefined();
+    // Unsafe branch name (e.g. flag-like, traversal, or invalid characters)
+    writeFileSync(
+      storePath,
+      JSON.stringify({ ...base, targetSha: "a".repeat(40), branch: "-bad-branch" }),
+      "utf-8"
+    );
+    const badBranchResult = store.read();
+    expect(badBranchResult.kind).toBe("invalid");
+    expect(badBranchResult.kind === "invalid" && badBranchResult.reason).toContain(
+      "invalid 'branch'"
+    );
   });
 
   it("supersedes an outstanding trigger when a newer leader update writes one", () => {

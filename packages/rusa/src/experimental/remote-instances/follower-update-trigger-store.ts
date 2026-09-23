@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 
 /**
  * Schema version of the on-disk trigger document.
@@ -26,7 +27,6 @@ export interface FollowerUpdateTrigger {
   branch: string;
   createdAt: string;
   attempts: Record<string, FollowerUpdateAttempt>;
-  completedAt?: string;
 }
 
 export interface CreateTriggerOptions {
@@ -49,7 +49,7 @@ function isAttempt(value: unknown): value is FollowerUpdateAttempt {
   if (!value || typeof value !== "object") return false;
   const a = value as Record<string, unknown>;
   if (typeof a.status !== "string" || !ATTEMPT_STATUSES.has(a.status)) return false;
-  if (typeof a.targetSha !== "string" || a.targetSha.length === 0) return false;
+  if (typeof a.targetSha !== "string" || !isFullCommitSha(a.targetSha)) return false;
   if (typeof a.lastAttemptAt !== "string") return false;
   if (a.error !== undefined && typeof a.error !== "string") return false;
   return true;
@@ -72,8 +72,17 @@ function validate(parsed: unknown): TriggerLoadResult {
       return { kind: "invalid", reason: `missing or invalid '${field}'` };
     }
   }
-  if (t.completedAt !== undefined && typeof t.completedAt !== "string") {
-    return { kind: "invalid", reason: "invalid 'completedAt'" };
+  if (!isFullCommitSha(t.targetSha as string)) {
+    return {
+      kind: "invalid",
+      reason: `invalid 'targetSha': '${String(t.targetSha)}' is not a full commit SHA`,
+    };
+  }
+  if (!isSafeFollowerBranch(t.branch as string)) {
+    return {
+      kind: "invalid",
+      reason: `invalid 'branch': '${String(t.branch)}' is not a safe branch name`,
+    };
   }
   if (!t.attempts || typeof t.attempts !== "object" || Array.isArray(t.attempts)) {
     return { kind: "invalid", reason: "missing or invalid 'attempts'" };
@@ -160,11 +169,7 @@ export class FollowerUpdateTriggerStore {
   }
 
   getActiveTrigger(): FollowerUpdateTrigger | null {
-    const trigger = this.load();
-    if (!trigger || trigger.completedAt) {
-      return null;
-    }
-    return trigger;
+    return this.load();
   }
 
   recordAttempt(followerId: string, attempt: FollowerUpdateAttempt): FollowerUpdateTrigger | null {
@@ -210,14 +215,6 @@ export class FollowerUpdateTriggerStore {
     return attempt?.status === "success" && attempt?.targetSha === targetSha;
   }
 
-  markCompleted(): FollowerUpdateTrigger | null {
-    const trigger = this.getActiveTrigger();
-    if (!trigger) return null;
-    trigger.completedAt = new Date().toISOString();
-    this.save(trigger);
-    return trigger;
-  }
-
   /**
    * Whether every follower in `followerIds` has reached the trigger's target.
    *
@@ -236,15 +233,5 @@ export class FollowerUpdateTriggerStore {
       const attempt = trigger.attempts[id];
       return attempt?.status === "success" && attempt?.targetSha === trigger.targetSha;
     });
-  }
-
-  clear(): void {
-    if (existsSync(this.filePath)) {
-      try {
-        rmSync(this.filePath, { force: true });
-      } catch {
-        /* best-effort */
-      }
-    }
   }
 }

@@ -180,7 +180,6 @@ describe("FollowerUpdateReconciler", () => {
 
     expect(store.hasSucceeded("f1", targetSha)).toBe(true);
     expect(store.getActiveTrigger()).not.toBeNull();
-    expect(store.load()?.completedAt).toBeUndefined();
 
     // f2 reconnects an hour later and still gets caught up.
     registerCallback?.({ id: "f2", commitSha: "old".repeat(10) });
@@ -202,16 +201,13 @@ describe("FollowerUpdateReconciler", () => {
     expect(status.activeTrigger?.targetSha).toBe(targetSha);
   });
 
-  it("distinguishes never-triggered from an explicitly closed-out trigger", () => {
+  it("distinguishes absent from active trigger", () => {
     const reconciler = new FollowerUpdateReconciler(store, mockHub);
     reconciler.arm();
     expect(reconciler.getStatus().state).toBe("none");
 
     store.createTrigger({ targetSha: "f1".repeat(20), branch: "staging" });
     expect(reconciler.getStatus().state).toBe("active");
-
-    store.markCompleted();
-    expect(reconciler.getStatus().state).toBe("completed");
   });
 
   it("dispatches nothing until armed, then reconciles whoever connected meanwhile", () => {
