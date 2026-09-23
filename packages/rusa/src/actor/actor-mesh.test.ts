@@ -976,6 +976,9 @@ describe("ActorMesh", () => {
       countUnhandled: (actorId: string) => (actorId === "t1" ? 1 : 0),
       list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
       markSeen: () => [],
+      // Partial fake: it never notifies, so the only wake here is whatever the
+      // mesh path under test sends itself.
+      onItemsAppended: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -992,6 +995,102 @@ describe("ActorMesh", () => {
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
     expect(logs).toContain("dispatch(not-live) refused — no live actor");
+  });
+
+  it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "durable work", parentId: "root" });
+    await tick();
+    expect(fake(id).calls).toHaveLength(0); // spawn is not a message
+
+    // The row is committed straight to the store with no mesh call after it,
+    // which is what an appending path that forgot to nudge looks like from
+    // here. Scheduling has to follow from the commit, not from the caller
+    // remembering (#388).
+    inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
+    await tick();
+
+    expect(fake(id).calls).toHaveLength(1);
+    expect(fake(id).calls[0]?.prompt).toContain("Work from your inbox");
+  });
+
+  it("pokes a recipient once per append, and not at all for rows it did not insert", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { logs, tick } = setup({ inboxStore });
+    // A recipient with no live actor makes every poke individually visible in
+    // the journal, which is what counting them one per actor per batch needs.
+    const pokes = (): number =>
+      logs.filter((line) => line === "dispatch(absent) refused — no live actor").length;
+
+    inboxStore.append([
+      { id: "e1", actorId: "absent", source: "mesh:a", payload: payload("mesh.message") },
+      { id: "e2", actorId: "absent", source: "mesh:b", payload: payload("mesh.message") },
+      { id: "e3", actorId: "absent", source: "mesh:c", payload: payload("mesh.message") },
+    ]);
+    await tick();
+    expect(pokes()).toBe(1);
+
+    // Redelivering known ids inserts nothing, so it is not work arriving and
+    // must wake nobody — the store reports only rows it actually committed.
+    inboxStore.append([
+      { id: "e1", actorId: "absent", source: "mesh:a", payload: payload("mesh.message") },
+    ]);
+    await tick();
+    expect(pokes()).toBe(1);
+  });
+
+  it("leaves a wake the appending path already sent alone, rather than sending a second", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, logs, tick } = setup({ inboxStore });
+    const pokes = (): number =>
+      logs.filter((line) => line === "dispatch(absent) refused — no live actor").length;
+
+    // The shape every appending path in the mesh has: commit, then wake the
+    // recipient itself. The debt the commit created is settled by that wake,
+    // so the seam has nothing left to pay.
+    inboxStore.append([{ actorId: "absent", source: "mesh:a", payload: payload("mesh.message") }]);
+    mesh.dispatch("absent");
+    await tick();
+    expect(pokes()).toBe(1);
+
+    // The same rule seen from a live actor: one delivery is one run, not the
+    // run the caller admitted plus a second the seam cancels it for.
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    mesh.sendMessage(worker, "one message", "root");
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+  });
+
+  it("settles a root-alias append debt when the appender wakes the concrete root", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const rootId = "root-3f1a";
+    const { mesh, logs, tick } = setup({ inboxStore, rootId });
+    const pokes = (): number =>
+      logs.filter((line) => line === `dispatch(${rootId}) is a no-op — no durable work`).length;
+
+    // The legacy alias and concrete id share one debt even though the current
+    // production writers normalize before appending. This only characterizes
+    // the seam's suppression key; the inbox's durable lookup remains concrete.
+    inboxStore.append([{ actorId: "root", source: "mesh:a", payload: payload("mesh.message") }]);
+    mesh.dispatch(rootId);
+    await tick();
+
+    expect(pokes()).toBe(1);
+  });
+
+  it("unsubscribes durable-append scheduling when a mesh is shut down", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const first = setup({ inboxStore });
+    first.mesh.shutdownAll();
+    const second = setup({ inboxStore });
+    const worker = second.mesh.spawn({ charter: "replacement worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    await second.tick();
+
+    expect(second.fake(worker).calls).toHaveLength(1);
+    expect(first.logs).not.toContain(`dispatch(${worker}) refused — no live actor`);
   });
 
   it("re-derives a remote reattach dispatch from the durable inbox (#568)", () => {
@@ -1874,6 +1973,7 @@ describe("ActorMesh", () => {
     expect(
       mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
     ).toBe(true);
+    await Promise.resolve(); // flush the durable-append drain after the join wake
     expect(firstSignal?.aborted).toBe(false);
     expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
     expect(fake(worker).calls).toHaveLength(1);
@@ -7495,6 +7595,9 @@ describe("ActorMesh", () => {
             (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
           ).length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -7582,6 +7685,9 @@ describe("ActorMesh", () => {
         append: () => {
           throw new Error("disk full");
         },
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -7620,6 +7726,9 @@ describe("ActorMesh", () => {
         countUnhandled: () => appended.length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
         markSeen: () => [],
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
@@ -8267,6 +8376,7 @@ describe("ActorMesh", () => {
         await t.startRun(watcher);
 
         await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
