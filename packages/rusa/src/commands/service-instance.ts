@@ -40,7 +40,7 @@ function resolveCurrentPackageDir(): string | null {
   }
 }
 
-function resolveServiceBasename(environment: ServiceEnvironment): string {
+export function resolveServiceBasename(environment: ServiceEnvironment): string {
   return environment === "production" ? "rusa" : "rusa-staging";
 }
 
@@ -234,19 +234,47 @@ function lastAssignment(assignments: readonly string[], name: string): string | 
  * so a provider-capable `PATH` that lives in a drop-in — an established
  * operator mechanism here — would be missed entirely.
  *
- * Returns null when systemd cannot answer (no user manager, or the unit is not
- * loaded), which is why `readUnitPathEnv` remains as a fallback.
+ * Returns null when systemd cannot answer (no user manager) and equally when
+ * it answers that the unit assigns no `PATH`, which is why `readUnitPathEnv`
+ * remains as a fallback. {@link probeSystemdUnitPathEnv} keeps those two apart
+ * for callers that have to report which one they are looking at.
  */
 export function readSystemdUnitPathEnv(unitName: string): string | null {
+  return probeSystemdUnitPathEnv(unitName).path;
+}
+
+/** What systemd said about a unit's `PATH`, including whether it said anything. */
+export interface SystemdUnitPathProbe {
+  /**
+   * False only when the user manager could not be asked at all — no session
+   * bus, no user manager. `systemctl show` answers for a unit it has never
+   * heard of (exit 0, empty value), so a failure here is about the manager and
+   * never about the unit.
+   */
+  answered: boolean;
+  /** The assigned `PATH`, or null when the unit assigns none — or nobody answered. */
+  path: string | null;
+}
+
+/**
+ * {@link readSystemdUnitPathEnv}, keeping the distinction it throws away.
+ *
+ * "Systemd reports no PATH for this unit" and "systemd could not be asked" are
+ * the same `null` to a caller that only wants a `PATH`, and different answers
+ * to one that has to report what it knows: the first means the unit is not
+ * assigning a PATH, the second means nothing about the unit has been
+ * established at all.
+ */
+export function probeSystemdUnitPathEnv(unitName: string): SystemdUnitPathProbe {
   try {
     const raw = execFileSync(
       "systemctl",
       ["--user", "show", "-p", "Environment", "--value", unitName],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }
     );
-    return lastAssignment(splitEnvironmentAssignments(raw), "PATH");
+    return { answered: true, path: lastAssignment(splitEnvironmentAssignments(raw), "PATH") };
   } catch {
-    return null;
+    return { answered: false, path: null };
   }
 }
 

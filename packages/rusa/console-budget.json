@@ -5,6 +5,7 @@
     "src/commands/config-docs.ts",
     "src/commands/db-check.ts",
     "src/commands/dev.ts",
+    "src/commands/doctor.ts",
     "src/commands/e2e-actor-mesh.ts",
     "src/commands/e2e-hydrate.ts",
     "src/commands/init.ts",

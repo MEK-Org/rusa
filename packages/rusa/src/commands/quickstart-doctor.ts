@@ -1,17 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statfsSync } from "node:fs";
 import { createServer } from "node:net";
-import { homedir, arch as osArch } from "node:os";
+import { arch as osArch } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "../config/loader.js";
-import { configuredProviderCommands, quotaCoordinatorUnitNames } from "./install-service.js";
-import {
-  readSystemdUnitPathEnv,
-  readUnitPathEnv,
-  resolveExecutableOnPath,
-  type ServiceEnvironment,
-} from "./service-instance.js";
 
 export type DoctorStatus = "pass" | "fail" | "warn" | "info";
 
@@ -39,10 +31,6 @@ export interface QuickstartDoctorDeps {
   fileExists: (path: string) => boolean;
   freeBytes: (path: string) => number;
   isPortAvailable: (port: number) => Promise<boolean>;
-  readSystemdUnitPath?: (unitName: string) => string | null;
-  readUnitFile?: (unitName: string) => string | null;
-  resolveExecutable?: (command: string, pathEnv: string) => string | null;
-  systemdUserDir?: string;
 }
 
 export interface QuickstartDoctorOptions {
@@ -52,9 +40,6 @@ export interface QuickstartDoctorOptions {
   minFreeDiskBytes?: number;
   ports?: number[];
   providerEnvKeys?: string[];
-  environment?: ServiceEnvironment;
-  systemdUserDir?: string;
-  providerCommands?: readonly string[];
   deps?: Partial<QuickstartDoctorDeps>;
 }
 
@@ -93,7 +78,6 @@ export const QUICKSTART_DOCTOR_CHECKS = [
   "free-disk",
   "loopback-ports",
   "provider-env-keys",
-  "coordinator-path-drift",
 ] as const;
 
 function buildQuickstartDoctorChecks(opts: {
@@ -104,9 +88,6 @@ function buildQuickstartDoctorChecks(opts: {
   minFreeDiskBytes: number;
   ports: number[];
   providerEnvKeys: readonly string[];
-  environment?: ServiceEnvironment;
-  systemdUserDir?: string;
-  providerCommands?: readonly string[];
 }): QuickstartDoctorCheck[] {
   const gitCheck = checkCommand("git", "git", ["--version"], REMEDIATION.git);
   const pnpmCheck = checkCommand("pnpm", "pnpm", ["--version"], REMEDIATION.pnpm);
@@ -127,16 +108,6 @@ function buildQuickstartDoctorChecks(opts: {
     {
       id: "provider-env-keys",
       run: () => checkProviderEnvKeys(opts.deps.env, opts.providerEnvKeys),
-    },
-    {
-      id: "coordinator-path-drift",
-      run: () =>
-        checkCoordinatorPathDrift(opts.deps, {
-          environment: opts.environment,
-          systemdUserDir: opts.systemdUserDir,
-          providerCommands: opts.providerCommands,
-          targetPath: opts.targetPath,
-        }),
     },
   ];
 }
@@ -239,13 +210,6 @@ function buildDeps(overrides: Partial<QuickstartDoctorDeps> = {}): QuickstartDoc
       return Number(stats.bavail) * Number(stats.bsize);
     },
     isPortAvailable: defaultIsPortAvailable,
-    readSystemdUnitPath: readSystemdUnitPathEnv,
-    readUnitFile: (unitName) => {
-      const userDir = overrides.systemdUserDir ?? join(homedir(), ".config", "systemd", "user");
-      const unitPath = join(userDir, unitName);
-      return existsSync(unitPath) ? readFileSync(unitPath, "utf8") : null;
-    },
-    resolveExecutable: resolveExecutableOnPath,
     ...overrides,
   };
 }
@@ -748,179 +712,6 @@ export function checkProviderEnvKeys(
   };
 }
 
-export interface CheckCoordinatorPathDriftOptions {
-  environment?: ServiceEnvironment;
-  systemdUserDir?: string;
-  providerCommands?: readonly string[];
-  targetPath?: string;
-}
-
-/**
- * Compare the installed quota coordinator unit's PATH against the PATH systemd
- * currently reports for the instance unit (#638).
- *
- * Plainly reports agreement as pass, and divergence as warn (non-fatal,
- * non-mutating), naming any provider CLI that resolves on one unit's PATH and
- * not the other, and pointing at `rusa install-quota-coordinator` as the remedy.
- */
-export function checkCoordinatorPathDrift(
-  deps: QuickstartDoctorDeps,
-  opts: CheckCoordinatorPathDriftOptions = {}
-): DoctorResult {
-  const environment = opts.environment ?? "production";
-  const serviceBasename = environment === "production" ? "rusa" : "rusa-staging";
-  const instanceUnit = `${serviceBasename}.service`;
-  const coordinatorUnit = quotaCoordinatorUnitNames(serviceBasename).serviceUnit;
-
-  const readSystemd = deps.readSystemdUnitPath ?? readSystemdUnitPathEnv;
-  const readUnit =
-    deps.readUnitFile ??
-    ((unit: string) => {
-      const userDir =
-        opts.systemdUserDir ?? deps.systemdUserDir ?? join(homedir(), ".config", "systemd", "user");
-      const path = join(userDir, unit);
-      return deps.fileExists(path) ? deps.readText(path) : null;
-    });
-
-  const coordinatorSystemdPath = readSystemd(coordinatorUnit);
-  const coordinatorFileContents = readUnit(coordinatorUnit);
-  const coordinatorFilePath = coordinatorFileContents
-    ? readUnitPathEnv(coordinatorFileContents)
-    : null;
-
-  // If systemd cannot find the coordinator unit and no unit file exists on disk,
-  // the coordinator unit is simply not installed.
-  if (coordinatorSystemdPath === null && coordinatorFileContents === null) {
-    return {
-      name: "quota coordinator PATH",
-      status: "pass",
-      message: `no quota coordinator unit is installed for ${instanceUnit} (skipped).`,
-    };
-  }
-
-  const coordinatorPath = coordinatorSystemdPath ?? coordinatorFilePath;
-  if (!coordinatorPath) {
-    return {
-      name: "quota coordinator PATH",
-      status: "warn",
-      message: `${coordinatorUnit} is installed but assigns no PATH.`,
-      hint: `Run 'rusa install-quota-coordinator${environment === "staging" ? " --environment staging" : ""}' to reinstall it with the updated PATH.`,
-      probed: [`coordinator unit: ${coordinatorUnit} (no PATH assigned)`],
-    };
-  }
-
-  const instanceSystemdPath = readSystemd(instanceUnit);
-  const instanceFileContents = readUnit(instanceUnit);
-  const instanceFilePath = instanceFileContents ? readUnitPathEnv(instanceFileContents) : null;
-  const instancePath = instanceSystemdPath ?? instanceFilePath;
-
-  if (!instancePath) {
-    return {
-      name: "quota coordinator PATH",
-      status: "warn",
-      message: `${coordinatorUnit} is installed, but ${instanceUnit} is not installed or assigns no PATH.`,
-      hint: `Run 'rusa install-service${environment === "staging" ? " --environment staging" : ""}' and 'rusa install-quota-coordinator${environment === "staging" ? " --environment staging" : ""}'.`,
-      probed: [
-        `${coordinatorUnit} PATH: ${coordinatorPath}`,
-        `${instanceUnit}: not installed or assigns no PATH`,
-      ],
-    };
-  }
-
-  if (coordinatorPath === instancePath) {
-    return {
-      name: "quota coordinator PATH",
-      status: "pass",
-      message: `coordinator and instance units agree on PATH (${coordinatorPath}).`,
-      probed: [
-        `${coordinatorUnit} PATH: ${coordinatorPath}`,
-        `${instanceUnit} PATH: ${instancePath}`,
-      ],
-    };
-  }
-
-  // Determine provider commands to check.
-  let commands = opts.providerCommands ? [...opts.providerCommands] : undefined;
-  if (!commands || commands.length === 0) {
-    try {
-      const config = loadConfig(opts.targetPath);
-      const configured = configuredProviderCommands(config);
-      if (configured.length > 0) commands = configured;
-    } catch {
-      // ignore
-    }
-  }
-  if (!commands || commands.length === 0) {
-    commands = ["codex", "claude", "agy", "kimi"];
-  }
-
-  const resolveExec = deps.resolveExecutable ?? resolveExecutableOnPath;
-  const missingOnCoordinator: string[] = [];
-  const missingOnInstance: string[] = [];
-  const resolvedOnBoth: string[] = [];
-
-  for (const cmd of commands) {
-    const onInstance = resolveExec(cmd, instancePath);
-    const onCoordinator = resolveExec(cmd, coordinatorPath);
-    if (onInstance && !onCoordinator) {
-      missingOnCoordinator.push(cmd);
-    } else if (onCoordinator && !onInstance) {
-      missingOnInstance.push(cmd);
-    } else if (onInstance && onCoordinator) {
-      resolvedOnBoth.push(cmd);
-    }
-  }
-  missingOnCoordinator.sort();
-  missingOnInstance.sort();
-  resolvedOnBoth.sort();
-
-  const reinstallHint = `Run 'rusa install-quota-coordinator${environment === "staging" ? " --environment staging" : ""}' to reinstall the coordinator with the updated PATH.`;
-
-  if (missingOnCoordinator.length > 0) {
-    const missing = missingOnCoordinator.join(", ");
-    return {
-      name: "quota coordinator PATH",
-      status: "warn",
-      message: `${coordinatorUnit} PATH has drifted from ${instanceUnit}; missing provider CLI(s): ${missing}.`,
-      hint: reinstallHint,
-      probed: [
-        `${coordinatorUnit} PATH: ${coordinatorPath}`,
-        `${instanceUnit} PATH: ${instancePath}`,
-        `missing on coordinator: ${missing}`,
-        ...(resolvedOnBoth.length > 0 ? [`resolved on both: ${resolvedOnBoth.join(", ")}`] : []),
-      ],
-    };
-  }
-
-  if (missingOnInstance.length > 0) {
-    const missing = missingOnInstance.join(", ");
-    return {
-      name: "quota coordinator PATH",
-      status: "warn",
-      message: `${coordinatorUnit} PATH diverges from ${instanceUnit}; provider CLI(s) resolve on coordinator but not instance: ${missing}.`,
-      hint: `Run 'rusa install-service' and 'rusa install-quota-coordinator' to reconcile.`,
-      probed: [
-        `${coordinatorUnit} PATH: ${coordinatorPath}`,
-        `${instanceUnit} PATH: ${instancePath}`,
-        `missing on instance: ${missing}`,
-        ...(resolvedOnBoth.length > 0 ? [`resolved on both: ${resolvedOnBoth.join(", ")}`] : []),
-      ],
-    };
-  }
-
-  return {
-    name: "quota coordinator PATH",
-    status: "warn",
-    message: `${coordinatorUnit} PATH has drifted from ${instanceUnit} (all checked provider CLIs resolve on both).`,
-    hint: reinstallHint,
-    probed: [
-      `${coordinatorUnit} PATH: ${coordinatorPath}`,
-      `${instanceUnit} PATH: ${instancePath}`,
-      ...(resolvedOnBoth.length > 0 ? [`resolved on both: ${resolvedOnBoth.join(", ")}`] : []),
-    ],
-  };
-}
-
 export async function runQuickstartDoctor(
   options: QuickstartDoctorOptions = {}
 ): Promise<DoctorResult[]> {
@@ -931,9 +722,6 @@ export async function runQuickstartDoctor(
   const minFreeDiskBytes = options.minFreeDiskBytes ?? QUICKSTART_MIN_FREE_DISK_BYTES;
   const ports = options.ports ?? [];
   const providerEnvKeys = options.providerEnvKeys ?? QUICKSTART_PROVIDER_ENV_KEYS;
-  const environment = options.environment ?? "production";
-  const systemdUserDir = options.systemdUserDir;
-  const providerCommands = options.providerCommands;
   const checks = buildQuickstartDoctorChecks({
     deps,
     repoRoot,
@@ -942,9 +730,6 @@ export async function runQuickstartDoctor(
     minFreeDiskBytes,
     ports,
     providerEnvKeys,
-    environment,
-    systemdUserDir,
-    providerCommands,
   });
 
   const results: DoctorResult[] = [];
@@ -983,15 +768,6 @@ export function formatDoctorResults(
     if (result.hint) lines.push(`       Fix: ${result.hint}`);
   }
   return lines.join("\n");
-}
-
-export async function runDoctor(options: QuickstartDoctorOptions = {}): Promise<DoctorResult[]> {
-  const results = await runQuickstartDoctor(options);
-  console.log(formatDoctorResults(results, "[rusa] Doctor:"));
-  if (results.some((result) => result.status === "fail")) {
-    process.exitCode = 1;
-  }
-  return results;
 }
 
 export async function assertQuickstartDoctor(
