@@ -3,12 +3,14 @@ import { join, sep } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   type CommandResult,
+  checkCoordinatorPathDrift,
   checkProviderEnvKeys,
   defaultFlutterDashboardDir,
   defaultRepoRoot,
   formatDoctorResults,
   QUICKSTART_DOCTOR_CHECKS,
   type QuickstartDoctorDeps,
+  runDoctor,
   runQuickstartDoctor,
   satisfiesVersionRange,
 } from "./quickstart-doctor.js";
@@ -43,6 +45,8 @@ function deps(
     fileExists: () => true,
     freeBytes: () => 20 * 1024 * 1024 * 1024,
     isPortAvailable: async () => true,
+    readSystemdUnitPath: () => null,
+    readUnitFile: () => null,
     ...overrides,
   };
 }
@@ -66,6 +70,8 @@ function depsWithRunLog(overrides: Partial<QuickstartDoctorDeps> = {}): {
       fileExists: () => true,
       freeBytes: () => 20 * 1024 * 1024 * 1024,
       isPortAvailable: async () => true,
+      readSystemdUnitPath: () => null,
+      readUnitFile: () => null,
       ...overrides,
     },
   };
@@ -136,6 +142,7 @@ describe("runQuickstartDoctor", () => {
       "free disk",
       "loopback ports",
       "provider API key environment",
+      "quota coordinator PATH",
     ]);
     expect(results.filter((result) => result.status === "fail")).toEqual([]);
   });
@@ -465,5 +472,284 @@ describe("runQuickstartDoctor", () => {
     });
     const nodeResult = results.find((result) => result.name === "node");
     expect(nodeResult?.status).toBe("pass");
+  });
+});
+
+describe("checkCoordinatorPathDrift (#638)", () => {
+  it("reports pass with skipped message when no coordinator unit is installed", () => {
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: () => null,
+        readUnitFile: () => null,
+      }) as QuickstartDoctorDeps
+    );
+
+    expect(result).toEqual({
+      name: "quota coordinator PATH",
+      status: "pass",
+      message: "no quota coordinator unit is installed for rusa.service (skipped).",
+    });
+  });
+
+  it("reports pass when coordinator and instance unit PATHs agree", () => {
+    const matchingPath = "/opt/providers/bin:/usr/bin:/bin";
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa.service" || unit === "rusa-quota-coordinator.service") {
+            return matchingPath;
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps
+    );
+
+    expect(result.status).toBe("pass");
+    expect(result.message).toBe(`coordinator and instance units agree on PATH (${matchingPath}).`);
+    expect(result.probed).toEqual([
+      `rusa-quota-coordinator.service PATH: ${matchingPath}`,
+      `rusa.service PATH: ${matchingPath}`,
+    ]);
+  });
+
+  it("detects drift when instance unit PATH changed after coordinator was installed (#638)", () => {
+    // Coordinator was installed with minimal PATH lacking codex.
+    // Instance unit was later reinstalled / updated with provider PATH containing codex.
+    const coordinatorPath = "/usr/bin:/bin";
+    const instancePath = "/opt/providers/bin:/usr/bin:/bin";
+
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return coordinatorPath;
+          if (unit === "rusa.service") return instancePath;
+          return null;
+        },
+        resolveExecutable: (cmd, pathEnv) => {
+          if (cmd === "codex" && pathEnv.includes("/opt/providers/bin")) {
+            return "/opt/providers/bin/codex";
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps,
+      { providerCommands: ["codex", "claude"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toBe(
+      "rusa-quota-coordinator.service PATH has drifted from rusa.service; missing provider CLI(s): codex."
+    );
+    expect(result.hint).toContain("Run 'rusa install-quota-coordinator'");
+    expect(result.probed).toEqual([
+      `rusa-quota-coordinator.service PATH: ${coordinatorPath}`,
+      `rusa.service PATH: ${instancePath}`,
+      "missing on coordinator: codex",
+    ]);
+  });
+
+  it("names all missing provider CLIs sorted alphabetically", () => {
+    const coordinatorPath = "/usr/bin:/bin";
+    const instancePath = "/opt/providers/bin:/usr/bin:/bin";
+
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return coordinatorPath;
+          if (unit === "rusa.service") return instancePath;
+          return null;
+        },
+        resolveExecutable: (cmd, pathEnv) => {
+          if (["codex", "claude", "kimi"].includes(cmd) && pathEnv.includes("/opt/providers/bin")) {
+            return `/opt/providers/bin/${cmd}`;
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps,
+      { providerCommands: ["kimi", "codex", "claude"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toContain("missing provider CLI(s): claude, codex, kimi.");
+    expect(result.probed).toContain("missing on coordinator: claude, codex, kimi");
+  });
+
+  it("reports provider CLIs that resolve on coordinator but not on instance", () => {
+    const coordinatorPath = "/custom/bin:/usr/bin:/bin";
+    const instancePath = "/usr/bin:/bin";
+
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return coordinatorPath;
+          if (unit === "rusa.service") return instancePath;
+          return null;
+        },
+        resolveExecutable: (cmd, pathEnv) => {
+          if (cmd === "codex" && pathEnv.includes("/custom/bin")) {
+            return "/custom/bin/codex";
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps,
+      { providerCommands: ["codex"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toContain(
+      "rusa-quota-coordinator.service PATH diverges from rusa.service; provider CLI(s) resolve on coordinator but not instance: codex."
+    );
+    expect(result.probed).toContain("missing on instance: codex");
+  });
+
+  it("warns when PATH strings diverge even if all checked CLIs resolve on both", () => {
+    const coordinatorPath = "/usr/local/bin:/opt/providers/bin:/usr/bin:/bin";
+    const instancePath = "/opt/providers/bin:/usr/local/bin:/usr/bin:/bin";
+
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return coordinatorPath;
+          if (unit === "rusa.service") return instancePath;
+          return null;
+        },
+        resolveExecutable: (cmd) => (cmd === "codex" ? "/opt/providers/bin/codex" : null),
+      }) as QuickstartDoctorDeps,
+      { providerCommands: ["codex"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toBe(
+      "rusa-quota-coordinator.service PATH has drifted from rusa.service (all checked provider CLIs resolve on both)."
+    );
+    expect(result.hint).toContain("rusa install-quota-coordinator");
+    expect(result.probed).toEqual([
+      `rusa-quota-coordinator.service PATH: ${coordinatorPath}`,
+      `rusa.service PATH: ${instancePath}`,
+      "resolved on both: codex",
+    ]);
+  });
+
+  it("falls back to unit file text when systemd cannot answer", () => {
+    const coordinatorUnit = ["[Service]", "Environment=PATH=/usr/bin:/bin"].join("\n");
+    const instanceUnit = ["[Service]", "Environment=PATH=/opt/providers/bin:/usr/bin:/bin"].join(
+      "\n"
+    );
+
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: () => null,
+        readUnitFile: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return coordinatorUnit;
+          if (unit === "rusa.service") return instanceUnit;
+          return null;
+        },
+        resolveExecutable: (cmd, pathEnv) => {
+          if (cmd === "codex" && pathEnv.includes("/opt/providers/bin")) {
+            return "/opt/providers/bin/codex";
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps,
+      { providerCommands: ["codex"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toContain("missing provider CLI(s): codex");
+  });
+
+  it("checks staging unit names when environment is staging", () => {
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) => {
+          if (unit === "rusa-staging-quota-coordinator.service") return "/usr/bin:/bin";
+          if (unit === "rusa-staging.service") return "/opt/providers/bin:/usr/bin:/bin";
+          return null;
+        },
+        resolveExecutable: (cmd, pathEnv) => {
+          if (cmd === "codex" && pathEnv.includes("/opt/providers/bin")) {
+            return "/opt/providers/bin/codex";
+          }
+          return null;
+        },
+      }) as QuickstartDoctorDeps,
+      { environment: "staging", providerCommands: ["codex"] }
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toContain(
+      "rusa-staging-quota-coordinator.service PATH has drifted from rusa-staging.service"
+    );
+    expect(result.hint).toContain("--environment staging");
+  });
+
+  it("warns when coordinator unit is installed but instance unit is not", () => {
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: (unit) =>
+          unit === "rusa-quota-coordinator.service" ? "/usr/bin:/bin" : null,
+        readUnitFile: () => null,
+      }) as QuickstartDoctorDeps
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toBe(
+      "rusa-quota-coordinator.service is installed, but rusa.service is not installed or assigns no PATH."
+    );
+  });
+
+  it("warns when coordinator unit is installed but assigns no PATH", () => {
+    const result = checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        readSystemdUnitPath: () => null,
+        readUnitFile: (unit) => {
+          if (unit === "rusa-quota-coordinator.service") return "[Service]\nRestart=always";
+          return null;
+        },
+      }) as QuickstartDoctorDeps
+    );
+
+    expect(result.status).toBe("warn");
+    expect(result.message).toBe("rusa-quota-coordinator.service is installed but assigns no PATH.");
+  });
+
+  it("does not mutate any unit or execute commands", () => {
+    let runCalled = false;
+    checkCoordinatorPathDrift(
+      deps(passingCommands, {
+        run: () => {
+          runCalled = true;
+          return { status: 0, stdout: "", stderr: "" };
+        },
+        readSystemdUnitPath: (unit) =>
+          unit === "rusa.service" || unit === "rusa-quota-coordinator.service" ? "/usr/bin" : null,
+      }) as QuickstartDoctorDeps
+    );
+
+    expect(runCalled).toBe(false);
+  });
+});
+
+describe("runDoctor", () => {
+  it("formats and runs all doctor checks including coordinator-path-drift", async () => {
+    const matchingPath = "/usr/bin:/bin";
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const results = await runDoctor({
+        repoRoot: "/repo",
+        targetPath: "/repo",
+        ports: [8080, 8085],
+        deps: deps(passingCommands, {
+          readSystemdUnitPath: () => matchingPath,
+        }),
+      });
+
+      expect(results).toHaveLength(QUICKSTART_DOCTOR_CHECKS.length);
+      const coordinatorResult = results.find((r) => r.name === "quota coordinator PATH");
+      expect(coordinatorResult?.status).toBe("pass");
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("[rusa] Doctor:"));
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });

@@ -14,6 +14,7 @@ import { runInit } from "./commands/init.js";
 import { runInstallQuotaCoordinator, runInstallService } from "./commands/install-service.js";
 import { runActorLogs, runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runDoctor } from "./commands/quickstart-doctor.js";
 import { runQuotaBackup, runQuotaBackupList, runQuotaRestore } from "./commands/quota-backup.js";
 import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
 import { runQuotaPacingReset } from "./commands/quota-pacing-reset.js";
@@ -79,6 +80,18 @@ program
   .addHelpText("after", `\n${CONFIG_DOCS.trimEnd()}`)
   .action(() => {
     printConfigDocs();
+  });
+
+program
+  .command("doctor")
+  .description("Run system, environment, and coordinator health checks")
+  .option("--environment <environment>", "Service environment: production or staging", "production")
+  .option("--home <path>", "Override RUSA_HOME for this check")
+  .action(async (opts: { environment: ServiceEnvironment; home?: string }) => {
+    await runDoctor({
+      environment: opts.environment,
+      targetPath: opts.home,
+    });
   });
 
 program
