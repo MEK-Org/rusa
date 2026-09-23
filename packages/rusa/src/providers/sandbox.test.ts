@@ -481,10 +481,10 @@ describe("sandbox bwrap args", () => {
     });
   });
 
-  it("buildActorBwrapArgs leaves siblings readable (open read) and scopes writes to its own dir + /tmp", async () => {
-    // The mesh worker layout: <home>/.rusa/workers/<id>. Visibility is open —
-    // an actor may read any other actor's repo — so the workers tree is NOT tmpfs'd.
-    // Write isolation comes from only re-binding this actor's own dir rw (plus /tmp).
+  it("maps Antigravity scratch to the actor directory while retaining the narrow write scope", async () => {
+    // The mesh worker layout: <home>/.rusa/workers/<id>. The provider's shared
+    // scratch path must be overlaid with the current actor directory: a worker
+    // then sees its durable workspace at that path, not a sibling's checkout.
     const home = mkdtempSync(join(tmpdir(), "mc-home-"));
     tempDirs.push(home);
     const workersDir = join(home, ".rusa", "workers");
@@ -505,7 +505,8 @@ describe("sandbox bwrap args", () => {
     const { buildActorBwrapArgs } = await import("./sandbox.js");
     const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
-    // Nothing in the workers tree is shadowed — a sibling actor's dir stays visible.
+    // The general worker tree stays read-only; this change narrows only the
+    // provider-specific scratch view.
     const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
     expect(tmpfsTargets).not.toContain(workersDir);
     expect(tmpfsTargets).not.toContain(home);
@@ -531,6 +532,18 @@ describe("sandbox bwrap args", () => {
     expect(args[chdirIndex + 1]).toBe(actorDir);
     // The provider's state dir is the only home subtree bound read-write.
     expect(args.join(" ")).toContain(`--bind ${join(home, ".gemini")} ${join(home, ".gemini")}`);
+    const scratchDir = join(home, ".gemini", "antigravity-cli", "scratch");
+    const providerStateBind = args.findIndex(
+      (arg, index) =>
+        arg === "--bind" &&
+        args[index + 1] === join(home, ".gemini") &&
+        args[index + 2] === join(home, ".gemini")
+    );
+    const scratchOverlay = args.findIndex(
+      (arg, index) =>
+        arg === "--bind" && args[index + 1] === actorDir && args[index + 2] === scratchDir
+    );
+    expect(scratchOverlay).toBeGreaterThan(providerStateBind);
   });
 
   it("shadows host-job audit artifacts out of mesh actor read/write scope", async () => {

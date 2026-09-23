@@ -163,9 +163,9 @@ export function antigravityConversationsDir(): string {
 
 /**
  * Where the CLI keeps its per-worker workspaces, one directory per actor that
- * has ever run under it. rusa does not create these — it addresses them so a
- * retired actor's can be deleted rather than left readable to every worker that
- * comes after (see `actor/workspace-sweep.ts`).
+ * has ever run under it. Sandboxed Antigravity actors see this path overlaid
+ * with their own working directory; the host path remains the cleanup target
+ * for older workspaces (see `actor/workspace-sweep.ts`).
  */
 export function antigravityScratchDir(): string {
   return join(homedir(), ".gemini", "antigravity-cli", "scratch");

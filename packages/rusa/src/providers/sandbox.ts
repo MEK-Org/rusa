@@ -787,6 +787,10 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
   }
 }
 
+function antigravityScratchPath(): string {
+  return join(getHostHomeDir(), ".gemini", "antigravity-cli", "scratch");
+}
+
 /**
  * Mesh-actor bwrap layout (the simplified, write-scoped model): keeps the REAL
  * home (read-only via `--ro-bind / /`), so every tool finds `~/.gitconfig`,
@@ -808,6 +812,13 @@ function buildMeshActorBwrapArgs(o: {
   const realActorDir = realpathIfExists(o.actorDir);
   const tempPaths: string[] = [];
   const commandPrefix: string[] = [];
+
+  // `--bind` needs an existing destination. Creating this empty mount point is
+  // safe: the provider owns its contents, while the sandbox replaces its view
+  // with the current actor directory below.
+  if (o.authMode === "antigravity") {
+    mkdirSync(antigravityScratchPath(), { recursive: true, mode: 0o700 });
+  }
 
   const args: string[] = [
     "--unshare-all",
@@ -886,6 +897,12 @@ function buildMeshActorBwrapArgs(o: {
   // Write scope: the provider's auth/state dir(s), at their real paths.
   for (const dir of providerWritableStateDirs(o.authMode)) {
     addWritableBindIfExists(args, dir, dir);
+  }
+  if (o.authMode === "antigravity") {
+    // agy uses one host-wide scratch root. Overlay it after the writable
+    // provider-state bind so an actor can see only its own durable workspace
+    // there; sibling provider workspaces are not reachable through scratch.
+    args.push("--bind", realActorDir, antigravityScratchPath());
   }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin
