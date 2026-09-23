@@ -2875,17 +2875,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent).toEqual([]);
   });
 
-  it("withholds root's system subscription only when the sensor is explicitly disabled", async () => {
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        observability: { diskAlert: { enabled: false } },
-      }),
-      "utf8"
-    );
+  it("keeps generated E2E configs free of disk alerts and system:events, even with an enabled base", async () => {
+    const e2eConfig = buildE2EConfig({
+      scratchPath: join(homeDir, "scratch"),
+      baseConfig: {
+        observability: { diskAlert: { enabled: true, thresholdPercent: 1 } },
+      } as RusaConfig,
+    });
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(e2eConfig), "utf8");
 
     let mesh: ActorMesh | undefined;
     let emitSystemDiskCheck: (() => Promise<void>) | undefined;

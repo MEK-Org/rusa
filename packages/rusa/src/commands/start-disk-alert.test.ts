@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
+import { buildE2EConfig } from "../e2e/provision.js";
 import type { Logger } from "../observability/logger.js";
 import type { DurableEventDelivery } from "../runtime/event-manager.js";
 import {
@@ -34,6 +35,28 @@ const delivered: DurableEventDelivery = {
 const uncovered: DurableEventDelivery = { entries: [], ownerIds: [] };
 
 describe("configuredRootEventSources and the disk sensor agree", () => {
+  it("keeps an explicitly configured E2E Slack source while dropping system:events", () => {
+    // The interference #574 reports was observed in the Slack integration e2e:
+    // the root owned `system:events` only because the sensor defaults on, and an
+    // unrelated host `system.disk` alert woke it mid-run. Slack is the branch
+    // that shows the fix end to end, because Slack raises no host alarms of its
+    // own — the explicitly requested source survives and the host one is gone.
+    // There is deliberately no chat twin of this case: chat configures a second
+    // `system:events` producer (#578's lapse alert), so a generated chat root
+    // keeps the subscription and cannot show the drop. The rule that it must
+    // keep it is already pinned below, on a config built by hand so the failure
+    // localizes to start.ts rather than to the E2E generator.
+    const config = buildE2EConfig({
+      scratchPath: "/tmp/rusa-e2e-scratch",
+      slack: { appTokenPath: "/dev/null", botTokenPath: "/dev/null" },
+    });
+
+    expect(config.observability?.diskAlert).toEqual({ enabled: false });
+    const sources = configuredRootEventSources(config);
+    expect(sources).toContain("slack:channels");
+    expect(sources).not.toContain("system:events");
+  });
+
   it("covers system:events when no observability block is configured at all", () => {
     // The production shape that dropped every alert: sensor on by default, and
     // the subscription only implied when the block was present.
