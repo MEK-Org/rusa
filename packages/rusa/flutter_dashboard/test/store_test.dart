@@ -123,6 +123,92 @@ void main() {
     },
   );
 
+  test(
+    'leaving the queue drops the reserved candidate without waiting for a snapshot',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.queued,
+            queuePosition: 0,
+            selectedProvider: 'synthetic-alias',
+            selectedModel: 'synthetic-reserved-model',
+            selectedEffort: 'high',
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      expect(store.actor('a')?.selectedModel, 'synthetic-reserved-model');
+
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.running));
+      await pumpEventQueue();
+
+      expect(store.actor('a')?.selectedProvider, isNull);
+      expect(store.actor('a')?.selectedModel, isNull);
+      expect(store.actor('a')?.selectedEffort, isNull);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'active runs carry their run_start model until the run stops',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.running)]
+        ..latestRunStarts['a'] = makeEvent(
+          'start-1',
+          'run_start',
+          actor: 'a',
+          payload: '{"provider":"p","model":"synthetic-model","effort":"high"}',
+        );
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      expect(
+        store.runSelections.value['a'],
+        const RunModelSelection(
+          model: 'synthetic-model',
+          effort: 'high',
+          provider: 'p',
+        ),
+      );
+      // Later snapshots of the same run do not repeat the lookup.
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.running));
+      await pumpEventQueue();
+      expect(api.runStartLookups, ['a']);
+
+      stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
+      await pumpEventQueue();
+      expect(store.runSelections.value, isEmpty);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'an actor with no recorded run_start is looked up once per run',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.running)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.running));
+      await pumpEventQueue();
+      expect(store.runSelections.value, isEmpty);
+      expect(api.runStartLookups, ['a']);
+
+      stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
+      stream.runtimeStatesCtrl.add(_runtime(3, 'a', RunState.running));
+      await pumpEventQueue();
+      expect(api.runStartLookups, ['a', 'a']);
+      await store.dispose();
+    },
+  );
+
   test('queued cards revalidate pacer-only changes on a bounded poll', () {
     fakeAsync((async) {
       final api = FakeApi()

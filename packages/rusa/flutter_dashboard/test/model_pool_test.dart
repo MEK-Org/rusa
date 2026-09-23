@@ -431,7 +431,7 @@ void main() {
 
       // Tree row is the bare model, with no pool count appended.
       expect(find.text('claude-opus-5'), findsOneWidget);
-      expect(find.text('effort medium'), findsOneWidget);
+      expect(find.text(', medium'), findsOneWidget);
 
       await _openInfo(tester, 'a-handle');
 
@@ -469,7 +469,7 @@ void main() {
       expect(find.text('claude-opus-5 +2'), findsOneWidget);
       // Effort is per candidate in a pool, so the first entry's is not shown
       // as if it governed the actor.
-      expect(find.text('effort medium'), findsNothing);
+      expect(find.text(', medium'), findsNothing);
       expect(
         tester
             .widget<Tooltip>(find.ancestor(
@@ -570,7 +570,7 @@ void main() {
       expect(find.text('claude-opus-5 → claude-sonnet-5 +2'), findsOneWidget);
       // The current effort is one candidate's of four about to be declared,
       // so it is not shown as if it governed the actor.
-      expect(find.text('effort medium'), findsNothing);
+      expect(find.text(', medium'), findsNothing);
       expect(
         tester
             .widget<Tooltip>(find.ancestor(

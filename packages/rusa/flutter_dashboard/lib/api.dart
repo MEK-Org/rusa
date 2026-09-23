@@ -154,6 +154,17 @@ class DashboardApi {
     return EventPage.fromJson(await _getJson(_u('/api/mesh/events', q)));
   }
 
+  /// The newest `run_start` event for [actorId], or null when it has none.
+  /// Its payload names the model and effort that run launched with.
+  Future<MeshEvent?> fetchLatestRunStart(String actorId) async {
+    final page = await fetchEvents(
+      actors: [actorId],
+      kinds: const ['run_start'],
+      limit: 1,
+    );
+    return page.events.isEmpty ? null : page.events.first;
+  }
+
   /// `GET /api/mesh/chat` — direct chat history, newest-first, rowid-cursor paginated.
   Future<ChatPage> fetchChat({
     required List<String> actors,

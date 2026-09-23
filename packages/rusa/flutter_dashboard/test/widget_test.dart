@@ -809,7 +809,7 @@ void main() {
           find.text('gemini-3.7-flash-high → claude-opus-4-8'),
           findsOneWidget,
         );
-        expect(find.text('effort medium → default'), findsOneWidget);
+        expect(find.text(', medium → default'), findsOneWidget);
 
         await tester.tap(find.text('a-handle'));
         await tester.pump(const Duration(milliseconds: 50));

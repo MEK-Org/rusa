@@ -6,6 +6,7 @@ import 'package:http/testing.dart';
 
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 
 import 'fakes.dart';
@@ -195,6 +196,82 @@ void main() {
 
       expect(find.byType(SnackBar), findsOneWidget);
       expect(find.textContaining('Failed to dismiss'), findsOneWidget);
+    });
+  });
+
+  group('InboxTab reference cards', () {
+    late FakeApi api;
+    late DashboardStore store;
+
+    Map<String, dynamic> meshReference({String? unavailable}) => {
+          'ref': 'mesh:messages/m-1',
+          'scheme': 'mesh',
+          'title': 'sender-id → actor-a',
+          'body': 'Please look at the flaky test',
+          'author': 'sender-id',
+          'timestamp': '2026-08-30T11:59:00.000Z',
+          'unavailable': unavailable,
+          'entity': {
+            'type': 'mesh_message',
+            'senderId': 'sender-id',
+            'recipientId': 'actor-a',
+          },
+        };
+
+    setUp(() {
+      api = FakeApi();
+      store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+    });
+
+    testWidgets(
+        'a mesh message renders as its own card, dated, with the dismiss in it',
+        (tester) async {
+      api.inboxResultsByStatus['unhandled'] = {
+        'entries': [
+          {...entry('entry-1'), 'reference': meshReference()},
+        ]
+      };
+      api.inboxResultsByStatus['handled'] = {'entries': []};
+
+      await pumpInbox(tester, store);
+
+      // No generic type/source header wrapped around the message.
+      expect(find.text('MESH.MESSAGE'), findsNothing);
+      expect(find.text('mesh:root'), findsNothing);
+      expect(find.text('Please look at the flaky test'), findsOneWidget);
+      // The subtitle is the message's own date, not the participants again.
+      expect(find.text(formatTs('2026-08-30T11:59:00.000Z')), findsOneWidget);
+      expect(find.textContaining('→'), findsOneWidget);
+
+      await tester.tap(find.text('Dismiss'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Dismiss'));
+      await tester.pumpAndSettle();
+      expect(api.markInboxHandledCalls.single.entryId, 'entry-1');
+    });
+
+    testWidgets('an unresolved reference keeps the generic entry header',
+        (tester) async {
+      api.inboxResultsByStatus['unhandled'] = {
+        'entries': [
+          {
+            ...entry('entry-1'),
+            'reference': meshReference(unavailable: 'message not found'),
+          },
+        ]
+      };
+      api.inboxResultsByStatus['handled'] = {'entries': []};
+
+      await pumpInbox(tester, store);
+
+      expect(find.text('MESH.MESSAGE'), findsOneWidget);
+      expect(find.text('mesh:root'), findsOneWidget);
+      expect(find.text('Dismiss'), findsOneWidget);
     });
   });
 }

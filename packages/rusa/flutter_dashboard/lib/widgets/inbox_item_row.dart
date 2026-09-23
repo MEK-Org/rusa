@@ -5,6 +5,8 @@ import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'header.dart';
+import 'inbox_event.dart';
+import 'obligation_reference_card.dart';
 import 'reference_preview.dart';
 
 class InboxChip extends StatelessWidget {
@@ -54,6 +56,10 @@ class _ResponsiveBadge extends StatelessWidget {
 
 /// A compact row showing an actor's selected inbox item on their overview card.
 /// When more items exist for this actor, a `(+N more)` badge is displayed.
+///
+/// An item whose reference renders on its own terms is that reference's card,
+/// with the badges in its header, rather than a card nested in this row; see
+/// [rendersOwnFrame].
 class InboxItemRow extends StatelessWidget {
   const InboxItemRow({
     super.key,
@@ -72,6 +78,30 @@ class InboxItemRow extends StatelessWidget {
   final void Function(String url) openLink;
   final EdgeInsetsGeometry contentPadding;
 
+  /// Whether this row draws its own card, so a caller should not frame it.
+  static bool rendersOwnFrame(InboxEntryDto entry) =>
+      ReferencePreview.rendersOwnContent(entry.reference) ||
+      ObligationReferenceCard.obligationIdFor(entry.payload) != null;
+
+  Widget _referenceCard(Widget? action) {
+    final event = presentGitHubInboxEvent(
+      payload: entry.payload,
+      reference: entry.reference,
+      eventReference: entry.eventReference,
+    );
+    return ReferencePreview(
+      reference: entry.reference!,
+      lookupActorHandle: (id) => store.actor(id)?.handle,
+      openLink: openLink,
+      margin: EdgeInsets.zero,
+      action: action,
+      kindLabel: event?.kindLabel,
+      detail: event?.detail,
+      summary: event?.summary,
+      showBody: !(event?.bodyless ?? false),
+    );
+  }
+
   void _openActor(BuildContext context) {
     store.clickActor(entry.actorId);
     onSelectView?.call(DashboardView.actors);
@@ -81,6 +111,50 @@ class InboxItemRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final showMoreCount = moreCount != null && moreCount! > 0;
     final content = entry.contentText;
+    final moreLabel = showMoreCount
+        ? Text(
+            '(+$moreCount more)',
+            style: kMonoStyle.copyWith(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: MeshColors.accent,
+            ),
+          )
+        : null;
+
+    if (rendersOwnFrame(entry)) {
+      final badges = [
+        if (entry.isResponsive) const _ResponsiveBadge(),
+        ?moreLabel,
+      ];
+      final action = badges.isEmpty
+          ? null
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (var i = 0; i < badges.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 6),
+                  badges[i],
+                ],
+              ],
+            );
+      final obligationId = ObligationReferenceCard.obligationIdFor(
+        entry.payload,
+      );
+      return InkWell(
+        onTap: () => _openActor(context),
+        borderRadius: BorderRadius.circular(6),
+        child: obligationId != null
+            ? ObligationReferenceCard(
+                obligationId: obligationId,
+                store: store,
+                fallbackText: entry.payload['intent']?.toString(),
+                action: action,
+                onSelectView: onSelectView,
+              )
+            : _referenceCard(action),
+      );
+    }
 
     return InkWell(
       onTap: () => _openActor(context),
@@ -106,15 +180,7 @@ class InboxItemRow extends StatelessWidget {
                       fontWeight: FontWeight.w500,
                     ),
                   ),
-                if (showMoreCount)
-                  Text(
-                    '(+$moreCount more)',
-                    style: kMonoStyle.copyWith(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: MeshColors.accent,
-                    ),
-                  ),
+                ?moreLabel,
               ],
             ),
             const SizedBox(height: 6),

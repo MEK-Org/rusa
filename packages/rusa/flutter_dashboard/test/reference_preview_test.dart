@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 
 Widget _host(Widget child) => MaterialApp(
@@ -116,7 +117,7 @@ void main() {
         await tester.pumpAndSettle();
 
         // The four header elements are present...
-        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.text('GITHUB ISSUE'), findsOneWidget);
         expect(find.byIcon(Icons.open_in_new), findsOneWidget);
         expect(
           find.text('Polish obligation artifact previews'),
@@ -125,7 +126,7 @@ void main() {
         expect(find.text('cited by operator-handle'), findsOneWidget);
 
         // ...and appear left to right in that order.
-        final schemeX = tester.getCenter(find.text('GITHUB')).dx;
+        final schemeX = tester.getCenter(find.text('GITHUB ISSUE')).dx;
         final linkX = tester.getCenter(find.byIcon(Icons.open_in_new)).dx;
         final labelX = tester
             .getCenter(find.text('Polish obligation artifact previews'))
@@ -287,6 +288,35 @@ void main() {
     );
 
     testWidgets(
+      'dates a mesh message instead of repeating its participants',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'mesh:messages/abc',
+                scheme: 'mesh',
+                title: 'actor-1 → actor-2',
+                body: 'hello',
+                timestamp: '2026-09-01T10:00:00.000Z',
+                entity: {
+                  'type': 'mesh_message',
+                  'senderId': 'actor-1',
+                  'recipientId': 'actor-2',
+                },
+              ),
+              lookupActorHandle: (id) =>
+                  {'actor-1': 'alice', 'actor-2': 'bob'}[id],
+            ),
+          ),
+        );
+
+        expect(find.text('alice → bob'), findsOneWidget);
+        expect(find.text(formatTs('2026-09-01T10:00:00.000Z')), findsOneWidget);
+      },
+    );
+
+    testWidgets(
       'resolves a mesh message sender and recipient that no lookup can find '
       'to "Unknown actor", never the raw ids — and a citer label does not '
       'hide the participant context',
@@ -314,7 +344,7 @@ void main() {
         // The citer's label takes the header slot, but the resolved
         // participant context still appears elsewhere on the card.
         expect(find.text("Operator's opening ask"), findsOneWidget);
-        expect(find.text('Unknown actor → Unknown actor'), findsWidgets);
+        expect(find.textContaining('Unknown actor → Unknown actor'), findsOne);
         final rendered = _allRenderedText(tester);
         expect(rendered.contains('retired-actor-77'), false);
         expect(rendered.contains('retired-actor-88'), false);
