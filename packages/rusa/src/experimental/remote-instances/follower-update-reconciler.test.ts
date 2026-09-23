@@ -34,7 +34,20 @@ describe("FollowerUpdateReconciler", () => {
         timestamp: new Date().toISOString(),
       })),
       onRegister: vi.fn((cb) => {
-        registerCallback = cb;
+        registerCallback = (f) => {
+          if (!mockFollowers.some((existing) => existing.id === f.id)) {
+            mockFollowers.push({
+              id: f.id,
+              platform: "linux",
+              pid: 10,
+              actors: [],
+              lastSeen: new Date().toISOString(),
+              commitSha: f.commitSha,
+              updateStatus: f.updateStatus,
+            });
+          }
+          cb(f);
+        };
         return () => {
           registerCallback = undefined;
         };
@@ -98,11 +111,16 @@ describe("FollowerUpdateReconciler", () => {
       follower("f3", "old".repeat(10)),
     ];
 
-    new FollowerUpdateReconciler(store, mockHub).arm();
+    const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    reconciler.arm();
 
     // A boot sweep must not fan out a deployment to every connected follower.
     expect(mockHub.updateFollower).toHaveBeenCalledTimes(1);
     expect(mockHub.updateFollower).toHaveBeenLastCalledWith("f1", { targetSha, branch: "staging" });
+
+    // While f1 is pending, intermediate reconcile passes do not dispatch f2.
+    reconciler.reconcileAll();
+    expect(mockHub.updateFollower).toHaveBeenCalledTimes(1);
 
     updateStatusCallback?.("f1", {
       updateId: "up-f1",
@@ -118,6 +136,11 @@ describe("FollowerUpdateReconciler", () => {
     expect(mockHub.updateFollower).toHaveBeenCalledTimes(2);
     expect(mockHub.updateFollower).toHaveBeenLastCalledWith("f2", { targetSha, branch: "staging" });
     expect(store.hasFailed("f1", targetSha)).toBe(true);
+    expect(store.getActiveTrigger()?.attempts.f1?.error).toBe("build failed");
+
+    // While f2 is pending, intermediate reconcile passes do not dispatch f3.
+    reconciler.reconcileAll();
+    expect(mockHub.updateFollower).toHaveBeenCalledTimes(2);
 
     updateStatusCallback?.("f2", {
       updateId: "up-f2",
@@ -129,6 +152,7 @@ describe("FollowerUpdateReconciler", () => {
     // A different terminal outcome also releases exactly one next candidate.
     expect(mockHub.updateFollower).toHaveBeenCalledTimes(3);
     expect(mockHub.updateFollower).toHaveBeenLastCalledWith("f3", { targetSha, branch: "staging" });
+    expect(store.hasSucceeded("f2", targetSha)).toBe(true);
   });
 
   it("advances after a restarted follower registers on the target", () => {
@@ -219,23 +243,26 @@ describe("FollowerUpdateReconciler", () => {
     expect(store.getActiveTrigger()?.attempts["f-flaky"]?.status).toBe("failed");
   });
 
-  it("records failure when updateStatus event reports failure", () => {
-    const targetSha = "e".repeat(40);
+  it("persists pending attempt before enqueuing update so the gate survives crash during dispatch", () => {
+    const targetSha = "5e".repeat(20);
     store.createTrigger({ targetSha, branch: "staging" });
-    mockFollowers = [follower("f-fail", "old".repeat(10))];
-
-    new FollowerUpdateReconciler(store, mockHub).arm();
-
-    updateStatusCallback?.("f-fail", {
-      updateId: "up-fail",
-      status: "failed",
-      error: "timed out during install",
-      newSha: targetSha,
-      timestamp: new Date().toISOString(),
+    let statusDuringDispatch: string | undefined;
+    mockHub.updateFollower = vi.fn((followerId) => {
+      statusDuringDispatch = store.getActiveTrigger()?.attempts[followerId]?.status;
+      return {
+        updateId: "up-crash",
+        status: "pending" as const,
+        newSha: targetSha,
+        timestamp: new Date().toISOString(),
+      };
     });
 
-    expect(store.hasFailed("f-fail", targetSha)).toBe(true);
-    expect(store.getActiveTrigger()?.attempts["f-fail"]?.error).toBe("timed out during install");
+    const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    reconciler.arm();
+    mockFollowers = [follower("f-crash", "old".repeat(10))];
+    reconciler.reconcileAll();
+
+    expect(statusDuringDispatch).toBe("pending");
   });
 
   const follower = (id: string, commitSha: string): FollowerInfo => ({
@@ -330,22 +357,6 @@ describe("FollowerUpdateReconciler", () => {
     expect(attempt?.status).toBe("failed");
     expect(attempt?.error).toBe("Follower not connected");
     expect(store.hasFailed("f-gone", targetSha)).toBe(true);
-  });
-
-  it("records success when a follower reports already_current", () => {
-    const targetSha = "3c".repeat(20);
-    store.createTrigger({ targetSha, branch: "staging" });
-
-    new FollowerUpdateReconciler(store, mockHub).arm();
-
-    updateStatusCallback?.("f-current", {
-      updateId: "up-current",
-      status: "already_current",
-      newSha: targetSha,
-      timestamp: new Date().toISOString(),
-    });
-
-    expect(store.hasSucceeded("f-current", targetSha)).toBe(true);
   });
 
   it("reconciles a reconnecting follower on commitSha even after a prior restarting status", () => {

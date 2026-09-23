@@ -179,9 +179,8 @@ export class FollowerUpdateReconciler {
     // refreshes commitSha. Its durable success record is still terminal for this target.
     if (this.store.hasSucceeded(follower.id, activeTrigger.targetSha)) return false;
 
-    // A previous automatic command has not yet reached a terminal outcome. This guard
-    // belongs here as well as in reconcileAll() because registration calls this public
-    // method directly through the hub callback.
+    // A previous automatic command has not yet reached a terminal outcome. This canonical
+    // gate check ensures single-flight serialization across all callers to reconcileFollower().
     if (this.pendingAutomaticFollower(activeTrigger)) return false;
 
     // Fail-stop loop prevention: do NOT retry automatically if this follower previously failed for this targetSha
@@ -202,20 +201,21 @@ export class FollowerUpdateReconciler {
       return false;
     }
 
-    // Dispatch first, then record what actually happened. Recording `pending` up front
-    // stranded a follower whose dispatch threw: not failed, so not suppressed; not
-    // succeeded, so never current; and the document asserted an attempt that never left.
+    // Record `pending` before dispatching so the durable single-flight gate is persisted
+    // before the command is enqueued on the follower. If the leader crashes during or
+    // immediately after dispatch, a replacement leader sees the in-flight gate and waits.
+    // If dispatch throws, the catch block overwrites `pending` with `failed`.
+    const attempt: FollowerUpdateAttempt = {
+      status: "pending",
+      targetSha: activeTrigger.targetSha,
+      lastAttemptAt: new Date().toISOString(),
+    };
+    this.store.recordAttempt(follower.id, attempt);
     try {
       this.hub.updateFollower(follower.id, {
         targetSha: activeTrigger.targetSha,
         branch: activeTrigger.branch,
       });
-      const attempt: FollowerUpdateAttempt = {
-        status: "pending",
-        targetSha: activeTrigger.targetSha,
-        lastAttemptAt: new Date().toISOString(),
-      };
-      this.store.recordAttempt(follower.id, attempt);
       this.log.info("follower_update_reconciliation_triggered", {
         followerId: follower.id,
         targetSha: activeTrigger.targetSha,
@@ -246,15 +246,8 @@ export class FollowerUpdateReconciler {
     const trigger = this.store.getActiveTrigger();
     if (!trigger) return;
 
-    if (this.recordCurrentFollower(follower, trigger)) {
-      this.reconcileAll();
-      return;
-    }
-
-    // The callback includes the just-registered follower so this path remains correct
-    // even for hub implementations whose list snapshot is refreshed after callbacks.
-    if (this.pendingAutomaticFollower(trigger)) return;
-    if (!this.reconcileFollower(follower, trigger)) this.reconcileAll();
+    this.recordCurrentFollower(follower, trigger);
+    this.reconcileAll();
   }
 
   onFollowerUpdateStatus(followerId: string, status: FollowerUpdateStatus): void {
@@ -271,10 +264,10 @@ export class FollowerUpdateReconciler {
         ? reportedTargetSha
         : trigger.targetSha;
     // Manual /followers/:id/update calls intentionally do not create a pending
-    // automatic attempt. They still retain the existing per-target accounting, but
-    // only the pending automatic follower may release this automatic queue.
-    const releasesAutomaticQueue =
-      pendingFollowerId === followerId && targetSha === trigger.targetSha;
+    // automatic attempt. When the pending automatic follower reports a terminal
+    // outcome (even against an overridden target), its attempt slot is no longer
+    // pending, releasing the single-flight gate to advance the queue.
+    const releasesAutomaticQueue = pendingFollowerId === followerId;
 
     if (status.status === "failed") {
       this.store.recordFailure(followerId, targetSha, status.error);
@@ -291,6 +284,7 @@ export class FollowerUpdateReconciler {
         targetSha,
       });
       if (releasesAutomaticQueue) this.reconcileAll();
+      else this.reportIfAllCurrent();
     }
   }
 

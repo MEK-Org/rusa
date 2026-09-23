@@ -624,6 +624,11 @@ describe("leader follower gateway", () => {
         });
         expect(retry.status).toBe(200);
         expect((await retry.json()) as { ok: boolean }).toMatchObject({ ok: true });
+
+        const updatedStatus = h.hub.getFollowerUpdateStatus("worker-retry");
+        expect(updatedStatus?.status).toBe("pending");
+        expect(updatedStatus?.updateId).toBeDefined();
+        expect(updatedStatus?.updateId).not.toBe(automatic?.updateId);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
