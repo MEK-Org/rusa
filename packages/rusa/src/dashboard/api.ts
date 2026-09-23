@@ -168,7 +168,6 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
-import { getResourceShape } from "../references/cache-service.js";
 import { parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
@@ -542,13 +541,20 @@ function gchatInboxMessageReference(source: string, payload: InboxPayload): stri
   try {
     const reference = parseReference(`gchat:${payload.messageName}`);
     const sourceReference = parseReference(source);
-    // Reuse the cache's shape contract rather than maintaining another notion
-    // of a Chat message here. The source must be the message's containing
+    const [messageCollection, messageSpace, messageKind] = reference.segments;
+    const [sourceCollection, sourceSpace] = sourceReference.segments;
+    // This is the exact Google message resource form, not the cache's broader
+    // internal entity classifier. The source must be the message's containing
     // space: an inbox payload cannot use this rendering path to name a message
     // in a different space.
-    return getResourceShape(reference) === "gchat_message" &&
-      getResourceShape(sourceReference) === "gchat_space" &&
-      reference.segments[1] === sourceReference.segments[1]
+    return reference.scheme === "gchat" &&
+      reference.segments.length === 4 &&
+      messageCollection === "spaces" &&
+      messageKind === "messages" &&
+      sourceReference.scheme === "gchat" &&
+      sourceReference.segments.length === 2 &&
+      sourceCollection === "spaces" &&
+      messageSpace === sourceSpace
       ? reference.key
       : undefined;
   } catch {

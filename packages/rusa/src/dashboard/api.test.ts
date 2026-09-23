@@ -2236,6 +2236,24 @@ describe("handleMeshApiRequest", () => {
         payload: { type: "gchat.message", messageName: "spaces/AAAA123" },
       },
       {
+        // Only the exact Google resource form may reach the resolver. The
+        // cache also classifies child resources, but an inbox event names a
+        // message, not one of its descendants.
+        id: "gchat-message-child",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/AAAA123/messages/BBBB/attachments/CCCC",
+        },
+      },
+      {
+        id: "gchat-non-space-message",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message", messageName: "threads/AAAA123/messages/BBBB" },
+      },
+      {
         // A payload must not make this entry fetch a message from another
         // space, even if the message path itself is valid.
         id: "gchat-wrong-space",
@@ -2247,7 +2265,7 @@ describe("handleMeshApiRequest", () => {
 
     const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     const entries = JSON.parse(res.body).entries as Array<{ reference?: unknown }>;
-    expect(entries).toHaveLength(3);
+    expect(entries).toHaveLength(5);
     for (const entry of entries) expect(entry.reference).toBeUndefined();
   });
 
