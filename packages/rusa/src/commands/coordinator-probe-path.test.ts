@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { buildTmuxScript } from "../providers/codex-status-scrape.js";
-import { poolClientUnitNames } from "./coordinator-provisioning.js";
+import { POOL_CLIENT_UNITS } from "./coordinator-provisioning.js";
 import {
   buildQuotaCoordinatorUnit,
   configuredProviderCommands,
@@ -234,7 +234,7 @@ describe("the quota coordinator's probe PATH reaches the tmux-launched CLI (#525
       const line = describePoolProbePathSource({ path: "/usr/bin", source: "process" }, null, []);
 
       expect(line).toContain("no pool client unit installed yet");
-      for (const unit of poolClientUnitNames()) expect(line).toContain(unit);
+      for (const unit of POOL_CLIENT_UNITS) expect(line).toContain(unit);
     });
   });
 });

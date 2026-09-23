@@ -56,9 +56,25 @@ the same pool. Re-running the installer retires those duplicates: each is
 stopped, disabled, and its unit file removed, and the removal is idempotent, so
 a host that has already transitioned has nothing to do.
 
+Only the unit names this project has installed are ever candidates —
+`rusa-quota-coordinator.service` and `rusa-staging-quota-coordinator.service`
+with their `-alert` companions — so a coordinator-shaped unit in
+`~/.config/systemd/user` that rusa did not write is left alone.
+
+A unit file is removed only after that unit is observed to have stopped. If
+`systemctl --user disable --now` fails, the install stops there with the unit
+still installed rather than deleting the file out from under a running duplicate
+and starting a second coordinator beside it. Stop the unit by hand and re-run.
+
 Retiring a unit never touches a database. If a retired coordinator ran against a
 different home, the installer names that home and says its files are left where
 they are.
+
+The install prints a `Database identity` line whenever the check could not be
+made — an installed unit that names no `RUSA_HOME` — so "not verified" is never
+reported as though it were "verified identical". If the installed unit runs
+against a home whose config cannot be read, the install refuses rather than
+guessing which database that unit opens; `--allow-database-change` overrides.
 
 ### What the unit carries, and why
 

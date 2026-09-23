@@ -26,8 +26,39 @@ import {
 export const POOL_COORDINATOR_UNIT = "rusa-quota-coordinator.service";
 export const POOL_COORDINATOR_ALERT_UNIT = "rusa-quota-coordinator-alert.service";
 
-/** Matches any coordinator unit name, pool-owned or environment-derived. */
-const COORDINATOR_UNIT_RE = /^(.+)-quota-coordinator(-alert)?\.service$/;
+/**
+ * Every coordinator unit name this project has ever installed.
+ *
+ * An exact set rather than a shape, because deletion is on the other end of it:
+ * `planCoordinatorTransition` feeds `retireEnvironmentDerivedCoordinators`,
+ * which disables and removes what it names out of `~/.config/systemd/user` —
+ * the user's own unit directory, shared with every other service they have
+ * installed. The set is closed and cannot grow behind us: the environment-
+ * derived name came from `resolveServiceBasename`, which is `production ?
+ * "rusa" : "rusa-staging"` over a two-valued `ServiceEnvironment`, and this
+ * change removes that derivation, so these four names are the complete history.
+ */
+const LEGACY_COORDINATOR_BASENAME = "rusa-staging";
+
+const COORDINATOR_SERVICE_UNITS: readonly string[] = [
+  POOL_COORDINATOR_UNIT,
+  `${LEGACY_COORDINATOR_BASENAME}-quota-coordinator.service`,
+];
+
+const COORDINATOR_ALERT_UNITS: readonly string[] = [
+  POOL_COORDINATOR_ALERT_UNIT,
+  `${LEGACY_COORDINATOR_BASENAME}-quota-coordinator-alert.service`,
+];
+
+/** True for a coordinator *service* unit we wrote; alert companions excluded. */
+function isCoordinatorServiceUnit(name: string): boolean {
+  return COORDINATOR_SERVICE_UNITS.includes(name);
+}
+
+/** True for any coordinator unit we wrote, service or alert companion. */
+function isCoordinatorUnit(name: string): boolean {
+  return isCoordinatorServiceUnit(name) || COORDINATOR_ALERT_UNITS.includes(name);
+}
 
 /** The environment variable naming the coordinator's own home. */
 export const COORDINATOR_HOME_ENV = "RUSA_QUOTA_COORDINATOR_HOME";
@@ -49,10 +80,7 @@ export function readInstalledCoordinatorUnits(
   unitNames: readonly string[]
 ): InstalledCoordinatorUnit[] {
   return unitNames
-    .filter((name) => {
-      const match = COORDINATOR_UNIT_RE.exec(name);
-      return match !== null && match[2] === undefined;
-    })
+    .filter(isCoordinatorServiceUnit)
     .sort()
     .map((unit) => {
       let contents: string;
@@ -169,7 +197,7 @@ export function planCoordinatorTransition(unitNames: readonly string[]): Coordin
   const removeUnits = unitNames
     .filter(
       (name) =>
-        COORDINATOR_UNIT_RE.test(name) &&
+        isCoordinatorUnit(name) &&
         name !== POOL_COORDINATOR_UNIT &&
         name !== POOL_COORDINATOR_ALERT_UNIT
     )
@@ -187,10 +215,18 @@ export function planCoordinatorTransition(unitNames: readonly string[]): Coordin
  * written down (#525). Reading it is not the coupling #507 removes: nothing
  * about the coordinator's identity, home, unit name, or database comes from
  * here, and the installer reports which unit it borrowed from.
+ *
+ * Named rather than discovered by scanning, because an instance unit has no
+ * distinguishing suffix the way `-quota-coordinator` does — scanning
+ * `~/.config/systemd/user/*.service` would mean guessing which of the user's
+ * units are rusa instances, and a wrong guess donates a stranger's `PATH` to
+ * the probe. These two are not an assumption about the pool's membership:
+ * `install-service` writes its unit as `resolveServiceBasename(environment)`,
+ * which is `production ? "rusa" : "rusa-staging"`, so this is the complete set
+ * of client unit names that command can produce. A third instance would have to
+ * change that derivation, which is the same edit that would extend this list.
  */
-export function poolClientUnitNames(): string[] {
-  return ["rusa.service", "rusa-staging.service"];
-}
+export const POOL_CLIENT_UNITS: readonly string[] = ["rusa.service", "rusa-staging.service"];
 
 export interface PoolProbePath {
   probePath: ProbePathEnv;
@@ -217,7 +253,7 @@ export interface PoolProbePath {
 export function resolvePoolProbePath(
   systemdUserDir: string,
   unitNames: readonly string[],
-  resolve: typeof resolveProbePathEnv = resolveProbePathEnv
+  resolveProbe: typeof resolveProbePathEnv = resolveProbePathEnv
 ): PoolProbePath {
   const installedUnits: string[] = [];
   for (const unit of unitNames) {
@@ -228,7 +264,7 @@ export function resolvePoolProbePath(
       continue;
     }
     installedUnits.push(unit);
-    const probePath = resolve(unit, contents);
+    const probePath = resolveProbe(unit, contents);
     if (probePath.source !== "process") return { probePath, donorUnit: unit, installedUnits };
   }
   return {

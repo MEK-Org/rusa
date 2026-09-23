@@ -27,9 +27,9 @@ import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   COORDINATOR_HOME_ENV,
   type CoordinatorServiceContext,
+  POOL_CLIENT_UNITS,
   POOL_COORDINATOR_UNIT,
   planCoordinatorTransition,
-  poolClientUnitNames,
   readInstalledCoordinatorUnits,
   resolveCoordinatorServiceContext,
   resolvePoolProbePath,
@@ -866,7 +866,7 @@ export function describePoolProbePathSource(
       "reinstall a client instance to give it one"
     );
   }
-  return `from this shell (no pool client unit installed yet: ${poolClientUnitNames().join(", ")})`;
+  return `from this shell (no pool client unit installed yet: ${POOL_CLIENT_UNITS.join(", ")})`;
 }
 
 /**
@@ -932,7 +932,7 @@ export async function runInstallQuotaCoordinator(opts?: {
   // starts, and a config still naming the pre-service file is refused here
   // rather than by a unit that fails on its first start.
   const { databasePath } = resolveCoordinatorDatabasePaths(config, context.home);
-  assertDatabaseIdentityPreserved({
+  const databaseIdentityNote = assertDatabaseIdentityPreserved({
     systemdUserDir,
     serviceUnit: context.serviceUnit,
     home: context.home,
@@ -951,7 +951,7 @@ export async function runInstallQuotaCoordinator(opts?: {
     probePath,
     donorUnit,
     installedUnits: installedClientUnits,
-  } = resolvePoolProbePath(systemdUserDir, poolClientUnitNames());
+  } = resolvePoolProbePath(systemdUserDir, POOL_CLIENT_UNITS);
   const userPath = probePath.path;
 
   const providerCommands = configuredProviderCommands(config);
@@ -1018,6 +1018,9 @@ export async function runInstallQuotaCoordinator(opts?: {
   console.log(`- Service home: ${context.home} (${describeHomeSource(context)})`);
   console.log(`- Socket: ${socketPath}`);
   console.log(`- Database: ${databasePath}`);
+  if (databaseIdentityNote) {
+    console.log(`- Database identity: ${databaseIdentityNote}`);
+  }
   console.log(
     `- Backups: ${config.quota?.coordinator?.backupDir?.trim() ?? defaultQuotaBackupDir(databasePath)}`
   );
@@ -1057,9 +1060,22 @@ function describeHomeSource(context: CoordinatorServiceContext): string {
  * The one thing a packaging change must not do is move the pool's authoritative
  * quota history. If a coordinator unit is already installed against a different
  * home, this compares the file that unit resolves with the file this install
- * would resolve, and stops when they differ. It does not read the old home's
- * config to decide whether to *proceed* — an unreadable old home is simply
- * unknown and not an obstacle — only to decide whether to *stop*.
+ * would resolve, and stops when they differ.
+ *
+ * It stops just as firmly when the prior home's config cannot be read or
+ * parsed. An unreadable prior home is not evidence that the database is
+ * staying put; it is the absence of evidence either way, and this install is
+ * already naming a *different* home than the running unit does, so proceeding
+ * would be guessing with the pool's history on the table. That degraded state
+ * is also exactly when an operator most wants to be asked. The transition
+ * itself never reaches here — adopting the installed unit's home makes prior
+ * and new the same home — so the refusal costs only the case where someone
+ * deliberately renamed the home on a host whose old config is broken, and
+ * `--allow-database-change` says to do it anyway.
+ *
+ * Returns a line for the install summary when the check could not be made at
+ * all — an installed unit that names no `RUSA_HOME` gives nothing to compare —
+ * so "not verified" is never printed as though it were "verified identical".
  */
 function assertDatabaseIdentityPreserved(opts: {
   systemdUserDir: string;
@@ -1067,20 +1083,31 @@ function assertDatabaseIdentityPreserved(opts: {
   home: string;
   databasePath: string;
   allowDatabaseChange: boolean;
-}): void {
-  if (opts.allowDatabaseChange) return;
+}): string | null {
+  if (opts.allowDatabaseChange) {
+    return "not checked (--allow-database-change)";
+  }
   const unitPath = join(opts.systemdUserDir, opts.serviceUnit);
-  if (!existsSync(unitPath)) return;
+  if (!existsSync(unitPath)) return null;
   const priorHome = readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME");
-  if (!priorHome || priorHome === opts.home) return;
+  if (!priorHome) {
+    return `not verified — installed ${opts.serviceUnit} names no RUSA_HOME to compare against`;
+  }
+  if (priorHome === opts.home) return null;
 
   let priorDatabase: string;
   try {
     priorDatabase = resolveCoordinatorDatabasePaths(loadConfig(priorHome), priorHome).databasePath;
-  } catch {
-    return;
+  } catch (error) {
+    throw new Error(
+      `${opts.serviceUnit} runs against home ${priorHome}, whose config could not be read ` +
+        `(${error instanceof Error ? error.message : String(error)}), so which database it opens ` +
+        `is unknown. Installing against ${opts.home} would point it at ${opts.databasePath}, and ` +
+        "that may be a different file than the pool's authoritative quota history. Re-run with " +
+        "--allow-database-change if that is the intent; neither file is touched either way."
+    );
   }
-  if (priorDatabase === opts.databasePath) return;
+  if (priorDatabase === opts.databasePath) return null;
 
   throw new Error(
     `${opts.serviceUnit} currently opens ${priorDatabase} (home ${priorHome}); installing against ` +
@@ -1100,31 +1127,52 @@ function assertDatabaseIdentityPreserved(opts: {
  * coordinator's database file is left exactly where it is, and is named here so
  * an operator can see what it was.
  *
+ * A unit is removed only after it is observed to have stopped. A failed
+ * `disable --now` whose result was discarded would delete the unit file out
+ * from under a still-running duplicate and then report it retired, leaving two
+ * coordinators probing the same providers — the exact condition this migration
+ * exists to end, in the one state where nothing on the host records it any
+ * more. So a stop failure ends the install instead, before the new unit is
+ * reloaded and started; re-running after stopping it by hand is idempotent.
+ *
  * `stopUnit` is the seam a test drives this through: the decision of what to
  * retire, the removal, and the reporting are the parts worth exercising, and
- * none of them should require a live user manager to observe.
+ * none of them should require a live user manager to observe. It reports
+ * whether the unit actually stopped.
  */
 export function retireEnvironmentDerivedCoordinators(
   systemdUserDir: string,
   installedUnitNames: readonly string[],
-  stopUnit: (unit: string) => void = (unit) => {
-    runQuietly("systemctl", ["--user", "disable", "--now", unit]);
-  }
+  stopUnit: (unit: string) => boolean = (unit) =>
+    runQuietly("systemctl", ["--user", "disable", "--now", unit])
 ): string[] {
   const { removeUnits } = planCoordinatorTransition(installedUnitNames);
   const retired: string[] = [];
+  const unstoppable: string[] = [];
   for (const unit of removeUnits) {
     const unitPath = join(systemdUserDir, unit);
     const retiredHome = existsSync(unitPath)
       ? readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME")
       : null;
-    stopUnit(unit);
+    if (!stopUnit(unit)) {
+      unstoppable.push(unit);
+      console.warn(`⚠️  Could not stop ${unit}; leaving its unit file in place`);
+      continue;
+    }
     rmSync(unitPath, { force: true });
     retired.push(unit);
     console.log(`✓ Retired duplicate pool coordinator ${unit}`);
     if (retiredHome) {
       console.log(`  its home ${retiredHome} and any database under it are left untouched on disk`);
     }
+  }
+  if (unstoppable.length > 0) {
+    throw new Error(
+      `Could not stop and disable ${unstoppable.join(", ")}. Each is a duplicate pool coordinator ` +
+        "probing the same providers as the one being installed, so this install stops here rather " +
+        "than starting a second one alongside it. Stop them by hand " +
+        `(systemctl --user disable --now ${unstoppable[0]}) and re-run; nothing was deleted.`
+    );
   }
   return retired;
 }
@@ -1142,7 +1190,7 @@ export function retireEnvironmentDerivedCoordinators(
  * to get it, and changes nothing.
  */
 function reportClientOrdering(systemdUserDir: string, coordinatorUnit: string): void {
-  for (const unit of poolClientUnitNames()) {
+  for (const unit of POOL_CLIENT_UNITS) {
     const unitPath = join(systemdUserDir, unit);
     if (!existsSync(unitPath)) continue;
     const contents = readFileSync(unitPath, "utf-8");

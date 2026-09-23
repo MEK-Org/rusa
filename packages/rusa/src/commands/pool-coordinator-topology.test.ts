@@ -1,8 +1,7 @@
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RusaConfig } from "../config/types.js";
 import {
   POOL_COORDINATOR_ALERT_UNIT,
   POOL_COORDINATOR_UNIT,
@@ -17,7 +16,6 @@ import {
   retireEnvironmentDerivedCoordinators,
   unitOrdersAfter,
 } from "./install-service.js";
-import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 
 /**
  * Issue #507's acceptance condition: two client instances consume one
@@ -31,7 +29,6 @@ import { resolveQuotaCoordinatorSocketPath } from "./quota-coordinator.js";
 
 const POOL_HOME = "/home/u/.rusa";
 const STAGING_HOME = "/home/u/.rusa-staging";
-const SOCKET = "/run/user/1000/rusa-quota/coordinator.sock";
 
 let systemdUserDir: string;
 let logs: string[];
@@ -92,6 +89,7 @@ function retire(): { retired: string[]; stopped: string[] } {
   const stopped: string[] = [];
   const retired = retireEnvironmentDerivedCoordinators(systemdUserDir, unitNames(), (unit) => {
     stopped.push(unit);
+    return true;
   });
   return { retired, stopped };
 }
@@ -148,19 +146,53 @@ describe("two client instances, one pool coordinator", () => {
     }
   });
 
-  it("has both clients dial the one socket while naming no database of their own", () => {
-    const client: RusaConfig["quota"] = { coordinator: { socketPath: SOCKET } };
-    const production = { quota: client } as RusaConfig;
-    const staging = { quota: client } as RusaConfig;
-
-    expect(resolveQuotaCoordinatorSocketPath(production)).toBe(SOCKET);
-    expect(resolveQuotaCoordinatorSocketPath(staging)).toBe(
-      resolveQuotaCoordinatorSocketPath(production)
+  it("changes no client unit, because provisioning and connecting are separate acts", () => {
+    seedEnvironmentDerivedHost();
+    const before = new Map(
+      ["rusa.service", "rusa-staging.service"].map((unit) => [
+        unit,
+        readFileSync(join(systemdUserDir, unit), "utf-8"),
+      ])
     );
-    // A client that named a database would be a second writer against the pool's
-    // history; connection is the whole of a client's coordinator configuration.
-    expect(production.quota?.databasePath).toBeUndefined();
-    expect(production.quota?.coordinator?.databasePath).toBeUndefined();
+
+    retire();
+
+    // The old installer retrofitted After=/Wants= into the instance unit that
+    // matched its --environment. Reaching into a unit `install-service` owns is
+    // the coupling #507 removes, and an instance unit is also the one thing in
+    // this directory a widened match would be most likely to reach.
+    for (const [unit, contents] of before) {
+      expect(readFileSync(join(systemdUserDir, unit), "utf-8")).toBe(contents);
+    }
+  });
+
+  it("leaves a coordinator-shaped unit this project never wrote exactly where it is", () => {
+    seedEnvironmentDerivedHost();
+    writeUnit("acme-quota-coordinator.service", "[Service]\nExecStart=/opt/acme/bin/collector\n");
+
+    const { retired, stopped } = retire();
+
+    expect(retired).not.toContain("acme-quota-coordinator.service");
+    expect(stopped).not.toContain("acme-quota-coordinator.service");
+    expect(unitNames()).toContain("acme-quota-coordinator.service");
+  });
+
+  it("stops before deleting: a unit that will not stop is left installed and the install fails", () => {
+    seedEnvironmentDerivedHost();
+    const stopped: string[] = [];
+
+    // Deleting the unit file of a duplicate that is still running would leave
+    // two coordinators probing the same providers with nothing on the host left
+    // to say so — the condition this whole transition exists to end.
+    expect(() =>
+      retireEnvironmentDerivedCoordinators(systemdUserDir, unitNames(), (unit) => {
+        stopped.push(unit);
+        return unit !== "rusa-staging-quota-coordinator.service";
+      })
+    ).toThrow(/Could not stop and disable rusa-staging-quota-coordinator\.service/);
+
+    expect(stopped).toContain("rusa-staging-quota-coordinator.service");
+    expect(unitNames()).toContain("rusa-staging-quota-coordinator.service");
   });
 
   it("adopts the surviving coordinator's home, so the pool database does not move", () => {

@@ -4,15 +4,30 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   COORDINATOR_HOME_ENV,
+  POOL_CLIENT_UNITS,
   POOL_COORDINATOR_ALERT_UNIT,
   POOL_COORDINATOR_UNIT,
   planCoordinatorTransition,
-  poolClientUnitNames,
   readInstalledCoordinatorUnits,
   resolveCoordinatorServiceContext,
   resolvePoolProbePath,
 } from "./coordinator-provisioning.js";
 import { resolveProbePathEnv } from "./service-instance.js";
+
+/**
+ * Unit-level cover for the provisioning decisions, where
+ * `pool-coordinator-topology.test.ts` is #507's acceptance check and asserts on
+ * the installed topology a transition leaves behind.
+ *
+ * The split is by what a test can show. An end-to-end topology assertion shows
+ * what *happened*; the cases that earn their place here are the ones about what
+ * must **not** happen and so leave no topology to look at — the refusals (two
+ * disagreeing units, no home from any source, a foreign unit left alone) — plus
+ * the resolution order between flag, env, and adoption, which a single seeded
+ * host cannot exercise because it has one answer. The adoption cases the two
+ * files share are deliberate: this one pins the decision, the other pins that
+ * the decision reaches the host.
+ */
 
 let systemdUserDir: string;
 
@@ -73,6 +88,17 @@ describe("readInstalledCoordinatorUnits", () => {
     ).toEqual([]);
   });
 
+  it("does not read a home out of a unit this project never wrote", () => {
+    // Same narrow set as the deletion path, for a quieter reason: an adopted
+    // home flows into the config path, the workers dir, and the database the
+    // service opens, so a stranger's unit must not be able to donate one.
+    writeUnit("acme-quota-coordinator.service", coordinatorUnit("/opt/acme"));
+
+    expect(
+      readInstalledCoordinatorUnits(systemdUserDir, ["acme-quota-coordinator.service"])
+    ).toEqual([]);
+  });
+
   it("reports a home of null for a unit that has gone missing under it", () => {
     expect(readInstalledCoordinatorUnits(systemdUserDir, [POOL_COORDINATOR_UNIT])).toEqual([
       { unit: POOL_COORDINATOR_UNIT, home: null },
@@ -130,6 +156,9 @@ describe("resolveCoordinatorServiceContext", () => {
     expect(context.adoptedFrom).toBe("rusa-staging-quota-coordinator.service");
   });
 
+  // Reachable only through a caller that supplies its own candidates: the units
+  // read off a host are the two known names, and the pool one wins when both are
+  // there. Kept because silently picking one of two homes picks a database.
   it("refuses to guess between two disagreeing units, because that picks a database", () => {
     expect(() =>
       resolveCoordinatorServiceContext({
@@ -176,6 +205,21 @@ describe("planCoordinatorTransition", () => {
         .removeUnits
     ).toEqual([]);
   });
+
+  it("removes only units this project could have written, never a stranger's", () => {
+    // The plan is the input to deletion, and the directory it is built from is
+    // the user's own `~/.config/systemd/user`, which holds every service they
+    // have installed. A unit shaped like a coordinator but never written here
+    // is not ours to stop, disable, or delete.
+    expect(
+      planCoordinatorTransition([
+        "acme-quota-coordinator.service",
+        "acme-quota-coordinator-alert.service",
+        "rusa-blue-quota-coordinator.service",
+        POOL_COORDINATOR_UNIT,
+      ]).removeUnits
+    ).toEqual([]);
+  });
 });
 
 describe("resolvePoolProbePath", () => {
@@ -195,7 +239,7 @@ describe("resolvePoolProbePath", () => {
     writeUnit("rusa.service", ["[Service]", "Environment=PATH=/opt/providers/bin:/usr/bin"]);
     writeUnit("rusa-staging.service", ["[Service]", "Environment=PATH=/usr/bin"]);
 
-    const borrowed = resolvePoolProbePath(systemdUserDir, poolClientUnitNames(), noSystemd);
+    const borrowed = resolvePoolProbePath(systemdUserDir, POOL_CLIENT_UNITS, noSystemd);
     expect(borrowed.donorUnit).toBe("rusa.service");
     expect(borrowed.probePath).toEqual({
       path: "/opt/providers/bin:/usr/bin",
@@ -210,7 +254,7 @@ describe("resolvePoolProbePath", () => {
 
     const borrowed = resolvePoolProbePath(
       systemdUserDir,
-      poolClientUnitNames(),
+      POOL_CLIENT_UNITS,
       withSystemd({ "rusa.service": "/opt/providers/bin:/usr/bin" })
     );
     expect(borrowed.donorUnit).toBe("rusa.service");
@@ -224,7 +268,7 @@ describe("resolvePoolProbePath", () => {
     writeUnit("rusa.service", ["[Service]", "Environment=RUSA_HOME=/home/u/.rusa"]);
     writeUnit("rusa-staging.service", ["[Service]", "Environment=PATH=/opt/providers/bin"]);
 
-    const borrowed = resolvePoolProbePath(systemdUserDir, poolClientUnitNames(), noSystemd);
+    const borrowed = resolvePoolProbePath(systemdUserDir, POOL_CLIENT_UNITS, noSystemd);
     expect(borrowed.donorUnit).toBe("rusa-staging.service");
     expect(borrowed.probePath.path).toBe("/opt/providers/bin");
   });
@@ -232,7 +276,7 @@ describe("resolvePoolProbePath", () => {
   it("falls back to this shell when the coordinator is installed before any client", () => {
     mkdirSync(join(systemdUserDir, "empty"), { recursive: true });
 
-    const borrowed = resolvePoolProbePath(systemdUserDir, poolClientUnitNames(), noSystemd);
+    const borrowed = resolvePoolProbePath(systemdUserDir, POOL_CLIENT_UNITS, noSystemd);
     expect(borrowed.donorUnit).toBeNull();
     expect(borrowed.installedUnits).toEqual([]);
     expect(borrowed.probePath.source).toBe("process");
@@ -243,7 +287,7 @@ describe("resolvePoolProbePath", () => {
     // #525 — so it has to be distinguishable from having no client at all.
     writeUnit("rusa.service", ["[Service]", "Environment=RUSA_HOME=/home/u/.rusa"]);
 
-    const borrowed = resolvePoolProbePath(systemdUserDir, poolClientUnitNames(), noSystemd);
+    const borrowed = resolvePoolProbePath(systemdUserDir, POOL_CLIENT_UNITS, noSystemd);
     expect(borrowed.donorUnit).toBeNull();
     expect(borrowed.installedUnits).toEqual(["rusa.service"]);
     expect(borrowed.probePath.source).toBe("process");
