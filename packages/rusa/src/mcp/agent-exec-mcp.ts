@@ -1012,7 +1012,7 @@ export function createAgentExecMcpServer(
         {
           title: "Delete a runtime model class (model-admin)",
           description:
-            "Delete a model class from mesh.db. Refuses deletion while any live actor is still bound to this class by reference — including a set_actor_model rebind staged for that actor's next run boundary — and names those actors so the caller rebinds them first (set_actor_model with an explicit pool or another class). Retired actors do not prevent deletion, and actors holding an explicit concrete pool are unaffected. Deleting a class nothing references stays a plain delete. Requires the model-admin capability.",
+            "Delete a model class from mesh.db. Refuses deletion while any live actor is still bound to this class by reference — including a set_actor_model rebind staged for that actor's next run boundary — and names those actors so the caller rebinds them first (set_actor_model with an explicit pool or another class). A rebind that is only staged still counts as a reference until it reaches that actor's run boundary, so an actor you just rebound may still be named. Retired actors do not prevent deletion, and actors holding an explicit concrete pool are unaffected. Deleting a class nothing references stays a plain delete. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact class name to delete."),
           },
@@ -1022,14 +1022,26 @@ export function createAgentExecMcpServer(
           if (denied) return denied;
           try {
             const className = assertClassName(name);
-            // `ModelClassRepository.delete` already refuses a class any live
-            // row still references, so this scan exists for the one binding
-            // the actors table cannot show: a staged `set_actor_model` that has
-            // not reached its run boundary yet. That rebind persists the class
-            // reference when `applyPendingModel` runs, and would then fail to
-            // resolve. Reporting both dimensions together also means the caller
-            // gets one list to rebind rather than discovering the second after
-            // clearing the first.
+            // The whole reference guard lives here rather than in
+            // `ModelClassRepository.delete`, because only here is it complete:
+            // a binding has a committed half in `model_config` and a staged
+            // half — a `set_actor_model` that has not reached its run boundary
+            // — that lives in process memory and is in no table.
+            //
+            // The two halves are read asymmetrically on purpose. A staged
+            // arrival counts as a reference; a staged departure does not clear
+            // one. An actor bound to this class with a rebind staged still
+            // blocks the delete, because the staged overlay is discardable: if
+            // the instance restarts before the run boundary the rebind
+            // evaporates and the committed binding is still there. Refusing on
+            // the committed state and only ever adding to it from the staged
+            // state is therefore fail-safe in both directions. The operator
+            // consequence is that a staged rebind must be applied, not just
+            // staged, before its class can be deleted.
+            //
+            // Sorted by id so the message is stable: `mesh.list()` is ordered
+            // by `created_at, id`, which is spawn order, and spawn order is
+            // not something a caller reading an error can predict.
             const liveReferencing = mesh
               .list()
               .filter(

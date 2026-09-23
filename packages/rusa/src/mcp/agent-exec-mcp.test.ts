@@ -140,6 +140,11 @@ function setup(
      * parentless actor that holds no grants.
      */
     seedRootGrants?: boolean;
+    /**
+     * Deterministic spawn ids. Real ids are random UUIDs, so a test that needs
+     * id order to differ from spawn order has to name the ids itself.
+     */
+    idgen?: () => string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -201,7 +206,7 @@ function setup(
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
-    idgen: () => `t${++seq}`,
+    idgen: opts.idgen ?? (() => `t${++seq}`),
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
     handleForId: opts.handleForId,
@@ -3029,7 +3034,14 @@ describe("runtime model-class management", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const store = new ModelClassRepository(db);
-    const { mesh } = setup(hooks(store));
+    // Spawn order and id order disagree, so the assertion below fails if the
+    // `.sort()` in `delete_model_class` is dropped: without it the message
+    // would carry `mesh.list()`'s `ORDER BY created_at, id` — spawn order.
+    // The harness's default `t1`, `t2` ids sort into spawn order, so they
+    // cannot tell the two apart.
+    const ids = ["worker-z", "worker-a"];
+    let next = 0;
+    const { mesh } = setup({ ...hooks(store), idgen: () => ids[next++] });
     const root = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
     );
@@ -3042,17 +3054,13 @@ describe("runtime model-class management", () => {
       },
     });
 
-    const spawn1 = (await root.callTool({
-      name: "spawn_thread",
-      arguments: { charter: "w1", model_config: { class: "pool-class" }, context_mode: "ledger" },
-    })) as CallToolResult;
-    const spawn2 = (await root.callTool({
-      name: "spawn_thread",
-      arguments: { charter: "w2", model_config: { class: "pool-class" }, context_mode: "ledger" },
-    })) as CallToolResult;
-    const id1 = (dataOf(spawn1) as { thread_id: string }).thread_id;
-    const id2 = (dataOf(spawn2) as { thread_id: string }).thread_id;
-    const sorted = [id1, id2].sort();
+    for (const charter of ["w1", "w2"]) {
+      const spawned = (await root.callTool({
+        name: "spawn_thread",
+        arguments: { charter, model_config: { class: "pool-class" }, context_mode: "ledger" },
+      })) as CallToolResult;
+      expect(spawned.isError).toBeFalsy();
+    }
 
     const deleteRes = (await root.callTool({
       name: "delete_model_class",
@@ -3060,8 +3068,9 @@ describe("runtime model-class management", () => {
     })) as CallToolResult;
     expect(deleteRes.isError).toBe(true);
     expect(String(dataOf(deleteRes))).toContain(
-      `Cannot delete model class 'pool-class': referenced by live actor(s): ${sorted.join(", ")}. Rebind these actors first.`
+      "Cannot delete model class 'pool-class': referenced by live actor(s): worker-a, worker-z. Rebind these actors first."
     );
+    expect(store.get("pool-class")).toBeDefined();
     db.close();
   });
 
