@@ -52,6 +52,7 @@ describe("buildE2EConfig", () => {
 
     const loaded = loadConfig(home);
     expect(loaded.github.account).toBeTruthy();
+    expect(loaded.github.repos).toEqual(["rusa-e2e/scratch"]);
     expect(Object.keys(loaded.providers).length).toBeGreaterThan(0);
     expect(loaded.geminiApiKey).toBeTruthy();
     expect(loaded.understanding?.rootNodeId).toBe(E2E_IU_ROOT_NODE_ID);

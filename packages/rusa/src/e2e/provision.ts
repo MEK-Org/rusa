@@ -83,7 +83,10 @@ export function buildE2EConfig(opts: {
     rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
     ...(opts.slack ? { slack: opts.slack } : {}),
-    github: { account: E2E_BOT },
+    // The scratch repo is this instance's configured GitHub event source, as a
+    // real instance declares its repos — so actors can subscribe to its issues
+    // and PRs and the local tracker's events route to them.
+    github: { account: E2E_BOT, repos: [E2E_REPO] },
     providers: {
       ...(base?.providers ?? { antigravity: { cliCommand: "agy" } }),
       fake: { cliCommand: "fake" },

@@ -2113,6 +2113,36 @@ describe("handleMeshApiRequest", () => {
     expect(entry.payload).toEqual({ type: "issue_comment.created", commentId: 1 });
   });
 
+  it("GET /api/mesh/inbox resolves the comment a GitHub event names alongside its source", async () => {
+    inbox.append([
+      {
+        id: "github-comment-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/627",
+        payload: { type: "pull_request_review_comment.created", commentId: 4077377741 },
+      },
+      {
+        id: "github-closed-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/627",
+        payload: { type: "pull_request.closed", merged: true },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entries = JSON.parse(res.body).entries as Array<{
+      id: string;
+      reference?: { ref: string };
+      eventReference?: { ref: string };
+    }>;
+    const comment = entries.find((e) => e.id === "github-comment-entry");
+    const closed = entries.find((e) => e.id === "github-closed-entry");
+    // The PR stays the entry's reference; the comment is resolved beside it.
+    expect(comment?.reference?.ref).toBe("github:MEK-Org/rusa/pulls/627");
+    expect(comment?.eventReference?.ref).toBe("github:MEK-Org/rusa/pulls/627/comments/4077377741");
+    expect(closed?.eventReference).toBeUndefined();
+  });
+
   it("GET /api/mesh/inbox leaves a Google Chat space source unresolved (no per-message reference)", async () => {
     // A chat event's `source` is the containing space (routing granularity),
     // not the specific message — resolving it here would show the wrong

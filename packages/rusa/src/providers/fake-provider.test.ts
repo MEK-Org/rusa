@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { McpHttpServer } from "../mcp/http-server.js";
 import { toolOk } from "../mcp/result.js";
@@ -75,6 +75,61 @@ describe("FakeProvider scripted runs", () => {
     await expect(provider.run({ cwd: "/tmp", prompt: "no marker" })).resolves.toMatchObject({
       output: "ordinary",
       exitCode: 7,
+    });
+  });
+
+  describe("scripted delayMs", () => {
+    const script = (delayMs: number) =>
+      `charter\nFAKE_PROVIDER_OUTPUT: ${JSON.stringify({ delayMs, output: "held" })}`;
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("holds the run open for the scripted time and keeps delayMs out of the result", async () => {
+      vi.useFakeTimers();
+      const provider = new FakeProvider();
+      let settled = false;
+      const run = provider.run({ cwd: "/tmp", prompt: script(60_000) }).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await run;
+      expect(result).toMatchObject({ success: true, output: "held" });
+      expect(result).not.toHaveProperty("delayMs");
+    });
+
+    it("streams a heartbeat while held, so the stall watchdog sees a live run", async () => {
+      vi.useFakeTimers();
+      const provider = new FakeProvider();
+      const chunks: string[] = [];
+      const run = provider.run({
+        cwd: "/tmp",
+        prompt: script(3 * 60_000 + 1),
+        onChunk: (chunk) => chunks.push(chunk),
+      });
+
+      await vi.advanceTimersByTimeAsync(3 * 60_000 + 1);
+      await run;
+      expect(chunks).toHaveLength(3);
+    });
+
+    it("ends the hold as soon as the run is aborted", async () => {
+      vi.useFakeTimers();
+      const provider = new FakeProvider();
+      const controller = new AbortController();
+      const run = provider.run({
+        cwd: "/tmp",
+        prompt: script(3_600_000),
+        signal: controller.signal,
+      });
+
+      controller.abort();
+      await expect(run).resolves.toMatchObject({ output: "held" });
     });
   });
 });

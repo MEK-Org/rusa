@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ContextConfig } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
+import { normalizeEventResource } from "../actor/event-subscriptions.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
 import type { SlackConfig } from "../config/types.js";
@@ -536,6 +537,23 @@ export function startRootControlServer(opts: {
           const id = decodeURIComponent(retireMatch[1]);
           opts.handles.rootControl.retireChild(id, "e2e-controller");
           send(res, 200, { id, status: "retired" });
+          return;
+        }
+        // Subscribe an actor to an event source, as its own
+        // `subscribe_event_source` tool would — so a scenario can route tracker
+        // events to a chosen actor's inbox without scripting the call.
+        const subscribeMatch = url.pathname.match(/^\/actors\/([^/]+)\/subscriptions$/);
+        if (subscribeMatch) {
+          const actorId = decodeURIComponent(subscribeMatch[1]);
+          let resource: string;
+          try {
+            resource = normalizeEventResource(String(body.source ?? ""));
+          } catch (err) {
+            send(res, 400, { error: err instanceof Error ? err.message : String(err) });
+            return;
+          }
+          opts.handles.mesh.addEventSourceSubscriber(resource, actorId, actorId);
+          send(res, 200, { ok: true, resource });
           return;
         }
         const messageMatch = url.pathname.match(/^\/actors\/([^/]+)\/messages$/);

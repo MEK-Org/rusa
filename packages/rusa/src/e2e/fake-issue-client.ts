@@ -136,7 +136,19 @@ export class FakeIssueClient implements IssueClient {
 
   async getIssue(_repo: string, issueNumber: number): Promise<IssueDetails> {
     const issue = this.tracker.getIssue(issueNumber);
-    if (!issue) throw new Error(`Issue #${issueNumber} not found in local tracker`);
+    if (!issue) {
+      // GitHub's issues API also serves PRs (they share one numbering space),
+      // which is how a reference to a PR is read.
+      const pr = this.tracker.getPr(issueNumber);
+      if (!pr) throw new Error(`Issue #${issueNumber} not found in local tracker`);
+      return {
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+        state: pr.state,
+        author: pr.author,
+      };
+    }
     return {
       number: issue.number,
       title: issue.title,
@@ -148,9 +160,14 @@ export class FakeIssueClient implements IssueClient {
   }
 
   async listIssueComments(_repo: string, issueNumber: number): Promise<IssueComment[]> {
+    // Issues and PRs share one numbering space, and GitHub serves a PR's
+    // conversation through the issue-comments API.
     const issue = this.tracker.getIssue(issueNumber);
-    if (!issue) throw new Error(`Issue #${issueNumber} not found in local tracker`);
-    return issue.comments.map((c) => ({
+    const comments =
+      issue?.comments ??
+      (this.tracker.getPr(issueNumber) ? this.tracker.listPrComments(issueNumber) : undefined);
+    if (!comments) throw new Error(`Issue #${issueNumber} not found in local tracker`);
+    return comments.map((c) => ({
       id: c.id,
       author: c.author,
       body: c.body,
