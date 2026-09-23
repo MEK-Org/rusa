@@ -3135,6 +3135,71 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
+  it("warns when a halt's model: matches no current or staged pool, and still places the hold", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    const config = {
+      github: { account: "mock-bot" },
+      providers: { claude: { cliCommand: "claude" } },
+      rootActor: { provider: "claude", model: "claude-sonnet-5" },
+      chat: {
+        projectId: "test",
+        subscription: "test",
+        pubsubKeyPath: "/dev/null",
+        gchat: "all",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    const message = (text: string, name: string) =>
+      chatSource.emit({
+        name,
+        spaceName: "spaces/test",
+        spaceType: "DIRECT_MESSAGE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text,
+        mentionsSelf: false,
+        isDirectMessage: true,
+      });
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // A transposed suffix: no run will ever resolve to this name, so the hold
+    // is inert for every caller that can name its model.
+    await message("/halt provider:claude model:claude-sonnet-5-hihg", "messages/halt-typo");
+    const typoAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(typoAck).toContain("Halted");
+    expect(typoAck).toContain("claude-sonnet-5-hihg");
+    expect(typoAck).toContain("no current or staged pool");
+    // The closest pool entry is offered back, and the hold stands as asked.
+    expect(typoAck).toContain("claude-sonnet-5");
+    expect(halt.isHalted("claude", "claude-sonnet-5-hihg")).toBe(true);
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+
+    await message("/resume", "messages/resume-typo");
+    expect(halt.isHalted()).toBe(false);
+
+    // The corrected halt names a pooled model and draws no warning.
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-correct");
+    const correctAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(correctAck).toContain("Halted");
+    expect(correctAck).not.toContain("no current or staged pool");
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+  });
+
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
     const config = {

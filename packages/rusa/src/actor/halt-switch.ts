@@ -186,3 +186,68 @@ function normalizeProvider(provider: string): string {
 function normalizeModel(model: string): string {
   return model.trim().toLowerCase();
 }
+
+/** One `/halt model:` scope that no pool entry names. */
+export interface UnpooledHaltModel {
+  /** The model as the operator named it, so the warning quotes them back. */
+  model: string;
+  /** Closest pool entries, nearest first — what they probably meant. */
+  nearest: string[];
+}
+
+/** How many pool entries a warning offers back before it stops being a hint. */
+const NEAREST_POOL_ENTRIES = 2;
+
+/**
+ * The `models` that no entry of `pooled` names, each with the closest pool
+ * entries to offer back.
+ *
+ * This is advisory and never a gate: halting a model that is not yet pooled is
+ * deliberate — an operator staging a rollout wants the hold in place *before*
+ * the model appears, so the first run on it cannot start. The caller places
+ * the halt as asked and uses this only to say what the mesh can presently see.
+ *
+ * Comparison is case-insensitive because {@link parseHaltCommand} lowercases
+ * what was typed while a pool keeps the provider's own casing; a literal
+ * compare would warn about models that are in fact held.
+ *
+ * An empty `pooled` yields nothing. A provider no live actor is using cannot
+ * tell a typo from a model the mesh has not been told about yet, and warning
+ * on every name there would teach the operator to ignore the warning.
+ */
+export function findUnpooledHaltModels(
+  models: readonly string[],
+  pooled: readonly string[]
+): UnpooledHaltModel[] {
+  if (pooled.length === 0) return [];
+  const known = new Set(pooled.map(normalizeModel));
+  const findings: UnpooledHaltModel[] = [];
+  for (const model of models) {
+    const normalized = normalizeModel(model);
+    if (known.has(normalized)) continue;
+    const nearest = [...new Set(pooled)]
+      .map((entry) => ({ entry, distance: editDistance(normalized, normalizeModel(entry)) }))
+      .sort((a, b) => a.distance - b.distance || a.entry.localeCompare(b.entry))
+      .slice(0, NEAREST_POOL_ENTRIES)
+      .map((candidate) => candidate.entry);
+    findings.push({ model, nearest });
+  }
+  return findings;
+}
+
+/** Levenshtein distance, for ranking pool entries against a name that missed. */
+function editDistance(a: string, b: string): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}

@@ -4495,6 +4495,32 @@ export class ActorMesh {
     return rec?.desiredModelConfig ?? rec?.modelConfig;
   }
 
+  /**
+   * Every model name `provider` appears under in a pool the mesh could still
+   * launch on — staged *and* current together, because a staged replacement is
+   * what the next run launches on ({@link launchModelConfig}) while the pool it
+   * replaces still governs a run already in flight, so a hold has to bite on
+   * either. Retired threads are excluded: their pools can never launch, and
+   * naming one would tell an operator a hold bites where it cannot.
+   *
+   * Read-only and advisory. `/halt provider:<p> model:<m>` deliberately accepts
+   * a model no pool names — staging a hold before a rollout is legitimate — so
+   * the chat ingestion site uses this only to warn that the scope it just
+   * recorded matches nothing currently launchable.
+   */
+  pooledModelsForProvider(provider: string): string[] {
+    const models = new Set<string>();
+    for (const record of this.actors.list()) {
+      if (record.status === "retired") continue;
+      for (const pool of [record.modelConfig, record.desiredModelConfig]) {
+        for (const entry of pool ?? []) {
+          if (entry.provider === provider) models.add(entry.model);
+        }
+      }
+    }
+    return [...models].sort();
+  }
+
   /** True only when every declared candidate in the pool is halted. */
   private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
     if (!modelConfig || modelConfig.length === 0) return false;

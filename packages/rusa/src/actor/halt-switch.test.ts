@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { HaltSwitch, parseHaltCommand } from "./halt-switch.js";
+import { findUnpooledHaltModels, HaltSwitch, parseHaltCommand } from "./halt-switch.js";
 
 describe("HaltSwitch", () => {
   let dir: string;
@@ -138,5 +138,35 @@ describe("parseHaltCommand", () => {
     expect(() => parseHaltCommand("/halt model:claude-sonnet-4-6")).toThrow(/requires a provider/);
     expect(() => parseHaltCommand("/halt providers:claude")).toThrow(/unknown halt option/);
     expect(() => parseHaltCommand("/halt models:claude-sonnet-4-6")).toThrow(/unknown halt option/);
+  });
+});
+
+describe("findUnpooledHaltModels", () => {
+  const pool = ["claude-opus-5", "claude-sonnet-5", "Gemini 3.7 Flash"];
+
+  it("finds the model no pool entry names and offers the closest entries", () => {
+    expect(findUnpooledHaltModels(["claude-opus-5-hihg"], pool)).toEqual([
+      { model: "claude-opus-5-hihg", nearest: ["claude-opus-5", "claude-sonnet-5"] },
+    ]);
+  });
+
+  it("matches a pool entry case-insensitively, because the parser lowercases what was typed", () => {
+    // `/halt provider:antigravity model:Gemini 3.7 Flash` arrives here lowercased;
+    // the pool keeps the provider's own casing, so a literal compare would warn
+    // about a model that is in fact held.
+    expect(findUnpooledHaltModels(["gemini 3.7 flash"], pool)).toEqual([]);
+  });
+
+  it("reports every unmatched model and keeps the operator's spelling", () => {
+    expect(findUnpooledHaltModels(["claude-opus-5", "gpt-5-codex"], pool)).toEqual([
+      { model: "gpt-5-codex", nearest: ["claude-opus-5", "claude-sonnet-5"] },
+    ]);
+  });
+
+  it("says nothing when the provider has no pool at all", () => {
+    // A provider no live actor is using cannot distinguish a typo from a model
+    // the mesh has simply not been told about; warning on every name there
+    // would teach the operator to ignore the warning.
+    expect(findUnpooledHaltModels(["anything"], [])).toEqual([]);
   });
 });

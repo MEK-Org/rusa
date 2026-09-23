@@ -52,7 +52,12 @@ import {
   routeRunFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
-import { type HaltCommand, HaltSwitch, parseHaltCommand } from "../actor/halt-switch.js";
+import {
+  findUnpooledHaltModels,
+  type HaltCommand,
+  HaltSwitch,
+  parseHaltCommand,
+} from "../actor/halt-switch.js";
 import {
   DEFAULT_ROOT_CHARTER,
   generateHandle,
@@ -3951,8 +3956,36 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const scope = parts.length ? parts.join(" and ") : "all actor runs";
         const expiry = haltCommand.until ? ` until ${haltCommand.until}` : "";
         const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
+        // A `model:` scope nothing can launch on is inert for every caller that
+        // names its model, so the acknowledgement would otherwise claim a scope
+        // that was never taken. Say so — but the hold still stands as asked,
+        // because holding a model before it is pooled is a deliberate way to
+        // stage a rollout.
+        const unpooled = findUnpooledHaltModels(
+          haltCommand.models ?? [],
+          (haltCommand.providers ?? []).flatMap((provider) =>
+            mesh.pooledModelsForProvider(provider)
+          )
+        );
+        const named = unpooled
+          .map((u) =>
+            u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
+          )
+          .join(", ");
+        // Advisory, never a gate: the hold is already placed above. Holding a
+        // model before it is pooled is how a rollout is staged, so this reports
+        // what the mesh can presently see and leaves the decision alone.
+        const warning = unpooled.length
+          ? ` ⚠️ ${named} — no current or staged pool names` +
+            ` ${unpooled.length === 1 ? "it" : "them"}. The hold stands and will bite if the` +
+            " model appears, but until then it stops only callers that cannot name a model," +
+            " and this halt must be resumed before a differently-spelled one can replace it."
+          : "";
         void cc
-          .send(msg.spaceName, `⛔ Halted ${scope}${expiry}.${flushed} Send /resume to continue.`)
+          .send(
+            msg.spaceName,
+            `⛔ Halted ${scope}${expiry}.${flushed} Send /resume to continue.${warning}`
+          )
           .catch(() => {});
         return;
       }
