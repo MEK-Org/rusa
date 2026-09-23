@@ -141,6 +141,17 @@ export class ModelClassRepository {
       .run(name, JSON.stringify(definition), at, at);
   }
 
+  /**
+   * Delete a model class definition from mesh.db.
+   *
+   * This is a plain delete: the reference guard lives at `delete_model_class`,
+   * the only caller, because only there is it complete. A live actor's binding
+   * has two parts — the committed `model_config` row and a `set_actor_model`
+   * staged in process memory that has not reached its run boundary yet — and
+   * the second is not in any table, so SQL here cannot see it. A guard at this
+   * layer would look complete and would not be, which is worse for the next
+   * caller than no guard at all (#636).
+   */
   delete(name: string): boolean {
     return this.db.prepare("DELETE FROM model_classes WHERE name = ?").run(name).changes > 0;
   }
