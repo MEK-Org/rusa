@@ -1306,9 +1306,17 @@ describe("ActorMesh", () => {
     mesh.sendMessage(explicit, "run", "root");
     await tick();
 
-    expect(applied).toEqual([
-      { id: classConfigured, pool: [{ provider: "claude", model: "edited" }] },
-    ]);
+    // Every publication is for the class-bound actor and carries the class's
+    // current definition; the explicit-pool actor is never published to. The
+    // count is deliberately not pinned: the refresh runs at each dispatch
+    // boundary and the assignment it makes is idempotent.
+    expect(applied.length).toBeGreaterThan(0);
+    expect(applied).toEqual(
+      applied.map(() => ({
+        id: classConfigured,
+        pool: [{ provider: "claude", model: "edited" }],
+      }))
+    );
     // Nothing was staged, so no model-set event was journalled for the refresh.
     expect(registry.get(classConfigured)?.desiredModelConfig).toBeUndefined();
   });
@@ -1406,25 +1414,6 @@ describe("ActorMesh", () => {
     expect(events).toContainEqual(
       expect.objectContaining({ kind: "actor_model_class_unresolved", actorId: id })
     );
-  });
-
-  it("retries a class-pool publication that the live actor rejects", async () => {
-    let attempts = 0;
-    const { mesh, registry } = setup({
-      onModelSet: () => {
-        if (++attempts === 1) throw new Error("live actor rejected the update");
-      },
-    });
-    const id = mesh.spawn({ charter: "class-bound", parentId: "root" });
-    replaceRecord(registry, id, {
-      modelClass: "fast",
-      modelConfig: [{ provider: "claude", model: "edited" }],
-    });
-
-    expect(() => mesh.applyPendingModel(id)).toThrow(/live actor rejected/);
-    mesh.applyPendingModel(id);
-
-    expect(attempts).toBe(2);
   });
 
   it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {

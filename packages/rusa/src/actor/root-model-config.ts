@@ -89,7 +89,7 @@ export function resolveRootBootModelConfig(input: {
   if (rootRecord?.modelClassError !== undefined) {
     throw new RootModelConfigStartupError(
       `root actor '${rootId}' is bound to model class "${rootRecord.modelClass}", which cannot be resolved: ${rootRecord.modelClassError}`,
-      "redefine that model class with set_model_class, or re-pin root to an explicit pool by replacing the root row's model_config in the actors table; startup never falls back to the configured rootActor tuple for a class-bound root"
+      "re-pin root to an explicit pool by replacing the root row's model_config in the actors table, or restore the class's row in the model_classes table — both are offline edits to mesh.db, because set_model_class is an MCP tool and reaching it needs the mesh this error is refusing to start; startup never falls back to the configured rootActor tuple for a class-bound root"
     );
   }
   const persisted = rootRecord?.modelConfig;

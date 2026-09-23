@@ -5071,7 +5071,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
           reason: expect.stringMatching(
             /bound to model class "frontier", which cannot be resolved/
           ),
-          action: expect.stringMatching(/redefine that model class with set_model_class/),
+          // The remediation must be executable without a running mesh: the
+          // offline re-pin leads, and set_model_class is named only as the
+          // tool that cannot be reached from here.
+          action: expect.stringMatching(
+            /^re-pin root to an explicit pool by replacing the root row's model_config in the actors table/
+          ),
         },
       ]);
       expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });

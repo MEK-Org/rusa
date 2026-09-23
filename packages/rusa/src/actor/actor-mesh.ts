@@ -831,14 +831,6 @@ export class ActorMesh {
    * Cleared when the class resolves again.
    */
   private readonly reportedModelClassFailures = new Map<string, string>();
-  /**
-   * The class pool last handed to each live actor, so the dispatch-boundary
-   * refresh re-publishes only after the class actually changed. Without it a
-   * single dispatch would push the same pool at every boundary that calls
-   * {@link applyPendingModel}.
-   */
-  private readonly publishedClassPools = new Map<string, string>();
-
   private readonly onModelSet?: (
     actorId: string,
     modelConfig: ProviderModelConfig[],
@@ -3903,7 +3895,6 @@ export class ActorMesh {
     if (record) this.runRetireCleanups(record);
     this.lifecycles.delete(id);
     // Per-actor model-class bookkeeping dies with the actor.
-    this.publishedClassPools.delete(id);
     this.reportedModelClassFailures.delete(id);
     this.log(`retired ${id}`);
   }
@@ -4222,15 +4213,10 @@ export class ActorMesh {
     }
 
     const appliedModelConfig = verified.modelConfig ?? newModelConfig;
-    // Publish before marking the pool delivered. The production callback updates
-    // the live Actor and can fail; recording first would suppress every retry
-    // while the durable record and dashboard show a pool the live actor lacks.
+    // Publish before journalling. The durable `actor_model_set` event below is
+    // the record that this pool reached the actor, so a publication that threw
+    // must not leave that claim behind.
     this.onModelSet?.(id, appliedModelConfig, verified);
-    if (boundClass !== undefined) {
-      this.publishedClassPools.set(id, JSON.stringify(appliedModelConfig));
-    } else {
-      this.publishedClassPools.delete(id);
-    }
 
     this.recordEvent({
       kind: "actor_model_set",
@@ -4252,11 +4238,11 @@ export class ActorMesh {
   private refreshClassBoundPool(id: string, record: ActorRecord): void {
     if (record.modelClass === undefined || !record.modelConfig) return;
     if (!this.runs.liveActor(id)?.setModelConfig) return;
-    const pool = JSON.stringify(record.modelConfig);
-    if (this.publishedClassPools.get(id) === pool) return;
+    // Unconditional: the publication is one idempotent field assignment on the
+    // live actor, so republishing an unchanged pool costs less than the
+    // bookkeeping that would skip it, and every dispatch boundary re-asserts
+    // the class's current definition.
     this.onModelSet?.(id, record.modelConfig, record);
-    // Do not suppress a retry until the live actor accepted the current pool.
-    this.publishedClassPools.set(id, pool);
   }
 
   /**

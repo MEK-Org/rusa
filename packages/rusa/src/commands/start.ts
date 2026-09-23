@@ -2406,9 +2406,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     onModelSet: (actorId, newModelConfig) => {
       const liveActor = mesh.get(actorId);
       if (liveActor && typeof liveActor.setModelConfig === "function") {
-        // Let ActorMesh retain a failed publication as retryable. Swallowing
-        // this exception here would make its class-pool cache claim success
-        // while the live actor continued to run its old pool (#626).
+        // One idempotent assignment on the live actor: a class-bound actor is
+        // re-published at every dispatch boundary, so this adopts the class's
+        // current definition for the run about to start (#626).
         liveActor.setModelConfig(newModelConfig);
       }
     },
