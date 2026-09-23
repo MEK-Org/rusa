@@ -34,7 +34,7 @@ class _Auth implements SessionAuth {
   Completer<SessionUser>? signInCompleter;
 
   @override
-  Stream<SessionUser?> authStateChanges() => changes.stream;
+  Stream<SessionUser?> userChanges() => changes.stream;
 
   @override
   Future<SessionUser> signInWithGoogle() async {
@@ -390,7 +390,7 @@ void main() {
   );
 
   test(
-    'an auth-state event during sign-in does not mark the dashboard ready early',
+    'a user-change event during sign-in does not mark the dashboard ready early',
     () async {
       final auth = _Auth(null);
       final pendingSignIn = Completer<SessionUser>();
@@ -452,7 +452,9 @@ void main() {
   });
 
   test('profile display label prefers name, then email, then Operator', () {
-    final named = FirebaseDashboardSession(_Auth(_User('token', displayName: 'Ada Lovelace')));
+    final named = FirebaseDashboardSession(
+      _Auth(_User('token', displayName: 'Ada Lovelace')),
+    );
     final emailed = FirebaseDashboardSession(
       _Auth(_User('token', displayName: ' ', email: 'ada@example.test')),
     );
@@ -462,6 +464,33 @@ void main() {
     expect(emailed.operatorDisplayName, 'ada@example.test');
     expect(unnamed.operatorDisplayName, 'Operator');
   });
+
+  test(
+    'a mounted session notifies when a user profile update changes its label',
+    () async {
+      final auth = _Auth(_User('token', displayName: 'Ada Lovelace'));
+      final session = FirebaseDashboardSession(
+        auth,
+        client: _Client([http.Response('{}', 200)]),
+      );
+      var notifications = 0;
+      session.addListener(() => notifications++);
+
+      session.start();
+      await Future<void>.delayed(Duration.zero);
+      final beforeUpdate = notifications;
+
+      auth.currentUser = _User('token', displayName: 'Grace Hopper');
+      auth.changes.add(auth.currentUser);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(session.operatorDisplayName, 'Grace Hopper');
+      expect(notifications, greaterThan(beforeUpdate));
+
+      session.dispose();
+      await auth.close();
+    },
+  );
 
   test(
     'a refused stream reconnect checks the session and only a 401 expires it',

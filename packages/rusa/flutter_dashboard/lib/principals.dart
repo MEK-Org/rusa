@@ -38,6 +38,18 @@ String viewerOwnerId(String? userPrincipalId) =>
 bool isViewerPrincipal(String? id, String? userPrincipalId) =>
     id != null && viewerPrincipalIds(userPrincipalId).contains(id);
 
+/// Whether [id] is the server-resolved principal for the person viewing this
+/// dashboard.
+///
+/// A read-compatible legacy alias is not enough on its own: it receives the
+/// profile label only when the server resolved that exact principal for this
+/// signed-in person.
+bool isVerifiedViewerPrincipal(String? id, String? userPrincipalId) =>
+    id != null &&
+    userPrincipalId != null &&
+    userPrincipalId.isNotEmpty &&
+    id == userPrincipalId;
+
 /// Whether typed owner text means "the viewing person" rather than an actor.
 ///
 /// Profile data is deliberately absent here. It is mutable presentation data,

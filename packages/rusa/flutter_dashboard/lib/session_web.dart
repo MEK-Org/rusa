@@ -85,7 +85,7 @@ class _FirebaseSessionAuth implements SessionAuth {
   }
 
   @override
-  Stream<SessionUser?> authStateChanges() => _auth.authStateChanges().map(
+  Stream<SessionUser?> userChanges() => _auth.userChanges().map(
     (user) => user == null ? null : _FirebaseSessionUser(user),
   );
 

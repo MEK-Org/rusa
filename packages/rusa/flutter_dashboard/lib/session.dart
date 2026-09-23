@@ -19,7 +19,10 @@ abstract interface class SessionUser {
 
 abstract interface class SessionAuth {
   SessionUser? get currentUser;
-  Stream<SessionUser?> authStateChanges();
+
+  /// A superset of authentication changes that also emits profile updates and
+  /// token refreshes for the current user.
+  Stream<SessionUser?> userChanges();
   Future<SessionUser> signInWithGoogle();
   Future<void> signOut();
 }
@@ -153,7 +156,7 @@ class FirebaseDashboardSession extends DashboardSession {
   /// Starts listening before the first frame. A restored Firebase user is made
   /// available synchronously by FlutterFire after `Firebase.initializeApp`.
   void start() {
-    _authSubscription = _auth.authStateChanges().listen(_onAuthStateChanged);
+    _authSubscription = _auth.userChanges().listen(_onAuthStateChanged);
     _user = _auth.currentUser;
     if (_user == null) {
       _setStatus(DashboardSessionStatus.signedOut);
@@ -172,7 +175,12 @@ class FirebaseDashboardSession extends DashboardSession {
     if (_status == DashboardSessionStatus.signedOut && !_creatingSession) {
       _markSignedIn();
       unawaited(checkSession());
+      return;
     }
+    // A user-change event can carry a new profile photo/display name or a
+    // refreshed credential without changing signed-in state. The mounted page
+    // listens to this notification and updates only its presentation fields.
+    notifyListeners();
   }
 
   void _markSignedIn() {

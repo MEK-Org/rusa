@@ -215,6 +215,47 @@ void main() {
     );
 
     testWidgets(
+      'creating after selecting the profile label keeps its durable principal separate',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..dashboardConfigResult = _configWithUser(kDurableUser);
+          final store = DashboardStore(
+            api: api,
+            stream: FakeStream(),
+            operatorDisplayName: 'Ada Lovelace',
+          );
+          await store.init();
+          addTearDown(store.dispose);
+
+          await tester.pumpWidget(
+            _dialogHost(
+              store,
+              (context) => showCreateObligationDialog(context, store),
+            ),
+          );
+          await tester.tap(find.text('open'));
+          await tester.pumpAndSettle();
+          await tester.enterText(
+            find.widgetWithText(TextFormField, 'e.g. Game Type'),
+            'Keep durable owner',
+          );
+          await tester.enterText(
+            find.widgetWithText(TextFormField, 'e.g. root, cloudy-porpoise'),
+            'Ada',
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Ada Lovelace'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.widgetWithText(ElevatedButton, 'Create'));
+          await tester.pumpAndSettle();
+
+          expect(api.createObligationCalls.single.ownerId, kDurableUser);
+        });
+      },
+    );
+
+    testWidgets(
       'without a durable user the dialogs still fall back to the alias the server accepts',
       (tester) async {
         await tester.runAsync(() async {
@@ -289,6 +330,11 @@ void main() {
         isViewerPrincipal(kLegacyOperatorPrincipalId, kDurableUser),
         isTrue,
       );
+      expect(
+        isVerifiedViewerPrincipal(kLegacyOperatorPrincipalId, kDurableUser),
+        isFalse,
+      );
+      expect(isVerifiedViewerPrincipal(kDurableUser, kDurableUser), isTrue);
       expect(isViewerPrincipal('worker-1', kDurableUser), isFalse);
       expect(isOperatorOwnerText(' operator ', kDurableUser), isTrue);
       expect(isOperatorOwnerText(kDurableUser, kDurableUser), isTrue);
@@ -296,6 +342,25 @@ void main() {
       // A profile label is presentation data, not a principal alias: a real
       // actor is allowed to have the same handle without becoming the viewer.
       expect(isOperatorOwnerText('Ada Lovelace', kDurableUser), isFalse);
+    });
+
+    test('profile labels require the resolved durable principal', () async {
+      final api = FakeApi()
+        ..dashboardConfigResult = _configWithUser(kDurableUser);
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        operatorDisplayName: 'Ada Lovelace',
+      );
+      await store.init();
+      await store.refreshDashboardConfig();
+      addTearDown(store.dispose);
+
+      expect(store.actorDisplay(kDurableUser), 'Ada Lovelace');
+      expect(store.actorDisplay(kLegacyOperatorPrincipalId), 'Operator');
+      expect(store.actorDisplay('human:another-user'), 'Operator');
+      expect(store.ownerLabel(kDurableUser), 'Ada Lovelace');
+      expect(store.ownerLabel(kLegacyOperatorPrincipalId), 'Operator');
     });
   });
 }

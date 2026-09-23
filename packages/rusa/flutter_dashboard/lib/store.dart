@@ -163,9 +163,10 @@ class DashboardStore {
     ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
-    this.operatorDisplayName,
+    String? operatorDisplayName,
   }) : _api = api,
        _stream = stream,
+       _operatorDisplayName = operatorDisplayName,
        _quotaCache = quotaCache ?? const NoopQuotaCache(),
        _treePreferencesCache =
            treePreferencesCache ?? const NoopTreePreferencesCache(),
@@ -305,12 +306,20 @@ class DashboardStore {
   final AvatarFilePicker? avatarFilePicker;
 
   /// Authenticated profile text for presentation only; never an owner id.
-  final String? operatorDisplayName;
+  String? _operatorDisplayName;
+
+  String? get operatorDisplayName => _operatorDisplayName;
+
+  /// Replaces presentation-only profile text after the session reports a user
+  /// update. Callers rebuild the visible dashboard around the same store, so
+  /// identity and the stream-backed workspace state remain intact.
+  void setOperatorDisplayName(String? value) => _operatorDisplayName = value;
 
   String get operatorDisplayLabel {
     final label = operatorDisplayName?.trim();
     return label == null || label.isEmpty ? 'Operator' : label;
   }
+
   final _subs = <StreamSubscription<dynamic>>[];
 
   final _actorStates = BehaviorSubject<ActorStateSnapshot>.seeded(
@@ -462,19 +471,28 @@ class DashboardStore {
   /// `human:*` prefix, or the server-resolved durable user principal.
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
-  /// Whether [id] is one of this authenticated viewer's durable/legacy ids.
-  bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
+  /// Whether [id] is the authenticated viewer's resolved principal for
+  /// display purposes. The legacy alias remains available to read old work,
+  /// but it cannot inherit this user's mutable profile label.
+  bool isViewer(String? id) => isVerifiedViewerPrincipal(id, userPrincipalId);
 
   /// Resolves an actor/thread/principal id to a display label.
-  String actorDisplay(String id) =>
-      actorDisplayLabel(id, (i) => actor(i)?.handle, isViewer, operatorDisplayName);
+  String actorDisplay(String id) => actorDisplayLabel(
+    id,
+    (i) => actor(i)?.handle,
+    isViewer,
+    operatorDisplayName,
+  );
 
   /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
   /// dialog), which keep showing the raw id for an actor the mesh view does
   /// not know rather than "Unknown actor" — that fallback predates #538 and
   /// is what the overview's blocker line is pinned to.
-  String ownerLabel(String id) =>
-      isViewer(id) ? operatorDisplayLabel : isHuman(id) ? 'Operator' : (actor(id)?.handle ?? id);
+  String ownerLabel(String id) => isViewer(id)
+      ? operatorDisplayLabel
+      : isHuman(id)
+      ? 'Operator'
+      : (actor(id)?.handle ?? id);
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {

@@ -269,12 +269,19 @@ class _DashboardPageState extends State<DashboardPage> {
       walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );
+    widget.session.addListener(_syncProfilePresentation);
     // Opens the SSE stream before the initial /threads fetch (seam-safe).
     _store.init();
   }
 
+  void _syncProfilePresentation() {
+    _store.setOperatorDisplayName(widget.session.operatorDisplayName);
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    widget.session.removeListener(_syncProfilePresentation);
     _store.dispose();
     super.dispose();
   }
