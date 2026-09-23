@@ -30,9 +30,12 @@ import {
 import {
   type DeploymentMode,
   type ExecutableSource,
+  type ProbePathEnv,
+  resolveExecutableOnPath,
   resolveExecutableSource,
   resolvePathEnvForUnit,
   resolvePathForUnit,
+  resolveProbePathEnv,
   resolveRepoRoot,
   resolveServiceDashboardUrl,
   resolveServiceInstance,
@@ -700,6 +703,21 @@ function installSingleSelfDeploy(opts: {
 }
 
 /**
+ * The provider CLIs this coordinator will have to launch, as commands to resolve.
+ *
+ * `cliCommand` is optional and defaults to the provider key — the same rule the
+ * scrapers apply when they spawn one.
+ */
+export function configuredProviderCommands(config: RusaConfig): string[] {
+  const commands = new Set<string>();
+  for (const [name, provider] of Object.entries(config.providers ?? {})) {
+    const command = provider?.cliCommand?.trim() || name;
+    if (command) commands.add(command);
+  }
+  return [...commands];
+}
+
+/**
  * Preflight the probe environment the coordinator unit will run in.
  *
  * These are checked at install time rather than left to fail at scrape time
@@ -708,8 +726,17 @@ function installSingleSelfDeploy(opts: {
  * otherwise. Missing tools are reported rather than fatal — a host may install
  * them after the unit — but an unwritable workers directory is fatal, because
  * no probe can run at all without it.
+ *
+ * Everything looked up here is resolved against the `PATH` the *unit* will
+ * carry, not the installer's own. Asking `sh -lc command -v` answered for the
+ * login shell running the install, which is the mismatch behind #525: the check
+ * passed while the service it was vouching for could not find `codex`.
  */
-function preflightProbeEnvironment(mcHome: string): { workersDir: string } {
+function preflightProbeEnvironment(
+  mcHome: string,
+  probePath: ProbePathEnv,
+  providerCommands: readonly string[]
+): { workersDir: string } {
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
   try {
@@ -725,8 +752,17 @@ function preflightProbeEnvironment(mcHome: string): { workersDir: string } {
     ["bwrap", "the quota probe sandboxes itself with bubblewrap"],
     ["tmux", "one provider's usage panel is only reachable through a PTY"],
   ] as const) {
-    if (!hasCommand(command)) {
-      console.warn(`⚠️  ${command} not found on PATH — ${why}; those scrapes will fail`);
+    if (!resolveExecutableOnPath(command, probePath.path)) {
+      console.warn(`⚠️  ${command} not found on the service PATH — ${why}; those scrapes will fail`);
+    }
+  }
+
+  for (const command of providerCommands) {
+    if (!resolveExecutableOnPath(command, probePath.path)) {
+      console.warn(
+        `⚠️  Provider CLI ${command} not found on the service PATH — the probe ` +
+          "launches it through tmux, so its scrapes will fail"
+      );
     }
   }
   return { workersDir };
@@ -773,17 +809,34 @@ export async function runInstallQuotaCoordinator(opts?: {
   // starts, and a config still naming the pre-service file is refused here
   // rather than by a unit that fails on its first start.
   const { databasePath } = resolveCoordinatorDatabasePaths(config, instance.mcHome);
-  const { workersDir } = preflightProbeEnvironment(instance.mcHome);
-
-  const executableSource = resolveExecutableSource(deploymentMode, opts?.repoPath);
-  const cliPath = resolvePathForUnit(executableSource.cliPath);
-  const nodePath = resolvePathForUnit(executableSource.nodePath);
-  const userPath = resolvePathEnvForUnit();
-  const xdgRuntimeDir = process.env.XDG_RUNTIME_DIR?.trim() || `/run/user/${userInfo().uid}`;
 
   const systemdUserDir = join(homedir(), ".config", "systemd", "user");
   mkdirSync(systemdUserDir, { recursive: true });
   const names = quotaCoordinatorUnitNames(instance.serviceBasename);
+
+  // The instance unit is the durable source of the provider-capable PATH: it is
+  // on disk, it is the environment the instance already launches provider CLIs
+  // in, and unlike `process.env.PATH` it does not change with whichever shell
+  // ran this installer. That shell dependence is #525 — an install from a
+  // minimal environment wrote a unit with no `codex` on its PATH, and the
+  // coordinator then started, answered `healthz`, and never scraped.
+  const instanceUnitPath = join(systemdUserDir, instance.serviceUnit);
+  const instanceUnitContents = existsSync(instanceUnitPath)
+    ? readFileSync(instanceUnitPath, "utf-8")
+    : null;
+  const probePath = resolveProbePathEnv(instanceUnitContents);
+  const userPath = probePath.path;
+
+  const { workersDir } = preflightProbeEnvironment(
+    instance.mcHome,
+    probePath,
+    configuredProviderCommands(config)
+  );
+
+  const executableSource = resolveExecutableSource(deploymentMode, opts?.repoPath);
+  const cliPath = resolvePathForUnit(executableSource.cliPath);
+  const nodePath = resolvePathForUnit(executableSource.nodePath);
+  const xdgRuntimeDir = process.env.XDG_RUNTIME_DIR?.trim() || `/run/user/${userInfo().uid}`;
 
   installUnit(
     systemdUserDir,
@@ -825,11 +878,9 @@ export async function runInstallQuotaCoordinator(opts?: {
   // An instance installed before its coordinator acquires the ordering here,
   // through the same daemon-reload below. The instance is not restarted for
   // it: ordering is a start-time property and applies on its next start.
-  const instanceUnitPath = join(systemdUserDir, instance.serviceUnit);
-  if (existsSync(instanceUnitPath)) {
-    const current = readFileSync(instanceUnitPath, "utf-8");
-    const ordered = withCoordinatorOrdering(current, names.serviceUnit);
-    if (ordered !== current) {
+  if (instanceUnitContents !== null) {
+    const ordered = withCoordinatorOrdering(instanceUnitContents, names.serviceUnit);
+    if (ordered !== instanceUnitContents) {
       writeFileSync(instanceUnitPath, ordered, "utf-8");
       console.log(
         `✓ Added After=/Wants=${names.serviceUnit} to ${instanceUnitPath} (applies on its next start)`
@@ -856,6 +907,11 @@ export async function runInstallQuotaCoordinator(opts?: {
     `- Backups: ${config.quota?.coordinator?.backupDir?.trim() ?? defaultQuotaBackupDir(databasePath)}`
   );
   console.log(`- Workers dir: ${workersDir}`);
+  console.log(
+    probePath.source === "instance-unit"
+      ? `- Probe PATH: taken from ${instance.serviceUnit}`
+      : `- Probe PATH: from this shell (no ${instance.serviceUnit} installed yet)`
+  );
   console.log(`- Status: systemctl --user status ${names.serviceUnit}`);
   console.log(`- Logs: journalctl --user -u ${names.serviceUnit} -f`);
   console.log(`- Readiness: curl --unix-socket ${socketPath} http://localhost/v1/readyz`);

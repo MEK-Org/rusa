@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { accessSync, existsSync, constants as fsConstants, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -174,6 +174,86 @@ export function resolvePathEnvForUnit(): string {
     segments.push(absPath);
   }
   return segments.join(":");
+}
+
+/**
+ * Read the `PATH` a unit file assigns to the service it describes.
+ *
+ * systemd resolves repeated assignments to one variable last-wins, so the last
+ * `Environment=PATH=` line is the one the service actually runs with. Both the
+ * bare and double-quoted spellings are accepted because both are legal and an
+ * operator drop-in may use either; `install-service` itself writes the bare form.
+ *
+ * Returns null when the unit assigns no `PATH`, which is a real case — a unit
+ * written before this directive existed inherits systemd's `/usr/bin:/bin`.
+ */
+export function readUnitPathEnv(unitContents: string): string | null {
+  let found: string | null = null;
+  for (const line of unitContents.split("\n")) {
+    const match = /^\s*Environment=(?:"PATH=([^"]*)"|PATH=(.*))$/.exec(line.trimEnd());
+    if (!match) continue;
+    found = (match[1] ?? match[2] ?? "").trim();
+  }
+  return found ? found : null;
+}
+
+/** Where a probe `PATH` came from, so the installer can say so rather than imply it. */
+export interface ProbePathEnv {
+  path: string;
+  source: "instance-unit" | "process";
+}
+
+/**
+ * Resolve the `PATH` the quota coordinator unit should run with.
+ *
+ * The coordinator scrapes by launching provider CLIs, so its `PATH` has to
+ * contain them. Deriving it from `process.env.PATH` alone made that a property
+ * of whichever shell happened to run the installer: an install from a minimal
+ * environment (a unit, a cron job, a non-login shell) wrote a unit whose `PATH`
+ * had no `codex` in it, the coordinator still started and answered `healthz`,
+ * and only the scrape failed — which is issue #525.
+ *
+ * The installed instance unit is the durable source of truth instead. It is on
+ * disk, it is the environment the instance already resolves provider CLIs in,
+ * and it does not change when the installing shell does. The process `PATH` is
+ * the fallback for the one case where there is no such unit yet — a coordinator
+ * installed before any instance — and the caller reports which one it used.
+ */
+export function resolveProbePathEnv(instanceUnitContents: string | null): ProbePathEnv {
+  const fromUnit = instanceUnitContents ? readUnitPathEnv(instanceUnitContents) : null;
+  if (fromUnit) return { path: fromUnit, source: "instance-unit" };
+  return { path: resolvePathEnvForUnit(), source: "process" };
+}
+
+/**
+ * Resolve `command` against an explicit `PATH` rather than this process's.
+ *
+ * Install-time checks have to ask about the `PATH` the *unit* will have; using
+ * `command -v` asks about the installer's shell, which is the very thing #525
+ * is about. A command containing a slash is a path already and is only checked
+ * for being an executable file.
+ */
+export function resolveExecutableOnPath(command: string, pathEnv: string): string | null {
+  if (command.includes("/")) {
+    const candidate = isAbsolute(command) ? command : resolve(command);
+    return isExecutableFile(candidate) ? candidate : null;
+  }
+  for (const segment of pathEnv.split(":")) {
+    if (!segment) continue;
+    const candidate = join(segment, command);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+function isExecutableFile(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    accessSync(candidate, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function resolveServiceDashboardUrl(
