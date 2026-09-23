@@ -19,6 +19,7 @@ import {
   QUOTA_KP_SECONDS_PER_POINT,
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
+  QUOTA_SCHEMA_VERSION,
   SharedQuotaStore,
 } from "./shared-store.js";
 
@@ -55,7 +56,266 @@ function recordObservation(
   store.recordParsed(id, state, state);
 }
 
+describe("SharedQuotaStore schema v2 migration", () => {
+  it("creates the mode and receipt tables in a fresh coordinator database", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-schema-fresh-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    try {
+      expect(store.db.pragma("user_version", { simple: true })).toBe(QUOTA_SCHEMA_VERSION);
+      expect(
+        (
+          store.db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .all() as Array<{ name: string }>
+        ).map((row) => row.name)
+      ).toEqual([
+        "quota_manual_observation_receipts",
+        "quota_observations",
+        "quota_provider_reading_modes",
+        "quota_scrapes",
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("upgrades a user_version 1 coordinator database without copying existing quota rows", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-schema-v1-"));
+    roots.push(root);
+    const path = join(root, "quota.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE quota_scrapes (
+        id TEXT PRIMARY KEY, provider TEXT NOT NULL, scraped_at TEXT NOT NULL,
+        raw_output TEXT NOT NULL, parsed_state TEXT, parse_error TEXT
+      );
+      CREATE TABLE quota_observations (
+        provider TEXT NOT NULL, kind TEXT NOT NULL, observed_slot INTEGER NOT NULL,
+        label TEXT NOT NULL, observed_at TEXT NOT NULL, percent_left REAL NOT NULL,
+        reset_at_iso TEXT, window_ms INTEGER NOT NULL, processed INTEGER NOT NULL DEFAULT 0,
+        controller_error REAL, controller_derivative REAL, uncapped_interval_seconds REAL,
+        interval_seconds REAL, PRIMARY KEY(provider, kind, observed_slot)
+      );
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO quota_observations
+          (provider, kind, observed_slot, label, observed_at, percent_left, window_ms)
+         VALUES ('claude', 'weekly', 1, 'Weekly', '2030-01-01T00:00:00.000Z', 50, 604800000)`
+      )
+      .run();
+    legacy.pragma("user_version = 1");
+    legacy.close();
+
+    const store = new SharedQuotaStore(path);
+    try {
+      expect(store.db.pragma("user_version", { simple: true })).toBe(QUOTA_SCHEMA_VERSION);
+      expect(
+        store.db
+          .prepare("SELECT provider, percent_left AS percentLeft FROM quota_observations")
+          .all()
+      ).toEqual([{ provider: "claude", percentLeft: 50 }]);
+      expect(
+        (
+          store.db.prepare("PRAGMA table_info(quota_manual_observation_receipts)").all() as Array<{
+            name: string;
+          }>
+        ).map((column) => column.name)
+      ).toEqual([
+        "provider",
+        "idempotency_key",
+        "generation",
+        "request_fingerprint",
+        "observed_at",
+        "accepted_at",
+      ]);
+      expect(
+        (
+          store.db.prepare("PRAGMA table_info(quota_provider_reading_modes)").all() as Array<{
+            name: string;
+          }>
+        ).map((column) => column.name)
+      ).toEqual(["provider", "mode", "generation", "updated_at"]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 describe("SharedQuotaStore canonical observations", () => {
+  it("stores a manual reading as ordinary evidence with a fingerprint-only receipt that ages out with raw retention", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-manual-receipt-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const mode = store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:00:00.000Z");
+      const snapshot = (percentLeft: number) => ({
+        provider: "claude" as const,
+        status: "available" as const,
+        scrapedAt: "2030-01-01T00:05:00.000Z",
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly" as const,
+            scope: "provider" as const,
+            percentLeft,
+            resetAtIso: "2030-01-08T00:00:00.000Z",
+          },
+        ],
+      });
+      const submit = (percentLeft: number, key = "reading-1") =>
+        store.recordManualObservation({
+          snapshot: snapshot(percentLeft),
+          generation: mode.generation,
+          idempotencyKey: key,
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        });
+
+      expect(submit(25)).toEqual({
+        result: "accepted",
+        observedAt: "2030-01-01T00:05:00.000Z",
+        generation: 1,
+      });
+
+      // The reading is one quota_scrapes row like any scrape (#572 precedent),
+      // so latest/history/hydration/pruning need no manual-specific branch.
+      const scrape = store.db
+        .prepare("SELECT provider, scraped_at, raw_output FROM quota_scrapes")
+        .all() as Array<{ provider: string; scraped_at: string; raw_output: string }>;
+      expect(scrape).toEqual([
+        {
+          provider: "claude",
+          scraped_at: "2030-01-01T00:05:00.000Z",
+          raw_output: JSON.stringify({
+            generation: 1,
+            idempotencyKey: "reading-1",
+            source: "manual",
+            version: 1,
+          }),
+        },
+      ]);
+      expect(store.getLatestSnapshot("claude")).toMatchObject({
+        scrapedAt: "2030-01-01T00:05:00.000Z",
+        limits: [expect.objectContaining({ percentLeft: 25 })],
+      });
+
+      // The receipt carries only a sha256 fingerprint of the request, never the body.
+      const receipts = store.db
+        .prepare(
+          "SELECT provider, idempotency_key, generation, request_fingerprint, observed_at, accepted_at FROM quota_manual_observation_receipts"
+        )
+        .all() as Array<Record<string, unknown>>;
+      expect(receipts).toEqual([
+        {
+          provider: "claude",
+          idempotency_key: "reading-1",
+          generation: 1,
+          request_fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+          observed_at: "2030-01-01T00:05:00.000Z",
+          accepted_at: "2030-01-01T00:05:30.000Z",
+        },
+      ]);
+      expect(receipts[0]?.request_fingerprint).not.toContain("25");
+
+      // Same key + same body replays; same key + different body conflicts.
+      expect(submit(25)).toEqual({
+        result: "duplicate",
+        observedAt: "2030-01-01T00:05:00.000Z",
+        generation: 1,
+      });
+      expect(submit(30)).toEqual({ result: "idempotency_conflict" });
+      expect(store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get()).toEqual({ n: 1 });
+
+      // Receipts share the 30-day raw-evidence retention. A retry after that
+      // window is still refused: it is older than the latest accepted reading.
+      const later = Date.parse("2030-01-01T00:05:30.000Z") + QUOTA_RAW_RETENTION_MS + 1;
+      expect(store.pruneRawScrapes(later)).toBe(2);
+      expect(
+        store.db.prepare("SELECT count(*) AS n FROM quota_manual_observation_receipts").get()
+      ).toEqual({ n: 0 });
+      expect(submit(25)).toEqual({ result: "stale_observation" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects direct manual observation with invalid percentLeft with a truthful error", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-manual-invalid-percent-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      const mode = store.setQuotaReadingMode("claude", "manual", "2030-01-01T00:00:00.000Z");
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 120,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-high",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: -5,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-neg",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+
+      expect(() =>
+        store.recordManualObservation({
+          snapshot: {
+            provider: "claude",
+            status: "available",
+            scrapedAt: "2030-01-01T00:05:00.000Z",
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: Number.NaN,
+                resetAtIso: "2030-01-08T00:00:00.000Z",
+                scope: "provider",
+              },
+            ],
+          },
+          generation: mode.generation,
+          idempotencyKey: "bad-percent-nan",
+          acceptedAt: "2030-01-01T00:05:30.000Z",
+        })
+      ).toThrow("manual observation percentLeft must be between 0 and 100");
+    } finally {
+      store.close();
+    }
+  });
+
   it("hydrates a validated legacy bare parsed_state without a schema migration", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-state-"));
     roots.push(root);
@@ -163,7 +423,12 @@ describe("SharedQuotaStore canonical observations", () => {
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
-      ).toEqual(["quota_observations", "quota_scrapes"]);
+      ).toEqual([
+        "quota_manual_observation_receipts",
+        "quota_observations",
+        "quota_provider_reading_modes",
+        "quota_scrapes",
+      ]);
     } finally {
       store.close();
     }
@@ -278,7 +543,12 @@ describe("SharedQuotaStore persisted controller", () => {
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
-      ).toEqual(["quota_observations", "quota_scrapes"]);
+      ).toEqual([
+        "quota_manual_observation_receipts",
+        "quota_observations",
+        "quota_provider_reading_modes",
+        "quota_scrapes",
+      ]);
     } finally {
       second.close();
       first.close();

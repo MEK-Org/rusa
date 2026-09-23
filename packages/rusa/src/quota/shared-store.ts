@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -108,6 +109,33 @@ export interface CanonicalQuotaObservation {
   windowMs: number;
 }
 
+/** The coordinator's durable collection authority for one provider lane. */
+export type QuotaReadingMode = "manual" | "scrape";
+
+export interface QuotaReadingModeState {
+  mode: QuotaReadingMode;
+  /** Monotonically increases on each actual mode transition. */
+  generation: number;
+  updatedAt: string | null;
+}
+
+export interface ManualQuotaObservation {
+  /** The snapshot shape emitted by the coordinator's normal scraper path. */
+  snapshot: ProviderQuotaSnapshot;
+  /** The mode generation returned by `set_quota_reading_mode`. */
+  generation: number;
+  idempotencyKey: string;
+  acceptedAt: string;
+}
+
+export type ManualObservationResult =
+  | { result: "accepted"; observedAt: string; generation: number }
+  | { result: "duplicate"; observedAt: string; generation: number }
+  | { result: "manual_mode_required" }
+  | { result: "generation_mismatch"; generation: number }
+  | { result: "stale_observation" }
+  | { result: "idempotency_conflict" };
+
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
 }
@@ -191,6 +219,41 @@ interface StoredScrapeRow {
   parse_error: string | null;
 }
 
+interface ScrapePermit {
+  provider: string;
+  generation: number;
+}
+
+/**
+ * Provenance marker stored as the `raw_output` of a manual `quota_scrapes` row.
+ * There is no scraper text to keep, so the blob carries a version indicator
+ * plus the request identity; the snapshot itself is in `parsed_state` like
+ * every other row.
+ */
+interface ManualScrapeRawOutput {
+  version: 1;
+  source: "manual";
+  idempotencyKey: string;
+  generation: number;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Stable request identity; no caller-controlled serialization ambiguities. */
+export function manualObservationFingerprint(snapshot: ProviderQuotaSnapshot): string {
+  return createHash("sha256").update(canonicalJson(snapshot)).digest("hex");
+}
+
 /**
  * WAL-backed quota storage shared by every instance using the same provider
  * credentials. Raw evidence is retained for 30 days; compact canonical
@@ -200,6 +263,17 @@ export class SharedQuotaStore {
   readonly db: Database.Database;
   private controllerOptions: QuotaControllerOptions | null = null;
   private controllerUpdated: ((provider: string) => void) | null = null;
+  /**
+   * Collection is asynchronous, while its persistence boundary is synchronous.
+   * The collector runs each probe inside {@link withScrapePermit}, which puts
+   * the lane's mode generation in async context; `recordRaw`, `recordParsed`
+   * and `recordParseError` read it back from the same context, so a result
+   * that lands after a mode transition is discarded at the write boundary
+   * without threading a token through the generic scrape-store interface that
+   * `quota-mcp.ts` and the model catalog share. Nothing is keyed by scrape id,
+   * so an abandoned probe leaves nothing behind.
+   */
+  private readonly scrapePermitContext = new AsyncLocalStorage<ScrapePermit>();
   /**
    * The parse, observation, and controller series are only observable here:
    * this is where a parse becomes a stored snapshot and where an observation
@@ -244,14 +318,88 @@ export class SharedQuotaStore {
     this.metrics = metrics ?? nullQuotaMetrics;
   }
 
-  private ensureSchema(): void {
-    const rawVersion = this.db.pragma("user_version", { simple: true });
-    const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
-    if (currentVersion === 0) {
-      this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
-    }
+  /**
+   * Existing lanes are scrape-controlled until an operator deliberately
+   * changes them. The implicit generation zero is important: it fences a
+   * first manual transition without needing a backfill row for every provider.
+   */
+  getQuotaReadingMode(provider: string): QuotaReadingModeState {
+    const row = this.db
+      .prepare(
+        `SELECT mode, generation, updated_at AS updatedAt
+         FROM quota_provider_reading_modes WHERE provider = ?`
+      )
+      .get(provider) as
+      | { mode: QuotaReadingMode; generation: number; updatedAt: string }
+      | undefined;
+    return row ?? { mode: "scrape", generation: 0, updatedAt: null };
+  }
 
-    this.db.exec(`
+  /**
+   * Switch collection authority atomically. Repeating the current mode is a
+   * no-op; only an actual transition advances the fence generation.
+   */
+  setQuotaReadingMode(
+    provider: string,
+    mode: QuotaReadingMode,
+    updatedAt = new Date().toISOString()
+  ): QuotaReadingModeState {
+    const change = this.db.transaction(() => {
+      const current = this.getQuotaReadingMode(provider);
+      if (current.mode === mode && current.updatedAt !== null) return current;
+      const next: QuotaReadingModeState = {
+        mode,
+        generation: current.mode === mode ? current.generation : current.generation + 1,
+        updatedAt,
+      };
+      this.db
+        .prepare(
+          `INSERT INTO quota_provider_reading_modes (provider, mode, generation, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(provider) DO UPDATE SET
+             mode = excluded.mode,
+             generation = excluded.generation,
+             updated_at = excluded.updated_at`
+        )
+        .run(provider, next.mode, next.generation, next.updatedAt);
+      return next;
+    });
+    return change.immediate();
+  }
+
+  /**
+   * Run one service-owned scrape under the mode/generation observed when it
+   * began, or return `undefined` without calling `collect` when the lane is
+   * manual. The persistence methods recheck that permit, so a result that
+   * crosses a mode transition cannot become a durable snapshot or observation.
+   * A probe can only start in scrape mode, so the generation check matters for
+   * one sequence: scrape → manual (reading accepted) → scrape again while the
+   * probe is still in flight. A bare mode check would admit that result on top
+   * of the newer manual reading; the generation captured at start does not.
+   */
+  async withScrapePermit<T>(provider: string, collect: () => Promise<T>): Promise<T | undefined> {
+    const mode = this.getQuotaReadingMode(provider);
+    if (mode.mode !== "scrape") return undefined;
+    return this.scrapePermitContext.run({ provider, generation: mode.generation }, collect);
+  }
+
+  /**
+   * True when the calling async context carries a scrape permit for `lane`
+   * that no longer matches the lane's current mode generation. A permit fences
+   * only its own lane; writes for another provider are not its business.
+   */
+  private fencedByScrapePermit(lane: string | undefined): boolean {
+    const permit = this.scrapePermitContext.getStore();
+    if (!permit || (lane !== undefined && permit.provider !== lane)) return false;
+    const current = this.getQuotaReadingMode(permit.provider);
+    return current.mode !== "scrape" || current.generation !== permit.generation;
+  }
+
+  private ensureSchema(): void {
+    const migrate = this.db.transaction(() => {
+      const rawVersion = this.db.pragma("user_version", { simple: true });
+      const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS quota_scrapes (
         id TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
@@ -291,8 +439,28 @@ export class SharedQuotaStore {
       CREATE INDEX IF NOT EXISTS idx_quota_observations_reasoned
         ON quota_observations(provider, kind, observed_at DESC)
         WHERE interval_seconds IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS quota_provider_reading_modes (
+        provider TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK (mode IN ('manual', 'scrape')),
+        generation INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS quota_manual_observation_receipts (
+        provider TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        accepted_at TEXT NOT NULL,
+        PRIMARY KEY(provider, idempotency_key)
+      );
     `);
-    this.ensureColumns();
+      this.ensureColumnsInTransaction();
+      if (currentVersion < QUOTA_SCHEMA_VERSION) {
+        this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
+      }
+    });
+    migrate.immediate();
   }
 
   /**
@@ -301,26 +469,32 @@ export class SharedQuotaStore {
    * opened directly by every instance rather than through the instance migration
    * runner, so its schema has to evolve here.
    */
-  private ensureColumns(): void {
-    const widen = this.db.transaction(() => {
-      const columns = new Set(
-        (
-          this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-        ).map((column) => column.name)
-      );
-      if (!columns.has("controller_integral")) {
-        this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
-      }
-    });
-    // Every process acquires the write reservation before inspecting the
-    // schema, so a waiter rechecks after the winning ALTER has committed.
-    widen.immediate();
+  private ensureColumnsInTransaction(): void {
+    const columns = new Set(
+      (
+        this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+      ).map((column) => column.name)
+    );
+    if (!columns.has("controller_integral")) {
+      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+    }
   }
 
+  /**
+   * Raw evidence and the manual idempotency receipts share one retention
+   * window: a receipt exists to make a retry of an accepted write a no-op, and
+   * a retry arriving after its `quota_scrapes` row has been pruned is rejected
+   * by ordering (`stale_observation`) rather than replayed anyway.
+   */
   pruneRawScrapes(nowMs = Date.now()): number {
     if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
     const cutoff = new Date(nowMs - QUOTA_RAW_RETENTION_MS).toISOString();
-    return this.db.prepare("DELETE FROM quota_scrapes WHERE scraped_at < ?").run(cutoff).changes;
+    return (
+      this.db.prepare("DELETE FROM quota_scrapes WHERE scraped_at < ?").run(cutoff).changes +
+      this.db
+        .prepare("DELETE FROM quota_manual_observation_receipts WHERE accepted_at < ?")
+        .run(cutoff).changes
+    );
   }
 
   pruneObservations(nowMs = Date.now()): number {
@@ -348,6 +522,10 @@ export class SharedQuotaStore {
 
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string {
     const id = randomUUID();
+    // A fenced result is a durable no-op: the id has no row, and the caller's
+    // follow-up `recordParsed` / `recordParseError` runs under the same stale
+    // permit (generations only grow), so it is discarded there too.
+    if (this.fencedByScrapePermit(opts.provider)) return id;
     this.db.transaction(() => {
       this.pruneRawScrapes();
       this.pruneObservations();
@@ -371,6 +549,13 @@ export class SharedQuotaStore {
     const scrape = this.db
       .prepare("SELECT provider, scraped_at FROM quota_scrapes WHERE id = ?")
       .get(id) as { provider: string; scraped_at: string } | undefined;
+    if (this.fencedByScrapePermit(scrape?.provider)) {
+      // The lane left scrape mode between the raw write and the parse: the
+      // raw row is withdrawn so neither `/v1/history` nor the observation
+      // stream sees a reading the operator has already superseded.
+      if (scrape) this.db.prepare("DELETE FROM quota_scrapes WHERE id = ?").run(id);
+      return;
+    }
     this.db.transaction(() => {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
@@ -388,16 +573,172 @@ export class SharedQuotaStore {
   }
 
   recordParseError(id: string, error: unknown): void {
-    this.db
-      .prepare("UPDATE quota_scrapes SET parse_error = ? WHERE id = ?")
-      .run(error instanceof Error ? (error.stack ?? error.message) : String(error), id);
     const scrape = this.db.prepare("SELECT provider FROM quota_scrapes WHERE id = ?").get(id) as
       | { provider: string }
       | undefined;
+    if (this.fencedByScrapePermit(scrape?.provider)) {
+      if (scrape) this.db.prepare("DELETE FROM quota_scrapes WHERE id = ?").run(id);
+      return;
+    }
+    this.db
+      .prepare("UPDATE quota_scrapes SET parse_error = ? WHERE id = ?")
+      .run(error instanceof Error ? (error.stack ?? error.message) : String(error), id);
     this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
       provider: scrape?.provider ?? "unknown",
       outcome: "failure",
     });
+  }
+
+  /**
+   * Canonical manual ingestion. The service validates the public request
+   * shape first; this transaction owns the race-sensitive parts, in this
+   * order: current authority (mode, then generation), durable idempotency
+   * (replay or conflict), ordering, and the write itself. Authority comes
+   * before replay on purpose: a retry of an accepted key after the lane left
+   * manual mode, or under a superseded generation, is answered with the same
+   * rejection a first attempt would get, so `duplicate: true` never vouches
+   * for an authority the caller no longer holds.
+   *
+   * The accepted reading is stored the way a scrape is: one `quota_scrapes`
+   * row (provenance in `raw_output`, snapshot in `parsed_state`) plus the
+   * canonical observation rows. That keeps
+   * `/v1/quota`, `/v1/history`, boot hydration and 30-day pruning on their one
+   * existing source; the receipt table holds only the idempotency fingerprint.
+   */
+  recordManualObservation(
+    input: ManualQuotaObservation,
+    controller?: QuotaControllerOptions
+  ): ManualObservationResult {
+    const provider = input.snapshot.provider.trim().toLocaleLowerCase("en-US");
+    const observedAt = input.snapshot.scrapedAt;
+    if (!observedAt) throw new Error("manual observation must have scrapedAt");
+    const observedMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedMs)) throw new Error("manual observation scrapedAt is invalid");
+    const acceptedMs = Date.parse(input.acceptedAt);
+    if (!Number.isFinite(acceptedMs)) throw new Error("manual observation acceptedAt is invalid");
+    for (const limit of input.snapshot.limits ?? []) {
+      if (!Number.isFinite(limit.percentLeft) || limit.percentLeft < 0 || limit.percentLeft > 100) {
+        throw new Error("manual observation percentLeft must be between 0 and 100");
+      }
+    }
+    const fingerprint = manualObservationFingerprint(input.snapshot);
+    const candidates = this.manualObservationSlots(input.snapshot, observedMs);
+    if (candidates.length === 0)
+      throw new Error("manual observation has no provider-scoped limits");
+
+    const record = this.db.transaction((): ManualObservationResult => {
+      const mode = this.getQuotaReadingMode(provider);
+      if (mode.mode !== "manual") return { result: "manual_mode_required" };
+      if (input.generation !== mode.generation) {
+        return { result: "generation_mismatch", generation: mode.generation };
+      }
+
+      const existing = this.db
+        .prepare(
+          `SELECT generation, request_fingerprint AS requestFingerprint, observed_at AS observedAt
+           FROM quota_manual_observation_receipts
+           WHERE provider = ? AND idempotency_key = ?`
+        )
+        .get(provider, input.idempotencyKey) as
+        | { generation: number; requestFingerprint: string; observedAt: string }
+        | undefined;
+      if (existing) {
+        if (existing.requestFingerprint === fingerprint) {
+          return {
+            result: "duplicate",
+            observedAt: existing.observedAt,
+            generation: existing.generation,
+          };
+        }
+        return { result: "idempotency_conflict" };
+      }
+
+      const latest = this.db
+        .prepare(
+          `SELECT observed_at AS observedAt FROM quota_observations
+           WHERE provider = ? ORDER BY observed_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(provider) as { observedAt: string } | undefined;
+      if (latest && observedMs <= Date.parse(latest.observedAt)) {
+        return { result: "stale_observation" };
+      }
+
+      for (const candidate of candidates) {
+        const occupied = this.db
+          .prepare(
+            `SELECT 1 FROM quota_observations
+             WHERE provider = ? AND kind = ? AND observed_slot = ?`
+          )
+          .get(provider, candidate.kind, candidate.slot);
+        if (occupied) return { result: "stale_observation" };
+      }
+
+      this.pruneRawScrapes(acceptedMs);
+      this.pruneObservations(acceptedMs);
+      const { raw: _raw, ...state } = input.snapshot;
+      const rawOutput: ManualScrapeRawOutput = {
+        version: 1,
+        source: "manual",
+        idempotencyKey: input.idempotencyKey,
+        generation: input.generation,
+      };
+      this.insertObservations(state, observedAt, provider);
+      this.db
+        .prepare(
+          `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(
+          randomUUID(),
+          provider,
+          observedAt,
+          canonicalJson(rawOutput),
+          serializeParsedState({ ...state, provider })
+        );
+      this.db
+        .prepare(
+          `INSERT INTO quota_manual_observation_receipts
+            (provider, idempotency_key, generation, request_fingerprint, observed_at, accepted_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          provider,
+          input.idempotencyKey,
+          input.generation,
+          fingerprint,
+          observedAt,
+          input.acceptedAt
+        );
+      return { result: "accepted", observedAt, generation: input.generation };
+    });
+
+    const result = record.immediate();
+    // A manual POST is an authoritative observation, not an instruction for a
+    // later collector tick: the caller that owns pacing passes its controller
+    // options so the accepted rows are reasoned before the response is sent.
+    // The scrape path's end-of-tick cadence is untouched.
+    const advance = controller ?? this.controllerOptions;
+    if (result.result === "accepted" && advance) {
+      this.advancePendingController(advance, provider);
+      this.controllerUpdated?.(provider);
+    }
+    return result;
+  }
+
+  private manualObservationSlots(
+    snapshot: ProviderQuotaSnapshot,
+    observedMs: number
+  ): Array<{ kind: QuotaWindowKind; slot: number }> {
+    const seen = new Set<string>();
+    const candidates: Array<{ kind: QuotaWindowKind; slot: number }> = [];
+    for (const limit of snapshot.limits ?? []) {
+      if (!isProviderScopedWindow(limit)) continue;
+      const kind = normalizeKind(limit.kind);
+      if (seen.has(kind)) continue;
+      seen.add(kind);
+      candidates.push({ kind, slot: Math.floor(observedMs / SLOT_MS) });
+    }
+    return candidates;
   }
 
   listSince(provider: string, sinceIso: string): QuotaScrape[] {

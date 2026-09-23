@@ -208,9 +208,12 @@ export class QuotaCollectionLoop {
       const stat = this.stat(provider);
       const startedMs = Date.now();
       try {
-        const outcome = await this.options.quotaService.getQuotaProbeOutcome(
-          provider as QuotaLlmProvider
+        const outcome = await this.options.store.withScrapePermit(provider, () =>
+          this.options.quotaService.getQuotaProbeOutcome(provider as QuotaLlmProvider)
         );
+        // Manual mode is an explicit collection suppression, not a failed
+        // probe. In particular Kimi gets no fallback probe while manual.
+        if (!outcome) continue;
         if (!outcome.didProbe) continue;
         stat.attempts += 1;
         stat.lastAttemptAt = new Date(startedMs).toISOString();

@@ -1,6 +1,10 @@
 import type Database from "better-sqlite3";
 
-export const QUOTA_SCHEMA_VERSION = 1;
+/**
+ * Coordinator-owned SQLite schema. Version 2 adds the durable per-provider
+ * reading-mode fence and manual-observation idempotency receipts.
+ */
+export const QUOTA_SCHEMA_VERSION = 2;
 
 export class SchemaVersionRefusalError extends Error {
   constructor(

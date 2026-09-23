@@ -10,11 +10,13 @@ import {
   COORDINATOR_PROTOCOL_MINOR,
   calculateFreshness,
   DEFAULT_MAX_INTERVAL_SECONDS,
+  MANUAL_QUOTA_OBSERVATION_PATH,
   ProtocolMismatchError,
   publishedThrottle,
+  QUOTA_READING_MODE_PATH,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
-import { QuotaCoordinatorService, SERVED_ROUTES } from "./coordinator-service.js";
+import { QuotaCoordinatorService, SERVED_ROUTES, WRITE_ROUTES } from "./coordinator-service.js";
 import { QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError } from "./schema-guard.js";
 import { type PersistedQuotaProviderStatus, SharedQuotaStore } from "./shared-store.js";
 
@@ -30,7 +32,8 @@ function makeRequest(
   socketPath: string,
   path: string,
   method: string = "GET",
-  body?: string
+  body?: string,
+  headers?: http.OutgoingHttpHeaders
 ): Promise<TestResponse> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -38,9 +41,12 @@ function makeRequest(
         socketPath,
         path,
         method,
-        headers: body
-          ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
-          : {},
+        headers: {
+          ...(body
+            ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
+            : {}),
+          ...headers,
+        },
       },
       (res) => {
         let data = "";
@@ -123,6 +129,24 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
         JSON.stringify({ mutate: true })
       );
       expect([200, 503].includes(getWithBody.status)).toBe(true);
+    }
+
+    // The operator writes are ordinary `/v1/` paths that are POST-only: the 405
+    // rule is per path, not "every v1 path is a GET" (design §5.2, criterion 7).
+    // Enumerate them the same way, and hold the two sets apart, so a later
+    // mutating endpoint has to be declared rather than smuggled onto a read path.
+    expect([...WRITE_ROUTES]).toEqual([QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH]);
+    for (const writeRoute of WRITE_ROUTES) {
+      expect((SERVED_ROUTES as readonly string[]).includes(writeRoute)).toBe(false);
+    }
+
+    for (const writeRoute of WRITE_ROUTES) {
+      expect(writeRoute.startsWith("/v1/")).toBe(true);
+      for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+        const res = await makeRequest(socketPath, writeRoute, method);
+        expect(res.status, `Expected 405 for ${method} on ${writeRoute}`).toBe(405);
+        expect(res.headers.allow).toBe("POST");
+      }
     }
   });
 
@@ -214,6 +238,248 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const throttle = await client.getThrottle();
     expect(throttle).not.toBeNull();
     expect(throttle?.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
+  });
+
+  it("persists manual mode, ingests one idempotent observation onto the pacing path, and preserves truthful age on stale writes", async () => {
+    const nowMs = Date.parse("2030-01-01T00:10:00.000Z");
+    const manualObservedAt = "2030-01-01T00:05:00.000Z";
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => nowMs,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    await service.start();
+
+    const switchedManual = await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "manual" })
+    );
+    expect(switchedManual.status).toBe(200);
+    expect(switchedManual.json).toMatchObject({
+      provider: "claude",
+      mode: "manual",
+      generation: 1,
+    });
+
+    const observation = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: manualObservedAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 25,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: { provider: "claude" },
+        },
+      ],
+    };
+    const accepted = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", generation: 1, observation }),
+      { "Idempotency-Key": "manual-reading-1" }
+    );
+    expect(accepted.status).toBe(200);
+    expect(accepted.json).toMatchObject({
+      observedAt: manualObservedAt,
+      generation: 1,
+      duplicate: false,
+    });
+    expect(store.getLatestSnapshot("claude")).toMatchObject({
+      provider: "claude",
+      scrapedAt: manualObservedAt,
+      limits: [expect.objectContaining({ percentLeft: 25 })],
+    });
+    // The reading is one ordinary evidence row, so history and latest agree.
+    const history = await makeRequest(
+      socketPath,
+      "/v1/history?provider=claude&since=2030-01-01T00:00:00.000Z"
+    );
+    expect(history.status).toBe(200);
+    expect(history.json.records).toEqual([
+      expect.objectContaining({ kind: "weekly", observedAt: manualObservedAt, percentLeft: 25 }),
+    ]);
+    expect(store.listSince("claude", "2030-01-01T00:00:00.000Z")).toEqual([
+      expect.objectContaining({ provider: "claude", scrapedAt: manualObservedAt }),
+    ]);
+    expect(
+      store.db
+        .prepare("SELECT raw_output AS rawOutput FROM quota_scrapes WHERE provider = 'claude'")
+        .all()
+    ).toEqual([
+      {
+        rawOutput: JSON.stringify({
+          generation: 1,
+          idempotencyKey: "manual-reading-1",
+          source: "manual",
+          version: 1,
+        }),
+      },
+    ]);
+    const ready = await makeRequest(socketPath, "/v1/readyz");
+    expect(ready.json.scrapes.claude.readingMode).toEqual({ mode: "manual", generation: 1 });
+    const paced = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(paced.status).toBe(200);
+    expect(paced.json).toMatchObject({ updatedAt: manualObservedAt, provider: "claude" });
+    expect(paced.json.intervalSeconds).toBeGreaterThan(0);
+    expect(paced.json.freshness.ageMs).toBe(5 * 60_000);
+
+    const duplicate = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", generation: 1, observation }),
+      { "Idempotency-Key": "manual-reading-1" }
+    );
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.json.duplicate).toBe(true);
+    expect(
+      store.db.prepare("SELECT count(*) AS n FROM quota_manual_observation_receipts").get()
+    ).toEqual({ n: 1 });
+
+    const changedDuplicate = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 1,
+        observation: { ...observation, limits: [{ ...observation.limits[0], percentLeft: 20 }] },
+      }),
+      { "Idempotency-Key": "manual-reading-1" }
+    );
+    expect(changedDuplicate.status).toBe(409);
+    expect(changedDuplicate.json.error.code).toBe("idempotency_conflict");
+
+    const stale = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 1,
+        observation: { ...observation, scrapedAt: "2030-01-01T00:00:00.000Z" },
+      }),
+      { "Idempotency-Key": "manual-reading-stale" }
+    );
+    expect(stale.status).toBe(409);
+    expect(stale.json.error.code).toBe("stale_observation");
+    const afterStale = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(afterStale.json).toMatchObject({ updatedAt: manualObservedAt });
+    expect(afterStale.json.freshness.ageMs).toBe(5 * 60_000);
+
+    const switchedScrape = await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "scrape" })
+    );
+    expect(switchedScrape.json).toMatchObject({ mode: "scrape", generation: 2 });
+    const rejectedInScrapeMode = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", generation: 1, observation }),
+      { "Idempotency-Key": "manual-reading-after-scrape" }
+    );
+    expect(rejectedInScrapeMode.status).toBe(409);
+    expect(rejectedInScrapeMode.json.error.code).toBe("manual_mode_required");
+    // Replay of an accepted key does not outrank current authority.
+    const replayInScrapeMode = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", generation: 1, observation }),
+      { "Idempotency-Key": "manual-reading-1" }
+    );
+    expect(replayInScrapeMode.status).toBe(409);
+    expect(replayInScrapeMode.json.error.code).toBe("manual_mode_required");
+    const readyInScrapeMode = await makeRequest(socketPath, "/v1/readyz");
+    expect(readyInScrapeMode.json.scrapes.claude.readingMode).toEqual({
+      mode: "scrape",
+      generation: 2,
+    });
+
+    const manualAgain = await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "manual" })
+    );
+    expect(manualAgain.json).toMatchObject({ mode: "manual", generation: 3 });
+    const delayedGeneration = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 1,
+        observation: { ...observation, scrapedAt: "2030-01-01T00:06:00.000Z" },
+      }),
+      { "Idempotency-Key": "manual-reading-old-generation" }
+    );
+    expect(delayedGeneration.status).toBe(409);
+    expect(delayedGeneration.json.error.code).toBe("mode_generation_mismatch");
+    const replayOldGeneration = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", generation: 1, observation }),
+      { "Idempotency-Key": "manual-reading-1" }
+    );
+    expect(replayOldGeneration.status).toBe(409);
+    expect(replayOldGeneration.json.error.code).toBe("mode_generation_mismatch");
+
+    // A hand-typed request is told which field failed; a reset that already
+    // passed is not a validation failure (the scrapers report those too).
+    const badPercent = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 3,
+        observation: { ...observation, limits: [{ ...observation.limits[0], percentLeft: 101 }] },
+      }),
+      { "Idempotency-Key": "manual-reading-bad-percent" }
+    );
+    expect(badPercent.status).toBe(400);
+    expect(badPercent.json.error.message).toBe(
+      "observation.limits[0].percentLeft must be between 0 and 100"
+    );
+    const passedReset = await makeRequest(
+      socketPath,
+      MANUAL_QUOTA_OBSERVATION_PATH,
+      "POST",
+      JSON.stringify({
+        provider: "claude",
+        generation: 3,
+        observation: {
+          ...observation,
+          scrapedAt: "2030-01-01T00:11:00.000Z",
+          limits: [{ ...observation.limits[0], resetAtIso: "2030-01-01T00:06:00.000Z" }],
+        },
+      }),
+      { "Idempotency-Key": "manual-reading-passed-reset" }
+    );
+    expect(passedReset.status).toBe(200);
+    expect(passedReset.json.duplicate).toBe(false);
+
+    await service.stop();
+    store.close();
+    store = new SharedQuotaStore(dbPath);
+    expect(store.getQuotaReadingMode("claude")).toEqual({
+      mode: "manual",
+      generation: 3,
+      updatedAt: new Date(nowMs).toISOString(),
+    });
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
@@ -614,10 +880,10 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
   // Criterion 9 & §7: Schema version refusal without mutating.
   it("criterion 9 & §7: service refuses to open database with PRAGMA user_version newer than supported without mutating", () => {
-    // Create DB with user_version = 2
+    // Create DB with a schema newer than this binary supports.
     const futureDbPath = join(tmpDir, "future.db");
     const db = new Database(futureDbPath);
-    db.pragma("user_version = 2");
+    db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION + 1}`);
     db.close();
 
     // SharedQuotaStore constructor must throw SchemaVersionRefusalError before ensureSchema/widenToWal
@@ -628,7 +894,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     // Verify the database was left untouched
     const checkDb = new Database(futureDbPath, { readonly: true });
     const version = checkDb.pragma("user_version", { simple: true });
-    expect(version).toBe(2);
+    expect(version).toBe(QUOTA_SCHEMA_VERSION + 1);
     const tables = checkDb
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
       .all() as Array<{ name: string }>;
