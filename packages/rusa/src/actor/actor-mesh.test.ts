@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
@@ -5674,6 +5675,61 @@ describe("ActorMesh", () => {
 
       deferred.releaseAll();
       await tick();
+    });
+
+    it("persists a queued pool replacement before its reservation is re-admitted", async () => {
+      const db = new Database(":memory:");
+      try {
+        runMigrations(db);
+        const actors = new SqliteActorRepository(db);
+        const deferred = deferredProvider();
+        const { mesh, tick } = setup({
+          actors: actors as unknown as InMemoryActorRepository,
+          maxConcurrent: 1,
+          sharedProvider: deferred.provider,
+        });
+        const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+        const worker = mesh.spawn({
+          charter: "worker",
+          parentId: "root",
+          modelConfig: { provider: "deferred", model: "model-a" },
+          context: { type: "portable", mode: "ledger" },
+        });
+
+        mesh.sendMessage(blocker, "hold the one slot", "root");
+        await tick();
+        mesh.sendMessage(worker, "wait behind the blocker", "root");
+        await tick();
+        expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+        mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
+
+        // The row changes before the old reservation can be released or the
+        // replacement admission can launch, so a daemon restart at this point
+        // reads the new selection rather than process-only staging (#652).
+        expect(actors.get(worker)?.modelConfig).toEqual([
+          { provider: "deferred", model: "model-b" },
+        ]);
+        expect(
+          JSON.parse(
+            (
+              db.prepare("SELECT model_config FROM actors WHERE id = ?").get(worker) as {
+                model_config: string;
+              }
+            ).model_config
+          )
+        ).toMatchObject({
+          entries: [{ provider: "deferred", model: "model-b" }],
+        });
+        expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+        deferred.releaseAll();
+        await tick();
+        deferred.releaseAll();
+        await tick();
+      } finally {
+        db.close();
+      }
     });
 
     it("keeps an in-flight run on its already-launched pool; only the following run picks up the staged one", async () => {
