@@ -1,24 +1,40 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'widgets/header.dart';
 
+/// Test override for simulating browser URLs in unit and widget tests.
+@visibleForTesting
+String? debugDashboardUrl;
+
 /// The view the current address names, or null when the path names none —
 /// the bare `/` landing, where the caller picks the default that suits the
 /// viewport.
-DashboardView? dashboardViewFromUrl() => _parse(Uri.base.path);
+DashboardView? dashboardViewFromUrl() {
+  final path = debugDashboardUrl != null
+      ? Uri.parse(debugDashboardUrl!).path
+      : Uri.base.path;
+  return _parse(path);
+}
 
 String? focusedObligationIdFromUrl() {
-  final path = Uri.base.path.replaceFirst(RegExp(r'/+$'), '');
+  final uri = debugDashboardUrl != null
+      ? Uri.parse(debugDashboardUrl!)
+      : Uri.base;
+  final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
   if (path.startsWith('/work/')) {
     return path.substring('/work/'.length);
   }
-  return Uri.base.queryParameters['obligation'];
+  return uri.queryParameters['obligation'];
 }
 
 String? focusedActorIdFromUrl() {
-  final path = Uri.base.path.replaceFirst(RegExp(r'/+$'), '');
+  final uri = debugDashboardUrl != null
+      ? Uri.parse(debugDashboardUrl!)
+      : Uri.base;
+  final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
   if (path.startsWith('/actors/')) {
     return path.substring('/actors/'.length);
   }
@@ -32,7 +48,10 @@ void writeDashboardViewToUrl(
   String? focusedActorId,
   Future<void> Function()? onNavigation,
 }) {
-  var queryParams = Map<String, String>.from(Uri.base.queryParameters);
+  final baseUri = debugDashboardUrl != null
+      ? Uri.parse(debugDashboardUrl!)
+      : Uri.base;
+  var queryParams = Map<String, String>.from(baseUri.queryParameters);
   queryParams.remove('obligation');
 
   var newPath = '/${view.name}';
@@ -46,7 +65,10 @@ void writeDashboardViewToUrl(
     path: newPath,
     queryParameters: queryParams.isEmpty ? null : queryParams,
   );
-  if (url.path != Uri.base.path || url.query != Uri.base.query) {
+  if (debugDashboardUrl != null) {
+    debugDashboardUrl = url.toString();
+  }
+  if (url.path != baseUri.path || url.query != baseUri.query) {
     if (onNavigation != null) unawaited(onNavigation());
   }
   // Let Flutter update its own browser-history entry. Calling the DOM History
