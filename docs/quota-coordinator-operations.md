@@ -83,7 +83,9 @@ orchestrator unit (design §9.1). It sets:
 
 - `Environment=PATH=<the resolved user PATH>` — the provider CLIs, `bwrap` and
   `tmux` all have to be findable; systemd's default `/usr/bin:/bin` finds none
-  of them.
+  of them. The `PATH` is fixed at install time, so it can fall behind the
+  instance unit's; `pnpm --filter rusa run check:coordinator-path` compares
+  the two and names any provider CLI the coordinator can no longer resolve.
 - `Environment=XDG_RUNTIME_DIR=<runtime dir>` — the tmux socket and the
   coordinator's own listener. Set explicitly because a coordinator that falls
   back to `/tmp` for its socket is one whose clients cannot find it.

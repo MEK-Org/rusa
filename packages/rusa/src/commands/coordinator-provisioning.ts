@@ -40,7 +40,7 @@ export const POOL_COORDINATOR_ALERT_UNIT = "rusa-quota-coordinator-alert.service
  */
 const LEGACY_COORDINATOR_BASENAME = "rusa-staging";
 
-const COORDINATOR_SERVICE_UNITS: readonly string[] = [
+export const COORDINATOR_SERVICE_UNITS: readonly string[] = [
   POOL_COORDINATOR_UNIT,
   `${LEGACY_COORDINATOR_BASENAME}-quota-coordinator.service`,
 ];

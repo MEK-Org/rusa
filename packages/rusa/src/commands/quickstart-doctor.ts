@@ -748,14 +748,17 @@ export async function runQuickstartDoctor(
   return results;
 }
 
-export function formatDoctorResults(results: readonly DoctorResult[]): string {
+export function formatDoctorResults(
+  results: readonly DoctorResult[],
+  header = "[quickstart] Preflight doctor:"
+): string {
   const label: Record<DoctorStatus, string> = {
     pass: "PASS",
     fail: "FAIL",
     warn: "WARN",
     info: "INFO",
   };
-  const lines = ["[quickstart] Preflight doctor:"];
+  const lines = [header];
   for (const result of results) {
     lines.push(`  ${label[result.status]} ${result.name}: ${result.message}`);
     if (result.probed?.length) {
