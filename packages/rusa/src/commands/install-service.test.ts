@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { POOL_COORDINATOR_UNIT } from "./coordinator-provisioning.js";
 import {
   buildAlertUnit,
   buildQuotaCoordinatorUnit,
   buildServiceUnit,
-  quotaCoordinatorUnitNames,
+  unitOrdersAfter,
   withCoordinatorOrdering,
 } from "./install-service.js";
 
@@ -125,15 +126,16 @@ describe("buildServiceUnit — coordinator ordering", () => {
   });
 });
 
-describe("quotaCoordinatorUnitNames", () => {
-  it("derives both names from the instance basename, so staging cannot collide", () => {
-    expect(quotaCoordinatorUnitNames("rusa")).toEqual({
-      serviceUnit: "rusa-quota-coordinator.service",
-      alertUnit: "rusa-quota-coordinator-alert.service",
-    });
-    expect(quotaCoordinatorUnitNames("rusa-staging").serviceUnit).toBe(
-      "rusa-staging-quota-coordinator.service"
-    );
+describe("unitOrdersAfter", () => {
+  it("answers for a unit that declares both directives, and one that declares neither", () => {
+    const ordered = buildServiceUnit({ ...base, coordinatorUnit: POOL_COORDINATOR_UNIT });
+    expect(unitOrdersAfter(ordered, POOL_COORDINATOR_UNIT)).toBe(true);
+    expect(unitOrdersAfter(buildServiceUnit(base), POOL_COORDINATOR_UNIT)).toBe(false);
+  });
+
+  it("is not satisfied by only one of the two directives", () => {
+    const halfOrdered = ["[Unit]", `After=${POOL_COORDINATOR_UNIT}`, "", "[Service]"].join("\n");
+    expect(unitOrdersAfter(halfOrdered, POOL_COORDINATOR_UNIT)).toBe(false);
   });
 });
 

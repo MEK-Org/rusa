@@ -1672,13 +1672,14 @@ Criterion 14 covers this: the harness reads through the service, takes no
 
 ### 9.1 Ownership and units
 
-In the target architecture, the coordinator is provisioned once per pool, with
-instances across environments acting as clients. Today, the shipped installer
-and systemd unit generator (`packages/rusa/src/commands/install-service.ts`)
-write units per environment, naming them `<serviceBasename>-quota-coordinator.service`
-from the instance's service basename. Decoupling coordinator unit installation
-from instance/environment basenames into a distinct pool-level installer is
-tracked as a follow-up gap.
+The coordinator is provisioned once per pool, with instances across
+environments acting as clients. Since #507 the shipped installer and systemd
+unit generator (`packages/rusa/src/commands/install-service.ts`) provision it
+that way: the unit names are the fixed `rusa-quota-coordinator.service` and its
+alert companion, the service's home is named explicitly rather than selected
+through an instance environment, and installing the coordinator does not edit
+any instance unit. The transition off the earlier per-environment units is in
+the runbook's §1.
 
 The coordinator unit runs alongside the instance units. It carries the same
 treatment the existing units get: journal logging, restart policy, and a

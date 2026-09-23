@@ -375,23 +375,34 @@ program
 
 program
   .command("install-quota-coordinator")
-  .description("Install the quota coordinator systemd user service and its failure alert")
-  .option("--environment <environment>", "Service environment: production or staging", "production")
+  .description(
+    "Install the pool-owned quota coordinator systemd user service and its failure alert"
+  )
+  .option(
+    "--home <path>",
+    "The coordinator's own service home (config, .env, workers dir). Defaults to RUSA_QUOTA_COORDINATOR_HOME, else the home the installed coordinator unit already uses"
+  )
   .option("--deployment-mode <mode>", "Executable source: package or self", "package")
   .option("--repo-path <path>", "Repo root or package directory to use for self deployment mode")
   .option("--no-restart", "write/enable units and reload systemd, but do not start the service")
+  .option(
+    "--allow-database-change",
+    "Permit this install to point the coordinator at a different quota database than the installed unit opens"
+  )
   .action(
     async (opts: {
-      environment: ServiceEnvironment;
+      home?: string;
       deploymentMode: DeploymentMode;
       repoPath?: string;
       restart: boolean;
+      allowDatabaseChange?: boolean;
     }) => {
       await runInstallQuotaCoordinator({
-        environment: opts.environment,
+        home: opts.home,
         deploymentMode: opts.deploymentMode,
         repoPath: opts.repoPath,
         restart: opts.restart,
+        allowDatabaseChange: opts.allowDatabaseChange,
       });
     }
   );
