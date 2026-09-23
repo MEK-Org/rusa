@@ -8,7 +8,9 @@ import {
   type ObligationActivationScheduler,
 } from "../../actor/os-scheduler.js";
 import {
+  isTerminalObligationStatus,
   OBLIGATION_CHECKPOINT_MAX,
+  OBLIGATION_STATUSES,
   type Obligation,
   type ObligationTree,
   ObligationValidationError,
@@ -2293,6 +2295,60 @@ describe("ObligationRepository", () => {
         expect(pruned.blockingChildren.map((c) => c.id)).toEqual(
           full.blockingChildren.map((c) => c.id)
         );
+      });
+
+      it("classifies every status identically between root SQL and descendant memory predicates", () => {
+        repository.create({ id: "shared-blocker", title: "shared-blocker", ownerId: "actor-a" });
+
+        for (const status of OBLIGATION_STATUSES) {
+          const rootId = `parity-root-${status}`;
+          repository.create({ id: rootId, title: rootId, ownerId: "actor-a" });
+          if (status === "done" || status === "cancelled") {
+            repository.setTerminalStatus(rootId, status, null, null, "system:mesh");
+          } else if (status === "waiting") {
+            repository.addPrerequisite(rootId, "shared-blocker", "system:mesh");
+          } else if (status === "scheduled") {
+            repository.setRecurrence(
+              rootId,
+              { policy: "cron", cronExpr: "0 * * * *" },
+              "system:mesh"
+            );
+            repository.setTerminalStatus(rootId, "done", null, null, "system:mesh");
+          }
+
+          const page = repository.listPage({ limit: 100, excludeQuietTerminalRoots: true });
+          const rootIncluded = page.obligations.some((o) => o.id === rootId);
+
+          const holderId = `parity-holder-${status}`;
+          const childId = `parity-child-${status}`;
+          repository.create({ id: holderId, title: holderId, ownerId: "actor-a" });
+          repository.create({
+            id: childId,
+            title: childId,
+            parentId: holderId,
+            ownerId: "actor-a",
+          });
+          if (status === "done" || status === "cancelled") {
+            repository.setTerminalStatus(childId, status, null, null, "system:mesh");
+          } else if (status === "waiting") {
+            repository.addPrerequisite(childId, "shared-blocker", "system:mesh");
+          } else if (status === "scheduled") {
+            repository.setRecurrence(
+              childId,
+              { policy: "cron", cronExpr: "0 * * * *" },
+              "system:mesh"
+            );
+            repository.setTerminalStatus(childId, "done", null, null, "system:mesh");
+          }
+
+          const [forest] = repository.getForest([holderId], {
+            excludeQuietTerminalDescendants: true,
+          });
+          const childIncluded = forest.children.some((c) => c.obligation.id === childId);
+
+          expect(rootIncluded).toBe(childIncluded);
+          expect(rootIncluded).toBe(!isTerminalObligationStatus(status));
+        }
       });
     });
   });

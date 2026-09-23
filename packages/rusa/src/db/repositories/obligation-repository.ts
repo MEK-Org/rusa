@@ -14,6 +14,7 @@ import {
   isBlockingObligationStatus,
   isTerminalObligationStatus,
   normalizeCheckpoint,
+  OBLIGATION_STATUSES,
   type Obligation,
   type ObligationArtifact,
   type ObligationHistoryEntry,
@@ -267,6 +268,10 @@ const PROJECTED_OBLIGATION = `
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
 `;
+
+const TERMINAL_STATUS_SQL = OBLIGATION_STATUSES.filter(isTerminalObligationStatus)
+  .map((s) => `'${s}'`)
+  .join(", ");
 
 /**
  * The same predicate `listPage`'s `excludeQuietTerminalRoots` clause applies
@@ -1883,7 +1888,7 @@ export class ObligationRepository {
     }
     if (options.excludeQuietTerminalRoots) {
       clauses.push(
-        `(obligation.status NOT IN ('done', 'cancelled')
+        `(obligation.status NOT IN (${TERMINAL_STATUS_SQL})
           OR obligation.recurrence_policy IS NOT NULL
           OR EXISTS (SELECT 1 FROM obligation_completions WHERE obligation_id = obligation.id))`
       );
