@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-	type ProbePathEnv,
-	readUnitEnvironment,
-	resolvePathEnvForUnit,
-	resolveProbePathEnv,
+  type ProbePathEnv,
+  readUnitEnvironment,
+  resolvePathEnvForUnit,
+  resolveProbePathEnv,
 } from "./service-instance.js";
 
 /**
@@ -24,8 +24,7 @@ import {
  * units are removed.
  */
 export const POOL_COORDINATOR_UNIT = "rusa-quota-coordinator.service";
-export const POOL_COORDINATOR_ALERT_UNIT =
-	"rusa-quota-coordinator-alert.service";
+export const POOL_COORDINATOR_ALERT_UNIT = "rusa-quota-coordinator-alert.service";
 
 /**
  * Every coordinator unit name this project has ever installed.
@@ -42,35 +41,33 @@ export const POOL_COORDINATOR_ALERT_UNIT =
 const LEGACY_COORDINATOR_BASENAME = "rusa-staging";
 
 export const COORDINATOR_SERVICE_UNITS: readonly string[] = [
-	POOL_COORDINATOR_UNIT,
-	`${LEGACY_COORDINATOR_BASENAME}-quota-coordinator.service`,
+  POOL_COORDINATOR_UNIT,
+  `${LEGACY_COORDINATOR_BASENAME}-quota-coordinator.service`,
 ];
 
 const COORDINATOR_ALERT_UNITS: readonly string[] = [
-	POOL_COORDINATOR_ALERT_UNIT,
-	`${LEGACY_COORDINATOR_BASENAME}-quota-coordinator-alert.service`,
+  POOL_COORDINATOR_ALERT_UNIT,
+  `${LEGACY_COORDINATOR_BASENAME}-quota-coordinator-alert.service`,
 ];
 
 /** True for a coordinator *service* unit we wrote; alert companions excluded. */
 function isCoordinatorServiceUnit(name: string): boolean {
-	return COORDINATOR_SERVICE_UNITS.includes(name);
+  return COORDINATOR_SERVICE_UNITS.includes(name);
 }
 
 /** True for any coordinator unit we wrote, service or alert companion. */
 function isCoordinatorUnit(name: string): boolean {
-	return (
-		isCoordinatorServiceUnit(name) || COORDINATOR_ALERT_UNITS.includes(name)
-	);
+  return isCoordinatorServiceUnit(name) || COORDINATOR_ALERT_UNITS.includes(name);
 }
 
 /** The environment variable naming the coordinator's own home. */
 export const COORDINATOR_HOME_ENV = "RUSA_QUOTA_COORDINATOR_HOME";
 
 export interface InstalledCoordinatorUnit {
-	/** Unit file name, e.g. `rusa-staging-quota-coordinator.service`. */
-	unit: string;
-	/** The `RUSA_HOME` that unit assigns, or null when it assigns none. */
-	home: string | null;
+  /** Unit file name, e.g. `rusa-staging-quota-coordinator.service`. */
+  unit: string;
+  /** The `RUSA_HOME` that unit assigns, or null when it assigns none. */
+  home: string | null;
 }
 
 /**
@@ -79,36 +76,36 @@ export interface InstalledCoordinatorUnit {
  * their own worth adopting and are removed alongside the service they belong to.
  */
 export function readInstalledCoordinatorUnits(
-	systemdUserDir: string,
-	unitNames: readonly string[],
+  systemdUserDir: string,
+  unitNames: readonly string[]
 ): InstalledCoordinatorUnit[] {
-	return unitNames
-		.filter(isCoordinatorServiceUnit)
-		.sort()
-		.map((unit) => {
-			let contents: string;
-			try {
-				contents = readFileSync(join(systemdUserDir, unit), "utf-8");
-			} catch {
-				return { unit, home: null };
-			}
-			return { unit, home: readUnitEnvironment(contents, "RUSA_HOME") };
-		});
+  return unitNames
+    .filter(isCoordinatorServiceUnit)
+    .sort()
+    .map((unit) => {
+      let contents: string;
+      try {
+        contents = readFileSync(join(systemdUserDir, unit), "utf-8");
+      } catch {
+        return { unit, home: null };
+      }
+      return { unit, home: readUnitEnvironment(contents, "RUSA_HOME") };
+    });
 }
 
 export type CoordinatorHomeSource = "flag" | "env" | "adopted";
 
 export interface CoordinatorServiceContext {
-	/** The coordinator's own home: where its config, `.env`, and workers dir live. */
-	home: string;
-	/** How that home was chosen, so the installer can report it rather than imply it. */
-	homeSource: CoordinatorHomeSource;
-	/** Present only for `adopted`: the unit the home was read back out of. */
-	adoptedFrom?: string;
-	serviceUnit: string;
-	alertUnit: string;
-	configPath: string;
-	workersDir: string;
+  /** The coordinator's own home: where its config, `.env`, and workers dir live. */
+  home: string;
+  /** How that home was chosen, so the installer can report it rather than imply it. */
+  homeSource: CoordinatorHomeSource;
+  /** Present only for `adopted`: the unit the home was read back out of. */
+  adoptedFrom?: string;
+  serviceUnit: string;
+  alertUnit: string;
+  configPath: string;
+  workersDir: string;
 }
 
 /**
@@ -130,68 +127,58 @@ export interface CoordinatorServiceContext {
  * one would silently choose which pool database the service adopts.
  */
 export function resolveCoordinatorServiceContext(opts: {
-	home?: string;
-	envHome?: string;
-	installedUnits?: readonly InstalledCoordinatorUnit[];
+  home?: string;
+  envHome?: string;
+  installedUnits?: readonly InstalledCoordinatorUnit[];
 }): CoordinatorServiceContext {
-	const explicit = opts.home?.trim();
-	if (explicit) return contextFor(resolve(explicit), "flag");
+  const explicit = opts.home?.trim();
+  if (explicit) return contextFor(resolve(explicit), "flag");
 
-	const fromEnv = opts.envHome?.trim();
-	if (fromEnv) return contextFor(resolve(fromEnv), "env");
+  const fromEnv = opts.envHome?.trim();
+  if (fromEnv) return contextFor(resolve(fromEnv), "env");
 
-	const candidates = (opts.installedUnits ?? []).filter(
-		(candidate): candidate is InstalledCoordinatorUnit & { home: string } =>
-			candidate.home !== null,
-	);
-	const pool = candidates.find(
-		(candidate) => candidate.unit === POOL_COORDINATOR_UNIT,
-	);
-	if (pool)
-		return {
-			...contextFor(resolve(pool.home), "adopted"),
-			adoptedFrom: pool.unit,
-		};
-	if (candidates.length === 1) {
-		return {
-			...contextFor(resolve(candidates[0].home), "adopted"),
-			adoptedFrom: candidates[0].unit,
-		};
-	}
-	if (candidates.length > 1) {
-		const listed = candidates.map((c) => `${c.unit} (${c.home})`).join(", ");
-		throw new Error(
-			`Cannot tell which home the pool coordinator should adopt: ${listed}. ` +
-				`Pass --home <path> to name it explicitly — choosing for you would choose which quota database the service opens.`,
-		);
-	}
+  const candidates = (opts.installedUnits ?? []).filter(
+    (candidate): candidate is InstalledCoordinatorUnit & { home: string } => candidate.home !== null
+  );
+  const pool = candidates.find((candidate) => candidate.unit === POOL_COORDINATOR_UNIT);
+  if (pool) return { ...contextFor(resolve(pool.home), "adopted"), adoptedFrom: pool.unit };
+  if (candidates.length === 1) {
+    return {
+      ...contextFor(resolve(candidates[0].home), "adopted"),
+      adoptedFrom: candidates[0].unit,
+    };
+  }
+  if (candidates.length > 1) {
+    const listed = candidates.map((c) => `${c.unit} (${c.home})`).join(", ");
+    throw new Error(
+      `Cannot tell which home the pool coordinator should adopt: ${listed}. ` +
+        `Pass --home <path> to name it explicitly — choosing for you would choose which quota database the service opens.`
+    );
+  }
 
-	throw new Error(
-		"The quota coordinator's home is no longer derived from an instance environment. " +
-			`Pass --home <path> (or set ${COORDINATOR_HOME_ENV}) to name the pool coordinator's own home.`,
-	);
+  throw new Error(
+    "The quota coordinator's home is no longer derived from an instance environment. " +
+      `Pass --home <path> (or set ${COORDINATOR_HOME_ENV}) to name the pool coordinator's own home.`
+  );
 }
 
-function contextFor(
-	home: string,
-	homeSource: CoordinatorHomeSource,
-): CoordinatorServiceContext {
-	return {
-		home,
-		homeSource,
-		serviceUnit: POOL_COORDINATOR_UNIT,
-		alertUnit: POOL_COORDINATOR_ALERT_UNIT,
-		configPath: join(home, "config.yaml"),
-		workersDir: join(home, "workers"),
-	};
+function contextFor(home: string, homeSource: CoordinatorHomeSource): CoordinatorServiceContext {
+  return {
+    home,
+    homeSource,
+    serviceUnit: POOL_COORDINATOR_UNIT,
+    alertUnit: POOL_COORDINATOR_ALERT_UNIT,
+    configPath: join(home, "config.yaml"),
+    workersDir: join(home, "workers"),
+  };
 }
 
 export interface CoordinatorTransitionPlan {
-	/**
-	 * Environment-derived coordinator units to stop, disable, and remove — the
-	 * duplicate pool coordinators. Their alert companions are included.
-	 */
-	removeUnits: string[];
+  /**
+   * Environment-derived coordinator units to stop, disable, and remove — the
+   * duplicate pool coordinators. Their alert companions are included.
+   */
+  removeUnits: string[];
 }
 
 /**
@@ -206,18 +193,16 @@ export interface CoordinatorTransitionPlan {
  * Removing a unit never removes a database. A coordinator that was opening a
  * different file leaves that file exactly where it is; the installer says so.
  */
-export function planCoordinatorTransition(
-	unitNames: readonly string[],
-): CoordinatorTransitionPlan {
-	const removeUnits = unitNames
-		.filter(
-			(name) =>
-				isCoordinatorUnit(name) &&
-				name !== POOL_COORDINATOR_UNIT &&
-				name !== POOL_COORDINATOR_ALERT_UNIT,
-		)
-		.sort();
-	return { removeUnits };
+export function planCoordinatorTransition(unitNames: readonly string[]): CoordinatorTransitionPlan {
+  const removeUnits = unitNames
+    .filter(
+      (name) =>
+        isCoordinatorUnit(name) &&
+        name !== POOL_COORDINATOR_UNIT &&
+        name !== POOL_COORDINATOR_ALERT_UNIT
+    )
+    .sort();
+  return { removeUnits };
 }
 
 /**
@@ -241,17 +226,14 @@ export function planCoordinatorTransition(
  * of client unit names that command can produce. A third instance would have to
  * change that derivation, which is the same edit that would extend this list.
  */
-export const POOL_CLIENT_UNITS: readonly string[] = [
-	"rusa.service",
-	"rusa-staging.service",
-];
+export const POOL_CLIENT_UNITS: readonly string[] = ["rusa.service", "rusa-staging.service"];
 
 export interface PoolProbePath {
-	probePath: ProbePathEnv;
-	/** The client unit the `PATH` was borrowed from, or null when none supplied one. */
-	donorUnit: string | null;
-	/** Candidate client units on disk, whether or not they supplied a `PATH`. */
-	installedUnits: string[];
+  probePath: ProbePathEnv;
+  /** The client unit the `PATH` was borrowed from, or null when none supplied one. */
+  donorUnit: string | null;
+  /** Candidate client units on disk, whether or not they supplied a `PATH`. */
+  installedUnits: string[];
 }
 
 /**
@@ -269,26 +251,25 @@ export interface PoolProbePath {
  * no PATH" — the second is the actionable case and the one that reproduces #525.
  */
 export function resolvePoolProbePath(
-	systemdUserDir: string,
-	unitNames: readonly string[],
-	resolveProbe: typeof resolveProbePathEnv = resolveProbePathEnv,
+  systemdUserDir: string,
+  unitNames: readonly string[],
+  resolveProbe: typeof resolveProbePathEnv = resolveProbePathEnv
 ): PoolProbePath {
-	const installedUnits: string[] = [];
-	for (const unit of unitNames) {
-		let contents: string;
-		try {
-			contents = readFileSync(join(systemdUserDir, unit), "utf-8");
-		} catch {
-			continue;
-		}
-		installedUnits.push(unit);
-		const probePath = resolveProbe(unit, contents);
-		if (probePath.source !== "process")
-			return { probePath, donorUnit: unit, installedUnits };
-	}
-	return {
-		probePath: { path: resolvePathEnvForUnit(), source: "process" },
-		donorUnit: null,
-		installedUnits,
-	};
+  const installedUnits: string[] = [];
+  for (const unit of unitNames) {
+    let contents: string;
+    try {
+      contents = readFileSync(join(systemdUserDir, unit), "utf-8");
+    } catch {
+      continue;
+    }
+    installedUnits.push(unit);
+    const probePath = resolveProbe(unit, contents);
+    if (probePath.source !== "process") return { probePath, donorUnit: unit, installedUnits };
+  }
+  return {
+    probePath: { path: resolvePathEnvForUnit(), source: "process" },
+    donorUnit: null,
+    installedUnits,
+  };
 }

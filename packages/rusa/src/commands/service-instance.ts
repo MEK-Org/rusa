@@ -40,7 +40,7 @@ function resolveCurrentPackageDir(): string | null {
   }
 }
 
-export function resolveServiceBasename(environment: ServiceEnvironment): string {
+function resolveServiceBasename(environment: ServiceEnvironment): string {
   return environment === "production" ? "rusa" : "rusa-staging";
 }
 

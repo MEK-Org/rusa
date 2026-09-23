@@ -8,7 +8,6 @@ import { CONFIG_DOCS, printConfigDocs } from "./commands/config-docs.js";
 import { runDashboard } from "./commands/dashboard.js";
 import { runDbCheck } from "./commands/db-check.js";
 import { runDev } from "./commands/dev.js";
-import { runDoctor } from "./commands/doctor.js";
 import { runActorMeshE2EUp } from "./commands/e2e-actor-mesh.js";
 import { runForwardWebhooks } from "./commands/forward-webhooks.js";
 import { runInit } from "./commands/init.js";
@@ -80,14 +79,6 @@ program
   .addHelpText("after", `\n${CONFIG_DOCS.trimEnd()}`)
   .action(() => {
     printConfigDocs();
-  });
-
-program
-  .command("doctor")
-  .description("Check this host's rusa service installation")
-  .option("--home <path>", "Rusa home to read the configured provider CLIs from")
-  .action((opts: { home?: string }) => {
-    runDoctor({ home: opts.home });
   });
 
 program
