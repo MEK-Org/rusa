@@ -468,11 +468,4 @@ export interface FollowerGatewayConfig {
 export interface MeshConfig {
   /** Cross-actor concurrency cap for non-responsive runs. Default 4. */
   maxConcurrent?: number;
-  /** Opt-in, public/synthetic-only responsive interruption policy. */
-  responsiveInterruption?: {
-    /** v1 observes predictions only; it never changes responsive dispatch. */
-    mode: "shadow";
-    /** Minimum closed-Choice confidence required to predict an interrupt (0..1). */
-    threshold?: number;
-  };
 }

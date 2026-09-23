@@ -7,7 +7,7 @@ import {
 } from "../actor/concurrency-limiter.js";
 import { isResponsiveNudge, type RunNudge } from "../actor/trigger-runner.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import type { InboxRepository } from "../repositories/inbox-repository.js";
+import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
 
 /**
  * The durable payload type a voice memo is delivered under, written by the
@@ -84,6 +84,13 @@ export interface DurableDispatchWork {
    * that run, and passing the voice hold.
    */
   unseenResponsive?: boolean;
+  /**
+   * The unabsorbed responsive rows themselves, collected only when a policy
+   * hook asked to observe them. They are the same rows that set
+   * `unseenResponsive`, read once, so an observer records the entries that
+   * actually caused this dispatch rather than a later re-read of the table.
+   */
+  unseenResponsiveEntries?: readonly InboxEntry[];
   /** Delivery time of the newest pending voice memo no run has absorbed. */
   voiceAt?: number;
 }
@@ -139,7 +146,7 @@ export interface RunManagerOptions {
    */
   onResponsiveArrived?: (
     actorId: string,
-    entryIds: readonly string[],
+    entries: readonly InboxEntry[],
     baseline: "interrupt" | "queue"
   ) => void;
   /** Internal construction-only port receiver. */
@@ -184,6 +191,14 @@ export class RunManager {
   private readonly markInboxSeen: (actorId: string) => void;
   private readonly onPreempted: (actorId: string, phase: string) => void;
   private readonly onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
+  /**
+   * Entry ids already handed to `onResponsiveArrived`. A row stays unseen
+   * until a run admits it, so without this a second delivery poke re-reports
+   * the first row alongside the new one — which would inflate exactly the
+   * false-preemption counts this observation exists to measure. Pruned to the
+   * still-unabsorbed set on every dispatch, so it cannot outgrow the inbox.
+   */
+  private readonly observedResponsive = new Map<string, Set<string>>();
   private readonly log: (msg: string) => void;
 
   constructor(opts: RunManagerOptions) {
@@ -249,7 +264,7 @@ export class RunManager {
   durableWork(actorId: string): DurableDispatchWork | null {
     const inbox = this.inbox;
     if (inbox.countUnhandled(actorId, { responsiveOnly: true }) > 0) {
-      return { priority: "responsive", ...dispatchWork(this.pendingResponsive(actorId)) };
+      return { priority: "responsive", ...this.pendingResponsive(actorId) };
     }
     return inbox.countUnhandled(actorId) > 0 ? { priority: "normal" } : null;
   }
@@ -268,12 +283,16 @@ export class RunManager {
    */
   private pendingResponsive(actorId: string): {
     unseenResponsive: boolean;
-    unseenResponsiveEntryIds?: readonly string[];
+    unseenResponsiveEntries?: readonly InboxEntry[];
     voiceAt?: number;
   } {
+    // Only an observer wants the rows themselves, and collecting them costs
+    // the early exit below. A deployment with no policy hook pages exactly
+    // what it always did.
+    const collect = this.onResponsiveArrived !== undefined;
     let cursor: string | undefined;
     let unseenResponsive = false;
-    const unseenResponsiveEntryIds: string[] = [];
+    const unseenResponsiveEntries: InboxEntry[] = [];
     let voiceAt: number | undefined;
 
     do {
@@ -286,7 +305,7 @@ export class RunManager {
       for (const entry of page.entries) {
         if (entry.seenAt === null) {
           unseenResponsive = true;
-          unseenResponsiveEntryIds.push(entry.id);
+          if (collect) unseenResponsiveEntries.push(entry);
           if (voiceAt === undefined && entry.payload.type === VOICE_INBOX_PAYLOAD_TYPE) {
             const at = entry.deliveredAt.getTime();
             if (Number.isFinite(at)) {
@@ -295,14 +314,43 @@ export class RunManager {
           }
         }
       }
+      if (!collect && unseenResponsive && voiceAt !== undefined) {
+        break;
+      }
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
 
     return {
       unseenResponsive,
-      ...(unseenResponsiveEntryIds.length > 0 ? { unseenResponsiveEntryIds } : {}),
+      ...(unseenResponsiveEntries.length > 0 ? { unseenResponsiveEntries } : {}),
       ...(voiceAt !== undefined ? { voiceAt } : {}),
     };
+  }
+
+  /**
+   * Report each newly arrived responsive row to the policy hook exactly once,
+   * using the rows this dispatch already read.
+   */
+  private observeResponsiveArrival(
+    actorId: string,
+    work: DurableDispatchWork,
+    baseline: "interrupt" | "queue"
+  ): void {
+    const observe = this.onResponsiveArrived;
+    if (!observe) return;
+    const entries = work.unseenResponsiveEntries ?? [];
+    const pending = new Set(entries.map((entry) => entry.id));
+    // Drop ids that have since been absorbed or handled before testing, so a
+    // row that comes back unseen is a genuinely new arrival.
+    const observed = this.observedResponsive.get(actorId) ?? new Set<string>();
+    for (const id of observed) {
+      if (!pending.has(id)) observed.delete(id);
+    }
+    const arrived = entries.filter((entry) => !observed.has(entry.id));
+    for (const entry of arrived) observed.add(entry.id);
+    if (observed.size > 0) this.observedResponsive.set(actorId, observed);
+    else this.observedResponsive.delete(actorId);
+    if (arrived.length > 0) observe(actorId, arrived, baseline);
   }
 
   private dispatchInternal(actorId: string, opts: { preempt: boolean }): boolean {
@@ -338,20 +386,12 @@ export class RunManager {
       this.log(`dispatch(${actorId}) held — active voice session`);
       return false;
     }
+    if (responsiveArrived) {
+      this.observeResponsiveArrival(actorId, work, opts.preempt ? "interrupt" : "queue");
+    }
     if (responsiveArrived && opts.preempt) {
-      this.onResponsiveArrived?.(
-        actorId,
-        this.pendingResponsive(actorId).unseenResponsiveEntryIds ?? [],
-        "interrupt"
-      );
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) this.onPreempted(actorId, preemption.phase);
-    } else if (responsiveArrived) {
-      this.onResponsiveArrived?.(
-        actorId,
-        this.pendingResponsive(actorId).unseenResponsiveEntryIds ?? [],
-        "queue"
-      );
     }
     if (target.isQueued) {
       // The new entry joins the already-accepted opportunity, which will list
@@ -463,16 +503,6 @@ export class RunManager {
 }
 
 /** The scheduling metadata a dispatch derives from durable state. */
-function dispatchWork(work: {
-  unseenResponsive: boolean;
-  voiceAt?: number;
-}): Pick<DurableDispatchWork, "unseenResponsive" | "voiceAt"> {
-  return {
-    unseenResponsive: work.unseenResponsive,
-    ...(work.voiceAt !== undefined ? { voiceAt: work.voiceAt } : {}),
-  };
-}
-
 function dispatchNudge(work: DurableDispatchWork): RunNudge {
   if (work.priority !== "responsive") return {};
   return work.voiceAt === undefined

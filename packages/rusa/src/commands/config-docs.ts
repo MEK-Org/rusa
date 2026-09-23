@@ -35,13 +35,6 @@ Minimal example:
       maxIntervalSeconds: 3600
       tickSeconds: 300
 
-  # Optional. Observe a local/synthetic JEV Choice prediction before the
-  # normal responsive interrupt path; it never changes that path in v1.
-  mesh:
-    responsiveInterruption:
-      mode: shadow
-      threshold: 0.8
-
   geminiApiKey: GEMINI_API_KEY_VALUE
 
   # Branch used by the root self-update tool (optional; defaults to master).
@@ -176,15 +169,6 @@ quota.throttle:
   enabled                  Optional boolean. Enables persisted closed-loop launch pacing.
   maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
   tickSeconds              Optional positive integer quota refresh interval.
-
-mesh.responsiveInterruption:
-
-  mode                     Required when present. Only "shadow" is accepted in v1: normal
-                           responsive interruption stays authoritative regardless of a prediction.
-  threshold                Optional closed-Choice confidence floor from 0 through 1; default 0.8.
-                           The public slice exposes a local/synthetic client seam only. It sends no
-                           live TypeSafe request or credentials; without a local client the redacted
-                           audit records an unavailable, safely queued decision.
 
 rootActor:
 

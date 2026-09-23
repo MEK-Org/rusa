@@ -282,37 +282,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
   }
-  if (parsed.mesh !== undefined) {
-    const mesh = parsed.mesh;
-    if (typeof mesh !== "object" || mesh === null || Array.isArray(mesh)) {
-      throw new Error("config.yaml: mesh must be a mapping when set");
-    }
-    if ("quotaThrottle" in (mesh as Record<string, unknown>)) {
-      throw new Error("config.yaml: mesh.quotaThrottle has moved to quota.throttle");
-    }
-    const responsiveInterruption = mesh.responsiveInterruption;
-    if (responsiveInterruption !== undefined) {
-      if (
-        typeof responsiveInterruption !== "object" ||
-        responsiveInterruption === null ||
-        Array.isArray(responsiveInterruption)
-      ) {
-        throw new Error("config.yaml: mesh.responsiveInterruption must be a mapping when set");
-      }
-      if (responsiveInterruption.mode !== "shadow") {
-        throw new Error('config.yaml: mesh.responsiveInterruption.mode must be "shadow"');
-      }
-      if (
-        responsiveInterruption.threshold !== undefined &&
-        (!Number.isFinite(responsiveInterruption.threshold) ||
-          responsiveInterruption.threshold < 0 ||
-          responsiveInterruption.threshold > 1)
-      ) {
-        throw new Error(
-          "config.yaml: mesh.responsiveInterruption.threshold must be a number between 0 and 1"
-        );
-      }
-    }
+  if (
+    parsed.mesh &&
+    typeof parsed.mesh === "object" &&
+    "quotaThrottle" in (parsed.mesh as Record<string, unknown>)
+  ) {
+    throw new Error("config.yaml: mesh.quotaThrottle has moved to quota.throttle");
   }
   const quota = parsed.quota;
   if (quota !== undefined) {

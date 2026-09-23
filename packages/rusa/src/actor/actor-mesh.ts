@@ -966,8 +966,8 @@ export class ActorMesh {
           payload: JSON.stringify({ reason: "responsive_notification" }),
         });
       },
-      onResponsiveArrived: (actorId, entryIds, baseline) => {
-        this.shadowResponsiveInterruptions(actorId, entryIds, baseline);
+      onResponsiveArrived: (actorId, entries, baseline) => {
+        this.shadowResponsiveInterruptions(actorId, entries, baseline);
       },
       onInternalPort: (port) => {
         this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
@@ -1329,29 +1329,34 @@ export class ActorMesh {
   }
 
   /**
-   * Fire-and-forget shadow decisions after the durable inbox has identified the
-   * exact new rows and before its normal preemption path runs. Only ids cross
-   * this seam: message bodies, issue text, and other operational content stay
-   * in their source stores.
+   * Fire-and-forget shadow decisions over the exact rows the durable inbox
+   * identified as newly arrived, before its normal preemption path runs. Only
+   * ids cross this seam: message bodies, issue text, and other operational
+   * content stay in their source stores.
+   *
+   * The comparison sets are read synchronously, before the `void`, because
+   * they describe the actor's state at the moment the row arrived. Deferring
+   * the read past the await boundary would let the run this dispatch is about
+   * to preempt change its own selection first, and the decision would then be
+   * scored against a world that the arrival had already altered.
    */
   private shadowResponsiveInterruptions(
     actorId: string,
-    incomingEntryIds: readonly string[],
+    incoming: readonly InboxEntry[],
     baseline: "interrupt" | "queue"
   ): void {
     const classifier = this.responsiveInterruption;
-    const inbox = this.inboxStore;
-    if (!classifier || !inbox || incomingEntryIds.length === 0) return;
+    if (!classifier || incoming.length === 0) return;
     const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
-    const unhandledIds = this.unhandledInboxEntryIds(actorId);
-    for (const incomingEntryId of incomingEntryIds) {
-      const incoming = inbox.read(actorId, incomingEntryId);
+    // Unselected rows are only ever the fallback for an actor holding no
+    // selection, so a selection spares the full unhandled scan entirely.
+    const pendingEntryIds =
+      selectedEntryIds.length > 0 ? [] : this.unselectedInboxEntryIds(actorId, selectedEntryIds);
+    for (const entry of incoming) {
       // Explicit Run Now is an operator control, not a classifier candidate.
       // Direct interrupt() does not dispatch at all, preserving its hard path.
-      if (!incoming || incoming.payload.type === "operator.run_now") continue;
-      const pendingEntryIds = unhandledIds.filter(
-        (entryId) => entryId !== incomingEntryId && !selectedEntryIds.includes(entryId)
-      );
+      if (entry.payload.type === "operator.run_now") continue;
+      const incomingEntryId = entry.id;
       void classifier
         .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
         .then((decision) => {
@@ -1363,35 +1368,29 @@ export class ActorMesh {
           });
         })
         .catch(() => {
-          // The policy is observation-only; a defective local fixture cannot
-          // delay or alter a durable responsive delivery.
-          this.recordEvent({
-            kind: "responsive_interruption_shadow",
-            actorId,
-            detail: "shadow",
-            payload: JSON.stringify({
-              baseline,
-              decision: {
-                incomingEntryId,
-                outcome: "queue",
-                reason: "unavailable",
-              },
-            }),
-          });
+          // `evaluate` resolves rather than throws, so this arm covers only a
+          // failure to record the observation. It emits no decision — one
+          // audit shape means a consumer parses one schema — and exists so a
+          // fire-and-forget promise cannot reject unhandled.
+          this.log(`responsive interruption shadow observation failed for ${incomingEntryId}`);
         });
     }
   }
 
-  /** Read the entire durable unhandled set; a classifier must not infer a
-   * comparison target from a convenient first page or a racing "latest" row. */
-  private unhandledInboxEntryIds(actorId: string): string[] {
+  /** Read the entire durable unhandled set minus the selected rows; a
+   * classifier must not infer a comparison target from a convenient first page
+   * or a racing "latest" row. */
+  private unselectedInboxEntryIds(actorId: string, selectedEntryIds: readonly string[]): string[] {
     const inbox = this.inboxStore;
     if (!inbox) return [];
+    const selected = new Set(selectedEntryIds);
     let cursor: string | undefined;
     const entryIds: string[] = [];
     do {
       const page = inbox.list(actorId, { status: "unhandled", limit: 100, cursor });
-      entryIds.push(...page.entries.map((entry) => entry.id));
+      for (const entry of page.entries) {
+        if (!selected.has(entry.id)) entryIds.push(entry.id);
+      }
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
     return entryIds;

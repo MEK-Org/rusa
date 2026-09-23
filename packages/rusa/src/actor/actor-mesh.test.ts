@@ -2508,6 +2508,42 @@ describe("ActorMesh", () => {
     expect(shadow?.payload).not.toContain("private operator body");
   });
 
+  it("observes each arriving responsive row once across repeated delivery pokes", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // No run is admitted, so neither row is ever marked seen: a second poke
+    // re-reads the first row alongside the second.
+    mesh.sendHumanMessage(worker, "first operator body", "session-1");
+    await tick();
+    mesh.sendHumanMessage(worker, "second operator body", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const observed = events
+      .filter((event) => event.kind === "responsive_interruption_shadow")
+      .map((event) => JSON.parse(event.payload ?? "{}").decision.incomingEntryId as string);
+    expect(observed).toHaveLength(new Set(observed).size);
+    expect(observed).toHaveLength(2);
+  });
+
   it("does not let ordinary traffic abort the run already working the operator's message", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];

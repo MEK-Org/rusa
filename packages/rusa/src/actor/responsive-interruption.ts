@@ -1,7 +1,13 @@
 /**
  * The deliberately narrow local seam for #533. It models only the two closed
  * JEV Choice calls this policy needs; it is not a general provider abstraction.
- * Production wiring does not construct a client in the public/synthetic slice.
+ *
+ * The request carries durable inbox identifiers and nothing else. A client that
+ * needs the text behind an id has to resolve it itself, and the data-access and
+ * retention boundary for doing so is not settled yet — so no client ships in
+ * this slice, and no production wiring constructs one. What lands here is the
+ * classifier and its seam, tested against fixtures; the operator-facing knob
+ * belongs with the change that first makes it observable.
  */
 export interface JevChoiceClient {
   choose(request: JevChoiceRequest): Promise<JevChoiceResponse>;
@@ -33,9 +39,9 @@ export type ResponsiveInterruptionRelation =
 
 export interface ResponsiveInterruptionInput {
   incomingEntryId: string;
-  /** Current selected work takes precedence over every unselected inbox row. */
+  /** The primary comparison set. Whenever it is non-empty it is the only set. */
   selectedEntryIds: readonly string[];
-  /** Unselected entries are a conservative fallback only when nothing is selected. */
+  /** Unselected rows, compared against only when nothing is selected. */
   pendingEntryIds: readonly string[];
 }
 
@@ -54,6 +60,22 @@ interface DecisionBase {
   input: ResponsiveInterruptionInput;
 }
 
+/**
+ * Why a decision produced no interrupt. These stay distinct on purpose: the
+ * feature exists to measure, and "we never asked", "the client broke" and "the
+ * client answered out of its own closed set" are different data.
+ */
+export type ResponsiveInterruptionQueueReason =
+  | "unavailable"
+  | "client_error"
+  | "no_comparison"
+  | "invalid_comparison_choice"
+  | "invalid_comparison_confidence"
+  | "low_confidence_comparison"
+  | "invalid_relation_choice"
+  | "invalid_relation_confidence"
+  | "low_confidence_relation";
+
 export type ResponsiveInterruptionDecision =
   | (DecisionBase & {
       outcome: "interrupt" | "queue";
@@ -62,13 +84,7 @@ export type ResponsiveInterruptionDecision =
     })
   | (DecisionBase & {
       outcome: "queue";
-      reason:
-        | "unavailable"
-        | "no_comparison"
-        | "invalid_comparison_choice"
-        | "low_confidence_comparison"
-        | "invalid_relation_choice"
-        | "low_confidence_relation";
+      reason: ResponsiveInterruptionQueueReason;
     });
 
 const RELATIONS = [
@@ -83,11 +99,25 @@ function isConfidence(value: number): boolean {
   return Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
-function redacted(response: JevChoiceResponse): RedactedChoiceDecision {
+/**
+ * Projects a response onto the closed set it was offered. `choice` is checked
+ * by the caller; this drops any probability key the client invented and any
+ * weight that is not a real number in 0..1, so the audit cannot carry arbitrary
+ * text in from a defective or future client.
+ */
+function redacted(
+  response: JevChoiceResponse,
+  offeredChoices: readonly string[]
+): RedactedChoiceDecision {
+  const probabilities: Record<string, number> = {};
+  for (const choice of offeredChoices) {
+    const weight = response.probabilities?.[choice];
+    if (weight !== undefined && isConfidence(weight)) probabilities[choice] = weight;
+  }
   return {
     choice: response.choice,
     confidence: response.confidence,
-    ...(response.probabilities ? { probabilities: response.probabilities } : {}),
+    ...(Object.keys(probabilities).length > 0 ? { probabilities } : {}),
   };
 }
 
@@ -117,18 +147,30 @@ export class ShadowResponsiveInterruptionClassifier {
         pendingEntryIds: [...input.pendingEntryIds],
       },
     };
-    // Selected work comes first. Unselected pending work is present as the
-    // conservative fallback the policy is allowed to name, never inferred from
-    // arbitrary message content or a racing "latest" row.
-    const comparisonEntryIds = [
-      ...new Set([...input.selectedEntryIds, ...input.pendingEntryIds]),
-    ].filter((entryId) => entryId !== input.incomingEntryId);
-    if (!this.client) return { ...base, outcome: "queue", reason: "unavailable" };
+    const queue = (reason: ResponsiveInterruptionQueueReason): ResponsiveInterruptionDecision => ({
+      ...base,
+      outcome: "queue",
+      reason,
+    });
+    // Selected work is the comparison set whenever there is any. Unselected
+    // rows are the fallback for an actor holding no selection, never a rival
+    // to a selection — a pending row winning over selected work is precisely
+    // the false pivot this policy exists to avoid predicting.
+    const primary =
+      input.selectedEntryIds.length > 0 ? input.selectedEntryIds : input.pendingEntryIds;
+    const comparisonEntryIds = [...new Set(primary)].filter(
+      (entryId) => entryId !== input.incomingEntryId
+    );
+    if (!this.client) return queue("unavailable");
+    // A closed choice with one legal answer decides nothing; skip the round trip.
+    if (comparisonEntryIds.length === 0) return queue("no_comparison");
+
+    const comparisonChoices = [...comparisonEntryIds, "none"];
     let comparison: JevChoiceResponse;
     try {
       comparison = await this.client.choose({
         id: "comparison",
-        choices: [...comparisonEntryIds, "none"],
+        choices: comparisonChoices,
         input: {
           incomingEntryId: input.incomingEntryId,
           comparisonEntryIds,
@@ -136,22 +178,15 @@ export class ShadowResponsiveInterruptionClassifier {
         },
       });
     } catch {
-      return { ...base, outcome: "queue", reason: "unavailable" };
+      return queue("client_error");
     }
-    if (!isConfidence(comparison.confidence)) {
-      return { ...base, outcome: "queue", reason: "invalid_comparison_choice" };
-    }
-    if (comparison.choice === "none") {
-      return { ...base, outcome: "queue", reason: "no_comparison" };
-    }
-    if (!comparisonEntryIds.includes(comparison.choice)) {
-      return { ...base, outcome: "queue", reason: "invalid_comparison_choice" };
-    }
-    if (comparison.confidence < this.threshold) {
-      return { ...base, outcome: "queue", reason: "low_confidence_comparison" };
-    }
+    if (!isConfidence(comparison.confidence)) return queue("invalid_comparison_confidence");
+    if (comparison.choice === "none") return queue("no_comparison");
+    if (!comparisonEntryIds.includes(comparison.choice)) return queue("invalid_comparison_choice");
+    if (comparison.confidence < this.threshold) return queue("low_confidence_comparison");
 
     const comparisonEntryId = comparison.choice;
+    const withComparison = { ...base, comparisonEntryId };
     let relationDecision: JevChoiceResponse;
     try {
       relationDecision = await this.client.choose({
@@ -164,42 +199,30 @@ export class ShadowResponsiveInterruptionClassifier {
         },
       });
     } catch {
-      return {
-        ...base,
-        comparisonEntryId,
-        outcome: "queue",
-        reason: "unavailable",
-      };
+      return { ...withComparison, outcome: "queue", reason: "client_error" };
     }
-    if (
-      !isConfidence(relationDecision.confidence) ||
-      !RELATIONS.includes(relationDecision.choice as ResponsiveInterruptionRelation)
-    ) {
-      return {
-        ...base,
-        comparisonEntryId,
-        outcome: "queue",
-        reason: "invalid_relation_choice",
-      };
+    if (!isConfidence(relationDecision.confidence)) {
+      return { ...withComparison, outcome: "queue", reason: "invalid_relation_confidence" };
     }
+    if (!RELATIONS.includes(relationDecision.choice as ResponsiveInterruptionRelation)) {
+      return { ...withComparison, outcome: "queue", reason: "invalid_relation_choice" };
+    }
+    const relation = relationDecision.choice as ResponsiveInterruptionRelation;
     if (relationDecision.confidence < this.threshold) {
       return {
-        ...base,
-        comparisonEntryId,
-        relation: relationDecision.choice as ResponsiveInterruptionRelation,
+        ...withComparison,
+        relation,
         outcome: "queue",
         reason: "low_confidence_relation",
       };
     }
 
-    const relation = relationDecision.choice as ResponsiveInterruptionRelation;
     return {
-      ...base,
-      comparisonEntryId,
+      ...withComparison,
       relation,
       outcome: relation === "unrelated" ? "queue" : "interrupt",
-      comparison: redacted(comparison),
-      relationDecision: redacted(relationDecision),
+      comparison: redacted(comparison, comparisonChoices),
+      relationDecision: redacted(relationDecision, RELATIONS),
     };
   }
 }
