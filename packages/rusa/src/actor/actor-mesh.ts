@@ -966,9 +966,21 @@ export class ActorMesh {
           payload: JSON.stringify({ reason: "responsive_notification" }),
         });
       },
-      onResponsiveArrived: (actorId, entries, baseline) => {
-        this.shadowResponsiveInterruptions(actorId, entries, baseline);
-      },
+      // Only wired when a classifier exists. The hook's presence is what
+      // switches `RunManager` into collecting rows, so supplying it
+      // unconditionally would make every deployment pay for an observer that
+      // has nothing to observe — and would strand the default-path early exit.
+      ...(this.responsiveInterruption
+        ? {
+            onResponsiveArrived: (
+              actorId: string,
+              entries: readonly InboxEntry[],
+              baseline: "interrupt" | "queue"
+            ) => {
+              this.shadowResponsiveInterruptions(actorId, entries, baseline);
+            },
+          }
+        : {}),
       onInternalPort: (port) => {
         this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
       },

@@ -221,6 +221,83 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     expect(JSON.stringify(decision)).not.toContain("leaked note");
   });
 
+  it("keeps the rejected confidence on a below-threshold comparison", async () => {
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      client: {
+        choose: async () => ({
+          choice: "selected-a",
+          confidence: 0.68,
+          probabilities: { "selected-a": 0.68, none: 0.32 },
+        }),
+      },
+      threshold: 0.8,
+    });
+
+    // The threshold is what this feature exists to place, and it cannot be
+    // placed from records that keep only the decisions above it.
+    await expect(
+      classifier.evaluate({
+        incomingEntryId: "incoming-z",
+        selectedEntryIds: ["selected-a"],
+        pendingEntryIds: [],
+      })
+    ).resolves.toMatchObject({
+      outcome: "queue",
+      reason: "low_confidence_comparison",
+      comparisonEntryId: "selected-a",
+      threshold: 0.8,
+      comparison: {
+        choice: "selected-a",
+        confidence: 0.68,
+        probabilities: { "selected-a": 0.68, none: 0.32 },
+      },
+    });
+  });
+
+  it("keeps both confidences on a below-threshold relation", async () => {
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: "selected-a", confidence: 0.95 }
+            : { choice: "correction", confidence: 0.42 },
+      },
+      threshold: 0.8,
+    });
+
+    await expect(
+      classifier.evaluate({
+        incomingEntryId: "incoming-z",
+        selectedEntryIds: ["selected-a"],
+        pendingEntryIds: [],
+      })
+    ).resolves.toMatchObject({
+      outcome: "queue",
+      reason: "low_confidence_relation",
+      comparisonEntryId: "selected-a",
+      relation: "correction",
+      comparison: { choice: "selected-a", confidence: 0.95 },
+      relationDecision: { choice: "correction", confidence: 0.42 },
+    });
+  });
+
+  it("reports a malformed confidence as malformed even when the choice is a deliberate none", async () => {
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      client: { choose: async () => ({ choice: "none", confidence: Number.NaN }) },
+      threshold: 0.8,
+    });
+
+    // A response that cannot be believed is not evidence of a deliberate
+    // "nothing matches" — the well-formedness check comes first on purpose.
+    await expect(
+      classifier.evaluate({
+        incomingEntryId: "incoming-z",
+        selectedEntryIds: ["selected-a"],
+        pendingEntryIds: [],
+      })
+    ).resolves.toMatchObject({ outcome: "queue", reason: "invalid_comparison_confidence" });
+  });
+
   it("queues a deliberate none choice without asking for a relation", async () => {
     const calls: string[] = [];
     const classifier = new ShadowResponsiveInterruptionClassifier({

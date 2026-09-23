@@ -85,6 +85,15 @@ export type ResponsiveInterruptionDecision =
   | (DecisionBase & {
       outcome: "queue";
       reason: ResponsiveInterruptionQueueReason;
+      /**
+       * What was learned before the decision was rejected, on the arms where
+       * anything was. A threshold cannot be tuned from records that discard
+       * the confidence it rejected, so the below-threshold arms carry the
+       * same redacted projection the accepted path does; the arms that never
+       * got a well-formed answer carry nothing.
+       */
+      comparison?: RedactedChoiceDecision;
+      relationDecision?: RedactedChoiceDecision;
     });
 
 const RELATIONS = [
@@ -183,7 +192,15 @@ export class ShadowResponsiveInterruptionClassifier {
     if (!isConfidence(comparison.confidence)) return queue("invalid_comparison_confidence");
     if (comparison.choice === "none") return queue("no_comparison");
     if (!comparisonEntryIds.includes(comparison.choice)) return queue("invalid_comparison_choice");
-    if (comparison.confidence < this.threshold) return queue("low_confidence_comparison");
+    if (comparison.confidence < this.threshold) {
+      return {
+        ...base,
+        comparisonEntryId: comparison.choice,
+        outcome: "queue",
+        reason: "low_confidence_comparison",
+        comparison: redacted(comparison, comparisonChoices),
+      };
+    }
 
     const comparisonEntryId = comparison.choice;
     const withComparison = { ...base, comparisonEntryId };
@@ -214,6 +231,8 @@ export class ShadowResponsiveInterruptionClassifier {
         relation,
         outcome: "queue",
         reason: "low_confidence_relation",
+        comparison: redacted(comparison, comparisonChoices),
+        relationDecision: redacted(relationDecision, RELATIONS),
       };
     }
 

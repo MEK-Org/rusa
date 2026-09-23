@@ -196,7 +196,10 @@ export class RunManager {
    * until a run admits it, so without this a second delivery poke re-reports
    * the first row alongside the new one — which would inflate exactly the
    * false-preemption counts this observation exists to measure. Pruned to the
-   * still-unabsorbed set on every dispatch, so it cannot outgrow the inbox.
+   * still-unabsorbed set on every dispatch, so one actor's set cannot outgrow
+   * its inbox — and cleared in `release`/`forget`/`closeAll` alongside `live`
+   * and `selections`, so a mesh that churns workers does not accumulate one
+   * stranded set per retired actor.
    */
   private readonly observedResponsive = new Map<string, Set<string>>();
   private readonly log: (msg: string) => void;
@@ -444,12 +447,14 @@ export class RunManager {
     this.live.get(actorId)?.close();
     this.live.delete(actorId);
     this.selections.delete(actorId);
+    this.observedResponsive.delete(actorId);
   }
 
   /** Forget one actor without closing it — a construction that failed to land. */
   forget(actorId: string): void {
     this.live.delete(actorId);
     this.selections.delete(actorId);
+    this.observedResponsive.delete(actorId);
   }
 
   /**
@@ -460,6 +465,7 @@ export class RunManager {
     for (const actor of this.live.values()) actor.close();
     this.live.clear();
     this.selections.clear();
+    this.observedResponsive.clear();
   }
 
   // --------------------------------------------------------------- admission

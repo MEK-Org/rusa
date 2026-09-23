@@ -2508,6 +2508,57 @@ describe("ActorMesh", () => {
     expect(shadow?.payload).not.toContain("private operator body");
   });
 
+  it("leaves the dispatch path untouched when no classifier is configured", async () => {
+    // The seam is described as inert without a classifier, so the thing to pin
+    // is the wiring rather than the absence of events: a mesh that wires the
+    // hook unconditionally makes `RunManager` collect rows and strands the
+    // default path's early exit in every deployment, none of which has one.
+    const base = createMemoryInboxStore();
+    let responsiveLists = 0;
+    const inboxStore: typeof base = {
+      ...base,
+      list: (actorId, options = {}) => {
+        if (options.responsiveOnly) responsiveLists++;
+        // Page the responsive scan one row at a time, as the real repository
+        // does past its limit, so a caller that cannot exit early pays for it.
+        const page = base.list(actorId, { ...options, limit: undefined });
+        if (!options.responsiveOnly) return page;
+        const start = options.cursor ? Number(options.cursor) : 0;
+        const entries = page.entries.slice(start, start + 1);
+        return {
+          ...page,
+          entries,
+          nextCursor: start + 1 < page.entries.length ? String(start + 1) : null,
+        };
+      },
+    };
+
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Newest first, so the voice memo is the first row the scan reads and a
+    // deployment with no observer has both its answers after one page.
+    mesh.sendHumanMessage(worker, "older operator body", "session-1");
+    await tick();
+
+    // Measure the voice memo's own dispatch: it is the newest row, so the scan
+    // has both its answers after one page and stops. A collecting deployment
+    // has to read the older row too, and pays a page for it.
+    responsiveLists = 0;
+    mesh.sendHumanMessage(worker, "voice body", "session-1", { voice: true });
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events.some((event) => event.kind === "responsive_interruption_shadow")).toBe(false);
+    expect(responsiveLists).toBe(1);
+  });
+
   it("observes each arriving responsive row once across repeated delivery pokes", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];

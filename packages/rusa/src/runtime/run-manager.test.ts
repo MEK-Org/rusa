@@ -8,6 +8,7 @@ import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repositor
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import {
   EmptyInboxRepository,
+  type InboxListOptions,
   type InboxPayload,
   type InboxRepository,
 } from "../repositories/inbox-repository.js";
@@ -16,6 +17,7 @@ import {
   type QueuedSelection,
   RunManager,
   type RunManagerInternalPort,
+  type RunManagerOptions,
 } from "./run-manager.js";
 
 /**
@@ -172,6 +174,7 @@ describe("RunManager", () => {
       constructActor?: (rec: ActorRecord) => MeshActor;
       inbox?: InboxRepository;
       debounceMs?: number;
+      onResponsiveArrived?: RunManagerOptions["onResponsiveArrived"];
     } = {}
   ): Harness {
     const actors = new Map<string, FakeActor>();
@@ -199,6 +202,7 @@ describe("RunManager", () => {
       isVoiceSessionActive: opts.isVoiceSessionActive,
       markInboxSeen: (actorId) => seen.push(actorId),
       onPreempted: (actorId, phase) => preempted.push([actorId, phase]),
+      ...(opts.onResponsiveArrived ? { onResponsiveArrived: opts.onResponsiveArrived } : {}),
       log: (msg) => logs.push(msg),
     });
     return { manager, actors, statuses, preempted, seen, logs, constructed, internalPort };
@@ -349,6 +353,85 @@ describe("RunManager", () => {
 
       h.manager.dispatch("a1");
       expect(actor.nudges).toEqual([{ priority: "responsive", voiceTimestamp: 1_000 }]);
+    });
+
+    it("pages and collects arriving rows only when a policy hook is wired", () => {
+      // A counting view of the real repository: the difference between the two
+      // deployments is how much of the inbox each one reads.
+      const counted = (): { repo: InboxRepository; responsiveLists: () => number } => {
+        let responsiveLists = 0;
+        const repo = new Proxy(inbox, {
+          get(target, prop, receiver) {
+            if (prop !== "list") return Reflect.get(target, prop, receiver);
+            return (actorId: string, options: InboxListOptions = {}) => {
+              if (options.responsiveOnly) responsiveLists++;
+              return target.list(actorId, options);
+            };
+          },
+        }) as InboxRepository;
+        return { repo, responsiveLists: () => responsiveLists };
+      };
+
+      // An unseen voice memo on the first page, with a second page behind it.
+      append("a1", { type: "human.voice", priority: "responsive" }, new Date(9_000));
+      for (let i = 0; i < 120; i++) {
+        append("a1", { type: "human.message", priority: "responsive" }, new Date(1_000 + i));
+      }
+
+      const plain = counted();
+      const noHook = setup({ inbox: plain.repo });
+      live(noHook, "a1");
+      expect(noHook.manager.durableWork("a1")).toEqual({
+        priority: "responsive",
+        unseenResponsive: true,
+        voiceAt: 9_000,
+      });
+      // The early exit is live: one page answered both questions.
+      expect(plain.responsiveLists()).toBe(1);
+
+      const observed = counted();
+      const arrivals: string[][] = [];
+      const withHook = setup({
+        inbox: observed.repo,
+        onResponsiveArrived: (_actorId, entries) => {
+          arrivals.push(entries.map((entry) => entry.id));
+        },
+      });
+      live(withHook, "a1");
+      const work = withHook.manager.durableWork("a1");
+      expect(work?.unseenResponsiveEntries).toHaveLength(121);
+      expect(observed.responsiveLists()).toBeGreaterThan(1);
+
+      withHook.manager.dispatch("a1");
+      expect(arrivals).toHaveLength(1);
+      expect(arrivals[0]).toHaveLength(121);
+    });
+
+    it("forgets an actor's observed responsive rows when it is released or forgotten", () => {
+      const arrivals: string[][] = [];
+      const h = setup({
+        onResponsiveArrived: (_actorId, entries) => {
+          arrivals.push(entries.map((entry) => entry.id));
+        },
+      });
+      live(h, "a1");
+      // No run is admitted, so the row is never marked seen and stays unabsorbed.
+      const entry = append("a1", { type: "human.message", priority: "responsive" });
+      h.manager.dispatch("a1");
+      h.manager.dispatch("a1");
+      expect(arrivals).toEqual([[entry.id]]);
+
+      // A released actor's state goes with it, so the row is a new arrival to
+      // whatever comes back under that id rather than an inherited memory.
+      h.manager.release("a1");
+      live(h, "a1");
+      h.manager.dispatch("a1");
+      expect(arrivals).toEqual([[entry.id], [entry.id]]);
+
+      h.manager.forget("a1");
+      live(h, "a1");
+      h.manager.dispatch("a1");
+      expect(arrivals).toEqual([[entry.id], [entry.id], [entry.id]]);
     });
 
     it("returns no durable work and no-ops dispatch when backed by an empty inbox repository", () => {
