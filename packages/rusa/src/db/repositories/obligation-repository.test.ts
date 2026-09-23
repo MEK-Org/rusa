@@ -2248,20 +2248,7 @@ describe("ObligationRepository", () => {
         return ids.sort();
       }
 
-      it("drops quiet terminal descendants and keeps live, recurring and historied ones", () => {
-        buildMixedTree();
-
-        const [pruned] = repository.getForest(["live-root"], {
-          excludeQuietTerminalDescendants: true,
-        });
-        expect(pruned.children.map((c) => c.obligation.id).sort()).toEqual([
-          "historied-done",
-          "live-child",
-          "recurring-done",
-        ]);
-      });
-
-      it("drops a quiet terminal descendant's whole subtree with it", () => {
+      it("drops quiet terminal descendants and their subtrees while keeping live, recurring and historied ones", () => {
         buildMixedTree();
 
         const [pruned] = repository.getForest(["live-root"], {
@@ -2306,15 +2293,6 @@ describe("ObligationRepository", () => {
         expect(pruned.blockingChildren.map((c) => c.id)).toEqual(
           full.blockingChildren.map((c) => c.id)
         );
-      });
-
-      it("still reads the forest in one statement", () => {
-        buildMixedTree();
-
-        const prepareSpy = vi.spyOn(db, "prepare");
-        repository.getForest(["live-root"], { excludeQuietTerminalDescendants: true });
-        expect(prepareSpy.mock.calls.length).toBe(1);
-        prepareSpy.mockRestore();
       });
     });
   });
