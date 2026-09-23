@@ -900,27 +900,6 @@ describe("handleMeshApiRequest", () => {
       "/api/mesh/followers/non-existent/update"
     );
     expect(notFoundRes.statusCode).toBe(404);
-
-    const mockReconciliation = {
-      activeTrigger: {
-        triggerId: "trig-123",
-        targetSha: "abcdef1234567890abcdef1234567890abcdef12",
-        branch: "staging",
-        source: "leader-update",
-        autoReconcile: true,
-        attempts: {},
-      },
-      completed: false,
-    };
-    const reconDeps = {
-      ...followerDeps,
-      getFollowerReconciliation: vi.fn(() => mockReconciliation),
-    };
-    const { res: reconRes } = await call(reconDeps, "GET", "/api/mesh/followers/reconciliation");
-    expect(reconRes.statusCode).toBe(200);
-    expect(JSON.parse(reconRes.body)).toEqual({
-      reconciliation: mockReconciliation,
-    });
   });
 
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {

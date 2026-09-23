@@ -1822,13 +1822,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
-        onGreenBuild: (newSha, branch) => {
+        onCommitted: (newSha, branch) => {
           try {
             followerTriggerStore.createTrigger({
               targetSha: newSha,
               branch,
-              source: "leader-update",
-              autoReconcile: true,
             });
             log.info("follower_update_trigger_persisted", {
               targetSha: newSha,
@@ -3866,13 +3864,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             if (!followerHub) throw new Error("Follower gateway not enabled");
             return followerHub.updateAllFollowers(opts);
           },
-          getFollowerReconciliation: () =>
-            followerHub
-              ? followerHub.getReconciliationStatus()
-              : {
-                  activeTrigger: followerTriggerStore.getActiveTrigger(),
-                  completed: !followerTriggerStore.getActiveTrigger(),
-                },
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
@@ -4127,6 +4118,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   }
+
+  // Boot survived: only now may an automatic leader-update trigger move followers.
+  // Arming here rather than at gateway bind is what keeps a leader that comes up far
+  // enough to open a socket and then dies from deploying followers onto the revision
+  // that killed it. Followers that connected earlier are reconciled by this call.
+  followerHub?.armReconciliation();
 
   // ── Lifecycle ──
   let running = true;

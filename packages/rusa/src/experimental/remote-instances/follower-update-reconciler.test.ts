@@ -76,7 +76,7 @@ describe("FollowerUpdateReconciler", () => {
     ];
 
     const reconciler = new FollowerUpdateReconciler(store, mockHub);
-    reconciler.reconcileAll();
+    reconciler.arm();
 
     expect(mockHub.updateFollower).toHaveBeenCalledTimes(1);
     expect(mockHub.updateFollower).toHaveBeenCalledWith("f1", {
@@ -93,7 +93,7 @@ describe("FollowerUpdateReconciler", () => {
     const targetSha = "b".repeat(40);
     store.createTrigger({ targetSha, branch: "staging" });
 
-    new FollowerUpdateReconciler(store, mockHub);
+    new FollowerUpdateReconciler(store, mockHub).arm();
 
     expect(registerCallback).toBeDefined();
     registerCallback?.({
@@ -112,7 +112,7 @@ describe("FollowerUpdateReconciler", () => {
     const targetSha = "c".repeat(40);
     store.createTrigger({ targetSha, branch: "staging" });
 
-    new FollowerUpdateReconciler(store, mockHub);
+    new FollowerUpdateReconciler(store, mockHub).arm();
 
     registerCallback?.({
       id: "f-green",
@@ -128,7 +128,7 @@ describe("FollowerUpdateReconciler", () => {
     store.createTrigger({ targetSha, branch: "staging" });
     store.recordFailure("f-flaky", targetSha, "compile error in step build");
 
-    new FollowerUpdateReconciler(store, mockHub);
+    new FollowerUpdateReconciler(store, mockHub).arm();
 
     // Follower reconnects on old commit
     registerCallback?.({
@@ -144,7 +144,7 @@ describe("FollowerUpdateReconciler", () => {
     const targetSha = "e".repeat(40);
     store.createTrigger({ targetSha, branch: "staging" });
 
-    new FollowerUpdateReconciler(store, mockHub);
+    new FollowerUpdateReconciler(store, mockHub).arm();
 
     updateStatusCallback?.("f-fail", {
       updateId: "up-fail",
@@ -158,25 +158,130 @@ describe("FollowerUpdateReconciler", () => {
     expect(store.getActiveTrigger()?.attempts["f-fail"]?.error).toBe("timed out during install");
   });
 
-  it("completes trigger when all registered followers succeed", () => {
+  const follower = (id: string, commitSha: string): FollowerInfo => ({
+    id,
+    platform: "linux",
+    pid: 10,
+    actors: [],
+    lastSeen: new Date().toISOString(),
+    commitSha,
+  });
+
+  it("keeps the trigger active for a follower that was offline during the leader update", () => {
+    // The one connected follower is already current. Retiring the trigger here would
+    // strand f2 — which is precisely the case the durable document exists to serve, since
+    // the leader keeps no enrollment roster and cannot know f2 exists.
     const targetSha = "f".repeat(40);
     store.createTrigger({ targetSha, branch: "staging" });
-
-    mockFollowers = [
-      {
-        id: "f1",
-        platform: "linux",
-        pid: 10,
-        actors: [],
-        lastSeen: new Date().toISOString(),
-        commitSha: targetSha,
-      },
-    ];
+    mockFollowers = [follower("f1", targetSha)];
 
     const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    reconciler.arm();
+
+    expect(store.hasSucceeded("f1", targetSha)).toBe(true);
+    expect(store.getActiveTrigger()).not.toBeNull();
+    expect(store.load()?.completedAt).toBeUndefined();
+
+    // f2 reconnects an hour later and still gets caught up.
+    registerCallback?.({ id: "f2", commitSha: "old".repeat(10) });
+
+    expect(mockHub.updateFollower).toHaveBeenCalledWith("f2", { targetSha, branch: "staging" });
+  });
+
+  it("reports all-connected-current without claiming the rollout finished", () => {
+    const targetSha = "f0".repeat(20);
+    store.createTrigger({ targetSha, branch: "staging" });
+    mockFollowers = [follower("f1", targetSha)];
+
+    const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    reconciler.arm();
+
+    const status = reconciler.getStatus();
+    expect(status.state).toBe("active");
+    expect(status.allConnectedCurrent).toBe(true);
+    expect(status.activeTrigger?.targetSha).toBe(targetSha);
+  });
+
+  it("distinguishes never-triggered from an explicitly closed-out trigger", () => {
+    const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    reconciler.arm();
+    expect(reconciler.getStatus().state).toBe("none");
+
+    store.createTrigger({ targetSha: "f1".repeat(20), branch: "staging" });
+    expect(reconciler.getStatus().state).toBe("active");
+
+    store.markCompleted();
+    expect(reconciler.getStatus().state).toBe("completed");
+  });
+
+  it("dispatches nothing until armed, then reconciles whoever connected meanwhile", () => {
+    // A leader that binds its gateway and then dies must not have moved anyone.
+    const targetSha = "1a".repeat(20);
+    store.createTrigger({ targetSha, branch: "staging" });
+
+    const reconciler = new FollowerUpdateReconciler(store, mockHub);
+    mockFollowers = [follower("f-early", "old".repeat(10))];
+    registerCallback?.({ id: "f-early", commitSha: "old".repeat(10) });
     reconciler.reconcileAll();
 
-    expect(store.getActiveTrigger()).toBeNull();
-    expect(store.load()?.completedAt).toBeDefined();
+    expect(mockHub.updateFollower).not.toHaveBeenCalled();
+    expect(store.getActiveTrigger()?.attempts["f-early"]).toBeUndefined();
+    expect(reconciler.getStatus().armed).toBe(false);
+
+    reconciler.arm();
+
+    expect(mockHub.updateFollower).toHaveBeenCalledWith("f-early", {
+      targetSha,
+      branch: "staging",
+    });
+    expect(reconciler.getStatus().armed).toBe(true);
+  });
+
+  it("records a failure when dispatch throws rather than leaving a stuck pending attempt", () => {
+    // updateFollower throws on ordinary conditions (follower gone, update already running).
+    // A leftover "pending" is neither failed nor succeeded, so the follower would never be
+    // retried, never suppressed, and never current.
+    const targetSha = "2b".repeat(20);
+    store.createTrigger({ targetSha, branch: "staging" });
+    mockHub.updateFollower = vi.fn(() => {
+      throw new Error("Follower not connected");
+    });
+
+    new FollowerUpdateReconciler(store, mockHub).arm();
+    registerCallback?.({ id: "f-gone", commitSha: "old".repeat(10) });
+
+    const attempt = store.getActiveTrigger()?.attempts["f-gone"];
+    expect(attempt?.status).toBe("failed");
+    expect(attempt?.error).toBe("Follower not connected");
+    expect(store.hasFailed("f-gone", targetSha)).toBe(true);
+  });
+
+  it("records success when a follower reports already_current", () => {
+    const targetSha = "3c".repeat(20);
+    store.createTrigger({ targetSha, branch: "staging" });
+
+    new FollowerUpdateReconciler(store, mockHub).arm();
+
+    updateStatusCallback?.("f-current", {
+      updateId: "up-current",
+      status: "already_current",
+      newSha: targetSha,
+      timestamp: new Date().toISOString(),
+    });
+
+    expect(store.hasSucceeded("f-current", targetSha)).toBe(true);
+  });
+
+  it("reconciles a reconnecting follower on commitSha even after a prior restarting status", () => {
+    // /register builds a fresh RemoteInstance, so updateStatus does not survive a
+    // reconnect. If that ever changes, a stale active phase would silently skip this
+    // follower forever — there is no terminal success phase to clear it.
+    const targetSha = "4d".repeat(20);
+    store.createTrigger({ targetSha, branch: "staging" });
+
+    new FollowerUpdateReconciler(store, mockHub).arm();
+    registerCallback?.({ id: "f-back", commitSha: "old".repeat(10), updateStatus: undefined });
+
+    expect(mockHub.updateFollower).toHaveBeenCalledWith("f-back", { targetSha, branch: "staging" });
   });
 });

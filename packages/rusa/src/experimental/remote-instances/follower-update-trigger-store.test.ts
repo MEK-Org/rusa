@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
+import {
+  FOLLOWER_UPDATE_TRIGGER_VERSION,
+  FollowerUpdateTriggerStore,
+} from "./follower-update-trigger-store.js";
 
 describe("FollowerUpdateTriggerStore", () => {
   const testDir = join(__dirname, ".tmp-trigger-store-test");
@@ -27,14 +30,12 @@ describe("FollowerUpdateTriggerStore", () => {
     const trigger = store.createTrigger({
       targetSha: "a".repeat(40),
       branch: "staging",
-      source: "leader-update",
     });
 
+    expect(trigger.version).toBe(FOLLOWER_UPDATE_TRIGGER_VERSION);
     expect(trigger.triggerId).toBeDefined();
     expect(trigger.targetSha).toBe("a".repeat(40));
     expect(trigger.branch).toBe("staging");
-    expect(trigger.source).toBe("leader-update");
-    expect(trigger.autoReconcile).toBe(true);
     expect(trigger.attempts).toEqual({});
     expect(existsSync(storePath)).toBe(true);
 
@@ -70,23 +71,110 @@ describe("FollowerUpdateTriggerStore", () => {
     expect(active?.attempts["follower-2"]?.status).toBe("success");
   });
 
-  it("marks trigger complete and hides it from getActiveTrigger", () => {
+  it("reports all-current as an observation without retiring the trigger", () => {
     const sha = "c".repeat(40);
     store.createTrigger({ targetSha: sha, branch: "staging" });
 
     store.recordSuccess("f1", sha);
     store.recordSuccess("f2", sha);
 
-    expect(store.checkCompletion(["f1", "f2"])).toBe(true);
-    expect(store.getActiveTrigger()).toBeNull();
-
-    const loaded = store.load();
-    expect(loaded?.completedAt).toBeDefined();
+    expect(store.allCurrent(["f1", "f2"])).toBe(true);
+    // The trigger stays active: the leader keeps no enrollment roster, so "every follower
+    // we can see is current" cannot establish that every enrolled follower is.
+    expect(store.getActiveTrigger()).not.toBeNull();
+    expect(store.load()?.completedAt).toBeUndefined();
   });
 
-  it("gracefully handles corrupt trigger files", () => {
+  it("does not report all-current while any named follower still lags", () => {
+    const sha = "c1".repeat(20);
+    store.createTrigger({ targetSha: sha, branch: "staging" });
+    store.recordSuccess("f1", sha);
+
+    expect(store.allCurrent(["f1", "f2"])).toBe(false);
+  });
+
+  it("markCompleted still retires a trigger when something explicitly closes it out", () => {
+    const sha = "c2".repeat(20);
+    store.createTrigger({ targetSha: sha, branch: "staging" });
+
+    store.markCompleted();
+
+    expect(store.getActiveTrigger()).toBeNull();
+    expect(store.load()?.completedAt).toBeDefined();
+  });
+
+  it("supersedes an outstanding trigger when a newer leader update writes one", () => {
+    const oldSha = "d".repeat(40);
+    const newSha = "e".repeat(40);
+    store.createTrigger({ targetSha: oldSha, branch: "staging" });
+    store.recordFailure("f1", oldSha, "build timeout");
+
+    store.createTrigger({ targetSha: newSha, branch: "staging" });
+
+    const active = store.getActiveTrigger();
+    expect(active?.targetSha).toBe(newSha);
+    // The new target clears the old failure suppression rather than inheriting it.
+    expect(store.hasFailed("f1", oldSha)).toBe(false);
+    expect(active?.attempts).toEqual({});
+  });
+
+  it("reports corrupt trigger files as invalid rather than as absent", () => {
     writeFileSync(storePath, "{ this is not valid json }", "utf-8");
+
+    const result = store.read();
+    expect(result.kind).toBe("invalid");
+    expect(result.kind === "invalid" && result.reason).toContain("unparseable JSON");
+    // Still non-throwing for callers that only ask for the trigger, so boot is unaffected.
     expect(store.load()).toBeNull();
     expect(store.getActiveTrigger()).toBeNull();
+  });
+
+  it("reports a document from an incompatible schema version as invalid, not absent", () => {
+    writeFileSync(
+      storePath,
+      JSON.stringify({
+        version: FOLLOWER_UPDATE_TRIGGER_VERSION + 1,
+        triggerId: "t1",
+        targetSha: "f".repeat(40),
+        branch: "staging",
+        createdAt: new Date().toISOString(),
+        attempts: {},
+      }),
+      "utf-8"
+    );
+
+    const result = store.read();
+    expect(result.kind).toBe("invalid");
+    expect(result.kind === "invalid" && result.reason).toContain("unsupported schema version");
+  });
+
+  it("rejects a document whose branch or attempt records are malformed", () => {
+    const base = {
+      version: FOLLOWER_UPDATE_TRIGGER_VERSION,
+      triggerId: "t1",
+      targetSha: "a".repeat(40),
+      createdAt: new Date().toISOString(),
+    };
+
+    // A malformed branch would otherwise be handed to updateFollower as a deploy target.
+    writeFileSync(storePath, JSON.stringify({ ...base, branch: 42, attempts: {} }), "utf-8");
+    expect(store.read()).toEqual({ kind: "invalid", reason: "missing or invalid 'branch'" });
+
+    // A bad attempt record would otherwise be silently dropped, un-suppressing a follower
+    // that had already failed this target.
+    writeFileSync(
+      storePath,
+      JSON.stringify({ ...base, branch: "staging", attempts: { f1: { status: "bogus" } } }),
+      "utf-8"
+    );
+    const result = store.read();
+    expect(result.kind).toBe("invalid");
+    expect(result.kind === "invalid" && result.reason).toContain(
+      "attempt record for follower 'f1'"
+    );
+  });
+
+  it("reports a missing file as absent", () => {
+    expect(store.read()).toEqual({ kind: "absent" });
   });
 });

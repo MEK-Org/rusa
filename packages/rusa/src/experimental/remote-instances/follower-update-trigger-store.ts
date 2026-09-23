@@ -2,6 +2,16 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+/**
+ * Schema version of the on-disk trigger document.
+ *
+ * This exists for the diagnostic, not for forward-compatibility: it is what lets a
+ * malformed or foreign document be *reported* as such rather than read as absence.
+ * "No active trigger" is the silent do-nothing path, so it must not double as the
+ * error path.
+ */
+export const FOLLOWER_UPDATE_TRIGGER_VERSION = 1;
+
 export interface FollowerUpdateAttempt {
   status: "pending" | "success" | "failed";
   lastAttemptAt: string;
@@ -10,12 +20,11 @@ export interface FollowerUpdateAttempt {
 }
 
 export interface FollowerUpdateTrigger {
+  version: number;
   triggerId: string;
   targetSha: string;
   branch: string;
   createdAt: string;
-  source: "leader-update" | "operator";
-  autoReconcile: boolean;
   attempts: Record<string, FollowerUpdateAttempt>;
   completedAt?: string;
 }
@@ -23,8 +32,58 @@ export interface FollowerUpdateTrigger {
 export interface CreateTriggerOptions {
   targetSha: string;
   branch: string;
-  source?: "leader-update" | "operator";
-  autoReconcile?: boolean;
+}
+
+/**
+ * Outcome of reading the trigger document. `absent` and `invalid` are kept distinct so
+ * an unreadable document is visible to an operator instead of looking like "nothing to do".
+ */
+export type TriggerLoadResult =
+  | { kind: "absent" }
+  | { kind: "ok"; trigger: FollowerUpdateTrigger }
+  | { kind: "invalid"; reason: string };
+
+const ATTEMPT_STATUSES = new Set(["pending", "success", "failed"]);
+
+function isAttempt(value: unknown): value is FollowerUpdateAttempt {
+  if (!value || typeof value !== "object") return false;
+  const a = value as Record<string, unknown>;
+  if (typeof a.status !== "string" || !ATTEMPT_STATUSES.has(a.status)) return false;
+  if (typeof a.targetSha !== "string" || a.targetSha.length === 0) return false;
+  if (typeof a.lastAttemptAt !== "string") return false;
+  if (a.error !== undefined && typeof a.error !== "string") return false;
+  return true;
+}
+
+/** Validates the one explicit shape this binary understands, reporting why it failed. */
+function validate(parsed: unknown): TriggerLoadResult {
+  if (!parsed || typeof parsed !== "object") {
+    return { kind: "invalid", reason: "document is not an object" };
+  }
+  const t = parsed as Record<string, unknown>;
+  if (t.version !== FOLLOWER_UPDATE_TRIGGER_VERSION) {
+    return {
+      kind: "invalid",
+      reason: `unsupported schema version ${String(t.version)} (expected ${FOLLOWER_UPDATE_TRIGGER_VERSION})`,
+    };
+  }
+  for (const field of ["triggerId", "targetSha", "branch", "createdAt"] as const) {
+    if (typeof t[field] !== "string" || (t[field] as string).length === 0) {
+      return { kind: "invalid", reason: `missing or invalid '${field}'` };
+    }
+  }
+  if (t.completedAt !== undefined && typeof t.completedAt !== "string") {
+    return { kind: "invalid", reason: "invalid 'completedAt'" };
+  }
+  if (!t.attempts || typeof t.attempts !== "object" || Array.isArray(t.attempts)) {
+    return { kind: "invalid", reason: "missing or invalid 'attempts'" };
+  }
+  for (const [followerId, attempt] of Object.entries(t.attempts as Record<string, unknown>)) {
+    if (!isAttempt(attempt)) {
+      return { kind: "invalid", reason: `invalid attempt record for follower '${followerId}'` };
+    }
+  }
+  return { kind: "ok", trigger: parsed as FollowerUpdateTrigger };
 }
 
 export class FollowerUpdateTriggerStore {
@@ -38,28 +97,30 @@ export class FollowerUpdateTriggerStore {
     }
   }
 
-  load(): FollowerUpdateTrigger | null {
+  /**
+   * Reads the trigger document, distinguishing absence from corruption. Callers surface
+   * `invalid` through the application logger; it never throws, so a bad document cannot
+   * block leader startup.
+   */
+  read(): TriggerLoadResult {
     if (!existsSync(this.filePath)) {
-      return null;
+      return { kind: "absent" };
     }
+    let parsed: unknown;
     try {
-      const content = readFileSync(this.filePath, "utf-8");
-      const parsed = JSON.parse(content) as FollowerUpdateTrigger;
-      if (
-        !parsed ||
-        typeof parsed !== "object" ||
-        typeof parsed.triggerId !== "string" ||
-        typeof parsed.targetSha !== "string"
-      ) {
-        return null;
-      }
-      if (!parsed.attempts || typeof parsed.attempts !== "object") {
-        parsed.attempts = {};
-      }
-      return parsed;
-    } catch {
-      return null;
+      parsed = JSON.parse(readFileSync(this.filePath, "utf-8"));
+    } catch (err) {
+      return {
+        kind: "invalid",
+        reason: `unparseable JSON: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
+    return validate(parsed);
+  }
+
+  load(): FollowerUpdateTrigger | null {
+    const result = this.read();
+    return result.kind === "ok" ? result.trigger : null;
   }
 
   save(trigger: FollowerUpdateTrigger): void {
@@ -84,14 +145,14 @@ export class FollowerUpdateTriggerStore {
     }
   }
 
+  /** Writing a new trigger supersedes any previous one, which is what bounds staleness. */
   createTrigger(options: CreateTriggerOptions): FollowerUpdateTrigger {
     const trigger: FollowerUpdateTrigger = {
+      version: FOLLOWER_UPDATE_TRIGGER_VERSION,
       triggerId: randomBytes(16).toString("hex"),
       targetSha: options.targetSha,
       branch: options.branch,
       createdAt: new Date().toISOString(),
-      source: options.source ?? "leader-update",
-      autoReconcile: options.autoReconcile ?? true,
       attempts: {},
     };
     this.save(trigger);
@@ -157,21 +218,24 @@ export class FollowerUpdateTriggerStore {
     return trigger;
   }
 
-  checkCompletion(connectedFollowerIds: string[]): boolean {
+  /**
+   * Whether every follower in `followerIds` has reached the trigger's target.
+   *
+   * Deliberately an observation, not a state transition: the caller passes the followers
+   * it can currently see, and the leader has no durable enrollment roster, so this can
+   * never establish that *all* enrolled followers are current. Completing the trigger on
+   * it would strand a follower that was offline during the leader update — which is the
+   * case the durable document exists to serve.
+   */
+  allCurrent(followerIds: string[]): boolean {
     const trigger = this.getActiveTrigger();
     if (!trigger) return false;
-    if (connectedFollowerIds.length === 0) return false;
+    if (followerIds.length === 0) return false;
 
-    const allSucceeded = connectedFollowerIds.every((id) => {
+    return followerIds.every((id) => {
       const attempt = trigger.attempts[id];
       return attempt?.status === "success" && attempt?.targetSha === trigger.targetSha;
     });
-
-    if (allSucceeded) {
-      this.markCompleted();
-      return true;
-    }
-    return false;
   }
 
   clear(): void {

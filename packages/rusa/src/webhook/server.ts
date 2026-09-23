@@ -164,7 +164,6 @@ export interface DashboardMeshRefs {
   getFollowers?: DashboardDataDeps["getFollowers"];
   updateFollower?: DashboardDataDeps["updateFollower"];
   updateAllFollowers?: DashboardDataDeps["updateAllFollowers"];
-  getFollowerReconciliation?: DashboardDataDeps["getFollowerReconciliation"];
 }
 
 export interface DashboardServerBaseOptions {
@@ -614,7 +613,6 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           getFollowers: options.mesh.getFollowers,
           updateFollower: options.mesh.updateFollower,
           updateAllFollowers: options.mesh.updateAllFollowers,
-          getFollowerReconciliation: options.mesh.getFollowerReconciliation,
         }
       : null;
   // Walkie-talkie deps : routes need the registry/mesh/hub either way so

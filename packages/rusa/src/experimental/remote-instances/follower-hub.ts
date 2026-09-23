@@ -8,7 +8,10 @@ import {
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
-import { FollowerUpdateReconciler } from "./follower-update-reconciler.js";
+import {
+  FollowerUpdateReconciler,
+  type ReconciliationStatus,
+} from "./follower-update-reconciler.js";
 import type { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { isFullCommitSha, isSafeFollowerBranch } from "./follower-update-validation.js";
 import type {
@@ -135,15 +138,21 @@ export class FollowerHub {
     };
   }
 
-  getReconciliationStatus(): { activeTrigger: unknown; completed: boolean } {
-    if (this.reconciler) {
-      return this.reconciler.getStatus();
-    }
-    const active = this.triggerStore?.getActiveTrigger() ?? null;
-    return {
-      activeTrigger: active,
-      completed: active === null,
-    };
+  /** Single source for reconciliation state; the reconciler owns the shape. */
+  getReconciliationStatus(): ReconciliationStatus {
+    return (
+      this.reconciler?.getStatus() ?? {
+        state: "none",
+        activeTrigger: null,
+        allConnectedCurrent: false,
+        armed: false,
+      }
+    );
+  }
+
+  /** Permit automatic reconciliation; the leader calls this once boot has completed. */
+  armReconciliation(): void {
+    this.reconciler?.arm();
   }
   async listen(host: string, port: number): Promise<string> {
     // Never accidentally expose the prototype on every public interface.
@@ -160,7 +169,6 @@ export class FollowerHub {
     const address = this.server.address();
     if (!address || typeof address === "string") throw new Error("No gateway address");
     this.origin = `http://${host}:${address.port}`;
-    this.reconciler?.reconcileAll();
     return this.origin;
   }
   list(): FollowerInfo[] {

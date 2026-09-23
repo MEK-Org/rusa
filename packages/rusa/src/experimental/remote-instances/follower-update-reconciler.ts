@@ -28,9 +28,20 @@ export interface FollowerUpdateReconcilerOptions {
   logger?: Logger;
 }
 
+export interface ReconciliationStatus {
+  /** "none" = no trigger was ever written; "active" = outstanding; "completed" = closed out. */
+  state: "none" | "active" | "completed";
+  activeTrigger: FollowerUpdateTrigger | null;
+  /** Every follower currently connected is on the target. Says nothing about offline ones. */
+  allConnectedCurrent: boolean;
+  /** Whether the leader has finished booting and automatic dispatch is permitted. */
+  armed: boolean;
+}
+
 export class FollowerUpdateReconciler {
   private readonly log: Logger;
   private unregisterCallbacks: (() => void)[] = [];
+  private armed = false;
 
   constructor(
     private readonly store: FollowerUpdateTriggerStore,
@@ -67,31 +78,72 @@ export class FollowerUpdateReconciler {
     return this.store.getActiveTrigger();
   }
 
-  getStatus(): { activeTrigger: FollowerUpdateTrigger | null; completed: boolean } {
+  /**
+   * Reconciliation state for operators.
+   *
+   * `state` distinguishes the three situations that a single `completed` boolean used to
+   * collapse: no trigger was ever written, a trigger is still outstanding, or one was
+   * explicitly closed out. `allConnectedCurrent` is an observation about the followers the
+   * leader can currently see — it is deliberately not a claim about every enrolled
+   * follower, because the leader has no durable roster.
+   */
+  getStatus(): ReconciliationStatus {
     const trigger = this.store.getActiveTrigger();
+    if (!trigger) {
+      return {
+        state: this.store.load() ? "completed" : "none",
+        activeTrigger: null,
+        allConnectedCurrent: false,
+        armed: this.armed,
+      };
+    }
     return {
+      state: "active",
       activeTrigger: trigger,
-      completed: trigger === null,
+      allConnectedCurrent: this.store.allCurrent(this.hub.list().map((f) => f.id)),
+      armed: this.armed,
     };
   }
 
+  /**
+   * Allow automatic reconciliation to dispatch.
+   *
+   * Held back until the leader has finished booting, so an automatic update cannot move
+   * followers onto a revision that killed the leader that promoted it. A follower that
+   * registers before this point is not lost: arming reconciles everyone then connected.
+   */
+  arm(): void {
+    if (this.armed) return;
+    this.armed = true;
+    this.log.info("follower_reconciliation_armed");
+    this.reconcileAll();
+  }
+
   reconcileAll(): void {
+    if (!this.armed) {
+      this.log.debug?.("follower_reconciliation_deferred_not_armed");
+      return;
+    }
     const trigger = this.store.getActiveTrigger();
-    if (!trigger || !trigger.autoReconcile) return;
+    if (!trigger) return;
 
     const followers = this.hub.list();
     for (const follower of followers) {
       this.reconcileFollower(follower, trigger);
     }
-    this.checkCompletion();
+    this.reportIfAllCurrent();
   }
 
   reconcileFollower(
     follower: { id: string; commitSha?: string; updateStatus?: FollowerUpdateStatus },
     trigger?: FollowerUpdateTrigger | null
   ): boolean {
+    if (!this.armed) {
+      this.log.debug?.("follower_reconciliation_deferred_not_armed", { followerId: follower.id });
+      return false;
+    }
     const activeTrigger = trigger ?? this.store.getActiveTrigger();
-    if (!activeTrigger || !activeTrigger.autoReconcile) return false;
+    if (!activeTrigger) return false;
 
     // Follower already on the target SHA
     if (follower.commitSha && follower.commitSha === activeTrigger.targetSha) {
@@ -101,7 +153,7 @@ export class FollowerUpdateReconciler {
           followerId: follower.id,
           targetSha: activeTrigger.targetSha,
         });
-        this.checkCompletion();
+        this.reportIfAllCurrent();
       }
       return false;
     }
@@ -124,19 +176,20 @@ export class FollowerUpdateReconciler {
       return false;
     }
 
-    // Dispatch the update
-    const attempt: FollowerUpdateAttempt = {
-      status: "pending",
-      targetSha: activeTrigger.targetSha,
-      lastAttemptAt: new Date().toISOString(),
-    };
-    this.store.recordAttempt(follower.id, attempt);
-
+    // Dispatch first, then record what actually happened. Recording `pending` up front
+    // stranded a follower whose dispatch threw: not failed, so not suppressed; not
+    // succeeded, so never current; and the document asserted an attempt that never left.
     try {
       this.hub.updateFollower(follower.id, {
         targetSha: activeTrigger.targetSha,
         branch: activeTrigger.branch,
       });
+      const attempt: FollowerUpdateAttempt = {
+        status: "pending",
+        targetSha: activeTrigger.targetSha,
+        lastAttemptAt: new Date().toISOString(),
+      };
+      this.store.recordAttempt(follower.id, attempt);
       this.log.info("follower_update_reconciliation_triggered", {
         followerId: follower.id,
         targetSha: activeTrigger.targetSha,
@@ -144,9 +197,12 @@ export class FollowerUpdateReconciler {
       });
       return true;
     } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.store.recordFailure(follower.id, activeTrigger.targetSha, error);
       this.log.warn("follower_update_reconciliation_dispatch_error", {
         followerId: follower.id,
-        err,
+        targetSha: activeTrigger.targetSha,
+        error,
       });
       return false;
     }
@@ -179,17 +235,25 @@ export class FollowerUpdateReconciler {
         followerId,
         targetSha,
       });
-      this.checkCompletion();
+      this.reportIfAllCurrent();
     }
   }
 
-  private checkCompletion(): void {
+  /**
+   * Report — but do not act on — every currently connected follower being current.
+   *
+   * This deliberately does not complete the trigger. The connected set is not a subset of
+   * a known roster (the leader keeps none), so treating it as exhaustive would close the
+   * trigger while an offline follower still needed it, which is the one case the durable
+   * document exists for. The trigger instead stays active until the next leader update
+   * supersedes it.
+   */
+  private reportIfAllCurrent(): void {
     const followers = this.hub.list();
     if (followers.length === 0) return;
     const ids = followers.map((f) => f.id);
-    const completed = this.store.checkCompletion(ids);
-    if (completed) {
-      this.log.info("follower_update_reconciliation_all_completed", {
+    if (this.store.allCurrent(ids)) {
+      this.log.info("follower_reconciliation_all_connected_current", {
         followerCount: ids.length,
       });
     }
