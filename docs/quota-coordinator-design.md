@@ -12,11 +12,12 @@ repository-relative; line numbers are that commit's.
 
 **A self-contained quota module.** One process scrapes the provider panels,
 parses and reasons about them, keeps the observation and controller history,
-and **publishes the resulting throttle periods** over a small read-only API.
-Instances stop scraping, stop parsing, and stop opening the quota database;
-they read a published interval and apply it to their own pacer exactly as they
-apply the persisted one today. Nothing in v1 gates a launch, reserves anything,
-or holds a lease.
+and **publishes the resulting throttle periods** over five side-effect-free GET
+paths, with two separately enumerated POST paths for operator control. Instances
+stop scraping, stop parsing, and stop opening the quota database; they read a
+published interval and apply it to their own pacer exactly as they apply the
+persisted one today. Nothing in v1 gates a launch, reserves anything, or holds a
+lease.
 
 **What v1 deliberately does not do.** It does not close the launch-clock gap in
 §1.4. Two instances reading one published interval still both start immediately
@@ -58,7 +59,9 @@ would have to respect, and nothing more.
   was the only reason it was withdrawn. The v1 wire contract becomes
   **read-only — six GETs and no mutating operation anywhere** (§5), which
   deletes client ingestion, the ingest receipts table, the observation replay
-  buffer, and the whole reservation lifecycle from v1's surface. The v1 schema
+  buffer, and the whole reservation lifecycle from v1's surface. Revision 10
+  later adds narrowly-scoped operator writes; it does not restore a general
+  client-ingestion or reservation protocol. The v1 schema
   addition shrinks to one singleton table, which revision 7 then removes
   altogether. §5.7 collapses, because a
   service that gates nothing cannot fail closed. And §8.4's account of
@@ -71,9 +74,10 @@ would have to respect, and nothing more.
   a *transfer* rather than an addition (§8.3); the A/B harness stops being a
   scraper and becomes a client (§1.7, Q10); the agent-facing `get_quota` tool
   reads through the service (Q11); and #178 closes when the self-scraping,
-  read-only v1 ships, with cross-instance coordination deferred pending evidence
-  that it is needed (Q12). The earlier requirement that the collector admit
-  off-host observation *sources* is superseded and removed. Review of revision 6
+  initially read-only v1 ships, with cross-instance coordination deferred
+  pending evidence that it is needed (Q12). The earlier requirement that the
+  collector admit off-host observation *sources* is superseded and removed.
+  Review of revision 6
   also found five things wrong or unstated, all fixed here: the freshness rule
   was ambiguous for a provider with several windows (§5.5), a client restarting
   during an outage would have been unpaced (§5.7), the restart invariant ignored
@@ -118,7 +122,8 @@ would have to respect, and nothing more.
   Q7 — which deliberately refused to invent a duration — carries the
   write-quiesce window measured by the drill it named as the place the number
   would come from.
-- **Revision 10 reverses the read-only path rule, and nothing else.** §5.2's
+- **Revision 10 replaces the read-only path rule and aligns the claims that
+  depended on it.** §5.2's
   "every v1 path is a `GET`" was written when v1 had no writes; #573's operator
   writes then had to live under an `/internal/` prefix to keep it true, which
   asserted a public-versus-internal split among consumers that does not exist —
@@ -126,8 +131,10 @@ would have to respect, and nothing more.
   Review of PR #583 ruled the original read-only requirement reversed, so the
   method contract is now stated per path (§5.2, criterion 7), the writes are
   `POST /v1/quota/reading-mode` and `POST /v1/quota/observations`, and
-  `/internal/` is gone. The read surface, its bodies, and every other guarantee
-  in §5 are untouched.
+  `/internal/` is gone. The GET read surface and its bodies are unchanged, but
+  the former claim that socket access can only read is removed: `0600` now
+  authorizes both reads and those operator writes, with no per-request role or
+  caller identity.
 
 ## Contents
 
@@ -452,16 +459,17 @@ live.
 One additional in-repo process (`rusa quota-coordinator`, a fourth
 `systemd --user` unit) **is** the quota module. It owns the quota database, runs
 the scrape loop, holds the single parse/inference path, advances the controller,
-and serves a small versioned **read-only** JSON API over a Unix domain socket in
-the user's runtime directory. Instances become readers: they neither scrape nor
-open the database.
+and serves a small versioned JSON API over a Unix domain socket in the user's
+runtime directory. Its normal clients are readers: they neither scrape nor open
+the database; #573 adds two operator-control writes on that same socket.
 
 Filesystem permissions on the socket are the authentication boundary — the same
 trust model the repo already uses for loopback MCP and the dashboard (§1.8),
 with a strictly smaller attack surface than a TCP port, since a Unix socket is
-not reachable off-host at all. Because the v1 surface has no mutating operation
-at all, the authentication question shrinks further: the worst a compromised
-client can do through this API is read.
+not reachable off-host at all. That permission is the whole authorization model
+for both the GET read plane and the two operator POSTs: any same-UID process
+that can open the socket can issue either kind of request. The API does not
+claim a client-versus-operator security boundary.
 
 Costs: a third unit to install, supervise, upgrade and back up; a new failure
 mode ("service down") that must have defined behaviour; an IPC hop on a path
@@ -521,7 +529,7 @@ v1.
 ### 3.2 Comparison
 
 Assessed against v1's job: one owner of collection, publishing throttle periods
-to read-only clients.
+to read clients while accepting explicitly operator-initiated manual readings.
 
 | Dimension | 1 — Shared SQLite | 2 — Same-host sidecar (UDS) | 3 — Networked |
 | --- | --- | --- | --- |
@@ -531,7 +539,7 @@ to read-only clients.
 | **Compatibility** | N writers all carrying the schema; ad-hoc widening on open | One writer; versioned wire contract; clients carry no schema | Same as 2 |
 | **Latency** | In-process SQLite call (µs) | UDS round trip (sub-ms), at one read per provider per tick (A2) | Network RTT plus TLS; still negligible at A2 rates |
 | **Availability** | No new dependency; a corrupt or locked file stops everyone anyway | New dependency, but a soft one: v1 gates nothing, so an outage freezes the published interval rather than stopping launches (§5.7) | Same, plus network partitions |
-| **Security** | Filesystem ACL on one file; every instance runs PTY probes | Filesystem ACL on one socket; unreachable off-host; **read-only client surface**; one more holder of `geminiApiKey`; probes run in one place | Authn/authz, transport encryption, exposed port |
+| **Security** | Filesystem ACL on one file; every instance runs PTY probes | Filesystem ACL on one socket; unreachable off-host; two operator writes share that authority; one more holder of `geminiApiKey`; probes run in one place | Authn/authz, transport encryption, exposed port |
 | **Scrape / parse cost** | N scrapes, N parses | **1 scrape, 1 parse** (§3.1) | Same as 2 |
 | **Blast radius of a scrape change** | Ships with the instance; a bad parse change rolls back the whole orchestrator | Ships with one unit; can be deployed and rolled back alone | Same as 2 |
 | **Backup** | One SQLite file, but no single process owns quiescing it | One SQLite file with exactly one writer that can quiesce and `VACUUM INTO` | Same as 2 |
@@ -543,7 +551,7 @@ to read-only clients.
 
 ## 4. Recommendation
 
-### 4.1 Option 2 — the same-host sidecar, owning collection, publishing read-only
+### 4.1 Option 2 — the same-host sidecar, owning collection, publishing reads
 
 **Adopt Option 2, scoped to v1 as described below.** It is the smallest option
 that meets what #178 asks for, and the topology assumption it rests on has been
@@ -565,41 +573,43 @@ Within Option 2, v1 is deliberately narrow:
   (`packages/rusa/src/mcp/http-server.ts`) with the TCP listener swapped for a
   socket path. No new protocol, no new dependency.
 - **It scrapes.** Collection, parsing, inference, controller advancement and
-  retention all live inside it. It does not accept quota information from its
-  clients — there is no ingestion endpoint in v1 at all (§5.5), which is what
-  makes "clients cannot supply the information they consume" a property of the
-  wire contract rather than a convention.
-- **Its client surface is read-only.** Five GETs, no POST, no PUT, no DELETE
-  (§5.5). Everything that mutates quota state is internal to the process.
-  *Amended by revision 10:* #573 adds two POST paths for the operator to hand
-  the daemon a manually read panel value. They are operator control over the
-  socket, not a client surface — no quota consumer calls them, and the daemon
-  is still the only writer of quota state — so the property this section is
-  claiming survives, but "no POST anywhere" no longer states it accurately.
+  retention all live inside it. Normal quota consumers do not submit the quota
+  information they read. #573 additionally accepts a manually read panel value
+  through two operator-control POSTs (§5.2); that is not a general
+  client-ingestion or reservation protocol.
+- **Its read plane is read-only.** The five read paths are GET-only (§5.5).
+  The same socket also accepts `POST /v1/quota/reading-mode` and
+  `POST /v1/quota/observations`, which the daemon validates and persists through
+  its canonical path. The daemon remains the sole direct writer of the quota
+  database, but the transport has no authenticated distinction between a quota
+  consumer and an operator: `0600` socket access permits both route classes.
 - **It arbitrates nothing.** No leases, no reservations, no gating. Clients read
   a published interval and pace themselves with it, exactly as they pace
   themselves with the persisted interval today (`start.ts:1289-1293`).
 
-### 4.2 What the read-only surface is worth, stated separately
+### 4.2 What the read plane is worth — and what it does not authorize
 
-It is worth stating on its own, because it is the property that makes the rest of
-the rollout cheap rather than merely tidy.
+The side-effect-free read plane still keeps routine clients and rollout simple.
+It is not, after #573, an access-control boundary for the socket.
 
-- **Auth collapses to "can you open the socket".** With no mutating operation
-  there is no privilege to model beyond read access, and a conforming or buggy
-  client cannot corrupt quota state, publish a wrong interval, or poison the
-  controller's memory.
+- **Routine clients are simple.** A quota consumer only needs a GET and cannot
+  change quota state by following that client contract. The two POSTs remain
+  explicit, enumerated operator controls rather than implicit method exceptions,
+  and they pass through the daemon's validation, observation, controller, and
+  pacing path.
+- **Socket access is the operator authority.** `0600` is the only authorization
+  check for every route. A same-UID process that can read can also send either
+  POST; there is no per-request token, role, or caller identity that enforces
+  the intended consumer/operator split. The daemon is still the only process
+  that writes its quota database through this protocol, but a raw socket caller
+  can ask it to apply a manual mode or observation.
 
-  **This is a correctness boundary, not a security boundary, and the difference
-  matters.** Under A1 the service and its clients run as the same Unix user
-  against the same filesystem, so a *compromised* client process can open the
-  relocated database directly no matter what verbs the API offers. What the
-  read-only surface buys is that no client can do damage **through the
-  contract** — by accident, by a bug, or by a future endpoint added without
-  thinking. Making it a security boundary requires real process isolation, which
-  is Q6, and v1 does not claim it. `databasePath` is published nowhere
-  accordingly (§5.2): no client needs the path, and publishing it only assists a
-  process that should not be opening the file.
+  **This is not a security boundary.** Under A1 the service and its clients run
+  as the same Unix user against the same filesystem. Real process isolation or
+  authenticated roles would be required to prevent such a process from using the
+  write routes; v1 does not claim either. `databasePath` is published nowhere
+  accordingly (§5.2): a normal client needs no path, and publishing it only
+  assists a process that should not be opening the file.
 - **The canary becomes free.** An instance can read `GET /v1/throttle` and
   *compare* it against what it would have applied, logging the difference and
   applying nothing, for as long as anyone wants. There is no such thing as a
@@ -623,9 +633,9 @@ the rollout cheap rather than merely tidy.
   provider CLIs are authenticated): the whole of A5 is in question, because a
   module that owns collection has to be deployable where collection is possible.
   The fallback is not Option 3 — it is a split where the service still owns
-  parsing, inference and publication while a thin same-host collector feeds it,
-  which is exactly the ingestion endpoint v1 deleted. That is a real design, and
-  it is the one to reach for if and only if A5a fails.
+  parsing, inference and publication while a thin same-host collector feeds it.
+  That is a general collector-ingestion design, distinct from #573's manual
+  operator controls, and it is the one to reach for if and only if A5a fails.
 - **A1a stops being tolerable** (unpaced consumption from followers or
   interactive use grows large enough that the controller's reaction to it is too
   slow): that is not an argument for Option 3, which would not help. The account
@@ -633,8 +643,9 @@ the rollout cheap rather than merely tidy.
   attribution, not topology — scrape more often, or teach the other paths to
   report what they spent. Neither is a v1 requirement.
 - **A6 is unacceptable** (no write-quiesce is ever schedulable): §8.3's
-  ownership flip needs redesign — probably a service that begins read-only and
-  takes the write lock only when it observes no other writer for a full tick.
+  ownership flip needs redesign — probably a service that begins without client
+  mutation and takes the write lock only when it observes no other writer for a
+  full tick.
   That is more machinery; it is not proposed here.
 - **A2 is false** (tick rate rises far enough that polling is wasteful): the
   publication becomes a push — a long-poll or an event stream driven by the
@@ -732,10 +743,12 @@ v1 authenticates by **filesystem permission on the socket**: `0600`, service
 user only. There is no token, because on a Unix socket a token would be a second
 copy of the same fact.
 
-The read-only surface is what keeps this sufficient. There is no operation a
-client can call that changes quota state, so the authorization question is
-"which processes may read the pool's quota history", and on a single-user host
-the answer is already "processes running as that user".
+The socket permission is the complete authorization model. `0600` means the
+service user may read the pool's quota history **and** invoke the two operator
+POSTs; no protocol field proves that a caller is an operator rather than a
+normal consumer. On a single-user host the answer to both is therefore
+"processes running as that user." The deployment relies on that trust boundary;
+the GET-only client behavior is not an authorization mechanism.
 
 **Key and credential exposure, stated plainly, because revision 6 moves it in
 both directions.**
@@ -1466,9 +1479,9 @@ not to do it.
 ### 8.3 Canary and rollback
 
 The original table is the intended rollout design, not a statement that every
-mode is present in the #499 build. The read-only surface makes the planned stage
-2 especially cheap once [#503](https://github.com/MEK-Org/rusa/issues/503)
-ships.
+mode is present in the #499 build. The side-effect-free client read plane makes
+the planned stage 2 especially cheap once
+[#503](https://github.com/MEK-Org/rusa/issues/503) ships.
 
 | Stage | Action | Verifies | Rollback |
 | --- | --- | --- | --- |
@@ -1583,11 +1596,12 @@ strongly:
   (`quota-mcp.ts:555-607`). If a provider ever exposes quota through an API, the
   swap changes one process and no client, because nothing on the wire mentions a
   scrape.
-- **Consumers are not the source of what they consume.** This is the property
-  that was missing, and it is now enforced by the wire contract rather than by
-  convention: there is no ingestion endpoint, so a client *cannot* supply quota
-  information even by mistake (§5.5, criterion 7).
-- **A read-only client needs one GET.** A dashboard, a report, or any future
+- **Normal consumers are not the source of what they consume.** The ordinary
+  client contract is GET-only. #573 allows a trusted same-UID caller to submit a
+  manually read panel value, but it does not authenticate that caller as an
+  operator or turn the service into a general consumer-ingestion path (§5.2,
+  criterion 7); that limit is operational, not an enforced wire identity.
+- **A read client needs one GET.** A dashboard, a report, or any future
   reader calls `GET /v1/throttle` or `GET /v1/quota` and nothing else.
 
 **What this costs, stated accurately.** An earlier revision claimed that deleting
@@ -1963,8 +1977,8 @@ right foundation for 1 and 8.
 
 **Nothing in this section is part of v1, and v2 is not scheduled.** The operator's
 direction on this proposal is to wait and see whether cross-instance coordination
-turns out to be necessary at all, once the read-only coordinator is running and
-there is evidence rather than argument to decide on.
+turns out to be necessary at all, once the coordinator's GET client plane is
+running and there is evidence rather than argument to decide on.
 
 Earlier revisions carried the full settled protocol here — tables, endpoints,
 lease lifecycle, roughly a hundred and seventy lines of a design explicitly out of
@@ -2080,11 +2094,12 @@ prerequisites, and all land in v1.
 Sequenced, and scoped to v1. None of these should be filed before the design is
 approved — that is a human decision, not a mesh one.
 
-1. **Service process and the v1 read API.** `rusa quota-coordinator`, the socket
-   listener, the five GET handlers including the collection form of
-   `/v1/throttle`, the `service` block on every response, `healthz`/`readyz`,
-   the two-code error envelope, the schema guard, and the client-side
-   `protocolMajor` refusal. Covers criteria 2, 7, 9 and 16.
+1. **Service process and the v1 API.** `rusa quota-coordinator`, the socket
+   listener, the five GET read handlers including the collection form of
+   `/v1/throttle`, the separately declared operator POSTs, the `service` block
+   on every response, `healthz`/`readyz`, the two-code error envelope, the schema
+   guard, and the client-side `protocolMajor` refusal. Covers criteria 2, 7, 9
+   and 16.
 2. **Move collection into the service.** The per-provider probe loop on
    `tickSeconds`, reusing `QuotaService`'s probe/parse/infer path and its TTL as
    a floor (`quota-mcp.ts:834-855`); the single `prevState`, **hydrated at boot
@@ -2168,14 +2183,15 @@ references to them in earlier review still resolve to the same questions.
   the second scraper v1 exists to remove. The changed failure mode ("the service
   is cold" instead of "the probe timed out") is why `GET /v1/quota` answers with
   an `unknown` shape rather than an error (§5.5), and criterion 15 asserts it.
-- **Q12 — Does #178 stay open for v2? No.** #178 closes when the self-scrape,
-  read-only coordinator ships; v2 is deferred until there is evidence that
-  cross-instance launch coordination is needed, and §12's item 9 files the
-  successor as a tracking issue rather than a scheduled one.
+- **Q12 — Does #178 stay open for v2? No.** #178 closes when the self-scraping
+  coordinator ships with its GET client read plane and operator controls; v2 is
+  deferred until there is evidence that cross-instance launch coordination is
+  needed, and §12's item 9 files the successor as a tracking issue rather than a
+  scheduled one.
 
-**Q9 is withdrawn.** It asked who observes consumption the service cannot see now
-that there is no ingestion endpoint, and it rested on a false premise: the parse
-prompt asks for the provider's **account-level** windows
+**Q9 is withdrawn.** It asked who observes consumption the service cannot see in
+the absence of a general client-ingestion endpoint, and it rested on a false
+premise: the parse prompt asks for the provider's **account-level** windows
 (`quota-mcp.ts:342-391`), so consumption from another host or from interactive
 human use already arrives at the next scrape as a lower `percentLeft`, exactly as
 it does today. There is no new blind spot to assign an owner to. What remains —
