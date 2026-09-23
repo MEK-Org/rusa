@@ -1994,6 +1994,14 @@ export async function handleMeshApiRequest(
   // and parse purely to be filtered client-side. `includeTerminalRoots=true`
   // (the Work tab's on-demand "Show Done" reload) restores the unfiltered
   // page.
+  //
+  // The same exclusion applies to descendants (#506). Filtering only roots
+  // still sent every finished obligation under a live root: on a production
+  // snapshot, 1451 of 1551 returned nodes — 2.23 MB of 2.53 MB — were ones
+  // the tree view drops without rendering, because it hides a quiet terminal
+  // node and does not descend past it. Those nodes still cost a serialize and
+  // a compress here and a decompress and a parse there, on every load, and
+  // they accumulate: finished work is never removed from the response.
   if (pathname === "/api/mesh/obligations/forest") {
     if (!deps.obligations) {
       sendJson(res, 503, { error: "obligations data unavailable" });
@@ -2012,7 +2020,10 @@ export async function handleMeshApiRequest(
       limit,
       offset,
     });
-    const trees = deps.obligations.getForest(page.obligations.map((obligation) => obligation.id));
+    const trees = deps.obligations.getForest(
+      page.obligations.map((obligation) => obligation.id),
+      { excludeQuietTerminalDescendants: !includeTerminalRoots }
+    );
     sendJson(res, 200, { trees, total: page.total, hasMore: page.hasMore });
     return true;
   }
