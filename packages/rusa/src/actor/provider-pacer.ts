@@ -387,11 +387,36 @@ function weeklyQuotaHeadroom(
  * Callers must reserve the winning lane (via `submit`) synchronously, with no
  * `await` between calling this and reserving — JS's single-threaded execution
  * is what keeps concurrent wakes from double-booking the same slot.
+ *
+ * For a responsive request (`opts.responsive`), pacing never disqualifies a
+ * lane: among lanes with trustworthy weekly quota evidence, the one with more
+ * headroom against the remaining window always wins, no matter how hot any
+ * lane is running against its pace (#655). Lanes at absolute zero are expected
+ * to have been pre-filtered by the caller. With no trustworthy evidence the
+ * responsive rule falls back to the same quote-based selection as normal work.
  */
 export function selectPoolLane<C>(
   candidates: readonly PoolLaneCandidate<C>[],
-  now: number
+  now: number,
+  opts: { responsive?: boolean } = {}
 ): PoolLaneCandidate<C> | undefined {
+  if (opts.responsive === true) {
+    // Absolute quota gates, pacing ranks: a lane that still has quota is
+    // preferred by headroom regardless of its pacing quote, and a pacing-hot
+    // lane is never disqualified — the reservation bypasses the queue anyway.
+    let best: PoolLaneCandidate<C> | undefined;
+    let bestHeadroom = Number.NEGATIVE_INFINITY;
+    for (const candidate of candidates) {
+      const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
+      if (headroom === undefined) continue;
+      if (headroom > bestHeadroom) {
+        bestHeadroom = headroom;
+        best = candidate;
+      }
+    }
+    if (best) return best;
+  }
+
   let best: PoolLaneCandidate<C> | undefined;
   let bestQuote = Number.POSITIVE_INFINITY;
   const immediatelyAvailable: PoolLaneCandidate<C>[] = [];
@@ -444,8 +469,10 @@ export interface SubmitPoolGateOptions<C>
  * Reserve the earliest-available declared candidate across multiple provider
  * lanes as a single composed {@link RunStartHandle}. A normal request paces
  * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
- * among non-halted candidates. Responsive priority preserves that selection,
- * but skips pacing once its selected lane has been reserved.
+ * among non-halted candidates. Responsive priority keeps the absolute-quota
+ * pre-filtering the caller applied, ranks the surviving lanes by quota
+ * headroom rather than pacing heat, and then skips pacing once its selected
+ * lane has been reserved (#655).
  *
  * `promote()` re-runs the normal selection rule before bypassing pacing. When
  * the newly selected lane differs, the stale reservation is cancelled; a
@@ -529,7 +556,7 @@ export function submitPoolGate<C, T>(
   };
 
   const responsive = opts.responsive === true;
-  const initial = selectPoolLane(healthy(), now());
+  const initial = selectPoolLane(healthy(), now(), { responsive });
   reserve(initial ?? candidates[0], responsive);
 
   return {
@@ -539,7 +566,7 @@ export function submitPoolGate<C, T>(
     },
     promote: () => {
       if (settled || inner?.started) return;
-      const target = selectPoolLane(healthy(), now()) ?? candidates[0];
+      const target = selectPoolLane(healthy(), now(), { responsive: true }) ?? candidates[0];
       if (currentCandidate === target) {
         // The reservation stays put, but its queued priority has changed.
         // Publish that transition so dashboard/HALT state cannot report a

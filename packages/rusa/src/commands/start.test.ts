@@ -19,6 +19,7 @@ import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import { type ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
+import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -881,6 +882,238 @@ describe("runStart webhook event routing (Phase 4)", () => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
     }
+  });
+
+  describe("model pool selection honors coordinator exhaustion (#655)", () => {
+    const claudeEntry = { provider: "claude", model: "claude-sonnet-5", effort: "high" };
+    const codexEntry = { provider: "codex", model: "gpt-5.6", effort: "high" };
+
+    // Boots runStart against a real coordinator socket whose /v1/throttle
+    // providers payload `makeProviders` controls, so a test can flip lane
+    // states between gates and wait for the next tick to consume them.
+    const bootWithCoordinator = async (
+      makeProviders: () => Record<string, unknown>
+    ): Promise<{
+      mesh: ActorMesh;
+      appliedInterval: (provider: string) => number | undefined;
+      close: () => Promise<void>;
+    }> => {
+      const socketPath = join(homeDir, "coordinator.sock");
+      const service = {
+        protocolMajor: 1,
+        protocolMinor: 0,
+        serverVersion: "test",
+        serverTime: new Date().toISOString(),
+      };
+      const coordinator = createServer((req, res) => {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        res.setHeader("content-type", "application/json");
+        if (url.pathname !== "/v1/throttle") {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+          return;
+        }
+        res.end(JSON.stringify({ service, providers: makeProviders() }));
+      });
+      await new Promise<void>((resolve, reject) => {
+        coordinator.once("error", reject);
+        coordinator.listen(socketPath, resolve);
+      });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: {
+            antigravity: { cliCommand: "agy" },
+            claude: { cliCommand: "claude" },
+            codex: { cliCommand: "codex" },
+          },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          geminiApiKey: "fake-gemini-key",
+          quota: {
+            coordinator: { socketPath },
+            throttle: { enabled: true, tickSeconds: 1 },
+          },
+        }),
+        "utf8"
+      );
+
+      let mesh: ActorMesh | undefined;
+      let appliedInterval: ((provider: string) => number | undefined) | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              appliedInterval = handles.coordinatorAppliedInterval;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh || !appliedInterval) throw new Error("mesh not ready");
+      return {
+        mesh,
+        appliedInterval,
+        close: () =>
+          new Promise<void>((resolve, reject) => {
+            coordinator.close((error) => (error ? reject(error) : resolve()));
+          }),
+      };
+    };
+
+    const weeklyBucket = (provider: string, percentLeft: number) => ({
+      key: `${provider}:weekly`,
+      percentLeft,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 300,
+      observedAt: new Date().toISOString(),
+      resetAtIso: new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString(),
+    });
+    const throttleStatus = (
+      provider: string,
+      opts: { percentLeft?: number; intervalSeconds?: number; expired?: boolean } = {}
+    ) => ({
+      provider,
+      intervalSeconds: opts.intervalSeconds ?? 0,
+      uncappedIntervalSeconds: opts.intervalSeconds ?? 0,
+      governingBucketKey: `${provider}:weekly`,
+      capped: false,
+      expired: opts.expired ?? false,
+      exhaustedUntil:
+        opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null,
+      updatedAt: new Date().toISOString(),
+      buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
+      freshness: {
+        ageMs: 0,
+        buckets: { [`${provider}:weekly`]: 0 },
+        stale: false,
+        hardStale: false,
+      },
+    });
+
+    it("responsive runs on a hot lane with quota while a coordinator-exhausted lane is skipped; normal waits", async () => {
+      // claude: coordinator-reported exhausted. codex: quota left, but pacing
+      // hot once its interval widens below.
+      let codexInterval = 0;
+      const { mesh, close, appliedInterval } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", { percentLeft: 0, expired: true }),
+        codex: throttleStatus("codex", { percentLeft: 50, intervalSeconds: codexInterval }),
+      }));
+      try {
+        // Heat codex: one normal gate starts on it immediately (interval 0),
+        // giving the lane a real start timestamp for the widened interval to
+        // pace against.
+        const warm = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(warm, [codexEntry], false).result).resolves.toBe("codex");
+
+        // Widen codex to a 1-hour pace and wait for the tick to apply it;
+        // its quote is now an hour out.
+        codexInterval = 3600;
+        await vi.waitFor(() => expect(appliedInterval("codex")).toBe(3600), {
+          timeout: 5_000,
+        });
+
+        // Responsive: the coordinator-exhausted claude lane is pre-filtered,
+        // and the pacing-hot codex lane still runs immediately because pacing
+        // never gates responsive work.
+        const responsiveFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const responsiveGate = mesh.gateRun(responsiveFn, [claudeEntry, codexEntry], true);
+        await expect(responsiveGate.result).resolves.toBe("codex");
+        expect(responsiveFn).toHaveBeenCalledTimes(1);
+        expect(responsiveFn).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+
+        // Normal: unchanged deferral — the run waits out codex's pace instead
+        // of attempting the exhausted claude lane early.
+        const normalFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const normalGate = mesh.gateRun(normalFn, [claudeEntry, codexEntry], false);
+        let normalSettled = false;
+        void normalGate.result.then(
+          () => {
+            normalSettled = true;
+          },
+          () => {
+            normalSettled = true;
+          }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(normalSettled).toBe(false);
+        expect(normalGate.started).toBe(false);
+        expect(normalFn).not.toHaveBeenCalled();
+        normalGate.cancel?.();
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("responsive prefers the lane with more quota headroom even when it is pacing-hot", async () => {
+      // Both lanes have quota; claude has more weekly headroom. claude is
+      // pacing-hot (1h interval warmed below), codex is available now.
+      const { mesh, close, appliedInterval } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", { percentLeft: 80, intervalSeconds: 3600 }),
+        codex: throttleStatus("codex", { percentLeft: 20, intervalSeconds: 0 }),
+      }));
+      try {
+        // Warm claude so its 1-hour interval quotes against a real start.
+        const warm = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(warm, [claudeEntry], false).result).resolves.toBe("claude");
+        await vi.waitFor(() => expect(appliedInterval("claude")).toBe(3600), {
+          timeout: 5_000,
+        });
+
+        // Normal priority keeps quote-first selection: codex is available now.
+        const normalFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(normalFn, [claudeEntry, codexEntry], false).result).resolves.toBe(
+          "codex"
+        );
+
+        // Responsive ranks by headroom among lanes with quota: claude wins
+        // despite being an hour deep into its pace, and starts immediately.
+        const responsiveFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const responsiveGate = mesh.gateRun(responsiveFn, [claudeEntry, codexEntry], true);
+        await expect(responsiveGate.result).resolves.toBe("claude");
+        expect(responsiveFn).toHaveBeenCalledTimes(1);
+        expect(responsiveFn).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("fails fast naming every lane exhausted when the coordinator reports zero on the whole pool", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", { percentLeft: 0, expired: true }),
+        codex: throttleStatus("codex", { percentLeft: 0, expired: true }),
+      }));
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const gate = mesh.gateRun(attempted, [claudeEntry, codexEntry], true);
+
+        const failure = await gate.result.then(
+          () => {
+            throw new Error("expected the gate to reject");
+          },
+          (error: unknown) => error
+        );
+        expect(failure).toBeInstanceOf(PoolExhaustedError);
+        const message = failure instanceof Error ? failure.message : String(failure);
+        expect(message).toContain("model pool exhausted");
+        expect(message).toContain("none was attempted");
+        expect(message.match(/\(exhausted\)/g)).toHaveLength(2);
+        expect(message).not.toContain("(pacing)");
+        expect(attempted).not.toHaveBeenCalled();
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
