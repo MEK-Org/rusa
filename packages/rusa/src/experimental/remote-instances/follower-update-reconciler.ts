@@ -145,6 +145,12 @@ export class FollowerUpdateReconciler {
     // the replacement cannot know whether the former leader's command is still draining
     // or restarting on its follower. Dispatching another automatic update there would
     // turn that uncertainty into a parallel rollout, so wait for its terminal outcome.
+    //
+    // This gate also remains fail-closed if a pending follower dies mid-update and reconnects
+    // still lagging (e.g. host reboot or OOM kill before build reporting). A lagging reconnect
+    // does not release the gate because registration is terminal evidence only on proven targetSha
+    // restart. Operators can diagnose this stall via GET /followers/reconciliation, and clear it
+    // via POST /followers/:id/update or allow the next leader update (createTrigger) to reset it.
     const pendingFollowerId = this.pendingAutomaticFollower(refreshedTrigger);
     if (pendingFollowerId) {
       this.log.debug?.("follower_update_reconciliation_waiting_for_terminal_status", {
@@ -202,9 +208,11 @@ export class FollowerUpdateReconciler {
     }
 
     // Record `pending` before dispatching so the durable single-flight gate is persisted
-    // before the command is enqueued on the follower. If the leader crashes during or
-    // immediately after dispatch, a replacement leader sees the in-flight gate and waits.
-    // If dispatch throws, the catch block overwrites `pending` with `failed`.
+    // before the command is enqueued on the follower. A crash that loses the gate would risk
+    // a parallel rollout, whereas a crash during the microsecond window before dispatch
+    // costs at most a queue stall bounded by the next trigger (`createTrigger` resets `attempts`).
+    // If the leader crashes during or immediately after dispatch, a replacement leader sees the
+    // in-flight gate and waits. If dispatch throws, the catch block overwrites `pending` with `failed`.
     const attempt: FollowerUpdateAttempt = {
       status: "pending",
       targetSha: activeTrigger.targetSha,
