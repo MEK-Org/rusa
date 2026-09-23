@@ -963,7 +963,7 @@ describe("ActorMesh", () => {
       markSeen: () => [],
       // Partial fake: it never notifies, so the only wake here is whatever the
       // mesh path under test sends itself.
-      onItemsAppended: () => {},
+      onItemsAppended: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -1045,6 +1045,37 @@ describe("ActorMesh", () => {
     mesh.sendMessage(worker, "one message", "root");
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
+  });
+
+  it("settles a root-alias append debt when the appender wakes the concrete root", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const rootId = "root-3f1a";
+    const { mesh, logs, tick } = setup({ inboxStore, rootId });
+    const pokes = (): number =>
+      logs.filter((line) => line === `dispatch(${rootId}) is a no-op — no durable work`).length;
+
+    // The legacy alias and concrete id share one debt even though the current
+    // production writers normalize before appending. This only characterizes
+    // the seam's suppression key; the inbox's durable lookup remains concrete.
+    inboxStore.append([{ actorId: "root", source: "mesh:a", payload: payload("mesh.message") }]);
+    mesh.dispatch(rootId);
+    await tick();
+
+    expect(pokes()).toBe(1);
+  });
+
+  it("unsubscribes durable-append scheduling when a mesh is shut down", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const first = setup({ inboxStore });
+    first.mesh.shutdownAll();
+    const second = setup({ inboxStore });
+    const worker = second.mesh.spawn({ charter: "replacement worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    await second.tick();
+
+    expect(second.fake(worker).calls).toHaveLength(1);
+    expect(first.logs).not.toContain(`dispatch(${worker}) refused — no live actor`);
   });
 
   it("re-derives a remote reattach dispatch from the durable inbox (#568)", () => {
@@ -1709,6 +1740,7 @@ describe("ActorMesh", () => {
     expect(
       mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
     ).toBe(true);
+    await Promise.resolve(); // flush the durable-append drain after the join wake
     expect(firstSignal?.aborted).toBe(false);
     expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
     expect(fake(worker).calls).toHaveLength(1);
@@ -7332,7 +7364,7 @@ describe("ActorMesh", () => {
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
-        onItemsAppended: () => {},
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -7422,7 +7454,7 @@ describe("ActorMesh", () => {
         },
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
-        onItemsAppended: () => {},
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -7463,7 +7495,7 @@ describe("ActorMesh", () => {
         markSeen: () => [],
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
-        onItemsAppended: () => {},
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
@@ -8111,6 +8143,7 @@ describe("ActorMesh", () => {
         await t.startRun(watcher);
 
         await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);

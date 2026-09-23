@@ -852,6 +852,7 @@ export class ActorMesh {
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
+  private unsubscribeInboxAppends?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet.
@@ -1017,10 +1018,7 @@ export class ActorMesh {
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
     this.eventManager = opts.eventManager;
     if (opts.inboxStore) {
-      // Deliberately not retained for unsubscription: the mesh has no teardown
-      // boundary today, so this subscription's lifetime is the mesh's own,
-      // which is the process's. Giving the mesh a disposer is its own change.
-      opts.inboxStore.onItemsAppended((items) => {
+      this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
       });
     }
@@ -1427,23 +1425,23 @@ export class ActorMesh {
    * The dispatch that schedules without interrupting. Responsive work still
    * passes the voice hold and is admitted; what it does not do is replace a
    * run already in flight. Private and named so "responsive but not
-   * preempting" cannot leak into a control path — its one caller is event
-   * fan-out, where only an event's effective owner may have its active run
-   * replaced.
+   * preempting" cannot leak into a control path. Its two callers are event
+   * fan-out's non-owner copy and self-caused mid-run ready attention.
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
     const resolved = this.resolveThreadId(dest);
+    const dispatchJoiningActiveRun = this.dispatchJoiningActiveRunPort;
+    if (!dispatchJoiningActiveRun) return false;
     this.appendWakesOwed.delete(resolved);
-    return this.dispatchJoiningActiveRunPort ? this.dispatchJoiningActiveRunPort(resolved) : false;
+    return dispatchJoiningActiveRun(resolved);
   }
 
   /**
    * The seam between a durable inbox write and scheduling (#388).
    *
    * Every row `append` commits leaves its recipient owed one content-free
-   * {@link dispatch}, so no appending path can make work durable and then
-   * leave it unscheduled. The notification is advisory by the store's
-   * contract — losing one costs latency, not correctness, because
+   * {@link dispatch} attempt. The notification is advisory by the store's
+   * contract — a refused or lost attempt costs latency, not correctness, because
    * {@link reconcileInbox} replays the same fact out of `actorsWithUnhandled()`
    * at boot.
    *
@@ -1455,7 +1453,8 @@ export class ActorMesh {
    * wakes clear the debt, which is what stops a second dispatch from
    * cancelling and re-queueing the run the first one just admitted. What is
    * left over is the case this exists for: work that became durable with no
-   * one scheduling it, which now runs instead of waiting for the next boot.
+   * one attempting to schedule it, which now gets that attempt instead of
+   * waiting for the next boot.
    *
    * Deferring to a microtask is what gives the appending turn its chance, and
    * the store's contract asks a listener to stay cheap and hand off rather
@@ -1471,6 +1470,9 @@ export class ActorMesh {
       this.appendWakesOwed.add(actorId);
       owed = true;
     }
+    // The only writer above queues this drain whenever it adds a new debt; a
+    // drain snapshots and clears the whole set, so an already-owed id is safe
+    // to skip here.
     if (!owed) return;
     queueMicrotask(() => {
       const unpaid = [...this.appendWakesOwed];
@@ -4476,6 +4478,9 @@ export class ActorMesh {
    * repository is untouched, so active actors can be rehydrated on the next boot.
    */
   shutdownAll(): void {
+    this.unsubscribeInboxAppends?.();
+    this.unsubscribeInboxAppends = undefined;
+    this.appendWakesOwed.clear();
     this.runs.closeAll();
   }
 
