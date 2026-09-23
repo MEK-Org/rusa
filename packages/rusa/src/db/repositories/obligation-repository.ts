@@ -172,6 +172,19 @@ export const MAX_OBLIGATION_PAGE_LIMIT = 100;
 
 export interface ListObligationsPageOptions extends ObligationPageOptions, ListObligationsOptions {}
 
+export interface GetForestOptions {
+  /**
+   * Leave out every descendant that is terminal, not recurring and carries no
+   * completion history — and that descendant's subtree with it.
+   *
+   * The same exclusion `listPage`'s `excludeQuietTerminalRoots` already makes
+   * for roots, one level down. The tree view hides exactly these nodes and
+   * does not descend past them, so without this the response's bulk is read,
+   * decompressed, parsed and discarded on every load (#506).
+   */
+  excludeQuietTerminalDescendants?: boolean;
+}
+
 export interface ChildObligationPageOptions extends ObligationPageOptions {
   blockingOnly?: boolean;
 }
@@ -254,6 +267,21 @@ const PROJECTED_OBLIGATION = `
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
 `;
+
+/**
+ * The same predicate `listPage`'s `excludeQuietTerminalRoots` clause applies
+ * to roots in SQL, restated over a row already in memory: terminal, not
+ * recurring, and no completion ledger behind it. The two have to agree — the
+ * dashboard applies one to the roots and the other to their descendants
+ * within a single response.
+ */
+function isQuietTerminalRow(row: ObligationRow): boolean {
+  return (
+    isTerminalObligationStatus(row.status as ObligationStatus) &&
+    row.recurrence_policy === null &&
+    row.has_completion_history === 0
+  );
+}
 
 function validatePriority(priority: number): number {
   if (!Number.isFinite(priority)) {
@@ -1906,8 +1934,11 @@ export class ObligationRepository {
    * assembling every tree from one in-memory parent→children index removes
    * both the bound and the bug: each id appears exactly once (primary key),
    * so no id can reach the assembly step twice.
+   *
+   * [options.excludeQuietTerminalDescendants] prunes finished work out of the
+   * assembled trees — see [GetForestOptions].
    */
-  getForest(rootIds: readonly string[]): ObligationTree[] {
+  getForest(rootIds: readonly string[], options: GetForestOptions = {}): ObligationTree[] {
     if (rootIds.length === 0) return [];
     const rows = this.db
       .prepare(`${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}`)
@@ -1940,11 +1971,19 @@ export class ObligationRepository {
         throw new ObligationValidationError(`obligation cycle detected at: ${row.id}`);
       }
       seen.add(row.id);
-      const childRows = childrenByParent.get(row.id) ?? [];
+      const allChildRows = childrenByParent.get(row.id) ?? [];
+      // Dropping a quiet terminal child drops its subtree with it, which is
+      // what the caller asking for this wants: the tree view hides such a node
+      // and everything under it, so anything below one is unreachable there.
+      const childRows = options.excludeQuietTerminalDescendants
+        ? allChildRows.filter((child) => !isQuietTerminalRow(child))
+        : allChildRows;
       const childObligations = childRows.map(toObligation);
       return {
         obligation: toObligation(row),
         children: childRows.map((child) => visit(child, seen)),
+        // Unaffected by the filter above: a blocking status is ready or
+        // waiting, so no row this can return was a candidate for pruning.
         blockingChildren: childObligations.filter((child) =>
           isBlockingObligationStatus(child.status)
         ),

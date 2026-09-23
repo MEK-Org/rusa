@@ -10,6 +10,7 @@ import {
 import {
   OBLIGATION_CHECKPOINT_MAX,
   type Obligation,
+  type ObligationTree,
   ObligationValidationError,
 } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
@@ -2148,6 +2149,173 @@ describe("ObligationRepository", () => {
         "recurring-done",
       ]);
       expect(unfiltered.total).toBe(5);
+    });
+
+    describe("excludeQuietTerminalDescendants (#506)", () => {
+      /**
+       * One live root over every kind of child the tree view distinguishes.
+       *
+       * `historied-done` reaches "terminal but keeps completion history" the
+       * same way the root-level test does: recur, complete once to write a
+       * ledger row, then turn recurrence back off.
+       *
+       * `scheduled-under-quiet-done` is the only way a non-terminal row can
+       * sit under a quiet terminal one. The store refuses to add a child to a
+       * terminal obligation, and refuses to complete one that still has a
+       * ready or waiting child — but `scheduled` is neither, so a recurring
+       * child that has just completed does not hold its parent open.
+       */
+      function buildMixedTree(): void {
+        repository.create({ id: "live-root", title: "live-root", ownerId: "actor-a" });
+        repository.create({
+          id: "live-child",
+          title: "live-child",
+          parentId: "live-root",
+          ownerId: "actor-a",
+        });
+
+        repository.create({
+          id: "quiet-done",
+          title: "quiet-done",
+          parentId: "live-root",
+          ownerId: "actor-a",
+        });
+        repository.create({
+          id: "scheduled-under-quiet-done",
+          title: "scheduled-under-quiet-done",
+          parentId: "quiet-done",
+          ownerId: "actor-a",
+        });
+        repository.setRecurrence(
+          "scheduled-under-quiet-done",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        repository.setTerminalStatus(
+          "scheduled-under-quiet-done",
+          "done",
+          null,
+          null,
+          "system:mesh"
+        );
+        repository.setTerminalStatus("quiet-done", "done", null, null, "system:mesh");
+
+        repository.create({
+          id: "quiet-cancelled",
+          title: "quiet-cancelled",
+          parentId: "live-root",
+          ownerId: "actor-a",
+        });
+        repository.setTerminalStatus("quiet-cancelled", "cancelled", null, null, "system:mesh");
+
+        repository.create({
+          id: "recurring-done",
+          title: "recurring-done",
+          parentId: "live-root",
+          ownerId: "actor-a",
+        });
+        repository.setRecurrence(
+          "recurring-done",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("recurring-done", "done", null, null, "system:mesh");
+
+        repository.create({
+          id: "historied-done",
+          title: "historied-done",
+          parentId: "live-root",
+          ownerId: "actor-a",
+        });
+        repository.setRecurrence(
+          "historied-done",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("historied-done", "done", null, null, "system:mesh");
+        repository.activateScheduled("historied-done", "system:mesh");
+        repository.setRecurrence("historied-done", null, "system:mesh");
+        repository.setTerminalStatus("historied-done", "done", null, null, "system:mesh");
+      }
+
+      function idsUnder(tree: ObligationTree): string[] {
+        const ids: string[] = [];
+        const walk = (node: ObligationTree): void => {
+          ids.push(node.obligation.id);
+          for (const child of node.children) walk(child);
+        };
+        for (const child of tree.children) walk(child);
+        return ids.sort();
+      }
+
+      it("drops quiet terminal descendants and keeps live, recurring and historied ones", () => {
+        buildMixedTree();
+
+        const [pruned] = repository.getForest(["live-root"], {
+          excludeQuietTerminalDescendants: true,
+        });
+        expect(pruned.children.map((c) => c.obligation.id).sort()).toEqual([
+          "historied-done",
+          "live-child",
+          "recurring-done",
+        ]);
+      });
+
+      it("drops a quiet terminal descendant's whole subtree with it", () => {
+        buildMixedTree();
+
+        const [pruned] = repository.getForest(["live-root"], {
+          excludeQuietTerminalDescendants: true,
+        });
+        // `scheduled-under-quiet-done` is not terminal, but it is only
+        // reachable through a node the tree view hides and does not descend
+        // past, so the view never renders it either way.
+        expect(idsUnder(pruned)).toEqual(["historied-done", "live-child", "recurring-done"]);
+      });
+
+      it("keeps every descendant when the option is off, which is the default", () => {
+        buildMixedTree();
+
+        const expected = [
+          "historied-done",
+          "live-child",
+          "quiet-cancelled",
+          "quiet-done",
+          "recurring-done",
+          "scheduled-under-quiet-done",
+        ];
+        expect(idsUnder(repository.getForest(["live-root"])[0])).toEqual(expected);
+        expect(
+          idsUnder(
+            repository.getForest(["live-root"], { excludeQuietTerminalDescendants: false })[0]
+          )
+        ).toEqual(expected);
+        expect(idsUnder(repository.getTree("live-root"))).toEqual(expected);
+      });
+
+      it("leaves blockingChildren identical either way", () => {
+        buildMixedTree();
+
+        const [pruned] = repository.getForest(["live-root"], {
+          excludeQuietTerminalDescendants: true,
+        });
+        const [full] = repository.getForest(["live-root"]);
+        // A blocking status is ready or waiting, so pruning terminal rows
+        // cannot reach this set.
+        expect(pruned.blockingChildren.map((c) => c.id)).toEqual(["live-child"]);
+        expect(pruned.blockingChildren.map((c) => c.id)).toEqual(
+          full.blockingChildren.map((c) => c.id)
+        );
+      });
+
+      it("still reads the forest in one statement", () => {
+        buildMixedTree();
+
+        const prepareSpy = vi.spyOn(db, "prepare");
+        repository.getForest(["live-root"], { excludeQuietTerminalDescendants: true });
+        expect(prepareSpy.mock.calls.length).toBe(1);
+        prepareSpy.mockRestore();
+      });
     });
   });
 
