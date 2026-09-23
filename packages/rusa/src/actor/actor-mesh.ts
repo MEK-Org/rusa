@@ -4192,7 +4192,10 @@ export class ActorMesh {
     const newModelConfig = record.desiredModelConfig;
     const boundClass = record.desiredModelClass;
 
-    this.actors.patch(id, {
+    // The one deliberate model-configuration write: it restates the row's
+    // model-config document, which an ordinary `patch` deliberately does not
+    // (#626).
+    this.actors.setModelSelection(id, {
       modelConfig: newModelConfig,
       modelClass: boundClass,
       desiredModelConfig: undefined,

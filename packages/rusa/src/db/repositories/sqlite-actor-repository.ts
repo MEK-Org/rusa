@@ -7,7 +7,7 @@ import {
   type ModelClassStore,
   type ProviderModelConfig,
 } from "../../providers/model-config.js";
-import type { ActorRepository } from "../../repositories/actor-repository.js";
+import type { ActorRepository, ModelSelectionChange } from "../../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../../voice/voice-config.js";
 import { ModelClassRepository } from "./model-class-repository.js";
@@ -178,9 +178,13 @@ function parseDocument<T>(
  * A class-bound record persists its reference and nothing else, so there is no
  * second copy of the class definition to go stale — and no resolved pool to
  * write back, which matters because reads hand callers a pool resolved from the
- * class row and an ordinary `patch` would otherwise persist it (#626). This is
- * also the only path that turns an existing v3 row into v4: a row converts when
- * something writes it, never in a sweep.
+ * class row and an ordinary `patch` would otherwise persist it (#626).
+ *
+ * Only an explicit model-configuration change reaches this function for a row
+ * that already holds a class-bearing document; see
+ * {@link keepStoredModelConfig}. A row converts from v3 to v4 when its model
+ * configuration is deliberately changed, never incidentally and never in a
+ * sweep.
  */
 function buildModelConfig(record: ActorRecord): string | null {
   if (record.modelClass !== undefined) {
@@ -196,6 +200,35 @@ function buildModelConfig(record: ActorRecord): string | null {
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
   return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
+}
+
+/**
+ * The stored `model_config` text to keep verbatim on an incidental write, or
+ * undefined when the write must restate the document.
+ *
+ * An incidental write — a session id, a title, a parent change — carries a
+ * record whose `modelConfig` is a *read-time projection* of the class row, so
+ * restating the document on such a write would both discard the row's existing
+ * encoding and convert v3 rows to v4 as a side effect of unrelated traffic
+ * (#626). Keeping the stored text is what confines the v4 cut to deliberate
+ * model-configuration changes, which matters for rollback: an older binary
+ * cannot read a v4 document, so a row must not acquire one by accident.
+ *
+ * Kept only when the stored document binds exactly the class the record still
+ * names, so a genuine rebind — or a move to an explicit pool — still falls
+ * through and is written in the current shape.
+ */
+function keepStoredModelConfig(record: ActorRecord, stored: string | null): string | undefined {
+  if (stored === null || record.modelClass === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const storedClass = (parsed as { modelClass?: unknown }).modelClass;
+  return storedClass === record.modelClass ? stored : undefined;
 }
 
 /**
@@ -415,7 +448,17 @@ export class SqliteActorRepository implements ActorRepository {
     this.write(record);
   }
 
-  private write(record: ActorRecord): void {
+  /**
+   * The one write allowed to restate an existing row's model-config document,
+   * per the {@link ActorRepository} contract. Everything else preserves the
+   * stored encoding.
+   */
+  setModelSelection(id: string, changes: ModelSelectionChange): void {
+    const record = this.get(id);
+    if (record) this.write({ ...record, ...changes, id }, { restateModelConfig: true });
+  }
+
+  private write(record: ActorRecord, opts?: { restateModelConfig?: boolean }): void {
     const isRoot = record.isRoot === true;
     if (record.parentId === null && !isRoot) {
       throw new Error(
@@ -430,14 +473,18 @@ export class SqliteActorRepository implements ActorRepository {
     }
 
     this.db.transaction(() => {
+      // One read of the prior row serves both the retirement timestamp and the
+      // stored model-config document an incidental write must preserve.
+      const prior = this.db
+        .prepare("SELECT retired_at, model_config FROM actors WHERE id = ?")
+        .get(record.id) as { retired_at: string | null; model_config: string | null } | undefined;
       const retiredAt =
-        record.status === "active"
-          ? null
-          : ((
-              this.db.prepare("SELECT retired_at FROM actors WHERE id = ?").get(record.id) as
-                | { retired_at: string | null }
-                | undefined
-            )?.retired_at ?? new Date().toISOString());
+        record.status === "active" ? null : (prior?.retired_at ?? new Date().toISOString());
+      const modelConfigJson =
+        opts?.restateModelConfig === true
+          ? buildModelConfig(record)
+          : (keepStoredModelConfig(record, prior?.model_config ?? null) ??
+            buildModelConfig(record));
 
       this.db
         .prepare(`INSERT INTO actors (
@@ -451,7 +498,7 @@ export class SqliteActorRepository implements ActorRepository {
           record.id,
           record.charter,
           record.parentId,
-          buildModelConfig(record),
+          modelConfigJson,
           buildContextConfig(record),
           buildVoiceConfig(record),
           record.title ?? null,

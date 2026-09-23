@@ -38,6 +38,13 @@ describe("SqliteActorRepository", () => {
     repository = new SqliteActorRepository(db);
   });
 
+  const storedModelConfig = (id: string): string =>
+    (
+      db.prepare("SELECT model_config FROM actors WHERE id = ?").get(id) as {
+        model_config: string;
+      }
+    ).model_config;
+
   it("round-trips fields through versioned config documents and normalized handles", () => {
     repository.upsert(root);
     const worker: ActorRecord = {
@@ -174,8 +181,37 @@ describe("SqliteActorRepository", () => {
     ).toEqual(["root", "worker"]);
   });
 
-  it("ignores the duplicated pool on an existing v3 row and drops it on the next write", () => {
+  it("ignores the duplicated pool on an existing v3 row without converting it", () => {
     classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    repository.upsert(root);
+    const v3 = JSON.stringify({
+      schemaVersion: 3,
+      entries: [{ provider: "codex", model: "gpt-stale", effort: "high" }],
+      modelClass: "fast",
+    });
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(v3);
+
+    // Read-through wins over the stale copy without any boot sweep.
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-swift" },
+    ]);
+
+    // An incidental write touches unrelated columns and must leave the stored
+    // document exactly as it found it, so a row never acquires a v4 encoding
+    // an older binary cannot read as a side effect of ordinary traffic (#626).
+    repository.patch("root", { title: "Renamed" });
+    repository.patch("root", { sessionId: "session-1" });
+    repository.patch("root", { charter: "Rewritten charter" });
+    expect(storedModelConfig("root")).toBe(v3);
+    expect(repository.get("root")?.title).toBe("Renamed");
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-swift" },
+    ]);
+  });
+
+  it("converts a v3 row to a v4 reference only on an explicit model-configuration change", () => {
+    classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    classes.upsert("slow", [{ provider: "codex", model: "gpt-deep", effort: "high" }], NOW);
     repository.upsert(root);
     db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(
       JSON.stringify({
@@ -185,21 +221,32 @@ describe("SqliteActorRepository", () => {
       })
     );
 
-    // Read-through wins over the stale copy without any boot sweep.
+    // Re-selecting the same class is still a deliberate selection, so it
+    // restates the document in the current shape.
+    repository.setModelSelection("root", { modelClass: "fast" });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({ schemaVersion: 4, modelClass: "fast" });
+
+    // A rebind onto a different class writes the new reference.
+    repository.setModelSelection("root", { modelClass: "slow" });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({ schemaVersion: 4, modelClass: "slow" });
     expect(repository.get("root")?.modelConfig).toEqual([
-      { provider: "claude", model: "claude-swift" },
+      { provider: "codex", model: "gpt-deep", effort: "high" },
     ]);
 
-    repository.patch("root", { title: "Renamed" });
-    expect(
-      JSON.parse(
-        (
-          db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
-            model_config: string;
-          }
-        ).model_config
-      )
-    ).toEqual({ schemaVersion: 4, modelClass: "fast" });
+    // Replacing the binding with an explicit pool drops the reference entirely.
+    repository.setModelSelection("root", {
+      modelClass: undefined,
+      modelConfig: [{ provider: "claude", model: "claude-pinned" }],
+    });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({
+      schemaVersion: 2,
+      entries: [{ provider: "claude", model: "claude-pinned" }],
+    });
+    // A later class edit no longer reaches the actor.
+    classes.upsert("slow", [{ provider: "codex", model: "gpt-deeper" }], NOW);
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-pinned" },
+    ]);
   });
 
   it("rejects a malformed v4 class reference at the consumption boundary", () => {

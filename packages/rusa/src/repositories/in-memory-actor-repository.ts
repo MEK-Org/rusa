@@ -1,5 +1,5 @@
 import type { ActorRecord } from "../actor/actor-record.js";
-import type { ActorRepository } from "./actor-repository.js";
+import type { ActorRepository, ModelSelectionChange } from "./actor-repository.js";
 
 /** Lightweight repository adapter for isolated tests and embedders without SQLite. */
 export class InMemoryActorRepository implements ActorRepository {
@@ -25,5 +25,13 @@ export class InMemoryActorRepository implements ActorRepository {
   patch(id: string, changes: Partial<Omit<ActorRecord, "id">>): void {
     const existing = this.records.get(id);
     if (existing) this.upsert({ ...existing, ...changes, id });
+  }
+
+  /**
+   * Records here are held as objects, not as a persisted document, so there is
+   * no stored encoding for an explicit model-configuration change to restate.
+   */
+  setModelSelection(id: string, changes: ModelSelectionChange): void {
+    this.patch(id, changes);
   }
 }
