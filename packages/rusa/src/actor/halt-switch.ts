@@ -225,7 +225,16 @@ export function findUnpooledHaltModels(
   for (const model of models) {
     const normalized = normalizeModel(model);
     if (known.has(normalized)) continue;
-    const nearest = [...new Set(pooled)]
+    // Pool entries retain their configured spelling, but matching is
+    // case-insensitive. Keep one stable spelling per semantic model so a
+    // suggestion cannot spend both of its slots on casing variants.
+    const distinct = new Map<string, string>();
+    for (const entry of pooled) {
+      const key = normalizeModel(entry);
+      const existing = distinct.get(key);
+      if (existing === undefined || entry.localeCompare(existing) < 0) distinct.set(key, entry);
+    }
+    const nearest = [...distinct.values()]
       .map((entry) => ({ entry, distance: editDistance(normalized, normalizeModel(entry)) }))
       .sort((a, b) => a.distance - b.distance || a.entry.localeCompare(b.entry))
       .slice(0, NEAREST_POOL_ENTRIES)

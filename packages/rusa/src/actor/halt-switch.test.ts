@@ -163,6 +163,15 @@ describe("findUnpooledHaltModels", () => {
     ]);
   });
 
+  it("offers distinct nearest models when pools differ only in casing", () => {
+    expect(
+      findUnpooledHaltModels(
+        ["claude-sonnet-5-hihg"],
+        ["claude-sonnet-5", "Claude-Sonnet-5", "claude-opus-5"]
+      )
+    ).toEqual([{ model: "claude-sonnet-5-hihg", nearest: ["claude-sonnet-5", "claude-opus-5"] }]);
+  });
+
   it("says nothing when the provider has no pool at all", () => {
     // A provider no live actor is using cannot distinguish a typo from a model
     // the mesh has simply not been told about; warning on every name there
