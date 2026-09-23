@@ -254,7 +254,12 @@ function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
   return undefined;
 }
 
-function getResourceShape(reference: ReturnType<typeof parseReference>): string | undefined {
+/**
+ * Classify a canonical reference using the same entity vocabulary as the cache.
+ * Callers that route a reference before loading it use this to stay aligned
+ * with the cache and resolver's accepted resource shapes.
+ */
+export function getResourceShape(reference: ReturnType<typeof parseReference>): string | undefined {
   if (reference.scheme === "github") {
     const issue = asGitHubIssue(reference);
     if (issue) {

@@ -168,6 +168,7 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
+import { getResourceShape } from "../references/cache-service.js";
 import { parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
@@ -527,21 +528,27 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 
 /**
  * The `gchat:spaces/S/messages/M` reference a Google Chat inbox entry is
- * about, or undefined when its payload names no well-formed message.
+ * about, or undefined when its payload names no message in its source space.
  *
  * A chat event's `source` is the containing space (routing granularity), so
  * resolving that would show the wrong entity; the message itself is the
  * payload's `messageName`, which is Google's resource name and so already
  * the reference path.
  */
-function gchatInboxMessageReference(payload: InboxPayload): string | undefined {
+function gchatInboxMessageReference(source: string, payload: InboxPayload): string | undefined {
   if (payload.type !== "gchat.message" || typeof payload.messageName !== "string") {
     return undefined;
   }
   try {
     const reference = parseReference(`gchat:${payload.messageName}`);
-    const [spaces, , messages] = reference.segments;
-    return reference.segments.length === 4 && spaces === "spaces" && messages === "messages"
+    const sourceReference = parseReference(source);
+    // Reuse the cache's shape contract rather than maintaining another notion
+    // of a Chat message here. The source must be the message's containing
+    // space: an inbox payload cannot use this rendering path to name a message
+    // in a different space.
+    return getResourceShape(reference) === "gchat_message" &&
+      getResourceShape(sourceReference) === "gchat_space" &&
+      reference.segments[1] === sourceReference.segments[1]
       ? reference.key
       : undefined;
   } catch {
@@ -610,7 +617,7 @@ async function resolveInboxPage(
         ]);
         return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
       }
-      const chatMessage = gchatInboxMessageReference(entry.payload);
+      const chatMessage = gchatInboxMessageReference(entry.source, entry.payload);
       if (chatMessage) return { ...entry, reference: await resolve(chatMessage) };
       return entry;
     })

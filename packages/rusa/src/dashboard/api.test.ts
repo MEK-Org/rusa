@@ -2221,26 +2221,7 @@ describe("handleMeshApiRequest", () => {
     expect(entry.eventReference).toBeUndefined();
   });
 
-  it("GET /api/mesh/inbox names the Google Chat message, never the space, when it cannot resolve it", async () => {
-    // No referenceCache/chatClient is wired in this suite's deps: the entry
-    // still points at its own message, reported unavailable.
-    inbox.append([
-      {
-        id: "gchat-inbox-entry",
-        actorId: UUID_A,
-        source: "gchat:spaces/AAAA123",
-        payload: { type: "gchat.message", messageName: "spaces/AAAA123/messages/BBBB" },
-      },
-    ]);
-
-    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
-    const entry = JSON.parse(res.body).entries[0];
-    expect(entry.reference).toMatchObject({ ref: "gchat:spaces/AAAA123/messages/BBBB" });
-    expect(entry.reference.unavailable).toBeTruthy();
-    expect(entry.reference.entity).toBeUndefined();
-  });
-
-  it("GET /api/mesh/inbox leaves a Google Chat entry without a well-formed message name unresolved", async () => {
+  it("GET /api/mesh/inbox leaves a malformed or cross-space Google Chat entry unresolved", async () => {
     inbox.append([
       {
         id: "gchat-no-message",
@@ -2254,11 +2235,19 @@ describe("handleMeshApiRequest", () => {
         source: "gchat:spaces/AAAA123",
         payload: { type: "gchat.message", messageName: "spaces/AAAA123" },
       },
+      {
+        // A payload must not make this entry fetch a message from another
+        // space, even if the message path itself is valid.
+        id: "gchat-wrong-space",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message", messageName: "spaces/BBBB456/messages/CCCC" },
+      },
     ]);
 
     const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     const entries = JSON.parse(res.body).entries as Array<{ reference?: unknown }>;
-    expect(entries).toHaveLength(2);
+    expect(entries).toHaveLength(3);
     for (const entry of entries) expect(entry.reference).toBeUndefined();
   });
 
