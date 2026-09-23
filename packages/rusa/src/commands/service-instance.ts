@@ -209,11 +209,17 @@ function splitEnvironmentAssignments(raw: string): string[] {
   return out;
 }
 
-/** The last `PATH=` among these assignments — last-wins, as systemd resolves it. */
-function lastPathAssignment(assignments: readonly string[]): string | null {
+/**
+ * The last `NAME=` among these assignments — last-wins, as systemd resolves it.
+ *
+ * The prefix is matched whole, so `RUSA_SLACK_BOT_TOKEN_PATH` can never be
+ * mistaken for `PATH`.
+ */
+function lastAssignment(assignments: readonly string[], name: string): string | null {
+  const prefix = `${name}=`;
   let found: string | null = null;
   for (const assignment of assignments) {
-    if (assignment.startsWith("PATH=")) found = assignment.slice("PATH=".length);
+    if (assignment.startsWith(prefix)) found = assignment.slice(prefix.length);
   }
   return found ? found : null;
 }
@@ -238,7 +244,7 @@ export function readSystemdUnitPathEnv(unitName: string): string | null {
       ["--user", "show", "-p", "Environment", "--value", unitName],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }
     );
-    return lastPathAssignment(splitEnvironmentAssignments(raw));
+    return lastAssignment(splitEnvironmentAssignments(raw), "PATH");
   } catch {
     return null;
   }
@@ -255,12 +261,31 @@ export function readSystemdUnitPathEnv(unitName: string): string | null {
  * written before this directive existed inherits systemd's `/usr/bin:/bin`.
  */
 export function readUnitPathEnv(unitContents: string): string | null {
+  return readUnitEnvironment(unitContents, "PATH");
+}
+
+/**
+ * Read one `Environment=` assignment out of a unit file.
+ *
+ * Generalized over the variable name because an installed unit is the durable
+ * record of more than its `PATH`: the pool coordinator installer reads
+ * `RUSA_HOME` back out of a coordinator unit it is about to replace, so a
+ * transition adopts the home the running service actually uses rather than one
+ * inferred from the unit's name.
+ *
+ * Splitting each `Environment=` line into assignments rather than matching the
+ * rest of the line is what makes `Environment=PATH=/usr/bin FOO=bar` and its
+ * mirror both read correctly, and it is why the name is matched as a whole
+ * assignment prefix: `RUSA_SLACK_BOT_TOKEN_PATH` is not `PATH`.
+ */
+export function readUnitEnvironment(unitContents: string, name: string): string | null {
   let found: string | null = null;
   for (const line of unitContents.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("Environment=")) continue;
-    const fromLine = lastPathAssignment(
-      splitEnvironmentAssignments(trimmed.slice("Environment=".length))
+    const fromLine = lastAssignment(
+      splitEnvironmentAssignments(trimmed.slice("Environment=".length)),
+      name
     );
     if (fromLine) found = fromLine;
   }

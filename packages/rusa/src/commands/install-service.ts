@@ -4,7 +4,9 @@ import {
   existsSync,
   constants as fsConstants,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
@@ -23,6 +25,16 @@ import {
 import { resolveErrorSink } from "../observability/error-sink.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
+  COORDINATOR_HOME_ENV,
+  type CoordinatorServiceContext,
+  POOL_COORDINATOR_UNIT,
+  planCoordinatorTransition,
+  poolClientUnitNames,
+  readInstalledCoordinatorUnits,
+  resolveCoordinatorServiceContext,
+  resolvePoolProbePath,
+} from "./coordinator-provisioning.js";
+import {
   defaultQuotaBackupDir,
   defaultQuotaCoordinatorSocketPath,
   resolveCoordinatorDatabasePaths,
@@ -31,11 +43,11 @@ import {
   type DeploymentMode,
   type ExecutableSource,
   type ProbePathEnv,
+  readUnitEnvironment,
   resolveExecutableOnPath,
   resolveExecutableSource,
   resolvePathEnvForUnit,
   resolvePathForUnit,
-  resolveProbePathEnv,
   resolveRepoRoot,
   resolveServiceDashboardUrl,
   resolveServiceInstance,
@@ -59,6 +71,23 @@ function runInDirOrThrow(cwd: string, cmd: string, args: string[]): string {
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
   }).trim();
+}
+
+/**
+ * Run a command whose failure is an expected outcome rather than an error.
+ *
+ * `systemctl stop`/`disable` on a unit that is already stopped or was never
+ * enabled exits non-zero, and the transition off the environment-derived
+ * coordinator units has to be idempotent: the second run finds nothing to stop
+ * and must still succeed.
+ */
+function runQuietly(cmd: string, args: string[]): boolean {
+  try {
+    execFileSync(cmd, args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function hasCommand(command: string): boolean {
@@ -222,17 +251,6 @@ export function buildAlertUnit(opts: {
   return unit.join("\n");
 }
 
-/** The coordinator's own unit and its `OnFailure=` companion, per instance. */
-export function quotaCoordinatorUnitNames(serviceBasename: string): {
-  serviceUnit: string;
-  alertUnit: string;
-} {
-  return {
-    serviceUnit: `${serviceBasename}-quota-coordinator.service`,
-    alertUnit: `${serviceBasename}-quota-coordinator-alert.service`,
-  };
-}
-
 /**
  * The quota coordinator unit.
  *
@@ -327,9 +345,7 @@ export function buildQuotaCoordinatorUnit(opts: {
  */
 export function withCoordinatorOrdering(unitContents: string, coordinatorUnit: string): string {
   const lines = unitContents.split("\n");
-  const has = (directive: string) =>
-    lines.some((line) => line.trim() === `${directive}=${coordinatorUnit}`);
-  const missing = (["After", "Wants"] as const).filter((directive) => !has(directive));
+  const missing = orderingDirectivesMissing(lines, coordinatorUnit);
   if (missing.length === 0) return unitContents;
 
   // Insert at the end of the [Unit] section: after its last directive, before
@@ -348,6 +364,40 @@ export function withCoordinatorOrdering(unitContents: string, coordinatorUnit: s
   }
   lines.splice(insertAt, 0, ...missing.map((directive) => `${directive}=${coordinatorUnit}`));
   return lines.join("\n");
+}
+
+function orderingDirectivesMissing(
+  lines: readonly string[],
+  coordinatorUnit: string
+): ("After" | "Wants")[] {
+  const has = (directive: string) =>
+    lines.some((line) => line.trim() === `${directive}=${coordinatorUnit}`);
+  return (["After", "Wants"] as const).filter((directive) => !has(directive));
+}
+
+/**
+ * The pool coordinator an instance unit should order after, or undefined when
+ * none is installed.
+ *
+ * One unit for every client of the pool, whatever environment the client is:
+ * the ordering is a statement about the shared service, not about a companion
+ * this instance owns. Only once that unit is actually on disk, because an
+ * ordering dependency on a unit systemd does not know about is a warning on
+ * every start of an instance that has no coordinator to wait for.
+ */
+export function coordinatorUnitForClient(systemdUserDir: string): string | undefined {
+  return existsSync(join(systemdUserDir, POOL_COORDINATOR_UNIT))
+    ? POOL_COORDINATOR_UNIT
+    : undefined;
+}
+
+/**
+ * Whether an instance unit already declares both ordering directives on the
+ * coordinator. The read half of {@link withCoordinatorOrdering}, used where the
+ * answer is reported to an operator rather than acted on.
+ */
+export function unitOrdersAfter(unitContents: string, coordinatorUnit: string): boolean {
+  return orderingDirectivesMissing(unitContents.split("\n"), coordinatorUnit).length === 0;
 }
 
 function installUnit(systemdUserDir: string, serviceUnit: string, contents: string): void {
@@ -565,14 +615,7 @@ function installSingleRusaService(opts: {
       restart: "always",
       startLimit: { intervalSec: 300, burst: 5 },
       onFailureUnit: alertUnitName,
-      // Only once the coordinator unit is actually on disk: an ordering
-      // dependency on a unit systemd does not know about is a warning on every
-      // start of an instance that has no coordinator to wait for.
-      coordinatorUnit: existsSync(
-        join(opts.systemdUserDir, quotaCoordinatorUnitNames(instance.serviceBasename).serviceUnit)
-      )
-        ? quotaCoordinatorUnitNames(instance.serviceBasename).serviceUnit
-        : undefined,
+      coordinatorUnit: coordinatorUnitForClient(opts.systemdUserDir),
       execStartPre,
       logToJournal: opts.logToJournal,
     })
@@ -733,11 +776,10 @@ export function configuredProviderCommands(config: RusaConfig): string[] {
  * passed while the service it was vouching for could not find `codex`.
  */
 function preflightProbeEnvironment(
-  mcHome: string,
+  workersDir: string,
   probePath: ProbePathEnv,
   providerCommands: readonly string[]
 ): { workersDir: string; missingProviderCommands: string[] } {
-  const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
   try {
     accessSync(workersDir, fsConstants.W_OK);
@@ -803,22 +845,59 @@ export function describeProbePathSource(
 }
 
 /**
- * Install the quota coordinator unit and its failure-alert companion.
+ * The same account for the pool coordinator, which has no single instance unit.
+ *
+ * It borrows from whichever client unit can supply a `PATH`, so the line has to
+ * name the donor rather than a unit fixed in advance. The two shell fallbacks
+ * are kept apart for the same reason as above: a client that is installed but
+ * assigns no `PATH` is the case that reproduces #525 and the one an operator can
+ * act on, while no client at all is expected on a host that provisions the
+ * coordinator first.
+ */
+export function describePoolProbePathSource(
+  probePath: ProbePathEnv,
+  donorUnit: string | null,
+  installedClientUnits: readonly string[]
+): string {
+  if (donorUnit !== null) return describeProbePathSource(probePath, donorUnit, true);
+  if (installedClientUnits.length > 0) {
+    return (
+      `from this shell — none of ${installedClientUnits.join(", ")} assigns a PATH of its own; ` +
+      "reinstall a client instance to give it one"
+    );
+  }
+  return `from this shell (no pool client unit installed yet: ${poolClientUnitNames().join(", ")})`;
+}
+
+/**
+ * Install the pool-owned quota coordinator unit and its failure-alert companion.
  *
  * Separate from `install-service` rather than folded into it: the coordinator is
  * one service per *pool*, and the pool is the set of instances sharing a quota
  * database — installing it implicitly alongside every instance would start a
  * second collector against the same providers, which is precisely the
  * duplicate-probe behaviour the coordinator exists to remove.
+ *
+ * It is also no longer installed *for* an instance. Under #507 the unit name is
+ * fixed, the home is named explicitly (or adopted from the unit already on
+ * disk), and nothing here edits an instance unit: provisioning the service and
+ * connecting a client to it are separate acts, and the installer says so rather
+ * than reaching into a unit `install-service` owns.
  */
 export async function runInstallQuotaCoordinator(opts?: {
-  environment?: ServiceEnvironment;
+  /** The coordinator's own home. Falls back to the env var, then to adoption. */
+  home?: string;
   deploymentMode?: DeploymentMode;
   repoPath?: string;
   /** Start/restart the unit after installing. Default true. */
   restart?: boolean;
+  /**
+   * Allow this install to point the pool coordinator at a different database
+   * than the installed unit opens. Off by default: that is the pool's
+   * authoritative quota history changing identity.
+   */
+  allowDatabaseChange?: boolean;
 }): Promise<void> {
-  const environment = opts?.environment ?? "production";
   const deploymentMode = opts?.deploymentMode ?? "package";
 
   if (!hasCommand("systemctl")) {
@@ -829,41 +908,55 @@ export async function runInstallQuotaCoordinator(opts?: {
   ensureDbusUserSessionPackage();
   ensureUserSystemdBusAvailable();
 
-  const homeOverride =
-    environment === "production" ? resolveHome() : (process.env.RUSA_HOME ?? undefined);
-  const instance = resolveServiceInstance(environment, homeOverride);
-  const configPath = join(instance.mcHome, "config.yaml");
-  if (!existsSync(configPath)) {
-    throw new Error(`Config file not found at ${configPath}. Run 'rusa init' first.`);
+  const systemdUserDir = join(homedir(), ".config", "systemd", "user");
+  mkdirSync(systemdUserDir, { recursive: true });
+  const installedUnitNames = readdirSync(systemdUserDir).filter((name) =>
+    name.endsWith(".service")
+  );
+
+  const context = resolveCoordinatorServiceContext({
+    home: opts?.home,
+    envHome: process.env[COORDINATOR_HOME_ENV],
+    installedUnits: readInstalledCoordinatorUnits(systemdUserDir, installedUnitNames),
+  });
+  if (!existsSync(context.configPath)) {
+    throw new Error(
+      `Config file not found at ${context.configPath}. The pool coordinator reads its ` +
+        "own service home; run 'rusa init' against that home, or pass --home <path>."
+    );
   }
-  const config = loadConfig(instance.mcHome);
+  const config = loadConfig(context.home);
 
   // The unit runs `quota-coordinator` with no `--database`, so the preflight
   // applies the same rule the service will: only the service-owned path
   // starts, and a config still naming the pre-service file is refused here
   // rather than by a unit that fails on its first start.
-  const { databasePath } = resolveCoordinatorDatabasePaths(config, instance.mcHome);
+  const { databasePath } = resolveCoordinatorDatabasePaths(config, context.home);
+  assertDatabaseIdentityPreserved({
+    systemdUserDir,
+    serviceUnit: context.serviceUnit,
+    home: context.home,
+    databasePath,
+    allowDatabaseChange: opts?.allowDatabaseChange === true,
+  });
 
-  const systemdUserDir = join(homedir(), ".config", "systemd", "user");
-  mkdirSync(systemdUserDir, { recursive: true });
-  const names = quotaCoordinatorUnitNames(instance.serviceBasename);
-
-  // The instance unit is the durable source of the provider-capable PATH: it is
-  // on disk, it is the environment the instance already launches provider CLIs
-  // in, and unlike `process.env.PATH` it does not change with whichever shell
-  // ran this installer. That shell dependence is #525 — an install from a
-  // minimal environment wrote a unit with no `codex` on its PATH, and the
-  // coordinator then started, answered `healthz`, and never scraped.
-  const instanceUnitPath = join(systemdUserDir, instance.serviceUnit);
-  const instanceUnitContents = existsSync(instanceUnitPath)
-    ? readFileSync(instanceUnitPath, "utf-8")
-    : null;
-  const probePath = resolveProbePathEnv(instance.serviceUnit, instanceUnitContents);
+  // #525: the provider-capable PATH is borrowed from an installed client unit,
+  // which is where it is already written down, rather than inherited from
+  // whichever shell ran this installer. That shell dependence is the bug — an
+  // install from a minimal environment wrote a unit with no `codex` on its
+  // PATH, and the coordinator then started, answered `healthz`, and never
+  // scraped. Nothing else about the coordinator is taken from that unit, and
+  // the borrow is reported below.
+  const {
+    probePath,
+    donorUnit,
+    installedUnits: installedClientUnits,
+  } = resolvePoolProbePath(systemdUserDir, poolClientUnitNames());
   const userPath = probePath.path;
 
   const providerCommands = configuredProviderCommands(config);
   const { workersDir, missingProviderCommands } = preflightProbeEnvironment(
-    instance.mcHome,
+    context.workersDir,
     probePath,
     providerCommands
   );
@@ -875,67 +968,54 @@ export async function runInstallQuotaCoordinator(opts?: {
 
   installUnit(
     systemdUserDir,
-    names.alertUnit,
+    context.alertUnit,
     buildAlertUnit({
-      description: `Rusa quota coordinator failure alert (${instance.serviceBasename})`,
+      description: "Rusa quota coordinator failure alert",
       nodePath,
       notifyScript: join(
         dirname(dirname(executableSource.cliPath)),
         "scripts",
         "notify-failure.mjs"
       ),
-      mcHome: instance.mcHome,
+      mcHome: context.home,
       errorSink: resolveErrorSink(config)?.ref,
       gchatConfigDir: config.chat?.gchatConfigDir,
       slackBotTokenPath: config.slack?.botTokenPath,
-      message: `${names.serviceUnit} entered a failed state`,
+      message: `${context.serviceUnit} entered a failed state`,
     })
   );
 
   installUnit(
     systemdUserDir,
-    names.serviceUnit,
+    context.serviceUnit,
     buildQuotaCoordinatorUnit({
-      description:
-        environment === "production"
-          ? "Rusa Quota Coordinator"
-          : "Rusa Quota Coordinator (Staging)",
-      mcHome: instance.mcHome,
+      description: "Rusa Quota Coordinator",
+      mcHome: context.home,
       cliPath,
       nodePath,
       userPath,
       xdgRuntimeDir,
-      onFailureUnit: names.alertUnit,
+      onFailureUnit: context.alertUnit,
       startLimit: { intervalSec: 300, burst: 5 },
     })
   );
 
-  // An instance installed before its coordinator acquires the ordering here,
-  // through the same daemon-reload below. The instance is not restarted for
-  // it: ordering is a start-time property and applies on its next start.
-  if (instanceUnitContents !== null) {
-    const ordered = withCoordinatorOrdering(instanceUnitContents, names.serviceUnit);
-    if (ordered !== instanceUnitContents) {
-      writeFileSync(instanceUnitPath, ordered, "utf-8");
-      console.log(
-        `✓ Added After=/Wants=${names.serviceUnit} to ${instanceUnitPath} (applies on its next start)`
-      );
-    } else {
-      console.log(`✓ ${instance.serviceUnit} already orders after ${names.serviceUnit}`);
-    }
-  }
+  const removed = retireEnvironmentDerivedCoordinators(systemdUserDir, installedUnitNames);
 
   runOrThrow("systemctl", ["--user", "daemon-reload"]);
   if (opts?.restart === false) {
-    runOrThrow("systemctl", ["--user", "enable", names.serviceUnit]);
-    console.log(`✓ Installed ${names.serviceUnit} (--no-restart)`);
+    runOrThrow("systemctl", ["--user", "enable", context.serviceUnit]);
+    console.log(`✓ Installed ${context.serviceUnit} (--no-restart)`);
   } else {
-    enableAndRestartUnit(names.serviceUnit);
+    enableAndRestartUnit(context.serviceUnit);
   }
+
+  reportClientOrdering(systemdUserDir, context.serviceUnit);
 
   const socketPath =
     config.quota?.coordinator?.socketPath?.trim() || defaultQuotaCoordinatorSocketPath();
-  console.log(`\n${names.serviceUnit} installed.`);
+  console.log(`\n${context.serviceUnit} installed.`);
+  console.log(`- Service home: ${context.home} (${describeHomeSource(context)})`);
   console.log(`- Socket: ${socketPath}`);
   console.log(`- Database: ${databasePath}`);
   console.log(
@@ -943,7 +1023,7 @@ export async function runInstallQuotaCoordinator(opts?: {
   );
   console.log(`- Workers dir: ${workersDir}`);
   console.log(
-    `- Probe PATH: ${describeProbePathSource(probePath, instance.serviceUnit, instanceUnitContents !== null)}`
+    `- Probe PATH: ${describePoolProbePathSource(probePath, donorUnit, installedClientUnits)}`
   );
   console.log(
     `- Provider CLIs: ${providerCommands.length - missingProviderCommands.length} of ` +
@@ -952,9 +1032,130 @@ export async function runInstallQuotaCoordinator(opts?: {
         ? ` (missing: ${missingProviderCommands.join(", ")})`
         : "")
   );
-  console.log(`- Status: systemctl --user status ${names.serviceUnit}`);
-  console.log(`- Logs: journalctl --user -u ${names.serviceUnit} -f`);
+  if (removed.length > 0) {
+    console.log(`- Retired duplicate pool coordinators: ${removed.join(", ")}`);
+  }
+  console.log(`- Status: systemctl --user status ${context.serviceUnit}`);
+  console.log(`- Logs: journalctl --user -u ${context.serviceUnit} -f`);
   console.log(`- Readiness: curl --unix-socket ${socketPath} http://localhost/v1/readyz`);
+}
+
+function describeHomeSource(context: CoordinatorServiceContext): string {
+  switch (context.homeSource) {
+    case "flag":
+      return "named with --home";
+    case "env":
+      return `named by ${COORDINATOR_HOME_ENV}`;
+    default:
+      return `adopted from ${context.adoptedFrom}`;
+  }
+}
+
+/**
+ * Refuse to silently change which quota database the pool coordinator opens.
+ *
+ * The one thing a packaging change must not do is move the pool's authoritative
+ * quota history. If a coordinator unit is already installed against a different
+ * home, this compares the file that unit resolves with the file this install
+ * would resolve, and stops when they differ. It does not read the old home's
+ * config to decide whether to *proceed* — an unreadable old home is simply
+ * unknown and not an obstacle — only to decide whether to *stop*.
+ */
+function assertDatabaseIdentityPreserved(opts: {
+  systemdUserDir: string;
+  serviceUnit: string;
+  home: string;
+  databasePath: string;
+  allowDatabaseChange: boolean;
+}): void {
+  if (opts.allowDatabaseChange) return;
+  const unitPath = join(opts.systemdUserDir, opts.serviceUnit);
+  if (!existsSync(unitPath)) return;
+  const priorHome = readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME");
+  if (!priorHome || priorHome === opts.home) return;
+
+  let priorDatabase: string;
+  try {
+    priorDatabase = resolveCoordinatorDatabasePaths(loadConfig(priorHome), priorHome).databasePath;
+  } catch {
+    return;
+  }
+  if (priorDatabase === opts.databasePath) return;
+
+  throw new Error(
+    `${opts.serviceUnit} currently opens ${priorDatabase} (home ${priorHome}); installing against ` +
+      `${opts.home} would point it at ${opts.databasePath}. That changes which database holds the ` +
+      "pool's authoritative quota history, which is not something an install should do on its own. " +
+      "Re-run with --allow-database-change if that is the intent; neither file is touched either way."
+  );
+}
+
+/**
+ * Stop, disable, and remove the environment-derived coordinator units.
+ *
+ * These are the duplicate pool coordinators: a second unit, derived from a
+ * second instance's basename, probing the same providers against the same
+ * pool. Removal is idempotent — a host that has already transitioned has
+ * nothing to remove — and it removes *units*, never databases: a retired
+ * coordinator's database file is left exactly where it is, and is named here so
+ * an operator can see what it was.
+ *
+ * `stopUnit` is the seam a test drives this through: the decision of what to
+ * retire, the removal, and the reporting are the parts worth exercising, and
+ * none of them should require a live user manager to observe.
+ */
+export function retireEnvironmentDerivedCoordinators(
+  systemdUserDir: string,
+  installedUnitNames: readonly string[],
+  stopUnit: (unit: string) => void = (unit) => {
+    runQuietly("systemctl", ["--user", "disable", "--now", unit]);
+  }
+): string[] {
+  const { removeUnits } = planCoordinatorTransition(installedUnitNames);
+  const retired: string[] = [];
+  for (const unit of removeUnits) {
+    const unitPath = join(systemdUserDir, unit);
+    const retiredHome = existsSync(unitPath)
+      ? readUnitEnvironment(readFileSync(unitPath, "utf-8"), "RUSA_HOME")
+      : null;
+    stopUnit(unit);
+    rmSync(unitPath, { force: true });
+    retired.push(unit);
+    console.log(`✓ Retired duplicate pool coordinator ${unit}`);
+    if (retiredHome) {
+      console.log(`  its home ${retiredHome} and any database under it are left untouched on disk`);
+    }
+  }
+  return retired;
+}
+
+/**
+ * Report, without editing, which client instance units order after the pool
+ * coordinator.
+ *
+ * The old installer retrofitted `After=`/`Wants=` into the instance unit that
+ * matched its `--environment`. That is the coupling #507 removes: provisioning
+ * the pool service is not the moment to rewrite a unit `install-service` owns,
+ * and under a pool model there is no single matching instance to rewrite
+ * anyway. The ordering is still wanted — it is written by `install-service`,
+ * which owns those units — so this says which instances are missing it and how
+ * to get it, and changes nothing.
+ */
+function reportClientOrdering(systemdUserDir: string, coordinatorUnit: string): void {
+  for (const unit of poolClientUnitNames()) {
+    const unitPath = join(systemdUserDir, unit);
+    if (!existsSync(unitPath)) continue;
+    const contents = readFileSync(unitPath, "utf-8");
+    if (unitOrdersAfter(contents, coordinatorUnit)) {
+      console.log(`✓ ${unit} already orders after ${coordinatorUnit}`);
+    } else {
+      console.warn(
+        `⚠️  ${unit} does not order after ${coordinatorUnit}. Re-run ` +
+          "`rusa install-service` for that instance to add it; this installer no longer " +
+          "edits instance units."
+      );
+    }
+  }
 }
 
 /**

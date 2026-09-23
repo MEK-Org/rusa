@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { buildTmuxScript } from "../providers/codex-status-scrape.js";
+import { poolClientUnitNames } from "./coordinator-provisioning.js";
 import {
   buildQuotaCoordinatorUnit,
   configuredProviderCommands,
+  describePoolProbePathSource,
   describeProbePathSource,
 } from "./install-service.js";
 import { readUnitPathEnv, resolveProbePathEnv } from "./service-instance.js";
@@ -203,6 +205,36 @@ describe("the quota coordinator's probe PATH reaches the tmux-launched CLI (#525
       expect(
         describeProbePathSource({ path: "/a", source: "instance-unit-file" }, unit, true)
       ).toContain("drop-in PATH was not seen");
+    });
+  });
+
+  describe("describePoolProbePathSource", () => {
+    it("names the client unit the PATH was actually borrowed from", () => {
+      // The pool coordinator has no instance unit of its own (#507), so the
+      // line has to name the donor rather than a unit fixed in advance.
+      expect(
+        describePoolProbePathSource(
+          { path: "/opt/providers/bin", source: "instance-unit-systemd" },
+          "rusa-staging.service",
+          ["rusa.service", "rusa-staging.service"]
+        )
+      ).toBe("taken from rusa-staging.service as systemd resolves it (drop-ins included)");
+    });
+
+    it("does not claim no client is installed when one is but supplies no PATH", () => {
+      const line = describePoolProbePathSource({ path: "/usr/bin", source: "process" }, null, [
+        "rusa.service",
+      ]);
+
+      expect(line).not.toContain("installed yet");
+      expect(line).toContain("none of rusa.service assigns a PATH of its own");
+    });
+
+    it("says no client is installed only when none is", () => {
+      const line = describePoolProbePathSource({ path: "/usr/bin", source: "process" }, null, []);
+
+      expect(line).toContain("no pool client unit installed yet");
+      for (const unit of poolClientUnitNames()) expect(line).toContain(unit);
     });
   });
 });
