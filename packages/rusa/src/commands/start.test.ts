@@ -4744,12 +4744,78 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // halt scoped to claude must still block dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
     halt.resume();
 
     // Halt the OLD provider (antigravity) instead — root is no longer
     // launching on antigravity, so this halt must not wrongly block it.
     halt.halt("halt antigravity", { providers: ["antigravity"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
+  });
+
+  it("root's beforeRun halt-gate allows dispatch when an unhalted pool fallback exists (#625)", async () => {
+    clearProviderModelCatalog("antigravity");
+    clearProviderModelCatalog("claude");
+    const config = {
+      github: { account: "mock-bot" },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "claude",
+        model: "claude-sonnet-5",
+        effort: "high",
+        context: { type: "portable", mode: "ledger" },
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+
+    const actorOpts = (
+      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
+    ).opts;
+
+    // Set an ordered pool: claude (primary), antigravity (fallback)
+    activeMesh.setActorModel(
+      "root",
+      [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      ],
+      "root"
+    );
+
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Halt only primary provider (claude): unhalted fallback (antigravity) exists,
+    // so beforeRun must allow dispatch.
+    halt.halt("halt claude", { providers: ["claude"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
+
+    // Halt both providers: all candidates are halted, so beforeRun must return false.
+    halt.halt("halt both", { providers: ["claude", "antigravity"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
     halt.resume();
   });
 

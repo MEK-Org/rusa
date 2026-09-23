@@ -247,7 +247,7 @@ function setup(
     onSpawn?: (record: { id: string }) => void;
     onRevive?: (record: { id: string }) => void;
     retireCleanups?: RetireCleanup[];
-    isHalted?: (provider?: string) => boolean;
+    isHalted?: ActorMeshOptions["isHalted"];
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
     recordChat?: (opts: {
@@ -5844,6 +5844,343 @@ describe("ActorMesh", () => {
       expect(poolBRuns).toEqual([]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
+    });
+
+    it("schedules a multi-model actor on an unhalted fallback when primary provider is halted (#625)", async () => {
+      const poolARuns: string[] = [];
+      const poolBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "pool-a",
+          {
+            name: "pool-a",
+            providerName: "pool-a",
+            run: async (runOpts) => {
+              poolARuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
+            },
+          },
+        ],
+        [
+          "pool-b",
+          {
+            name: "pool-b",
+            providerName: "pool-b",
+            run: async (runOpts) => {
+              poolBRuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "b" };
+            },
+          },
+        ],
+      ]);
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider, _model) => {
+          if (!provider) return false;
+          return halted.has(provider);
+        },
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: pacerFor(c.provider),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          const actor: Actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => {
+              const base = providerByName.get(selected.provider);
+              if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+              return base;
+            },
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Place a provider-wide halt on pool-a before the message arrives.
+      halted.add("pool-a");
+
+      // Send the actor a fresh message.
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Expected: the scheduler filters halted pool-a and schedules on fallback pool-b.
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+    });
+
+    it("blocks only matching entries from a model-scoped halt (#625)", async () => {
+      const executedModels: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const haltedModels = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider, model) => {
+          if (!provider) return false;
+          return model ? haltedModels.has(`${provider}:${model}`) : false;
+        },
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: `${c.provider}:${c.model}`,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => (c.model ? haltedModels.has(`${c.provider}:${c.model}`) : false),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-1" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                executedModels.push(selected.model ?? "");
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-1" },
+          { provider: "pool-a", model: "model-2" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt only model-1 from pool-a
+      haltedModels.add("pool-a:model-1");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Only model-2 should have run
+      expect(executedModels).toEqual(["model-2"]);
+    });
+
+    it("leaves an all-held pool unscheduled with existing retry semantics on unhalt (#625)", async () => {
+      const runs: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                runs.push(selected.provider);
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt both providers in the pool
+      halted.add("pool-a");
+      halted.add("pool-b");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Remains unscheduled: no runs, not queued
+      expect(runs).toEqual([]);
+      expect(mesh.activeRunState(worker)).toBeNull();
+
+      // Unhalt pool-a: reconcile unseen inbox restores eligibility without pool edit
+      halted.delete("pool-a");
+      mesh.reconcileUnseenInbox();
+      await tick();
+
+      expect(runs).toEqual(["pool-a"]);
+    });
+
+    it("preserves relative order of unheld entries when filtering precedes quota pacing (#625)", async () => {
+      const selectedProviders: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                selectedProviders.push(selected.provider);
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+          { provider: "pool-c", model: "model-c" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt only pool-a; both pool-b and pool-c are available
+      halted.add("pool-a");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Relative order of [pool-b, pool-c] preserved: pool-b chosen
+      expect(selectedProviders).toEqual(["pool-b"]);
     });
   });
 
