@@ -143,7 +143,7 @@ export { MeshChatRepository } from "./mesh-chat-repository.js";
 export type { MeshEvent, MeshEventKind } from "./mesh-event-repository.js";
 export { MeshEventRepository } from "./mesh-event-repository.js";
 export type { ModelClass } from "./model-class-repository.js";
-export { ModelClassInUseError, ModelClassRepository } from "./model-class-repository.js";
+export { ModelClassRepository } from "./model-class-repository.js";
 export type { ModelScrape } from "./model-scrape-repository.js";
 export { ModelScrapeRepository } from "./model-scrape-repository.js";
 export type {

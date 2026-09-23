@@ -3036,9 +3036,10 @@ describe("runtime model-class management", () => {
     const store = new ModelClassRepository(db);
     // Spawn order and id order disagree, so the assertion below fails if the
     // `.sort()` in `delete_model_class` is dropped: without it the message
-    // would carry `mesh.list()`'s `ORDER BY created_at, id` — spawn order.
-    // The harness's default `t1`, `t2` ids sort into spawn order, so they
-    // cannot tell the two apart.
+    // would carry `InMemoryActorRepository`'s Map insertion order (spawn order).
+    // The harness's default `t1`, `t2` ids sort into spawn order, so naming
+    // actors `worker-z` then `worker-a` specifically forces spawn order and
+    // lexicographical ID order to disagree.
     const ids = ["worker-z", "worker-a"];
     let next = 0;
     const { mesh } = setup({ ...hooks(store), idgen: () => ids[next++] });
@@ -3152,11 +3153,11 @@ describe("runtime model-class management", () => {
     db.close();
   });
 
-  it("succeeds when referencing actor is retired", async () => {
+  it("succeeds when referencing actor is retired, and subsequent revival allows rebind", async () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const store = new ModelClassRepository(db);
-    const { mesh } = setup(hooks(store));
+    const { mesh, registry } = setup(hooks(store));
     const root = await connect(
       createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
     );
@@ -3186,6 +3187,16 @@ describe("runtime model-class management", () => {
     })) as CallToolResult;
     expect(retireRes.isError).toBeFalsy();
 
+    // While retired, setting model is refused
+    const retiredSetRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(retiredSetRes.isError).toBe(true);
+
     // Deletion succeeds now that actor is retired
     const deleteRes = (await root.callTool({
       name: "delete_model_class",
@@ -3194,6 +3205,26 @@ describe("runtime model-class management", () => {
     expect(deleteRes.isError).toBeFalsy();
     expect(dataOf(deleteRes)).toEqual({ name: "temp-class", deleted: true });
     expect(store.get("temp-class")).toBeUndefined();
+
+    // Reviving the retired actor succeeds: it is born idle and marked active
+    const reviveRes = (await root.callTool({
+      name: "revive_thread",
+      arguments: { thread_id: workerId },
+    })) as CallToolResult;
+    expect(reviveRes.isError).toBeFalsy();
+    expect(registry.get(workerId)?.status).toBe("active");
+
+    // Because the actor is now active, root can rebind it to an explicit pool
+    const rebindRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(rebindRes.isError).toBeFalsy();
+    mesh.applyPendingModel(workerId);
+    expect(registry.get(workerId)?.modelClass).toBeUndefined();
 
     db.close();
   });

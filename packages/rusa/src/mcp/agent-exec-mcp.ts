@@ -17,10 +17,7 @@ import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
-import {
-  ModelClassInUseError,
-  type ModelClassRepository,
-} from "../db/repositories/model-class-repository.js";
+import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
@@ -28,6 +25,15 @@ import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.j
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
+
+class ModelClassInUseError extends Error {
+  constructor(className: string, referencingActors: readonly string[]) {
+    super(
+      `Cannot delete model class '${className}': referenced by live actor(s): ${referencingActors.join(", ")}. Rebind these actors first.`
+    );
+    this.name = "ModelClassInUseError";
+  }
+}
 
 export const AGENT_EXEC_MCP_NAME = "mesh";
 

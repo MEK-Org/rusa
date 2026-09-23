@@ -80,24 +80,6 @@ function fromRow(row: ModelClassRow): ModelClass {
 }
 
 /**
- * Thrown when a model class deletion is refused because live actors are still
- * bound to it by class reference (#636).
- */
-export class ModelClassInUseError extends Error {
-  readonly className: string;
-  readonly referencingActors: readonly string[];
-
-  constructor(className: string, referencingActors: readonly string[]) {
-    super(
-      `Cannot delete model class '${className}': referenced by live actor(s): ${referencingActors.join(", ")}. Rebind these actors first.`
-    );
-    this.name = "ModelClassInUseError";
-    this.className = className;
-    this.referencingActors = referencingActors;
-  }
-}
-
-/**
  * SQLite source of truth for model classes. Every lookup reads the committed
  * row directly: a successful `set_model_class` affects the next class
  * selection in this process without a mesh restart, and a class-bound actor's
