@@ -880,7 +880,12 @@ export function createAgentExecMcpServer(
       try {
         let targetId = actor_id;
         try {
-          mesh.setActorModel(targetId, model_config, selfId);
+          const outcome = mesh.setActorModel(targetId, model_config, selfId);
+          return toolOk(
+            outcome === "staged"
+              ? `staged modelConfig update for ${targetId}; applies when its current run ends`
+              : `applied modelConfig update for ${targetId}`
+          );
         } catch (err) {
           if (
             err instanceof Error &&
@@ -889,7 +894,12 @@ export function createAgentExecMcpServer(
             if (!UUID_REGEX.test(actor_id)) {
               const child = mesh.resolveDirectChildHandle(selfId, actor_id);
               targetId = child.id;
-              mesh.setActorModel(targetId, model_config, selfId);
+              const outcome = mesh.setActorModel(targetId, model_config, selfId);
+              return toolOk(
+                outcome === "staged"
+                  ? `staged modelConfig update for ${targetId}; applies when its current run ends`
+                  : `applied modelConfig update for ${targetId}`
+              );
             } else {
               throw err;
             }
@@ -897,12 +907,6 @@ export function createAgentExecMcpServer(
             throw err;
           }
         }
-        const phase = mesh.activeRunState(targetId)?.phase;
-        return toolOk(
-          phase === "running" || phase === "winding_down"
-            ? `staged modelConfig update for ${targetId}; applies when its current run ends`
-            : `applied modelConfig update for ${targetId}`
-        );
       } catch (err) {
         return toolError(err);
       }

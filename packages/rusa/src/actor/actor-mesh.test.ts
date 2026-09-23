@@ -5780,9 +5780,8 @@ describe("ActorMesh", () => {
       await tick();
     });
 
-    it("applies a pool after the actor reports its real coalesced terminal, but not an unlaunched terminal", async () => {
-      const deferred = deferredProvider();
-      const { mesh, registry, tick } = setup({ sharedProvider: deferred.provider });
+    it("leaves a pool staged after an unlaunched terminal", async () => {
+      const { mesh, registry } = setup();
       const unlaunched = mesh.spawn({
         charter: "unlaunched worker",
         parentId: "root",
@@ -5810,7 +5809,11 @@ describe("ActorMesh", () => {
       });
       expect(registry.get(unlaunched)?.modelConfig?.[0]?.model).toBe("model-a");
       expect(registry.get(unlaunched)?.desiredModelConfig?.[0]?.model).toBe("model-b");
+    });
 
+    it("applies a pool after the actor reports its real coalesced terminal", async () => {
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({ sharedProvider: deferred.provider });
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
@@ -5846,6 +5849,32 @@ describe("ActorMesh", () => {
       // neighboring fake-timer test.
       deferred.releaseAll();
       await tick();
+    });
+
+    it("rolls back an immediate update when live publication throws", () => {
+      const events: string[] = [];
+      const { mesh, registry } = setup({
+        onModelSet: () => {
+          throw new Error("live actor unavailable");
+        },
+        events: (event) => events.push(event.kind),
+      });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "test-provider", model: "model-a" },
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      expect(() =>
+        mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root")
+      ).toThrow("live actor unavailable");
+      expect(registry.get(worker)).toMatchObject({
+        modelConfig: [{ provider: "test-provider", model: "model-a" }],
+        desiredModelConfig: undefined,
+        desiredModelClass: undefined,
+      });
+      expect(events).not.toContain("actor_model_set");
     });
 
     it("emits actor_model_set when an idle actor's pool is applied, ahead of the next run", async () => {
