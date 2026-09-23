@@ -9,6 +9,7 @@ import 'api.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'obligations_cache.dart';
 import 'principals.dart';
 import 'quota_cache.dart';
 import 'tree_preferences_cache.dart';
@@ -25,6 +26,7 @@ const Duration _kRuntimeRetryMax = Duration(seconds: 5);
 // staged-head changes do not. Poll only while cards are queued so their
 // explanation stays current without a permanent thread-list poll.
 const Duration _kQueuePacingPollInterval = Duration(seconds: 10);
+const Duration _kObligationLookupTtl = Duration(seconds: 30);
 
 /// One line in the merged live-output console.
 class LiveLine {
@@ -158,6 +160,7 @@ class DashboardStore {
     QuotaCache? quotaCache,
     TreePreferencesCache? treePreferencesCache,
     ActorHierarchyCache? actorHierarchyCache,
+    ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
   }) : _api = api,
@@ -167,6 +170,7 @@ class DashboardStore {
            treePreferencesCache ?? const NoopTreePreferencesCache(),
        _actorHierarchyCache =
            actorHierarchyCache ?? const NoopActorHierarchyCache(),
+       _obligationsCache = obligationsCache ?? const NoopObligationsCache(),
        _hierarchyScope = cacheScopeFor(api.base) {
     // Seed the quota subject from the persisted snapshot BEFORE the first frame
     // (ISSUE_NUM ask 4): the header reads `store.quota.valueOrNull` as its
@@ -221,6 +225,31 @@ class DashboardStore {
     _actorsStale.add(true);
   }
 
+  /// Hydrates only the snapshot belonging to an already-resolved viewer (#505).
+  /// A browser can retain another person's localStorage entries after logout, so
+  /// no persisted obligations are exposed before dashboard configuration names
+  /// the authenticated principal.
+  void _seedObligationsFromCache(String principalId) {
+    final cached = _obligationsCache.load(
+      scope: _hierarchyScope,
+      principalId: principalId,
+    );
+    if (cached == null) return;
+    if (!cached.isUsableAt(
+      scope: _hierarchyScope,
+      principalId: principalId,
+      now: DateTime.timestamp(),
+    )) {
+      _obligationsCache.invalidate(
+        scope: _hierarchyScope,
+        principalId: principalId,
+      );
+      return;
+    }
+    _cachedObligationTrees = cached.trees;
+    _cachedObligationPrincipal = principalId;
+  }
+
   /// The server boundary a persisted hierarchy belongs to, as
   /// `scheme://host[:port]` of the API base.
   ///
@@ -254,9 +283,15 @@ class DashboardStore {
   final QuotaCache _quotaCache;
   final TreePreferencesCache _treePreferencesCache;
   final ActorHierarchyCache _actorHierarchyCache;
+  final ObligationsCache _obligationsCache;
   final String _hierarchyScope;
+  List<ObligationTreeDto>? _cachedObligationTrees;
+  String? _cachedObligationPrincipal;
 
   DashboardApi get api => _api;
+  ObligationsCache get obligationsCache => _obligationsCache;
+  List<ObligationTreeDto>? get cachedObligationTrees => _cachedObligationTrees;
+  String? get cachedObligationPrincipal => _cachedObligationPrincipal;
 
   /// Walkie-talkie platform deps , wired by the web entrypoint. Null
   /// means the feature is absent (headless harnesses/tests that don't care) —
@@ -293,6 +328,20 @@ class DashboardStore {
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
+
+  /// Model and effort of each active run, keyed by actor id. Seeded from the
+  /// actor's newest `run_start` event and replaced by live ones; an actor's
+  /// entry is dropped as soon as it stops running.
+  final _runSelections = BehaviorSubject<Map<String, RunModelSelection>>.seeded(
+    const {},
+  );
+  final _runSelectionLookups = <String>{};
+
+  /// Obligation lookups for inbox entries that name one, reused for
+  /// [_kObligationLookupTtl] so cards re-rendering on every snapshot share
+  /// one fetch.
+  final _obligationLookups =
+      <String, ({DateTime at, Future<ObligationDto?> obligation})>{};
 
   /// True while a background quota revalidation is in flight (ISSUE_NUM ask 4).
   /// Purely in-memory for this process's lifetime — deliberately NOT
@@ -364,6 +413,8 @@ class DashboardStore {
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
   ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
+  ValueStream<Map<String, RunModelSelection>> get runSelections =>
+      _runSelections.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
   ValueStream<bool> get actorsStale => _actorsStale.stream;
@@ -440,6 +491,7 @@ class DashboardStore {
     _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
     _subs.add(_stream.runtimeStates.listen(_onRuntimeState));
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
+    _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
@@ -455,7 +507,11 @@ class DashboardStore {
 
   Future<void> refreshDashboardConfig() async {
     try {
-      _dashboardConfig.add(await _api.fetchDashboardConfig());
+      final config = await _api.fetchDashboardConfig();
+      _onPrincipalResolved(config.userPrincipalId);
+      // WorkTab listens to this subject. Publish only after the cache is
+      // reconciled, so no listener can render a previous principal's trees.
+      _dashboardConfig.add(config);
     } on DashboardApiException catch (e) {
       // Older/static dashboard hosts may not expose this endpoint; the header
       // keeps its weekly per-provider defaults.
@@ -464,6 +520,51 @@ class DashboardStore {
     } catch (e) {
       _error.add('$e');
     }
+  }
+
+  void _onPrincipalResolved(String? resolvedPrincipal) {
+    _cachedObligationTrees = null;
+    _cachedObligationPrincipal = resolvedPrincipal;
+    if (resolvedPrincipal == null || resolvedPrincipal.isEmpty) return;
+    _seedObligationsFromCache(resolvedPrincipal);
+  }
+
+  /// Persists [trees] as the new last-known successful obligations snapshot (#505).
+  void saveObligationsSnapshot(List<ObligationTreeDto> trees) {
+    final principal = userPrincipalId;
+    // A capture without an authenticated principal is unsafe to replay later.
+    if (principal == null || principal.isEmpty) return;
+    _cachedObligationTrees = trees;
+    _cachedObligationPrincipal = principal;
+    _obligationsCache.save(
+      PersistedObligationsSnapshot.capture(
+        scope: _hierarchyScope,
+        principalId: principal,
+        trees: trees,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// Invalidates the cached obligations snapshot so navigation return or reload
+  /// does not regress to known-old state after a mutation (#505).
+  void invalidateObligationsCache() {
+    final principal = _cachedObligationPrincipal ?? userPrincipalId;
+    _cachedObligationTrees = null;
+    _cachedObligationPrincipal = principal;
+    if (principal == null || principal.isEmpty) return;
+    _obligationsCache.invalidate(
+      scope: _hierarchyScope,
+      principalId: principal,
+    );
+  }
+
+  /// Runs an obligation-changing API operation and prevents a later Work-tab
+  /// return from reviving the old persisted forest.
+  Future<T> mutateObligations<T>(Future<T> Function() operation) async {
+    final result = await operation();
+    invalidateObligationsCache();
+    return result;
   }
 
   Future<void> refreshThreads() async {
@@ -1227,6 +1328,12 @@ class DashboardStore {
         e.kind == 'actor_model_set') {
       _scheduleTopologyRefresh();
     }
+    if (e.kind == 'run_start' && e.actorId != null) {
+      final selection = RunModelSelection.fromRunStartPayload(e.payload);
+      if (selection != null && !_runSelections.isClosed) {
+        _runSelections.add({..._runSelections.value, e.actorId!: selection});
+      }
+    }
     if (e.kind == 'run_yielded') {
       if (_seenYieldEventIds.add(e.id)) {
         final cur = _yieldEvents.value;
@@ -1243,6 +1350,7 @@ class DashboardStore {
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
+      invalidateObligationsCache();
       _obligationRefreshes.add(e.detail);
     }
 
@@ -1420,6 +1528,63 @@ class DashboardStore {
     }
   }
 
+  /// The obligation [id], or null when it cannot be loaded. Fetched at most
+  /// once per [_kObligationLookupTtl], so its status stays reasonably fresh
+  /// without every rebuild refetching it.
+  Future<ObligationDto?> obligationById(String id) {
+    final now = DateTime.now();
+    final cached = _obligationLookups[id];
+    if (cached != null && now.difference(cached.at) < _kObligationLookupTtl) {
+      return cached.obligation;
+    }
+    final obligation = _api
+        .fetchObligationDetail(id)
+        .then<ObligationDto?>((detail) => detail.obligation)
+        .catchError((Object _) => null);
+    _obligationLookups[id] = (at: now, obligation: obligation);
+    return obligation;
+  }
+
+  /// Keeps [runSelections] to exactly the actors in an active run: drops any
+  /// actor that stopped, and looks up the newest `run_start` once for an
+  /// active actor whose start this page never saw. A lookup that finds
+  /// nothing is not retried until the actor leaves and re-enters a run.
+  void _syncRunSelections(ActorStateSnapshot snapshot) {
+    final active = {
+      for (final a in snapshot.actors.values)
+        if (a.isActiveRun) a.id,
+    };
+    _runSelectionLookups.removeWhere((id) => !active.contains(id));
+    final current = _runSelections.value;
+    if (current.keys.any((id) => !active.contains(id))) {
+      _runSelections.add({
+        for (final entry in current.entries)
+          if (active.contains(entry.key)) entry.key: entry.value,
+      });
+    }
+    for (final id in active) {
+      if (_runSelections.value.containsKey(id)) continue;
+      if (!_runSelectionLookups.add(id)) continue;
+      unawaited(_lookUpRunSelection(id));
+    }
+  }
+
+  Future<void> _lookUpRunSelection(String actorId) async {
+    RunModelSelection? selection;
+    try {
+      final event = await _api.fetchLatestRunStart(actorId);
+      selection = RunModelSelection.fromRunStartPayload(event?.payload);
+    } catch (_) {
+      return;
+    }
+    if (selection == null || _runSelections.isClosed) return;
+    // A live `run_start` that landed meanwhile is newer; a stop dropped the
+    // actor from the active set and the answer no longer describes a run.
+    if (_runSelections.value.containsKey(actorId)) return;
+    if (!_runSelectionLookups.contains(actorId)) return;
+    _runSelections.add({..._runSelections.value, actorId: selection});
+  }
+
   bool _applyRuntimeState(ActorRuntimeStateDelta delta) {
     final cur = _actorStates.value;
     final existing = cur.actors[delta.actorId];
@@ -1431,6 +1596,10 @@ class DashboardStore {
     // authoritative pacing snapshot is requested.
     final clearsSelectedObligation =
         delta.runState == RunState.idle || delta.runState == RunState.queued;
+    // The reserved candidate describes a queued run only; once the run starts
+    // or is cancelled the server stops reporting it, so drop it immediately
+    // rather than show it until the next snapshot.
+    final clearsReservation = delta.runState != RunState.queued;
     updatedActors[delta.actorId] = existing.copyWith(
       thread: existing.thread.copyWith(
         runState: delta.runState,
@@ -1443,6 +1612,13 @@ class DashboardStore {
         moreInboxItemsCount: clearsSelectedObligation
             ? null
             : existing.thread.moreInboxItemsCount,
+        selectedProvider: clearsReservation
+            ? null
+            : existing.thread.selectedProvider,
+        selectedModel: clearsReservation ? null : existing.thread.selectedModel,
+        selectedEffort: clearsReservation
+            ? null
+            : existing.thread.selectedEffort,
       ),
       runState: delta.runState,
     );
@@ -1667,6 +1843,7 @@ class DashboardStore {
     _api.close();
     await Future.wait([
       _actorStates.close(),
+      _runSelections.close(),
       _halted.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),

@@ -132,3 +132,47 @@ export function validateInboxPayload(payload: unknown): asserts payload is Inbox
     throw new Error('inbox payload.priority must be "responsive" when present');
   }
 }
+
+/**
+ * An immutable empty inbox repository that holds no entries.
+ * Used for lightweight test meshes and environments where inbox storage
+ * is not configured, ensuring durable-only dispatch contracts are preserved
+ * without manufacturing work.
+ */
+export class EmptyInboxRepository implements InboxRepository {
+  append(_entries: InboxAppendInput[]): InboxEntry[] {
+    return [];
+  }
+  onItemsAppended(_listener: InboxItemsAppendedListener): () => void {
+    return () => {};
+  }
+  list(_actorId: string, _options?: InboxListOptions): InboxPage {
+    return { entries: [], unhandledCount: 0, nextCursor: null };
+  }
+  selectPrioritizedUnhandled?(_actorId: string): InboxEntry | null {
+    return null;
+  }
+  read(_actorId: string, _entryId: string): InboxEntry | null {
+    return null;
+  }
+  countUnhandled(_actorId: string, _options?: { responsiveOnly?: boolean }): number {
+    return 0;
+  }
+  actorsWithUnhandled(): InboxActorWork[] {
+    return [];
+  }
+  actorsWithUnseen(): InboxActorWork[] {
+    return [];
+  }
+  markSeen(_actorId: string, _seenAt?: Date): InboxEntry[] {
+    return [];
+  }
+  markHandled(
+    _actorId: string,
+    _entryIds: string[],
+    _handledAt?: Date,
+    _handledNote?: string
+  ): MarkHandledResult[] {
+    return [];
+  }
+}

@@ -342,6 +342,10 @@ program
   .option("--socket <path>", "Override socket path")
   .option("--database <path>", "Override service-owned quota database path")
   .option(
+    "--probe-off",
+    "Stage-0 rollout: serve copied data without provider probes or controller writes"
+  )
+  .option(
     "--legacy-database <path>",
     "Legacy direct-mode database path for the scheduled relocation"
   )
@@ -356,6 +360,7 @@ program
       database?: string;
       legacyDatabase?: string;
       relocate?: boolean;
+      probeOff?: boolean;
     }) => {
       await runQuotaCoordinator({
         home: opts.home,
@@ -363,6 +368,7 @@ program
         databasePath: opts.database,
         legacyDatabasePath: opts.legacyDatabase,
         relocate: opts.relocate,
+        probeOff: opts.probeOff,
       });
     }
   );

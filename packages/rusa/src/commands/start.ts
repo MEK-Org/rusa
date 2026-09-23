@@ -142,6 +142,7 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
+import { FollowerUpdateTriggerStore } from "../experimental/remote-instances/follower-update-trigger-store.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
@@ -1464,8 +1465,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
   const rootProviderName = rootActor.provider;
-  const isProviderHalted = (providerName?: string) =>
-    haltSwitch.isHalted(providerName ?? rootProviderName);
+  const isProviderHalted = (providerName?: string, modelName?: string) =>
+    haltSwitch.isHalted(providerName ?? rootProviderName, modelName);
   let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   if (haltSwitch.hasActiveHalt()) {
     const why = haltSwitch.reason();
@@ -1797,6 +1798,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // best-effort: if the deploy checkout can't be resolved, the mesh still boots
   // without it. Its drainer self-excludes the CALLER's run (whoever holds the
   // grant), not a fixed root id.
+  const followerTriggerStore = new FollowerUpdateTriggerStore(
+    join(mcHome, "data", "follower-update-trigger.json")
+  );
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -1818,6 +1822,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onCommitted: (newSha, branch) => {
+          try {
+            followerTriggerStore.createTrigger({
+              targetSha: newSha,
+              branch,
+            });
+            log.info("follower_update_trigger_persisted", {
+              targetSha: newSha,
+              branch,
+            });
+          } catch (tErr) {
+            log.warn("follower_update_trigger_persist_failed", {
+              targetSha: newSha,
+              branch,
+              err: tErr,
+            });
+          }
+        },
         notify: sendErrorSink
           ? {
               notify: sendErrorSink,
@@ -2069,7 +2091,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log });
+    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
     await followerHub.listen(config.followers.bind, config.followers.port);
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
@@ -2306,7 +2328,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        isHalted: (c) => isProviderHalted(c.provider),
+        isHalted: (c) => isProviderHalted(c.provider, c.model),
         onSelected: request.threadId
           ? (selection) => {
               const provider = selection.candidate.provider;
@@ -2404,15 +2426,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       refreshLiveActorMcp(actorId);
     },
     onModelSet: (actorId, newModelConfig) => {
-      try {
-        const liveActor = mesh.get(actorId);
-        if (liveActor && typeof liveActor.setModelConfig === "function") {
-          liveActor.setModelConfig(newModelConfig);
-        }
-      } catch (err) {
-        console.warn(
-          `[mesh] failed to update live modelConfig for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
-        );
+      const liveActor = mesh.get(actorId);
+      if (liveActor && typeof liveActor.setModelConfig === "function") {
+        // One idempotent assignment on the live actor: a class-bound actor is
+        // re-published at every dispatch boundary, so this adopts the class's
+        // current definition for the run about to start (#626).
+        liveActor.setModelConfig(newModelConfig);
       }
     },
     // Recreate the private working directory for the revived actor
@@ -2433,6 +2452,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // candidate before registering MCP servers so a resolution failure can't leave
       // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
       // to the root provider.
+      //
+      // A class-bound actor whose class is missing or invalid also arrives with no
+      // pool, but only at rehydration — a spawn validates its class first. The
+      // fallback below is a placeholder for an actor that will not run: the pre-run
+      // gate refuses it while the binding is broken, and the moment the class
+      // resolves again the dispatch boundary hands it the real pool (#626). Report
+      // it here so a restart surfaces the broken binding without waiting for a wake.
+      mesh.reportModelClassFailure(id);
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
           provider: rootActor.provider,
@@ -2907,11 +2934,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           continue;
         }
         const existing = mesh.get(record.id);
-        // A wake the follower never observed is re-derived from the durable
-        // inbox here, whichever branch re-creates the channel (#568).
+        // A dispatch the follower never observed needs no re-derivation: the
+        // durable inbox still holds the work and its priority, so an advisory
+        // dispatch on either channel-recreating branch recovers it (#568).
         if (!existing) {
           mesh.rehydrate(record);
-          mesh.notifyInboxChanged(record.id, mesh.durableInboxNudge(record.id));
+          mesh.dispatch(record.id);
         } else if (
           "attachHost" in existing &&
           typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
@@ -2919,7 +2947,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           try {
             const newHost = followerHub.createHost(follower.id, record.id);
             (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
-            mesh.notifyInboxChanged(record.id, mesh.durableInboxNudge(record.id));
+            mesh.dispatch(record.id);
           } catch (err) {
             log.warn("follower_reconnect_attach_failed", {
               actorId: record.id,
@@ -3368,7 +3396,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       });
     },
     recoveryEligibility: (entry) => {
-      if (isProviderHalted(entry.provider)) {
+      if (isProviderHalted(entry.provider, entry.model)) {
         return { eligible: false, reason: "halted" };
       }
       const now = Date.now();
@@ -3381,18 +3409,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
     beforeRun: ({ mode }): boolean => {
-      // Same dispatch-time apply as the worker beforeRun (#199, extended to
-      // pools): a pool staged while root was queued/idle must land before
-      // this run's own gate()/admission and run_start, not at the end of
-      // the run after. Root's declared pool may hold several ordered
-      // entries (see the `modelConfig` comment on root's Actor construction
-      // above); the halt gate reads the first, the entry that launches first.
-      mesh.applyPendingModel(rootId);
-      const rootRecord = actors.get(rootId);
-      const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
-      if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
-        return false;
-      }
+      if (!mesh.prepareRun(rootId)) return false;
       if (mode === "yield-elicitation") return true;
       const watermark = root.getInterruptedWatermark?.();
       if (watermark) {
@@ -3834,6 +3851,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
           getFollowers: () => (followerHub ? followerHub.list() : []),
+          updateFollower: (id, opts) => {
+            if (!followerHub) throw new Error("Follower gateway not enabled");
+            return followerHub.updateFollower(id, opts);
+          },
+          updateAllFollowers: (opts) => {
+            if (!followerHub) throw new Error("Follower gateway not enabled");
+            return followerHub.updateAllFollowers(opts);
+          },
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
@@ -3939,9 +3964,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const cancelled = mesh.cancelHaltedQueuedRuns();
         scheduleHaltExpiry(haltCommand.until);
         console.warn(`[mesh] ⛔ HALT engaged via chat by ${who}`);
-        const scope = haltCommand.providers?.length
-          ? `provider${haltCommand.providers.length === 1 ? "" : "s"} ${haltCommand.providers.join(", ")}`
-          : "all actor runs";
+        const parts: string[] = [];
+        if (haltCommand.providers?.length) {
+          parts.push(
+            `provider${haltCommand.providers.length === 1 ? "" : "s"} ${haltCommand.providers.join(", ")}`
+          );
+        }
+        if (haltCommand.models?.length) {
+          parts.push(
+            `model${haltCommand.models.length === 1 ? "" : "s"} ${haltCommand.models.join(", ")}`
+          );
+        }
+        const scope = parts.length ? parts.join(" and ") : "all actor runs";
         const expiry = haltCommand.until ? ` until ${haltCommand.until}` : "";
         const flushed = cancelled.length ? ` Cleared ${cancelled.length} queued run(s).` : "";
         void cc
@@ -4088,6 +4122,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   }
+
+  // Boot survived: only now may an automatic leader-update trigger move followers.
+  // Arming here rather than at gateway bind is what keeps a leader that comes up far
+  // enough to open a socket and then dies from deploying followers onto the revision
+  // that killed it. Followers that connected earlier are reconciled by this call.
+  followerHub?.armReconciliation();
 
   // ── Lifecycle ──
   let running = true;

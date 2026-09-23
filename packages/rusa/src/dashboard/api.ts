@@ -155,10 +155,20 @@ export interface DashboardDataDeps {
   slackClient?: import("../slack/slack-client.js").SlackClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
   getFollowers?: () => FollowerInfo[];
+  updateFollower?: (
+    followerId: string,
+    options?: { targetSha?: string; branch?: string }
+  ) => FollowerUpdateStatus;
+  updateAllFollowers?: (options?: {
+    targetSha?: string;
+    branch?: string;
+  }) => FollowerUpdateStatus[];
 }
 
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
-export type { FollowerInfo };
+import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
+import { githubInboxEventReference } from "../github/inbox-notification.js";
+export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
 const AVATAR_PREFIX = "/api/mesh/avatar/";
@@ -225,6 +235,11 @@ function charterPreview(charter: string): string {
 
 type ResolvedInboxEntry = InboxEntry & {
   reference?: ResolvedReference;
+  /**
+   * The comment or review the event is about, nested under `reference` (the
+   * issue or PR it was routed by), when the event names one.
+   */
+  eventReference?: ResolvedReference;
 };
 type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
 
@@ -251,6 +266,12 @@ interface ThreadDto {
   modelConfig: ProviderModelConfig[];
   /** Named class that produced the declared snapshot, if it was class-configured. */
   modelClass?: string;
+  /**
+   * Why {@link modelClass} could not be resolved, when it could not be. The
+   * pool is empty in that case rather than stale, so the panel has to say why
+   * instead of showing nothing.
+   */
+  modelClassError?: string;
   /** Pending full-pool replacement staged for the next run boundary, if any. */
   desiredModelConfig?: ProviderModelConfig[];
   /** Named class that produced the pending snapshot, if it was class-configured. */
@@ -552,12 +573,20 @@ async function resolveInboxPage(
         // Same cache/resolver an obligation's cited artifacts use, so a
         // GitHub-sourced inbox entry gets the identical rich preview and
         // "open in new tab" link rather than a second rendering path.
-        const reference = deps.referenceCache
-          ? await deps.referenceCache
-              .get(entry.source, deps)
-              .catch(() => resolveReferenceSync(entry.source, { meshChat: deps.meshChat }))
-          : resolveReferenceSync(entry.source, { meshChat: deps.meshChat });
-        return { ...entry, reference };
+        const resolve = (ref: string) =>
+          deps.referenceCache
+            ? deps.referenceCache
+                .get(ref, deps)
+                .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+            : resolveReferenceSync(ref, { meshChat: deps.meshChat });
+        // A comment or review is resolved alongside the issue/PR it arrived
+        // through, so the card can show what was said and what it was said on.
+        const eventRef = githubInboxEventReference(entry.source, entry.payload);
+        const [reference, eventReference] = await Promise.all([
+          resolve(entry.source),
+          eventRef ? resolve(eventRef) : undefined,
+        ]);
+        return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
       }
       return entry;
     })
@@ -735,6 +764,80 @@ export async function handleMeshApiRequest(
               principal
             );
             sendJson(res, 201, { id });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/followers/:id/update — explicit follower update
+    const followerUpdateMatch = pathname.match(/^\/api\/mesh\/followers\/([^/]+)\/update$/);
+    if (followerUpdateMatch) {
+      const followerId = decodeURIComponent(followerUpdateMatch[1]);
+      if (!deps?.updateFollower) {
+        sendJson(res, 503, { error: "Follower gateway update unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: Record<string, unknown> = {};
+          if (bodyStr.trim()) {
+            try {
+              parsed = JSON.parse(bodyStr);
+            } catch {
+              sendJson(res, 400, { error: "Invalid JSON body" });
+              return;
+            }
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          const updateFollower = deps?.updateFollower;
+          if (!updateFollower) return;
+          try {
+            const status = updateFollower(followerId, {
+              targetSha: typeof parsed.targetSha === "string" ? parsed.targetSha : undefined,
+              branch: typeof parsed.branch === "string" ? parsed.branch : undefined,
+            });
+            sendJson(res, 200, { ok: true, followerId, updateStatus: status });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            const statusCode = message.includes("not connected") ? 404 : 400;
+            sendJson(res, statusCode, { error: message });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/followers/update-all — update all connected followers
+    if (pathname === "/api/mesh/followers/update-all") {
+      if (!deps?.updateAllFollowers) {
+        sendJson(res, 503, { error: "Follower gateway update unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: Record<string, unknown> = {};
+          if (bodyStr.trim()) {
+            try {
+              parsed = JSON.parse(bodyStr);
+            } catch {
+              sendJson(res, 400, { error: "Invalid JSON body" });
+              return;
+            }
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          const updateAllFollowers = deps?.updateAllFollowers;
+          if (!updateAllFollowers) return;
+          try {
+            const statuses = updateAllFollowers({
+              targetSha: typeof parsed.targetSha === "string" ? parsed.targetSha : undefined,
+              branch: typeof parsed.branch === "string" ? parsed.branch : undefined,
+            });
+            sendJson(res, 200, { ok: true, updates: statuses });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -1600,6 +1703,20 @@ export async function handleMeshApiRequest(
     return true;
   }
 
+  // GET /api/mesh/followers/:id/update — get follower update status
+  const getFollowerUpdateMatch = pathname.match(/^\/api\/mesh\/followers\/([^/]+)\/update$/);
+  if (getFollowerUpdateMatch) {
+    const followerId = decodeURIComponent(getFollowerUpdateMatch[1]);
+    const followers = deps?.getFollowers ? deps.getFollowers() : [];
+    const follower = followers.find((f) => f.id === followerId);
+    if (!follower) {
+      sendJson(res, 404, { error: `Follower ${followerId} not found` });
+      return true;
+    }
+    sendJson(res, 200, { followerId, updateStatus: follower.updateStatus ?? null });
+    return true;
+  }
+
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
     const runtime =
@@ -1708,6 +1825,7 @@ export async function handleMeshApiRequest(
           desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
           modelConfig: r.modelConfig ?? [],
           ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
+          ...(r.modelClassError !== undefined ? { modelClassError: r.modelClassError } : {}),
           ...(r.desiredModelConfig !== undefined
             ? { desiredModelConfig: r.desiredModelConfig }
             : {}),

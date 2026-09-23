@@ -26,6 +26,15 @@ import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
 
+class ModelClassInUseError extends Error {
+  constructor(className: string, referencingActors: readonly string[]) {
+    super(
+      `Cannot delete model class '${className}': referenced by live actor(s): ${referencingActors.join(", ")}. Rebind these actors first.`
+    );
+    this.name = "ModelClassInUseError";
+  }
+}
+
 export const AGENT_EXEC_MCP_NAME = "mesh";
 
 const providerModelConfigSchema = z.object({
@@ -975,7 +984,7 @@ export function createAgentExecMcpServer(
         {
           title: "Create or replace a runtime model class (model-admin)",
           description:
-            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Requires the model-admin capability.",
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Actors bound to this class by reference follow the new definition: dashboard and API reads show it at once, and each actor picks it up on its next run, while an already-launched run keeps the tuple it started on. Actors holding an explicit concrete pool are unaffected. A class definition cannot reference another class. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
             model_config: concreteModelConfigSchema.describe(
@@ -1009,7 +1018,7 @@ export function createAgentExecMcpServer(
         {
           title: "Delete a runtime model class (model-admin)",
           description:
-            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Requires the model-admin capability.",
+            "Delete a model class from mesh.db. Refuses deletion while any live actor is still bound to this class by reference — including a set_actor_model rebind staged for that actor's next run boundary — and names those actors so the caller rebinds them first (set_actor_model with an explicit pool or another class). A rebind that is only staged still counts as a reference until it reaches that actor's run boundary, so an actor you just rebound may still be named. Retired actors do not prevent deletion, and actors holding an explicit concrete pool are unaffected. Deleting a class nothing references stays a plain delete. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact class name to delete."),
           },
@@ -1019,6 +1028,38 @@ export function createAgentExecMcpServer(
           if (denied) return denied;
           try {
             const className = assertClassName(name);
+            // The whole reference guard lives here rather than in
+            // `ModelClassRepository.delete`, because only here is it complete:
+            // a binding has a committed half in `model_config` and a staged
+            // half — a `set_actor_model` that has not reached its run boundary
+            // — that lives in process memory and is in no table.
+            //
+            // The two halves are read asymmetrically on purpose. A staged
+            // arrival counts as a reference; a staged departure does not clear
+            // one. An actor bound to this class with a rebind staged still
+            // blocks the delete, because the staged overlay is discardable: if
+            // the instance restarts before the run boundary the rebind
+            // evaporates and the committed binding is still there. Refusing on
+            // the committed state and only ever adding to it from the staged
+            // state is therefore fail-safe in both directions. The operator
+            // consequence is that a staged rebind must be applied, not just
+            // staged, before its class can be deleted.
+            //
+            // Sorted by id so the message is stable: `mesh.list()` is ordered
+            // by `created_at, id`, which is spawn order, and spawn order is
+            // not something a caller reading an error can predict.
+            const liveReferencing = mesh
+              .list()
+              .filter(
+                (actor) =>
+                  actor.status === "active" &&
+                  (actor.modelClass === className || actor.desiredModelClass === className)
+              )
+              .map((actor) => actor.id)
+              .sort();
+            if (liveReferencing.length > 0) {
+              return toolError(new ModelClassInUseError(className, liveReferencing));
+            }
             const deleted = modelClasses.delete(className);
             if (deleted) {
               mesh.recordEvent({

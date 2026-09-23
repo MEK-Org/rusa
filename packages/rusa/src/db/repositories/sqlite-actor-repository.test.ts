@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
+import { ModelClassRepository } from "./model-class-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 
@@ -22,16 +23,27 @@ const root: ActorRecord = {
   createdAt: "2026-09-03T13:00:00.000Z",
 };
 
+const NOW = "2026-09-22T00:00:00.000Z";
+
 describe("SqliteActorRepository", () => {
   let db: Database.Database;
   let repository: SqliteActorRepository;
+  let classes: ModelClassRepository;
 
   beforeEach(() => {
     db = new Database(":memory:");
     runMigrations(db);
     db.pragma("foreign_keys = ON");
+    classes = new ModelClassRepository(db);
     repository = new SqliteActorRepository(db);
   });
+
+  const storedModelConfig = (id: string): string =>
+    (
+      db.prepare("SELECT model_config FROM actors WHERE id = ?").get(id) as {
+        model_config: string;
+      }
+    ).model_config;
 
   it("round-trips fields through versioned config documents and normalized handles", () => {
     repository.upsert(root);
@@ -85,19 +97,213 @@ describe("SqliteActorRepository", () => {
     ]);
   });
 
-  it("round-trips model-class provenance in the v3 document without changing the actors table", () => {
-    const classConfigured = { ...root, modelClass: "fast" };
-    repository.upsert(classConfigured);
+  it("persists a class-bound actor as a v4 reference and resolves its pool on every read", () => {
+    classes.upsert("fast", [{ provider: "codex", model: "gpt-fast", effort: "low" }], NOW);
+    repository.upsert({ ...root, modelClass: "fast" });
 
-    expect(repository.get("root")).toEqual(classConfigured);
+    // The resolved pool is a read-time projection of the class row, not the
+    // pool that happened to be on the record at write time.
+    expect(repository.get("root")).toEqual({
+      ...root,
+      modelClass: "fast",
+      modelConfig: [{ provider: "codex", model: "gpt-fast", effort: "low" }],
+    });
     const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
       model_config: string;
     };
-    expect(JSON.parse(row.model_config)).toEqual({
+    expect(JSON.parse(row.model_config)).toEqual({ schemaVersion: 4, modelClass: "fast" });
+
+    // #626: editing the class reaches the actor with no rewrite of the actor row.
+    classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-swift" },
+    ]);
+    expect(repository.get("root")?.modelClassError).toBeUndefined();
+    expect(
+      (
+        db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as
+          | { model_config: string }
+          | undefined
+      )?.model_config
+    ).toBe(JSON.stringify({ schemaVersion: 4, modelClass: "fast" }));
+  });
+
+  it("resolves the live class through list and children as well as get", () => {
+    classes.upsert("fast", [{ provider: "codex", model: "gpt-fast" }], NOW);
+    repository.upsert(root);
+    repository.upsert({
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      modelClass: "fast",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+
+    classes.upsert("fast", [{ provider: "codex", model: "gpt-faster" }], NOW);
+    const expected = [{ provider: "codex", model: "gpt-faster" }];
+    expect(repository.children("root")[0]?.modelConfig).toEqual(expected);
+    expect(repository.list().find((a) => a.id === "worker")?.modelConfig).toEqual(expected);
+  });
+
+  it("leaves an explicitly declared pool untouched by model class edits", () => {
+    classes.upsert("fast", [{ provider: "codex", model: "gpt-fast" }], NOW);
+    repository.upsert(root);
+
+    classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    expect(repository.get("root")).toEqual(root);
+  });
+
+  it("surfaces an unresolvable class as a per-actor error rather than a failed read", () => {
+    classes.upsert("fast", [{ provider: "codex", model: "gpt-fast" }], NOW);
+    repository.upsert(root);
+    repository.upsert({
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      modelClass: "fast",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    classes.delete("fast");
+
+    const broken = repository.get("worker");
+    expect(broken?.modelClass).toBe("fast");
+    expect(broken?.modelConfig).toBeUndefined();
+    expect(broken?.modelClassError).toMatch(/unknown model class "fast"/);
+    // One broken binding must not take the whole listing down with it.
+    expect(repository.get("root")).toEqual(root);
+    expect(
+      repository
+        .list()
+        .map((a) => a.id)
+        .sort()
+    ).toEqual(["root", "worker"]);
+  });
+
+  it("contains corrupt model-class definitions to the bound actor", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "broken",
+      charter: "Broken class binding",
+      parentId: "root",
+      modelClass: "broken-class",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    repository.upsert({
+      id: "missing",
+      charter: "Missing class binding",
+      parentId: "root",
+      modelClass: "missing-class",
+      status: "active",
+      createdAt: "2026-09-03T13:02:00.000Z",
+    });
+    classes.upsert("broken-class", [{ provider: "codex", model: "gpt-fast" }], NOW);
+    db.prepare("UPDATE model_classes SET definition_json = ? WHERE name = 'broken-class'").run(
+      "not-json"
+    );
+
+    // A corrupt referenced row and an unrelated corrupt row must both be
+    // reported on the individual binding; neither may make the actor list fail.
+    expect(repository.get("broken")?.modelClassError).toMatch(/broken-class.*invalid/i);
+    expect(repository.get("missing")?.modelClassError).toMatch(
+      /unknown model class "missing-class"/
+    );
+    expect(
+      repository
+        .list()
+        .map((actor) => actor.id)
+        .sort()
+    ).toEqual(["broken", "missing", "root"]);
+  });
+
+  it("ignores the duplicated pool on an existing v3 row without converting it", () => {
+    classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    repository.upsert(root);
+    const v3 = JSON.stringify({
       schemaVersion: 3,
-      entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
+      entries: [{ provider: "codex", model: "gpt-stale", effort: "high" }],
       modelClass: "fast",
     });
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(v3);
+
+    // Read-through wins over the stale copy without any boot sweep.
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-swift" },
+    ]);
+
+    // An incidental write touches unrelated columns and must leave the stored
+    // document exactly as it found it, so a row never acquires a v4 encoding
+    // an older binary cannot read as a side effect of ordinary traffic (#626).
+    repository.patch("root", { title: "Renamed" });
+    repository.patch("root", { sessionId: "session-1" });
+    repository.patch("root", { charter: "Rewritten charter" });
+    expect(storedModelConfig("root")).toBe(v3);
+    expect(repository.get("root")?.title).toBe("Renamed");
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-swift" },
+    ]);
+  });
+
+  it("converts a v3 row to a v4 reference only on an explicit model-configuration change", () => {
+    classes.upsert("fast", [{ provider: "claude", model: "claude-swift" }], NOW);
+    classes.upsert("slow", [{ provider: "codex", model: "gpt-deep", effort: "high" }], NOW);
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(
+      JSON.stringify({
+        schemaVersion: 3,
+        entries: [{ provider: "codex", model: "gpt-stale", effort: "high" }],
+        modelClass: "fast",
+      })
+    );
+
+    // Re-selecting the same class is still a deliberate selection, so it
+    // restates the document in the current shape.
+    repository.setModelSelection("root", { modelClass: "fast" });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({ schemaVersion: 4, modelClass: "fast" });
+
+    // A rebind onto a different class writes the new reference.
+    repository.setModelSelection("root", { modelClass: "slow" });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({ schemaVersion: 4, modelClass: "slow" });
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-deep", effort: "high" },
+    ]);
+
+    // Replacing the binding with an explicit pool drops the reference entirely.
+    repository.setModelSelection("root", {
+      modelClass: undefined,
+      modelConfig: [{ provider: "claude", model: "claude-pinned" }],
+    });
+    expect(JSON.parse(storedModelConfig("root"))).toEqual({
+      schemaVersion: 2,
+      entries: [{ provider: "claude", model: "claude-pinned" }],
+    });
+    // A later class edit no longer reaches the actor.
+    classes.upsert("slow", [{ provider: "codex", model: "gpt-deeper" }], NOW);
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-pinned" },
+    ]);
+  });
+
+  it("refuses to silently drop an explicit model selection for a missing row", () => {
+    expect(() => repository.setModelSelection("missing", { modelClass: "fast" })).toThrow(
+      /cannot set model selection on unknown actor 'missing'/
+    );
+  });
+
+  it("rejects a malformed v4 class reference at the consumption boundary", () => {
+    repository.upsert(root);
+
+    for (const invalid of [
+      '{"schemaVersion":4}',
+      '{"schemaVersion":4,"modelClass":""}',
+      '{"schemaVersion":4,"modelClass":"fast","entries":[]}',
+      '{"schemaVersion":4,"modelClass":123}',
+    ]) {
+      db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(invalid);
+      expect(() => repository.get("root")).toThrow(/invalid model_config for actor 'root'/);
+    }
   });
 
   it("continues to read strict v2 pools without class provenance", () => {

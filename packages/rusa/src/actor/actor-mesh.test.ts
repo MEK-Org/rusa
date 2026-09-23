@@ -79,9 +79,25 @@ import {
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
+
+/**
+ * Test-only raw-row replacement. `patch` deliberately cannot alter model
+ * selection; these cases model what a repository read can surface after a
+ * class row changes or becomes invalid.
+ */
+function replaceRecord(
+  registry: InMemoryActorRepository,
+  id: string,
+  changes: Partial<ActorRecord>
+): void {
+  const record = registry.get(id);
+  if (!record) throw new Error(`actor record ${id} missing`);
+  registry.upsert({ ...record, ...changes });
+}
 
 function captureLogger(records: Array<Record<string, unknown>>): Logger {
   let logger!: Logger;
@@ -163,7 +179,12 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       if (options.source !== undefined) {
         matched = matched.filter((entry) => entry.source === options.source);
       }
+      if (options.responsiveOnly) {
+        matched = matched.filter((entry) => entry.payload.priority === "responsive");
+      }
+      // Newest first, as SqliteInboxRepository's `delivered_at DESC` ordering is.
       matched = [...matched].reverse();
+      if (options.limit !== undefined) matched = matched.slice(0, options.limit);
       return {
         entries: matched,
         unhandledCount: entries.filter(
@@ -242,7 +263,7 @@ function setup(
     onSpawn?: (record: { id: string }) => void;
     onRevive?: (record: { id: string }) => void;
     retireCleanups?: RetireCleanup[];
-    isHalted?: (provider?: string) => boolean;
+    isHalted?: ActorMeshOptions["isHalted"];
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
     recordChat?: (opts: {
@@ -284,6 +305,7 @@ function setup(
     handleForId?: (id: string) => string;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
+    responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
     secretsDir?: string;
   } = {}
 ) {
@@ -359,6 +381,7 @@ function setup(
     retireCleanups: opts.retireCleanups,
     providerGate: opts.providerGate,
     voiceTransferLogger: opts.voiceTransferLogger,
+    responsiveInterruption: opts.responsiveInterruption,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -951,7 +974,11 @@ describe("ActorMesh", () => {
         { actorId: "not-live", priority: "normal" as const },
       ],
       countUnhandled: (actorId: string) => (actorId === "t1" ? 1 : 0),
+      list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
       markSeen: () => [],
+      // Partial fake: it never notifies, so the only wake here is whatever the
+      // mesh path under test sends itself.
+      onItemsAppended: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -967,22 +994,121 @@ describe("ActorMesh", () => {
 
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
-    expect(logs).toContain("inbox_changed for not-live not nudged — no live actor");
+    expect(logs).toContain("dispatch(not-live) refused — no live actor");
   });
 
-  it("re-derives a remote reattach nudge from the durable inbox (#568)", () => {
+  it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
     const inboxStore = createMemoryInboxStore();
-    const { mesh } = setup({ inboxStore });
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "durable work", parentId: "root" });
+    await tick();
+    expect(fake(id).calls).toHaveLength(0); // spawn is not a message
+
+    // The row is committed straight to the store with no mesh call after it,
+    // which is what an appending path that forgot to nudge looks like from
+    // here. Scheduling has to follow from the commit, not from the caller
+    // remembering (#388).
+    inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
+    await tick();
+
+    expect(fake(id).calls).toHaveLength(1);
+    expect(fake(id).calls[0]?.prompt).toContain("Work from your inbox");
+  });
+
+  it("pokes a recipient once per append, and not at all for rows it did not insert", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { logs, tick } = setup({ inboxStore });
+    // A recipient with no live actor makes every poke individually visible in
+    // the journal, which is what counting them one per actor per batch needs.
+    const pokes = (): number =>
+      logs.filter((line) => line === "dispatch(absent) refused — no live actor").length;
+
+    inboxStore.append([
+      { id: "e1", actorId: "absent", source: "mesh:a", payload: payload("mesh.message") },
+      { id: "e2", actorId: "absent", source: "mesh:b", payload: payload("mesh.message") },
+      { id: "e3", actorId: "absent", source: "mesh:c", payload: payload("mesh.message") },
+    ]);
+    await tick();
+    expect(pokes()).toBe(1);
+
+    // Redelivering known ids inserts nothing, so it is not work arriving and
+    // must wake nobody — the store reports only rows it actually committed.
+    inboxStore.append([
+      { id: "e1", actorId: "absent", source: "mesh:a", payload: payload("mesh.message") },
+    ]);
+    await tick();
+    expect(pokes()).toBe(1);
+  });
+
+  it("leaves a wake the appending path already sent alone, rather than sending a second", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, logs, tick } = setup({ inboxStore });
+    const pokes = (): number =>
+      logs.filter((line) => line === "dispatch(absent) refused — no live actor").length;
+
+    // The shape every appending path in the mesh has: commit, then wake the
+    // recipient itself. The debt the commit created is settled by that wake,
+    // so the seam has nothing left to pay.
+    inboxStore.append([{ actorId: "absent", source: "mesh:a", payload: payload("mesh.message") }]);
+    mesh.dispatch("absent");
+    await tick();
+    expect(pokes()).toBe(1);
+
+    // The same rule seen from a live actor: one delivery is one run, not the
+    // run the caller admitted plus a second the seam cancels it for.
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    mesh.sendMessage(worker, "one message", "root");
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+  });
+
+  it("settles a root-alias append debt when the appender wakes the concrete root", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const rootId = "root-3f1a";
+    const { mesh, logs, tick } = setup({ inboxStore, rootId });
+    const pokes = (): number =>
+      logs.filter((line) => line === `dispatch(${rootId}) is a no-op — no durable work`).length;
+
+    // The legacy alias and concrete id share one debt even though the current
+    // production writers normalize before appending. This only characterizes
+    // the seam's suppression key; the inbox's durable lookup remains concrete.
+    inboxStore.append([{ actorId: "root", source: "mesh:a", payload: payload("mesh.message") }]);
+    mesh.dispatch(rootId);
+    await tick();
+
+    expect(pokes()).toBe(1);
+  });
+
+  it("unsubscribes durable-append scheduling when a mesh is shut down", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const first = setup({ inboxStore });
+    first.mesh.shutdownAll();
+    const second = setup({ inboxStore });
+    const worker = second.mesh.spawn({ charter: "replacement worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    await second.tick();
+
+    expect(second.fake(worker).calls).toHaveLength(1);
+    expect(first.logs).not.toContain(`dispatch(${worker}) refused — no live actor`);
+  });
+
+  it("re-derives a remote reattach dispatch from the durable inbox (#568)", () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, logs } = setup({ inboxStore });
     const id = mesh.spawn({ charter: "remote", parentId: "root" });
 
-    // Nothing unhandled: an ordinary nudge, so an idle follower is not woken as responsive.
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    // Nothing unhandled: the reattach dispatch is advisory and finds no work,
+    // so an idle follower is not woken at all.
+    expect(mesh.dispatch(id)).toBe(false);
+    expect(logs).toContain(`dispatch(${id}) is a no-op — no durable work`);
 
     inboxStore.append([{ actorId: id, source: "mesh:root", payload: payload("mesh.message") }]);
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    expect(mesh.dispatch(id)).toBe(true);
 
     // A responsive item the follower never observed (delivered during a
-    // transport gap) is what makes the reattach nudge responsive.
+    // transport gap) is what makes the reattach dispatch responsive. The caller
+    // still says nothing about priority; the durable entry does.
     const [urgent] = inboxStore.append([
       {
         actorId: id,
@@ -990,10 +1116,27 @@ describe("ActorMesh", () => {
         payload: { ...payload("mesh.message"), priority: "responsive" },
       },
     ]);
-    expect(mesh.durableInboxNudge(id)).toEqual({ priority: "responsive" });
+    expect(mesh.dispatch(id)).toBe(true);
 
     inboxStore.markHandled(id, [urgent.id]);
-    expect(mesh.durableInboxNudge(id)).toEqual({});
+    inboxStore.markHandled(
+      id,
+      inboxStore.entries.filter((e) => e.actorId === id && e.handledAt === null).map((e) => e.id)
+    );
+    expect(mesh.dispatch(id)).toBe(false);
+  });
+
+  it("warns when constructed without durable inbox storage", () => {
+    const logs: string[] = [];
+    new ActorMesh({
+      actors: new InMemoryActorRepository(),
+      log: (message) => logs.push(message),
+      createActor: () => ({}) as unknown as Actor,
+    });
+
+    expect(logs).toContain(
+      "ActorMesh constructed without an inboxStore; dispatch is disabled until durable inbox storage is wired"
+    );
   });
 
   it("coalesces inbox changes during a run into one dirty follow-up", async () => {
@@ -1155,6 +1298,224 @@ describe("ActorMesh", () => {
     mesh.sendMessage(classConfigured, "apply explicit pin", "root");
     await tick();
     expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
+  });
+
+  it("refuses to dispatch a class-bound actor whose class no longer resolves, reporting it once", async () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry, fake, tick } = setup({ events: (event) => events.push(event) });
+    const id = mesh.spawn({ charter: "do work", parentId: "root" });
+    // The shape the repository reads back once the class row is gone: the
+    // binding survives, the pool does not.
+    replaceRecord(registry, id, {
+      modelClass: "fast",
+      modelConfig: undefined,
+      modelClassError: 'unknown model class "fast" — no runtime model classes are defined',
+    });
+
+    mesh.sendMessage(id, "begin", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+
+    // A second wake reports the same reason again but does not re-journal it.
+    mesh.sendMessage(id, "begin again", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(0);
+    expect(events.filter((e) => e.kind === "actor_model_class_unresolved")).toEqual([
+      {
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: 'unknown model class "fast" — no runtime model classes are defined',
+      },
+    ]);
+
+    // Redefining the class heals the binding without touching the actor row.
+    replaceRecord(registry, id, {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      modelClassError: undefined,
+    });
+    mesh.sendMessage(id, "now run", "root");
+    await tick();
+    expect(fake(id).calls).toHaveLength(1);
+  });
+
+  it("applies a staged repair before refusing an unresolved class binding", async () => {
+    const resolve = (input: SpawnRequest["modelConfig"]): ProviderModelConfig[] => {
+      if (isModelClassReference(input)) {
+        if (input.class === "healthy") return [{ provider: "codex", model: "gpt-healthy" }];
+        throw new Error(`unknown class ${input.class}`);
+      }
+      const concrete = assertConcreteModelConfig(input);
+      return (Array.isArray(concrete) ? concrete : [concrete]).map((entry) => ({
+        provider: entry.provider,
+        model: entry.model ?? "missing-model",
+        effort: entry.effort,
+      }));
+    };
+    const { mesh, registry, fake, tick } = setup({
+      validateModel: (_record, input) => resolve(input),
+    });
+    const classRepair = mesh.spawn({ charter: "class repair", parentId: "root" });
+    const explicitRepair = mesh.spawn({ charter: "explicit repair", parentId: "root" });
+    for (const id of [classRepair, explicitRepair]) {
+      replaceRecord(registry, id, {
+        modelClass: "deleted",
+        modelConfig: undefined,
+        modelClassError: 'unknown model class "deleted" — no runtime model classes are defined',
+      });
+    }
+
+    mesh.setActorModel(classRepair, { class: "healthy" }, "root");
+    mesh.setActorModel(explicitRepair, { provider: "codex", model: "gpt-pinned" }, "root");
+    mesh.sendMessage(classRepair, "repair class", "root");
+    mesh.sendMessage(explicitRepair, "repair pin", "root");
+    await tick();
+
+    expect(fake(classRepair).calls).toHaveLength(1);
+    expect(fake(explicitRepair).calls).toHaveLength(1);
+    expect(registry.get(classRepair)).toMatchObject({
+      modelClass: "healthy",
+      modelConfig: [{ provider: "codex", model: "gpt-healthy" }],
+    });
+    expect(registry.get(explicitRepair)).toMatchObject({
+      modelClass: undefined,
+      modelConfig: [{ provider: "codex", model: "gpt-pinned" }],
+    });
+  });
+
+  it("hands a class-bound actor its class's current definition at the dispatch boundary", async () => {
+    const applied: Array<{ id: string; pool: ProviderModelConfig[] }> = [];
+    const { mesh, registry, tick } = setup({
+      onModelSet: (id, pool) => applied.push({ id, pool: [...pool] }),
+    });
+    const classConfigured = mesh.spawn({ charter: "class-bound", parentId: "root" });
+    const explicit = mesh.spawn({ charter: "explicit", parentId: "root" });
+    replaceRecord(registry, classConfigured, {
+      modelClass: "fast",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+    });
+    replaceRecord(registry, explicit, {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+    });
+    applied.length = 0;
+
+    // A class edit reaches the record by read-through; the live actor still
+    // holds the pool it was constructed with until its next dispatch (#626).
+    replaceRecord(registry, classConfigured, {
+      modelConfig: [{ provider: "claude", model: "edited" }],
+    });
+    replaceRecord(registry, explicit, { modelConfig: [{ provider: "claude", model: "edited" }] });
+    mesh.sendMessage(classConfigured, "run", "root");
+    mesh.sendMessage(explicit, "run", "root");
+    await tick();
+
+    // Every publication is for the class-bound actor and carries the class's
+    // current definition; the explicit-pool actor is never published to. The
+    // count is deliberately not pinned: the refresh runs at each dispatch
+    // boundary and the assignment it makes is idempotent.
+    expect(applied.length).toBeGreaterThan(0);
+    expect(applied).toEqual(
+      applied.map(() => ({
+        id: classConfigured,
+        pool: [{ provider: "claude", model: "edited" }],
+      }))
+    );
+    // Nothing was staged, so no model-set event was journalled for the refresh.
+    expect(registry.get(classConfigured)?.desiredModelConfig).toBeUndefined();
+  });
+
+  it("launches the edited class tuple only on the run after an already-launched tuple", async () => {
+    const attempts: RawProviderModelConfig[] = [];
+    const completions: Array<() => void> = [];
+    let liveMesh!: ActorMesh;
+    const { mesh, registry, tick } = setup({
+      onModelSet: (id, pool) => liveMesh.get(id)?.setModelConfig?.(pool),
+      createActor: (ctx) => {
+        let actor!: Actor;
+        actor = new Actor({
+          id: ctx.record.id,
+          cwd: `/tmp/${ctx.record.id}`,
+          modelConfig: ctx.record.modelConfig ?? [{ provider: "codex", model: "initial" }],
+          resolveProvider: (selected) =>
+            new FakeProvider(
+              () => {
+                actor.declareYield();
+                return new Promise((resolve) =>
+                  completions.push(() => resolve({ success: true, output: "", exitCode: 0 }))
+                );
+              },
+              selected.provider,
+              selected.model,
+              selected.effort
+            ),
+          onProviderAttempt: (provider) =>
+            attempts.push({
+              provider: provider.providerName,
+              model: provider.model,
+              effort: provider.effort,
+            }),
+          mcpServers: [],
+          loadSessionId: () => ctx.getRecord()?.sessionId,
+          saveSessionId: (sessionId) => ctx.mesh.actors.patch(ctx.record.id, { sessionId }),
+          buildPrompt: () => ({ prompt: "Work from your inbox." }),
+          gate: ctx.gate,
+          beforeRun: ctx.beforeRun,
+          admitRun: ctx.admitRun,
+          lifecycle: ctx.lifecycle,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+          debounceMs: DEBOUNCE,
+        });
+        return actor;
+      },
+    });
+    liveMesh = mesh;
+    const id = mesh.spawn({ charter: "class-bound", parentId: "root" });
+    const oldTuple = { provider: "codex", model: "gpt-old", effort: "low" };
+    const editedTuple = { provider: "claude", model: "claude-edited", effort: "high" };
+    const initialRecord = registry.get(id);
+    if (!initialRecord) throw new Error("spawned actor record missing");
+    registry.upsert({ ...initialRecord, modelClass: "fast", modelConfig: [oldTuple] });
+    mesh.applyPendingModel(id);
+
+    mesh.sendMessage(id, "launch old class", "root");
+    await tick();
+    expect(attempts).toEqual([oldTuple]);
+
+    // The class edit appears on a fresh record read while the old provider
+    // attempt remains live. It must not rewrite that launched attempt.
+    const classBoundRecord = registry.get(id);
+    if (!classBoundRecord) throw new Error("class-bound actor record missing");
+    registry.upsert({ ...classBoundRecord, modelConfig: [editedTuple] });
+    expect(attempts).toEqual([oldTuple]);
+    completions.shift()?.();
+    await tick();
+
+    mesh.sendMessage(id, "launch edited class", "root");
+    await tick();
+    expect(attempts).toEqual([oldTuple, editedTuple]);
+    completions.shift()?.();
+    await tick();
+  });
+
+  it("keeps inspection of a class error separate from the refusal event", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry } = setup({ events: (event) => events.push(event) });
+    const id = mesh.spawn({ charter: "inspect broken class", parentId: "root" });
+    const record = registry.get(id);
+    if (!record) throw new Error("spawned actor record missing");
+    registry.upsert({
+      ...record,
+      modelClass: "missing",
+      modelConfig: undefined,
+      modelClassError: 'unknown model class "missing" — no runtime model classes are defined',
+    });
+
+    expect(mesh.modelClassError(id)).toMatch(/unknown model class/);
+    expect(events.filter((event) => event.kind === "actor_model_class_unresolved")).toEqual([]);
+    mesh.reportModelClassFailure(id);
+    expect(events).toContainEqual(
+      expect.objectContaining({ kind: "actor_model_class_unresolved", actorId: id })
+    );
   });
 
   it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {
@@ -1576,6 +1937,56 @@ describe("ActorMesh", () => {
       obligationId: "ob-9",
       priority: "responsive",
     });
+  });
+
+  it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // The running actor closed a prerequisite and made its own obligation
+    // ready. The entry is durably responsive, so it is scheduled and admitted
+    // as responsive — but the actor will see it in its own worklist, so the
+    // run it is already doing is not thrown away.
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+    ).toBe(true);
+    await Promise.resolve(); // flush the durable-append drain after the join wake
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(2);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(true);
   });
 
   it("never lets inbox dedupe suppress a genuine repeated transition delivered by a restarted mesh (#513)", async () => {
@@ -2074,7 +2485,7 @@ describe("ActorMesh", () => {
         payload: { type: "github.issue" },
       },
     ]);
-    expect(mesh.notifyInboxChanged(worker)).toBe(false);
+    expect(mesh.dispatch(worker)).toBe(false);
     mesh.deliverWake(worker, "cron maintenance");
     await tick();
 
@@ -2164,7 +2575,7 @@ describe("ActorMesh", () => {
     const [sourceNormal] = inboxStore.append([
       { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.notifyInboxChanged(source)).toBe(false);
+    expect(mesh.dispatch(source)).toBe(false);
 
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
@@ -2200,7 +2611,7 @@ describe("ActorMesh", () => {
     inboxStore.append([
       { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
     ]);
-    expect(mesh.notifyInboxChanged(target)).toBe(false);
+    expect(mesh.dispatch(target)).toBe(false);
     holder = "";
     expect(mesh.notifyVoiceSessionEnded(target)).toBe(true);
     await tick();
@@ -2343,7 +2754,7 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
     inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
-    mesh.notifyInboxChanged(worker);
+    mesh.dispatch(worker);
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
     expect(firstSignal?.aborted).toBe(false);
@@ -2355,7 +2766,7 @@ describe("ActorMesh", () => {
         payload: { type: "system.disk", priority: "responsive" },
       },
     ]);
-    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    mesh.dispatch(worker);
 
     expect(firstSignal?.aborted).toBe(true);
     expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
@@ -2385,6 +2796,196 @@ describe("ActorMesh", () => {
     expect(unhandled.map((e) => e.payload.type)).toEqual(["mesh.message", "system.disk"]);
   });
 
+  it("keeps the normal responsive preemption while shadowing a redacted Choice decision", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    const provider = new FakeProvider((opts) => {
+      firstSignal = opts.signal;
+      return new Promise<Partial<RunResult>>(() => {});
+    });
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(firstSignal?.aborted).toBe(false);
+
+    mesh.sendHumanMessage(worker, "private operator body", "session-1");
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadow = events.find((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toEqual(
+      expect.objectContaining({
+        actorId: worker,
+        detail: "shadow",
+      })
+    );
+    expect(shadow?.payload).toContain('"outcome":"interrupt"');
+    expect(shadow?.payload).not.toContain("private operator body");
+  });
+
+  it("leaves the dispatch path untouched when no classifier is configured", async () => {
+    // The seam is described as inert without a classifier, so the thing to pin
+    // is the wiring rather than the absence of events: a mesh that wires the
+    // hook unconditionally makes `RunManager` collect rows and strands the
+    // default path's early exit in every deployment, none of which has one.
+    const base = createMemoryInboxStore();
+    let responsiveLists = 0;
+    const inboxStore: typeof base = {
+      ...base,
+      list: (actorId, options = {}) => {
+        if (options.responsiveOnly) responsiveLists++;
+        // Page the responsive scan one row at a time, as the real repository
+        // does past its limit, so a caller that cannot exit early pays for it.
+        const page = base.list(actorId, { ...options, limit: undefined });
+        if (!options.responsiveOnly) return page;
+        const start = options.cursor ? Number(options.cursor) : 0;
+        const entries = page.entries.slice(start, start + 1);
+        return {
+          ...page,
+          entries,
+          nextCursor: start + 1 < page.entries.length ? String(start + 1) : null,
+        };
+      },
+    };
+
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Newest first, so the voice memo is the first row the scan reads and a
+    // deployment with no observer has both its answers after one page.
+    mesh.sendHumanMessage(worker, "older operator body", "session-1");
+    await tick();
+
+    // Measure the voice memo's own dispatch: it is the newest row, so the scan
+    // has both its answers after one page and stops. A collecting deployment
+    // has to read the older row too, and pays a page for it.
+    responsiveLists = 0;
+    mesh.sendHumanMessage(worker, "voice body", "session-1", { voice: true });
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events.some((event) => event.kind === "responsive_interruption_shadow")).toBe(false);
+    expect(responsiveLists).toBe(1);
+  });
+
+  it("observes each arriving responsive row once across repeated delivery pokes", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        choose: async (request) =>
+          request.id === "comparison"
+            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
+            : { choice: "refinement", confidence: 0.95 },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // No run is admitted, so neither row is ever marked seen: a second poke
+    // re-reads the first row alongside the second.
+    mesh.sendHumanMessage(worker, "first operator body", "session-1");
+    await tick();
+    mesh.sendHumanMessage(worker, "second operator body", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const observed = events
+      .filter((event) => event.kind === "responsive_interruption_shadow")
+      .map((event) => JSON.parse(event.payload ?? "{}").decision.incomingEntryId as string);
+    expect(observed).toHaveLength(new Set(observed).size);
+    expect(observed).toHaveLength(2);
+  });
+
+  it("does not let ordinary traffic abort the run already working the operator's message", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "done" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // The operator's message starts a responsive run. It stays unhandled for
+    // the whole run: an actor marks its work handled at the end.
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "mesh:human:operator",
+        payload: { type: "human.message", priority: "responsive" },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(firstSignal?.aborted).toBe(false);
+
+    // Three children report in while that run is still going. Each delivery is
+    // ordinary work arriving behind responsive work the run already holds, so
+    // none of them is a reason to throw the run away and start over.
+    for (const child of ["c1", "c2", "c3"]) {
+      inboxStore.append([
+        { actorId: worker, source: `mesh:${child}`, payload: payload("mesh.message") },
+      ]);
+      mesh.dispatch(worker);
+    }
+
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // The ordinary work is not lost: it is durable, and the run in flight ends
+    // with exactly one coalesced follow-up.
+    resolveFirst({ success: true, exitCode: 0, output: "operator answered" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(2);
+  });
+
   it("delivers responsive inbox work to an idle actor without a preemption event", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
@@ -2398,7 +2999,7 @@ describe("ActorMesh", () => {
         payload: { type: "system.disk", priority: "responsive" },
       },
     ]);
-    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    mesh.dispatch(worker);
     await tick();
 
     expect(fake(worker).calls).toHaveLength(1);
@@ -4441,7 +5042,7 @@ describe("ActorMesh", () => {
       onModelSet: (actorId, modelConfig, record) =>
         modelSets.push({ actorId, newModel: modelConfig[0]?.model, record }),
     });
-    registry.patch("root", {
+    replaceRecord(registry, "root", {
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });
@@ -5712,6 +6313,343 @@ describe("ActorMesh", () => {
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
     });
+
+    it("schedules a multi-model actor on an unhalted fallback when primary provider is halted (#625)", async () => {
+      const poolARuns: string[] = [];
+      const poolBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "pool-a",
+          {
+            name: "pool-a",
+            providerName: "pool-a",
+            run: async (runOpts) => {
+              poolARuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
+            },
+          },
+        ],
+        [
+          "pool-b",
+          {
+            name: "pool-b",
+            providerName: "pool-b",
+            run: async (runOpts) => {
+              poolBRuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "b" };
+            },
+          },
+        ],
+      ]);
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider, _model) => {
+          if (!provider) return false;
+          return halted.has(provider);
+        },
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: pacerFor(c.provider),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          const actor: Actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => {
+              const base = providerByName.get(selected.provider);
+              if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+              return base;
+            },
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Place a provider-wide halt on pool-a before the message arrives.
+      halted.add("pool-a");
+
+      // Send the actor a fresh message.
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Expected: the scheduler filters halted pool-a and schedules on fallback pool-b.
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+    });
+
+    it("blocks only matching entries from a model-scoped halt (#625)", async () => {
+      const executedModels: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const haltedModels = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider, model) => {
+          if (!provider) return false;
+          return model ? haltedModels.has(`${provider}:${model}`) : false;
+        },
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: `${c.provider}:${c.model}`,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => (c.model ? haltedModels.has(`${c.provider}:${c.model}`) : false),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-1" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                executedModels.push(selected.model ?? "");
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-1" },
+          { provider: "pool-a", model: "model-2" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt only model-1 from pool-a
+      haltedModels.add("pool-a:model-1");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Only model-2 should have run
+      expect(executedModels).toEqual(["model-2"]);
+    });
+
+    it("leaves an all-held pool unscheduled with existing retry semantics on unhalt (#625)", async () => {
+      const runs: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                runs.push(selected.provider);
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt both providers in the pool
+      halted.add("pool-a");
+      halted.add("pool-b");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Remains unscheduled: no runs, not queued
+      expect(runs).toEqual([]);
+      expect(mesh.activeRunState(worker)).toBeNull();
+
+      // Unhalt pool-a: reconcile unseen inbox restores eligibility without pool edit
+      halted.delete("pool-a");
+      mesh.reconcileUnseenInbox();
+      await tick();
+
+      expect(runs).toEqual(["pool-a"]);
+    });
+
+    it("preserves relative order of unheld entries when filtering precedes quota pacing (#625)", async () => {
+      const selectedProviders: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const halted = new Set<string>();
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: new ProviderPacer(0),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                selectedProviders.push(selected.provider);
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: "ok" };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+          { provider: "pool-c", model: "model-c" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Halt only pool-a; both pool-b and pool-c are available
+      halted.add("pool-a");
+
+      mesh.sendMessage(worker, "fresh message", "root");
+      await tick();
+
+      // Relative order of [pool-b, pool-c] preserved: pool-b chosen
+      expect(selectedProviders).toEqual(["pool-b"]);
+    });
   });
 
   // #347 responsive promotion retains the normal admission choice. A queued
@@ -6650,7 +7588,16 @@ describe("ActorMesh", () => {
             handledAt: null,
           }));
         },
-        countUnhandled: () => appended.length,
+        // Honours responsiveOnly: these entries carry no priority, so dispatch
+        // must read them as ordinary work and debounce rather than quick-start.
+        countUnhandled: (_actorId: string, options: { responsiveOnly?: boolean } = {}) =>
+          appended.filter(
+            (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
+          ).length,
+        list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -6738,6 +7685,9 @@ describe("ActorMesh", () => {
         append: () => {
           throw new Error("disk full");
         },
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -6773,7 +7723,12 @@ describe("ActorMesh", () => {
             handledAt: null,
           }));
         },
+        countUnhandled: () => appended.length,
+        list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
         markSeen: () => [],
+        // Partial fake: it never notifies, so the only wake here is whatever the
+        // mesh path under test sends itself.
+        onItemsAppended: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
@@ -7370,7 +8325,7 @@ describe("ActorMesh", () => {
       });
       const startRun = async (actorId: string) => {
         inboxStore.append([{ actorId, source: "mesh:root", payload: payload("mesh.message") }]);
-        harness.mesh.notifyInboxChanged(actorId);
+        harness.mesh.dispatch(actorId);
         await harness.tick();
         expect(runs.get(actorId)).toBe(1);
         expect(signals.get(actorId)?.aborted).toBe(false);
@@ -7421,6 +8376,7 @@ describe("ActorMesh", () => {
         await t.startRun(watcher);
 
         await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
@@ -8618,7 +9574,7 @@ describe("ActorMesh", () => {
           payload: { type: "task", content: "initial task" },
         },
       ]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
 
       expect(mesh.activeRunState(worker)).toEqual({ actorId: worker, phase: "running" });
@@ -8670,7 +9626,7 @@ describe("ActorMesh", () => {
           payload: { type: "task", content: "initial task" },
         },
       ]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
 
       expect(mesh.activeRunState(worker)).toEqual({ actorId: worker, phase: "running" });
@@ -8740,7 +9696,7 @@ describe("ActorMesh", () => {
       });
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       inboxStore.append([{ actorId: worker, source: "root", payload: payload("task") }]);
-      mesh.notifyInboxChanged(worker);
+      mesh.dispatch(worker);
       await tick();
       expect(fake(worker).calls).toHaveLength(1);
       expect(signal?.aborted).toBe(false);
@@ -9161,8 +10117,8 @@ describe("ActorMesh", () => {
       expect(activeRoute.principal).toBe(worker);
       expect(activeRoute.isLive).toBe(true);
 
-      // Worker is retired/dead and no longer in live set
-      (env.mesh as unknown as { live: Set<string> }).live.delete(worker);
+      // Worker is retired/dead and no longer in the RunManager's live registry
+      (env.mesh as unknown as { runs: { forget(id: string): void } }).runs.forget(worker);
 
       const deadRoute = env.mesh.resolveEffectiveRoute(issueRef);
       // Route is uncovered because subscriber is dead and has no live ancestor owner

@@ -28,16 +28,36 @@ export interface ActorRecord {
   charter: string;
   parentId: string | null;
   handles?: ActorHandle[];
-  /** Bounded, non-empty, validated pool of provider/model/effort candidates. */
+  /**
+   * Bounded, non-empty, validated pool of provider/model/effort candidates.
+   * A durable snapshot for an explicitly declared tuple or pool; for a
+   * class-bound actor ([modelClass] set) it is instead resolved from the
+   * class's current definition on every read, and is unset when that class
+   * cannot be resolved ([modelClassError]).
+   */
   modelConfig?: ProviderModelConfig[];
   /**
-   * Named runtime model class that produced [modelConfig]'s resolved snapshot.
-   * Omitted for an explicitly declared tuple or pool, including records written
-   * before class provenance was retained. The original class cannot be
-   * truthfully recovered from a historical resolved pool, so those records
-   * remain on the explicit-pool dashboard fallback until reconfigured.
+   * The runtime model class this actor is bound to — its single durable source
+   * of model selection truth. Nothing copies the class's entries onto the
+   * actor: [modelConfig] above reads through to the class row, so a class edit
+   * reaches the dashboard and the actor's next scheduled run without any
+   * restart (#626). An already-launched run keeps the pool it launched on, in
+   * its own run record.
+   *
+   * Omitted for an explicitly declared tuple or pool, which stays a durable
+   * snapshot that class edits never touch — including records written before
+   * class provenance was retained, whose original class cannot be truthfully
+   * recovered from a historical resolved pool.
    */
   modelClass?: string;
+  /**
+   * Why [modelClass] could not be resolved on this read — missing, deleted,
+   * empty or invalid. Set only for a class-bound actor, and then [modelConfig]
+   * is deliberately left unset: a broken binding fails visibly at the dispatch
+   * gate and on the dashboard rather than quietly running on a stale pool.
+   * Derived per read, never stored on the actor row.
+   */
+  modelClassError?: string;
   /** Process-local staged full-pool replacement; deliberately not durable. */
   desiredModelConfig?: ProviderModelConfig[];
   /** Process-local provenance for [desiredModelConfig], cleared with that staged pool. */

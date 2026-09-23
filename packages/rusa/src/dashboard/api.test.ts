@@ -831,6 +831,77 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("POST and GET /api/mesh/followers/:id/update manage follower update operations", async () => {
+    const mockUpdateFollower = vi.fn().mockImplementation((_id, opts) => ({
+      updateId: "up-123",
+      status: "pending",
+      newSha: opts?.targetSha,
+      timestamp: "2026-09-22T00:00:00.000Z",
+    }));
+
+    const followerDeps: DashboardDataDeps = {
+      ...deps,
+      getFollowers: () => [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: [],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+          updateStatus: {
+            updateId: "up-123",
+            status: "building",
+            newSha: "abcdef1234567890abcdef1234567890abcdef12",
+            timestamp: "2026-09-22T00:00:01.000Z",
+          },
+        },
+      ],
+      updateFollower: mockUpdateFollower,
+    };
+
+    const { res: postRes } = await call(
+      followerDeps,
+      "POST",
+      "/api/mesh/followers/mac-mini/update",
+      JSON.stringify({ targetSha: "abcdef1234567890abcdef1234567890abcdef12" })
+    );
+    await settled(postRes);
+    expect(postRes.statusCode).toBe(200);
+    expect(JSON.parse(postRes.body)).toEqual({
+      ok: true,
+      followerId: "mac-mini",
+      updateStatus: {
+        updateId: "up-123",
+        status: "pending",
+        newSha: "abcdef1234567890abcdef1234567890abcdef12",
+        timestamp: "2026-09-22T00:00:00.000Z",
+      },
+    });
+    expect(mockUpdateFollower).toHaveBeenCalledWith("mac-mini", {
+      targetSha: "abcdef1234567890abcdef1234567890abcdef12",
+      branch: undefined,
+    });
+
+    const { res: getRes } = await call(followerDeps, "GET", "/api/mesh/followers/mac-mini/update");
+    expect(getRes.statusCode).toBe(200);
+    expect(JSON.parse(getRes.body)).toEqual({
+      followerId: "mac-mini",
+      updateStatus: {
+        updateId: "up-123",
+        status: "building",
+        newSha: "abcdef1234567890abcdef1234567890abcdef12",
+        timestamp: "2026-09-22T00:00:01.000Z",
+      },
+    });
+
+    const { res: notFoundRes } = await call(
+      followerDeps,
+      "GET",
+      "/api/mesh/followers/non-existent/update"
+    );
+    expect(notFoundRes.statusCode).toBe(404);
+  });
+
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {
     // Silently falling back to native is the failure mode that matters here: the
     // operator would get an ordinary actor and believe it was portable.
@@ -1138,6 +1209,33 @@ describe("handleMeshApiRequest", () => {
     const explicit = threads.find((t: { id: string }) => t.id === UUID_B);
     expect(classConfigured.modelClass).toBe("fast");
     expect(Object.hasOwn(explicit, "modelClass")).toBe(false);
+  });
+
+  it("GET /api/mesh/threads surfaces a class binding the runtime cannot resolve", async () => {
+    // The repository's read-through shape for a deleted class: the binding
+    // survives, the pool does not. The dashboard is where an operator finds
+    // out, so the reason must reach the payload rather than being flattened
+    // into "no model" (#626).
+    actors.upsert({
+      ...rec(UUID_A, "root", "active"),
+      modelClass: "fast",
+      modelClassError: 'unknown model class "fast" — runtime classes: careful',
+    });
+    actors.upsert({
+      ...rec(UUID_B, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+      modelClass: "careful",
+    });
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const broken = threads.find((t: { id: string }) => t.id === UUID_A);
+    const healthy = threads.find((t: { id: string }) => t.id === UUID_B);
+    expect(broken.modelClass).toBe("fast");
+    expect(broken.modelClassError).toBe('unknown model class "fast" — runtime classes: careful');
+    // No pool resolved, so the row publishes no model to run on.
+    expect(broken.model).toBeNull();
+    expect(Object.hasOwn(healthy, "modelClassError")).toBe(false);
   });
 
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
@@ -2040,6 +2138,36 @@ describe("handleMeshApiRequest", () => {
     });
     // The raw payload is untouched — only mesh-message entries get rewritten.
     expect(entry.payload).toEqual({ type: "issue_comment.created", commentId: 1 });
+  });
+
+  it("GET /api/mesh/inbox resolves the comment a GitHub event names alongside its source", async () => {
+    inbox.append([
+      {
+        id: "github-comment-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/627",
+        payload: { type: "pull_request_review_comment.created", commentId: 4077377741 },
+      },
+      {
+        id: "github-closed-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/pulls/627",
+        payload: { type: "pull_request.closed", merged: true },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entries = JSON.parse(res.body).entries as Array<{
+      id: string;
+      reference?: { ref: string };
+      eventReference?: { ref: string };
+    }>;
+    const comment = entries.find((e) => e.id === "github-comment-entry");
+    const closed = entries.find((e) => e.id === "github-closed-entry");
+    // The PR stays the entry's reference; the comment is resolved beside it.
+    expect(comment?.reference?.ref).toBe("github:MEK-Org/rusa/pulls/627");
+    expect(comment?.eventReference?.ref).toBe("github:MEK-Org/rusa/pulls/627/comments/4077377741");
+    expect(closed?.eventReference).toBeUndefined();
   });
 
   it("GET /api/mesh/inbox leaves a Google Chat space source unresolved (no per-message reference)", async () => {

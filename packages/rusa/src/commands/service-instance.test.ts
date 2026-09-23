@@ -1,10 +1,13 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  readUnitPathEnv,
+  resolveExecutableOnPath,
   resolveExecutableSource,
   resolvePathEnvForUnit,
+  resolveProbePathEnv,
   resolveServiceDashboardUrl,
   resolveServiceHome,
   resolveServiceInstance,
@@ -89,5 +92,154 @@ describe("resolvePathEnvForUnit", () => {
     process.env.FNM_DIR = "/home/u/.local/share/fnm";
     process.env.PATH = "/home/u/.local/bin:/usr/bin:/home/u/.local/bin:/bin";
     expect(resolvePathEnvForUnit()).toBe("/home/u/.local/bin:/usr/bin:/bin");
+  });
+});
+
+describe("readUnitPathEnv", () => {
+  it("reads the PATH an instance unit assigns", () => {
+    const unit = [
+      "[Service]",
+      "Environment=RUSA_HOME=/home/u/.rusa",
+      "Environment=PATH=/home/u/.local/bin:/usr/bin:/bin",
+      "Restart=always",
+    ].join("\n");
+    expect(readUnitPathEnv(unit)).toBe("/home/u/.local/bin:/usr/bin:/bin");
+  });
+
+  it("accepts both quoted spellings an operator drop-in may use", () => {
+    // The whole assignment quoted, and only its value quoted. Both are legal
+    // systemd and mean the same thing; a segment carrying either into
+    // `resolveExecutableOnPath` would fail to resolve anything.
+    expect(readUnitPathEnv('Environment="PATH=/opt/bin:/usr/bin"')).toBe("/opt/bin:/usr/bin");
+    expect(readUnitPathEnv('Environment=PATH="/opt/bin:/usr/bin"')).toBe("/opt/bin:/usr/bin");
+  });
+
+  it("reads PATH out of a line that sets several variables, in either order", () => {
+    // `Environment=` legally sets more than one variable per line. Capturing
+    // the rest of the line whole would make `FOO=bar` a PATH segment.
+    expect(readUnitPathEnv("Environment=PATH=/usr/bin FOO=bar")).toBe("/usr/bin");
+    expect(readUnitPathEnv("Environment=FOO=bar PATH=/usr/bin")).toBe("/usr/bin");
+    expect(readUnitPathEnv('Environment="FOO=bar" "PATH=/opt/bin"')).toBe("/opt/bin");
+  });
+
+  it("takes the last assignment, because that is the one systemd applies", () => {
+    const unit = ["Environment=PATH=/first/bin", "Environment=PATH=/second/bin"].join("\n");
+    expect(readUnitPathEnv(unit)).toBe("/second/bin");
+  });
+
+  it("returns null for a unit that assigns no PATH, rather than an empty one", () => {
+    expect(readUnitPathEnv("[Service]\nEnvironment=RUSA_HOME=/home/u/.rusa")).toBeNull();
+    expect(readUnitPathEnv("Environment=PATH=")).toBeNull();
+    // A different variable that merely ends in PATH must not be mistaken for it.
+    expect(readUnitPathEnv("Environment=RUSA_SLACK_BOT_TOKEN_PATH=/tmp/tok")).toBeNull();
+  });
+});
+
+describe("resolveProbePathEnv", () => {
+  const noSystemd = () => null;
+
+  it("prefers what systemd resolves for the unit, so drop-ins count", () => {
+    // A provider-capable PATH may live in `<unit>.d/*.conf` rather than the main
+    // unit, and a drop-in's assignment wins. Reading the file alone would take
+    // the main unit's older, narrower PATH and report it as authoritative.
+    process.env.PATH = "/usr/bin:/bin";
+    const unit = "[Service]\nEnvironment=PATH=/main/bin:/usr/bin";
+
+    expect(resolveProbePathEnv("rusa-staging.service", unit, () => "/dropin/bin:/usr/bin")).toEqual(
+      { path: "/dropin/bin:/usr/bin", source: "instance-unit-systemd" }
+    );
+  });
+
+  it("falls back to the unit file when systemd cannot answer", () => {
+    // Issue #525: installing from a minimal environment wrote a coordinator unit
+    // whose PATH had no provider CLI on it. The instance unit on disk does.
+    process.env.PATH = "/usr/bin:/bin";
+    const unit = "[Service]\nEnvironment=PATH=/opt/providers/bin:/usr/bin:/bin";
+
+    expect(resolveProbePathEnv("rusa-staging.service", unit, noSystemd)).toEqual({
+      path: "/opt/providers/bin:/usr/bin:/bin",
+      source: "instance-unit-file",
+    });
+  });
+
+  it("falls back to this process when no instance unit is installed yet", () => {
+    process.env.FNM_DIR = "";
+    process.env.PATH = "/usr/bin:/bin";
+
+    expect(resolveProbePathEnv("rusa-staging.service", null, noSystemd)).toEqual({
+      path: "/usr/bin:/bin",
+      source: "process",
+    });
+  });
+
+  it("does not ask systemd about a unit that is not installed", () => {
+    // `systemctl show` answers for an unknown unit with an empty environment
+    // rather than an error, so asking would not distinguish it from a unit that
+    // assigns no PATH.
+    process.env.FNM_DIR = "";
+    process.env.PATH = "/usr/bin:/bin";
+    let asked = false;
+
+    resolveProbePathEnv("rusa-staging.service", null, () => {
+      asked = true;
+      return "/never/used";
+    });
+
+    expect(asked).toBe(false);
+  });
+
+  it("falls back when the instance unit exists but assigns no PATH of its own", () => {
+    process.env.FNM_DIR = "";
+    process.env.PATH = "/usr/bin:/bin";
+
+    expect(
+      resolveProbePathEnv("rusa-staging.service", "[Service]\nRestart=always", noSystemd).source
+    ).toBe("process");
+  });
+});
+
+describe("resolveExecutableOnPath", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "rusa-path-resolve-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("finds an executable on the given PATH, not on this process's", () => {
+    writeFileSync(join(dir, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    process.env.PATH = "/nonexistent";
+
+    expect(resolveExecutableOnPath("codex", `${dir}:/usr/bin`)).toBe(join(dir, "codex"));
+  });
+
+  it("returns null for a name that is present but not executable", () => {
+    // A non-executable file would still satisfy an existsSync check while the
+    // probe's tmux session fails to launch it.
+    writeFileSync(join(dir, "codex"), "not a program", { mode: 0o644 });
+
+    expect(resolveExecutableOnPath("codex", dir)).toBeNull();
+  });
+
+  it("returns null for a directory that shares the command's name", () => {
+    mkdirSync(join(dir, "codex"));
+
+    expect(resolveExecutableOnPath("codex", dir)).toBeNull();
+  });
+
+  it("treats a command containing a slash as the path it already is", () => {
+    writeFileSync(join(dir, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+
+    expect(resolveExecutableOnPath(join(dir, "codex"), "/nonexistent")).toBe(join(dir, "codex"));
+    expect(resolveExecutableOnPath(join(dir, "absent"), dir)).toBeNull();
+  });
+
+  it("skips empty segments rather than resolving against the working directory", () => {
+    writeFileSync(join(dir, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+
+    expect(resolveExecutableOnPath("codex", `::${dir}`)).toBe(join(dir, "codex"));
   });
 });

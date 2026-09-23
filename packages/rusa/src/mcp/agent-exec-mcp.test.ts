@@ -130,7 +130,6 @@ function setup(
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
-    useInboxStore?: boolean;
     rootId?: string;
     experimentEnrollments?: ExperimentEnrollmentStore;
     secretsDir?: string;
@@ -141,6 +140,11 @@ function setup(
      * parentless actor that holds no grants.
      */
     seedRootGrants?: boolean;
+    /**
+     * Deterministic spawn ids. Real ids are random UUIDs, so a test that needs
+     * id order to differ from spawn order has to name the ids itself.
+     */
+    idgen?: () => string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -172,11 +176,13 @@ function setup(
   const eventDb = new Database(":memory:");
   runMigrations(eventDb);
   const inboxStore = new SqliteInboxRepository(eventDb);
+  const chatStore = new MeshChatRepository(eventDb);
   const eventManager = new EventManager({
     inboxStore,
     resolver: eventSourceResolver,
   });
   mesh = new ActorMesh({
+    recordChat: (entry) => chatStore.record(entry),
     actors: registry,
     rootId: opts.rootId,
     validateSpawn: opts.validateSpawn,
@@ -187,7 +193,7 @@ function setup(
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
-    inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    inboxStore,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -200,7 +206,7 @@ function setup(
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: opts.secretsDir ?? defaultTestSecretsDir,
-    idgen: () => `t${++seq}`,
+    idgen: opts.idgen ?? (() => `t${++seq}`),
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
     handleForId: opts.handleForId,
@@ -705,7 +711,6 @@ describe("agent-execution MCP server", () => {
     try {
       const obligations = new ObligationRepository(db);
       const { inboxStore, mesh } = setup({
-        useInboxStore: true,
         obligations: {
           findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
           get: (id) => obligations.get(id),
@@ -766,7 +771,6 @@ describe("agent-execution MCP server", () => {
     let holder = "";
     const controls: Array<[string, string]> = [];
     const { inboxStore, mesh } = setup({
-      useInboxStore: true,
       isVoiceSessionActive: (actorId) => actorId === holder,
       voiceSessionTransfer: {
         activeSessionIdFor: (actorId) => {
@@ -2932,6 +2936,317 @@ describe("runtime model-class management", () => {
     expect(names).not.toContain("list_model_classes");
     db.close();
   });
+
+  it("refuses to delete a class when a live worker is bound to it by reference", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    const setRes = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(setRes.isError).toBeFalsy();
+
+    const spawnRes = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "worker",
+        model_config: { class: "review" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    expect(spawnRes.isError).toBeFalsy();
+    const workerId = (dataOf(spawnRes) as { thread_id: string }).thread_id;
+
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "review" },
+    })) as CallToolResult;
+
+    expect(deleteRes.isError).toBe(true);
+    expect(String(dataOf(deleteRes))).toContain(
+      `Cannot delete model class 'review': referenced by live actor(s): ${workerId}. Rebind these actors first.`
+    );
+    expect(store.get("review")).toBeDefined();
+    db.close();
+  });
+
+  it("refuses to delete a class when root is bound to it by reference", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "leader",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    const setModelRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: "root",
+        model_config: { class: "leader" },
+      },
+    })) as CallToolResult;
+    expect(setModelRes.isError).toBeFalsy();
+
+    // Staged desiredModelClass check
+    const deleteStagedRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "leader" },
+    })) as CallToolResult;
+    expect(deleteStagedRes.isError).toBe(true);
+    expect(String(dataOf(deleteStagedRes))).toContain(
+      "Cannot delete model class 'leader': referenced by live actor(s): root. Rebind these actors first."
+    );
+
+    // Apply pending model so modelClass is committed
+    mesh.applyPendingModel("root");
+
+    const deleteCommittedRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "leader" },
+    })) as CallToolResult;
+    expect(deleteCommittedRes.isError).toBe(true);
+    expect(String(dataOf(deleteCommittedRes))).toContain(
+      "Cannot delete model class 'leader': referenced by live actor(s): root. Rebind these actors first."
+    );
+    expect(store.get("leader")).toBeDefined();
+    db.close();
+  });
+
+  it("names all referencing live actors sorted by ID when multiple exist", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    // Spawn order and id order disagree, so the assertion below fails if the
+    // `.sort()` in `delete_model_class` is dropped: without it the message
+    // would carry `InMemoryActorRepository`'s Map insertion order (spawn order).
+    // The harness's default `t1`, `t2` ids sort into spawn order, so naming
+    // actors `worker-z` then `worker-a` specifically forces spawn order and
+    // lexicographical ID order to disagree.
+    const ids = ["worker-z", "worker-a"];
+    let next = 0;
+    const { mesh } = setup({ ...hooks(store), idgen: () => ids[next++] });
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "pool-class",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    for (const charter of ["w1", "w2"]) {
+      const spawned = (await root.callTool({
+        name: "spawn_thread",
+        arguments: { charter, model_config: { class: "pool-class" }, context_mode: "ledger" },
+      })) as CallToolResult;
+      expect(spawned.isError).toBeFalsy();
+    }
+
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "pool-class" },
+    })) as CallToolResult;
+    expect(deleteRes.isError).toBe(true);
+    expect(String(dataOf(deleteRes))).toContain(
+      "Cannot delete model class 'pool-class': referenced by live actor(s): worker-a, worker-z. Rebind these actors first."
+    );
+    expect(store.get("pool-class")).toBeDefined();
+    db.close();
+  });
+
+  it("succeeds after referencing actors are rebound to another class or explicit pool", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "class-a",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "class-b",
+        model_config: { provider: "codex", model: "gpt-5.6-sol" },
+      },
+    });
+
+    const spawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "w", model_config: { class: "class-a" }, context_mode: "ledger" },
+    })) as CallToolResult;
+    const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
+
+    // Initially refused
+    const firstAttempt = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-a" },
+    })) as CallToolResult;
+    expect(firstAttempt.isError).toBe(true);
+
+    // Rebind worker to class-b
+    await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { class: "class-b" },
+      },
+    });
+    mesh.applyPendingModel(workerId);
+
+    // Now deletion of class-a succeeds
+    const secondAttempt = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-a" },
+    })) as CallToolResult;
+    expect(secondAttempt.isError).toBeFalsy();
+    expect(dataOf(secondAttempt)).toEqual({ name: "class-a", deleted: true });
+    expect(store.get("class-a")).toBeUndefined();
+
+    // Rebind worker to explicit concrete pool
+    await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+    mesh.applyPendingModel(workerId);
+
+    // Now deletion of class-b succeeds
+    const deleteClassB = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-b" },
+    })) as CallToolResult;
+    expect(deleteClassB.isError).toBeFalsy();
+    expect(dataOf(deleteClassB)).toEqual({ name: "class-b", deleted: true });
+    expect(store.get("class-b")).toBeUndefined();
+
+    db.close();
+  });
+
+  it("succeeds when referencing actor is retired, and subsequent revival allows rebind", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh, registry } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "temp-class",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    const spawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "temp worker",
+        model_config: { class: "temp-class" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
+
+    // Retire the worker
+    const retireRes = (await root.callTool({
+      name: "retire_thread",
+      arguments: { thread_id: workerId },
+    })) as CallToolResult;
+    expect(retireRes.isError).toBeFalsy();
+
+    // While retired, setting model is refused
+    const retiredSetRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(retiredSetRes.isError).toBe(true);
+
+    // Deletion succeeds now that actor is retired
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "temp-class" },
+    })) as CallToolResult;
+    expect(deleteRes.isError).toBeFalsy();
+    expect(dataOf(deleteRes)).toEqual({ name: "temp-class", deleted: true });
+    expect(store.get("temp-class")).toBeUndefined();
+
+    // Reviving the retired actor succeeds: it is born idle and marked active
+    const reviveRes = (await root.callTool({
+      name: "revive_thread",
+      arguments: { thread_id: workerId },
+    })) as CallToolResult;
+    expect(reviveRes.isError).toBeFalsy();
+    expect(registry.get(workerId)?.status).toBe("active");
+
+    // Because the actor is now active, root can rebind it to an explicit pool
+    const rebindRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(rebindRes.isError).toBeFalsy();
+    mesh.applyPendingModel(workerId);
+    expect(registry.get(workerId)?.modelClass).toBeUndefined();
+
+    db.close();
+  });
+
+  it("returns deleted: false for a nonexistent class", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    const res = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "nonexistent" },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(dataOf(res)).toEqual({ name: "nonexistent", deleted: false });
+
+    db.close();
+  });
 });
 
 class FakeWakeScheduler {
@@ -3101,6 +3416,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       name === "review"
         ? { modelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }] }
         : undefined,
+    names: () => ["review"],
     list: () => [{ name: "review" }],
   };
 
@@ -3198,7 +3514,10 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
   it("set_actor_model still fills an omitted model from the current pool for a concrete partial update", async () => {
     const { mesh, registry } = setup(productionHooks());
-    registry.patch("root", {
+    const root = registry.get("root");
+    if (!root) throw new Error("root record missing");
+    registry.upsert({
+      ...root,
       modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
       context: { type: "portable", mode: "ledger" },
     });
@@ -3243,7 +3562,10 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
   it("set_actor_model lets the root stage its own portable provider and model", async () => {
     const { mesh, registry } = setup();
-    registry.patch("root", {
+    const root = registry.get("root");
+    if (!root) throw new Error("root record missing");
+    registry.upsert({
+      ...root,
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });

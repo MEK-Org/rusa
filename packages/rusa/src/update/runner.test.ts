@@ -7,6 +7,7 @@ import { buildSentinelPath, readBuildSentinel, verifyBuildSentinel } from "./bui
 import {
   assertSubmodulesMaterialized,
   BuildRunner,
+  GitRunner,
   runTimedStep,
   submodulePathsFromGitmodules,
 } from "./runner.js";
@@ -85,6 +86,15 @@ describe("runTimedStep — hard timeout (elder fix #2: a hung build can't wedge 
 });
 
 describe("GitRunner submodule materialization checks", () => {
+  it("does not treat git exit 128 as an ancestry miss", async () => {
+    const nonRepo = mkdtempSync(join(tmpdir(), "not-a-repo-"));
+
+    await expect(new GitRunner(nonRepo).isAncestor(SHA, "HEAD")).rejects.toMatchObject({
+      name: "StepError",
+      step: "git-contains-target",
+    });
+  });
+
   it("enumerates submodule paths from .gitmodules", () => {
     const repo = mkdtempSync(join(tmpdir(), "repo-"));
     writeFileSync(

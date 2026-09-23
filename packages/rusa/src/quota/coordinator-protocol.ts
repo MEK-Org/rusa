@@ -1,12 +1,22 @@
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import type { PersistedQuotaBucketStatus, PersistedQuotaProviderStatus } from "./shared-store.js";
+import { isProviderScopedWindow } from "./window-scope.js";
 
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
-export const COORDINATOR_PROTOCOL_MINOR = 0;
+export const COORDINATOR_PROTOCOL_MINOR = 1;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+/**
+ * Operator write routes (#573). They are ordinary `/v1/` paths: design §5.2,
+ * Criterion 7 states the allowed method per path rather than declaring the
+ * whole of v1 read-only, so a POST route no longer has to sit outside the
+ * version prefix in order to exist. The socket's file mode is the whole of
+ * their authorization, exactly as it is for the read surface.
+ */
+export const QUOTA_READING_MODE_PATH = "/v1/quota/reading-mode";
+export const MANUAL_QUOTA_OBSERVATION_PATH = "/v1/quota/observations";
 
 export interface QuotaCoordinatorServiceInfo {
   protocolMajor: number;
@@ -100,6 +110,11 @@ export type QuotaCoordinatorErrorCode =
   | "not_ready"
   | "provider_unknown"
   | "method_not_allowed"
+  | "invalid_request"
+  | "manual_mode_required"
+  | "mode_generation_mismatch"
+  | "stale_observation"
+  | "idempotency_conflict"
   | "internal_error";
 
 export interface QuotaCoordinatorError {
@@ -121,6 +136,23 @@ export interface QuotaCoordinatorPathMismatchError {
 export interface QuotaCoordinatorErrorResponse {
   service: QuotaCoordinatorServiceInfo;
   error: QuotaCoordinatorError | QuotaCoordinatorPathMismatchError;
+}
+
+/** Durable per-provider collection authority, exposed only on the local authenticated socket. */
+export interface QuotaReadingModeResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  mode: "manual" | "scrape";
+  generation: number;
+}
+
+/** Success envelope for a replay-safe manual observation POST. */
+export interface ManualQuotaObservationResponse {
+  service: QuotaCoordinatorServiceInfo;
+  provider: string;
+  observedAt: string;
+  generation: number;
+  duplicate: boolean;
 }
 
 export interface QuotaCoordinatorHealthResponse {
@@ -149,6 +181,12 @@ export interface QuotaReadyScrapeStatus {
   lastAttemptAt?: string | null;
   attempts?: number;
   failures?: number;
+  /**
+   * The lane's durable collection authority (#573). `manual` explains a lane
+   * whose probes stopped without an error; `generation` is what an
+   * observation write has to echo.
+   */
+  readingMode?: { mode: "manual" | "scrape"; generation: number };
 }
 
 export interface QuotaCoordinatorReadyResponse {
@@ -384,4 +422,63 @@ export function isValidQuotaPayload(
   return (
     isOptionalString(obj.message) && isOptionalString(obj.raw) && isOptionalString(obj.scrapedAt)
   );
+}
+
+/**
+ * Manual writes are intentionally narrower than read responses: they must
+ * supply a concrete, current provider snapshot that can enter the canonical
+ * provider-paced observation stream without parser inference. Returns `null`
+ * when valid, otherwise the first reason the reading was refused so a
+ * hand-typed request gets told which field to fix. A reset that has already
+ * passed is accepted, as it is from the scrapers: the controller treats it as
+ * "no usable reset" rather than an error.
+ */
+export function manualQuotaObservationProblem(value: unknown, provider: string): string | null {
+  if (!isValidQuotaPayload(value, provider)) {
+    return `observation must be a ${provider} quota snapshot`;
+  }
+  const snapshot = value as ProviderQuotaSnapshot;
+  if (snapshot.status !== "available" && snapshot.status !== "exhausted") {
+    return 'observation.status must be "available" or "exhausted"';
+  }
+  if (!snapshot.scrapedAt || !Number.isFinite(Date.parse(snapshot.scrapedAt))) {
+    return "observation.scrapedAt must be an ISO-8601 timestamp";
+  }
+  if (!snapshot.limits || snapshot.limits.length === 0) {
+    return "observation.limits must contain at least one limit";
+  }
+
+  const seenKinds = new Set<string>();
+  let providerLimitCount = 0;
+  for (const [index, limit] of snapshot.limits.entries()) {
+    const at = `observation.limits[${index}]`;
+    const scopedProvider =
+      typeof limit.scope === "object" && limit.scope !== null ? limit.scope.provider : undefined;
+    if (!limit.label.trim()) return `${at}.label must not be blank`;
+    if (limit.percentLeft < 0 || limit.percentLeft > 100) {
+      return `${at}.percentLeft must be between 0 and 100`;
+    }
+    if (limit.resetAtIso !== undefined && !Number.isFinite(Date.parse(limit.resetAtIso))) {
+      return `${at}.resetAtIso must be an ISO-8601 timestamp`;
+    }
+    if (scopedProvider !== undefined && scopedProvider !== provider) {
+      return `${at}.scope.provider must be ${provider}`;
+    }
+    if (!isProviderScopedWindow(limit)) continue;
+    const kind = limit.kind ?? "other";
+    if (seenKinds.has(kind)) return `${at} repeats the provider-scoped ${kind} window`;
+    seenKinds.add(kind);
+    providerLimitCount += 1;
+  }
+  return providerLimitCount > 0 ? null : "observation.limits needs one provider-scoped window";
+}
+
+export function isValidManualQuotaObservation(
+  value: unknown,
+  provider: string
+): value is ProviderQuotaSnapshot & {
+  scrapedAt: string;
+  limits: NonNullable<ProviderQuotaSnapshot["limits"]>;
+} {
+  return manualQuotaObservationProblem(value, provider) === null;
 }

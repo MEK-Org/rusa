@@ -4,9 +4,11 @@ import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'obligation_reference_card.dart';
 import 'reference_preview.dart';
 import '../util.dart';
 import 'header.dart';
+import 'inbox_event.dart';
 import 'inbox_item_row.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
@@ -345,16 +347,19 @@ class _InboxTabState extends State<InboxTab> {
       blockers: blockers,
       onSelectView: widget.onSelectView,
       onMutated: _refresh,
+      showKindChip: false,
       showReorder: isReadyList && items.length > 1,
       onMoveUp: index > 0
           ? () async {
               final previousId = index - 2 >= 0 ? items[index - 2].id : null;
               final nextId = items[index - 1].id;
               try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
+                await widget.store.mutateObligations(
+                  () => widget.store.api.reorderObligation(
+                    o.id,
+                    previousId: previousId,
+                    nextId: nextId,
+                  ),
                 );
                 _refresh();
               } catch (err) {
@@ -376,10 +381,12 @@ class _InboxTabState extends State<InboxTab> {
                   ? items[index + 2].id
                   : null;
               try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
+                await widget.store.mutateObligations(
+                  () => widget.store.api.reorderObligation(
+                    o.id,
+                    previousId: previousId,
+                    nextId: nextId,
+                  ),
                 );
                 _refresh();
               } catch (err) {
@@ -546,6 +553,18 @@ class _InboxTabState extends State<InboxTab> {
     ),
   );
 
+  Widget _dismissButton(Map<String, dynamic> e) => TextButton.icon(
+    onPressed: () => _dismiss(e),
+    icon: const Icon(Icons.check_circle_outline, size: 14),
+    label: const Text('Dismiss', style: TextStyle(fontSize: 11)),
+    style: TextButton.styleFrom(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      minimumSize: Size.zero,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      foregroundColor: MeshColors.textSecondary,
+    ),
+  );
+
   Widget _entryCard(Map<String, dynamic> e) {
     final payload = e['payload'] as Map<String, dynamic>? ?? const {};
     final rawReference = e['reference'];
@@ -567,6 +586,20 @@ class _InboxTabState extends State<InboxTab> {
             )
             .map((x) => '${x.key}: ${x.value}')
             .join('\n');
+    // A reference rendered on its own terms (a mesh message, a GitHub
+    // comment, ...) already says what the entry is, so it stands in for the
+    // entry's generic type/source header instead of nesting inside it.
+    final rawEventReference = e['eventReference'];
+    final event = presentGitHubInboxEvent(
+      payload: payload,
+      reference: reference,
+      eventReference: rawEventReference is Map<String, dynamic>
+          ? ReferenceDto.fromJson(rawEventReference)
+          : null,
+    );
+    final obligationId = ObligationReferenceCard.obligationIdFor(payload);
+    final ownCard =
+        obligationId != null || ReferencePreview.rendersOwnContent(reference);
     return Opacity(
       opacity: handled ? .86 : 1,
       child: Padding(
@@ -574,88 +607,93 @@ class _InboxTabState extends State<InboxTab> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // A two-column or narrow-stacked layout can give this card much
-            // less width than the single-column page always used to — and a
-            // real GitHub `type`/`source` can run long (e.g.
-            // `pull_request_review_comment.created`,
-            // `github:owner/repo/pulls/N`). A plain `Row` can't shrink the
-            // chip when it alone is wider than what's left, which overflows;
-            // a flat `Wrap` lets the chip, source, arrival time, and dismiss
-            // each drop to their own line instead.
-            Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 8,
-              runSpacing: 4,
-              children: [
-                InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
-                Text(
-                  e['source']?.toString() ?? '',
-                  style: const TextStyle(
-                    color: MeshColors.accent,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                Wrap(
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  spacing: 8,
-                  runSpacing: 4,
-                  children: [
-                    if (arrivedAt != null)
-                      Text(
-                        'Arrived: ${formatTs(arrivedAt.toString())}',
-                        style: const TextStyle(
-                          color: MeshColors.textMuted,
-                          fontSize: 11,
-                          fontFamily: kMonoFontFamily,
-                        ),
-                      ),
-                    // Only an outstanding entry is dismissible. A resolved
-                    // one already carries someone's account of it, and the
-                    // server will not let a second clear overwrite that note.
-                    if (!handled)
-                      TextButton.icon(
-                        onPressed: () => _dismiss(e),
-                        icon: const Icon(Icons.check_circle_outline, size: 14),
-                        label: const Text(
-                          'Dismiss',
-                          style: TextStyle(fontSize: 11),
-                        ),
-                        style: TextButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          minimumSize: Size.zero,
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          foregroundColor: MeshColors.textSecondary,
-                        ),
-                      ),
-                  ],
-                ),
-              ],
-            ),
-            const SizedBox(height: 9),
-            // A reference the server could resolve renders through the same
-            // widget as an obligation's cited artifacts. Everything else keeps
-            // the raw payload dump, which is honest for v1: no resolver exists
-            // for those sources yet, and inventing a prettier rendering would
-            // hide that.
-            if (reference != null)
+            if (obligationId != null)
+              ObligationReferenceCard(
+                obligationId: obligationId,
+                store: widget.store,
+                fallbackText: payload['intent']?.toString(),
+                action: handled ? null : _dismissButton(e),
+                onSelectView: widget.onSelectView,
+              )
+            else if (ownCard)
               ReferencePreview(
-                reference: reference,
+                reference: reference!,
                 lookupActorHandle: (id) => widget.store.actor(id)?.handle,
                 openLink: widget.openLink,
+                margin: EdgeInsets.zero,
+                action: handled ? null : _dismissButton(e),
+                kindLabel: event?.kindLabel,
+                detail: event?.detail,
+                summary: event?.summary,
+                showBody: !(event?.bodyless ?? false),
               )
-            else
-              Text(
-                content.isEmpty ? 'No attached contents.' : content,
-                style: const TextStyle(
-                  color: Color(0xFFCBD5E1),
-                  height: 1.5,
-                  fontFamily: kMonoFontFamily,
-                  fontSize: 12.5,
-                ),
+            else ...[
+              // A two-column or narrow-stacked layout can give this card much
+              // less width than the single-column page always used to — and a
+              // real GitHub `type`/`source` can run long (e.g.
+              // `pull_request_review_comment.created`,
+              // `github:owner/repo/pulls/N`). A plain `Row` can't shrink the
+              // chip when it alone is wider than what's left, which overflows;
+              // a flat `Wrap` lets the chip, source, arrival time, and dismiss
+              // each drop to their own line instead.
+              Wrap(
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
+                  Text(
+                    e['source']?.toString() ?? '',
+                    style: const TextStyle(
+                      color: MeshColors.accent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 8,
+                    runSpacing: 4,
+                    children: [
+                      if (arrivedAt != null)
+                        Text(
+                          'Arrived: ${formatTs(arrivedAt.toString())}',
+                          style: const TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 11,
+                            fontFamily: kMonoFontFamily,
+                          ),
+                        ),
+                      // Only an outstanding entry is dismissible. A resolved
+                      // one already carries someone's account of it, and the
+                      // server will not let a second clear overwrite that note.
+                      if (!handled) _dismissButton(e),
+                    ],
+                  ),
+                ],
               ),
+              const SizedBox(height: 9),
+              // A reference the server could resolve renders through the same
+              // widget as an obligation's cited artifacts. Everything else keeps
+              // the raw payload dump, which is honest for v1: no resolver exists
+              // for those sources yet, and inventing a prettier rendering would
+              // hide that.
+              if (reference != null)
+                ReferencePreview(
+                  reference: reference,
+                  lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                  openLink: widget.openLink,
+                )
+              else
+                Text(
+                  content.isEmpty ? 'No attached contents.' : content,
+                  style: const TextStyle(
+                    color: Color(0xFFCBD5E1),
+                    height: 1.5,
+                    fontFamily: kMonoFontFamily,
+                    fontSize: 12.5,
+                  ),
+                ),
+            ],
             if (handled) ...[
               const SizedBox(height: 10),
               Container(

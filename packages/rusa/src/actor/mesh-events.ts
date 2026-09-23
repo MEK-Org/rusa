@@ -42,6 +42,12 @@ export type MeshEventKind =
   // `actorId` = the updated actor, `peerId` = the requester (parent or root),
   // `detail` = oldModel -> newModel summary.
   | "actor_model_set"
+  // A class-bound actor's model class could not be resolved, so its run was
+  // refused rather than launched on a stale pool. `actorId` = the blocked
+  // actor, `detail` = the resolution failure. Emitted once per distinct reason
+  // so a permanently broken binding does not fill the log, and again if the
+  // reason changes or returns after a repair.
+  | "actor_model_class_unresolved"
   // Run lifecycle brackets an execution opportunity. `run_queued` fires once
   // when the pre-run gate first accepts the actor into scheduling; deliveries
   // coalesced into that queued opportunity do not emit duplicates. It remains
@@ -113,6 +119,11 @@ export type MeshEventKind =
   // phase; payload = { reason: "responsive_notification" }. The displaced
   // opportunity still closes normally through run_end or run_abandoned.
   | "run_preempted"
+  // Shadow-only JEV interruption observation. `actorId` is the recipient;
+  // payload holds the baseline disposition and a redacted decision snapshot
+  // containing durable inbox ids, closed choices, confidence and threshold —
+  // never message bodies or other operational content.
+  | "responsive_interruption_shadow"
   // A portable-context v2 ledger folded one or more inbound messages. `actorId`
   // is the remembered actor; detail/body carry generation/count metadata only.
   | "portable_context_compacted"

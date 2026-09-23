@@ -36,6 +36,7 @@ class WorkTab extends StatefulWidget {
 
 class _WorkTabState extends State<WorkTab> {
   bool _loading = true;
+  bool _isBackgroundRefreshing = false;
   String? _error;
   List<ObligationTreeDto> _rootTrees = [];
   late final Set<String> _expandedIds = widget.store.workExpanded;
@@ -63,6 +64,7 @@ class _WorkTabState extends State<WorkTab> {
     try {
       setState(() {
         if (_rootTrees.isEmpty) _loading = true;
+        _isBackgroundRefreshing = _rootTrees.isNotEmpty;
         _error = null;
       });
       final forest = await widget.store.api.fetchObligationForest(
@@ -73,15 +75,28 @@ class _WorkTabState extends State<WorkTab> {
         _rootTrees = forest.trees;
         _fetchedTerminalRoots = includeTerminal;
         _loading = false;
+        _isBackgroundRefreshing = false;
       });
+      // Focus-link and Show Done requests include terminal roots. Persist only
+      // the default terminal-excluding forest so a later default view cannot
+      // paint rows it believes it did not fetch.
+      if (!includeTerminal) {
+        widget.store.saveObligationsSnapshot(forest.trees);
+      }
       _checkFocusLink();
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
-        _error = e.toString();
+        _error = 'We could not refresh the work queue. Check your connection and retry.';
         _loading = false;
+        _isBackgroundRefreshing = false;
       });
     }
+  }
+
+  void _handleMutation() {
+    widget.store.invalidateObligationsCache();
+    _loadRoots();
   }
 
   void _checkFocusLink() {
@@ -190,9 +205,11 @@ class _WorkTabState extends State<WorkTab> {
   ) async {
     try {
       if (zone == HierarchyDropZone.on) {
-        await widget.store.api.reparentObligation(
-          dragged.id,
-          parentId: target.id,
+        await widget.store.mutateObligations(
+          () => widget.store.api.reparentObligation(
+            dragged.id,
+            parentId: target.id,
+          ),
         );
         _expandedIds.add(target.id);
         widget.store.saveWorkExpanded(_expandedIds);
@@ -208,10 +225,12 @@ class _WorkTabState extends State<WorkTab> {
         final nextId = insertIndex == queue.length
             ? null
             : queue[insertIndex].id;
-        await widget.store.api.reorderObligation(
-          dragged.id,
-          previousId: previousId,
-          nextId: nextId,
+        await widget.store.mutateObligations(
+          () => widget.store.api.reorderObligation(
+            dragged.id,
+            previousId: previousId,
+            nextId: nextId,
+          ),
         );
       }
       await _loadRoots();
@@ -230,6 +249,15 @@ class _WorkTabState extends State<WorkTab> {
   @override
   void initState() {
     super.initState();
+    final cached = widget.store.cachedObligationTrees;
+    if (cached != null) {
+      _rootTrees = cached;
+      _loading = false;
+      _isBackgroundRefreshing = true;
+    } else {
+      _loading = true;
+      _isBackgroundRefreshing = false;
+    }
     _loadRoots();
     _focusSub = widget.store.focusedObligationId.listen((focusedId) {
       if (focusedId != null && !_loading) {
@@ -237,17 +265,36 @@ class _WorkTabState extends State<WorkTab> {
       }
     });
     _checkpointSub = widget.store.obligationRefreshes.listen((_) {
-      _loadRoots();
+      _handleMutation();
     });
     // Owner/creator labels read the viewing principal off the dashboard
     // config, which lands after init returns; a tree drawn before then would
     // name the person "Unknown actor" until something else rebuilt it (#538).
+    // When the principal switches, re-seed or clear the tree accordingly (#505).
     _principalSub = widget.store.dashboardConfig
         .map((c) => c?.userPrincipalId)
         .distinct()
         .skip(1)
-        .listen((_) {
-          if (mounted) setState(() {});
+        .listen((newPrincipalId) {
+          if (mounted) {
+            final cached = widget.store.cachedObligationTrees;
+            if (cached != null) {
+              setState(() {
+                _rootTrees = cached;
+                _loading = false;
+                _isBackgroundRefreshing = true;
+                _error = null;
+              });
+            } else {
+              setState(() {
+                _rootTrees = [];
+                _loading = true;
+                _isBackgroundRefreshing = false;
+                _error = null;
+              });
+            }
+            _loadRoots();
+          }
         });
   }
 
@@ -292,16 +339,55 @@ class _WorkTabState extends State<WorkTab> {
     return result;
   }
 
+  Widget _refreshErrorBanner({required EdgeInsets margin}) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    margin: margin,
+    decoration: BoxDecoration(
+      color: MeshColors.statusHalted.withAlpha(35),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: MeshColors.statusHalted.withAlpha(80)),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.warning_amber_rounded, size: 16, color: MeshColors.statusHalted),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            _error ?? '',
+            style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        const SizedBox(width: 8),
+        InkWell(
+          onTap: _loadRoots,
+          child: const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            child: Text(
+              'Retry',
+              style: TextStyle(
+                color: MeshColors.accent,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
+    if (_loading && _rootTrees.isEmpty) {
       return const Scaffold(
         backgroundColor: MeshColors.bgPrimary,
         body: Center(child: CircularProgressIndicator()),
       );
     }
 
-    if (_error != null) {
+    if (_error != null && _rootTrees.isEmpty) {
       return Scaffold(
         backgroundColor: MeshColors.bgPrimary,
         body: Center(
@@ -309,7 +395,7 @@ class _WorkTabState extends State<WorkTab> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(
-                'Failed to load work queue: $_error',
+                _error!,
                 style: const TextStyle(color: MeshColors.textSecondary),
               ),
               const SizedBox(height: 12),
@@ -334,13 +420,15 @@ class _WorkTabState extends State<WorkTab> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   _narrowBackBar(),
+                  if (_error != null && _rootTrees.isNotEmpty)
+                    _refreshErrorBanner(margin: const EdgeInsets.all(8)),
                   const Divider(height: 1, color: MeshColors.border),
                   Expanded(
                     child: _DetailView(
                       obligationId: _selectedObligationId!,
                       store: widget.store,
                       onSelectView: widget.onSelectView,
-                      onMutated: _loadRoots,
+                      onMutated: _handleMutation,
                       openLink: widget.openLink,
                     ),
                   ),
@@ -364,7 +452,7 @@ class _WorkTabState extends State<WorkTab> {
                         obligationId: _selectedObligationId!,
                         store: widget.store,
                         onSelectView: widget.onSelectView,
-                        onMutated: _loadRoots,
+                        onMutated: _handleMutation,
                         openLink: widget.openLink,
                       )
                     : const Center(
@@ -421,14 +509,32 @@ class _WorkTabState extends State<WorkTab> {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'WORK QUEUE',
-                style: TextStyle(
-                  color: MeshColors.textSecondary,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.8,
-                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'WORK QUEUE',
+                    style: TextStyle(
+                      color: MeshColors.textSecondary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                  if (_isBackgroundRefreshing) ...[
+                    const SizedBox(width: 8),
+                    const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          MeshColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
               Row(
                 mainAxisSize: MainAxisSize.min,
@@ -449,7 +555,7 @@ class _WorkTabState extends State<WorkTab> {
                     onPressed: () => showCreateObligationDialog(
                       context,
                       widget.store,
-                      onCreated: _loadRoots,
+                      onCreated: _handleMutation,
                     ),
                     tooltip: 'New Root Obligation',
                   ),
@@ -463,6 +569,8 @@ class _WorkTabState extends State<WorkTab> {
             ],
           ),
         ),
+        if (_error != null && _rootTrees.isNotEmpty)
+          _refreshErrorBanner(margin: const EdgeInsets.fromLTRB(12, 0, 12, 8)),
         const Divider(height: 1, color: MeshColors.border),
         Expanded(
           child: nodes.isEmpty
@@ -1250,6 +1358,7 @@ class _DetailViewState extends State<_DetailView> {
         store: store,
         showOwner: true,
         showActions: false,
+        showKindChip: false,
         onSelectView: onSelectView,
         contentPadding: const EdgeInsets.symmetric(
           horizontal: 16,
@@ -1329,6 +1438,7 @@ class _DetailViewState extends State<_DetailView> {
                   obligation: c,
                   store: store,
                   showOwner: true,
+                  showKindChip: false,
                   showActions:
                       false, // In the original, the work_tab children row didn't have actions menu.
                   contentPadding: const EdgeInsets.symmetric(
@@ -1341,10 +1451,12 @@ class _DetailViewState extends State<_DetailView> {
                           final previousId = i - 2 >= 0 ? list[i - 2].id : null;
                           final nextId = list[i - 1].id;
                           try {
-                            await store.api.reorderObligation(
-                              c.id,
-                              previousId: previousId,
-                              nextId: nextId,
+                            await store.mutateObligations(
+                              () => store.api.reorderObligation(
+                                c.id,
+                                previousId: previousId,
+                                nextId: nextId,
+                              ),
                             );
                             onMutated?.call();
                           } catch (err) {
@@ -1366,10 +1478,12 @@ class _DetailViewState extends State<_DetailView> {
                               ? list[i + 2].id
                               : null;
                           try {
-                            await store.api.reorderObligation(
-                              c.id,
-                              previousId: previousId,
-                              nextId: nextId,
+                            await store.mutateObligations(
+                              () => store.api.reorderObligation(
+                                c.id,
+                                previousId: previousId,
+                                nextId: nextId,
+                              ),
                             );
                             onMutated?.call();
                           } catch (err) {
@@ -1450,6 +1564,7 @@ class _DetailViewState extends State<_DetailView> {
               store: store,
               showOwner: true,
               showActions: false,
+              showKindChip: false,
               onSelectView: onSelectView,
               contentPadding: const EdgeInsets.symmetric(
                 horizontal: 16,

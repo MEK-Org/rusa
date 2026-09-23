@@ -5,6 +5,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
+import 'package:rusa_dashboard/obligations_cache.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/hierarchy_drag_drop.dart';
@@ -722,16 +723,26 @@ void main() {
           status: 'done',
           recurrencePolicy: 'cron',
         );
-        final api = FakeApi()
+        final cache = FakeObligationsCache();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [
             liveRoot,
             quietTerminalRoot,
             recurringTerminalRoot,
-          ];
+          ]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          );
 
-        final store = DashboardStore(api: api, stream: FakeStream());
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
         await store.init();
+        await pumpEventQueue();
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
@@ -750,6 +761,10 @@ void main() {
           api.fetchObligationForestCalls.single.includeTerminalRoots,
           isFalse,
         );
+        expect(
+          cache.stored!.trees.map((tree) => tree.obligation.id),
+          isNot(contains('root-quiet-done')),
+        );
 
         await tester.tap(find.byTooltip('Show Done'));
         await tester.pump();
@@ -760,6 +775,10 @@ void main() {
         expect(
           api.fetchObligationForestCalls.last.includeTerminalRoots,
           isTrue,
+        );
+        expect(
+          cache.stored!.trees.map((tree) => tree.obligation.id),
+          isNot(contains('root-quiet-done')),
         );
 
         await store.dispose();
@@ -1530,6 +1549,401 @@ void main() {
 
         expect(find.text('and 2 more'), findsOneWidget);
         expect(find.text('and 4 more'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'measures cached and cold first useful content against the same delayed forest response (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        const forestResponseDelay = Duration(seconds: 2);
+        final cachedOb = makeObligation(
+          'cached-ob-1',
+          ownerId: 'root',
+          title: 'Cached Fast Loading Obligation',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final serverOb = makeObligation(
+          'server-ob-1',
+          ownerId: 'root',
+          title: 'Authoritative Obligation After Refresh',
+        );
+
+        Future<Duration> measureFirstUsefulContent({
+          required ObligationsCache cache,
+          required String firstUsefulTitle,
+          required bool expectBeforeForestResponse,
+        }) async {
+          final gate = Completer<void>();
+          final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+            ..threadsResult = [makeThread('root')]
+            ..obligationsResult = [serverOb]
+            ..dashboardConfigResult = const DashboardConfigDto(
+              quotaProviders: {},
+              userPrincipalId: 'test-user',
+            )
+            ..forestGates.add(gate);
+          final store = DashboardStore(
+            api: api,
+            stream: FakeStream(),
+            obligationsCache: cache,
+          );
+
+          await store.init();
+          await store.dashboardConfig.firstWhere(
+            (config) => config?.userPrincipalId == 'test-user',
+          );
+          if (expectBeforeForestResponse) {
+            expect(store.cachedObligationTrees, isNotNull);
+          }
+          // Both measurements start at the same point: the Work tab begins
+          // rendering after the authenticated principal has resolved. That
+          // keeps the comparison focused on the forest response the cache
+          // avoids waiting for, rather than timing an unrelated config call.
+          final stopwatch = Stopwatch()..start();
+          final forestResponse = Future<void>.delayed(
+            forestResponseDelay,
+            gate.complete,
+          );
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          );
+          await tester.pump();
+
+          // This is the rendered first-useful-content observation: the forest
+          // request is still held below, so a cache hit must already be visible
+          // and a cold load cannot yet show the server result.
+          if (expectBeforeForestResponse) {
+            expect(find.text(firstUsefulTitle), findsOneWidget);
+            expect(find.text('WORK QUEUE'), findsOneWidget);
+            expect(
+              find.descendant(
+                of: find.byType(WorkTab),
+                matching: find.byType(CircularProgressIndicator),
+              ),
+              findsOneWidget,
+            );
+            stopwatch.stop();
+          } else {
+            expect(find.text(firstUsefulTitle), findsNothing);
+          }
+
+          await forestResponse;
+          await pumpEventQueue();
+          await tester.pump();
+          await tester.pump();
+
+          if (!expectBeforeForestResponse) stopwatch.stop();
+          expect(
+            find.text('Authoritative Obligation After Refresh'),
+            findsOneWidget,
+          );
+
+          final elapsed = stopwatch.elapsed;
+          await store.dispose();
+          await tester.pumpWidget(const SizedBox.shrink());
+          await tester.pump();
+          return elapsed;
+        }
+
+        final cachedFirstUseful = await measureFirstUsefulContent(
+          cache: FakeObligationsCache(snapshot),
+          firstUsefulTitle: 'Cached Fast Loading Obligation',
+          expectBeforeForestResponse: true,
+        );
+        final coldFirstUseful = await measureFirstUsefulContent(
+          cache: FakeObligationsCache(),
+          firstUsefulTitle: 'Authoritative Obligation After Refresh',
+          expectBeforeForestResponse: false,
+        );
+
+        // The cold control is the pre-cache path: it cannot render useful
+        // obligations until the controlled forest response arrives.
+        // The cached path is observed in a rendered frame before that response.
+        expect(cachedFirstUseful, lessThan(forestResponseDelay));
+        expect(coldFirstUseful, greaterThanOrEqualTo(forestResponseDelay));
+        expect(coldFirstUseful, greaterThan(cachedFirstUseful));
+        // Keep the actual before/after values in the test output so the PR can
+        // report observed evidence without presenting a fabricated fixed time.
+        // ignore: avoid_print
+        print(
+          'first useful content (#505, controlled ${forestResponseDelay.inMilliseconds}ms forest): '
+          'cached=${cachedFirstUseful.inMilliseconds}ms, cold=${coldFirstUseful.inMilliseconds}ms',
+        );
+      });
+    },
+  );
+
+  testWidgets(
+    'never renders another principal’s cached obligations while config resolves (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final aliceTree = ObligationTreeDto(
+          obligation: makeObligation('alice-obligation', title: 'Alice private obligation'),
+          children: const [],
+          blockingChildren: const [],
+        );
+        final bobTree = ObligationTreeDto(
+          obligation: makeObligation('bob-obligation', title: 'Bob cached obligation'),
+          children: const [],
+          blockingChildren: const [],
+        );
+        final configGate = Completer<DashboardConfigDto>();
+        final firstForestGate = Completer<void>();
+        final secondForestGate = Completer<void>();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [makeObligation('fresh-bob', title: 'Bob authoritative obligation')]
+          ..dashboardConfigGate = configGate
+          ..forestGates.addAll([firstForestGate, secondForestGate]);
+        final cache = FakeObligationsCache(
+          PersistedObligationsSnapshot.capture(
+            scope: 'http://localhost:4040',
+            principalId: 'user-alice',
+            trees: [aliceTree],
+            now: DateTime.utc(2026, 9, 22, 12),
+          ),
+        )..save(
+          PersistedObligationsSnapshot.capture(
+            scope: 'http://localhost:4040',
+            principalId: 'user-bob',
+            trees: [bobTree],
+            now: DateTime.utc(2026, 9, 22, 12),
+          ),
+        );
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(home: Scaffold(body: WorkTab(store: store, onSelectView: (_) {}))),
+        );
+        await tester.pump();
+        expect(find.text('Alice private obligation'), findsNothing);
+
+        configGate.complete(const DashboardConfigDto(
+          quotaProviders: {},
+          userPrincipalId: 'user-bob',
+        ));
+        await pumpEventQueue();
+        await tester.pump();
+
+        expect(find.text('Alice private obligation'), findsNothing);
+        expect(find.text('Bob cached obligation'), findsOneWidget);
+
+        firstForestGate.complete();
+        secondForestGate.complete();
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Alice private obligation'), findsNothing);
+        expect(find.text('Bob authoritative obligation'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'retains cached view and displays actionable retry banner when background refresh fails (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(320, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final cachedOb = makeObligation(
+          'cached-ob-err',
+          ownerId: 'root',
+          title: 'Cached Obligation Preserved On Error',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final cache = FakeObligationsCache(snapshot);
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [cachedOb]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
+          ..forestError = Exception('Network error during background sync');
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+        await pumpEventQueue();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        // Even though fetch failed, the cached obligation MUST remain visible (no full-page error!)
+        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+
+        // At narrow width the banner uses the one actionable sentence rather
+        // than a duplicated failure prefix that can clip its guidance.
+        expect(
+          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Failed to refresh:'), findsNothing);
+        expect(find.textContaining('Network error during background sync'), findsNothing);
+        expect(find.text('Retry'), findsOneWidget);
+
+        // Clear error on API and tap Retry
+        api.forestError = null;
+        await tester.tap(find.text('Retry'));
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        // Error banner is dismissed after successful retry
+        expect(find.textContaining('Failed to refresh:'), findsNothing);
+        expect(find.text('Cached Obligation Preserved On Error'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'cold-start load failure with empty cache renders actionable error alone without doubling prefix (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cache = FakeObligationsCache();
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
+          ..forestError = Exception('Connection refused');
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await store.init();
+        await pumpEventQueue();
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('We could not refresh the work queue. Check your connection and retry.'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Failed to load work queue:'), findsNothing);
+        expect(find.text('Retry'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'invalidates cache and reloads on obligation mutation in WorkTab (#505)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final cachedOb = makeObligation(
+          'cached-ob-mut',
+          ownerId: 'root',
+          title: 'Before Mutation',
+        );
+        final cachedTree = ObligationTreeDto(
+          obligation: cachedOb,
+          children: const [],
+          blockingChildren: const [],
+        );
+        final snapshot = PersistedObligationsSnapshot.capture(
+          scope: 'http://localhost:4040',
+          principalId: 'test-user',
+          trees: [cachedTree],
+          now: DateTime.utc(2026, 9, 22, 12),
+        );
+        final cache = FakeObligationsCache(snapshot);
+        final api = FakeApi(base: Uri.parse('http://localhost:4040'))
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [cachedOb]
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          );
+
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          obligationsCache: cache,
+        );
+        await store.init();
+        await pumpEventQueue();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Before Mutation'), findsOneWidget);
+
+        // The shared store mutation seam covers callbacks outside WorkTab too.
+        final created = await store.mutateObligations(
+          () => api.createObligation(ownerId: 'root', title: 'Newly Created Child'),
+        );
+        expect(created.id, isNotNull);
+
+        // The successful mutation invalidates the principal-scoped snapshot.
+        expect(cache.invalidateCount, 1);
+        expect(store.cachedObligationTrees, isNull);
 
         await store.dispose();
       });

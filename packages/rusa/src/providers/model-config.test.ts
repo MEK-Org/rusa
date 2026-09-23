@@ -26,7 +26,7 @@ function classStore(definitions: Record<string, ProviderModelConfig[]> = {}): Mo
       const modelConfig = definitions[name];
       return modelConfig ? { modelConfig } : undefined;
     },
-    list: () => Object.keys(definitions).map((name) => ({ name })),
+    names: () => Object.keys(definitions),
   };
 }
 

@@ -15,18 +15,25 @@ import {
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  isValidManualQuotaObservation,
+  MANUAL_QUOTA_OBSERVATION_PATH,
+  type ManualQuotaObservationResponse,
+  manualQuotaObservationProblem,
   type PublishedThrottleColdStatus,
   type PublishedThrottleLaneStatus,
   publishedThrottle,
+  QUOTA_READING_MODE_PATH,
   type QuotaCoordinatorError,
   type QuotaCoordinatorErrorResponse,
   type QuotaCoordinatorPathMismatchError,
   type QuotaCoordinatorServiceInfo,
+  type QuotaReadingModeResponse,
   type QuotaReadyScrapeStatus,
 } from "./coordinator-protocol.js";
 import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
-import type { SharedQuotaStore } from "./shared-store.js";
+import type { QuotaReadingMode, SharedQuotaStore } from "./shared-store.js";
 
+/** The GET-only read surface. */
 export const SERVED_ROUTES = [
   "/v1/throttle",
   "/v1/quota",
@@ -34,6 +41,42 @@ export const SERVED_ROUTES = [
   "/v1/healthz",
   "/v1/readyz",
 ] as const;
+
+/**
+ * The POST-only operator write surface (#573). Declared beside the read
+ * surface because Criterion 7 is checked by enumerating routes: a new mutating
+ * endpoint has to be added here to be served, and the contract test asserts the
+ * two sets stay disjoint, so it cannot quietly appear as a method exception on
+ * a read path instead.
+ */
+export const WRITE_ROUTES = [QUOTA_READING_MODE_PATH, MANUAL_QUOTA_OBSERVATION_PATH] as const;
+
+/** True for a path this service routes, read or write; the metric label set. */
+function isRoutedPath(pathname: string): boolean {
+  return (
+    (SERVED_ROUTES as readonly string[]).includes(pathname) ||
+    (WRITE_ROUTES as readonly string[]).includes(pathname)
+  );
+}
+
+/**
+ * Write-contract policy for the operator routes. Neither value is derived
+ * from observed producer behaviour; both are ceilings chosen from what the
+ * coordinator already tolerates elsewhere.
+ *
+ * Future skew: a reading is stamped with the panel's own `scrapedAt`, so the
+ * only legitimate way it is "in the future" is clock skew between the machine
+ * that read the panel and this one. Five minutes is one observation slot
+ * (`SLOT_MS` in shared-store.ts): anything larger would let a reading claim a
+ * slot no scrape could reach yet.
+ *
+ * Body ceiling: a complete four-window snapshot with labels and explanations
+ * serialises to well under 4 KiB; 64 KiB is sixteen times that, small enough
+ * to buffer as a string on the socket and large enough that no honest client
+ * has to think about it.
+ */
+const MANUAL_OBSERVATION_MAX_FUTURE_MS = 5 * 60 * 1000;
+const MAX_WRITE_BODY_BYTES = 64 * 1024;
 
 export const DEFAULT_COORDINATOR_PROVIDERS = QUOTA_THROTTLE_PROVIDERS;
 
@@ -117,7 +160,7 @@ export class QuotaCoordinatorService {
     }
 
     this.server = http.createServer((req, res) => {
-      this.handleRequest(req, res);
+      void this.handleRequest(req, res);
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -202,9 +245,9 @@ export class QuotaCoordinatorService {
     };
   }
 
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
-      this.dispatchRequest(req, res);
+      await this.dispatchRequest(req, res);
     } catch (err) {
       this.sendError(res, 500, {
         code: "internal_error",
@@ -218,7 +261,7 @@ export class QuotaCoordinatorService {
       // distinct query a client happens to send.
       const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
       this.metrics.counter(QUOTA_SERVICE_METRICS.readsTotal, {
-        path: (SERVED_ROUTES as readonly string[]).includes(pathname) ? pathname : "unrouted",
+        path: isRoutedPath(pathname) ? pathname : "unrouted",
         status: res.statusCode,
       });
     }
@@ -256,13 +299,81 @@ export class QuotaCoordinatorService {
     }
   }
 
-  private dispatchRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      let body = "";
+      let bytes = 0;
+      req.setEncoding("utf8");
+      req.on("data", (chunk: string) => {
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > MAX_WRITE_BODY_BYTES) {
+          reject(new Error("Request body exceeds 64 KiB"));
+          req.destroy();
+          return;
+        }
+        body += chunk;
+      });
+      req.once("error", reject);
+      req.once("aborted", () => reject(new Error("Request was aborted")));
+      req.once("end", () => {
+        if (!body.trim()) {
+          reject(new Error("Request body must be JSON"));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          reject(new Error("Request body must be valid JSON"));
+        }
+      });
+    });
+  }
+
+  private configuredProvider(rawProvider: unknown): string | null {
+    if (typeof rawProvider !== "string") return null;
+    const provider = normalizeProviderThrottleKey(rawProvider);
+    return provider && this.configuredProviders.includes(provider) ? provider : null;
+  }
+
+  private async dispatchRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
     const serviceInfo = this.getServiceInfo();
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
 
-    // Per §5.2 and Criterion 7: Every v1 path is a GET.
-    // Any other method on any v1 path returns 405 unconditionally, and no v1 path accepts a body.
+    // The operator write routes (#573) are checked before the GET-only rule
+    // below, because §5.2 / Criterion 7 fixes the allowed method per path: these
+    // two are POST-only, every other v1 path is GET-only. The coordinator daemon
+    // is the sole writer of the quota database and owns the controller advance
+    // and publish that must follow the write, so the operator reports the
+    // reading and the daemon records it; the socket's file mode is the whole of
+    // their authorization.
+    if (pathname === QUOTA_READING_MODE_PATH || pathname === MANUAL_QUOTA_OBSERVATION_PATH) {
+      if (req.method !== "POST") {
+        this.sendError(
+          res,
+          405,
+          {
+            code: "method_not_allowed",
+            message: `Method ${req.method} not allowed on ${pathname}; only POST is permitted`,
+            retryable: false,
+          },
+          { Allow: "POST" }
+        );
+        return;
+      }
+      if (pathname === QUOTA_READING_MODE_PATH) {
+        await this.setQuotaReadingMode(req, res, serviceInfo);
+      } else {
+        await this.recordManualObservation(req, res, serviceInfo);
+      }
+      return;
+    }
+
+    // Per §5.2 and Criterion 7: every v1 path other than the two write routes
+    // above is a GET. Any other method returns 405, and no GET path reads a body.
     if (pathname.startsWith("/v1/")) {
       if (req.method !== "GET") {
         this.sendError(
@@ -270,7 +381,7 @@ export class QuotaCoordinatorService {
           405,
           {
             code: "method_not_allowed",
-            message: `Method ${req.method} not allowed on v1 endpoints; only GET is permitted`,
+            message: `Method ${req.method} not allowed on ${pathname}; only GET is permitted`,
             retryable: false,
           },
           { Allow: "GET" }
@@ -484,6 +595,13 @@ export class QuotaCoordinatorService {
           };
         }
         this.mergeCollectionStats(scrapes);
+        for (const provider of this.configuredProviders) {
+          const { mode, generation } = this.options.store.getQuotaReadingMode(provider);
+          scrapes[provider] = {
+            ...(scrapes[provider] ?? { scrapedAt: null, status: "pending" }),
+            readingMode: { mode, generation },
+          };
+        }
 
         this.sendJson(res, 200, {
           service: serviceInfo,
@@ -512,5 +630,175 @@ export class QuotaCoordinatorService {
       message: `Path ${pathname} not found`,
       retryable: false,
     });
+  }
+
+  /** `set_quota_reading_mode(provider, mode)`: switch one lane's collection authority. */
+  private async setQuotaReadingMode(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    serviceInfo: QuotaCoordinatorServiceInfo
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await this.readJsonBody(req);
+    } catch (error) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      });
+      return;
+    }
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body) ||
+      !["manual", "scrape"].includes((body as { mode?: unknown }).mode as string)
+    ) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: "Body must contain provider and mode (manual or scrape)",
+        retryable: false,
+      });
+      return;
+    }
+    const provider = this.configuredProvider((body as { provider?: unknown }).provider);
+    if (!provider) {
+      this.sendError(res, 404, {
+        code: "provider_unknown",
+        message: "Provider is missing or not configured on this coordinator",
+        retryable: false,
+      });
+      return;
+    }
+    const mode = (body as { mode: QuotaReadingMode }).mode;
+    const state = this.options.store.setQuotaReadingMode(
+      provider,
+      mode,
+      new Date(this.options.now ? this.options.now() : Date.now()).toISOString()
+    );
+    this.sendJson<QuotaReadingModeResponse>(res, 200, {
+      service: serviceInfo,
+      provider,
+      mode: state.mode,
+      generation: state.generation,
+    });
+  }
+
+  /** Accept one manual reading for a manual-mode lane and reason it immediately. */
+  private async recordManualObservation(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    serviceInfo: QuotaCoordinatorServiceInfo
+  ): Promise<void> {
+    let body: unknown;
+    try {
+      body = await this.readJsonBody(req);
+    } catch (error) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false,
+      });
+      return;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: "Body must be a manual observation request object",
+        retryable: false,
+      });
+      return;
+    }
+    const request = body as { provider?: unknown; generation?: unknown; observation?: unknown };
+    const provider = this.configuredProvider(request.provider);
+    if (!provider) {
+      this.sendError(res, 404, {
+        code: "provider_unknown",
+        message: "Provider is missing or not configured on this coordinator",
+        retryable: false,
+      });
+      return;
+    }
+    const idempotencyKey = req.headers["idempotency-key"];
+    const problem =
+      typeof idempotencyKey !== "string" || !idempotencyKey.trim() || idempotencyKey.length > 200
+        ? "Idempotency-Key header is required (1-200 characters)"
+        : !Number.isSafeInteger(request.generation)
+          ? "generation must be the integer returned by the reading-mode switch"
+          : manualQuotaObservationProblem(request.observation, provider);
+    if (problem !== null || !isValidManualQuotaObservation(request.observation, provider)) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: problem ?? "observation is invalid",
+        retryable: false,
+      });
+      return;
+    }
+    const nowMs = this.options.now ? this.options.now() : Date.now();
+    const observation = request.observation;
+    const generation = request.generation as number;
+    const observedAtMs = Date.parse(observation.scrapedAt);
+    if (observedAtMs > nowMs + MANUAL_OBSERVATION_MAX_FUTURE_MS) {
+      this.sendError(res, 400, {
+        code: "invalid_request",
+        message: "Observation scrapedAt is more than five minutes in the future",
+        retryable: false,
+      });
+      return;
+    }
+    if (nowMs - observedAtMs > this.hardStaleAfterMs) {
+      this.sendError(res, 409, {
+        code: "stale_observation",
+        message: "Observation is older than the coordinator hard-stale threshold",
+        retryable: false,
+      });
+      return;
+    }
+    const result = this.options.store.recordManualObservation(
+      {
+        snapshot: observation,
+        generation,
+        idempotencyKey: (idempotencyKey as string).trim(),
+        acceptedAt: new Date(nowMs).toISOString(),
+      },
+      { maxIntervalSeconds: this.maxIntervalSeconds }
+    );
+    if (result.result === "accepted" || result.result === "duplicate") {
+      this.sendJson<ManualQuotaObservationResponse>(res, 200, {
+        service: serviceInfo,
+        provider,
+        observedAt: result.observedAt,
+        generation: result.generation,
+        duplicate: result.result === "duplicate",
+      });
+      return;
+    }
+    if (result.result === "generation_mismatch") {
+      this.sendError(res, 409, {
+        code: "mode_generation_mismatch",
+        message: `Observation generation does not match current generation ${result.generation}`,
+        retryable: false,
+      });
+      return;
+    }
+    const failure = {
+      manual_mode_required: {
+        status: 409,
+        code: "manual_mode_required" as const,
+        message: "Manual observations are accepted only while the provider is in manual mode",
+      },
+      stale_observation: {
+        status: 409,
+        code: "stale_observation" as const,
+        message: "Observation is not newer than the current authoritative observation",
+      },
+      idempotency_conflict: {
+        status: 409,
+        code: "idempotency_conflict" as const,
+        message: "Idempotency-Key was already used for a different observation",
+      },
+    }[result.result];
+    this.sendError(res, failure.status, { ...failure, retryable: false });
   }
 }

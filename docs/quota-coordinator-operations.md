@@ -93,14 +93,170 @@ carries the per-provider scrape outcome (`status`, `attempts`, `failures`,
 `lastAttemptAt`, `error`). A coordinator whose probes are broken still passes
 `healthz` — that asymmetry is the point, and drill 2 rehearses it.
 
-### #499 staging proof and the stage-3 handoff
+### Runtime manual quota readings
 
-The shipped coordinator has no probe-off switch, and the shipped client has no
-compare-only mode: configuring its socket selects the normal client path and
-applies the coordinator publication. The probe-off stage and compare-only stage
-in the design are still follow-up work ([#502](https://github.com/MEK-Org/rusa/issues/502)
-and [#503](https://github.com/MEK-Org/rusa/issues/503)); neither was executed by
-#499.
+The two write routes are `POST /v1/quota/reading-mode` and
+`POST /v1/quota/observations`; every other `/v1/` path is still GET-only
+(design §5.2, Criterion 7, revision 10). The coordinator socket is the
+authorization boundary, not the path: these write calls are available only to a
+process that can use the mode-`0600` Unix socket. There is no network listener
+and no additional bearer token. Every provider starts in `scrape` mode. Switching mode
+returns a monotonically increasing `generation`; keep that value with the source
+reading and send it back on the observation write. It fences an observation
+delayed across a mode transition, and it fences a scrape that was already in
+flight when the lane went manual — that scrape writes nothing, even if the lane
+has returned to `scrape` mode by the time it lands, because its generation is
+gone.
+
+```bash
+quota_socket="$XDG_RUNTIME_DIR/rusa-quota/coordinator.sock"
+
+# Stop collection and accept external observations. Record generation from the response.
+curl --unix-socket "$quota_socket" -sS -X POST \
+  -H 'Content-Type: application/json' \
+  http://localhost/v1/quota/reading-mode \
+  --data '{"provider":"claude","mode":"manual"}'
+# {"provider":"claude","mode":"manual","generation":1,...}
+
+# Submit one real reading. `scrapedAt` is when the source was observed, never
+# when this request was sent. The idempotency key is retained durably.
+curl --unix-socket "$quota_socket" -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: claude-usage-2026-09-20T03:30:00Z' \
+  http://localhost/v1/quota/observations \
+  --data '{
+    "provider":"claude",
+    "generation":1,
+    "observation":{
+      "provider":"claude",
+      "status":"available",
+      "scrapedAt":"2026-09-20T03:30:00.000Z",
+      "limits":[{
+        "label":"Weekly","kind":"weekly","percentLeft":42,
+        "resetAtIso":"2026-09-24T00:00:00.000Z",
+        "scope":{"provider":"claude"}}]
+    }
+  }'
+# {"provider":"claude","observedAt":"2026-09-20T03:30:00.000Z","duplicate":false,...}
+
+# Restore native collection. This increments the generation only when it is a
+# real transition; wait for a new successful scrape before treating it as fresh.
+curl --unix-socket "$quota_socket" -sS -X POST \
+  -H 'Content-Type: application/json' \
+  http://localhost/v1/quota/reading-mode \
+  --data '{"provider":"claude","mode":"scrape"}'
+```
+
+`/v1/readyz` shows each configured lane's current
+`scrapes.<provider>.readingMode: {mode, generation}`, so a lane left in
+`manual` is visible without touching the database.
+
+Responses, in the order the coordinator checks them:
+
+- HTTP 400 names the offending field (`Idempotency-Key`, `generation`,
+  `observation.limits[0].percentLeft must be between 0 and 100`, …). A body
+  over 64 KiB is refused (a full multi-limit snapshot is a few KiB). A
+  `scrapedAt` more than 5 minutes in the future is refused — one observation
+  slot of clock skew between the source panel and the coordinator host. A
+  `resetAtIso` already in the past is accepted: it is what a panel shows in the
+  moments after a window rolls over, and the store treats it as a rollover.
+- HTTP 409 `manual_mode_required` in `scrape` mode and `mode_generation_mismatch`
+  for an old generation. Authority is checked before replay: replaying an
+  already-accepted key after the lane left `manual`, or under a superseded
+  generation, gets these codes rather than `duplicate: true`.
+- HTTP 409 `idempotency_conflict` when the same key arrives with a different
+  body. `duplicate: true` (HTTP 200) means the same key with byte-identical
+  content; nothing is written again.
+- HTTP 409 `stale_observation` for old, out-of-order, or same-slot readings.
+
+None of the rejections changes `/v1/quota`, `/v1/throttle`, history, or its
+reported age. An accepted reading is stored as an ordinary `quota_scrapes`
+evidence row whose `raw_output` is `{"source":"manual", "idempotencyKey",
+"generation"}`, plus its `quota_observations`
+rows, so latest, history, hydration, and pruning need no manual-specific path.
+The receipt row keeps only a sha256 fingerprint of the request, never the body,
+and ages out with the 30-day raw-evidence retention; a retry after that window
+is refused as `stale_observation` because it is older than the latest accepted
+reading.
+
+Manual mode suppresses every coordinator scraper for that lane, including
+Kimi. It is not a request to use a different Kimi fallback. The accepted
+observation enters the normal durable observation and PID-controller path, so
+inspect both views after a write:
+
+```bash
+curl --unix-socket "$quota_socket" -sS 'http://localhost/v1/quota?provider=claude'
+curl --unix-socket "$quota_socket" -sS 'http://localhost/v1/throttle?provider=claude'
+```
+
+#### Deploy and rollback order
+
+1. Take the normal coordinator SQLite backup, stop the coordinator, deploy the
+   v2 binary, and start it. Its one-way v1→v2 migration only adds
+   `quota_provider_reading_modes` and `quota_manual_observation_receipts`; it
+   does not copy or backfill quota evidence.
+2. Confirm `/v1/readyz` (every lane reports `readingMode.mode: "scrape"`),
+   switch one staging provider to `manual`, submit a current reading using the
+   returned generation, and verify the two reads above show that exact
+   `scrapedAt` and the resulting pacing decision.
+3. To roll back the operational mode, POST `scrape`, then wait for a successful
+   new provider scrape before relying on automatic collection again. The manual
+   receipts remain as idempotency evidence for the raw retention window.
+4. Do not run a pre-v2 coordinator binary against this database: its schema
+   guard correctly refuses `user_version = 2`. That includes
+   `rusa quota-pacing-reset`, which opens the same database — run it from the
+   v2 build. A binary rollback therefore requires stopping the coordinator and
+   restoring the pre-deploy SQLite backup under the existing restore procedure;
+   it intentionally loses manual-mode state and receipts created after that
+   backup.
+
+### Stage-0 probe-off and the #499 staging proof
+
+`rusa quota-coordinator --probe-off` is the shipped stage-0 switch. It opens
+the configured **copied** coordinator database and starts the same socket,
+read, health/readiness, backup, and metric surfaces, but does not construct or
+start `QuotaCollectionLoop`. Therefore it starts no provider CLI probe and
+performs no scrape, parse, or controller write. Normal starts remain probe-on
+by default.
+
+For a one-off foreground check, run:
+
+```bash
+rusa quota-coordinator --home "$RUSA_HOME" --probe-off
+```
+
+For the installed user unit, add a temporary drop-in and restart it:
+
+```bash
+systemctl --user edit <basename>-quota-coordinator.service
+# Add exactly:
+# [Service]
+# Environment=RUSA_QUOTA_COORDINATOR_PROBE_OFF=1
+systemctl --user daemon-reload
+systemctl --user restart <basename>-quota-coordinator.service
+```
+
+The startup record carries `probeOff: true` and the journal records `Quota probe
+collection disabled for stage-0 rollout`. Verify the socket mode, `healthz`,
+`readyz`, seeded `GET /v1/throttle`, seeded `GET /v1/quota`, backups, and
+`quota_service_reads_total`; scrape and controller metrics must not advance.
+
+Precedence is deliberately one-way: the switch is on if *either* the flag or
+the drop-in variable asks for it, so while the drop-in is installed there is no
+command-line way to ask a start for probe-on. That is the intended shape — the
+drop-in is the unit's state, and changing the unit's state is the rollback
+below, not a flag an ad-hoc invocation can quietly win with.
+
+To roll back stage 0 into the normal collection stage, remove the drop-in with
+`systemctl --user revert <basename>-quota-coordinator.service`, then
+`systemctl --user daemon-reload` and restart the unit. The absence of the
+switch is deliberately probe-on; do not leave a probe-off override in place
+when expecting fresh quota observations.
+
+The shipped client still has no compare-only mode: configuring its socket
+selects the normal client path and applies the coordinator publication.
+Compare-only remains follow-up work ([#503](https://github.com/MEK-Org/rusa/issues/503)).
+#499 predates the stage-0 switch and did not execute it.
 
 Instead, #499 used a separate staging coordinator with a fresh staging database
 and its normal probe loop to prove probing outside the instance, then restarted

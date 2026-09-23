@@ -194,7 +194,7 @@ program
   .description("Hydrate an external-root e2e instance by driving the real mesh APIs")
   .requiredOption(
     "--scenario <name>",
-    "Scenario: dashboard-basic or dashboard-empty (requires am-up --root-driver external)"
+    "Scenario: dashboard-basic, dashboard-empty or dashboard-references (requires am-up --root-driver external)"
   )
   .option("--root-control-port <port>", "Root control HTTP port", (v) => Number.parseInt(v, 10))
   .option("--chat-control-port <port>", "Chat control HTTP port", (v) => Number.parseInt(v, 10))

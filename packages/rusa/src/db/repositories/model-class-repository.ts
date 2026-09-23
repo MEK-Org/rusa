@@ -82,8 +82,10 @@ function fromRow(row: ModelClassRow): ModelClass {
 /**
  * SQLite source of truth for model classes. Every lookup reads the committed
  * row directly: a successful `set_model_class` affects the next class
- * selection in this process without a mesh restart, while actor records retain
- * the concrete pool already resolved for them.
+ * selection in this process without a mesh restart, and a class-bound actor's
+ * pool with it — actor records hold a reference to the class, never a copy of
+ * its entries, so an edit here is the edit those actors see (#626). An
+ * explicitly declared pool is a durable snapshot and is unaffected.
  */
 export class ModelClassRepository {
   constructor(private readonly db: Database.Database) {}
@@ -109,6 +111,19 @@ export class ModelClassRepository {
     ).map(fromRow);
   }
 
+  /**
+   * Names-only lookup for an unknown-class diagnostic. Unlike {@link list},
+   * this intentionally never decodes a sibling's definition: one corrupt
+   * class must not prevent another actor's broken reference from being shown.
+   */
+  names(): string[] {
+    return (
+      this.db.prepare("SELECT name FROM model_classes ORDER BY name ASC").all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+  }
+
   /** Full replacement, preserving ordered candidate semantics exactly as supplied. */
   upsert(name: string, modelConfig: readonly ProviderModelConfig[], at: string): void {
     const definition: StoredDefinition = {
@@ -126,6 +141,17 @@ export class ModelClassRepository {
       .run(name, JSON.stringify(definition), at, at);
   }
 
+  /**
+   * Delete a model class definition from mesh.db.
+   *
+   * This is a plain delete: the reference guard lives at `delete_model_class`,
+   * the only caller, because only there is it complete. A live actor's binding
+   * has two parts — the committed `model_config` row and a `set_actor_model`
+   * staged in process memory that has not reached its run boundary yet — and
+   * the second is not in any table, so SQL here cannot see it. A guard at this
+   * layer would look complete and would not be, which is worse for the next
+   * caller than no guard at all (#636).
+   */
   delete(name: string): boolean {
     return this.db.prepare("DELETE FROM model_classes WHERE name = ?").run(name).changes > 0;
   }

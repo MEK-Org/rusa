@@ -176,6 +176,21 @@ export function createTrackerRequestHandler(tracker: LocalTracker) {
       if (parts[0] === "pulls" && parts.length === 1 && method === "GET") {
         return sendJson(res, 200, tracker.listPrs().map(serializePr));
       }
+      // POST /pulls — open a PR; emits a pull_request/opened intake event.
+      if (parts[0] === "pulls" && parts.length === 1 && method === "POST") {
+        const parsed = parseJsonObjectBody(await readBody(req));
+        if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+        const title = typeof parsed.value.title === "string" ? parsed.value.title.trim() : "";
+        if (!title) return sendJson(res, 400, { error: "Missing 'title'" });
+        const pr = await tracker.openPr({
+          title,
+          body: typeof parsed.value.body === "string" ? parsed.value.body : "",
+          author: typeof parsed.value.author === "string" ? parsed.value.author : undefined,
+          headRef: typeof parsed.value.headRef === "string" ? parsed.value.headRef : undefined,
+          draft: parsed.value.draft === true,
+        });
+        return sendJson(res, 201, serializePr(pr));
+      }
       if (parts[0] === "pulls" && parts.length >= 2) {
         const prNumber = Number.parseInt(parts[1], 10);
         if (!Number.isFinite(prNumber)) {
@@ -203,6 +218,74 @@ export function createTrackerRequestHandler(tracker: LocalTracker) {
             return sendJson(res, 404, { error: "Pull request not found" });
           }
           return sendJson(res, 200, tracker.listReviews(prNumber).map(serializeReview));
+        }
+
+        // POST /pulls/:n/comments — a conversation comment; emits issue_comment.
+        if (parts.length === 3 && parts[2] === "comments" && method === "POST") {
+          if (!tracker.getPr(prNumber)) {
+            return sendJson(res, 404, { error: "Pull request not found" });
+          }
+          const parsed = parseJsonObjectBody(await readBody(req));
+          if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+          const body = typeof parsed.value.body === "string" ? parsed.value.body : "";
+          if (!body.trim()) return sendJson(res, 400, { error: "Missing 'body'" });
+          const author = typeof parsed.value.author === "string" ? parsed.value.author : undefined;
+          return sendJson(res, 201, await tracker.addPrComment(prNumber, { body, author }));
+        }
+
+        // POST /pulls/:n/review-comments — one inline comment; emits
+        // pull_request_review_comment.
+        if (parts.length === 3 && parts[2] === "review-comments" && method === "POST") {
+          if (!tracker.getPr(prNumber)) {
+            return sendJson(res, 404, { error: "Pull request not found" });
+          }
+          const parsed = parseJsonObjectBody(await readBody(req));
+          if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+          const body = typeof parsed.value.body === "string" ? parsed.value.body : "";
+          const path = typeof parsed.value.path === "string" ? parsed.value.path : "";
+          if (!body.trim() || !path) {
+            return sendJson(res, 400, { error: "Missing 'body' or 'path'" });
+          }
+          const comment = await tracker.addReviewComment(prNumber, {
+            body,
+            path,
+            line: typeof parsed.value.line === "number" ? parsed.value.line : undefined,
+            author: typeof parsed.value.author === "string" ? parsed.value.author : undefined,
+          });
+          return sendJson(res, 201, comment);
+        }
+
+        // POST /pulls/:n/push — new commits on the head; emits synchronize.
+        if (parts.length === 3 && parts[2] === "push" && method === "POST") {
+          if (!tracker.getPr(prNumber)) {
+            return sendJson(res, 404, { error: "Pull request not found" });
+          }
+          return sendJson(res, 200, serializePr(await tracker.pushToPr(prNumber)));
+        }
+
+        // POST /pulls/:n/edit — retitle/redescribe; emits edited.
+        if (parts.length === 3 && parts[2] === "edit" && method === "POST") {
+          if (!tracker.getPr(prNumber)) {
+            return sendJson(res, 404, { error: "Pull request not found" });
+          }
+          const parsed = parseJsonObjectBody(await readBody(req));
+          if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+          const pr = await tracker.editPr(prNumber, {
+            title: typeof parsed.value.title === "string" ? parsed.value.title : undefined,
+            body: typeof parsed.value.body === "string" ? parsed.value.body : undefined,
+          });
+          return sendJson(res, 200, serializePr(pr));
+        }
+
+        // POST /pulls/:n/close — close, or merge with {"merged": true}; emits closed.
+        if (parts.length === 3 && parts[2] === "close" && method === "POST") {
+          if (!tracker.getPr(prNumber)) {
+            return sendJson(res, 404, { error: "Pull request not found" });
+          }
+          const parsed = parseJsonObjectBody((await readBody(req)) || "{}");
+          if (!parsed.ok) return sendJson(res, 400, { error: parsed.error });
+          const pr = await tracker.closePr(prNumber, { merged: parsed.value.merged === true });
+          return sendJson(res, 200, serializePr(pr));
         }
 
         // POST /pulls/:n/reviews — submit a review; emits a pr_review intake event.

@@ -21,10 +21,11 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import type {
-  InboxEntry,
-  InboxPayload,
-  InboxRepository,
+import {
+  EmptyInboxRepository,
+  type InboxEntry,
+  type InboxPayload,
+  type InboxRepository,
 } from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
@@ -34,6 +35,12 @@ import {
   type EventSourceOwnershipDiagnostic,
   type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
+import {
+  type MeshProviderGate,
+  type QueuedSelection,
+  RunManager,
+  VOICE_INBOX_PAYLOAD_TYPE,
+} from "../runtime/run-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceDefinition } from "../voice/voice-catalog.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
@@ -59,11 +66,7 @@ import {
   InMemoryCapabilityGrantStore,
   PARENT_GRANTABLE_CAPABILITIES,
 } from "./capability-grants.js";
-import {
-  ConcurrencyLimiter,
-  RunStartCancelledError,
-  type RunStartHandle,
-} from "./concurrency-limiter.js";
+import type { RunStartHandle } from "./concurrency-limiter.js";
 import {
   type EventResource,
   type EventSourceOwnerStore,
@@ -92,7 +95,8 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
-import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-runner.js";
+import type { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
+import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
@@ -469,29 +473,6 @@ export interface MechanicalInboxForensics {
   status?: string;
 }
 
-/**
- * The declared tuple a queued run has actually reserved — populated the
- * moment a `providerGate` implementation reports it via `onSelected`, kept
- * only while the run is queued, and read by both HALT safety
- * ({@link ActorMesh.cancelHaltedQueuedRuns}, which must cancel on the
- * reserved lane, not the whole declared pool) and selection telemetry/queued
- * dashboard state. `provider` is the declared alias as configured;
- * `lane` is the canonical pacing/account key (`providerThrottleKey`) it
- * resolves to — deliberately kept distinct so a configured alias is never
- * silently erased.
- */
-export interface QueuedSelection {
-  provider: string;
-  lane: string;
-  model: string;
-  effort?: string;
-  /** Index of this candidate within the actor's declared pool, in declaration order. */
-  declaredIndex: number;
-  /** Epoch-ms quote for when this reservation becomes eligible to start. */
-  eligibleAt: number;
-  responsive: boolean;
-}
-
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
   executionTarget?: string;
@@ -580,30 +561,13 @@ export interface ActorMeshOptions {
    * winning tuple. A responsive run uses that same selection, then bypasses
    * pacing/concurrency after its candidate is reserved.
    */
-  providerGate?: <T>(
-    fn: (selected: RawProviderModelConfig) => Promise<T>,
-    candidates: readonly RawProviderModelConfig[],
-    opts: {
-      responsive: boolean;
-      /** Owning actor, retained only for scheduler observability. */
-      threadId?: string;
-      enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
-      /**
-       * Report the reserved candidate — at initial reservation and again on
-       * a later reselection or in-place responsive promotion — so the mesh can
-       * track it for HALT safety and selection telemetry. A `providerGate`
-       * implementation that never calls this leaves the mesh without a
-       * recorded selection, which falls back to whole-pool HALT checks.
-       */
-      onSelected?: (selection: QueuedSelection) => void;
-    }
-  ) => RunStartHandle<T>;
+  providerGate?: MeshProviderGate;
   /**
    * Mesh-wide emergency brake consulted in every worker's `beforeRun`: when it
    * returns true the run is skipped (and, being a skip, won't self-continue), so
    * the mesh quiesces within one run-cycle. Defaults to never-halted.
    */
-  isHalted?: (provider?: string) => boolean;
+  isHalted?: (provider?: string, model?: string) => boolean;
   /**
    * Second, independent run-gate term consulted in every worker's `beforeRun`:
    * the in-memory graceful-shutdown brake (see {@link GracefulShutdown}). Kept
@@ -719,8 +683,8 @@ export interface ActorMeshOptions {
    * beside it, so a mesh with two competing routing policies cannot be
    * constructed at all.
    *
-   * Mesh retains the manager only to append through it before
-   * notifyInboxChanged; #384 will move after-commit notification out of Mesh.
+   * Mesh retains the manager only to append through it before dispatching the
+   * recipients the delivery persisted entries for.
    */
   eventManager?: EventManager;
   /**
@@ -754,6 +718,8 @@ export interface ActorMeshOptions {
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
   onInboxEntriesSeen?: (actorId: string, entries: readonly InboxEntry[]) => void;
+  /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
+  responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   /**
    * The allow-list of grantable capability names — typically the keys of the
    * wiring's grantable-MCP registry. A grant of any name outside this set is
@@ -796,8 +762,9 @@ const STRICT_HEAD_CLOSURE_EXITS =
  *   and its subtree and marks the records retired (B.5).
  *
  * The root is created by the wiring and {@link adopt}ed so workers can message it.
- * Per-actor serialization comes from each actor's TriggerRunner; cross-actor
- * concurrency is bounded by a shared {@link ConcurrencyLimiter}.
+ * Execution coordination is not Mesh's: {@link RunManager} owns the live
+ * actors, their construction, dispatch, admission, and terminal cleanup. Mesh
+ * keeps the durable records and hands the manager an actor id.
  */
 interface HeadClosureRunState {
   headObligationIds: Set<string>;
@@ -838,11 +805,9 @@ export class ActorMesh {
     record: ActorRecord,
     modelConfig: ModelConfigInput
   ) => ProviderModelConfig[];
-  private readonly limiter: ConcurrencyLimiter;
-  private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
-  /** Reserved-lane state for genuinely queued runs; see {@link QueuedSelection}. */
-  private readonly selections = new Map<string, QueuedSelection>();
-  private readonly isHalted: (provider?: string) => boolean;
+  /** The execution coordinator: live actors, construction, dispatch, admission. */
+  private readonly runs: RunManager;
+  private readonly isHalted: (provider?: string, model?: string) => boolean;
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
   private readonly now: () => string;
@@ -863,6 +828,12 @@ export class ActorMesh {
     actorId: string,
     capability: string
   ) => Promise<void> | void;
+  /**
+   * The last unresolved-class reason reported per actor, so a permanently
+   * broken binding emits one event rather than one per dispatch attempt.
+   * Cleared when the class resolves again.
+   */
+  private readonly reportedModelClassFailures = new Map<string, string>();
   private readonly onModelSet?: (
     actorId: string,
     modelConfig: ProviderModelConfig[],
@@ -887,19 +858,26 @@ export class ActorMesh {
   /** Captured at selection so root enrollment changes never alter an active run. */
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
+  private unsubscribeInboxAppends?: () => void;
+  private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
+  /**
+   * Recipients of durably committed inbox rows that nothing has woken yet.
+   * See {@link scheduleAppendedWork}.
+   */
+  private readonly appendWakesOwed = new Set<string>();
   private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
   private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
+  private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
   private readonly voiceTransferLog: Logger;
   private scheduledMessages?: ScheduledMessageScheduler;
   private readonly withTransaction: (fn: () => void) => void;
-  private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
   /** Direct callers without repository changes use this mesh-local epoch. */
   private readonly directReadyHeadEpoch = randomUUID();
@@ -961,12 +939,14 @@ export class ActorMesh {
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
+    this.log = opts.log ?? (() => {});
     this.supportedVoices = opts.supportedVoices ?? [];
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.voiceSessionTransfer = opts.voiceSessionTransfer;
     this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
+    this.responsiveInterruption = opts.responsiveInterruption;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
     // any other grantable server — neither advertises nor grants it here.
@@ -974,23 +954,50 @@ export class ActorMesh {
       [...(opts.grantableCapabilities ?? [])].filter((cap) => !HOST_GLOBAL_CAPABILITIES.has(cap))
     );
     this.secretsDir = opts.secretsDir ?? secretsDirPath();
-    this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
-    this.providerGate =
-      opts.providerGate ??
-      ((fn, candidates, admissionOpts) => {
-        // No real pacing wired (e.g. an isolated test mesh): declaration order
-        // is the whole policy, matching a fixed single-choice actor's behavior.
-        const selected = candidates[0];
-        const run = () => fn(selected);
-        if (opts.rateLimit) {
-          const result = opts.rateLimit(
-            () => (admissionOpts.responsive ? run() : admissionOpts.enqueueNormal(run).result),
-            selected.provider
-          );
-          return { result, started: false, promote: () => {}, cancel: () => false };
-        }
-        return admissionOpts.responsive ? immediateStart(run) : admissionOpts.enqueueNormal(run);
-      });
+    if (!opts.inboxStore) {
+      this.log(
+        "ActorMesh constructed without an inboxStore; dispatch is disabled until durable inbox storage is wired"
+      );
+    }
+    this.runs = new RunManager({
+      inbox: opts.inboxStore ?? new EmptyInboxRepository(),
+      maxConcurrent: opts.maxConcurrent,
+      providerGate: opts.providerGate,
+      rateLimit: opts.rateLimit,
+      constructActor: (record) => this.createActor(this.factoryContext(record)),
+      recordStatus: (actorId) => this.actors.get(actorId)?.status,
+      isVoiceSessionActive: (actorId) => this.isVoiceSessionActive(actorId),
+      markInboxSeen: (actorId) => {
+        this.markInboxSeen(actorId);
+      },
+      onPreempted: (actorId, phase) => {
+        this.recordEvent({
+          kind: "run_preempted",
+          actorId,
+          detail: phase,
+          payload: JSON.stringify({ reason: "responsive_notification" }),
+        });
+      },
+      // Only wired when a classifier exists. The hook's presence is what
+      // switches `RunManager` into collecting rows, so supplying it
+      // unconditionally would make every deployment pay for an observer that
+      // has nothing to observe — and would strand the default-path early exit.
+      ...(this.responsiveInterruption
+        ? {
+            onResponsiveArrived: (
+              actorId: string,
+              entries: readonly InboxEntry[],
+              baseline: "interrupt" | "queue"
+            ) => {
+              this.shadowResponsiveInterruptions(actorId, entries, baseline);
+            },
+          }
+        : {}),
+      onInternalPort: (port) => {
+        this.dispatchJoiningActiveRunPort = port.dispatchJoiningActiveRun;
+      },
+      log: (msg) => this.log(msg),
+    });
     this.isHalted = opts.isHalted ?? (() => false);
     this.isShuttingDown = opts.isShuttingDown ?? (() => false);
     this.idgen = opts.idgen ?? (() => randomUUID());
@@ -1012,11 +1019,15 @@ export class ActorMesh {
     ];
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
-    this.log = opts.log ?? (() => {});
     this.voiceTransferLog = opts.voiceTransferLogger ?? nullLogger;
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
     this.eventManager = opts.eventManager;
+    if (opts.inboxStore) {
+      this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
+        this.scheduleAppendedWork(items);
+      });
+    }
   }
 
   /**
@@ -1190,7 +1201,7 @@ export class ActorMesh {
   adopt(record: ActorRecord, actor: MeshActor): void {
     const existing = this.actors.get(record.id);
     this.actors.upsert(existing ? { ...existing, ...record } : record);
-    this.live.set(record.id, actor);
+    this.runs.register(record.id, actor);
     if (actor.lifecycle) this.lifecycles.set(record.id, actor.lifecycle);
     else this.lifecycleFor(record.id);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
@@ -1207,11 +1218,10 @@ export class ActorMesh {
    * inbox reconciliation nudges actors with durable work.
    */
   rehydrate(record: ActorRecord): void {
-    if (this.live.has(record.id)) return; // already live (e.g. the adopted root)
+    if (this.runs.isLive(record.id)) return; // already live (e.g. the adopted root)
     if (record.status !== "active") return; // don't revive retired threads
     try {
-      const actor = this.createActor(this.factoryContext(record));
-      this.live.set(record.id, actor);
+      const actor = this.runs.instantiate(record);
       this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
       this.log(`rehydrated ${record.id} (parent ${record.parentId})`);
     } catch (err) {
@@ -1259,7 +1269,7 @@ export class ActorMesh {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
         const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
-        this.notifyInboxChanged(work.actorId, { priority: work.priority });
+        this.dispatch(work.actorId);
       }
     } catch (err) {
       // Recovery is a nudge over durable state, not the durability boundary.
@@ -1269,20 +1279,6 @@ export class ActorMesh {
     }
   }
 
-  /**
-   * The nudge a re-attached actor should receive for the work it already holds.
-   * A wake lost in transit is not durable, but the inbox entry behind it is: a
-   * responsive entry still unhandled after the gap earns the responsive wake
-   * (quick start and preemption) it would have had on first delivery.
-   */
-  durableInboxNudge(actorId: string): RunNudge {
-    if (!this.inboxStore) return {};
-    actorId = this.resolveThreadId(actorId);
-    return this.inboxStore.countUnhandled(actorId, { responsiveOnly: true }) > 0
-      ? { priority: "responsive" }
-      : {};
-  }
-
   /** Resume recovery: nudge only work that never passed a pre-run halt gate. */
   reconcileUnseenInbox(): void {
     if (!this.inboxStore) return;
@@ -1290,7 +1286,7 @@ export class ActorMesh {
       for (const work of this.inboxStore.actorsWithUnseen()) {
         const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
-        this.notifyInboxChanged(work.actorId, { priority: work.priority });
+        this.dispatch(work.actorId);
       }
     } catch (err) {
       this.log(
@@ -1343,78 +1339,162 @@ export class ActorMesh {
   }
 
   /**
-   * Notify an actor that its durable worklist changed, returning whether this
-   * call requested an execution opportunity. If one is already queued, the new
-   * entry joins it and becomes seen immediately; only deliveries during an
-   * active run set the dirty follow-up. A held normal entry remains durable but
-   * returns false because the session-end release, not this call, will nudge it.
+   * The mesh's only dispatch input: tell a `RunManager` that an actor may have
+   * durable work. The call carries no priority, no item, and no nudge — every
+   * one of those is read back out of the inbox — so no caller can describe work
+   * the durable record does not already hold. It returns whether an execution
+   * opportunity was requested; a dispatch against an actor with nothing
+   * unhandled is a no-op, and a dispatch lost entirely is recovered by
+   * reconciliation rather than by the sender retrying.
    *
-   * Responsive work replaces an in-flight run — operator control, human
-   * messages, and `runNow` all mean "now". The one wake that may not is an
-   * event copy for a recipient other than the effective owner; that decision
-   * lives in {@link notifyEventRecipient}, so no caller of this method can
-   * turn preemption off.
+   * Dispatch replaces an in-flight run when the durable work is responsive —
+   * operator control, human messages, and `runNow` all mean "now". The one wake
+   * that may not is an event copy for a recipient other than the effective
+   * owner; that decision lives in {@link dispatchJoiningActiveRun}, so no
+   * caller of this method can turn preemption off.
    */
-  notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
-    return this.wakeForInbox(actorId, nudge, { preempt: true });
+  dispatch(actorId: string): boolean {
+    const resolved = this.resolveThreadId(actorId);
+    this.appendWakesOwed.delete(resolved);
+    return this.runs.dispatch(resolved);
   }
 
   /**
-   * Event fan-out's wake. Only the event's effective owner may have its active
-   * run replaced; every other recipient's copy keeps responsive scheduling and
-   * admission but joins that actor's run as a follow-up instead of aborting
-   * work the event does not belong to. Private and named for its one use so
-   * "responsive but not preempting" cannot leak into a control path.
+   * Fire-and-forget shadow decisions over the exact rows the durable inbox
+   * identified as newly arrived, before its normal preemption path runs. Only
+   * ids cross this seam: message bodies, issue text, and other operational
+   * content stay in their source stores.
+   *
+   * The comparison sets are read synchronously, before the `void`, because
+   * they describe the actor's state at the moment the row arrived. Deferring
+   * the read past the await boundary would let the run this dispatch is about
+   * to preempt change its own selection first, and the decision would then be
+   * scored against a world that the arrival had already altered.
    */
-  private notifyEventRecipient(
-    dest: string,
-    priority: "responsive" | "normal" | undefined,
-    isOwner: boolean
-  ): boolean {
-    return this.wakeForInbox(dest, { priority }, { preempt: isOwner });
+  private shadowResponsiveInterruptions(
+    actorId: string,
+    incoming: readonly InboxEntry[],
+    baseline: "interrupt" | "queue"
+  ): void {
+    const classifier = this.responsiveInterruption;
+    if (!classifier || incoming.length === 0) return;
+    const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
+    // Unselected rows are only ever the fallback for an actor holding no
+    // selection, so a selection spares the full unhandled scan entirely.
+    const pendingEntryIds =
+      selectedEntryIds.length > 0 ? [] : this.unselectedInboxEntryIds(actorId, selectedEntryIds);
+    for (const entry of incoming) {
+      // Explicit Run Now is an operator control, not a classifier candidate.
+      // Direct interrupt() does not dispatch at all, preserving its hard path.
+      if (entry.payload.type === "operator.run_now") continue;
+      const incomingEntryId = entry.id;
+      void classifier
+        .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .then((decision) => {
+          this.recordEvent({
+            kind: "responsive_interruption_shadow",
+            actorId,
+            detail: "shadow",
+            payload: JSON.stringify({ baseline, decision }),
+          });
+        })
+        .catch(() => {
+          // `evaluate` resolves rather than throws, so this arm covers only a
+          // failure to record the observation. It emits no decision — one
+          // audit shape means a consumer parses one schema — and exists so a
+          // fire-and-forget promise cannot reject unhandled.
+          this.log(`responsive interruption shadow observation failed for ${incomingEntryId}`);
+        });
+    }
   }
 
-  /** The shared body of both wakes; `preempt` is required so every caller states it. */
-  private wakeForInbox(actorId: string, nudge: RunNudge, opts: { preempt: boolean }): boolean {
-    actorId = this.resolveThreadId(actorId);
-    const rec = this.actors.get(actorId);
-    if (rec && rec.status !== "active") {
-      this.log(`inbox_changed for ${actorId} not nudged — actor is retired`);
-      return false;
-    }
-    const target = this.live.get(actorId);
-    if (!target) {
-      this.log(`inbox_changed for ${actorId} not nudged — no live actor`);
-      return false;
-    }
-    if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
-      // The entry is already durable. It must wait for the session-end nudge,
-      // rather than adding an ordinary execution opportunity behind the voice
-      // conversation. Responsive work passes the hold whether or not it may
-      // preempt — the same voice exemption `admitRun` and `selectInboxEntries`
-      // grant responsive entries — so a non-owner's event copy is admitted
-      // behind the voice session's own run rather than held with normal work.
-      this.log(`inbox_changed for ${actorId} held — active voice session`);
-      return false;
-    }
-    if (isResponsiveNudge(nudge) && opts.preempt) {
-      const preemption = target.preemptForResponsive();
-      if (preemption.preempted) {
-        this.recordEvent({
-          kind: "run_preempted",
-          actorId,
-          detail: preemption.phase,
-          payload: JSON.stringify({ reason: "responsive_notification" }),
-        });
+  /** Read the entire durable unhandled set minus the selected rows; a
+   * classifier must not infer a comparison target from a convenient first page
+   * or a racing "latest" row. */
+  private unselectedInboxEntryIds(actorId: string, selectedEntryIds: readonly string[]): string[] {
+    const inbox = this.inboxStore;
+    if (!inbox) return [];
+    const selected = new Set(selectedEntryIds);
+    let cursor: string | undefined;
+    const entryIds: string[] = [];
+    do {
+      const page = inbox.list(actorId, { status: "unhandled", limit: 100, cursor });
+      for (const entry of page.entries) {
+        if (!selected.has(entry.id)) entryIds.push(entry.id);
       }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return entryIds;
+  }
+
+  /**
+   * The dispatch that schedules without interrupting. Responsive work still
+   * passes the voice hold and is admitted; what it does not do is replace a
+   * run already in flight. Private and named so "responsive but not
+   * preempting" cannot leak into a control path. Its two callers are event
+   * fan-out's non-owner copy and self-caused mid-run ready attention.
+   */
+  private dispatchJoiningActiveRun(dest: string): boolean {
+    const resolved = this.resolveThreadId(dest);
+    const dispatchJoiningActiveRun = this.dispatchJoiningActiveRunPort;
+    if (!dispatchJoiningActiveRun) return false;
+    this.appendWakesOwed.delete(resolved);
+    return dispatchJoiningActiveRun(resolved);
+  }
+
+  /**
+   * The seam between a durable inbox write and scheduling (#388).
+   *
+   * Every row `append` commits leaves its recipient owed one content-free
+   * {@link dispatch} attempt. The notification is advisory by the store's
+   * contract — a refused or lost attempt costs latency, not correctness, because
+   * {@link reconcileInbox} replays the same fact out of `actorsWithUnhandled()`
+   * at boot.
+   *
+   * The debt is settled by whoever reaches the actor first, and this pays only
+   * what nobody else did. Every appending path in the mesh still wakes its own
+   * recipient in the same turn, some of them deliberately without preempting —
+   * an event copy delivered to a recipient that is not its effective owner is
+   * entitled to join the run in flight rather than replace it — and those
+   * wakes clear the debt, which is what stops a second dispatch from
+   * cancelling and re-queueing the run the first one just admitted. What is
+   * left over is the case this exists for: work that became durable with no
+   * one attempting to schedule it, which now gets that attempt instead of
+   * waiting for the next boot.
+   *
+   * Deferring to a microtask is what gives the appending turn its chance, and
+   * the store's contract asks a listener to stay cheap and hand off rather
+   * than block the appender.
+   */
+  private scheduleAppendedWork(items: readonly InboxEntry[]): void {
+    let owed = false;
+    for (const item of items) {
+      // Keyed the way the two dispatches key their deletes, so a row addressed
+      // to "root" and a dispatch of the concrete root id are the same debt.
+      const actorId = this.resolveThreadId(item.actorId);
+      if (this.appendWakesOwed.has(actorId)) continue;
+      this.appendWakesOwed.add(actorId);
+      owed = true;
     }
-    if (target.isQueued) {
-      this.markInboxSeen(actorId);
-      target.requestRun(nudge);
-      return true;
-    }
-    target.requestRun(nudge);
-    return true;
+    // The only writer above queues this drain whenever it adds a new debt; a
+    // drain snapshots and clears the whole set, so an already-owed id is safe
+    // to skip here.
+    if (!owed) return;
+    queueMicrotask(() => {
+      const unpaid = [...this.appendWakesOwed];
+      this.appendWakesOwed.clear();
+      for (const actorId of unpaid) {
+        try {
+          this.dispatch(actorId);
+        } catch (err) {
+          // An advisory wake is never allowed to become the appender's
+          // problem, and boot reconciliation still covers what it missed.
+          this.log(
+            `inbox notification dispatch for ${actorId} failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    });
   }
 
   /** Lifecycle boundary after the halt gate and before scheduler admission. */
@@ -1553,7 +1633,7 @@ export class ActorMesh {
         }
       }
     }
-    const actor = this.live.get(actorId);
+    const actor = this.runs.liveActor(actorId);
     if (actor) {
       this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
         refreshThreadSnapshot: true,
@@ -1723,8 +1803,9 @@ export class ActorMesh {
           obligationId: head.id,
           intent: head.intent ?? undefined,
           // A responsive head's attention is immediately responsive work:
-          // it preempts where the inbox model admits preemption (see
-          // notifyInboxChanged's responsive nudge below).
+          // it preempts where the inbox model admits preemption. The priority
+          // written here is the only thing that makes the dispatch below
+          // responsive.
           ...(responsive ? { priority: "responsive" as const } : {}),
         } as unknown as InboxPayload,
       },
@@ -1732,7 +1813,7 @@ export class ActorMesh {
     if (entries.length === 0) {
       return false;
     }
-    this.notifyInboxChanged(actorId, responsive ? { priority: "responsive" } : {});
+    this.dispatch(actorId);
     return true;
   }
 
@@ -1788,9 +1869,9 @@ export class ActorMesh {
     ]);
     if (entries.length === 0) return false;
     if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
-      this.notifyInboxChanged(actorId);
+      this.dispatchJoiningActiveRun(actorId);
     } else {
-      this.notifyInboxChanged(actorId, { priority: "responsive" });
+      this.dispatch(actorId);
     }
     return true;
   }
@@ -1862,7 +1943,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    this.notifyInboxChanged(actorId);
+    this.dispatch(actorId);
     return true;
   }
 
@@ -1904,7 +1985,7 @@ export class ActorMesh {
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
-      this.notifyInboxChanged(actorId);
+      this.dispatch(actorId);
     }
   }
 
@@ -1918,7 +1999,7 @@ export class ActorMesh {
     if (!this.inboxStore) return false;
     const total = this.inboxStore.countUnhandled(actorId);
     const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
-    if (total > responsive) return this.notifyInboxChanged(actorId);
+    if (total > responsive) return this.dispatch(actorId);
     return false;
   }
 
@@ -1935,7 +2016,7 @@ export class ActorMesh {
   ): { sessionId: string; targetActorId: string } {
     fromActorId = this.resolveThreadId(fromActorId);
     const source = this.actors.get(fromActorId);
-    if (!source || source.status !== "active" || !this.live.has(fromActorId)) {
+    if (!source || source.status !== "active" || !this.runs.isLive(fromActorId)) {
       throw new Error("source actor is not active");
     }
     const target = this.resolveHeldActiveActor(fromActorId, targetHandleOrId);
@@ -2000,7 +2081,7 @@ export class ActorMesh {
     this.notifyVoiceSessionEnded(fromActorId);
     if (inserted.length > 0) {
       try {
-        this.notifyInboxChanged(target.id, { priority: "responsive" });
+        this.dispatch(target.id);
       } catch (error) {
         this.log(
           `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
@@ -2075,7 +2156,7 @@ export class ActorMesh {
     }
     const target = matches[0];
     if (target.status === "retired") throw new Error("target actor is retired");
-    if (!this.live.has(target.id)) throw new Error("target actor is not live");
+    if (!this.runs.isLive(target.id)) throw new Error("target actor is not live");
     return target;
   }
 
@@ -2152,16 +2233,15 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      actor = this.createActor({
-        ...this.factoryContext(record),
-        executionTarget: req.executionTarget,
-      });
+      // `record.executionTarget` is `req.executionTarget`, so the placement a
+      // spawn asked for reaches the factory through the record like every
+      // other construction input.
+      actor = this.runs.instantiate(record);
     } catch (err) {
       this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });
       throw err;
     }
-    this.live.set(id, actor);
     this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     void this.lifecycleFor(id).emit("onSpawn", { actorId: id });
     // Genuine-birth side-effect hook (out-of-band, fire-and-forget) — e.g. kick
@@ -2901,7 +2981,7 @@ export class ActorMesh {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
     const delivery = this.eventManager.handleExternalEvent(raw);
-    this.notifyPersistedInboxEntries(delivery, raw.priority);
+    this.notifyPersistedInboxEntries(delivery);
     // Returned so a host-level alarm can tell an uncovered drop from a delivery
     // and fall back to its own channel rather than trusting mesh routing (#481).
     return delivery;
@@ -2910,16 +2990,14 @@ export class ActorMesh {
   /**
    * Every persisted copy is just as durable and just as responsive for
    * scheduling; which recipient's run may be replaced is decided by
-   * {@link notifyEventRecipient}. A subscriber-only route preempts nobody.
+   * {@link dispatchJoiningActiveRun}. A subscriber-only route preempts nobody.
    */
-  private notifyPersistedInboxEntries(
-    delivery: DurableEventDelivery,
-    priority: "responsive" | "normal" | undefined
-  ): void {
+  private notifyPersistedInboxEntries(delivery: DurableEventDelivery): void {
     for (const entry of delivery.entries) {
       const dest = entry.actorId;
       const isOwner = delivery.ownerIds.includes(dest);
-      if (!this.notifyEventRecipient(dest, priority, isOwner)) {
+      const dispatched = isOwner ? this.dispatch(dest) : this.dispatchJoiningActiveRun(dest);
+      if (!dispatched) {
         throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
       }
     }
@@ -2927,7 +3005,7 @@ export class ActorMesh {
 
   /** A narrow live-actor read port for the host-assembled routing kernel. */
   isLiveActor(actorId: string): boolean {
-    return this.live.has(actorId);
+    return this.runs.isLive(actorId);
   }
 
   /** A narrow handle/id resolution port for directed delivery. */
@@ -2937,10 +3015,10 @@ export class ActorMesh {
 
   private resolveLiveActor(handleOrId: string): MeshActor | undefined {
     handleOrId = this.resolveThreadId(handleOrId);
-    const actor = this.live.get(handleOrId);
+    const actor = this.runs.liveActor(handleOrId);
     if (actor) return actor;
 
-    for (const [id, candidate] of this.live) {
+    for (const [id, candidate] of this.runs.liveEntries()) {
       if (this.handleForId(id) === handleOrId) return candidate;
     }
     return undefined;
@@ -3034,7 +3112,7 @@ export class ActorMesh {
       return { delivered: false, status: rec?.status };
     }
 
-    const target = this.live.get(toId);
+    const target = this.runs.liveActor(toId);
     const messageId = this.recordMessageEmitted({
       fromId,
       toId,
@@ -3056,7 +3134,7 @@ export class ActorMesh {
         },
       ]);
     }
-    this.notifyInboxChanged(toId);
+    this.dispatch(toId);
     return { delivered: true };
   }
 
@@ -3098,7 +3176,7 @@ export class ActorMesh {
       },
     ]);
     if (inserted.length === 0) return { delivered: true };
-    this.notifyInboxChanged(toId);
+    this.dispatch(toId);
     return { delivered: true };
   }
 
@@ -3124,7 +3202,7 @@ export class ActorMesh {
       lastChatSessionId: sessionId,
       lastChatPrincipalId: fromId,
     });
-    const target = this.live.get(toId);
+    const target = this.runs.liveActor(toId);
     const messageId = this.recordMessageEmitted({
       fromId,
       toId,
@@ -3144,7 +3222,7 @@ export class ActorMesh {
           actorId: toId,
           source: `mesh:${fromId}`,
           payload: {
-            type: isVoice ? "human.voice" : "human.message",
+            type: isVoice ? VOICE_INBOX_PAYLOAD_TYPE : "human.message",
             priority: "responsive",
             messageId,
             fromId,
@@ -3153,10 +3231,7 @@ export class ActorMesh {
         },
       ]);
     }
-    this.notifyInboxChanged(toId, {
-      priority: "responsive",
-      voiceTimestamp: isVoice ? Date.now() : undefined,
-    });
+    this.dispatch(toId);
     return { delivered: true };
   }
 
@@ -3175,8 +3250,8 @@ export class ActorMesh {
     const baseActorId = colonIdx >= 0 ? actorId.slice(0, colonIdx) : actorId;
     const resolvedId = this.resolveThreadId(baseActorId);
     const rec = this.actors.get(resolvedId);
-    const isLive = Boolean(rec && rec.status === "active" && this.live.has(resolvedId));
-    const target = isLive ? this.live.get(resolvedId) : undefined;
+    const isLive = Boolean(rec && rec.status === "active" && this.runs.isLive(resolvedId));
+    const target = isLive ? this.runs.liveActor(resolvedId) : undefined;
     const isResponsive = priority === "responsive";
     const messageId = target
       ? this.recordMessageEmitted({
@@ -3224,7 +3299,7 @@ export class ActorMesh {
         },
       },
     ]);
-    this.notifyInboxChanged(resolvedId, isResponsive ? { priority: "responsive" } : {});
+    this.dispatch(resolvedId);
     return true;
   }
 
@@ -3240,7 +3315,7 @@ export class ActorMesh {
    */
   declareYield(id: string, status: string, note?: string): void {
     id = this.resolveThreadId(id);
-    const actor = this.live.get(id);
+    const actor = this.runs.liveActor(id);
     if (!actor) {
       this.recordEvent({
         kind: "run_yielded",
@@ -3443,7 +3518,7 @@ export class ActorMesh {
 
   markUnkillable(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
-    const target = this.live.get(actorId);
+    const target = this.runs.liveActor(actorId);
     if (target) {
       target.markUnkillable();
     }
@@ -3549,7 +3624,7 @@ export class ActorMesh {
   ): { interrupted: boolean; status?: string } {
     targetId = this.resolveThreadId(targetId);
     by = this.resolveThreadId(by);
-    const target = this.live.get(targetId);
+    const target = this.runs.liveActor(targetId);
     if (!target) {
       return { interrupted: false, status: "not_live" };
     }
@@ -3577,7 +3652,7 @@ export class ActorMesh {
         const unhandled = this.inboxStore.list(targetId, { status: "unhandled" }).entries;
         const hasNewWork = unhandled.some((e) => e.deliveredAt > runStartTime);
         if (hasNewWork) {
-          this.notifyInboxChanged(targetId);
+          this.dispatch(targetId);
         }
       }
       return { interrupted: true };
@@ -3598,7 +3673,7 @@ export class ActorMesh {
     if (record.status === "retired") {
       throw new Error(`cannot run actor ${targetId}: actor is not active`);
     }
-    const target = this.live.get(targetId);
+    const target = this.runs.liveActor(targetId);
     target?.clearInterruptWatermark?.();
 
     if (this.inboxStore) {
@@ -3613,7 +3688,7 @@ export class ActorMesh {
         },
       ]);
     }
-    this.notifyInboxChanged(targetId, { priority: "responsive" });
+    this.dispatch(targetId);
     return { queued: true };
   }
 
@@ -3631,11 +3706,11 @@ export class ActorMesh {
    *    whose failure mode is "this thread can never be retired" should not depend
    *    on an event arriving.
    *  - Conversely the cleanup path cannot use this one: `retireInner` deletes from
-   *    `this.live` before it runs the cleanups, so by then every thread reads idle.
+   *    the live registry before it runs the cleanups, so by then every thread reads idle.
    */
   activeRunState(actorId: string): ActiveRunState | null {
     actorId = this.resolveThreadId(actorId);
-    const actor = this.live.get(actorId);
+    const actor = this.runs.liveActor(actorId);
     if (!actor) return null;
     if (actor.isRunning) {
       return {
@@ -3653,7 +3728,10 @@ export class ActorMesh {
       streamId: this.runtimeStreamId,
       revision: this.runtimeRevision,
       states: new Map(
-        [...this.live].map(([actorId, actor]) => [actorId, this.runtimeStateOf(actor)])
+        [...this.runs.liveEntries()].map(([actorId, actor]) => [
+          actorId,
+          this.runtimeStateOf(actor),
+        ])
       ),
     };
   }
@@ -3696,7 +3774,7 @@ export class ActorMesh {
   /** True only if the actor is live and declared yield during its active run. */
   isYielded(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
-    const actor = this.live.get(actorId);
+    const actor = this.runs.liveActor(actorId);
     return Boolean(actor?.isYielded);
   }
 
@@ -3925,9 +4003,7 @@ export class ActorMesh {
     for (const child of this.actors.children(id)) {
       if (child.status === "active") this.retireUnchecked(child.id);
     }
-    const actor = this.live.get(id);
-    actor?.close();
-    this.live.delete(id);
+    this.runs.release(id);
     const record = this.actors.get(id);
     // No mechanical drop of this thread's pending deliveries here (#191). Every
     // entry into retirement now preflights the whole subtree for scheduled
@@ -3976,6 +4052,8 @@ export class ActorMesh {
     });
     if (record) this.runRetireCleanups(record);
     this.lifecycles.delete(id);
+    // Per-actor model-class bookkeeping dies with the actor.
+    this.reportedModelClassFailures.delete(id);
     this.log(`retired ${id}`);
   }
 
@@ -4221,7 +4299,7 @@ export class ActorMesh {
     // actor's dirty bit coalesces repeated updates into exactly one replacement
     // opportunity; a live provider run has no pending reservation, so it keeps
     // its launched pool through its normal run boundary.
-    const liveActor = this.live.get(id);
+    const liveActor = this.runs.liveActor(id);
     // Do not turn a staged move onto an already-halted pool into a transient
     // re-quote that `beforeRun` merely drops: retain the work through the
     // existing halt/resume path instead. Partially healthy pools still
@@ -4232,10 +4310,10 @@ export class ActorMesh {
       return;
     }
 
-    if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
+    if (this.inboxStore && this.runs.isLive(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
       if (unhandled.length > 0) {
-        this.notifyInboxChanged(id);
+        this.dispatch(id);
       }
     }
   }
@@ -4253,31 +4331,103 @@ export class ActorMesh {
    */
   applyPendingModel(id: string): void {
     const record = this.actors.get(id);
-    if (!record || record.desiredModelConfig === undefined) return;
+    if (!record) return;
+    if (record.desiredModelConfig === undefined) {
+      this.refreshClassBoundPool(id, record);
+      return;
+    }
 
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
+    const boundClass = record.desiredModelClass;
 
-    this.actors.patch(id, {
+    // The one deliberate model-configuration write: it restates the row's
+    // model-config document, which an ordinary `patch` deliberately does not
+    // (#626).
+    this.actors.setModelSelection(id, {
       modelConfig: newModelConfig,
-      modelClass: record.desiredModelClass,
+      modelClass: boundClass,
       desiredModelConfig: undefined,
       desiredModelClass: undefined,
     });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
-    if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
+    if (boundClass !== undefined) {
+      // A class binding persists the reference, not the pool the selection
+      // resolved to, so the pool is whatever the class says now — verify the
+      // binding landed and publish the live definition rather than a snapshot
+      // that a concurrent class edit may already have overtaken (#626).
+      if (verified.modelClass !== boundClass) {
+        throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
+      }
+      if (!verified.modelConfig) {
+        throw new Error(
+          `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
+        );
+      }
+    } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
 
-    this.onModelSet?.(id, newModelConfig, verified);
+    const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+    // Publish before journalling. The durable `actor_model_set` event below is
+    // the record that this pool reached the actor, so a publication that threw
+    // must not leave that claim behind.
+    this.onModelSet?.(id, appliedModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(newModelConfig)}`,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
     });
+  }
+
+  /**
+   * Hand a class-bound actor's current class definition to the live actor
+   * object at its dispatch boundary.
+   *
+   * The record already reads through to the class row, so nothing durable
+   * changes here — but a running actor caches the pool it was constructed
+   * with, and without this refresh an edit made after construction would not
+   * reach the actor's next run (#626). An unresolvable class is left to the
+   * pre-run gate, which refuses the run outright.
+   */
+  private refreshClassBoundPool(id: string, record: ActorRecord): void {
+    if (record.modelClass === undefined || !record.modelConfig) return;
+    if (!this.runs.liveActor(id)?.setModelConfig) return;
+    // Unconditional: the publication is one idempotent field assignment on the
+    // live actor, so republishing an unchanged pool costs less than the
+    // bookkeeping that would skip it, and every dispatch boundary re-asserts
+    // the class's current definition.
+    this.onModelSet?.(id, record.modelConfig, record);
+  }
+
+  /**
+   * Pure read of why a class-bound actor cannot be scheduled. Querying this
+   * never emits an event, so dashboard and diagnostic callers can inspect the
+   * record without changing its timeline.
+   */
+  modelClassError(id: string): string | undefined {
+    return this.actors.get(id)?.modelClassError;
+  }
+
+  /** Record a coalesced visible failure at a boot or dispatch refusal site. */
+  reportModelClassFailure(id: string, reason = this.modelClassError(id)): void {
+    if (reason === undefined) return;
+    if (this.reportedModelClassFailures.get(id) !== reason) {
+      this.reportedModelClassFailures.set(id, reason);
+      this.recordEvent({
+        kind: "actor_model_class_unresolved",
+        actorId: id,
+        detail: reason,
+      });
+    }
+  }
+
+  /** Forget a prior visible failure after the class resolves again. */
+  clearModelClassFailure(id: string): void {
+    if (this.reportedModelClassFailures.has(id)) this.reportedModelClassFailures.delete(id);
   }
 
   /**
@@ -4363,11 +4513,10 @@ export class ActorMesh {
     // rather than stranded active-but-not-live (elder review of ISSUE_NUM).
     try {
       this.onRevive?.(updatedRecord);
-      const actor = this.createActor(this.factoryContext(updatedRecord));
-      this.live.set(id, actor);
+      const actor = this.runs.instantiate(updatedRecord);
       this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     } catch (err) {
-      this.live.delete(id);
+      this.runs.forget(id);
       this.actors.patch(id, { status: "retired" });
       this.log(
         `reviveThread(${id}) failed, rolled back to retired: ${err instanceof Error ? err.message : String(err)}`
@@ -4387,7 +4536,7 @@ export class ActorMesh {
 
   /** The live actor for an id, if any. */
   get(id: string): MeshActor | undefined {
-    return this.live.get(this.resolveThreadId(id));
+    return this.runs.liveActor(this.resolveThreadId(id));
   }
 
   /** True if `ancestorId` is `id` itself or any ancestor up the ownership tree. */
@@ -4409,8 +4558,10 @@ export class ActorMesh {
    * repository is untouched, so active actors can be rehydrated on the next boot.
    */
   shutdownAll(): void {
-    for (const actor of this.live.values()) actor.close();
-    this.live.clear();
+    this.unsubscribeInboxAppends?.();
+    this.unsubscribeInboxAppends = undefined;
+    this.appendWakesOwed.clear();
+    this.runs.closeAll();
   }
 
   /** All thread records (active and retired). */
@@ -4420,7 +4571,7 @@ export class ActorMesh {
 
   /** Slots currently running (for diagnostics/tests). */
   get inFlight(): number {
-    return this.limiter.inFlight;
+    return this.runs.inFlight;
   }
 
   /**
@@ -4435,12 +4586,7 @@ export class ActorMesh {
     responsive = false,
     threadId?: string
   ): RunStartHandle<T> {
-    return this.providerGate(fn, candidates, {
-      responsive,
-      threadId,
-      enqueueNormal: (run) => this.limiter.enqueue(run),
-      onSelected: threadId ? (selection) => this.selections.set(threadId, selection) : undefined,
-    });
+    return this.runs.gateRun(fn, candidates, responsive, threadId);
   }
 
   /**
@@ -4449,12 +4595,12 @@ export class ActorMesh {
    * is cancelled, or ends — never a stale reservation.
    */
   getSelection(id: string): QueuedSelection | undefined {
-    return this.selections.get(id);
+    return this.runs.selectionFor(id);
   }
 
   /** Clear a recorded selection at start/cancel/end so it never outlives the reservation it describes. */
   clearSelection(id: string): void {
-    this.selections.delete(id);
+    this.runs.clearSelection(id);
   }
 
   /**
@@ -4469,7 +4615,7 @@ export class ActorMesh {
    */
   runningThreadIds(): Set<string> {
     const ids = new Set<string>();
-    for (const [id, actor] of this.live) {
+    for (const [id, actor] of this.runs.liveEntries()) {
       if (actor.isRunning) ids.add(id);
     }
     return ids;
@@ -4478,7 +4624,7 @@ export class ActorMesh {
   /** Actors that passed their pre-run gate but are waiting for their run to start. */
   queuedThreadIds(): Set<string> {
     const ids = new Set<string>();
-    for (const [id, actor] of this.live) {
+    for (const [id, actor] of this.runs.liveEntries()) {
       if (actor.isQueued) ids.add(id);
     }
     return ids;
@@ -4505,7 +4651,32 @@ export class ActorMesh {
   /** True only when every declared candidate in the pool is halted. */
   private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
     if (!modelConfig || modelConfig.length === 0) return false;
-    return modelConfig.every((c) => this.isHalted(c.provider));
+    return modelConfig.every((c) => this.isHalted(c.provider, c.model));
+  }
+
+  /**
+   * Apply the shared pre-run admission rule used by the externally constructed
+   * root and every mesh-created actor. It checks the staged-or-current pool
+   * before committing it, so an all-held staged pool is left intact for a
+   * future eligible run; a pool with any unheld candidate remains schedulable.
+   */
+  prepareRun(id: string): boolean {
+    const rec = this.actors.get(id);
+    if (!rec || rec.status !== "active") return false;
+    if (this.allCandidatesHalted(this.launchModelConfig(id)) || this.isShuttingDown()) {
+      return false;
+    }
+    this.applyPendingModel(id);
+    // A staged rebind or explicit pin is the supported repair path for a
+    // broken current class. Apply it before inspecting the current binding so
+    // an idle actor can repair itself on its next dispatch (#626).
+    const modelClassError = this.modelClassError(id);
+    if (modelClassError !== undefined) {
+      this.reportModelClassFailure(id, modelClassError);
+      return false;
+    }
+    this.clearModelClassFailure(id);
+    return true;
   }
 
   /**
@@ -4519,10 +4690,10 @@ export class ActorMesh {
    */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
-    for (const [id, actor] of this.live) {
-      const selection = this.selections.get(id);
+    for (const [id, actor] of this.runs.liveEntries()) {
+      const selection = this.runs.selectionFor(id);
       const halted = selection
-        ? this.isHalted(selection.provider)
+        ? this.isHalted(selection.provider, selection.model)
         : this.allCandidatesHalted(this.launchModelConfig(id));
       if (halted && actor.cancelQueuedRun?.()) {
         cancelled.push(id);
@@ -4534,7 +4705,7 @@ export class ActorMesh {
   /** Replay starts canceled by a halt once at least one pool candidate is no longer blocked. */
   resumeCancelledRuns(): string[] {
     const resumed: string[] = [];
-    for (const [id, actor] of this.live) {
+    for (const [id, actor] of this.runs.liveEntries()) {
       if (!this.allCandidatesHalted(this.launchModelConfig(id)) && actor.resumeCancelledRun?.()) {
         resumed.push(id);
       }
@@ -4551,25 +4722,10 @@ export class ActorMesh {
       lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
-        const rec = this.actors.get(record.id);
-        if (!rec || rec.status !== "active") {
-          return false;
-        }
-        // Halt gate consults the pool this dispatch will actually launch —
-        // desired-if-staged, else current (#169) — without yet committing
-        // it, so a staged move onto a halted provider never mutates
-        // `modelConfig` for a run that never launches.
-        if (this.allCandidatesHalted(this.launchModelConfig(record.id)) || this.isShuttingDown()) {
-          return false;
-        }
-        // Apply a pool staged while idle/queued before this dispatch's own
-        // gate()/admission reads the declared pool (#199, extended to pools):
-        // an in-flight run's beforeRun never re-fires for that same run, so
-        // this only ever lands on a fresh dispatch, never mid-run.
-        this.applyPendingModel(record.id);
+        if (!this.prepareRun(record.id)) return false;
         if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
-        const actor = this.live.get(record.id);
+        const actor = this.runs.liveActor(record.id);
         const watermark = actor?.getInterruptedWatermark?.();
         if (watermark) {
           const entries = this.inboxStore.list(record.id, { status: "unhandled" }).entries;
@@ -4695,11 +4851,11 @@ export class ActorMesh {
           },
         },
       ]);
-      this.notifyInboxChanged(toId);
+      this.dispatch(toId);
       return;
     }
 
-    const target = this.live.get(toId);
+    const target = this.runs.liveActor(toId);
     if (!target) throw new Error(`scheduled delivery target ${toId} is not available`);
     target.requestRun();
   }
@@ -4728,26 +4884,4 @@ export class ActorMesh {
         body: message.body,
       }));
   }
-}
-
-function immediateStart<T>(fn: () => Promise<T>): RunStartHandle<T> {
-  let started = false;
-  let cancelled = false;
-  const result = Promise.resolve().then(() => {
-    if (cancelled) throw new RunStartCancelledError();
-    started = true;
-    return fn();
-  });
-  return {
-    result,
-    get started() {
-      return started;
-    },
-    promote: () => {},
-    cancel: () => {
-      if (started || cancelled) return false;
-      cancelled = true;
-      return true;
-    },
-  };
 }

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { resourceKey } from "../actor/event-subscriptions.js";
-import { checkSuiteWakesAnyone, deriveGitHubInboxNotification } from "./inbox-notification.js";
+import {
+  checkSuiteWakesAnyone,
+  deriveGitHubInboxNotification,
+  githubInboxEventReference,
+} from "./inbox-notification.js";
 
 describe("deriveGitHubInboxNotification", () => {
   it("uses an issue source and keeps only the comment-specific identifier", () => {
@@ -332,5 +336,55 @@ describe("checkSuiteWakesAnyone", () => {
         check_suite: { id: 456, status: "queued", conclusion: null },
       })
     ).toBe(true);
+  });
+});
+
+describe("review ids", () => {
+  it("keeps the review id of a submitted review", () => {
+    const notification = deriveGitHubInboxNotification("pull_request_review", {
+      action: "submitted",
+      repository: { full_name: "dummy-org/dummy-repo" },
+      pull_request: { number: 12 },
+      review: { id: 9001, state: "approved", body: "not cached" },
+    });
+
+    expect(notification?.payload).toEqual({
+      type: "pull_request_review.submitted",
+      reviewId: 9001,
+    });
+  });
+});
+
+describe("githubInboxEventReference", () => {
+  const pr = "github:dummy-org/dummy-repo/pulls/12";
+
+  it("nests a PR conversation comment under issues/, as GitHub files it", () => {
+    expect(githubInboxEventReference(pr, { type: "issue_comment.created", commentId: 5 })).toBe(
+      "github:dummy-org/dummy-repo/issues/12/comments/5"
+    );
+  });
+
+  it("nests an inline review comment under pulls/", () => {
+    expect(
+      githubInboxEventReference(pr, { type: "pull_request_review_comment.created", commentId: 6 })
+    ).toBe("github:dummy-org/dummy-repo/pulls/12/comments/6");
+  });
+
+  it("names a submitted review", () => {
+    expect(
+      githubInboxEventReference(pr, { type: "pull_request_review.submitted", reviewId: 7 })
+    ).toBe("github:dummy-org/dummy-repo/pulls/12/reviews/7");
+  });
+
+  it("names nothing for an event about the source itself", () => {
+    expect(githubInboxEventReference(pr, { type: "pull_request.closed", merged: true })).toBe(
+      undefined
+    );
+    expect(
+      githubInboxEventReference("github:dummy-org/dummy-repo", {
+        type: "issue_comment.created",
+        commentId: 5,
+      })
+    ).toBe(undefined);
   });
 });

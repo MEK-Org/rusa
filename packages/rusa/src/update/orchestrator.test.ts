@@ -365,4 +365,64 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.restarting).toBe(true);
     expect(exits).toEqual([0]);
   });
+
+  it("invokes onCommitted with newSha and branch once the update is committed", async () => {
+    const { deps } = makeDeps();
+    const committed: { sha: string; branch: string }[] = [];
+    deps.onCommitted = (sha, branch) => {
+      committed.push({ sha, branch });
+    };
+    const res = await executeUpdate(plan({ branch: "staging" }), deps);
+    expect(res.ok).toBe(true);
+    expect(committed).toEqual([{ sha: "1".repeat(40), branch: "staging" }]);
+  });
+
+  it("does not invoke onCommitted when build fails", async () => {
+    const { deps } = makeDeps();
+    const committed: { sha: string; branch: string }[] = [];
+    deps.onCommitted = (sha, branch) => {
+      committed.push({ sha, branch });
+    };
+    deps.build = {
+      async build() {
+        throw new StepError("build", "compile failed", false);
+      },
+    };
+    const res = await executeUpdate(plan(), deps);
+    expect(res.ok).toBe(false);
+    expect(committed).toHaveLength(0);
+  });
+
+  it("does not invoke onCommitted when a post-build step fails and the checkout rolls back", async () => {
+    // The reason the hook moved off build-green: a drain failure resets the checkout to
+    // oldSha, so anything persisted at build time would name a revision this leader
+    // reverted — and would later deploy followers onto it.
+    const { deps, git, drain } = makeDeps();
+    const committed: { sha: string; branch: string }[] = [];
+    deps.onCommitted = (sha, branch) => {
+      committed.push({ sha, branch });
+    };
+    drain.waitForQuiescence = async () => {
+      throw new StepError("drain", "drain exploded", false);
+    };
+
+    const res = await executeUpdate(plan(), deps);
+
+    expect(res.ok).toBe(false);
+    expect(committed).toHaveLength(0);
+    expect(git.resets).toEqual([NEW, OLD]); // rolled back off the revision no trigger names
+  });
+
+  it("still restarts when onCommitted throws", async () => {
+    // The restart is already irreversible here; a failed follower-trigger write costs one
+    // skipped reconciliation, not a failed update.
+    const { deps, exits } = makeDeps();
+    deps.onCommitted = () => {
+      throw new Error("disk full writing follower trigger");
+    };
+    const res = await executeUpdate(plan(), deps);
+    expect(res.ok).toBe(true);
+    expect(res.restarting).toBe(true);
+    expect(exits).toEqual([0]);
+  });
 });

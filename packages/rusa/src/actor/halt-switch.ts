@@ -4,18 +4,20 @@ import { dirname } from "node:path";
 export interface HaltState {
   reason?: string;
   providers?: string[];
+  models?: string[];
   until?: string;
 }
 
 export interface HaltCommand {
   providers?: string[];
+  models?: string[];
   until?: string;
 }
 
 /**
  * A mechanical, file-backed emergency brake for the mesh. A legacy empty/plain
  * sentinel remains a global indefinite halt. Structured halts are stored as JSON
- * so they can target providers and/or expire at a requested datetime.
+ * so they can target providers, models, and/or expire at a requested datetime.
  *
  *  - by hand on the box:   `touch ~/.rusa/HALT`  /  `rm ~/.rusa/HALT`
  *  - by chat command:      `/halt` / `/resume` are matched mechanically at the
@@ -28,8 +30,8 @@ export interface HaltCommand {
  * kill -9); the plug is the hard stop.
  *
  * Every query reads the file — there is no cached state to get out of sync with
- * a hand-edit. `isHalted()` asks whether a provider (or the whole system) is
- * halted; `hasActiveHalt()` asks whether any provider scope is active.
+ * a hand-edit. `isHalted()` asks whether a provider/model (or the whole system) is
+ * halted; `hasActiveHalt()` asks whether any provider or model scope is active.
  */
 export class HaltSwitch {
   constructor(
@@ -37,16 +39,27 @@ export class HaltSwitch {
     private readonly now: () => number = () => Date.now()
   ) {}
 
-  /** True iff an active sentinel applies system-wide or to `provider`. */
-  isHalted(provider?: string): boolean {
+  /** True iff an active sentinel applies system-wide, to `provider`, or to `model`. */
+  isHalted(provider?: string, model?: string): boolean {
     const state = this.state();
     if (!state) return false;
-    if (!state.providers?.length) return true;
+    if (!state.providers?.length && !state.models?.length) return true;
     if (!provider) return false;
-    return state.providers.includes(normalizeProvider(provider));
+    const providerMatches =
+      !state.providers?.length || state.providers.includes(normalizeProvider(provider));
+    if (!providerMatches) return false;
+    if (state.models?.length) {
+      // A model-scoped hold is a brake: a caller that cannot identify its
+      // selected model must not run on the held provider. Normal selection
+      // always carries a validated model; this protects less-specific callers
+      // while they are brought to that same boundary.
+      if (!model) return true;
+      return state.models.includes(normalizeModel(model));
+    }
+    return true;
   }
 
-  /** True iff any global or provider-scoped halt is active. */
+  /** True iff any global or provider/model-scoped halt is active. */
   hasActiveHalt(): boolean {
     return this.state() !== null;
   }
@@ -62,6 +75,9 @@ export class HaltSwitch {
       ...(reason ? { reason } : {}),
       ...(options.providers?.length
         ? { providers: [...new Set(options.providers.map(normalizeProvider))] }
+        : {}),
+      ...(options.models?.length
+        ? { models: [...new Set(options.models.map(normalizeModel))] }
         : {}),
       ...(options.until ? { until: new Date(options.until).toISOString() } : {}),
     };
@@ -110,9 +126,16 @@ export class HaltSwitch {
           .map(normalizeProvider)
           .filter(Boolean)
       : undefined;
+    const models = Array.isArray(value.models)
+      ? value.models
+          .filter((model): model is string => typeof model === "string")
+          .map(normalizeModel)
+          .filter(Boolean)
+      : undefined;
     return {
       ...(typeof value.reason === "string" && value.reason ? { reason: value.reason } : {}),
       ...(providers?.length ? { providers: [...new Set(providers)] } : {}),
+      ...(models?.length ? { models: [...new Set(models)] } : {}),
       ...(until ? { until } : {}),
     };
   }
@@ -137,6 +160,10 @@ export function parseHaltCommand(text: string): HaltCommand | null {
       const providers = value.split(",").map(normalizeProvider).filter(Boolean);
       if (providers.length === 0) throw new Error("provider list cannot be empty");
       result.providers = [...new Set(providers)];
+    } else if (key === "model") {
+      const models = value.split(",").map(normalizeModel).filter(Boolean);
+      if (models.length === 0) throw new Error("model list cannot be empty");
+      result.models = [...new Set(models)];
     } else if (key === "until") {
       const timestamp = Date.parse(value);
       if (!Number.isFinite(timestamp)) throw new Error(`invalid halt datetime "${value}"`);
@@ -145,10 +172,17 @@ export function parseHaltCommand(text: string): HaltCommand | null {
       throw new Error(`unknown halt option "${key}"`);
     }
   }
+  if (result.models?.length && !result.providers?.length) {
+    throw new Error("model-scoped halt requires a provider");
+  }
   return result;
 }
 
 function normalizeProvider(provider: string): string {
   const normalized = provider.trim().toLowerCase();
   return normalized === "agy" ? "antigravity" : normalized;
+}
+
+function normalizeModel(model: string): string {
+  return model.trim().toLowerCase();
 }

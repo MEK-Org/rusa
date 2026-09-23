@@ -277,4 +277,69 @@ describe("LocalTracker", () => {
     });
     expect(() => tracker.getPrDiff(1)).toThrow(/no bare remote/);
   });
+
+  describe("PR activity for scenarios", () => {
+    function recording() {
+      const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+      const tracker = makeTracker((type, payload) => events.push({ type, payload }));
+      return { tracker, events };
+    }
+
+    it("emits opened, edited, synchronize and a merged close for a PR's lifecycle", async () => {
+      const { tracker, events } = recording();
+
+      const pr = await tracker.openPr({ title: "Fix flaky test", body: "Retries the fetch." });
+      await tracker.editPr(pr.number, { title: "Fix the flaky auth test" });
+      await tracker.pushToPr(pr.number);
+      await tracker.closePr(pr.number, { merged: true });
+
+      expect(events.map((e) => `${e.type}.${String(e.payload.action)}`)).toEqual([
+        "pull_request.opened",
+        "pull_request.edited",
+        "pull_request.synchronize",
+        "pull_request.closed",
+      ]);
+      const closed = events[3].payload.pull_request as { merged: boolean; title: string };
+      expect(closed).toMatchObject({ merged: true, title: "Fix the flaky auth test" });
+      expect(tracker.getPr(pr.number)?.state).toBe("closed");
+    });
+
+    it("files a PR conversation comment as an issue comment marked as a PR", async () => {
+      const { tracker, events } = recording();
+      const pr = await tracker.openPr({ title: "PR", body: "" });
+
+      const comment = await tracker.addPrComment(pr.number, {
+        body: "Looks close",
+        author: "alice",
+      });
+
+      const payload = events[1].payload as {
+        issue: { number: number; pull_request?: unknown };
+        comment: { id: number; body: string };
+      };
+      expect(events[1].type).toBe("issue_comment");
+      expect(payload.issue.number).toBe(pr.number);
+      expect(payload.issue.pull_request).toBeDefined();
+      expect(payload.comment).toMatchObject({ id: comment.id, body: "Looks close" });
+      expect(tracker.listPrComments(pr.number)).toEqual([comment]);
+    });
+
+    it("emits one pull_request_review_comment per inline comment and stores it", async () => {
+      const { tracker, events } = recording();
+      const pr = await tracker.openPr({ title: "PR", body: "" });
+
+      const comment = await tracker.addReviewComment(pr.number, {
+        body: "Off by one here",
+        path: "src/auth.ts",
+        line: 12,
+        author: "bob",
+      });
+
+      expect(events[1].type).toBe("pull_request_review_comment");
+      expect((events[1].payload.comment as { id: number }).id).toBe(comment.id);
+      expect(tracker.getReviewComments(pr.number)).toEqual([
+        expect.objectContaining({ id: comment.id, body: "Off by one here", path: "src/auth.ts" }),
+      ]);
+    });
+  });
 });

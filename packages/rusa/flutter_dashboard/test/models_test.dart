@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 
+import 'fakes.dart';
+
 void main() {
   group('MeshEvent.resolvedRunModel', () {
     test('uses launch metadata and leaves historical run_start rows blank', () {
@@ -502,6 +504,110 @@ void main() {
       });
 
       expect(thread.pacingIntervalMs, 36000001);
+    });
+  });
+
+  group('ObligationDto.body', () {
+    test('drops an opening line that repeats the heading', () {
+      final o = makeObligation(
+        'ob-1',
+        title: 'Draft the plan',
+        intent: 'Draft the plan\nList the rough edges from this week.',
+      );
+      expect(o.body, 'List the rough edges from this week.');
+    });
+
+    test('is absent when the intent is only the heading', () {
+      expect(
+        makeObligation('ob-1', title: 'Draft the plan', intent: 'Draft the plan')
+            .body,
+        isNull,
+      );
+    });
+
+    test('keeps an intent that does not open with the heading', () {
+      expect(
+        makeObligation('ob-1', title: 'Draft', intent: 'Why: the review found gaps')
+            .body,
+        'Why: the review found gaps',
+      );
+    });
+  });
+
+  group('ThreadDto reserved candidate', () {
+    Map<String, dynamic> queuedJson([
+      Map<String, dynamic> extra = const {},
+    ]) => {
+      'id': 'synthetic-queued',
+      'handle': 'synthetic-queued',
+      'parentId': 'root',
+      'status': 'active',
+      'provider': 'synthetic-provider',
+      'model': 'synthetic-model',
+      'charterPreview': '',
+      'createdAt': '2026-01-01T00:00:00.000Z',
+      'runState': 'queued',
+      ...extra,
+    };
+
+    test(
+      'deserializes the queued run\'s reserved provider, model and effort',
+      () {
+        final thread = ThreadDto.fromJson(
+          queuedJson({
+            'selectedProvider': 'synthetic-alias',
+            'selectedLane': 'synthetic-lane',
+            'selectedModel': 'synthetic-reserved-model',
+            'selectedEffort': 'high',
+          }),
+        );
+
+        expect(thread.selectedProvider, 'synthetic-alias');
+        expect(thread.selectedModel, 'synthetic-reserved-model');
+        expect(thread.selectedEffort, 'high');
+      },
+    );
+
+    test('treats explicit nulls and absent keys as no reservation', () {
+      final explicit = ThreadDto.fromJson(
+        queuedJson({
+          'selectedProvider': null,
+          'selectedModel': null,
+          'selectedEffort': null,
+        }),
+      );
+      final absent = ThreadDto.fromJson(queuedJson());
+
+      for (final thread in [explicit, absent]) {
+        expect(thread.selectedProvider, isNull);
+        expect(thread.selectedModel, isNull);
+        expect(thread.selectedEffort, isNull);
+      }
+    });
+  });
+
+  group('RunModelSelection', () {
+    test('labels like the mechanical signature parenthetical', () {
+      expect(
+        const RunModelSelection(model: 'claude-opus-5', effort: 'high').label,
+        'claude-opus-5, high',
+      );
+      expect(
+        const RunModelSelection(model: 'claude-opus-5').label,
+        'claude-opus-5',
+      );
+    });
+
+    test('reads a run_start payload and ignores one without a model', () {
+      expect(
+        RunModelSelection.fromRunStartPayload(
+          '{"provider":"p","model":"m","effort":"low","runId":"r"}',
+        ),
+        const RunModelSelection(model: 'm', effort: 'low', provider: 'p'),
+      );
+      expect(RunModelSelection.fromRunStartPayload('{"provider":"p"}'), isNull);
+      expect(RunModelSelection.fromRunStartPayload('not json'), isNull);
+      expect(RunModelSelection.fromRunStartPayload(null), isNull);
     });
   });
 

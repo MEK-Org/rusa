@@ -4744,12 +4744,78 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // halt scoped to claude must still block dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
     halt.resume();
 
     // Halt the OLD provider (antigravity) instead — root is no longer
     // launching on antigravity, so this halt must not wrongly block it.
     halt.halt("halt antigravity", { providers: ["antigravity"] });
     expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
+  });
+
+  it("root's beforeRun halt-gate allows dispatch when an unhalted pool fallback exists (#625)", async () => {
+    clearProviderModelCatalog("antigravity");
+    clearProviderModelCatalog("claude");
+    const config = {
+      github: { account: "mock-bot" },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "claude",
+        model: "claude-sonnet-5",
+        effort: "high",
+        context: { type: "portable", mode: "ledger" },
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+
+    const actorOpts = (
+      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
+    ).opts;
+
+    // Set an ordered pool: claude (primary), antigravity (fallback)
+    activeMesh.setActorModel(
+      "root",
+      [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      ],
+      "root"
+    );
+
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Halt only primary provider (claude): unhalted fallback (antigravity) exists,
+    // so beforeRun must allow dispatch.
+    halt.halt("halt claude", { providers: ["claude"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
+
+    // Halt both providers: all candidates are halted, so beforeRun must return false.
+    halt.halt("halt both", { providers: ["claude", "antigravity"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
     halt.resume();
   });
 
@@ -4901,30 +4967,119 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ]);
     });
 
-    it("keeps the persisted pool's class provenance through a restart", async () => {
-      await persistOperatorPool();
-      // A class-bearing (v3) document only ever carries a non-empty pool, so
-      // the merge onto the existing row is what keeps the class: startup
-      // decides the pool and leaves the class alone.
+    // Define or redefine a model class, touching `model_classes` and nothing
+    // else — the shape of a `set_model_class` edit, which #626 requires reach
+    // bound actors without rewriting their rows.
+    const defineClass = (name: string, definition: ProviderModelConfig[]): void => {
+      const db = new Database(join(homeDir, "data", "mesh.db"));
+      try {
+        db.prepare(
+          `INSERT INTO model_classes (name, definition_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET definition_json = excluded.definition_json`
+        ).run(
+          name,
+          JSON.stringify({ version: 1, modelConfig: definition }),
+          "2026-09-22T00:00:00.000Z",
+          "2026-09-22T00:00:00.000Z"
+        );
+      } finally {
+        db.close();
+      }
+    };
+
+    // Bind root to a model class by hand, the way a class selection would have
+    // left the row, optionally through a legacy v3 document that still carries
+    // the copy #626 stopped writing.
+    const bindRootToClass = (
+      name: string,
+      definition: ProviderModelConfig[] | undefined,
+      opts?: { legacyV3Pool?: ProviderModelConfig[] }
+    ): void => {
+      if (definition) defineClass(name, definition);
       const db = new Database(join(homeDir, "data", "mesh.db"));
       try {
         db.prepare("UPDATE actors SET model_config = ? WHERE id = ?").run(
-          JSON.stringify({ schemaVersion: 3, entries: operatorPool, modelClass: "frontier" }),
+          opts?.legacyV3Pool
+            ? JSON.stringify({ schemaVersion: 3, entries: opts.legacyV3Pool, modelClass: name })
+            : JSON.stringify({ schemaVersion: 4, modelClass: name }),
           "root"
         );
       } finally {
         db.close();
       }
+    };
+
+    it("boots a class-bound root on the class's current definition, leaving a legacy v3 row as it found it", async () => {
+      await persistOperatorPool();
+      // The legacy v3 copy is deliberately a pool root must NOT boot on: the
+      // class row is the only authority once the actor is class-bound (#626).
+      const staleCopy = [{ provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" }];
+      bindRootToClass("frontier", operatorPool, { legacyV3Pool: staleCopy });
 
       const mesh = await boot();
 
       expect(mesh.actors.get("root")?.modelConfig).toEqual(operatorPool);
       expect(mesh.actors.get("root")?.modelClass).toBe("frontier");
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      // Boot re-adopts root's record unconditionally, but adoption is not a
+      // model-configuration change: the stored document survives the boot
+      // untouched, so a rollback to an older binary is not made harder by
+      // simply starting this one (#626).
       expect(readRootModelConfigRow()).toEqual({
         schemaVersion: 3,
-        entries: operatorPool,
+        entries: staleCopy,
         modelClass: "frontier",
       });
+
+      // A class edit reaches root's record with no restart and no rewrite,
+      // while the already-launched root keeps the pool it launched on.
+      const edited = [{ provider: "claude", model: "claude-sonnet-5", effort: "low" }];
+      defineClass("frontier", edited);
+      expect(mesh.actors.get("root")?.modelConfig).toEqual(edited);
+      expect(liveRootPool(mesh)).toEqual(operatorPool);
+      expect(readRootModelConfigRow()).toEqual({
+        schemaVersion: 3,
+        entries: staleCopy,
+        modelClass: "frontier",
+      });
+    });
+
+    it("refuses to boot a class-bound root whose class cannot be resolved, leaving the row untouched", async () => {
+      await persistOperatorPool();
+      // Bound to a class nobody has defined — the deleted-class case, which
+      // must not quietly fall back to the configured rootActor tuple.
+      bindRootToClass("frontier", undefined);
+      logCapture.lines.length = 0;
+      let ready = false;
+
+      await runStart({
+        e2e: {
+          onReady: (handles) => {
+            ready = true;
+            shutdownFn = handles.shutdown;
+          },
+        },
+      });
+
+      expect(ready).toBe(false);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(bootRecords("root_model_config_invalid")).toMatchObject([
+        {
+          level: "error",
+          error: "RootModelConfigStartupError",
+          reason: expect.stringMatching(
+            /bound to model class "frontier", which cannot be resolved/
+          ),
+          // The remediation must be executable without a running mesh: the
+          // offline re-pin leads, and set_model_class is named only as the
+          // tool that cannot be reached from here.
+          action: expect.stringMatching(
+            /^re-pin root to an explicit pool by replacing the root row's model_config in the actors table/
+          ),
+        },
+      ]);
+      expect(readRootModelConfigRow()).toEqual({ schemaVersion: 4, modelClass: "frontier" });
     });
 
     it("does not replace a persisted pool with a changed scalar rootActor tuple", async () => {
@@ -5758,7 +5913,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       createdAt: "2026-09-07T00:02:00.000Z",
     });
 
-    const notifyInboxSpy = vi.spyOn(mesh, "notifyInboxChanged");
+    const dispatchSpy = vi.spyOn(mesh, "dispatch");
 
     // Follower disconnects and re-registers to the same leader (same-leader reconnect)
     await fetch(`http://127.0.0.1:${port}/unregister`, {
@@ -5793,10 +5948,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(reconnect.status).toBe(200);
     const reconnected = (await reconnect.json()) as { session: string };
 
-    // Same-leader reattach nudges inbox recovery on the existing actor at the
-    // priority the durable inbox says it deserves: the responsive item that
-    // landed while the follower was unreachable is what makes it responsive (#568).
-    expect(notifyInboxSpy).toHaveBeenCalledWith("placed-worker", { priority: "responsive" });
+    // Same-leader reattach dispatches the existing actor and says nothing about
+    // priority: the responsive item that landed while the follower was
+    // unreachable is still durable, and reading it back is what makes the
+    // recovered run responsive (#568). The dispatch is accepted, which it is
+    // only because that durable work is there to find.
+    expect(dispatchSpy).toHaveBeenCalledWith("placed-worker");
+    expect(dispatchSpy.mock.results.some((r) => r.value === true)).toBe(true);
 
     // The follower's poll receives both the re-attached actor's fresh init
     // and the retired actor's stop command to prevent runtime orphaning
