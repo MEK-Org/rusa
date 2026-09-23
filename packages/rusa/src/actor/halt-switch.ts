@@ -211,29 +211,31 @@ const NEAREST_POOL_ENTRIES = 2;
  * what was typed while a pool keeps the provider's own casing; a literal
  * compare would warn about models that are in fact held.
  *
- * An empty `pooled` yields nothing. A provider no live actor is using cannot
- * tell a typo from a model the mesh has not been told about yet, and warning
- * on every name there would teach the operator to ignore the warning.
+ * An empty `pooled` still reports every name. The handler rejects a provider
+ * that is not configured before it places the hold, so no pool here means a
+ * configured provider no live actor is presently using — and "no current or
+ * staged pool names it" is exactly as true there as anywhere else. Such a
+ * finding carries no `nearest`, because there is nothing to suggest.
  */
 export function findUnpooledHaltModels(
   models: readonly string[],
   pooled: readonly string[]
 ): UnpooledHaltModel[] {
-  if (pooled.length === 0) return [];
   const known = new Set(pooled.map(normalizeModel));
+  // Pool entries retain their configured spelling, but matching is
+  // case-insensitive. One stable spelling per semantic model is a property of
+  // the pool, so it is derived once here beside `known`: a suggestion cannot
+  // then spend both of its slots on casing variants of a single model.
+  const distinct = new Map<string, string>();
+  for (const entry of pooled) {
+    const key = normalizeModel(entry);
+    const existing = distinct.get(key);
+    if (existing === undefined || entry.localeCompare(existing) < 0) distinct.set(key, entry);
+  }
   const findings: UnpooledHaltModel[] = [];
   for (const model of models) {
     const normalized = normalizeModel(model);
     if (known.has(normalized)) continue;
-    // Pool entries retain their configured spelling, but matching is
-    // case-insensitive. Keep one stable spelling per semantic model so a
-    // suggestion cannot spend both of its slots on casing variants.
-    const distinct = new Map<string, string>();
-    for (const entry of pooled) {
-      const key = normalizeModel(entry);
-      const existing = distinct.get(key);
-      if (existing === undefined || entry.localeCompare(existing) < 0) distinct.set(key, entry);
-    }
     const nearest = [...distinct.values()]
       .map((entry) => ({ entry, distance: editDistance(normalized, normalizeModel(entry)) }))
       .sort((a, b) => a.distance - b.distance || a.entry.localeCompare(b.entry))

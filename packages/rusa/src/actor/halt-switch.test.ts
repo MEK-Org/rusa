@@ -172,10 +172,13 @@ describe("findUnpooledHaltModels", () => {
     ).toEqual([{ model: "claude-sonnet-5-hihg", nearest: ["claude-sonnet-5", "claude-opus-5"] }]);
   });
 
-  it("says nothing when the provider has no pool at all", () => {
-    // A provider no live actor is using cannot distinguish a typo from a model
-    // the mesh has simply not been told about; warning on every name there
-    // would teach the operator to ignore the warning.
-    expect(findUnpooledHaltModels(["anything"], [])).toEqual([]);
+  it("still reports the miss when the provider has no pool at all", () => {
+    // The handler rejects an unconfigured provider before the hold is placed,
+    // so an empty pool means a configured provider no live actor is using.
+    // "No current or staged pool names it" is true there and worth saying: the
+    // hold is placed either way, and staying silent is the #630 failure --- an
+    // acknowledgement that reads exactly like a correct one. There is nothing
+    // to suggest, so the finding carries no hints.
+    expect(findUnpooledHaltModels(["anything"], [])).toEqual([{ model: "anything", nearest: [] }]);
   });
 });

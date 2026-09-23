@@ -3140,7 +3140,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const chatSource = new FakeChatSource();
     const config = {
       github: { account: "mock-bot" },
-      providers: { claude: { cliCommand: "claude" } },
+      providers: { claude: { cliCommand: "claude" }, codex: { cliCommand: "codex" } },
       rootActor: { provider: "claude", model: "claude-sonnet-5" },
       chat: {
         projectId: "test",
@@ -3198,6 +3198,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(correctAck).toContain("Halted");
     expect(correctAck).not.toContain("no current or staged pool");
     expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+
+    await message("/resume", "messages/resume-correct");
+
+    // `codex` is configured but no live actor is using it, so its pool is
+    // empty. The handler rejected an *unconfigured* provider long before this
+    // point, so silence here would be the #630 failure again --- an
+    // acknowledgement indistinguishable from a correct one. It warns, with no
+    // "closest:" list, because an empty pool has nothing to suggest.
+    await message("/halt provider:codex model:gpt-5-codx", "messages/halt-unpooled-provider");
+    const unpooledAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(unpooledAck).toContain("Halted");
+    expect(unpooledAck).toContain("gpt-5-codx");
+    expect(unpooledAck).toContain("no current or staged pool");
+    expect(unpooledAck).not.toContain("closest:");
+    expect(halt.isHalted("codex", "gpt-5-codx")).toBe(true);
   });
 
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
