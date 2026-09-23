@@ -4646,7 +4646,7 @@ export class ActorMesh {
   }
 
   /**
-   * The modelConfig pool a thread's next run will actually launch on: a
+   * The modelConfig pool a thread's next run will actually launch on.
    * An overlay is normally consumed immediately by `setActorModel`; when one
    * remains for a run boundary (mid-run, an admission gap, or an all-halted
    * preflight), every halt-gate check must still consult it instead of the
