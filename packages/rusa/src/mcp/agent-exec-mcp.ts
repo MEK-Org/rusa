@@ -17,7 +17,10 @@ import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
-import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import {
+  ModelClassInUseError,
+  type ModelClassRepository,
+} from "../db/repositories/model-class-repository.js";
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
@@ -1009,7 +1012,7 @@ export function createAgentExecMcpServer(
         {
           title: "Delete a runtime model class (model-admin)",
           description:
-            "Delete a model class from mesh.db. Future class references to it fail as unknown, and any actor still bound to this class by reference stops resolving a pool at all: it is refused at its next dispatch, and a class-bound root refuses to boot. Rebind those actors (set_actor_model with an explicit pool or another class) before deleting. Actors holding an explicit concrete pool are unaffected. Requires the model-admin capability.",
+            "Delete a model class from mesh.db. Refuses deletion while any live actor is still bound to this class by reference — including a set_actor_model rebind staged for that actor's next run boundary — and names those actors so the caller rebinds them first (set_actor_model with an explicit pool or another class). Retired actors do not prevent deletion, and actors holding an explicit concrete pool are unaffected. Deleting a class nothing references stays a plain delete. Requires the model-admin capability.",
           inputSchema: {
             name: z.string().min(1).describe("Exact class name to delete."),
           },
@@ -1019,6 +1022,26 @@ export function createAgentExecMcpServer(
           if (denied) return denied;
           try {
             const className = assertClassName(name);
+            // `ModelClassRepository.delete` already refuses a class any live
+            // row still references, so this scan exists for the one binding
+            // the actors table cannot show: a staged `set_actor_model` that has
+            // not reached its run boundary yet. That rebind persists the class
+            // reference when `applyPendingModel` runs, and would then fail to
+            // resolve. Reporting both dimensions together also means the caller
+            // gets one list to rebind rather than discovering the second after
+            // clearing the first.
+            const liveReferencing = mesh
+              .list()
+              .filter(
+                (actor) =>
+                  actor.status === "active" &&
+                  (actor.modelClass === className || actor.desiredModelClass === className)
+              )
+              .map((actor) => actor.id)
+              .sort();
+            if (liveReferencing.length > 0) {
+              return toolError(new ModelClassInUseError(className, liveReferencing));
+            }
             const deleted = modelClasses.delete(className);
             if (deleted) {
               mesh.recordEvent({

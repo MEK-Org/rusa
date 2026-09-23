@@ -80,6 +80,24 @@ function fromRow(row: ModelClassRow): ModelClass {
 }
 
 /**
+ * Thrown when a model class deletion is refused because live actors are still
+ * bound to it by class reference (#636).
+ */
+export class ModelClassInUseError extends Error {
+  readonly className: string;
+  readonly referencingActors: readonly string[];
+
+  constructor(className: string, referencingActors: readonly string[]) {
+    super(
+      `Cannot delete model class '${className}': referenced by live actor(s): ${referencingActors.join(", ")}. Rebind these actors first.`
+    );
+    this.name = "ModelClassInUseError";
+    this.className = className;
+    this.referencingActors = referencingActors;
+  }
+}
+
+/**
  * SQLite source of truth for model classes. Every lookup reads the committed
  * row directly: a successful `set_model_class` affects the next class
  * selection in this process without a mesh restart, and a class-bound actor's
@@ -141,7 +159,59 @@ export class ModelClassRepository {
       .run(name, JSON.stringify(definition), at, at);
   }
 
+  /**
+   * Returns the IDs of all live (non-retired) actors currently bound to this
+   * model class by reference (#636).
+   *
+   * Only live actors (`retired_at IS NULL`) are returned: retired actors are
+   * permanently stopped, never scheduled, and cannot be rebound with
+   * `set_actor_model`. Counting retired rows would permanently prevent deleting
+   * any class once used.
+   *
+   * Both class-bearing document shapes are caught by the same `$.modelClass`
+   * path: a v4 reference and a v3 record whose copied pool is already ignored
+   * on read. Deleting the class breaks either one identically.
+   */
+  referencingActors(name: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM actors
+         WHERE retired_at IS NULL
+           AND model_config IS NOT NULL
+           AND json_valid(model_config)
+           AND json_extract(model_config, '$.modelClass') = ?
+         ORDER BY id ASC`
+      )
+      .all(name) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Delete a model class definition from mesh.db.
+   *
+   * Refuses deletion if any live actor is still bound to this class by
+   * reference, throwing {@link ModelClassInUseError} naming those actors (#636).
+   *
+   * Settled design choices:
+   * 1. Retired actors' rows do NOT count as references: they will never run
+   *    again, and cannot be rebound.
+   * 2. No force/override parameter: "rebind, then delete" is required to prevent
+   *    leaving live actors or root with an unresolvable class that breaks
+   *    dispatch or prevents root boot.
+   * 3. The guard lives here, at the store, so a future caller inherits it
+   *    rather than having to remember it. `delete_model_class` adds only the
+   *    one reference this query cannot see: a process-local staged rebind.
+   *
+   * Deleting a class that does not exist stays the cheap no-op it is today —
+   * there is nothing to protect, so the reference scan is skipped entirely.
+   */
   delete(name: string): boolean {
+    const exists = this.db.prepare("SELECT 1 FROM model_classes WHERE name = ?").get(name);
+    if (!exists) return false;
+    const referencing = this.referencingActors(name);
+    if (referencing.length > 0) {
+      throw new ModelClassInUseError(name, referencing);
+    }
     return this.db.prepare("DELETE FROM model_classes WHERE name = ?").run(name).changes > 0;
   }
 }

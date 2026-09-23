@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
-import { ModelClassRepository } from "./model-class-repository.js";
+import { ModelClassInUseError, ModelClassRepository } from "./model-class-repository.js";
 import { PrincipalRepository } from "./principal-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 
@@ -165,7 +165,10 @@ describe("SqliteActorRepository", () => {
       status: "active",
       createdAt: "2026-09-03T13:01:00.000Z",
     });
-    classes.delete("fast");
+    // classes.delete refuses removal because a live actor references "fast" (#636).
+    expect(() => classes.delete("fast")).toThrow(ModelClassInUseError);
+    // Delete via direct SQL to test that SqliteActorRepository surfaces the unresolvable class.
+    db.prepare("DELETE FROM model_classes WHERE name = ?").run("fast");
 
     const broken = repository.get("worker");
     expect(broken?.modelClass).toBe("fast");

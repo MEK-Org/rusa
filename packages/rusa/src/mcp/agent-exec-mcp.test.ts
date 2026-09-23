@@ -2931,6 +2931,282 @@ describe("runtime model-class management", () => {
     expect(names).not.toContain("list_model_classes");
     db.close();
   });
+
+  it("refuses to delete a class when a live worker is bound to it by reference", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    const setRes = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(setRes.isError).toBeFalsy();
+
+    const spawnRes = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "worker",
+        model_config: { class: "review" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    expect(spawnRes.isError).toBeFalsy();
+    const workerId = (dataOf(spawnRes) as { thread_id: string }).thread_id;
+
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "review" },
+    })) as CallToolResult;
+
+    expect(deleteRes.isError).toBe(true);
+    expect(String(dataOf(deleteRes))).toContain(
+      `Cannot delete model class 'review': referenced by live actor(s): ${workerId}. Rebind these actors first.`
+    );
+    expect(store.get("review")).toBeDefined();
+    db.close();
+  });
+
+  it("refuses to delete a class when root is bound to it by reference", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "leader",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    const setModelRes = (await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: "root",
+        model_config: { class: "leader" },
+      },
+    })) as CallToolResult;
+    expect(setModelRes.isError).toBeFalsy();
+
+    // Staged desiredModelClass check
+    const deleteStagedRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "leader" },
+    })) as CallToolResult;
+    expect(deleteStagedRes.isError).toBe(true);
+    expect(String(dataOf(deleteStagedRes))).toContain(
+      "Cannot delete model class 'leader': referenced by live actor(s): root. Rebind these actors first."
+    );
+
+    // Apply pending model so modelClass is committed
+    mesh.applyPendingModel("root");
+
+    const deleteCommittedRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "leader" },
+    })) as CallToolResult;
+    expect(deleteCommittedRes.isError).toBe(true);
+    expect(String(dataOf(deleteCommittedRes))).toContain(
+      "Cannot delete model class 'leader': referenced by live actor(s): root. Rebind these actors first."
+    );
+    expect(store.get("leader")).toBeDefined();
+    db.close();
+  });
+
+  it("names all referencing live actors sorted by ID when multiple exist", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "pool-class",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    const spawn1 = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "w1", model_config: { class: "pool-class" }, context_mode: "ledger" },
+    })) as CallToolResult;
+    const spawn2 = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "w2", model_config: { class: "pool-class" }, context_mode: "ledger" },
+    })) as CallToolResult;
+    const id1 = (dataOf(spawn1) as { thread_id: string }).thread_id;
+    const id2 = (dataOf(spawn2) as { thread_id: string }).thread_id;
+    const sorted = [id1, id2].sort();
+
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "pool-class" },
+    })) as CallToolResult;
+    expect(deleteRes.isError).toBe(true);
+    expect(String(dataOf(deleteRes))).toContain(
+      `Cannot delete model class 'pool-class': referenced by live actor(s): ${sorted.join(", ")}. Rebind these actors first.`
+    );
+    db.close();
+  });
+
+  it("succeeds after referencing actors are rebound to another class or explicit pool", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "class-a",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "class-b",
+        model_config: { provider: "codex", model: "gpt-5.6-sol" },
+      },
+    });
+
+    const spawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "w", model_config: { class: "class-a" }, context_mode: "ledger" },
+    })) as CallToolResult;
+    const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
+
+    // Initially refused
+    const firstAttempt = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-a" },
+    })) as CallToolResult;
+    expect(firstAttempt.isError).toBe(true);
+
+    // Rebind worker to class-b
+    await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { class: "class-b" },
+      },
+    });
+    mesh.applyPendingModel(workerId);
+
+    // Now deletion of class-a succeeds
+    const secondAttempt = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-a" },
+    })) as CallToolResult;
+    expect(secondAttempt.isError).toBeFalsy();
+    expect(dataOf(secondAttempt)).toEqual({ name: "class-a", deleted: true });
+    expect(store.get("class-a")).toBeUndefined();
+
+    // Rebind worker to explicit concrete pool
+    await root.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: workerId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+    mesh.applyPendingModel(workerId);
+
+    // Now deletion of class-b succeeds
+    const deleteClassB = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "class-b" },
+    })) as CallToolResult;
+    expect(deleteClassB.isError).toBeFalsy();
+    expect(dataOf(deleteClassB)).toEqual({ name: "class-b", deleted: true });
+    expect(store.get("class-b")).toBeUndefined();
+
+    db.close();
+  });
+
+  it("succeeds when referencing actor is retired", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "temp-class",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    });
+
+    const spawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "temp worker",
+        model_config: { class: "temp-class" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    const workerId = (dataOf(spawn) as { thread_id: string }).thread_id;
+
+    // Retire the worker
+    const retireRes = (await root.callTool({
+      name: "retire_thread",
+      arguments: { thread_id: workerId },
+    })) as CallToolResult;
+    expect(retireRes.isError).toBeFalsy();
+
+    // Deletion succeeds now that actor is retired
+    const deleteRes = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "temp-class" },
+    })) as CallToolResult;
+    expect(deleteRes.isError).toBeFalsy();
+    expect(dataOf(deleteRes)).toEqual({ name: "temp-class", deleted: true });
+    expect(store.get("temp-class")).toBeUndefined();
+
+    db.close();
+  });
+
+  it("returns deleted: false for a nonexistent class", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+
+    const res = (await root.callTool({
+      name: "delete_model_class",
+      arguments: { name: "nonexistent" },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(dataOf(res)).toEqual({ name: "nonexistent", deleted: false });
+
+    db.close();
+  });
 });
 
 class FakeWakeScheduler {
