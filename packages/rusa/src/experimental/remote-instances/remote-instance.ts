@@ -13,7 +13,7 @@ import type {
 } from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
-const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
+export const ACTIVE_UPDATE_PHASES = new Set<FollowerUpdateStatusPhase>([
   "pending",
   "fetching",
   "building",

@@ -142,6 +142,7 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
+import { FollowerUpdateTriggerStore } from "../experimental/remote-instances/follower-update-trigger-store.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import { GitBridgeIssueClient, getIssueClient, type IssueClient } from "../gitops/issue-client.js";
 import { initEmptyBareRepo } from "../gitops/worktree.js";
@@ -1797,6 +1798,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // best-effort: if the deploy checkout can't be resolved, the mesh still boots
   // without it. Its drainer self-excludes the CALLER's run (whoever holds the
   // grant), not a fixed root id.
+  const followerTriggerStore = new FollowerUpdateTriggerStore(
+    join(mcHome, "data", "follower-update-trigger.json")
+  );
   let updateToolDepsFor: ((selfId: string) => UpdateToolDeps) | undefined;
   try {
     const repoRoot = resolveRepoRoot();
@@ -1818,6 +1822,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           (m) => console.log(m)
         ),
         drain: new MeshDrainer(gracefulShutdown, () => mesh.activeRunThreadIds(), selfId),
+        onCommitted: (newSha, branch) => {
+          try {
+            followerTriggerStore.createTrigger({
+              targetSha: newSha,
+              branch,
+            });
+            log.info("follower_update_trigger_persisted", {
+              targetSha: newSha,
+              branch,
+            });
+          } catch (tErr) {
+            log.warn("follower_update_trigger_persist_failed", {
+              targetSha: newSha,
+              branch,
+              err: tErr,
+            });
+          }
+        },
         notify: sendErrorSink
           ? {
               notify: sendErrorSink,
@@ -2069,7 +2091,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    followerHub = new FollowerHub(token, { logger: log });
+    followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
     await followerHub.listen(config.followers.bind, config.followers.port);
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
@@ -4100,6 +4122,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   }
+
+  // Boot survived: only now may an automatic leader-update trigger move followers.
+  // Arming here rather than at gateway bind is what keeps a leader that comes up far
+  // enough to open a socket and then dies from deploying followers onto the revision
+  // that killed it. Followers that connected earlier are reconciled by this call.
+  followerHub?.armReconciliation();
 
   // ── Lifecycle ──
   let running = true;

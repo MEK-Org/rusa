@@ -94,6 +94,14 @@ export interface UpdateDeps {
   recordAction?: (text: string) => void;
   /** Injected `process.exit` seam so tests assert the exit without dying. */
   exit: (code: number) => void;
+  /**
+   * Fires after the update is committed and drained, immediately before the restart exit.
+   *
+   * Deliberately not at build-green: a failure in a later step rolls the checkout back to
+   * `oldSha`, and anything persisted at build time would then point at a revision this
+   * leader reverted. By the time this runs there is no rollback left to contradict it.
+   */
+  onCommitted?: (newSha: string, branch: string) => Promise<void> | void;
   log?: (msg: string) => void;
 }
 
@@ -278,6 +286,19 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
       );
     }
+    if (deps.onCommitted) {
+      // Best-effort: the restart is already committed and irreversible, so a failure here
+      // costs one skipped automatic reconciliation, not a failed update. The manual
+      // follower-update path stays available either way.
+      try {
+        await deps.onCommitted(newSha, plan.branch);
+      } catch (hookErr) {
+        log(
+          `[update] onCommitted hook failed: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`
+        );
+      }
+    }
+
     log(`[update] exit(0) → systemd restart onto ${shortSha(newSha)} (${subject})`);
     deps.exit(0);
     return {

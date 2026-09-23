@@ -242,11 +242,20 @@ Follower updates can be triggered via three paths:
    - `POST /followers/:id/update` - triggers update for a single follower with optional `{ targetSha, branch }`.
    - `GET /followers/:id/update` - queries the last known update status of a follower.
    - `POST /followers/update-all` - triggers updates across all currently connected followers.
+   - `GET /followers/reconciliation` - queries the active automatic update trigger and reconciliation state.
 2. **Dashboard REST API** (loopback control API):
    - `POST /api/mesh/followers/:id/update`
    - `GET /api/mesh/followers/:id/update`
    - `POST /api/mesh/followers/update-all`
-The leader's self-update does not enqueue follower updates before its replacement has booted. Operators use the authenticated gateway or dashboard endpoint after verifying the leader update; this keeps a failed leader self-update from moving followers to an unproven revision.
+3. **Automatic leader-update trigger & reconciliation**:
+   - When the leader self-updates via the `update` tool, `executeUpdate` persists an active `FollowerUpdateTrigger` to `<mcHome>/data/follower-update-trigger.json` *after* the update is committed and drained, immediately before the restart exit. A failed or timed-out leader update never writes a trigger — and neither does one that fails after a green build, since that path rolls the checkout back to the old SHA and no trigger may name a revision the leader reverted.
+   - The document is schema-versioned. A trigger file that is unparseable or of an unrecognised shape is reported through the application logger as invalid — distinctly from "no active trigger" — and never prevents the leader from starting.
+   - **The replacement leader must survive its own boot before it moves anyone else.** Reconciliation is armed only once startup completes and the mesh is live, not when the follower gateway binds its socket. A leader that comes up far enough to open a port and then dies therefore dispatches nothing. This is the automated form of the operator-verification step that previously guarded the same risk: the leader demonstrating it can run the revision is what authorises propagating it. Followers that connect before arming are reconciled at arming, not dropped.
+   - As enrolled followers reconnect and register via `POST /register`, the reconciler evaluates their reported `commitSha`:
+     - If `follower.commitSha === trigger.targetSha`: recorded as `success`.
+     - If the follower lags `targetSha`, an update is dispatched via `updateFollower`. The attempt is recorded after dispatch; a dispatch that throws is recorded as a failure rather than a `pending` the follower could never leave.
+     - **Fail-stop loop prevention**: If a follower previously reported a failure (`status: "failed"`) for the given `targetSha`, automatic reconciliation skips that follower to avoid endless build/restart loops. A newer target supersedes that suppression.
+   - **An active trigger is not retired by the followers that happen to be connected.** The leader keeps no durable enrollment roster, so "every follower we can see is current" cannot establish that every enrolled follower is; completing on it would strand a follower that was offline during the leader update, which is the case the durable document exists to serve. The trigger instead stays active until the next leader update supersedes it, so a follower that reconnects hours later is still caught up. `GET /followers/reconciliation` reports whether a trigger is outstanding, whether all *connected* followers are current, and the per-follower attempt state.
 
 ### Follower-side update execution and safe rollback boundary
 
