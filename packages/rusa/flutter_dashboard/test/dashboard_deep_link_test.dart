@@ -124,6 +124,10 @@ void main() {
         parseFocusedObligationId(Uri.parse('/?obligation=ob%2Dlegacy')),
         'ob-legacy',
       );
+      expect(
+        parseFocusedObligationId(Uri.parse('/?obligation=50%25')),
+        '50%',
+      );
       expect(parseFocusedObligationId(Uri.parse('/overview')), isNull);
 
       expect(

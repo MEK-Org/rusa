@@ -11,8 +11,9 @@ DashboardView? parseDashboardView(Uri uri) {
   return null;
 }
 
-/// Extracts and decodes the focused obligation ID from path `/work/<id>` or
-/// legacy query parameter `?obligation=<id>`.
+/// Extracts the focused obligation ID from path `/work/<id>` or legacy query
+/// parameter `?obligation=<id>`. Path segments need decoding; queryParameters
+/// has already decoded query values.
 String? parseFocusedObligationId(Uri uri) {
   final cleanPath = uri.path.replaceFirst(RegExp(r'/+$'), '');
   if (cleanPath.startsWith('/work/')) {
@@ -20,7 +21,7 @@ String? parseFocusedObligationId(Uri uri) {
     return Uri.decodeComponent(raw);
   }
   final queryParam = uri.queryParameters['obligation'];
-  return queryParam != null ? Uri.decodeComponent(queryParam) : null;
+  return queryParam;
 }
 
 /// Extracts and decodes the focused actor ID from path `/actors/<id>`.
