@@ -1,12 +1,16 @@
 import { isHumanOperator } from "../mcp/stamp.js";
 import type { InboxEntry } from "../repositories/inbox-repository.js";
+import type { ChatContextWindow } from "./inbox-chat-context.js";
 
 /**
- * An inbox entry enriched with an optional run-scoped handling hint.
+ * An inbox entry enriched with an optional run-scoped handling hint and, for
+ * chat entries, the recent conversation around it.
  * Returned to actors at selection time by the inbox MCP server.
  */
 export interface SelectedInboxEntry extends InboxEntry {
   hint?: string;
+  chatContext?: ChatContextWindow | { sameAsEntryId: string };
+  chatContextError?: string;
 }
 
 function extractThreadId(threadName: string): string | undefined {

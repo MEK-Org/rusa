@@ -57,6 +57,58 @@ export class SlackClient {
     };
   }
 
+  /**
+   * The newest `limit` messages, oldest first: the tail of the thread rooted at
+   * `threadTs` when given, otherwise the channel's top-level messages. Replies
+   * page from the thread's start, so a long thread is walked to its end, up to
+   * `maxScanned` messages.
+   */
+  async listRecentMessages(
+    channel: string,
+    opts: { threadTs?: string; limit: number; maxScanned?: number }
+  ): Promise<SlackMessage[]> {
+    const toMessage = (m: {
+      ts?: string;
+      text?: string;
+      user?: string;
+      bot_id?: string;
+      thread_ts?: string;
+    }) => ({
+      channel,
+      ts: m.ts ?? "",
+      text: m.text ?? "",
+      user: m.user ?? m.bot_id,
+      threadTs: m.thread_ts,
+    });
+    if (!opts.threadTs) {
+      // History also carries replies broadcast to the channel; over-fetch so
+      // dropping them still leaves `limit` top-level messages in the common case.
+      const response = await this.web.conversations.history({
+        channel,
+        limit: Math.min(opts.limit * 3, 200),
+      });
+      return (response.messages ?? [])
+        .filter((m) => !m.thread_ts || m.thread_ts === m.ts)
+        .slice(0, opts.limit)
+        .map(toMessage)
+        .reverse();
+    }
+    const maxScanned = opts.maxScanned ?? 1000;
+    const replies: SlackMessage[] = [];
+    let cursor: string | undefined;
+    do {
+      const response = await this.web.conversations.replies({
+        channel,
+        ts: opts.threadTs,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      replies.push(...(response.messages ?? []).map(toMessage));
+      cursor = response.response_metadata?.next_cursor || undefined;
+    } while (cursor && replies.length < maxScanned);
+    return replies.slice(-opts.limit);
+  }
+
   async send(channel: string, text: string, threadTs?: string): Promise<string> {
     const result = await this.web.chat.postMessage({ channel, text, thread_ts: threadTs });
     if (!result.ts) throw new Error("Slack did not return a message timestamp");

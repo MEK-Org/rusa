@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { attachChatContext, type InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
@@ -29,6 +30,8 @@ export interface InboxMcpRunScope {
   isFenced?: () => boolean;
   /** Explicit walkie authority hides and fences ordinary work for this actor. */
   isVoiceSessionActive?: () => boolean;
+  /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
+  chatContext?: InboxChatContextSources;
 }
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
@@ -57,6 +60,10 @@ export function createInboxMcpServer(
       },
       selected: () => localSelection,
     } satisfies InboxMcpRunScope);
+  const enrich = async (entries: InboxEntry[]): Promise<SelectedInboxEntry[]> => {
+    const hinted = attachInboxHints(entries);
+    return scope.chatContext ? attachChatContext(hinted, actorId, scope.chatContext) : hinted;
+  };
   server.registerTool(
     "list",
     {
@@ -92,7 +99,7 @@ export function createInboxMcpServer(
     {
       title: "Select inbox work for this run",
       description:
-        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and durably resolves the run's primary obligation when possible. During the observe-first rollout, ambiguous or unrelated work is reported in focus diagnostics rather than rejected. Selected entries retain source-specific handling hints.",
+        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and durably resolves the run's primary obligation when possible. During the observe-first rollout, ambiguous or unrelated work is reported in focus diagnostics rather than rejected. Selected entries retain source-specific handling hints. Chat entries also carry `chatContext`: the most recent messages of their thread, top-level channel, or mesh conversation, both sides, with ids to page further back using the read tools.",
       inputSchema: {
         entry_ids: z.array(z.string().min(1)).min(1).max(100),
         obligation_id: z
@@ -111,10 +118,10 @@ export function createInboxMcpServer(
         }
         const selected = scope.select(entry_ids, obligation_id);
         if (Array.isArray(selected)) {
-          return toolOk({ entries: attachInboxHints(selected) });
+          return toolOk({ entries: await enrich(selected) });
         }
         return toolOk({
-          entries: attachInboxHints(selected.entries),
+          entries: await enrich(selected.entries),
           focus: selected.focus,
           ...(selected.discipline === undefined ? {} : { discipline: selected.discipline }),
         });
