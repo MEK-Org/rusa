@@ -31,6 +31,8 @@ import {
 } from "./token-accounting.js";
 import type { CodingProvider, McpServerSpec, RunOptions, RunResult } from "./types.js";
 
+export { antigravityScratchDir } from "./antigravity-paths.js";
+
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_TAIL_BYTES = 2 * 1024 * 1024;
 const CONVERSATION_PREFIX_BYTES = 4096;
@@ -159,16 +161,6 @@ export interface AntigravityQuotaRefusal {
 
 export function antigravityConversationsDir(): string {
   return join(homedir(), ".gemini", "antigravity-cli", "conversations");
-}
-
-/**
- * Where the CLI keeps its per-worker workspaces, one directory per actor that
- * has ever run under it. Sandboxed Antigravity actors see this path overlaid
- * with their own working directory; the host path remains the cleanup target
- * for older workspaces (see `actor/workspace-sweep.ts`).
- */
-export function antigravityScratchDir(): string {
-  return join(homedir(), ".gemini", "antigravity-cli", "scratch");
 }
 
 interface ConversationFileWatermark {

@@ -481,10 +481,10 @@ describe("sandbox bwrap args", () => {
     });
   });
 
-  it("maps Antigravity scratch to the actor directory while retaining the narrow write scope", async () => {
+  it("shadows sibling worker directories and maps Antigravity scratch privately", async () => {
     // The mesh worker layout: <home>/.rusa/workers/<id>. The provider's shared
-    // scratch path must be overlaid with the current actor directory: a worker
-    // then sees its durable workspace at that path, not a sibling's checkout.
+    // scratch path must be overlaid with a current-actor-only non-durable directory.
+    // The shared workers parent is shadowed and only this actor is rebound.
     const home = mkdtempSync(join(tmpdir(), "mc-home-"));
     tempDirs.push(home);
     const workersDir = join(home, ".rusa", "workers");
@@ -505,12 +505,13 @@ describe("sandbox bwrap args", () => {
     const { buildActorBwrapArgs } = await import("./sandbox.js");
     const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
-    // The general worker tree stays read-only; this change narrows only the
-    // provider-specific scratch view.
+    // The workers tree is shadowed, then only this actor directory is recreated
+    // for the writable bind below.
     const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
-    expect(tmpfsTargets).not.toContain(workersDir);
+    expect(tmpfsTargets).toContain(workersDir);
     expect(tmpfsTargets).not.toContain(home);
-    // Only /tmp is tmpfs'd (writable scratch); the host root is ro-bound (read-all).
+    // /tmp is tmpfs'd for writes; the host root remains read-only beneath the
+    // worker-tree shadow.
     expect(tmpfsTargets).toContain("/tmp");
     expect(args).toContain("--ro-bind");
     // The real home is kept (read-only via ro-bind /); no synthetic HOME remapping.
@@ -528,6 +529,10 @@ describe("sandbox bwrap args", () => {
     expectSetenv(args, "npm_config_cache", "/tmp/cache/npm");
     // The actor's own dir is a writable bind, re-bound in place + chdir'd.
     expect(args.join(" ")).toContain(`--bind ${actorDir} ${actorDir}`);
+    const actorDirTarget = args.findIndex(
+      (arg, index) => arg === "--dir" && args[index + 1] === actorDir
+    );
+    expect(actorDirTarget).toBeGreaterThan(-1);
     const chdirIndex = args.indexOf("--chdir");
     expect(args[chdirIndex + 1]).toBe(actorDir);
     // The provider's state dir is the only home subtree bound read-write.
@@ -541,7 +546,9 @@ describe("sandbox bwrap args", () => {
     );
     const scratchOverlay = args.findIndex(
       (arg, index) =>
-        arg === "--bind" && args[index + 1] === actorDir && args[index + 2] === scratchDir
+        arg === "--bind" &&
+        args[index + 1] === join(actorDir, ".antigravity-scratch") &&
+        args[index + 2] === scratchDir
     );
     expect(scratchOverlay).toBeGreaterThan(providerStateBind);
   });

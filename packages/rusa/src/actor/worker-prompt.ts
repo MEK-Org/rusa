@@ -360,8 +360,9 @@ export function buildWorkerPrompt(
 
 You have a private working directory — your current directory, yours alone. Clone
 whatever repositories your charter calls for into it (you have git and \`gh\`).
-Provider scratch is disposable. Keep durable work in this directory; portable
-Antigravity actors put nothing important in provider scratch.
+Provider scratch is a private, non-durable workspace alias under this directory.
+Keep durable work in this directory, not provider scratch; portable Antigravity
+actors put nothing important in provider scratch.
 Always use \`git clone --recurse-submodules\` — never \`--single-branch\` or \`--depth\`. Those narrow
 \`remote.origin.fetch\`, and after that \`git fetch\` exits 0 with no output forever
 while every branch outside the refspec silently stops advancing, so reads off
