@@ -24,8 +24,6 @@ import 'web_quota_cache.dart';
 import 'web_tree_preferences_cache.dart';
 import 'widgets/dashboard_body.dart';
 
-export 'app.dart';
-
 /// The live actor-mesh viewer dashboard (an issue). Reads the PR2 Data API +
 /// SSE stream and renders the locked V1.4.0 design: an alive-actor tree on the
 /// left and the selected actor's Events / Live Output on the right.
@@ -38,7 +36,8 @@ void main() {
     RusaDashboardApp(
       title: resolveDashboardTitle(web.document.title),
       bootstrapSession: bootstrapDashboardSession,
-      browserHooksBuilder: (session) => DashboardSessionBrowserHooks(session),
+      browserHooksBuilder: (session) =>
+          DashboardSessionBrowserHooks(session).dispose,
       pageBuilder: (context, session) => DashboardPage(session: session),
     ),
   );

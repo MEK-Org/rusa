@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/app.dart';
+import 'package:rusa_dashboard/dashboard_url_core.dart';
 import 'package:rusa_dashboard/dashboard_url_stub.dart';
 import 'package:rusa_dashboard/session.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
 
 import 'fakes.dart';
 
@@ -71,305 +73,268 @@ Widget _testDashboardBody(DashboardStore store) => Scaffold(
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  final recordedNavCalls = <MethodCall>[];
+
   setUp(() {
     debugDashboardUrl = null;
+    recordedNavCalls.clear();
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.navigation, (call) async {
+      recordedNavCalls.add(call);
+      return null;
+    });
   });
 
   tearDown(() {
     debugDashboardUrl = null;
+    recordedNavCalls.clear();
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
   });
 
-  testWidgets(
-    'does not overwrite initial deep link to root during async bootstrap',
-    (tester) async {
-      final calls = <MethodCall>[];
-      final messenger =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-        call,
-      ) async {
-        calls.add(call);
-        return null;
-      });
-      addTearDown(() {
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-        tester.platformDispatcher.clearDefaultRouteNameTestValue();
-      });
-
-      tester.platformDispatcher.defaultRouteNameTestValue = '/work/ob-123';
-      final sessionCompleter = Completer<DashboardSession>();
-
-      await tester.pumpWidget(
-        RusaDashboardApp(
-          session: sessionCompleter.future,
-          initialRoute: '/work/ob-123',
-        ),
+  group('dashboard URL core parsing and building', () {
+    test('parses known views from URIs', () {
+      expect(parseDashboardView(Uri.parse('/actors')), DashboardView.actors);
+      expect(
+        parseDashboardView(Uri.parse('/actors/sub')),
+        DashboardView.actors,
       );
-
-      // During async session bootstrap, Flutter Navigator must not emit a route
-      // update to "/" or throw a missing-route exception.
-      final rootUpdates = calls.where(
-        (c) =>
-            c.method == 'routeInformationUpdated' &&
-            c.arguments is Map &&
-            (c.arguments as Map)['uri'] == '/',
+      expect(
+        parseDashboardView(Uri.parse('/understanding')),
+        DashboardView.understanding,
       );
-      expect(rootUpdates, isEmpty);
-    },
-  );
-
-  testWidgets(
-    'preserves /work/<id> deep link through cold authenticated load',
-    (tester) async {
-      await tester.runAsync(() async {
-        final calls = <MethodCall>[];
-        final messenger =
-            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-          call,
-        ) async {
-          calls.add(call);
-          return null;
-        });
-        addTearDown(() {
-          messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-          tester.platformDispatcher.clearDefaultRouteNameTestValue();
-        });
-
-        tester.platformDispatcher.defaultRouteNameTestValue =
-            '/work/ob-focused';
-        debugDashboardUrl = '/work/ob-focused';
-
-        final api = FakeApi();
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-
-        final session = _TestSession(status: DashboardSessionStatus.signedIn);
-
-        await tester.pumpWidget(
-          RusaDashboardApp(
-            session: Future.value(session),
-            initialRoute: '/work/ob-focused',
-            pageBuilder: (_, _) => _testDashboardBody(store),
-          ),
-        );
-        await tester.pump();
-        await tester.pump(const Duration(milliseconds: 50));
-
-        expect(find.byType(DashboardBody), findsOneWidget);
-        expect(store.focusedObligationId.value, 'ob-focused');
-        expect(debugDashboardUrl, '/work/ob-focused');
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets(
-    'preserves /actors/<id> deep link through cold authenticated load',
-    (tester) async {
-      await tester.runAsync(() async {
-        final calls = <MethodCall>[];
-        final messenger =
-            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-          call,
-        ) async {
-          calls.add(call);
-          return null;
-        });
-        addTearDown(() {
-          messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-          tester.platformDispatcher.clearDefaultRouteNameTestValue();
-        });
-
-        tester.platformDispatcher.defaultRouteNameTestValue =
-            '/actors/actor-99';
-        debugDashboardUrl = '/actors/actor-99';
-
-        final api = FakeApi()..threadsResult = [makeThread('actor-99')];
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-
-        final session = _TestSession(status: DashboardSessionStatus.signedIn);
-
-        await tester.pumpWidget(
-          RusaDashboardApp(
-            session: Future.value(session),
-            initialRoute: '/actors/actor-99',
-            pageBuilder: (_, _) => _testDashboardBody(store),
-          ),
-        );
-        await tester.pump();
-        await tester.pump(const Duration(milliseconds: 50));
-
-        expect(find.byType(DashboardBody), findsOneWidget);
-        expect(store.primary.value, 'actor-99');
-        expect(debugDashboardUrl, '/actors/actor-99');
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets(
-    'preserves /work/<id> destination through signed-out to signed-in transition',
-    (tester) async {
-      await tester.runAsync(() async {
-        final calls = <MethodCall>[];
-        final messenger =
-            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-          call,
-        ) async {
-          calls.add(call);
-          return null;
-        });
-        addTearDown(() {
-          messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-          tester.platformDispatcher.clearDefaultRouteNameTestValue();
-        });
-
-        tester.platformDispatcher.defaultRouteNameTestValue =
-            '/work/ob-deferred';
-        debugDashboardUrl = '/work/ob-deferred';
-
-        final api = FakeApi();
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-
-        final session = _TestSession(status: DashboardSessionStatus.signedOut);
-
-        await tester.pumpWidget(
-          RusaDashboardApp(
-            session: Future.value(session),
-            initialRoute: '/work/ob-deferred',
-            pageBuilder: (_, _) => _testDashboardBody(store),
-          ),
-        );
-        await tester.pump();
-
-        // While signed out, SignInPage is displayed and URL is preserved.
-        expect(find.byType(SignInPage), findsOneWidget);
-        expect(find.byType(DashboardBody), findsNothing);
-        expect(debugDashboardUrl, '/work/ob-deferred');
-
-        // User signs in with Google.
-        await tester.tap(
-          find.widgetWithText(FilledButton, 'Sign in with Google'),
-        );
-        await tester.pump();
-        await tester.pump(const Duration(milliseconds: 50));
-
-        // After sign-in, DashboardBody mounts and retains the deep link.
-        expect(find.byType(SignInPage), findsNothing);
-        expect(find.byType(DashboardBody), findsOneWidget);
-        expect(store.focusedObligationId.value, 'ob-deferred');
-        expect(debugDashboardUrl, '/work/ob-deferred');
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets(
-    'preserves /actors/<id> destination through signed-out to signed-in transition',
-    (tester) async {
-      await tester.runAsync(() async {
-        final calls = <MethodCall>[];
-        final messenger =
-            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-          call,
-        ) async {
-          calls.add(call);
-          return null;
-        });
-        addTearDown(() {
-          messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-          tester.platformDispatcher.clearDefaultRouteNameTestValue();
-        });
-
-        tester.platformDispatcher.defaultRouteNameTestValue =
-            '/actors/actor-login';
-        debugDashboardUrl = '/actors/actor-login';
-
-        final api = FakeApi()..threadsResult = [makeThread('actor-login')];
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-
-        final session = _TestSession(status: DashboardSessionStatus.signedOut);
-
-        await tester.pumpWidget(
-          RusaDashboardApp(
-            session: Future.value(session),
-            initialRoute: '/actors/actor-login',
-            pageBuilder: (_, _) => _testDashboardBody(store),
-          ),
-        );
-        await tester.pump();
-
-        expect(find.byType(SignInPage), findsOneWidget);
-        expect(find.byType(DashboardBody), findsNothing);
-        expect(debugDashboardUrl, '/actors/actor-login');
-
-        // User signs in.
-        await tester.tap(
-          find.widgetWithText(FilledButton, 'Sign in with Google'),
-        );
-        await tester.pump();
-        await tester.pump(const Duration(milliseconds: 50));
-
-        expect(find.byType(SignInPage), findsNothing);
-        expect(find.byType(DashboardBody), findsOneWidget);
-        expect(store.primary.value, 'actor-login');
-        expect(debugDashboardUrl, '/actors/actor-login');
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets('operates normally in local/no-auth mode', (tester) async {
-    await tester.runAsync(() async {
-      final calls = <MethodCall>[];
-      final messenger =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      messenger.setMockMethodCallHandler(SystemChannels.navigation, (
-        call,
-      ) async {
-        calls.add(call);
-        return null;
-      });
-      addTearDown(() {
-        messenger.setMockMethodCallHandler(SystemChannels.navigation, null);
-        tester.platformDispatcher.clearDefaultRouteNameTestValue();
-      });
-
-      tester.platformDispatcher.defaultRouteNameTestValue = '/work/ob-local';
-      debugDashboardUrl = '/work/ob-local';
-
-      final api = FakeApi();
-      final store = DashboardStore(api: api, stream: FakeStream());
-      await store.init();
-
-      final session = LocalDashboardSession();
-
-      await tester.pumpWidget(
-        RusaDashboardApp(
-          session: Future.value(session),
-          initialRoute: '/work/ob-local',
-          pageBuilder: (_, _) => _testDashboardBody(store),
-        ),
+      expect(parseDashboardView(Uri.parse('/reports')), DashboardView.reports);
+      expect(parseDashboardView(Uri.parse('/work')), DashboardView.work);
+      expect(
+        parseDashboardView(Uri.parse('/work/ob-123')),
+        DashboardView.work,
       );
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 50));
-
-      expect(find.byType(DashboardBody), findsOneWidget);
-      expect(store.focusedObligationId.value, 'ob-local');
-      expect(debugDashboardUrl, '/work/ob-local');
-
-      await store.dispose();
+      expect(parseDashboardView(Uri.parse('/overview')), DashboardView.overview);
+      expect(parseDashboardView(Uri.parse('/')), isNull);
     });
+
+    test('extracts and percent-decodes focused IDs', () {
+      expect(
+        parseFocusedObligationId(Uri.parse('/work/ob%2Dfocused')),
+        'ob-focused',
+      );
+      expect(
+        parseFocusedObligationId(Uri.parse('/?obligation=ob%2Dlegacy')),
+        'ob-legacy',
+      );
+      expect(parseFocusedObligationId(Uri.parse('/overview')), isNull);
+
+      expect(
+        parseFocusedActorId(Uri.parse('/actors/actor%2D99')),
+        'actor-99',
+      );
+      expect(parseFocusedActorId(Uri.parse('/work/ob-1')), isNull);
+    });
+
+    test('builds updated dashboard URIs', () {
+      final base = Uri.parse('/work/ob-1?other=keep&obligation=drop');
+      final updated = buildDashboardUri(
+        base,
+        DashboardView.actors,
+        focusedActorId: 'actor-2',
+      );
+      expect(updated.path, '/actors/actor-2');
+      expect(updated.queryParameters, {'other': 'keep'});
+    });
+  });
+
+  group('deep link navigation and routing', () {
+    testWidgets(
+      'does not overwrite initial deep link to root during async bootstrap',
+      (tester) async {
+        addTearDown(() {
+          tester.platformDispatcher.clearDefaultRouteNameTestValue();
+        });
+
+        tester.platformDispatcher.defaultRouteNameTestValue = '/work/ob-123';
+        final sessionCompleter = Completer<DashboardSession>();
+
+        await tester.pumpWidget(
+          RusaDashboardApp(
+            bootstrapSession: () => sessionCompleter.future,
+            pageBuilder: (_, session) => const SizedBox(),
+          ),
+        );
+
+        // During async session bootstrap, Flutter Navigator must not emit a route
+        // update to "/" or throw a missing-route exception.
+        final rootUpdates = recordedNavCalls.where(
+          (c) =>
+              c.method == 'routeInformationUpdated' &&
+              c.arguments is Map &&
+              (c.arguments as Map)['uri'] == '/',
+        );
+        expect(rootUpdates, isEmpty);
+      },
+    );
+
+    for (final (path, expectedId, isWork) in [
+      ('/work/ob-focused', 'ob-focused', true),
+      ('/actors/actor-99', 'actor-99', false),
+    ]) {
+      testWidgets(
+        'preserves $path deep link through cold authenticated load',
+        (tester) async {
+          await tester.runAsync(() async {
+            addTearDown(() {
+              tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            });
+
+            tester.platformDispatcher.defaultRouteNameTestValue = path;
+            debugDashboardUrl = path;
+
+            final api = FakeApi();
+            if (!isWork) {
+              api.threadsResult = [makeThread(expectedId)];
+            }
+            final store = DashboardStore(api: api, stream: FakeStream());
+            await store.init();
+
+            final session = _TestSession(
+              status: DashboardSessionStatus.signedIn,
+            );
+
+            await tester.pumpWidget(
+              RusaDashboardApp(
+                bootstrapSession: () => Future.value(session),
+                pageBuilder: (_, _) => _testDashboardBody(store),
+              ),
+            );
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 50));
+
+            expect(find.byType(DashboardBody), findsOneWidget);
+            if (isWork) {
+              expect(store.focusedObligationId.value, expectedId);
+            } else {
+              expect(store.primary.value, expectedId);
+            }
+            expect(debugDashboardUrl, path);
+
+            await store.dispose();
+          });
+        },
+      );
+    }
+
+    for (final (path, expectedId, isWork) in [
+      ('/work/ob-deferred', 'ob-deferred', true),
+      ('/actors/actor-login', 'actor-login', false),
+    ]) {
+      testWidgets(
+        'preserves $path destination through signed-out to signed-in transition',
+        (tester) async {
+          await tester.runAsync(() async {
+            addTearDown(() {
+              tester.platformDispatcher.clearDefaultRouteNameTestValue();
+            });
+
+            tester.platformDispatcher.defaultRouteNameTestValue = path;
+            debugDashboardUrl = path;
+
+            final api = FakeApi();
+            if (!isWork) {
+              api.threadsResult = [makeThread(expectedId)];
+            }
+            final store = DashboardStore(api: api, stream: FakeStream());
+            await store.init();
+
+            final session = _TestSession(
+              status: DashboardSessionStatus.signedOut,
+            );
+
+            await tester.pumpWidget(
+              RusaDashboardApp(
+                bootstrapSession: () => Future.value(session),
+                pageBuilder: (_, _) => _testDashboardBody(store),
+              ),
+            );
+            await tester.pump();
+
+            // While signed out, SignInPage is displayed and URL is preserved.
+            expect(find.byType(SignInPage), findsOneWidget);
+            expect(find.byType(DashboardBody), findsNothing);
+            expect(debugDashboardUrl, path);
+
+            // User signs in with Google.
+            await tester.tap(
+              find.widgetWithText(FilledButton, 'Sign in with Google'),
+            );
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 50));
+
+            // After sign-in, DashboardBody mounts and retains the deep link.
+            expect(find.byType(SignInPage), findsNothing);
+            expect(find.byType(DashboardBody), findsOneWidget);
+            if (isWork) {
+              expect(store.focusedObligationId.value, expectedId);
+            } else {
+              expect(store.primary.value, expectedId);
+            }
+            expect(debugDashboardUrl, path);
+
+            await store.dispose();
+          });
+        },
+      );
+    }
+
+    testWidgets('operates normally in local/no-auth mode', (tester) async {
+      await tester.runAsync(() async {
+        addTearDown(() {
+          tester.platformDispatcher.clearDefaultRouteNameTestValue();
+        });
+
+        tester.platformDispatcher.defaultRouteNameTestValue = '/work/ob-local';
+        debugDashboardUrl = '/work/ob-local';
+
+        final api = FakeApi();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        final session = LocalDashboardSession();
+
+        await tester.pumpWidget(
+          RusaDashboardApp(
+            bootstrapSession: () => Future.value(session),
+            pageBuilder: (_, _) => _testDashboardBody(store),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.byType(DashboardBody), findsOneWidget);
+        expect(store.focusedObligationId.value, 'ob-local');
+        expect(debugDashboardUrl, '/work/ob-local');
+
+        await store.dispose();
+      });
+    });
+
+    testWidgets(
+      'renders auth startup error cleanly when bootstrapSession throws',
+      (tester) async {
+        await tester.pumpWidget(
+          RusaDashboardApp(
+            bootstrapSession: () =>
+                Future.error(Exception('Failed to reach auth provider')),
+            pageBuilder: (_, _) => const SizedBox(),
+          ),
+        );
+        await tester.pump();
+
+        expect(
+          find.text('Unable to connect to Rusa. Please reload and try again.'),
+          findsOneWidget,
+        );
+      },
+    );
   });
 }

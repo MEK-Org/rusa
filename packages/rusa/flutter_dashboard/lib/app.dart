@@ -9,14 +9,14 @@ import 'theme.dart';
 typedef DashboardPageBuilder =
     Widget Function(BuildContext context, DashboardSession session);
 
+typedef DashboardSessionHooksDisposer = void Function();
+
 class RusaDashboardApp extends StatefulWidget {
   const RusaDashboardApp({
     super.key,
     this.title = defaultDashboardTitle,
-    this.bootstrapSession,
-    this.session,
-    this.initialRoute,
-    this.pageBuilder,
+    required this.bootstrapSession,
+    required this.pageBuilder,
     this.browserHooksBuilder,
   });
 
@@ -24,20 +24,15 @@ class RusaDashboardApp extends StatefulWidget {
   /// configured root actor name when one is set.
   final String title;
 
-  /// Optional session bootstrap delegate for runtime environments.
-  final Future<DashboardSession> Function()? bootstrapSession;
+  /// Required session bootstrap delegate for runtime environments and tests.
+  final Future<DashboardSession> Function() bootstrapSession;
 
-  /// Optional injected session future, used in tests.
-  final Future<DashboardSession>? session;
-
-  /// Optional initial route, used in tests to simulate incoming deep links.
-  final String? initialRoute;
-
-  /// Builds the authenticated dashboard page once session is active.
-  final DashboardPageBuilder? pageBuilder;
+  /// Required builder for the authenticated dashboard page once session is active.
+  final DashboardPageBuilder pageBuilder;
 
   /// Injects browser lifecycle hooks scoped to the active session.
-  final Object Function(DashboardSession session)? browserHooksBuilder;
+  final DashboardSessionHooksDisposer Function(DashboardSession session)?
+  browserHooksBuilder;
 
   @override
   State<RusaDashboardApp> createState() => _RusaDashboardAppState();
@@ -46,20 +41,14 @@ class RusaDashboardApp extends StatefulWidget {
 class _RusaDashboardAppState extends State<RusaDashboardApp> {
   DashboardSession? _resolvedSession;
   String? _authenticatedTitle;
-  late final Future<DashboardSession> _session =
-      widget.session ??
-      (widget.bootstrapSession?.call() ??
-          Future.value(LocalDashboardSession()));
+  late final Future<DashboardSession> _session = _bootstrapSession();
 
-  @override
-  void initState() {
-    super.initState();
-    _session.then((session) {
-      if (!mounted) return;
-      _resolvedSession = session;
-      session.addListener(_onSessionChanged);
-      _onSessionChanged();
-    });
+  Future<DashboardSession> _bootstrapSession() async {
+    final session = await widget.bootstrapSession();
+    _resolvedSession = session;
+    session.addListener(_onSessionChanged);
+    _onSessionChanged();
+    return session;
   }
 
   void _onSessionChanged() {
@@ -75,6 +64,7 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
   @override
   void dispose() {
     _resolvedSession?.removeListener(_onSessionChanged);
+    _resolvedSession?.dispose();
     super.dispose();
   }
 
@@ -105,13 +95,13 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
       title: _authenticatedTitle ?? widget.title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
-      // With path URL strategy, Navigator's default initial-route expansion
-      // asks for each path prefix (/work, /work/<id>); an onGenerateRoute alone
-      // would build multiple DashboardPage instances with duplicate stores.
-      // Providing onGenerateInitialRoutes generates exactly one page matching
+      // Keep one DashboardPage for every initial path. With path URL strategy,
+      // Navigator's default initial-route expansion asks for each path prefix;
+      // providing onGenerateInitialRoutes generates exactly one page matching
       // the requested deep link without falling back to "/" or replacing the
       // browser URL during asynchronous session bootstrap or sign-in.
-      initialRoute: widget.initialRoute,
+      // onGenerateRoute returns null to satisfy WidgetsApp assertion while
+      // ensuring no duplicate session host or stores are built on named pushes.
       onGenerateInitialRoutes: (initialRoute) => [
         MaterialPageRoute<void>(
           settings: RouteSettings(
@@ -120,10 +110,7 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
           builder: (context) => _buildHost(),
         ),
       ],
-      onGenerateRoute: (settings) => MaterialPageRoute<void>(
-        settings: settings,
-        builder: (context) => _buildHost(),
-      ),
+      onGenerateRoute: (settings) => null,
     );
   }
 }
@@ -131,36 +118,31 @@ class _RusaDashboardAppState extends State<RusaDashboardApp> {
 class _DashboardSessionHost extends StatefulWidget {
   const _DashboardSessionHost({
     required this.session,
-    this.pageBuilder,
+    required this.pageBuilder,
     this.browserHooksBuilder,
   });
 
   final DashboardSession session;
-  final DashboardPageBuilder? pageBuilder;
-  final Object Function(DashboardSession session)? browserHooksBuilder;
+  final DashboardPageBuilder pageBuilder;
+  final DashboardSessionHooksDisposer Function(DashboardSession session)?
+  browserHooksBuilder;
 
   @override
   State<_DashboardSessionHost> createState() => _DashboardSessionHostState();
 }
 
 class _DashboardSessionHostState extends State<_DashboardSessionHost> {
-  Object? _browserHooks;
+  DashboardSessionHooksDisposer? _disposeHooks;
 
   @override
   void initState() {
     super.initState();
-    _browserHooks = widget.browserHooksBuilder?.call(widget.session);
+    _disposeHooks = widget.browserHooksBuilder?.call(widget.session);
   }
 
   @override
   void dispose() {
-    final hooks = _browserHooks;
-    if (hooks != null) {
-      try {
-        (hooks as dynamic).dispose();
-      } catch (_) {}
-    }
-    widget.session.dispose();
+    _disposeHooks?.call();
     super.dispose();
   }
 
@@ -170,9 +152,7 @@ class _DashboardSessionHostState extends State<_DashboardSessionHost> {
     builder: (context, _) {
       return switch (widget.session.status) {
         DashboardSessionStatus.local || DashboardSessionStatus.signedIn =>
-          widget.pageBuilder != null
-              ? widget.pageBuilder!(context, widget.session)
-              : const SizedBox.shrink(),
+          widget.pageBuilder(context, widget.session),
         DashboardSessionStatus.signedOut => SignInPage(session: widget.session),
       };
     },

@@ -3,38 +3,32 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'dashboard_url_core.dart';
 import 'widgets/header.dart';
 
 /// Test override for simulating browser URLs in unit and widget tests.
 @visibleForTesting
 String? debugDashboardUrl;
 
+Uri? _currentUri() =>
+    debugDashboardUrl != null ? Uri.parse(debugDashboardUrl!) : null;
+
 /// VM/test fallback. The browser implementation reads and writes the URL; off
 /// the browser there is no address to read, so no view is named unless
 /// [debugDashboardUrl] is set by a test.
 DashboardView? dashboardViewFromUrl() {
-  if (debugDashboardUrl == null) return null;
-  return _parse(Uri.parse(debugDashboardUrl!).path);
+  final uri = _currentUri();
+  return uri != null ? parseDashboardView(uri) : null;
 }
 
 String? focusedObligationIdFromUrl() {
-  if (debugDashboardUrl == null) return null;
-  final uri = Uri.parse(debugDashboardUrl!);
-  final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
-  if (path.startsWith('/work/')) {
-    return path.substring('/work/'.length);
-  }
-  return uri.queryParameters['obligation'];
+  final uri = _currentUri();
+  return uri != null ? parseFocusedObligationId(uri) : null;
 }
 
 String? focusedActorIdFromUrl() {
-  if (debugDashboardUrl == null) return null;
-  final uri = Uri.parse(debugDashboardUrl!);
-  final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
-  if (path.startsWith('/actors/')) {
-    return path.substring('/actors/'.length);
-  }
-  return null;
+  final uri = _currentUri();
+  return uri != null ? parseFocusedActorId(uri) : null;
 }
 
 void writeDashboardViewToUrl(
@@ -43,22 +37,12 @@ void writeDashboardViewToUrl(
   String? focusedActorId,
   Future<void> Function()? onNavigation,
 }) {
-  final baseUri = debugDashboardUrl != null
-      ? Uri.parse(debugDashboardUrl!)
-      : Uri();
-  var queryParams = Map<String, String>.from(baseUri.queryParameters);
-  queryParams.remove('obligation');
-
-  var newPath = '/${view.name}';
-  if (view == DashboardView.work && focusedObligationId != null) {
-    newPath = '/work/$focusedObligationId';
-  } else if (view == DashboardView.actors && focusedActorId != null) {
-    newPath = '/actors/$focusedActorId';
-  }
-
-  final url = Uri(
-    path: newPath,
-    queryParameters: queryParams.isEmpty ? null : queryParams,
+  final baseUri = _currentUri() ?? Uri();
+  final url = buildDashboardUri(
+    baseUri,
+    view,
+    focusedObligationId: focusedObligationId,
+    focusedActorId: focusedActorId,
   );
   if (debugDashboardUrl != null) {
     debugDashboardUrl = url.toString();
@@ -67,14 +51,4 @@ void writeDashboardViewToUrl(
     if (onNavigation != null) unawaited(onNavigation());
   }
   unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: true));
-}
-
-DashboardView? _parse(String path) {
-  final cleanPath = path.replaceFirst(RegExp(r'/+$'), '');
-  if (cleanPath.startsWith('/actors')) return DashboardView.actors;
-  if (cleanPath == '/understanding') return DashboardView.understanding;
-  if (cleanPath == '/reports') return DashboardView.reports;
-  if (cleanPath.startsWith('/work')) return DashboardView.work;
-  if (cleanPath == '/overview') return DashboardView.overview;
-  return null;
 }
