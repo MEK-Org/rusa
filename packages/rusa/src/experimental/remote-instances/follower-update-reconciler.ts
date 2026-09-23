@@ -5,6 +5,7 @@ import type {
   FollowerUpdateTrigger,
   FollowerUpdateTriggerStore,
 } from "./follower-update-trigger-store.js";
+import { isFullCommitSha } from "./follower-update-validation.js";
 import type { FollowerUpdateStatus } from "./protocol.js";
 import { ACTIVE_UPDATE_PHASES } from "./remote-instance.js";
 
@@ -126,9 +127,36 @@ export class FollowerUpdateReconciler {
     const trigger = this.store.getActiveTrigger();
     if (!trigger) return;
 
+    // A normal update ends by restarting the follower, so its replacement registration
+    // is the success signal. Observe those registrations before looking for work: that
+    // is what releases the next follower after a successful automatic update.
     const followers = this.hub.list();
     for (const follower of followers) {
-      this.reconcileFollower(follower, trigger);
+      this.recordCurrentFollower(follower, trigger);
+    }
+
+    // recordCurrentFollower() persists a terminal attempt. Reload before consulting the
+    // durable gate so a replacement leader does not keep waiting on a pending attempt it
+    // just resolved from the follower's registration.
+    const refreshedTrigger = this.store.getActiveTrigger();
+    if (!refreshedTrigger) return;
+
+    // `pending` is durable single-flight state. It survives a leader replacement, where
+    // the replacement cannot know whether the former leader's command is still draining
+    // or restarting on its follower. Dispatching another automatic update there would
+    // turn that uncertainty into a parallel rollout, so wait for its terminal outcome.
+    const pendingFollowerId = this.pendingAutomaticFollower(refreshedTrigger);
+    if (pendingFollowerId) {
+      this.log.debug?.("follower_update_reconciliation_waiting_for_terminal_status", {
+        followerId: pendingFollowerId,
+        targetSha: refreshedTrigger.targetSha,
+      });
+      this.reportIfAllCurrent();
+      return;
+    }
+
+    for (const follower of followers) {
+      if (this.reconcileFollower(follower, refreshedTrigger)) return;
     }
     this.reportIfAllCurrent();
   }
@@ -144,18 +172,17 @@ export class FollowerUpdateReconciler {
     const activeTrigger = trigger ?? this.store.getActiveTrigger();
     if (!activeTrigger) return false;
 
-    // Follower already on the target SHA
-    if (follower.commitSha && follower.commitSha === activeTrigger.targetSha) {
-      if (!this.store.hasSucceeded(follower.id, activeTrigger.targetSha)) {
-        this.store.recordSuccess(follower.id, activeTrigger.targetSha);
-        this.log.info("follower_already_on_target_sha", {
-          followerId: follower.id,
-          targetSha: activeTrigger.targetSha,
-        });
-        this.reportIfAllCurrent();
-      }
-      return false;
-    }
+    // Follower already on the target SHA.
+    if (this.recordCurrentFollower(follower, activeTrigger)) return false;
+
+    // A terminal already_current status can arrive before the next registration
+    // refreshes commitSha. Its durable success record is still terminal for this target.
+    if (this.store.hasSucceeded(follower.id, activeTrigger.targetSha)) return false;
+
+    // A previous automatic command has not yet reached a terminal outcome. This guard
+    // belongs here as well as in reconcileAll() because registration calls this public
+    // method directly through the hub callback.
+    if (this.pendingAutomaticFollower(activeTrigger)) return false;
 
     // Fail-stop loop prevention: do NOT retry automatically if this follower previously failed for this targetSha
     if (this.store.hasFailed(follower.id, activeTrigger.targetSha)) {
@@ -212,14 +239,42 @@ export class FollowerUpdateReconciler {
     commitSha?: string;
     updateStatus?: FollowerUpdateStatus;
   }): void {
-    this.reconcileFollower(follower);
+    if (!this.armed) {
+      this.log.debug?.("follower_reconciliation_deferred_not_armed", { followerId: follower.id });
+      return;
+    }
+    const trigger = this.store.getActiveTrigger();
+    if (!trigger) return;
+
+    if (this.recordCurrentFollower(follower, trigger)) {
+      this.reconcileAll();
+      return;
+    }
+
+    // The callback includes the just-registered follower so this path remains correct
+    // even for hub implementations whose list snapshot is refreshed after callbacks.
+    if (this.pendingAutomaticFollower(trigger)) return;
+    if (!this.reconcileFollower(follower, trigger)) this.reconcileAll();
   }
 
   onFollowerUpdateStatus(followerId: string, status: FollowerUpdateStatus): void {
     const trigger = this.store.getActiveTrigger();
     if (!trigger) return;
 
-    const targetSha = status.newSha ?? trigger.targetSha;
+    const pendingFollowerId = this.pendingAutomaticFollower(trigger);
+    // A failure before fetch resolves the target reports an empty newSha. Persisting
+    // that as an attempt target would invalidate the trigger document and leave the
+    // single-flight gate stuck, so use the authoritative automatic target instead.
+    const reportedTargetSha = status.newSha;
+    const targetSha =
+      reportedTargetSha !== undefined && isFullCommitSha(reportedTargetSha)
+        ? reportedTargetSha
+        : trigger.targetSha;
+    // Manual /followers/:id/update calls intentionally do not create a pending
+    // automatic attempt. They still retain the existing per-target accounting, but
+    // only the pending automatic follower may release this automatic queue.
+    const releasesAutomaticQueue =
+      pendingFollowerId === followerId && targetSha === trigger.targetSha;
 
     if (status.status === "failed") {
       this.store.recordFailure(followerId, targetSha, status.error);
@@ -228,14 +283,41 @@ export class FollowerUpdateReconciler {
         targetSha,
         error: status.error,
       });
+      if (releasesAutomaticQueue) this.reconcileAll();
     } else if (status.status === "already_current") {
       this.store.recordSuccess(followerId, targetSha);
       this.log.info("follower_update_reconciliation_already_current", {
         followerId,
         targetSha,
       });
-      this.reportIfAllCurrent();
+      if (releasesAutomaticQueue) this.reconcileAll();
     }
+  }
+
+  /** Records a restart-confirmed success and tells the caller whether the follower is current. */
+  private recordCurrentFollower(
+    follower: { id: string; commitSha?: string },
+    trigger: FollowerUpdateTrigger
+  ): boolean {
+    if (follower.commitSha !== trigger.targetSha) return false;
+    if (!this.store.hasSucceeded(follower.id, trigger.targetSha)) {
+      this.store.recordSuccess(follower.id, trigger.targetSha);
+      this.log.info("follower_already_on_target_sha", {
+        followerId: follower.id,
+        targetSha: trigger.targetSha,
+      });
+    }
+    return true;
+  }
+
+  /** The one automatic command whose terminal outcome must be observed before another starts. */
+  private pendingAutomaticFollower(trigger: FollowerUpdateTrigger): string | null {
+    for (const [followerId, attempt] of Object.entries(trigger.attempts)) {
+      if (attempt.status === "pending" && attempt.targetSha === trigger.targetSha) {
+        return followerId;
+      }
+    }
+    return null;
   }
 
   /**
