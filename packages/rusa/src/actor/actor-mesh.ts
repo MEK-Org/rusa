@@ -4301,24 +4301,7 @@ export class ActorMesh {
     });
     const phase = this.activeRunState(id)?.phase;
     const staged = phase === "running" || phase === "winding_down";
-    if (!staged) {
-      try {
-        this.applyPendingModel(id);
-      } catch (error) {
-        // An immediate set is one operator action: a verification or live-actor
-        // publication failure must not leave its durable half applied after the
-        // caller received an error. Delayed application deliberately retains
-        // its overlay for a later boundary; this direct path restores the
-        // selection and any overlay that existed before this call.
-        this.actors.setModelSelection(id, {
-          modelConfig: record.modelConfig,
-          modelClass: record.modelClass,
-          desiredModelConfig: record.desiredModelConfig,
-          desiredModelClass: record.desiredModelClass,
-        });
-        throw error;
-      }
-    }
+    if (!staged) this.applyPendingModel(id);
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -4371,63 +4354,43 @@ export class ActorMesh {
     const newModelConfig = record.desiredModelConfig;
     const boundClass = record.desiredModelClass;
 
-    let selectionWritten = false;
-    try {
-      // The one deliberate model-configuration write: it restates the row's
-      // model-config document, which an ordinary `patch` deliberately does not
-      // (#626).
-      this.actors.setModelSelection(id, {
-        modelConfig: newModelConfig,
-        modelClass: boundClass,
-        desiredModelConfig: undefined,
-        desiredModelClass: undefined,
-      });
-      selectionWritten = true;
+    // The one deliberate model-configuration write: it restates the row's
+    // model-config document, which an ordinary `patch` deliberately does not
+    // (#626).
+    this.actors.setModelSelection(id, {
+      modelConfig: newModelConfig,
+      modelClass: boundClass,
+      desiredModelConfig: undefined,
+      desiredModelClass: undefined,
+    });
 
-      const verified = this.actors.get(id);
-      if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
-      if (boundClass !== undefined) {
-        // A class binding persists the reference, not the pool the selection
-        // resolved to, so the pool is whatever the class says now — verify the
-        // binding landed and publish the live definition rather than a snapshot
-        // that a concurrent class edit may already have overtaken (#626).
-        if (verified.modelClass !== boundClass) {
-          throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
-        }
-        if (!verified.modelConfig) {
-          throw new Error(
-            `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
-          );
-        }
-      } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
-        throw new Error(`Failed to verify deferred model update for thread: ${id}`);
+    const verified = this.actors.get(id);
+    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
+    if (boundClass !== undefined) {
+      // A class binding persists the reference, not the pool the selection
+      // resolved to, so the pool is whatever the class says now — verify the
+      // binding landed and publish the live definition rather than a snapshot
+      // that a concurrent class edit may already have overtaken (#626).
+      if (verified.modelClass !== boundClass) {
+        throw new Error(`Failed to verify deferred model class update for thread: ${id}`);
       }
-
-      const appliedModelConfig = verified.modelConfig ?? newModelConfig;
-      // Publish before journalling. The durable `actor_model_set` event below is
-      // the record that this pool reached the actor, so a publication that threw
-      // must not leave that claim behind.
-      this.onModelSet?.(id, appliedModelConfig, verified);
-
-      this.recordEvent({
-        kind: "actor_model_set",
-        actorId: id,
-        detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
-      });
-    } catch (error) {
-      // Later run-boundary attempts retain their requested overlay for retry;
-      // `setActorModel` restores its caller's prior overlay when an immediate
-      // request fails. Either way, never leave an unverified selection durable.
-      if (selectionWritten) {
-        this.actors.setModelSelection(id, {
-          modelConfig: oldModelConfig,
-          modelClass: record.modelClass,
-          desiredModelConfig: newModelConfig,
-          desiredModelClass: boundClass,
-        });
+      if (!verified.modelConfig) {
+        throw new Error(
+          `Model class "${boundClass}" applied to thread ${id} no longer resolves: ${verified.modelClassError ?? "unknown reason"}`
+        );
       }
-      throw error;
+    } else if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
+      throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
+
+    const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+    this.onModelSet?.(id, appliedModelConfig, verified);
+
+    this.recordEvent({
+      kind: "actor_model_set",
+      actorId: id,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(appliedModelConfig)}${boundClass !== undefined ? ` (class "${boundClass}")` : ""}`,
+    });
   }
 
   /**

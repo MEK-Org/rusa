@@ -5851,32 +5851,6 @@ describe("ActorMesh", () => {
       await tick();
     });
 
-    it("rolls back an immediate update when live publication throws", () => {
-      const events: string[] = [];
-      const { mesh, registry } = setup({
-        onModelSet: () => {
-          throw new Error("live actor unavailable");
-        },
-        events: (event) => events.push(event.kind),
-      });
-      const worker = mesh.spawn({
-        charter: "worker",
-        parentId: "root",
-        modelConfig: { provider: "test-provider", model: "model-a" },
-        context: { type: "portable", mode: "ledger" },
-      });
-
-      expect(() =>
-        mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root")
-      ).toThrow("live actor unavailable");
-      expect(registry.get(worker)).toMatchObject({
-        modelConfig: [{ provider: "test-provider", model: "model-a" }],
-        desiredModelConfig: undefined,
-        desiredModelClass: undefined,
-      });
-      expect(events).not.toContain("actor_model_set");
-    });
-
     it("emits actor_model_set when an idle actor's pool is applied, ahead of the next run", async () => {
       const trace: string[] = [];
       const { mesh, tick } = setup({
