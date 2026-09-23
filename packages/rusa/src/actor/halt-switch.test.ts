@@ -142,24 +142,24 @@ describe("parseHaltCommand", () => {
 });
 
 describe("findUnpooledHaltModels", () => {
-  const pool = ["claude-opus-5", "claude-sonnet-5", "Gemini 3.7 Flash"];
+  const pool = ["claude-opus-5", "Claude-Sonnet-5", "gemini-2.5-flash"];
 
   it("finds the model no pool entry names and offers the closest entries", () => {
     expect(findUnpooledHaltModels(["claude-opus-5-hihg"], pool)).toEqual([
-      { model: "claude-opus-5-hihg", nearest: ["claude-opus-5", "claude-sonnet-5"] },
+      { model: "claude-opus-5-hihg", nearest: ["claude-opus-5", "Claude-Sonnet-5"] },
     ]);
   });
 
   it("matches a pool entry case-insensitively, because the parser lowercases what was typed", () => {
-    // `/halt provider:antigravity model:Gemini 3.7 Flash` arrives here lowercased;
-    // the pool keeps the provider's own casing, so a literal compare would warn
-    // about a model that is in fact held.
-    expect(findUnpooledHaltModels(["gemini 3.7 flash"], pool)).toEqual([]);
+    // `/halt provider:claude model:claude-sonnet-5` arrives here lowercased;
+    // a pool configured with mixed-casing like "Claude-Sonnet-5" would otherwise
+    // warn about a model that is in fact held.
+    expect(findUnpooledHaltModels(["claude-sonnet-5"], pool)).toEqual([]);
   });
 
   it("reports every unmatched model and keeps the operator's spelling", () => {
     expect(findUnpooledHaltModels(["claude-opus-5", "gpt-5-codex"], pool)).toEqual([
-      { model: "gpt-5-codex", nearest: ["claude-opus-5", "claude-sonnet-5"] },
+      { model: "gpt-5-codex", nearest: ["claude-opus-5", "Claude-Sonnet-5"] },
     ]);
   });
 

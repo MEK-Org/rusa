@@ -87,6 +87,7 @@ import {
   isKnownExperiment,
   STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
+import { normalizeProvider } from "./halt-switch.js";
 import { generateHandle } from "./handle-generator.js";
 import {
   DROPPED_MESSAGE_DETAIL,
@@ -4503,18 +4504,29 @@ export class ActorMesh {
    * either. Retired threads are excluded: their pools can never launch, and
    * naming one would tell an operator a hold bites where it cannot.
    *
+   * Cohesion: ActorMesh owns thread launch semantics and the staged-or-current
+   * lifecycle; keeping this query on the mesh encapsulates what "launchable"
+   * means rather than duplicating actor-record filtering in callers.
+   *
+   * Provider comparison is normalized (lowercased, alias-folded via {@link normalizeProvider})
+   * to match the canonical provider tokens from `/halt`, since pool configs may
+   * store unnormalized or alias keys (e.g. "agy", "Claude").
+   *
    * Read-only and advisory. `/halt provider:<p> model:<m>` deliberately accepts
    * a model no pool names — staging a hold before a rollout is legitimate — so
    * the chat ingestion site uses this only to warn that the scope it just
    * recorded matches nothing currently launchable.
    */
   pooledModelsForProvider(provider: string): string[] {
+    const target = normalizeProvider(provider);
     const models = new Set<string>();
     for (const record of this.actors.list()) {
       if (record.status === "retired") continue;
       for (const pool of [record.modelConfig, record.desiredModelConfig]) {
         for (const entry of pool ?? []) {
-          if (entry.provider === provider) models.add(entry.model);
+          if (entry.provider && normalizeProvider(entry.provider) === target) {
+            models.add(entry.model);
+          }
         }
       }
     }

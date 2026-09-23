@@ -3086,6 +3086,31 @@ describe("ActorMesh", () => {
     expect(mesh.pooledModelsForProvider("provider-b")).toEqual([]);
   });
 
+  it("pooledModelsForProvider normalizes provider names and aliases", () => {
+    const { mesh } = setup();
+    const portable = { type: "portable", mode: "ledger" } as const;
+    mesh.spawn({
+      charter: "agy-keyed",
+      parentId: "root",
+      modelConfig: { provider: "agy", model: "gemini-2.5-pro" },
+      context: portable,
+    });
+    mesh.spawn({
+      charter: "cased-provider",
+      parentId: "root",
+      modelConfig: { provider: "Claude", model: "claude-sonnet-5" },
+      context: portable,
+    });
+
+    // Alias folding: "agy" pool entry matches query for "antigravity" and vice versa.
+    expect(mesh.pooledModelsForProvider("antigravity")).toEqual(["gemini-2.5-pro"]);
+    expect(mesh.pooledModelsForProvider("agy")).toEqual(["gemini-2.5-pro"]);
+
+    // Case insensitivity: "Claude" pool entry matches query for "claude".
+    expect(mesh.pooledModelsForProvider("claude")).toEqual(["claude-sonnet-5"]);
+    expect(mesh.pooledModelsForProvider("CLAUDE")).toEqual(["claude-sonnet-5"]);
+  });
+
   it("calls onRetire for every node in a retired subtree", async () => {
     const retired: string[] = [];
     const { mesh, tick } = setup({ onRetire: (r) => retired.push(r.id) });
