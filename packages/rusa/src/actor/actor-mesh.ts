@@ -95,7 +95,11 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
-import type { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
+import {
+  type ResponsiveInterruptionVerdict,
+  type ShadowResponsiveInterruptionClassifier,
+  shadowReactionTarget,
+} from "./responsive-interruption.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
@@ -721,6 +725,12 @@ export interface ActorMeshOptions {
   /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   /**
+   * Posts a shadow verdict as a reaction on the chat message that arrived.
+   * Only ever called when `responsiveInterruption` is also supplied, so an
+   * install without the opt-in policy posts nothing even if this is wired.
+   */
+  reactToChatMessage?: (messageName: string, emoji: string) => Promise<void>;
+  /**
    * The allow-list of grantable capability names — typically the keys of the
    * wiring's grantable-MCP registry. A grant of any name outside this set is
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
@@ -872,6 +882,7 @@ export class ActorMesh {
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
@@ -947,6 +958,7 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.responsiveInterruption = opts.responsiveInterruption;
+    this.reactToChatMessage = opts.reactToChatMessage;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
     // any other grantable server — neither advertises nor grants it here.
@@ -1397,6 +1409,10 @@ export class ActorMesh {
             detail: "shadow",
             payload: JSON.stringify({ baseline, decision }),
           });
+          // The audit row is recorded first and independently: a chat space
+          // the bot cannot react in must not cost the measurement this whole
+          // feature exists to collect.
+          this.postShadowReaction(entry.payload, decision.outcome, incomingEntryId);
         })
         .catch(() => {
           // `evaluate` resolves rather than throws, so this arm covers only a
@@ -1405,6 +1421,34 @@ export class ActorMesh {
           // fire-and-forget promise cannot reject unhandled.
           this.log(`responsive interruption shadow observation failed for ${incomingEntryId}`);
         });
+    }
+  }
+
+  /**
+   * Show a shadow verdict where the operator already is, on the arriving chat
+   * message. Gated on the classifier's own presence rather than a separate
+   * knob, so the opt-in that turns the policy on is the same one that turns
+   * this on and a default install posts nothing.
+   */
+  private postShadowReaction(
+    payload: Readonly<Record<string, unknown>>,
+    outcome: ResponsiveInterruptionVerdict,
+    incomingEntryId: string
+  ): void {
+    const react = this.reactToChatMessage;
+    if (!react) return;
+    const target = shadowReactionTarget(payload, outcome);
+    if (!target) return;
+    // A reaction is an observation aid, never a delivery guarantee. Failures
+    // are logged rather than retried, and a host that throws synchronously is
+    // caught here too so it cannot surface as a lost observation upstream —
+    // the audit event already holds the verdict either way.
+    const failed = () =>
+      this.log(`responsive interruption shadow reaction failed for ${incomingEntryId}`);
+    try {
+      void react(target.messageName, target.emoji).catch(failed);
+    } catch {
+      failed();
     }
   }
 
