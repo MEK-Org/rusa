@@ -247,4 +247,31 @@ describe("FakeIssueClient", () => {
     expect(issue.state).toBe("closed");
     expect(issue.stateReason).toBe("not_planned");
   });
+
+  it("serves a PR's conversation comments through the issue-comments read", async () => {
+    const { tracker, client } = setup();
+    const pr = await tracker.openPr({ title: "PR", body: "" });
+    const comment = await tracker.addPrComment(pr.number, { body: "Ship it", author: "alice" });
+
+    await expect(client.listIssueComments(REPO, pr.number)).resolves.toEqual([
+      { id: comment.id, author: "alice", body: "Ship it", createdAt: comment.createdAt },
+    ]);
+  });
+
+  it("reads a PR through the issues read, as GitHub's issues API serves PRs", async () => {
+    const { tracker, client } = setup();
+    const pr = await tracker.openPr({
+      title: "Retry fetch",
+      body: "Adds a retry.",
+      author: "alice",
+    });
+
+    await expect(client.getIssue(REPO, pr.number)).resolves.toMatchObject({
+      number: pr.number,
+      title: "Retry fetch",
+      body: "Adds a retry.",
+      state: "open",
+      author: "alice",
+    });
+  });
 });

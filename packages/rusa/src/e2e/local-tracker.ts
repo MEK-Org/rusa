@@ -109,6 +109,9 @@ export class LocalTracker {
   private readonly prs = new Map<number, TrackerPr>();
   /** Reviews submitted against a PR, keyed by PR number. */
   private readonly reviews = new Map<number, TrackerReview[]>();
+  /** Conversation comments on a PR (GitHub files these as issue comments). */
+  private readonly prComments = new Map<number, TrackerComment[]>();
+
   /** Issues and PRs share one numbering space, as on GitHub. */
   private nextNumber = 1;
   private nextCommentId = 1;
@@ -357,6 +360,148 @@ export class LocalTracker {
     pr.state = "closed";
     pr.updatedAt = new Date().toISOString();
     return `fake-merge-sha-${prNumber}`;
+  }
+
+  // ── PR activity (scenario-facing; emit intake events) ─────────────────────
+  //
+  // The agent-facing PR paths above deliberately emit nothing. These are for a
+  // scenario playing the humans around a PR — opening one, discussing it,
+  // pushing to it, merging it — so each emits the webhook GitHub would send.
+
+  /**
+   * Open a PR and emit `pull_request`/`opened`. The head branch is recorded,
+   * not pushed; a scenario PR has no diff unless its branch exists in the
+   * remote.
+   */
+  async openPr(opts: {
+    title: string;
+    body: string;
+    author?: string;
+    headRef?: string;
+    draft?: boolean;
+  }): Promise<TrackerPr> {
+    const pr = this.upsertPrByHead({
+      headRef: opts.headRef ?? `e2e/seeded-${this.nextNumber}`,
+      title: opts.title,
+      body: opts.body,
+      draft: opts.draft,
+      author: opts.author ?? this.defaultAuthor,
+    });
+    await this.emitPr("opened", pr);
+    return pr;
+  }
+
+  /** Edit a PR's title and/or body and emit `pull_request`/`edited`. */
+  async editPr(prNumber: number, opts: { title?: string; body?: string }): Promise<TrackerPr> {
+    const pr = this.requirePr(prNumber);
+    if (opts.title !== undefined) pr.title = opts.title;
+    if (opts.body !== undefined) pr.body = opts.body;
+    pr.updatedAt = new Date().toISOString();
+    await this.emitPr("edited", pr);
+    return pr;
+  }
+
+  /** Record new commits on a PR's head and emit `pull_request`/`synchronize`. */
+  async pushToPr(prNumber: number): Promise<TrackerPr> {
+    const pr = this.requirePr(prNumber);
+    pr.updatedAt = new Date().toISOString();
+    await this.emitPr("synchronize", pr);
+    return pr;
+  }
+
+  /** Close (or merge) a PR and emit `pull_request`/`closed` with `merged`. */
+  async closePr(prNumber: number, opts: { merged?: boolean } = {}): Promise<TrackerPr> {
+    const pr = this.requirePr(prNumber);
+    pr.state = "closed";
+    pr.updatedAt = new Date().toISOString();
+    await this.emitPr("closed", pr, { merged: opts.merged === true });
+    return pr;
+  }
+
+  /**
+   * Comment on a PR's conversation and emit `issue_comment`/`created` — on
+   * GitHub a PR conversation comment is an issue comment whose issue carries a
+   * `pull_request` marker.
+   */
+  async addPrComment(
+    prNumber: number,
+    opts: { body: string; author?: string }
+  ): Promise<TrackerComment> {
+    const pr = this.requirePr(prNumber);
+    const comment: TrackerComment = {
+      id: this.nextCommentId++,
+      author: opts.author ?? this.defaultAuthor,
+      body: opts.body,
+      createdAt: new Date().toISOString(),
+    };
+    const list = this.prComments.get(prNumber) ?? [];
+    list.push(comment);
+    this.prComments.set(prNumber, list);
+    pr.updatedAt = comment.createdAt;
+    await this.emit("issue_comment", {
+      action: "created",
+      issue: {
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+        html_url: pr.htmlUrl,
+        state: pr.state,
+        user: { login: pr.author },
+        pull_request: { html_url: pr.htmlUrl },
+      },
+      comment: { id: comment.id, body: comment.body, user: { login: comment.author } },
+      repository: { full_name: this.repo },
+    });
+    return comment;
+  }
+
+  /** Conversation comments on a PR, oldest first. */
+  listPrComments(prNumber: number): TrackerComment[] {
+    return this.prComments.get(prNumber) ?? [];
+  }
+
+  /**
+   * Leave one inline review comment and emit
+   * `pull_request_review_comment`/`created`, as GitHub does per comment.
+   * Stored by {@link recordPrReviewComment}, like the orchestrator's own.
+   */
+  async addReviewComment(
+    prNumber: number,
+    opts: { body: string; path: string; line?: number; author?: string }
+  ): Promise<{ id: number; path: string; line: number | null; body: string }> {
+    const pr = this.requirePr(prNumber);
+    const author = opts.author ?? this.defaultAuthor;
+    const comment = this.recordPrReviewComment(prNumber, {
+      path: opts.path,
+      line: opts.line,
+      body: opts.body,
+      author,
+    });
+    await this.emit("pull_request_review_comment", {
+      action: "created",
+      comment: {
+        id: comment.id,
+        body: comment.body,
+        path: comment.path,
+        line: comment.line,
+        user: { login: author },
+      },
+      pull_request: this.toPrPayload(pr),
+      repository: { full_name: this.repo },
+    });
+    return comment;
+  }
+
+  private async emitPr(
+    action: string,
+    pr: TrackerPr,
+    extra: Record<string, unknown> = {}
+  ): Promise<void> {
+    await this.emit("pull_request", {
+      action,
+      pull_request: { ...this.toPrPayload(pr), state: pr.state, ...extra },
+      repository: { full_name: this.repo },
+    });
   }
 
   /**

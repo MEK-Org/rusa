@@ -4,6 +4,7 @@ import '../actor_display.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../util.dart';
 
 /// One rendering for any resolved reference.
 class ReferencePreview extends StatefulWidget {
@@ -16,7 +17,32 @@ class ReferencePreview extends StatefulWidget {
     this.isHuman,
     this.openLink = openInNewTab,
     this.action,
+    this.margin = const EdgeInsets.only(bottom: 10),
+    this.kindLabel,
+    this.detail,
+    this.summary,
+    this.showBody = true,
   });
+
+  /// Entity types this widget renders specifically rather than as a generic
+  /// title and body.
+  static const _renderedEntityTypes = {
+    'github_issue',
+    'github_pull_request',
+    'github_comment',
+    'github_review',
+    'gchat_message',
+    'slack_message',
+    'mesh_message',
+  };
+
+  /// Whether [reference] resolved to content this widget renders on its own
+  /// terms, so a surface citing it can show this card in place of its own
+  /// generic framing instead of nesting one inside the other.
+  static bool rendersOwnContent(ReferenceDto? reference) =>
+      reference != null &&
+      reference.isResolved &&
+      _renderedEntityTypes.contains(reference.entity?['type']);
 
   final ReferenceDto reference;
 
@@ -38,6 +64,24 @@ class ReferencePreview extends StatefulWidget {
 
   /// Optional action widget rendered at the trailing edge of the header row.
   final Widget? action;
+
+  /// Space around the card; flush when it stands in for a surrounding frame.
+  final EdgeInsetsGeometry margin;
+
+  /// Chip text in place of the reference's own kind — e.g. an inbox event's
+  /// `GITHUB PR COMMENT`, naming what happened to [reference].
+  final String? kindLabel;
+
+  /// Something within [reference] (a comment, a review) whose content is the
+  /// body instead, with [reference] kept as the title for context.
+  final ReferenceDto? detail;
+
+  /// A line shown as the body when there is no [detail] content to show.
+  final String? summary;
+
+  /// False for a card that is just its header — an event whose chip already
+  /// says everything, with no content worth a body.
+  final bool showBody;
 
   @override
   State<ReferencePreview> createState() => _ReferencePreviewState();
@@ -96,6 +140,20 @@ class _ReferencePreviewState extends State<ReferencePreview> {
       displayTitle = _genericTitle(widget.reference.scheme, entityType);
     }
 
+    final detail = widget.detail;
+    final detailBody = detail != null && detail.isResolved
+        ? _contentOf(detail)
+        : '';
+    if (detailBody.isNotEmpty) {
+      displayBody = detailBody;
+    } else if (widget.summary != null) {
+      displayBody = widget.summary!;
+    }
+    final linkUrl = [
+      detail?.url,
+      widget.reference.url,
+    ].firstWhere((u) => u != null && u.trim().isNotEmpty, orElse: () => null);
+
     final hasBody = displayBody.isNotEmpty;
     // The header's single label slot: the citer's own gloss for why this was
     // attached, when they gave one, else the resolved title of the thing
@@ -106,16 +164,24 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     final citedByHandle = widget.attachedBy != null
         ? _handle(widget.attachedBy!)
         : null;
-    final authorHandle = widget.reference.scheme == 'mesh'
-        ? meshParticipants
-        : (widget.reference.author != null &&
-                  widget.reference.author!.trim().isNotEmpty
-              ? widget.reference.author
-              : null);
+    // A mesh message's subtitle is when it was sent. Its title already names
+    // who wrote to whom — unless a citer's label took the header, in which
+    // case the participants still belong on the card.
+    final timestamp = widget.reference.timestamp;
+    final sentAt = timestamp != null && timestamp.isNotEmpty
+        ? formatTs(timestamp)
+        : null;
+    final meshSubtitle = [
+      if (headerLabel != displayTitle) meshParticipants,
+      sentAt,
+    ].whereType<String>().join(' · ');
+    final subtitle = widget.reference.scheme == 'mesh'
+        ? (meshSubtitle.isEmpty ? null : meshSubtitle)
+        : _byline(detail != null ? detail.author : widget.reference.author);
 
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 10),
+      margin: widget.margin,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: MeshColors.bgTertiary,
@@ -128,12 +194,14 @@ class _ReferencePreviewState extends State<ReferencePreview> {
         children: [
           Row(
             children: [
-              _SchemeChip(widget.reference.scheme),
-              if (widget.reference.url != null &&
-                  widget.reference.url!.trim().isNotEmpty) ...[
+              ReferenceKindChip(
+                widget.kindLabel ??
+                    referenceKindLabel(widget.reference.scheme, entityType),
+              ),
+              if (linkUrl != null) ...[
                 const SizedBox(width: 4),
                 IconButton(
-                  onPressed: () => widget.openLink(widget.reference.url!),
+                  onPressed: () => widget.openLink(linkUrl),
                   icon: const Icon(Icons.open_in_new, size: 14),
                   color: MeshColors.accent,
                   padding: EdgeInsets.zero,
@@ -174,83 +242,102 @@ class _ReferencePreviewState extends State<ReferencePreview> {
               ],
             ],
           ),
-          if (authorHandle != null) ...[
+          if (subtitle != null) ...[
             const SizedBox(height: 6),
             Text(
-              widget.reference.scheme == 'mesh'
-                  ? authorHandle
-                  : 'by $authorHandle',
+              subtitle,
               style: const TextStyle(
                 color: MeshColors.textMuted,
                 fontSize: 10.5,
               ),
             ),
           ],
-          const SizedBox(height: 8),
-          if (hasBody)
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final style = const TextStyle(
-                      color: Color(0xFFCBD5E1),
-                      fontSize: 12,
-                      height: 1.45,
-                    );
-                    final painter = TextPainter(
-                      text: TextSpan(text: displayBody, style: style),
-                      maxLines: 5,
-                      textDirection: Directionality.of(context),
-                      textScaler: MediaQuery.textScalerOf(context),
-                      locale: Localizations.maybeLocaleOf(context),
-                    )..layout(maxWidth: constraints.maxWidth);
-                    final overflows = painter.didExceedMaxLines;
-                    if (overflows != _overflows) {
-                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                        if (mounted) setState(() => _overflows = overflows);
-                      });
-                    }
+          if (widget.showBody) ...[
+            const SizedBox(height: 8),
+            if (hasBody)
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final style = const TextStyle(
+                        color: Color(0xFFCBD5E1),
+                        fontSize: 12,
+                        height: 1.45,
+                      );
+                      final painter = TextPainter(
+                        text: TextSpan(text: displayBody, style: style),
+                        maxLines: 5,
+                        textDirection: Directionality.of(context),
+                        textScaler: MediaQuery.textScalerOf(context),
+                        locale: Localizations.maybeLocaleOf(context),
+                      )..layout(maxWidth: constraints.maxWidth);
+                      final overflows = painter.didExceedMaxLines;
+                      if (overflows != _overflows) {
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (mounted) setState(() => _overflows = overflows);
+                        });
+                      }
 
-                    return _expanded || !overflows
-                        ? SelectableText(displayBody, style: style)
-                        : Text(
-                            displayBody,
-                            maxLines: 5,
-                            overflow: TextOverflow.ellipsis,
-                            style: style,
-                          );
-                  },
-                ),
-                if (_overflows) ...[
-                  const SizedBox(height: 6),
-                  InkWell(
-                    onTap: () => setState(() => _expanded = !_expanded),
-                    child: Text(
-                      _expanded ? 'Show less' : 'Show more',
-                      style: const TextStyle(
-                        color: MeshColors.accent,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w500,
+                      return _expanded || !overflows
+                          ? SelectableText(displayBody, style: style)
+                          : Text(
+                              displayBody,
+                              maxLines: 5,
+                              overflow: TextOverflow.ellipsis,
+                              style: style,
+                            );
+                    },
+                  ),
+                  if (_overflows) ...[
+                    const SizedBox(height: 6),
+                    InkWell(
+                      onTap: () => setState(() => _expanded = !_expanded),
+                      child: Text(
+                        _expanded ? 'Show less' : 'Show more',
+                        style: const TextStyle(
+                          color: MeshColors.accent,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                     ),
-                  ),
+                  ],
                 ],
-              ],
-            )
-          else
-            Text(
-              widget.reference.unavailable ?? 'No content.',
-              style: const TextStyle(
-                color: MeshColors.textMuted,
-                fontSize: 11.5,
-                fontStyle: FontStyle.italic,
+              )
+            else
+              Text(
+                widget.reference.unavailable ?? 'No content.',
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 11.5,
+                  fontStyle: FontStyle.italic,
+                ),
               ),
-            ),
+          ],
         ],
       ),
     );
   }
+}
+
+String? _byline(String? author) =>
+    author != null && author.trim().isNotEmpty ? 'by $author' : null;
+
+/// What a comment, review or message actually says, for showing a [detail]
+/// reference's content under its parent's title.
+String _contentOf(ReferenceDto reference) {
+  final entity = reference.entity;
+  final text = switch (entity?['type']) {
+    'github_comment' => entity?['body'] as String?,
+    'github_review' =>
+      ((entity?['body'] as String?)?.trim().isNotEmpty ?? false)
+          ? entity!['body'] as String
+          : _reviewVerdictText(entity?['state'] as String?),
+    'gchat_message' || 'slack_message' => entity?['contents'] as String?,
+    _ => reference.body,
+  };
+  return text?.trim() ?? '';
 }
 
 /// A human-safe, generic label for a reference whose title is otherwise the
@@ -275,7 +362,7 @@ String _genericTitle(String scheme, String? entityType) => switch (entityType) {
 /// An approval/rejection with no written comment still has content: the
 /// verdict itself. Returns null for an unrecognized or missing state, so the
 /// caller's "no content" fallback still applies there.
-String? _reviewVerdictText(String? state) => switch (state) {
+String? _reviewVerdictText(String? state) => switch (state?.toUpperCase()) {
   'APPROVED' => 'Approved.',
   'CHANGES_REQUESTED' => 'Changes requested.',
   'COMMENTED' => 'Commented, no summary.',
@@ -283,9 +370,26 @@ String? _reviewVerdictText(String? state) => switch (state) {
   _ => null,
 };
 
-class _SchemeChip extends StatelessWidget {
-  const _SchemeChip(this.scheme);
-  final String scheme;
+/// What a reference is, for its card's chip: the kind of thing where the
+/// entity says, e.g. `MESH MESSAGE` or `GITHUB PR`, else just its source.
+String referenceKindLabel(String scheme, String? entityType) =>
+    switch (entityType) {
+      'mesh_message' => 'MESH MESSAGE',
+      'github_issue' => 'GITHUB ISSUE',
+      'github_pull_request' => 'GITHUB PR',
+      'github_comment' => 'GITHUB COMMENT',
+      'github_review' => 'GITHUB REVIEW',
+      'gchat_message' => 'GCHAT MESSAGE',
+      'gchat_space' => 'GCHAT SPACE',
+      'slack_message' => 'SLACK MESSAGE',
+      'slack_channel' => 'SLACK CHANNEL',
+      _ => scheme.toUpperCase(),
+    };
+
+/// The chip that opens a reference card's header, naming what it cites.
+class ReferenceKindChip extends StatelessWidget {
+  const ReferenceKindChip(this.label, {super.key});
+  final String label;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -296,7 +400,7 @@ class _SchemeChip extends StatelessWidget {
       border: Border.all(color: MeshColors.border),
     ),
     child: Text(
-      scheme.toUpperCase(),
+      label,
       style: const TextStyle(
         color: MeshColors.accent,
         fontSize: 9.5,

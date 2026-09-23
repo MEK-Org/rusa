@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
+import '../actor_display.dart';
 import '../breakpoints.dart';
 import '../models.dart';
 import '../principals.dart';
@@ -33,6 +34,10 @@ class _OverviewTabState extends State<OverviewTab> {
   String? _statusFilter;
   late Future<Map<String, dynamic>> _humanQueueFuture;
   StreamSubscription<String?>? _viewerPrincipalSub;
+
+  /// Re-renders queued cards' relative "Runs in ~N min" labels as time passes
+  /// between snapshots; idle while nothing is queued.
+  Timer? _startLabelTick;
 
   /// The ids this queue is "mine" for: the durable user principal the server
   /// resolved plus the legacy alias, so a database that is only partly
@@ -110,11 +115,17 @@ class _OverviewTabState extends State<OverviewTab> {
         .listen((_) {
           if (mounted) _refreshHumanQueue();
         });
+    _startLabelTick = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted && widget.store.actorStates.value.queuedActors.isNotEmpty) {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
     _viewerPrincipalSub?.cancel();
+    _startLabelTick?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -660,6 +671,7 @@ class _OverviewTabState extends State<OverviewTab> {
       store: widget.store,
       blockers: blockers,
       onSelectView: widget.onSelectView,
+      showKindChip: false,
       onMutated: _refreshHumanQueue,
       contentPadding: const EdgeInsets.all(12),
       showReorder: isReadyList && items.length > 1,
@@ -760,18 +772,29 @@ class _OverviewTabState extends State<OverviewTab> {
                   style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                 )
               else
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final itemWidth = constraints.maxWidth < 600
-                        ? constraints.maxWidth
-                        : (constraints.maxWidth - 12) / 2;
-                    return Wrap(
-                      spacing: 12,
-                      runSpacing: 12,
-                      children: [
-                        for (final t in runningThreads)
-                          _buildActorContextCard(t, width: itemWidth),
-                      ],
+                StreamBuilder<Map<String, RunModelSelection>>(
+                  stream: widget.store.runSelections,
+                  initialData: widget.store.runSelections.value,
+                  builder: (context, selectionSnap) {
+                    final selections = selectionSnap.data ?? const {};
+                    return LayoutBuilder(
+                      builder: (context, constraints) {
+                        final itemWidth = constraints.maxWidth < 600
+                            ? constraints.maxWidth
+                            : (constraints.maxWidth - 12) / 2;
+                        return Wrap(
+                          spacing: 12,
+                          runSpacing: 12,
+                          children: [
+                            for (final t in runningThreads)
+                              _buildActorContextCard(
+                                t,
+                                width: itemWidth,
+                                selection: selections[t.id],
+                              ),
+                          ],
+                        );
+                      },
                     );
                   },
                 ),
@@ -833,7 +856,8 @@ class _OverviewTabState extends State<OverviewTab> {
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _buildActorContextCard(
                       actor,
-                      queueDetail: _queueWaitDetail(actor),
+                      queued: true,
+                      selection: actor.reservedSelection,
                     ),
                   ),
             ],
@@ -847,12 +871,129 @@ class _OverviewTabState extends State<OverviewTab> {
   /// The header remains the actor-navigation target; the optional obligation
   /// row keeps its own Work-tab navigation rather than being swallowed by the
   /// actor tap target.
+  ///
+  /// A [queued] card says when it expects to run under its title and, when
+  /// wide enough, lays its inbox item out as a column beside the identity, so
+  /// a long queue scans as one row per actor; narrower cards keep it below.
+  ///
+  /// [selection] is the run's model — started, or reserved while queued — and
+  /// follows the handle as the mechanical signature does:
+  /// `handle (model, effort)`.
   Widget _buildActorContextCard(
     ActorViewState actor, {
     double? width,
-    String? queueDetail,
+    bool queued = false,
+    RunModelSelection? selection,
   }) {
     final selectedObligation = actor.selectedObligation;
+    final startLabel = queued ? _queueStartLabel(actor) : null;
+    final header = InkWell(
+      onTap: () => _navigateToActor(actor.id),
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          // The avatar heads the identity cluster rather than floating at the
+          // middle of its three lines.
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ActorAvatarWithStatus(
+              id: actor.id,
+              state: actor.dotState,
+              size: 40,
+              retired: actor.isRetired,
+              store: widget.store,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text.rich(
+                    TextSpan(
+                      text: actor.handle,
+                      children: [
+                        if (selection != null)
+                          TextSpan(
+                            text: ' (${selection.label})',
+                            style: const TextStyle(
+                              color: MeshColors.textSecondary,
+                              fontWeight: FontWeight.w400,
+                            ),
+                          ),
+                      ],
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: kMonoStyle.copyWith(
+                      color: MeshColors.textPrimary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    actor.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: MeshColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+                  if (startLabel != null) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      startLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.statusIdle,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    final Widget? focusContent = selectedObligation != null
+        ? ObligationRow(
+            obligation: selectedObligation,
+            store: widget.store,
+            showActions: false,
+            contentPadding: const EdgeInsets.all(12),
+            onSelectView: widget.onSelectView,
+          )
+        : actor.selectedInboxItem != null
+        ? InboxItemRow(
+            entry: actor.selectedInboxItem!,
+            moreCount: actor.moreInboxItemsCount,
+            store: widget.store,
+            onSelectView: widget.onSelectView,
+          )
+        : null;
+    // An inbox item that renders as its reference's own card needs no frame.
+    final framed =
+        selectedObligation != null ||
+        actor.selectedInboxItem == null ||
+        !InboxItemRow.rendersOwnFrame(actor.selectedInboxItem!);
+    final focus = focusContent == null
+        ? null
+        : !framed
+        ? focusContent
+        : Container(
+            decoration: BoxDecoration(
+              color: MeshColors.bgSecondary,
+              borderRadius: BorderRadius.circular(5),
+              border: Border.all(color: MeshColors.border),
+            ),
+            child: focusContent,
+          );
     return Container(
       width: width,
       decoration: BoxDecoration(
@@ -860,129 +1001,39 @@ class _OverviewTabState extends State<OverviewTab> {
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: MeshColors.border),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          InkWell(
-            onTap: () => _navigateToActor(actor.id),
-            borderRadius: BorderRadius.circular(6),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final identity = Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          actor.handle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: kMonoStyle.copyWith(
-                            color: MeshColors.textPrimary,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 13,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          actor.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: MeshColors.textSecondary,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                  final avatar = ActorAvatarWithStatus(
-                    id: actor.id,
-                    state: actor.dotState,
-                    size: 40,
-                    retired: actor.isRetired,
-                    store: widget.store,
-                  );
-                  final details = queueDetail == null
-                      ? null
-                      : Text(
-                          queueDetail,
-                          textAlign: TextAlign.right,
-                          style: kMonoStyle.copyWith(
-                            color: MeshColors.textSecondary,
-                            fontSize: 11,
-                          ),
-                        );
-                  if (constraints.maxWidth < 430 && details != null) {
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            avatar,
-                            const SizedBox(width: 10),
-                            identity,
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        Align(alignment: Alignment.centerRight, child: details),
-                      ],
-                    );
-                  }
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      avatar,
-                      const SizedBox(width: 10),
-                      identity,
-                      if (details != null) ...[
-                        const SizedBox(width: 12),
-                        Flexible(child: details),
-                      ],
-                    ],
-                  );
-                },
-              ),
-            ),
-          ),
-          if (selectedObligation != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: Container(
-                decoration: BoxDecoration(
-                  color: MeshColors.bgSecondary,
-                  borderRadius: BorderRadius.circular(5),
-                  border: Border.all(color: MeshColors.border),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (queued &&
+              focus != null &&
+              constraints.maxWidth >= _kQueuedFocusColumnMinWidth) {
+            // Top-aligned: a tall inbox card must not float the actor down to
+            // its middle.
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: header),
+                Expanded(
+                  flex: 3,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(0, 12, 12, 12),
+                    child: focus,
+                  ),
                 ),
-                child: ObligationRow(
-                  obligation: selectedObligation,
-                  store: widget.store,
-                  showActions: false,
-                  contentPadding: const EdgeInsets.all(12),
-                  onSelectView: widget.onSelectView,
+              ],
+            );
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              header,
+              if (focus != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  child: focus,
                 ),
-              ),
-            )
-          else if (actor.selectedInboxItem != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: Container(
-                decoration: BoxDecoration(
-                  color: MeshColors.bgSecondary,
-                  borderRadius: BorderRadius.circular(5),
-                  border: Border.all(color: MeshColors.border),
-                ),
-                child: InboxItemRow(
-                  entry: actor.selectedInboxItem!,
-                  moreCount: actor.moreInboxItemsCount,
-                  store: widget.store,
-                  onSelectView: widget.onSelectView,
-                ),
-              ),
-            ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }
@@ -1174,6 +1225,20 @@ class _OverviewTabState extends State<OverviewTab> {
       message,
       style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
     );
+    final handle = Text(
+      actorDisplayLabel(
+        actorId,
+        (id) => widget.store.actor(id)?.handle,
+        widget.store.isHuman,
+      ),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: kMonoStyle.copyWith(
+        color: MeshColors.textPrimary,
+        fontSize: 12.5,
+        fontWeight: FontWeight.w700,
+      ),
+    );
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -1189,6 +1254,8 @@ class _OverviewTabState extends State<OverviewTab> {
                 Row(
                   children: [
                     ActorAvatar(id: actorId, size: 24, store: widget.store),
+                    const SizedBox(width: 8),
+                    Flexible(child: handle),
                     const SizedBox(width: 8),
                     pill,
                     const SizedBox(width: 8),
@@ -1212,6 +1279,15 @@ class _OverviewTabState extends State<OverviewTab> {
               const SizedBox(width: 8),
               ActorAvatar(id: actorId, size: 28, store: widget.store),
               const SizedBox(width: 8),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 180),
+                child: Padding(
+                  // Level with the pill's text beside the 28px avatar.
+                  padding: const EdgeInsets.only(top: 3),
+                  child: handle,
+                ),
+              ),
+              const SizedBox(width: 8),
               pill,
               const SizedBox(width: 12),
               Expanded(child: messageText),
@@ -1222,42 +1298,29 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Names the gate a queued card is waiting behind using only what the
-  /// pacer snapshot already carries: a null estimate at lane position 0 is
-  /// the staged head holding for a mesh concurrency slot, a null estimate
-  /// further back is a request behind that head, and any other estimate is
-  /// the lane's pacing clock. A zero interval has no pacing gap to quote.
-  String _queueWaitDetail(ActorViewState actor) {
-    final interval = actor.pacingIntervalMs ?? 0;
-    final pacing = interval > 0
-        ? 'Provider pacing every ${_formatPacingInterval(interval)}'
-        : null;
-    if (actor.estimatedStartAt != null) {
-      final estimate = 'Estimated start ${formatTs(actor.estimatedStartAt!)}';
-      return pacing == null ? estimate : '$pacing; $estimate';
+  /// When a queued card expects to run, in relative terms: the pacer's
+  /// estimate as "Runs in ~8 min", or — when it can't honestly quote one —
+  /// what the run is waiting on. A null estimate at lane position 0 is the
+  /// staged head holding for a mesh concurrency slot; further back, a request
+  /// behind that head.
+  String _queueStartLabel(ActorViewState actor) {
+    final estimate = actor.estimatedStartAt;
+    if (estimate != null) {
+      final startsIn = formatStartsIn(estimate);
+      return startsIn == null ? 'Starting shortly' : 'Runs $startsIn';
     }
     final position = actor.queuePosition;
-    if (position == 0) {
-      return pacing == null
-          ? 'Waiting for mesh concurrency.'
-          : 'Waiting for mesh concurrency; ${pacing.toLowerCase()}.';
-    }
+    if (position == 0) return 'Runs when a slot frees up';
     if (position != null) {
-      final behind =
-          'Lane position ${position + 1}; behind a request waiting for mesh '
-          'concurrency';
-      return pacing == null ? '$behind.' : '$behind; ${pacing.toLowerCase()}.';
+      return position == 1
+          ? 'Runs after 1 queued run'
+          : 'Runs after $position queued runs';
     }
-    return actor.waitingOn ?? 'Queued behind another provider request.';
+    return actor.waitingOn ?? 'Waiting for a provider slot';
   }
 }
 
-String _formatPacingInterval(int milliseconds) {
-  if (milliseconds < 60 * 1000) {
-    return '${(milliseconds / 1000).toStringAsFixed(1)}s';
-  }
-  if (milliseconds < 60 * 60 * 1000) {
-    return '${(milliseconds / (60 * 1000)).toStringAsFixed(1)}m';
-  }
-  return '${(milliseconds / (60 * 60 * 1000)).toStringAsFixed(1)}h';
-}
+/// Narrowest queued card that lays its inbox item out beside the identity.
+/// The identity takes a quarter and the inbox item three quarters, so this
+/// keeps the identity at least 280px — room for a handle, model, and title.
+const double _kQueuedFocusColumnMinWidth = 1120;

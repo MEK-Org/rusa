@@ -39,6 +39,9 @@ ThreadDto makeThread(
   int? moreInboxItemsCount,
   String? voiceName,
   int? pacingIntervalMs,
+  String? selectedProvider,
+  String? selectedModel,
+  String? selectedEffort,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -70,6 +73,9 @@ ThreadDto makeThread(
       ? null
       : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
   pacingIntervalMs: pacingIntervalMs,
+  selectedProvider: selectedProvider,
+  selectedModel: selectedModel,
+  selectedEffort: selectedEffort,
 );
 
 InboxEntryDto makeInboxEntry(
@@ -390,6 +396,17 @@ class FakeApi extends DashboardApi {
     return p;
   }
 
+  /// Newest `run_start` per actor for [fetchLatestRunStart]; kept apart from
+  /// [eventPages] so run-model lookups never consume a test's event pages.
+  final latestRunStarts = <String, MeshEvent>{};
+  final runStartLookups = <String>[];
+
+  @override
+  Future<MeshEvent?> fetchLatestRunStart(String actorId) async {
+    runStartLookups.add(actorId);
+    return latestRunStarts[actorId];
+  }
+
   @override
   Future<ChatPage> fetchChat({
     required List<String> actors,
@@ -639,6 +656,8 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  int obligationDetailCallCount = 0;
+
   @override
   Future<ObligationDetailSnapshot> fetchObligationDetail(
     String id, {
@@ -647,6 +666,7 @@ class FakeApi extends DashboardApi {
     int? completionsOffset,
     int? limit,
   }) async {
+    obligationDetailCallCount++;
     final byOffset = obligationDetailByOffset;
     if (byOffset != null) {
       return byOffset(id, completionsOffset);

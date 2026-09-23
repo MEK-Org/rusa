@@ -167,6 +167,7 @@ export interface DashboardDataDeps {
 
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
+import { githubInboxEventReference } from "../github/inbox-notification.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -234,6 +235,11 @@ function charterPreview(charter: string): string {
 
 type ResolvedInboxEntry = InboxEntry & {
   reference?: ResolvedReference;
+  /**
+   * The comment or review the event is about, nested under `reference` (the
+   * issue or PR it was routed by), when the event names one.
+   */
+  eventReference?: ResolvedReference;
 };
 type ResolvedInboxPage = Omit<InboxPage, "entries"> & { entries: ResolvedInboxEntry[] };
 
@@ -561,12 +567,20 @@ async function resolveInboxPage(
         // Same cache/resolver an obligation's cited artifacts use, so a
         // GitHub-sourced inbox entry gets the identical rich preview and
         // "open in new tab" link rather than a second rendering path.
-        const reference = deps.referenceCache
-          ? await deps.referenceCache
-              .get(entry.source, deps)
-              .catch(() => resolveReferenceSync(entry.source, { meshChat: deps.meshChat }))
-          : resolveReferenceSync(entry.source, { meshChat: deps.meshChat });
-        return { ...entry, reference };
+        const resolve = (ref: string) =>
+          deps.referenceCache
+            ? deps.referenceCache
+                .get(ref, deps)
+                .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+            : resolveReferenceSync(ref, { meshChat: deps.meshChat });
+        // A comment or review is resolved alongside the issue/PR it arrived
+        // through, so the card can show what was said and what it was said on.
+        const eventRef = githubInboxEventReference(entry.source, entry.payload);
+        const [reference, eventReference] = await Promise.all([
+          resolve(entry.source),
+          eventRef ? resolve(eventRef) : undefined,
+        ]);
+        return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
       }
       return entry;
     })

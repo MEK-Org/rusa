@@ -3,9 +3,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
-import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
+import 'package:rusa_dashboard/widgets/inbox_item_row.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
@@ -125,7 +125,52 @@ void main() {
 
       expect(tester.takeException(), isNull);
       expect(find.textContaining('A long yield summary note'), findsOneWidget);
+      expect(find.text('$actor-handle'), findsOneWidget);
 
+      await store.dispose();
+    });
+  });
+
+  testWidgets('yield rows name the actor, never a raw id', (tester) async {
+    await tester.runAsync(() async {
+      const known = '11111111-1111-4111-8111-111111111111';
+      const gone = '22222222-2222-4222-8222-222222222222';
+      final api = FakeApi()
+        ..threadsResult = [makeThread(known)]
+        ..eventPages = [
+          EventPage(
+            events: [
+              makeEvent(
+                'e1',
+                'run_yielded',
+                actor: known,
+                detail: 'complete',
+                body: 'Known note',
+              ),
+              makeEvent(
+                'e2',
+                'run_yielded',
+                actor: gone,
+                detail: 'blocked',
+                body: 'Gone note',
+              ),
+            ],
+            nextCursor: null,
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      await tester.binding.setSurfaceSize(const Size(1500, 1400));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(_app(store));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('$known-handle'), findsOneWidget);
+      expect(find.text('Unknown actor'), findsOneWidget);
+      expect(find.text(gone), findsNothing);
+      expect(tester.takeException(), isNull);
       await store.dispose();
     });
   });
@@ -570,37 +615,13 @@ void main() {
         await tester.pump();
 
         expect(find.text('5 queued'), findsOneWidget);
-        expect(
-          find.text(
-            'Provider pacing every 10.0h; '
-            'Estimated start ${formatTs('2026-01-01T00:00:10.000Z')}',
-          ),
-          findsOneWidget,
-        );
-        expect(
-          find.text(
-            'Provider pacing every 10.0h; '
-            'Estimated start ${formatTs('2026-01-01T00:00:30.000Z')}',
-          ),
-          findsOneWidget,
-        );
-        expect(
-          find.text('Estimated start ${formatTs('2026-01-01T00:00:20.000Z')}'),
-          findsOneWidget,
-        );
-        expect(
-          find.text(
-            'Waiting for mesh concurrency; provider pacing every 10.0h.',
-          ),
-          findsOneWidget,
-        );
-        expect(
-          find.text(
-            'Lane position 2; behind a request waiting for mesh concurrency; '
-            'provider pacing every 10.0h.',
-          ),
-          findsOneWidget,
-        );
+        // Each card says when it runs in relative terms; these estimates have
+        // already passed, so those runs are due.
+        expect(find.text('Starting shortly'), findsNWidgets(3));
+        expect(find.text('Runs when a slot frees up'), findsOneWidget);
+        expect(find.text('Runs after 1 queued run'), findsOneWidget);
+        // The queued list no longer quotes provider pacing.
+        expect(find.textContaining('pacing every'), findsNothing);
 
         // Rendered in estimated run order: early, deferred, late, then the
         // unknown-ETA entries by lane position.
@@ -875,4 +896,282 @@ void main() {
       });
     },
   );
+
+  group('queued actor cards', () {
+    const reservedHandle = 'reserved-handle (synthetic-reserved-model, high)';
+
+    Future<DashboardStore> bootQueued() async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 's', revision: 0)
+        ..threadsResult = [
+          makeThread('root', runState: RunState.idle),
+          makeThread(
+            'reserved',
+            parent: 'root',
+            title: 'Reserved actor',
+            runState: RunState.queued,
+            queuePosition: 0,
+            selectedProvider: 'synthetic-alias',
+            selectedModel: 'synthetic-reserved-model',
+            selectedEffort: 'high',
+            selectedInboxItem: makeInboxEntry(
+              'item-reserved',
+              actorId: 'reserved',
+              content: 'Queued inbox content',
+            ),
+          ),
+          makeThread(
+            'unreserved',
+            parent: 'root',
+            title: 'Unreserved actor',
+            runState: RunState.queued,
+            queuePosition: 1,
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      return store;
+    }
+
+    testWidgets(
+      'wide cards put the inbox item in a third column beside the wait estimate',
+      (tester) async {
+        await tester.runAsync(() async {
+          final store = await bootQueued();
+          await tester.binding.setSurfaceSize(const Size(1500, 1400));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          final handle = tester.getRect(find.text(reservedHandle));
+          final title = tester.getRect(find.text('Reserved actor'));
+          final start = tester.getRect(find.text('Runs when a slot frees up'));
+          final inbox = tester.getRect(find.text('Queued inbox content'));
+          // The start estimate sits under the title, in the identity column.
+          expect(start.top, greaterThanOrEqualTo(title.bottom));
+          expect(start.left, handle.left);
+          expect(inbox.left, greaterThan(start.right));
+          // Same row: the inbox column spans the header's line rather than
+          // starting below it.
+          final inboxBox = tester.getRect(find.byType(InboxItemRow));
+          expect(inboxBox.top, lessThan(handle.center.dy));
+          expect(inboxBox.bottom, greaterThan(handle.center.dy));
+          // The actor sits at the top of the card, level with the inbox card.
+          expect(handle.top, closeTo(inboxBox.top, 4));
+          // The avatar heads the identity cluster, level with the handle.
+          final header = find
+              .ancestor(
+                of: find.text(reservedHandle),
+                matching: find.byType(InkWell),
+              )
+              .first;
+          final avatar = find.descendant(
+            of: header,
+            matching: find.byType(ActorAvatarWithStatus),
+          );
+          expect(
+            tester.getRect(avatar).top,
+            closeTo(tester.getRect(header).top + 12, 2),
+          );
+          // The identity takes a quarter of the card, the inbox three quarters.
+          expect(
+            inboxBox.width,
+            greaterThan(3 * (inboxBox.left - handle.left)),
+          );
+          expect(tester.takeException(), isNull);
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets('narrow cards keep the inbox item below the header', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final store = await bootQueued();
+        await tester.binding.setSurfaceSize(const Size(600, 1400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        final handle = tester.getRect(find.text(reservedHandle));
+        final inbox = tester.getRect(find.text('Queued inbox content'));
+        expect(inbox.top, greaterThan(handle.bottom));
+        expect(tester.takeException(), isNull);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('quotes a future estimate relative to now', (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'soon',
+              parent: 'root',
+              runState: RunState.queued,
+              estimatedStartAt: DateTime.now()
+                  .add(const Duration(minutes: 8, seconds: 10))
+                  .toUtc()
+                  .toIso8601String(),
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Runs in ~8 min'), findsOneWidget);
+        await store.dispose();
+      });
+    });
+
+    testWidgets(
+      'names the reserved model after the handle only when one is reserved',
+      (tester) async {
+        await tester.runAsync(() async {
+          final store = await bootQueued();
+          await tester.binding.setSurfaceSize(const Size(1500, 1400));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          expect(find.text(reservedHandle), findsOneWidget);
+          expect(find.text('unreserved-handle'), findsOneWidget);
+          await store.dispose();
+        });
+      },
+    );
+  });
+
+  testWidgets(
+    'an inbox item with its own reference card is not framed or labelled again',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'queued',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 0,
+              moreInboxItemsCount: 2,
+              selectedInboxItem: makeInboxEntry(
+                'item-mesh',
+                actorId: 'queued',
+                source: 'mesh:root',
+                type: 'mesh.message',
+                priority: 'responsive',
+                reference: const ReferenceDto(
+                  ref: 'mesh:messages/m-1',
+                  scheme: 'mesh',
+                  title: 'root → queued',
+                  body: 'Mesh message body',
+                  timestamp: '2026-09-01T10:00:00.000Z',
+                  entity: {
+                    'type': 'mesh_message',
+                    'senderId': 'root',
+                    'recipientId': 'queued',
+                  },
+                ),
+              ),
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.binding.setSurfaceSize(const Size(1500, 1400));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Mesh message body'), findsOneWidget);
+        expect(find.byType(InboxChip), findsNothing);
+        expect(find.text('mesh:root'), findsNothing);
+        // The row's badges move into the reference card's header.
+        expect(find.text('RESPONSIVE'), findsOneWidget);
+        expect(find.text('(+2 more)'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+        await store.dispose();
+      });
+    },
+  );
+
+  group('running actor cards', () {
+    testWidgets(
+      'name the run\'s model after the handle from its run_start, then follow live starts',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..runtimeCursor = const RuntimeCursor(streamId: 's', revision: 0)
+            ..threadsResult = [
+              makeThread('root', runState: RunState.idle),
+              makeThread(
+                'running',
+                parent: 'root',
+                title: 'Running actor',
+                runState: RunState.running,
+              ),
+              makeThread(
+                'effortless',
+                parent: 'root',
+                title: 'Effortless actor',
+                runState: RunState.running,
+              ),
+            ]
+            ..latestRunStarts['running'] = makeEvent(
+              'start-1',
+              'run_start',
+              actor: 'running',
+              payload:
+                  '{"provider":"synthetic-alias","model":"synthetic-run-model","effort":"xhigh"}',
+            )
+            ..latestRunStarts['effortless'] = makeEvent(
+              'start-2',
+              'run_start',
+              actor: 'effortless',
+              payload: '{"provider":"synthetic-alias","model":"bare-model"}',
+            );
+          final stream = FakeStream();
+          final store = DashboardStore(api: api, stream: stream);
+          await store.init();
+          await tester.binding.setSurfaceSize(const Size(1500, 1400));
+          addTearDown(() => tester.binding.setSurfaceSize(null));
+          await tester.pumpWidget(_app(store));
+          await tester.pump();
+          await tester.pump();
+
+          expect(
+            find.text('running-handle (synthetic-run-model, xhigh)'),
+            findsOneWidget,
+          );
+          expect(find.text('effortless-handle (bare-model)'), findsOneWidget);
+
+          stream.meshCtrl.add(
+            makeEvent(
+              'start-3',
+              'run_start',
+              actor: 'running',
+              payload:
+                  '{"provider":"synthetic-alias","model":"synthetic-fallback","effort":"low"}',
+            ),
+          );
+          await tester.pump();
+          await tester.pump();
+          expect(
+            find.text('running-handle (synthetic-fallback, low)'),
+            findsOneWidget,
+          );
+          expect(tester.takeException(), isNull);
+          await store.dispose();
+        });
+      },
+    );
+  });
 }

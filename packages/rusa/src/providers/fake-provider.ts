@@ -12,6 +12,39 @@ interface ScriptedToolCall {
 
 interface ScriptedRunResult extends Partial<RunResult> {
   toolCalls?: ScriptedToolCall[];
+  /**
+   * Hold the run open this long after any scripted tool calls, so an e2e
+   * scenario can keep an actor visibly running (and saturate the concurrency
+   * cap so others queue). An abort — an interrupt, a cancel, or the actor's
+   * run-ceiling watchdog — ends it early.
+   */
+  delayMs?: number;
+}
+
+/**
+ * How often a held run streams a heartbeat chunk. A real provider streams
+ * output as it works; a silent one trips the actor's stall watchdog.
+ */
+const HOLD_HEARTBEAT_MS = 60_000;
+
+/** Resolves after `ms`, or as soon as `signal` aborts, streaming a heartbeat meanwhile. */
+function holdUnlessAborted(
+  ms: number,
+  signal?: AbortSignal,
+  onChunk?: (chunk: string) => void
+): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    const heartbeat = onChunk ? setInterval(() => onChunk("."), HOLD_HEARTBEAT_MS) : undefined;
+    function done() {
+      clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -44,9 +77,13 @@ export class FakeProvider implements CodingProvider {
 
     // For e2e hydration: allow the system prompt or messages to script the output.
     const scriptLine = opts.prompt.split("\n").find((line) => line.startsWith(SCRIPT_PREFIX));
+    let delayMs: number | undefined;
     if (scriptLine) {
       try {
-        const parsed = JSON.parse(scriptLine.slice(SCRIPT_PREFIX.length)) as ScriptedRunResult;
+        const { delayMs: scriptedDelay, ...parsed } = JSON.parse(
+          scriptLine.slice(SCRIPT_PREFIX.length)
+        ) as ScriptedRunResult;
+        delayMs = scriptedDelay;
         override = { ...override, ...parsed };
 
         if (parsed.toolCalls && opts.mcpServers) {
@@ -69,6 +106,9 @@ export class FakeProvider implements CodingProvider {
       } catch (e) {
         throw new Error("Failed to execute FAKE_PROVIDER_OUTPUT", { cause: e });
       }
+    }
+    if (typeof delayMs === "number" && delayMs > 0) {
+      await holdUnlessAborted(delayMs, opts.signal, opts.onChunk);
     }
 
     const sessionId = override.sessionId ?? opts.session?.id ?? `fake-session-${++this.created}`;

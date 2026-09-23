@@ -44,4 +44,24 @@ void main() {
       expect(formatReturnsIn(future), 'in <1m');
     });
   });
+
+  group('formatStartsIn', () {
+    final now = DateTime.utc(2026, 1, 1, 12);
+    String? at(Duration d) =>
+        formatStartsIn(now.add(d).toIso8601String(), now: now);
+
+    test('quotes an approximate, rounded wait', () {
+      expect(at(const Duration(seconds: 20)), 'in <1 min');
+      expect(at(const Duration(minutes: 7, seconds: 40)), 'in ~8 min');
+      expect(at(const Duration(hours: 2)), 'in ~2 h');
+      expect(at(const Duration(hours: 2, minutes: 5)), 'in ~2 h 5 min');
+      expect(at(const Duration(days: 3, hours: 4)), 'in ~3 d 4 h');
+      expect(at(const Duration(days: 1)), 'in ~1 d');
+    });
+
+    test('returns null once the estimate has passed or is unreadable', () {
+      expect(at(const Duration(seconds: -1)), isNull);
+      expect(formatStartsIn('not-a-date', now: now), isNull);
+    });
+  });
 }

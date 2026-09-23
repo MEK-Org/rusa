@@ -65,6 +65,33 @@ describe("external root E2E control server", () => {
     expect(retireChild).toHaveBeenCalledWith("child-1", "e2e-controller");
   });
 
+  it("subscribes an actor to an event source in its own name", async () => {
+    const addEventSourceSubscriber = vi.fn();
+    const handles = {
+      externalRoot: new ExternalRootDriver("root", vi.fn()),
+      rootControl: {},
+      mesh: { list: () => [], addEventSourceSubscriber },
+      inboxStore: { list: vi.fn(), markHandled: vi.fn() },
+    } as unknown as RunStartE2EHandles;
+    const server = startRootControlServer({ port: 0, handles });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    close = () =>
+      new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    const port = (server.address() as AddressInfo).port;
+
+    const subscribed = await fetch(`http://127.0.0.1:${port}/actors/child-1/subscriptions`, {
+      method: "POST",
+      body: JSON.stringify({ source: "github:rusa-e2e/scratch/pulls/3" }),
+    });
+
+    expect(subscribed.status).toBe(200);
+    expect(addEventSourceSubscriber).toHaveBeenCalledWith(
+      "github:rusa-e2e/scratch/pulls/3",
+      "child-1",
+      "child-1"
+    );
+  });
+
   it("refuses a blank execution target at the HTTP boundary instead of running it locally", async () => {
     const spawnChild = vi.fn(() => "child-1");
     const handles = {

@@ -94,6 +94,7 @@ class InboxEntryDto {
     this.handledNote,
     this.payload = const {},
     this.reference,
+    this.eventReference,
   });
 
   final String id;
@@ -106,8 +107,13 @@ class InboxEntryDto {
   final Map<String, dynamic> payload;
   final ReferenceDto? reference;
 
+  /// The comment or review the event is about, nested under [reference] (the
+  /// issue or PR it arrived through), when the event names one.
+  final ReferenceDto? eventReference;
+
   factory InboxEntryDto.fromJson(Map<String, dynamic> j) {
     final rawReference = j['reference'];
+    final rawEventReference = j['eventReference'];
     return InboxEntryDto(
       id: j['id'] as String? ?? '',
       actorId: j['actorId'] as String? ?? '',
@@ -119,6 +125,9 @@ class InboxEntryDto {
       payload: (j['payload'] as Map<String, dynamic>?) ?? const {},
       reference: rawReference is Map<String, dynamic>
           ? ReferenceDto.fromJson(rawReference)
+          : null,
+      eventReference: rawEventReference is Map<String, dynamic>
+          ? ReferenceDto.fromJson(rawEventReference)
           : null,
     );
   }
@@ -192,6 +201,9 @@ class ThreadDto {
     this.queuePosition,
     this.estimatedStartAt,
     this.pacingIntervalMs,
+    this.selectedProvider,
+    this.selectedModel,
+    this.selectedEffort,
     this.ownerExpectsRetirement,
     this.selectedObligation,
     this.selectedInboxItem,
@@ -275,6 +287,13 @@ class ThreadDto {
   /// when the actor is not in a pacer queue. Zero means the lane has no
   /// pacing gap, so any future [estimatedStartAt] is an explicit deferral.
   final int? pacingIntervalMs;
+
+  /// The candidate a genuinely queued run has reserved from its pool: the
+  /// declared provider alias, model, and effort it will start with. Null when
+  /// the actor is idle or running, or while nothing has been reserved yet.
+  final String? selectedProvider;
+  final String? selectedModel;
+  final String? selectedEffort;
   final bool? ownerExpectsRetirement;
 
   /// The active run's durable inbox focus, if it resolved to an obligation.
@@ -323,6 +342,9 @@ class ThreadDto {
     int? queuePosition,
     String? estimatedStartAt,
     int? pacingIntervalMs,
+    Object? selectedProvider = _keepThreadField,
+    Object? selectedModel = _keepThreadField,
+    Object? selectedEffort = _keepThreadField,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
     Object? selectedInboxItem = _keepThreadField,
@@ -369,6 +391,15 @@ class ThreadDto {
     queuePosition: queuePosition ?? this.queuePosition,
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     pacingIntervalMs: pacingIntervalMs ?? this.pacingIntervalMs,
+    selectedProvider: identical(selectedProvider, _keepThreadField)
+        ? this.selectedProvider
+        : selectedProvider as String?,
+    selectedModel: identical(selectedModel, _keepThreadField)
+        ? this.selectedModel
+        : selectedModel as String?,
+    selectedEffort: identical(selectedEffort, _keepThreadField)
+        ? this.selectedEffort
+        : selectedEffort as String?,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
     selectedObligation: identical(selectedObligation, _keepThreadField)
@@ -426,6 +457,9 @@ class ThreadDto {
     // from a REAL, so decode through num rather than let one fractional
     // number reject the entire thread snapshot.
     pacingIntervalMs: (j['pacingIntervalMs'] as num?)?.round(),
+    selectedProvider: j['selectedProvider'] as String?,
+    selectedModel: j['selectedModel'] as String?,
+    selectedEffort: j['selectedEffort'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
     selectedObligation: j['selectedObligation'] is Map
         ? ObligationDto.fromJson(
@@ -636,6 +670,50 @@ class AvatarGenerationUpdate {
 
 /// Normalized view state for a single actor in the mesh.
 /// Combines the underlying [ThreadDto] metadata with the live, reactive [RunState].
+/// The model and effort one run started with (or, while queued, reserved):
+/// the same pair an actor's mechanical signature names.
+class RunModelSelection {
+  const RunModelSelection({required this.model, this.effort, this.provider});
+
+  final String model;
+  final String? effort;
+  final String? provider;
+
+  /// `model` or `model, effort` — the parenthetical of the server's
+  /// `formatVisibleActorSignature`, e.g. `handle (claude-opus-5, high)`.
+  String get label => effort == null ? model : '$model, $effort';
+
+  /// Reads a `run_start` event payload, or null when it names no model.
+  static RunModelSelection? fromRunStartPayload(String? payload) {
+    if (payload == null) return null;
+    try {
+      final decoded = jsonDecode(payload);
+      if (decoded is! Map) return null;
+      final model = decoded['model'];
+      if (model is! String || model.isEmpty) return null;
+      final effort = decoded['effort'];
+      final provider = decoded['provider'];
+      return RunModelSelection(
+        model: model,
+        effort: effort is String ? effort : null,
+        provider: provider is String ? provider : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is RunModelSelection &&
+      other.model == model &&
+      other.effort == effort &&
+      other.provider == provider;
+
+  @override
+  int get hashCode => Object.hash(model, effort, provider);
+}
+
 class ActorViewState {
   const ActorViewState({required this.thread, required this.runState});
 
@@ -661,6 +739,21 @@ class ActorViewState {
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
   int? get pacingIntervalMs => thread.pacingIntervalMs;
+  String? get selectedProvider => thread.selectedProvider;
+  String? get selectedModel => thread.selectedModel;
+  String? get selectedEffort => thread.selectedEffort;
+
+  /// The candidate a queued run has reserved, or null when none is reported.
+  RunModelSelection? get reservedSelection {
+    final model = thread.selectedModel;
+    if (model == null) return null;
+    return RunModelSelection(
+      model: model,
+      effort: thread.selectedEffort,
+      provider: thread.selectedProvider,
+    );
+  }
+
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
   ObligationDto? get selectedObligation => thread.selectedObligation;
   InboxEntryDto? get selectedInboxItem => thread.selectedInboxItem;
@@ -1615,13 +1708,18 @@ class ObligationDto {
     return firstLine.isEmpty ? 'Untitled Obligation' : firstLine;
   }
 
-  /// The fuller statement, or null when there isn't one worth showing. A row
-  /// written before the title/body split has an intent whose first line *is*
-  /// the heading, so rendering both would echo it under itself.
+  /// The fuller statement, or null when there isn't one worth showing. An
+  /// intent often opens with the heading itself (always so for a row written
+  /// before the title/body split), so that line is dropped rather than echoed
+  /// under the heading; what follows it is the body.
   String? get body {
     final i = intent?.trim();
-    if (i == null || i.isEmpty || i == heading) return null;
-    return i;
+    if (i == null || i.isEmpty) return null;
+    final lines = i.split('\n');
+    final rest = lines.first.trim() == heading
+        ? lines.skip(1).join('\n').trim()
+        : i;
+    return rest.isEmpty ? null : rest;
   }
 
   bool get isReady => status == 'ready';

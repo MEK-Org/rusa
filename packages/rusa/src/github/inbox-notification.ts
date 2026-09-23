@@ -99,8 +99,46 @@ export function deriveGitHubInboxNotification(
   }
   const commentId = integerId((payload.comment as { id?: unknown } | undefined)?.id);
   if (commentId !== undefined) inboxPayload.commentId = commentId;
+  if (event === "pull_request_review") {
+    const reviewId = integerId((payload.review as { id?: unknown } | undefined)?.id);
+    if (reviewId !== undefined) inboxPayload.reviewId = reviewId;
+  }
 
   return { resource, payload: inboxPayload };
+}
+
+/**
+ * The comment or review an inbox event is about, as a reference nested under
+ * its source — or `undefined` for an event about the source itself (opened,
+ * pushed, closed, ...).
+ *
+ * An issue or PR is the routing granularity, so it is the entry's `source`;
+ * this recovers the finer thing someone actually wrote. A PR conversation
+ * comment is an issue comment on GitHub, so it nests under `issues/` even when
+ * the source is the PR, while an inline review comment nests under `pulls/`.
+ */
+export function githubInboxEventReference(
+  source: string,
+  payload: InboxPayload
+): string | undefined {
+  const match = /^github:([^/]+\/[^/]+)\/(issues|pulls)\/([1-9]\d*)$/.exec(source);
+  if (!match) return undefined;
+  const [, repo, collection, number] = match;
+  const type = payload.type;
+  const commentId = integerId(payload.commentId);
+  if (commentId !== undefined) {
+    if (type.startsWith("issue_comment.")) {
+      return `github:${repo}/issues/${number}/comments/${commentId}`;
+    }
+    if (type.startsWith("pull_request_review_comment.") && collection === "pulls") {
+      return `github:${repo}/pulls/${number}/comments/${commentId}`;
+    }
+  }
+  const reviewId = integerId(payload.reviewId);
+  if (reviewId !== undefined && type.startsWith("pull_request_review.") && collection === "pulls") {
+    return `github:${repo}/pulls/${number}/reviews/${reviewId}`;
+  }
+  return undefined;
 }
 
 function integerId(value: unknown): number | undefined {

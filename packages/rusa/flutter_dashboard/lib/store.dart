@@ -26,6 +26,7 @@ const Duration _kRuntimeRetryMax = Duration(seconds: 5);
 // staged-head changes do not. Poll only while cards are queued so their
 // explanation stays current without a permanent thread-list poll.
 const Duration _kQueuePacingPollInterval = Duration(seconds: 10);
+const Duration _kObligationLookupTtl = Duration(seconds: 30);
 
 /// One line in the merged live-output console.
 class LiveLine {
@@ -328,6 +329,20 @@ class DashboardStore {
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
 
+  /// Model and effort of each active run, keyed by actor id. Seeded from the
+  /// actor's newest `run_start` event and replaced by live ones; an actor's
+  /// entry is dropped as soon as it stops running.
+  final _runSelections = BehaviorSubject<Map<String, RunModelSelection>>.seeded(
+    const {},
+  );
+  final _runSelectionLookups = <String>{};
+
+  /// Obligation lookups for inbox entries that name one, reused for
+  /// [_kObligationLookupTtl] so cards re-rendering on every snapshot share
+  /// one fetch.
+  final _obligationLookups =
+      <String, ({DateTime at, Future<ObligationDto?> obligation})>{};
+
   /// True while a background quota revalidation is in flight (ISSUE_NUM ask 4).
   /// Purely in-memory for this process's lifetime — deliberately NOT
   /// persisted (no localStorage), so it always starts false on a fresh load.
@@ -398,6 +413,8 @@ class DashboardStore {
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
   ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
+  ValueStream<Map<String, RunModelSelection>> get runSelections =>
+      _runSelections.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
   ValueStream<bool> get actorsStale => _actorsStale.stream;
@@ -474,6 +491,7 @@ class DashboardStore {
     _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
     _subs.add(_stream.runtimeStates.listen(_onRuntimeState));
     _subs.add(_stream.avatarUpdates.listen(_onAvatarUpdate));
+    _subs.add(_actorStates.listen(_syncRunSelections));
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
@@ -1310,6 +1328,12 @@ class DashboardStore {
         e.kind == 'actor_model_set') {
       _scheduleTopologyRefresh();
     }
+    if (e.kind == 'run_start' && e.actorId != null) {
+      final selection = RunModelSelection.fromRunStartPayload(e.payload);
+      if (selection != null && !_runSelections.isClosed) {
+        _runSelections.add({..._runSelections.value, e.actorId!: selection});
+      }
+    }
     if (e.kind == 'run_yielded') {
       if (_seenYieldEventIds.add(e.id)) {
         final cur = _yieldEvents.value;
@@ -1504,6 +1528,63 @@ class DashboardStore {
     }
   }
 
+  /// The obligation [id], or null when it cannot be loaded. Fetched at most
+  /// once per [_kObligationLookupTtl], so its status stays reasonably fresh
+  /// without every rebuild refetching it.
+  Future<ObligationDto?> obligationById(String id) {
+    final now = DateTime.now();
+    final cached = _obligationLookups[id];
+    if (cached != null && now.difference(cached.at) < _kObligationLookupTtl) {
+      return cached.obligation;
+    }
+    final obligation = _api
+        .fetchObligationDetail(id)
+        .then<ObligationDto?>((detail) => detail.obligation)
+        .catchError((Object _) => null);
+    _obligationLookups[id] = (at: now, obligation: obligation);
+    return obligation;
+  }
+
+  /// Keeps [runSelections] to exactly the actors in an active run: drops any
+  /// actor that stopped, and looks up the newest `run_start` once for an
+  /// active actor whose start this page never saw. A lookup that finds
+  /// nothing is not retried until the actor leaves and re-enters a run.
+  void _syncRunSelections(ActorStateSnapshot snapshot) {
+    final active = {
+      for (final a in snapshot.actors.values)
+        if (a.isActiveRun) a.id,
+    };
+    _runSelectionLookups.removeWhere((id) => !active.contains(id));
+    final current = _runSelections.value;
+    if (current.keys.any((id) => !active.contains(id))) {
+      _runSelections.add({
+        for (final entry in current.entries)
+          if (active.contains(entry.key)) entry.key: entry.value,
+      });
+    }
+    for (final id in active) {
+      if (_runSelections.value.containsKey(id)) continue;
+      if (!_runSelectionLookups.add(id)) continue;
+      unawaited(_lookUpRunSelection(id));
+    }
+  }
+
+  Future<void> _lookUpRunSelection(String actorId) async {
+    RunModelSelection? selection;
+    try {
+      final event = await _api.fetchLatestRunStart(actorId);
+      selection = RunModelSelection.fromRunStartPayload(event?.payload);
+    } catch (_) {
+      return;
+    }
+    if (selection == null || _runSelections.isClosed) return;
+    // A live `run_start` that landed meanwhile is newer; a stop dropped the
+    // actor from the active set and the answer no longer describes a run.
+    if (_runSelections.value.containsKey(actorId)) return;
+    if (!_runSelectionLookups.contains(actorId)) return;
+    _runSelections.add({..._runSelections.value, actorId: selection});
+  }
+
   bool _applyRuntimeState(ActorRuntimeStateDelta delta) {
     final cur = _actorStates.value;
     final existing = cur.actors[delta.actorId];
@@ -1515,6 +1596,10 @@ class DashboardStore {
     // authoritative pacing snapshot is requested.
     final clearsSelectedObligation =
         delta.runState == RunState.idle || delta.runState == RunState.queued;
+    // The reserved candidate describes a queued run only; once the run starts
+    // or is cancelled the server stops reporting it, so drop it immediately
+    // rather than show it until the next snapshot.
+    final clearsReservation = delta.runState != RunState.queued;
     updatedActors[delta.actorId] = existing.copyWith(
       thread: existing.thread.copyWith(
         runState: delta.runState,
@@ -1527,6 +1612,13 @@ class DashboardStore {
         moreInboxItemsCount: clearsSelectedObligation
             ? null
             : existing.thread.moreInboxItemsCount,
+        selectedProvider: clearsReservation
+            ? null
+            : existing.thread.selectedProvider,
+        selectedModel: clearsReservation ? null : existing.thread.selectedModel,
+        selectedEffort: clearsReservation
+            ? null
+            : existing.thread.selectedEffort,
       ),
       runState: delta.runState,
     );
@@ -1751,6 +1843,7 @@ class DashboardStore {
     _api.close();
     await Future.wait([
       _actorStates.close(),
+      _runSelections.close(),
       _halted.close(),
       _schedulerWarning.close(),
       _supportedVoices.close(),

@@ -672,13 +672,13 @@ class _ActorRowState extends State<_ActorRow> {
                             ),
                           ),
                         if (showEffort) ...[
-                          if (showModel) const SizedBox(width: 6),
+                          // Follows the model as the mechanical signature's
+                          // `(model, effort)` does; standalone it keeps its
+                          // label so a bare value still reads as effort.
                           Flexible(
                             child: Text(
-                              thread.effortChangePending &&
-                                      thread.desiredEffort != thread.effort
-                                  ? 'effort ${thread.effort ?? "default"} → ${thread.desiredEffort ?? "default"}'
-                                  : 'effort ${thread.effort ?? "default"}',
+                              '${showModel ? ', ' : 'effort '}'
+                              '${thread.effortChangePending && thread.desiredEffort != thread.effort ? '${thread.effort ?? "default"} → ${thread.desiredEffort ?? "default"}' : thread.effort ?? "default"}',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: kMonoStyle.copyWith(

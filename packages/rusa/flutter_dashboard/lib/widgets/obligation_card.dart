@@ -8,6 +8,7 @@ import '../util.dart';
 import 'header.dart';
 import 'obligation_dialogs.dart';
 import 'obligation_status.dart';
+import 'reference_preview.dart';
 
 class ObligationRow extends StatelessWidget {
   const ObligationRow({
@@ -23,6 +24,8 @@ class ObligationRow extends StatelessWidget {
     this.showActions = true,
     this.showReorder = false,
     this.contentPadding = const EdgeInsets.all(16),
+    this.showKindChip = true,
+    this.trailing,
   });
 
   final ObligationDto obligation;
@@ -37,6 +40,15 @@ class ObligationRow extends StatelessWidget {
   final bool showReorder;
   final EdgeInsetsGeometry contentPadding;
 
+  /// Leads the title/status row with an `OBLIGATION` chip, like a reference
+  /// card names what it cites. Off where the surrounding list already says these are
+  /// obligations (a parent/children/blocked-by panel, an obligation queue).
+  final bool showKindChip;
+
+  /// Optional widget at the trailing edge of the title row, as a reference
+  /// card's header action (e.g. an inbox entry's dismiss).
+  final Widget? trailing;
+
   @override
   Widget build(BuildContext context) {
     final body = obligation.body;
@@ -47,9 +59,14 @@ class ObligationRow extends StatelessWidget {
     final hasTerminalNote =
         obligation.terminalNote != null && obligation.terminalNote!.trim().isNotEmpty;
 
-    final titleAndOwner = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    // Kind, title, then status on one row — status follows the title as it
+    // does in the actor and obligation detail headers.
+    final titleRow = Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 8,
+      runSpacing: 4,
       children: [
+        if (showKindChip) const ReferenceKindChip('OBLIGATION'),
         Text(
           obligation.heading,
           style: const TextStyle(
@@ -58,22 +75,7 @@ class ObligationRow extends StatelessWidget {
             fontSize: 13.5,
           ),
         ),
-        if (body != null) ...[
-          const SizedBox(height: 4),
-          Text(
-            body,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12, height: 1.35),
-          ),
-        ],
-        if (showOwner) ...[
-          const SizedBox(height: 2),
-          Text(
-            'Owner: ${store.ownerLabel(obligation.ownerId)}',
-            style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
-          ),
-        ],
+        ObligationStatusChip(obligation: obligation, store: store),
       ],
     );
 
@@ -194,13 +196,32 @@ class ObligationRow extends StatelessWidget {
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                ObligationStatusChip(obligation: obligation, store: store),
-                const SizedBox(width: 12),
-                Expanded(child: titleAndOwner),
+                Expanded(child: titleRow),
+                if (trailing != null) ...[
+                  const SizedBox(width: 8),
+                  trailing!,
+                ],
                 const SizedBox(width: 8),
                 actionButtons,
               ],
             ),
+            // The intent and owner sit under the whole row, not under the title.
+            if (body != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                body,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12, height: 1.35),
+              ),
+            ],
+            if (showOwner) ...[
+              const SizedBox(height: 2),
+              Text(
+                'Owner: ${store.ownerLabel(obligation.ownerId)}',
+                style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
+              ),
+            ],
             if (obligation.hasCheckpoint) ...[
               const SizedBox(height: 10),
               ObligationCheckpointPanel(
