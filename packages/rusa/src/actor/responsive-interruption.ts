@@ -88,6 +88,22 @@ export function shadowVerdictEmoji(outcome: ResponsiveInterruptionVerdict): stri
 }
 
 /**
+ * The verdict a decision actually predicts, or `null` when none was made.
+ *
+ * Only a model that answered has predicted anything. No client, a client
+ * error, a timeout, a malformed answer, or nothing to weigh the arrival
+ * against are failures to evaluate, and showing them as ❌ would read as a
+ * judgement nobody made — the operator could then "correct" it. A
+ * below-threshold interrupt *is* a prediction: the policy's, of queue.
+ */
+export function shadowPrediction(
+  decision: ResponsiveInterruptionDecision
+): ResponsiveInterruptionVerdict | null {
+  if ("verdict" in decision) return decision.verdict;
+  return decision.reason === "low_confidence" ? "queue" : null;
+}
+
+/**
  * The Google Chat message a shadow verdict belongs on, or `null` when the
  * arrival did not come from chat and there is nothing to react to.
  *
@@ -159,7 +175,13 @@ export type ResponsiveInterruptionDecision =
       matchedCandidateIds?: readonly string[];
     });
 
-/** How long a decision may take before the policy stops waiting on it. */
+/**
+ * How long a decision may take before the policy stops waiting on it.
+ * Uncalibrated placeholder: no live client exists yet to measure. The number,
+ * and whether an abandoned request should be cancelled through an
+ * `AbortSignal` on the request rather than merely no longer awaited, belong to
+ * the live-client slice.
+ */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
 function isConfidence(value: unknown): value is number {

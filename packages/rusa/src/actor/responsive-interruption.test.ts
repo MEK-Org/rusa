@@ -1,20 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
-  type JevDecisionClient,
-  type JevDecisionRequest,
-  SHADOW_INTERRUPT_EMOJI,
-  SHADOW_QUEUE_EMOJI,
-  ShadowResponsiveInterruptionClassifier,
-  shadowReactionTarget,
-  shadowVerdictEmoji,
-} from "./responsive-interruption.js";
-import {
   AMBIGUOUS_FIXTURE,
   CLEAR_MATCH_FIXTURE,
   type FixtureEntry,
   type ResponsiveInterruptionFixture,
   SCALE_FIXTURE,
-} from "./responsive-interruption-fixtures.js";
+} from "./fixtures/responsive-interruption.js";
+import {
+  type JevDecisionClient,
+  type JevDecisionRequest,
+  SHADOW_INTERRUPT_EMOJI,
+  SHADOW_QUEUE_EMOJI,
+  ShadowResponsiveInterruptionClassifier,
+  shadowPrediction,
+  shadowReactionTarget,
+  shadowVerdictEmoji,
+} from "./responsive-interruption.js";
 
 /**
  * A client that answers from the fixture bodies rather than from ids, so a
@@ -47,15 +48,18 @@ function fixtureClient(fixture: ResponsiveInterruptionFixture): JevDecisionClien
       const best = scored[0];
       const runnerUp = scored[1];
       if (!best || best.score === 0) return { verdict: "queue", confidence: 0.95 };
-      // A lead over the field is what makes a match a match. Without one the
-      // client says so through its confidence rather than picking a winner.
+      // A lead over the field is what makes a match a match. Without one this
+      // fake still leans toward interrupting, but says how weakly through its
+      // confidence: the confident guess the classifier's threshold exists to
+      // turn back. A fake that answered `queue` here would pass with the
+      // threshold deleted.
       const lead = best.score - (runnerUp?.score ?? 0);
-      const confidence = lead >= 2 ? 0.94 : 0.41;
       return {
-        verdict: lead >= 2 ? "interrupt" : "queue",
-        confidence,
+        verdict: "interrupt",
+        confidence: lead >= 2 ? 0.94 : 0.41,
         rationale: `overlap ${best.score}, lead ${lead}`,
-        matchedCandidateIds: lead >= 2 ? [best.id] : [],
+        matchedCandidateIds:
+          lead >= 2 ? [best.id] : scored.filter((c) => c.score === best.score).map((c) => c.id),
       };
     },
   };
@@ -342,8 +346,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       // The cost of being wrong here is a false preemption of real work, so
       // the right behaviour is an unconfident queue, not a plausible pick.
       const decision = await evaluate(AMBIGUOUS_FIXTURE);
-      expect(decision).toMatchObject({ outcome: "queue" });
-      expect(decision).not.toMatchObject({ outcome: "interrupt" });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "low_confidence" });
     });
 
     it(`still finds the one match inside ${SCALE_FIXTURE.name}`, async () => {
@@ -379,6 +382,47 @@ describe("shadowVerdictEmoji", () => {
     expect(shadowVerdictEmoji("queue")).toBe(SHADOW_QUEUE_EMOJI);
     expect(SHADOW_INTERRUPT_EMOJI).toBe("✅");
     expect(SHADOW_QUEUE_EMOJI).toBe("❌");
+  });
+});
+
+describe("shadowPrediction", () => {
+  const decide = (decideFn?: JevDecisionClient["decide"]) =>
+    new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      timeoutMs: 10,
+      ...(decideFn ? { client: client(decideFn) } : {}),
+    }).evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: ["selected-a"],
+      pendingEntryIds: [],
+    });
+
+  it("is the model's verdict whenever the model answered", async () => {
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.9 })))
+    ).toBe("interrupt");
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "queue", confidence: 0.3 })))
+    ).toBe("queue");
+    // A weak interrupt turned back by the threshold is still a prediction.
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.5 })))
+    ).toBe("queue");
+  });
+
+  it("is nothing when no judgement was made", async () => {
+    expect(shadowPrediction(await decide())).toBe(null);
+    expect(
+      shadowPrediction(
+        await decide(async () => {
+          throw new Error("down");
+        })
+      )
+    ).toBe(null);
+    expect(shadowPrediction(await decide(() => new Promise(() => {})))).toBe(null);
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "maybe", confidence: 0.9 })))
+    ).toBe(null);
   });
 });
 

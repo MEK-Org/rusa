@@ -98,6 +98,7 @@ import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler
 import {
   type ResponsiveInterruptionVerdict,
   type ShadowResponsiveInterruptionClassifier,
+  shadowPrediction,
   shadowReactionTarget,
 } from "./responsive-interruption.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
@@ -1412,7 +1413,8 @@ export class ActorMesh {
           // The audit row is recorded first and independently: a chat space
           // the bot cannot react in must not cost the measurement this whole
           // feature exists to collect.
-          this.postShadowReaction(entry.payload, decision.outcome, incomingEntryId);
+          const prediction = shadowPrediction(decision);
+          if (prediction) this.postShadowReaction(entry.payload, prediction, incomingEntryId);
         })
         .catch(() => {
           // `evaluate` resolves rather than throws, so this arm covers only a
@@ -1440,16 +1442,11 @@ export class ActorMesh {
     const target = shadowReactionTarget(payload, outcome);
     if (!target) return;
     // A reaction is an observation aid, never a delivery guarantee. Failures
-    // are logged rather than retried, and a host that throws synchronously is
-    // caught here too so it cannot surface as a lost observation upstream —
-    // the audit event already holds the verdict either way.
-    const failed = () =>
-      this.log(`responsive interruption shadow reaction failed for ${incomingEntryId}`);
-    try {
-      void react(target.messageName, target.emoji).catch(failed);
-    } catch {
-      failed();
-    }
+    // are logged rather than retried; the audit event already holds the
+    // verdict either way.
+    void react(target.messageName, target.emoji).catch(() =>
+      this.log(`responsive interruption shadow reaction failed for ${incomingEntryId}`)
+    );
   }
 
   /** Read the entire durable unhandled set minus the selected rows; a

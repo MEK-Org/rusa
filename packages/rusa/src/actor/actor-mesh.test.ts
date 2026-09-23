@@ -2946,7 +2946,7 @@ describe("ActorMesh", () => {
     ]);
   });
 
-  it("posts nothing on an arrival the classifier would queue anyway when there is no classifier", async () => {
+  it("posts no reaction when no classifier is configured", async () => {
     // The gate is the classifier itself: a default install has none, so it
     // must not touch the operator's chat space at all.
     const inboxStore = createMemoryInboxStore();
@@ -2980,6 +2980,57 @@ describe("ActorMesh", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(reactions).toEqual([]);
+  });
+
+  it("posts no reaction when the classifier failed to reach a verdict", async () => {
+    // A client error is not a prediction of queue. Showing it as ❌ would put
+    // a judgement nobody made in front of the operator; the audit row alone
+    // records the failure.
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const reactions: string[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        decide: async () => {
+          throw new Error("decision service unavailable");
+        },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      reactToChatMessage: async (messageName) => {
+        reactions.push(messageName);
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([]);
+    const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0]?.payload).toContain('"reason":"client_error"');
   });
 
   it("still records the shadow observation when the reaction cannot be posted", async () => {
