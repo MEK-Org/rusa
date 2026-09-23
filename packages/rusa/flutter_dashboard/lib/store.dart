@@ -462,16 +462,19 @@ class DashboardStore {
   /// `human:*` prefix, or the server-resolved durable user principal.
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
+  /// Whether [id] is one of this authenticated viewer's durable/legacy ids.
+  bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
+
   /// Resolves an actor/thread/principal id to a display label.
   String actorDisplay(String id) =>
-      actorDisplayLabel(id, (i) => actor(i)?.handle, isHuman, operatorDisplayName);
+      actorDisplayLabel(id, (i) => actor(i)?.handle, isViewer, operatorDisplayName);
 
   /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
   /// dialog), which keep showing the raw id for an actor the mesh view does
   /// not know rather than "Unknown actor" — that fallback predates #538 and
   /// is what the overview's blocker line is pinned to.
   String ownerLabel(String id) =>
-      isHuman(id) ? operatorDisplayLabel : (actor(id)?.handle ?? id);
+      isViewer(id) ? operatorDisplayLabel : isHuman(id) ? 'Operator' : (actor(id)?.handle ?? id);
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {

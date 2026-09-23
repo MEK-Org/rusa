@@ -227,7 +227,7 @@ class ObligationRow extends StatelessWidget {
               ObligationCheckpointPanel(
                 obligation: obligation,
                 lookupHandle: (id) => store.actor(id)?.handle,
-                isHuman: (id) => store.isHuman(id),
+                isViewer: (id) => store.isViewer(id),
                 humanDisplayName: store.operatorDisplayName,
                 maxLines: 4,
               ),
@@ -364,13 +364,13 @@ class ObligationRow extends StatelessWidget {
 String checkpointStampLabel(
   ObligationDto obligation,
   String? Function(String id) lookupHandle, {
-  bool Function(String id)? isHuman,
+  bool Function(String id)? isViewer,
   String? humanDisplayName,
 }) {
   final author = actorDisplayLabel(
     obligation.checkpointBy!,
     lookupHandle,
-    isHuman,
+    isViewer,
     humanDisplayName,
   );
   final when = formatTs(obligation.checkpointAt!);
@@ -389,7 +389,7 @@ class ObligationCheckpointPanel extends StatelessWidget {
     super.key,
     required this.obligation,
     required this.lookupHandle,
-    this.isHuman,
+    this.isViewer,
     this.humanDisplayName,
     this.maxLines,
     this.selectable = false,
@@ -397,7 +397,7 @@ class ObligationCheckpointPanel extends StatelessWidget {
 
   final ObligationDto obligation;
   final String? Function(String id) lookupHandle;
-  final bool Function(String id)? isHuman;
+  final bool Function(String id)? isViewer;
   final String? humanDisplayName;
 
   /// Cap the standing's height where the surrounding surface is a summary. Null
@@ -442,7 +442,7 @@ class ObligationCheckpointPanel extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  checkpointStampLabel(obligation, lookupHandle, isHuman: isHuman, humanDisplayName: humanDisplayName),
+                  checkpointStampLabel(obligation, lookupHandle, isViewer: isViewer, humanDisplayName: humanDisplayName),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),

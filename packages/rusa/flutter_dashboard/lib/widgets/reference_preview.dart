@@ -14,7 +14,7 @@ class ReferencePreview extends StatefulWidget {
     this.label,
     this.attachedBy,
     this.lookupActorHandle,
-    this.isHuman,
+    this.isViewer,
     this.humanDisplayName,
     this.openLink = openInNewTab,
     this.action,
@@ -56,8 +56,8 @@ class ReferencePreview extends StatefulWidget {
   /// unresolved lookup still falls back to "Unknown actor", never the id.
   final String? Function(String id)? lookupActorHandle;
 
-  /// Whether an id belongs to a human operator.
-  final bool Function(String id)? isHuman;
+  /// Whether an id is one of the authenticated viewer's principals.
+  final bool Function(String id)? isViewer;
   final String? humanDisplayName;
 
   /// Opens a reference's url. Injectable so tests can assert exactly what
@@ -94,7 +94,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
   bool _overflows = false;
 
   String _handle(String id) =>
-      actorDisplayLabel(id, widget.lookupActorHandle, widget.isHuman, widget.humanDisplayName);
+      actorDisplayLabel(id, widget.lookupActorHandle, widget.isViewer, widget.humanDisplayName);
 
   @override
   Widget build(BuildContext context) {

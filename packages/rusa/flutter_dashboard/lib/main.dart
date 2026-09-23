@@ -298,7 +298,6 @@ class _DashboardPageState extends State<DashboardPage> {
                   : null,
               onNavigation: widget.session.visit,
               profilePhotoUrl: widget.session.profilePhotoUrl,
-              profileDisplayName: widget.session.operatorDisplayName,
               store: _store,
               understandingBuilder: (_) => IuTreeBody(session: widget.session),
               reportsBuilder: (_) => IuReportsBody(store: _store),

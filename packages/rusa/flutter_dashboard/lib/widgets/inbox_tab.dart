@@ -619,7 +619,7 @@ class _InboxTabState extends State<InboxTab> {
               ReferencePreview(
                 reference: reference!,
                 lookupActorHandle: (id) => widget.store.actor(id)?.handle,
-                isHuman: widget.store.isHuman,
+                isViewer: widget.store.isViewer,
                 humanDisplayName: widget.store.operatorDisplayName,
                 openLink: widget.openLink,
                 margin: EdgeInsets.zero,
@@ -683,7 +683,7 @@ class _InboxTabState extends State<InboxTab> {
                 ReferencePreview(
                   reference: reference,
                   lookupActorHandle: (id) => widget.store.actor(id)?.handle,
-                  isHuman: widget.store.isHuman,
+                  isViewer: widget.store.isViewer,
                   humanDisplayName: widget.store.operatorDisplayName,
                   openLink: widget.openLink,
                 )

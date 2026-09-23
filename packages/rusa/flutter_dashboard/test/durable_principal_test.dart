@@ -169,6 +169,52 @@ void main() {
     );
 
     testWidgets(
+      'selecting the profile label keeps its durable principal separate',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..dashboardConfigResult = _configWithUser(kDurableUser)
+            ..obligationsResult = [makeObligation('ob-1', ownerId: 'worker-1')];
+          final store = DashboardStore(
+            api: api,
+            stream: FakeStream(),
+            operatorDisplayName: 'Ada Lovelace',
+          );
+          await store.init();
+          addTearDown(store.dispose);
+
+          await tester.pumpWidget(
+            _dialogHost(
+              store,
+              (context) => showReassignObligationDialog(
+                context,
+                store,
+                api.obligationsResult.single,
+              ),
+            ),
+          );
+          await tester.tap(find.text('open'));
+          await tester.pumpAndSettle();
+
+          await tester.enterText(
+            find.widgetWithText(
+              TextFormField,
+              'e.g. cloudy-porpoise, operator, or UUID',
+            ),
+            'Ada',
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Ada Lovelace'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.widgetWithText(ElevatedButton, 'Reassign'));
+          await tester.pumpAndSettle();
+
+          expect(api.reassignCalls.single.ownerId, kDurableUser);
+        });
+      },
+    );
+
+    testWidgets(
       'without a durable user the dialogs still fall back to the alias the server accepts',
       (tester) async {
         await tester.runAsync(() async {
@@ -247,6 +293,9 @@ void main() {
       expect(isOperatorOwnerText(' operator ', kDurableUser), isTrue);
       expect(isOperatorOwnerText(kDurableUser, kDurableUser), isTrue);
       expect(isOperatorOwnerText('cloudy-porpoise', kDurableUser), isFalse);
+      // A profile label is presentation data, not a principal alias: a real
+      // actor is allowed to have the same handle without becoming the viewer.
+      expect(isOperatorOwnerText('Ada Lovelace', kDurableUser), isFalse);
     });
   });
 }
