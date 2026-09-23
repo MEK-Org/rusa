@@ -5724,40 +5724,72 @@ describe("ActorMesh", () => {
       await tick();
     });
 
-    it("applies a pool staged mid-run when that run ends without a result, but only if it launched", async () => {
-      const { mesh, registry } = setup();
-      const worker = mesh.spawn({
-        charter: "worker",
+    it("applies a pool after the actor reports its real coalesced terminal, but not an unlaunched terminal", async () => {
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({ sharedProvider: deferred.provider });
+      const unlaunched = mesh.spawn({
+        charter: "unlaunched worker",
         parentId: "root",
-        modelConfig: { provider: "test-provider", model: "model-a" },
+        modelConfig: { provider: "deferred", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
-      const live = mesh.get(worker);
-      if (!live) throw new Error("worker not live");
-      const running = vi.spyOn(live, "isRunning", "get").mockReturnValue(true);
+      const unlaunchedLive = mesh.get(unlaunched);
+      if (!unlaunchedLive) throw new Error("unlaunched worker not live");
 
-      mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root");
-      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
+      // The false terminal is an interface-level guard: `actor.test.ts`
+      // drives its producer through a real cancelled gate, while this focused
+      // mesh test keeps the consumer's no-application rule explicit.
+      const running = vi.spyOn(unlaunchedLive, "isRunning", "get").mockReturnValue(true);
+
+      mesh.setActorModel(unlaunched, { provider: "deferred", model: "model-b" }, "root");
+      expect(registry.get(unlaunched)?.modelConfig?.[0]?.model).toBe("model-a");
       running.mockReturnValue(false);
 
       // A start cancelled before launch is not the end of the run the change
       // waited on; it stays staged.
-      await mesh.lifecycleFor(worker).emit("onEnd", {
-        actorId: worker,
+      await mesh.lifecycleFor(unlaunched).emit("onEnd", {
+        actorId: unlaunched,
         runId: "run-unlaunched",
         terminal: { kind: "abandoned", reason: "start-cancelled", started: false },
       });
+      expect(registry.get(unlaunched)?.modelConfig?.[0]?.model).toBe("model-a");
+      expect(registry.get(unlaunched)?.desiredModelConfig?.[0]?.model).toBe("model-b");
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "deferred", model: "model-a" },
+        context: { type: "portable", mode: "ledger" },
+      });
+      const live = mesh.get(worker);
+      if (!live) throw new Error("worker not live");
+
+      // Drive the launched case through Actor itself. A newer responsive
+      // voice wake coalesces the live provider run; Actor's total finally
+      // reports `{ kind: "abandoned", started: true }` to this mesh lifecycle.
+      mesh.sendMessage(worker, "start the real provider run", "root");
+      await tick();
+      expect(deferred.pending()).toBe(1);
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+
+      // The pool remains staged while the real provider attempt is live.
+      mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
       expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
       expect(registry.get(worker)?.desiredModelConfig?.[0]?.model).toBe("model-b");
 
-      // A launched run that was abandoned did end: the change is due now.
-      await mesh.lifecycleFor(worker).emit("onEnd", {
-        actorId: worker,
-        runId: "run-launched",
-        terminal: { kind: "abandoned", reason: "coalesced", started: true },
-      });
+      live.requestRun({ priority: "responsive", voiceTimestamp: Date.now() });
+      deferred.releaseAll();
+      await tick();
+
+      // The coalesced, launched run ended without a result, so the staged
+      // pool is now durable and live before its replacement run starts.
       expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
       expect(registry.get(worker)?.desiredModelConfig).toBeUndefined();
+
+      // Let the replacement opportunity settle so it cannot leak into a
+      // neighboring fake-timer test.
+      deferred.releaseAll();
+      await tick();
     });
 
     it("emits actor_model_set when an idle actor's pool is applied, ahead of the next run", async () => {
