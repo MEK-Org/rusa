@@ -481,7 +481,7 @@ describe("sandbox bwrap args", () => {
     });
   });
 
-  it("shadows sibling worker directories and maps Antigravity scratch privately", async () => {
+  it("shadows sibling worker directories and maps Antigravity state privately", async () => {
     // The mesh worker layout: <home>/.rusa/workers/<id>. The provider's shared
     // scratch path must be overlaid with a current-actor-only non-durable directory.
     // The shared workers parent is shadowed and only this actor is rebound.
@@ -551,6 +551,14 @@ describe("sandbox bwrap args", () => {
         args[index + 2] === scratchDir
     );
     expect(scratchOverlay).toBeGreaterThan(providerStateBind);
+    const conversationsDir = join(home, ".gemini", "antigravity-cli", "conversations");
+    const conversationsOverlay = args.findIndex(
+      (arg, index) =>
+        arg === "--bind" &&
+        args[index + 1] === join(actorDir, ".antigravity-conversations") &&
+        args[index + 2] === conversationsDir
+    );
+    expect(conversationsOverlay).toBeGreaterThan(providerStateBind);
   });
 
   it("shadows host-job audit artifacts out of mesh actor read/write scope", async () => {

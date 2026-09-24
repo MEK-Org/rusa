@@ -23,7 +23,12 @@ import { loadConfig } from "../config/loader.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
 import { createLogger, type Logger } from "../observability/logger.js";
-import { antigravityActorScratchDir, antigravityScratchDir } from "./antigravity-paths.js";
+import {
+  antigravityActorConversationsDir,
+  antigravityActorScratchDir,
+  antigravityConversationsDir,
+  antigravityScratchDir,
+} from "./antigravity-paths.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -812,12 +817,14 @@ function buildMeshActorBwrapArgs(o: {
   const tempPaths: string[] = [];
   const commandPrefix: string[] = [];
 
-  // `--bind` needs an existing destination. Creating this empty mount point is
-  // safe: the provider owns its contents, while the sandbox replaces its view
-  // with the current actor's private provider-scratch directory below.
+  // `--bind` needs existing source and destination directories. The sandbox
+  // replaces the shared provider views below with actor-owned paths, so neither
+  // provider scratch nor conversation records can cross a worker boundary.
   if (o.authMode === "antigravity") {
     mkdirSync(antigravityScratchDir(), { recursive: true, mode: 0o700 });
+    mkdirSync(antigravityConversationsDir(), { recursive: true, mode: 0o700 });
     mkdirSync(antigravityActorScratchDir(realActorDir), { recursive: true, mode: 0o700 });
+    mkdirSync(antigravityActorConversationsDir(realActorDir), { recursive: true, mode: 0o700 });
   }
 
   const args: string[] = [
@@ -898,10 +905,15 @@ function buildMeshActorBwrapArgs(o: {
     addWritableBindIfExists(args, dir, dir);
   }
   if (o.authMode === "antigravity") {
-    // agy uses one host-wide scratch root. Overlay it after the writable
-    // provider-state bind with a private non-durable directory; durable work
-    // stays at the actor directory and sibling workspaces stay unreachable.
+    // agy keeps scratch and conversation records beneath the writable provider
+    // state directory. Overlay both after that broad bind: scratch stays private
+    // to this actor and conversation memory is unavailable to sibling workers.
     args.push("--bind", antigravityActorScratchDir(realActorDir), antigravityScratchDir());
+    args.push(
+      "--bind",
+      antigravityActorConversationsDir(realActorDir),
+      antigravityConversationsDir()
+    );
   }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin
@@ -1120,10 +1132,9 @@ function injectGitBridgeEnv(args: string[]): void {
 
 /**
  * Mesh entrypoint: an actor owns a single private directory and clones whatever
- * repos its charter needs inside it. Visibility is intentionally OPEN — an actor
- * may READ the whole host, including any other actor's repo (e.g. a reviewer
- * inspecting a coder's work). Isolation is write-scope, not read-scope: the actor
- * can only WRITE inside its own directory, the provider's state dir, the shared
+ * repos its charter needs inside it. Worker sandboxes shadow the shared worker
+ * parent and re-bind only their own directory, so a sibling worktree is not
+ * addressable. Write scope remains the actor directory, provider state, shared
  * pnpm CAS, and /tmp.
  *
  * Keeps the REAL home (read-only), so there's no synthetic HOME and no auth

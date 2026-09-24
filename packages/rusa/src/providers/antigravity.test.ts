@@ -252,6 +252,51 @@ describe("AntigravityProvider", () => {
     );
   });
 
+  it("reads sandboxed quota state from the actor-private conversation store", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-agy-sandbox-home-"));
+    const actorDir = join(home, ".rusa", "workers", "actor-one");
+    const conversationId = "11111111-2222-4333-8444-555555555555";
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    mkdirSync(actorDir, { recursive: true });
+
+    try {
+      const provider = new AntigravityProvider(
+        "antigravity",
+        { cliCommand: "agy" },
+        "Gemini 3.5 Flash (Low)"
+      );
+      const child = mockChildProcess();
+      vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test prompt",
+        cwd: actorDir,
+        sandbox: { worktreePath: actorDir },
+        session: {},
+      });
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      const logFile = args[args.indexOf("--log-file") + 1];
+      const privateConversations = join(actorDir, ".antigravity-conversations");
+      writeFileSync(
+        join(privateConversations, `${conversationId}.db-wal`),
+        JSON.stringify({
+          error: { code: 429, status: "RESOURCE_EXHAUSTED", reason: "QUOTA_EXHAUSTED" },
+        })
+      );
+      writeFileSync(logFile, `Print mode: conversation=${conversationId}, sending message`);
+      child.emit("close", 0);
+
+      const result = await runPromise;
+      expect(result.success).toBe(false);
+      expect(result.output).toContain("reason=QUOTA_EXHAUSTED");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
   it("terminates subprocess and returns cancelled status when signal is aborted", async () => {
     const config: ProviderConfig = { cliCommand: "agy" };
     const provider = new AntigravityProvider("antigravity", config, "Gemini 3.1 Pro (High)");

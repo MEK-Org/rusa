@@ -14,6 +14,10 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
+import {
+  antigravityActorConversationsDir,
+  antigravityConversationsDir,
+} from "./antigravity-paths.js";
 import { getProviderModelCatalog } from "./model-catalog.js";
 import {
   type ModelEffortSelection,
@@ -31,7 +35,7 @@ import {
 } from "./token-accounting.js";
 import type { CodingProvider, McpServerSpec, RunOptions, RunResult } from "./types.js";
 
-export { antigravityScratchDir } from "./antigravity-paths.js";
+export { antigravityConversationsDir, antigravityScratchDir } from "./antigravity-paths.js";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_TAIL_BYTES = 2 * 1024 * 1024;
@@ -157,10 +161,6 @@ export interface AntigravityQuotaRefusal {
   reason: "QUOTA_EXHAUSTED";
   retryDelay?: string;
   quotaResetTimeStamp?: string;
-}
-
-export function antigravityConversationsDir(): string {
-  return join(homedir(), ".gemini", "antigravity-cli", "conversations");
 }
 
 interface ConversationFileWatermark {
@@ -436,8 +436,15 @@ export class AntigravityProvider implements CodingProvider {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const command = this.config.cliCommand ?? "agy";
     const selection = resolveAntigravitySelection(this.model, this.effort);
+    // The sandbox overlays the CLI's shared conversations path with this
+    // actor-owned directory. Read it from the same host path so resume, quota
+    // classification, and token accounting observe the sandboxed invocation.
+    const conversationsDir = opts.sandbox
+      ? antigravityActorConversationsDir(opts.cwd)
+      : this.conversationsDir;
+    if (opts.sandbox) mkdirSync(conversationsDir, { recursive: true, mode: 0o700 });
     const incomingDbPath = opts.session?.id
-      ? join(this.conversationsDir, `${opts.session.id}.db`)
+      ? join(conversationsDir, `${opts.session.id}.db`)
       : undefined;
     const generationCursor = incomingDbPath ? agyGenerationCursor(incomingDbPath) : -1;
 
@@ -659,10 +666,7 @@ export class AntigravityProvider implements CodingProvider {
       const sessionId = result.sessionId ?? opts.session?.id;
       const extracted =
         sessionId && generationCursor !== undefined
-          ? extractAgyTokenUsageFromDb(
-              join(this.conversationsDir, `${sessionId}.db`),
-              generationCursor
-            )
+          ? extractAgyTokenUsageFromDb(join(conversationsDir, `${sessionId}.db`), generationCursor)
           : null;
       const model = extracted?.model ?? this.model ?? null;
       return {
@@ -673,7 +677,7 @@ export class AntigravityProvider implements CodingProvider {
       };
     };
     const quotaRefusalWatermarks = opts.session?.id
-      ? conversationWatermarks(opts.session.id, this.conversationsDir)
+      ? conversationWatermarks(opts.session.id, conversationsDir)
       : undefined;
 
     return runSubprocess({
@@ -758,7 +762,7 @@ export class AntigravityProvider implements CodingProvider {
         if (exitCode === 0) {
           const refusal = classifyAntigravityQuotaRefusal(
             sessionId,
-            this.conversationsDir,
+            conversationsDir,
             quotaRefusalWatermarks
           );
           if (refusal) {

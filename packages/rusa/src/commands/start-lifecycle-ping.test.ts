@@ -61,6 +61,9 @@ describe("createStartRetireCleanups", () => {
   it("removes the retired worker workdir and cancels its cron wake", async () => {
     const actorId = "actor-1";
     mkdirSync(join(workersDir, actorId), { recursive: true });
+    // Provider scratch lives inside the actor workdir, so retirement removes
+    // it together with the actor's private checkout rather than accumulating it.
+    writeFileSync(join(workersDir, actorId, ".antigravity-scratch"), "scratch");
     const cancelled: string[] = [];
     const stopped: string[] = [];
     const cleanups = createStartRetireCleanups(
