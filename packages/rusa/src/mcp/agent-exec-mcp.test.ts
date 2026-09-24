@@ -252,7 +252,7 @@ function setup(
   if (opts.seedRootGrants !== false) {
     seedConfiguredActorGrants(capabilityGrants, rootId, () => "2026-01-01T00:00:00Z");
   }
-  return { registry, mesh, events, inboxStore, rootId, capabilityGrants };
+  return { registry, mesh, events, inboxStore, rootId, capabilityGrants, root };
 }
 
 /** Tools that exist only for a holder of an administrative capability. */
@@ -2886,12 +2886,16 @@ describe("runtime model-class management", () => {
       },
     })) as CallToolResult;
     expect(update.isError).toBeFalsy();
+    // The class edit is deliberately not late-bound into existing records.
+    expect(registry.get(firstId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
+    ]);
     const setExisting = (await root.callTool({
       name: "set_actor_model",
       arguments: { actor_id: firstId, model_config: { class: "review" } },
     })) as CallToolResult;
     expect(setExisting.isError).toBeFalsy();
-    expect(registry.get(firstId)?.desiredModelConfig).toEqual([
+    expect(registry.get(firstId)?.modelConfig).toEqual([
       { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
     ]);
     const secondSpawn = (await root.callTool({
@@ -2901,10 +2905,6 @@ describe("runtime model-class management", () => {
     const secondId = (dataOf(secondSpawn) as { thread_id: string }).thread_id;
     expect(registry.get(secondId)?.modelConfig).toEqual([
       { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
-    ]);
-    // The class edit is deliberately not late-bound into existing records.
-    expect(registry.get(firstId)?.modelConfig).toEqual([
-      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
     ]);
     db.close();
   });
@@ -3529,12 +3529,12 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
-    expect(registry.get("root")?.desiredModelConfig).toEqual([
+    expect(registry.get("root")?.modelConfig).toEqual([
       { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
     ]);
   });
 
-  it("set_actor_model stages a full modelConfig replacement via MCP tool", async () => {
+  it("set_actor_model applies a full modelConfig replacement to an idle actor via MCP tool", async () => {
     const { mesh, registry } = setup();
     const childId = mesh.spawn({
       charter: "worker",
@@ -3552,16 +3552,17 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
+    expect((res.content[0] as { text: string }).text).toBe(
+      `applied modelConfig update for ${childId}`
+    );
     expect(registry.get(childId)?.modelConfig).toEqual([
-      { provider: "claude", model: "claude-sonnet-5" },
-    ]);
-    expect(registry.get(childId)?.desiredModelConfig).toEqual([
       { provider: "claude", model: "claude-opus-4-8" },
     ]);
+    expect(registry.get(childId)?.desiredModelConfig).toBeUndefined();
   });
 
   it("set_actor_model lets the root stage its own portable provider and model", async () => {
-    const { mesh, registry } = setup();
+    const { mesh, registry, root: rootActor } = setup();
     const root = registry.get("root");
     if (!root) throw new Error("root record missing");
     registry.upsert({
@@ -3571,12 +3572,18 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    // The root calls this from inside its own run, so the change waits for
+    // that run to end.
+    vi.spyOn(rootActor, "isRunning", "get").mockReturnValue(true);
     const res = (await client.callTool({
       name: "set_actor_model",
       arguments: { actor_id: "root", model_config: { provider: "codex", model: "gpt-5.6-sol" } },
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
+    expect((res.content[0] as { text: string }).text).toBe(
+      "staged modelConfig update for root; applies when its current run ends"
+    );
     expect(registry.get("root")).toMatchObject({
       modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
@@ -3600,7 +3607,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       },
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
-    expect(registry.get(childId)?.desiredModelConfig).toEqual([
+    expect(registry.get(childId)?.modelConfig).toEqual([
       { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
     ]);
   });
@@ -3669,9 +3676,6 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
     expect(res1.isError).toBeFalsy();
     expect(registry.get(portableChild)?.modelConfig).toEqual([
-      { provider: "claude", model: "claude-opus-4-8" },
-    ]);
-    expect(registry.get(portableChild)?.desiredModelConfig).toEqual([
       { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
     ]);
 
@@ -3747,8 +3751,8 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       })) as CallToolResult;
       expect(updateRes.isError).toBeFalsy();
 
-      // Verify staged replacement preserves the first entry's effort and appends the second
-      expect(registry.get(childId)?.desiredModelConfig).toEqual([
+      // Verify the applied replacement preserves the first entry's effort and appends the second
+      expect(registry.get(childId)?.modelConfig).toEqual([
         { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
         { provider: "antigravity", model: "gemini-3.8-flash" },
       ]);
@@ -4015,7 +4019,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         },
       })) as CallToolResult;
       expect(updateRes.isError).toBeFalsy();
-      expect(registry.get(childId)?.desiredModelConfig).toEqual([
+      expect(registry.get(childId)?.modelConfig).toEqual([
         { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
       ]);
     });
