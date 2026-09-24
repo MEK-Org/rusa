@@ -107,6 +107,8 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
 
+type ResponsiveReadyAttention = { id: string; intent: string | null; readyCount?: number };
+
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
   readonly id: string;
@@ -935,11 +937,15 @@ export class ActorMesh {
    * per mutation would trigger eager preemption or require complex mid-run
    * join disambiguation; instead, self-caused attention is deferred until
    * the run finishes, deduplicated per obligation, and flushed into the inbox
-   * if the obligation is still ready and responsive.
+   * if the obligation is still ready and responsive. The buffer is deliberately
+   * transient: a process loss re-derives this durable obligation fact through
+   * boot {@link reconcileResponsiveReadyAttention}; a live run always flushes
+   * through the lifecycle's result or non-result terminal path before another
+   * run opens its window.
    */
   private readonly runResponsiveReadyAttention = new Map<
     string,
-    Map<string, { id: string; intent: string | null; readyCount?: number }>
+    Map<string, ResponsiveReadyAttention>
   >();
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
@@ -1814,22 +1820,7 @@ export class ActorMesh {
       ) {
         continue;
       }
-      const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
-      const entryId = deduplicatedInboxEntryId(
-        `obligation-ready-responsive:${obligation.id}${episodeKey}`,
-        actorId
-      );
-      entries.push({
-        id: entryId,
-        actorId,
-        source: `obligation:${obligation.id}`,
-        payload: {
-          type: "obligation.ready_responsive",
-          obligationId: obligation.id,
-          intent: obligation.intent ?? undefined,
-          priority: "responsive",
-        } as unknown as InboxPayload,
-      });
+      entries.push(this.responsiveReadyAttentionEntry(actorId, obligation));
     }
     if (entries.length > 0) this.inboxStore.append(entries);
   }
@@ -1951,9 +1942,30 @@ export class ActorMesh {
    * `readyCount` makes every new episode a distinct entry; a replay of the
    * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
    */
+  private responsiveReadyAttentionEntry(
+    actorId: string,
+    obligation: ResponsiveReadyAttention
+  ): InboxAppendInput {
+    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
+    return {
+      id: deduplicatedInboxEntryId(
+        `obligation-ready-responsive:${obligation.id}${episodeKey}`,
+        actorId
+      ),
+      actorId,
+      source: `obligation:${obligation.id}`,
+      payload: {
+        type: "obligation.ready_responsive",
+        obligationId: obligation.id,
+        intent: obligation.intent ?? undefined,
+        priority: "responsive",
+      } as unknown as InboxPayload,
+    };
+  }
+
   deliverResponsiveReadyAttention(
     ownerId: string,
-    obligation: { id: string; intent: string | null; readyCount?: number },
+    obligation: ResponsiveReadyAttention,
     /**
      * The owner made its own obligation ready mid-run: defer delivery until the
      * end of the run (#632). Generalizes the ready-head deferral principle: an
@@ -1961,6 +1973,9 @@ export class ActorMesh {
      * actions. When the run finishes, flushRunResponsiveReadyAttention delivers
      * entries for any obligations that remain ready.
      * Any other cause is external responsive work and preempts immediately.
+     * This path only covers the ready-responsive sink that carries its acting
+     * principal; self-scheduled messages and event fan-out have separate
+     * delivery semantics and remain outside this slice.
      */
     selfCausedMidRun = false
   ): boolean {
@@ -1984,23 +1999,8 @@ export class ActorMesh {
       return true;
     }
 
-    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
-    const entryId = deduplicatedInboxEntryId(
-      `obligation-ready-responsive:${obligation.id}${episodeKey}`,
-      actorId
-    );
     const entries = this.inboxStore.append([
-      {
-        id: entryId,
-        actorId,
-        source: `obligation:${obligation.id}`,
-        payload: {
-          type: "obligation.ready_responsive",
-          obligationId: obligation.id,
-          intent: obligation.intent ?? undefined,
-          priority: "responsive",
-        } as unknown as InboxPayload,
-      },
+      this.responsiveReadyAttentionEntry(actorId, obligation),
     ]);
     if (entries.length === 0) return false;
     this.dispatch(actorId);

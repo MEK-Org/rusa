@@ -2080,6 +2080,60 @@ describe("ActorMesh", () => {
     ).toBe(false);
   });
 
+  it("reconciles self-caused responsive attention deferred by a process loss (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    let worker = "";
+    let runIndex = 0;
+    const provider = new FakeProvider(() => {
+      if (runIndex++ === 0) return new Promise<Partial<RunResult>>(() => {});
+      return { success: true, exitCode: 0, output: "restarted" };
+    });
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: "ready",
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
+    const first = setup({ actors, inboxStore, sharedProvider: provider, obligations });
+    worker = first.mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    first.mesh.dispatch(worker);
+    await first.tick();
+    expect(
+      first.mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-recovered", intent: "survives restart" },
+        true
+      )
+    ).toBe(true);
+    expect(inboxStore.entries.some((entry) => entry.source === "obligation:ob-recovered")).toBe(
+      false
+    );
+
+    // A restart loses the transient buffer, then rehydrates actors and derives
+    // the still-ready responsive fact from durable obligation state.
+    const restarted = setup({ actors, inboxStore });
+    restarted.mesh.rehydrateAll();
+    restarted.mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-recovered", ownerId: worker, intent: "survives restart" },
+      ],
+    });
+    await restarted.tick();
+
+    expect(
+      inboxStore.entries.filter(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-recovered"
+      )
+    ).toHaveLength(1);
+  });
+
   it("preempts active run when responsive ready attention is external (#632)", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
