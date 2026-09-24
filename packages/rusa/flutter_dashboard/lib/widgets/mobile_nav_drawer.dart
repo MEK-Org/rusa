@@ -19,6 +19,7 @@ class MobileNavDrawer extends StatelessWidget {
     this.quotaProviders = kDefaultQuotaProviders,
     this.onLogout,
     this.profilePhotoUrl,
+    this.profileDisplayName,
   });
 
   final DashboardStore store;
@@ -32,6 +33,7 @@ class MobileNavDrawer extends StatelessWidget {
   final Map<String, QuotaProviderConfig> quotaProviders;
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
+  final String? profileDisplayName;
 
   @override
   Widget build(BuildContext context) {
@@ -122,6 +124,7 @@ class MobileNavDrawer extends StatelessWidget {
                           ProfileMenu(
                             key: const ValueKey('drawer-account'),
                             photoUrl: profilePhotoUrl,
+                            displayName: profileDisplayName,
                             onLogout: onLogout!,
                             showLabel: true,
                           ),

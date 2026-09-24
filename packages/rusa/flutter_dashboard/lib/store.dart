@@ -163,6 +163,7 @@ class DashboardStore {
     ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
+    this.operatorDisplayName,
   }) : _api = api,
        _stream = stream,
        _quotaCache = quotaCache ?? const NoopQuotaCache(),
@@ -302,6 +303,15 @@ class DashboardStore {
   /// Null means unsupported (headless harnesses/tests) — `pickAndUploadAvatar`
   /// then reports a clear error instead of picking a file.
   final AvatarFilePicker? avatarFilePicker;
+
+  /// Authenticated profile text for presentation only; never an owner id.
+  final String? operatorDisplayName;
+
+  String get operatorDisplayLabel {
+    final label = operatorDisplayName?.trim();
+    return label == null || label.isEmpty ? 'Operator' : label;
+  }
+
   final _subs = <StreamSubscription<dynamic>>[];
 
   final _actorStates = BehaviorSubject<ActorStateSnapshot>.seeded(
@@ -453,16 +463,26 @@ class DashboardStore {
   /// `human:*` prefix, or the server-resolved durable user principal.
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
+  /// Whether [id] names the viewing person under either of their ids.
+  bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
+
   /// Resolves an actor/thread/principal id to a display label.
-  String actorDisplay(String id) =>
-      actorDisplayLabel(id, (i) => actor(i)?.handle, isHuman);
+  String actorDisplay(String id) => actorDisplayLabel(
+    id,
+    (i) => actor(i)?.handle,
+    isViewer,
+    operatorDisplayName,
+  );
 
   /// [actorDisplay] for the compact owner lines (row owner, blocker, reassign
   /// dialog), which keep showing the raw id for an actor the mesh view does
   /// not know rather than "Unknown actor" — that fallback predates #538 and
   /// is what the overview's blocker line is pinned to.
-  String ownerLabel(String id) =>
-      isHuman(id) ? 'Operator' : (actor(id)?.handle ?? id);
+  String ownerLabel(String id) => isViewer(id)
+      ? operatorDisplayLabel
+      : isHuman(id)
+      ? 'Operator'
+      : (actor(id)?.handle ?? id);
 
   void setWalkieActive(bool active) {
     if (!_walkieActive.isClosed) {

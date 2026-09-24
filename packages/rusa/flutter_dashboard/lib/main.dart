@@ -67,6 +67,7 @@ class _DashboardPageState extends State<DashboardPage> {
       treePreferencesCache: WebTreePreferencesCache(),
       actorHierarchyCache: WebActorHierarchyCache(),
       obligationsCache: WebObligationsCache(),
+      operatorDisplayName: widget.session.operatorDisplayName,
       walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );

@@ -57,7 +57,16 @@ class _FirebaseSessionUser implements SessionUser {
   final User _user;
 
   @override
+  String get uid => _user.uid;
+
+  @override
   String? get photoUrl => _user.photoURL;
+
+  @override
+  String? get displayName => _user.displayName;
+
+  @override
+  String? get email => _user.email;
 
   @override
   Future<String> getIdToken({bool forceRefresh = false}) async {

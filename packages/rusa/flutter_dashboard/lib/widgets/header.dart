@@ -151,11 +151,13 @@ class MeshHeader extends StatelessWidget {
     this.detailActor,
     this.onLogout,
     this.profilePhotoUrl,
+    this.profileDisplayName,
   });
 
   final DashboardStore store;
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
+  final String? profileDisplayName;
 
   /// Which top-level view is active (drives the nav highlight).
   final DashboardView selected;
@@ -366,6 +368,7 @@ class MeshHeader extends StatelessWidget {
                           const SizedBox(width: 10),
                           ProfileMenu(
                             photoUrl: profilePhotoUrl,
+                            displayName: profileDisplayName,
                             onLogout: onLogout!,
                           ),
                         ],
@@ -404,12 +407,14 @@ class ProfileMenu extends StatelessWidget {
   const ProfileMenu({
     super.key,
     this.photoUrl,
+    this.displayName,
     required this.onLogout,
     this.showLabel = false,
     this.tooltip,
   });
 
   final String? photoUrl;
+  final String? displayName;
   final VoidCallback onLogout;
   final bool showLabel;
   final String? tooltip;
@@ -459,9 +464,13 @@ class ProfileMenu extends StatelessWidget {
             children: [
               avatar,
               const SizedBox(width: 12),
-              const Text(
-                'Account',
-                style: TextStyle(
+              Text(
+                displayName?.trim().isNotEmpty == true
+                    ? displayName!.trim()
+                    : 'Account',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
                   color: MeshColors.textPrimary,
                   fontSize: 15,
                   fontWeight: FontWeight.w500,

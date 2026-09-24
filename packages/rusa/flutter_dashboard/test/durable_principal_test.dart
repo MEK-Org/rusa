@@ -247,6 +247,29 @@ void main() {
       expect(isOperatorOwnerText(' operator ', kDurableUser), isTrue);
       expect(isOperatorOwnerText(kDurableUser, kDurableUser), isTrue);
       expect(isOperatorOwnerText('cloudy-porpoise', kDurableUser), isFalse);
+      // A profile label is presentation data, not a principal alias: a real
+      // actor is allowed to have the same handle without becoming the viewer.
+      expect(isOperatorOwnerText('Ada Lovelace', kDurableUser), isFalse);
+    });
+
+    test('the viewer profile label covers both of their ids', () async {
+      final api = FakeApi()
+        ..dashboardConfigResult = _configWithUser(kDurableUser);
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        operatorDisplayName: 'Ada Lovelace',
+      );
+      await store.init();
+      await store.refreshDashboardConfig();
+      addTearDown(store.dispose);
+
+      expect(store.actorDisplay(kDurableUser), 'Ada Lovelace');
+      expect(store.actorDisplay(kLegacyOperatorPrincipalId), 'Ada Lovelace');
+      expect(store.actorDisplay('human:another-user'), 'Operator');
+      expect(store.ownerLabel(kDurableUser), 'Ada Lovelace');
+      expect(store.ownerLabel(kLegacyOperatorPrincipalId), 'Ada Lovelace');
+      expect(store.ownerLabel('human:another-user'), 'Operator');
     });
   });
 }
