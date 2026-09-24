@@ -256,7 +256,9 @@ describe("ObligationRepository", () => {
           blockedBy: ["gate"],
           responsive: true,
         });
-        expect(announced).toEqual([]);
+        // The gate now blocks responsive work, so it is urgent itself (#674).
+        expect(announced).toEqual([{ id: "gate", actingPrincipal: "system:mesh" }]);
+        announced.length = 0;
 
         repository.setTerminalStatus("gate", "done", null, null, "system:mesh");
         expect(repository.require("gate").status).toBe("done");
@@ -573,6 +575,221 @@ describe("ObligationRepository", () => {
         repository.setTerminalStatus("child", "done", null, null, "system:mesh");
         expect(repository.require("hotfix")).toMatchObject({ status: "ready", readyCount: 2 });
       });
+    });
+  });
+
+  describe("responsive blockers (#674)", () => {
+    let announced: string[];
+    let headChanges: Array<{ ownerId: string; headId: string | null; responsive: boolean }>;
+    const effective = (...ids: string[]) =>
+      ids.map((id) => repository.require(id).effectiveResponsive);
+
+    beforeEach(() => {
+      announced = [];
+      headChanges = [];
+      repository.setResponsiveReadyListener((obligation) => announced.push(obligation.id));
+      repository.setReadyHeadListener(({ ownerId, head }) =>
+        headChanges.push({
+          ownerId,
+          headId: head?.id ?? null,
+          responsive: head?.effectiveResponsive ?? false,
+        })
+      );
+    });
+
+    it("makes direct and transitive prerequisites responsive, and escalates a ready head in place", () => {
+      repository.create({ title: "a", id: "a", ownerId: "actor-b" });
+      repository.create({ title: "b", id: "b", ownerId: "actor-b", blockedBy: ["a"] });
+      repository.create({ title: "unrelated", id: "unrelated", ownerId: "actor-c" });
+      expect(effective("a", "b")).toEqual([false, false]);
+      headChanges.length = 0;
+
+      repository.create({
+        title: "c",
+        id: "c",
+        ownerId: "actor-a",
+        blockedBy: ["b"],
+        responsive: true,
+      });
+
+      expect(repository.require("b").status).toBe("waiting");
+      expect(effective("c", "b", "a", "unrelated")).toEqual([true, true, true, false]);
+      // Neither blocker row carries the explicit flag: the urgency is derived.
+      expect(repository.require("a").responsive).toBeNull();
+      expect(repository.require("b").responsive).toBeNull();
+      // `a` is actor-b's head and stays in place, so its owner hears through a
+      // responsive head change rather than a separate entry.
+      expect(headChanges).toContainEqual({ ownerId: "actor-b", headId: "a", responsive: true });
+      expect(announced).toEqual([]);
+    });
+
+    it("carries urgency to a waiting blocker's ready descendants", () => {
+      repository.create({ title: "head", id: "head", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
+      repository.create({
+        title: "blocker child",
+        id: "blocker-child",
+        ownerId: "actor-b",
+        parentId: "blocker",
+      });
+      expect(repository.require("blocker").status).toBe("waiting");
+
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["blocker"],
+        responsive: true,
+      });
+
+      expect(effective("blocker", "blocker-child", "head")).toEqual([true, true, false]);
+      expect(announced).toEqual(["blocker-child"]);
+      expect(repository.listResponsiveReadyAttention().map((o) => o.id)).toEqual(["blocker-child"]);
+    });
+
+    it("announces an already-ready blocker when an edge or the dependent changes", () => {
+      repository.create({ title: "head", id: "head", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "edge later", id: "edge-later", ownerId: "actor-b", priority: 2 });
+      repository.create({ title: "marked", id: "marked", ownerId: "actor-b", priority: 3 });
+      repository.create({
+        title: "urgent",
+        id: "urgent",
+        ownerId: "actor-a",
+        responsive: true,
+      });
+      repository.create({
+        title: "plain dependent",
+        id: "plain-dependent",
+        ownerId: "actor-a",
+        blockedBy: ["marked"],
+      });
+      expect(announced).toEqual([]);
+
+      repository.addPrerequisite("urgent", "edge-later", "actor-a");
+      expect(repository.require("urgent").status).toBe("waiting");
+      expect(effective("edge-later", "marked")).toEqual([true, false]);
+      expect(announced).toEqual(["edge-later"]);
+
+      repository.markResponsive("plain-dependent", "system:mesh");
+      expect(effective("marked")).toEqual([true]);
+      expect(announced).toEqual(["edge-later", "marked"]);
+    });
+
+    it("keeps a shared blocker responsive until its last responsive dependent stops waiting", () => {
+      repository.create({ title: "shared", id: "shared", ownerId: "actor-b" });
+      repository.create({
+        title: "first",
+        id: "first",
+        ownerId: "actor-a",
+        blockedBy: ["shared"],
+        responsive: true,
+      });
+      repository.create({
+        title: "second",
+        id: "second",
+        ownerId: "actor-c",
+        blockedBy: ["shared"],
+        responsive: true,
+      });
+      expect(effective("shared")).toEqual([true]);
+
+      repository.removePrerequisite("first", "shared", "actor-a");
+      expect(effective("shared")).toEqual([true]);
+
+      repository.setTerminalStatus("second", "cancelled", null, null, "actor-c");
+      expect(effective("shared")).toEqual([false]);
+    });
+
+    it("drops inherited urgency when a path clears, is removed, or is cancelled", () => {
+      // Clearing: a completed prerequisite no longer carries the edge, and the
+      // re-released middle link stays urgent only while `top` still waits on it.
+      repository.create({ title: "bottom", id: "bottom", ownerId: "actor-b" });
+      repository.create({
+        title: "middle",
+        id: "middle",
+        ownerId: "actor-b",
+        blockedBy: ["bottom"],
+      });
+      repository.create({
+        title: "top",
+        id: "top",
+        ownerId: "actor-a",
+        blockedBy: ["middle"],
+        responsive: true,
+      });
+      repository.setTerminalStatus("bottom", "done", null, null, "actor-b");
+      expect(repository.require("middle").status).toBe("ready");
+      expect(effective("middle", "bottom")).toEqual([true, false]);
+
+      // Removing the edge releases the blocker.
+      repository.removePrerequisite("top", "middle", "actor-a");
+      expect(effective("middle")).toEqual([false]);
+
+      // Cancelling the middle of a chain releases everything below it.
+      repository.create({ title: "base", id: "base", ownerId: "actor-b" });
+      repository.create({ title: "link", id: "link", ownerId: "actor-b", blockedBy: ["base"] });
+      repository.create({
+        title: "tip",
+        id: "tip",
+        ownerId: "actor-a",
+        blockedBy: ["link"],
+        responsive: true,
+      });
+      expect(effective("link", "base")).toEqual([true, true]);
+      repository.setTerminalStatus("link", "cancelled", null, null, "actor-b");
+      expect(effective("base")).toEqual([false]);
+    });
+
+    it("re-derives the same effective state and attention after a restart", () => {
+      repository.create({ title: "head", id: "head", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["blocker"],
+        responsive: true,
+      });
+      const attentionBefore = repository.listResponsiveReadyAttention().map((o) => o.id);
+      expect(attentionBefore).toEqual(["blocker"]);
+
+      const reloaded = new ObligationRepository(
+        db,
+        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
+        () => now++
+      );
+      expect(reloaded.require("blocker")).toMatchObject({
+        responsive: null,
+        effectiveResponsive: true,
+      });
+      expect(reloaded.listResponsiveReadyAttention().map((o) => o.id)).toEqual(attentionBefore);
+      expect(reloaded.readyHeadRecords()).toContainEqual({
+        ownerId: "actor-b",
+        headId: "head",
+        responsive: false,
+      });
+    });
+
+    it("gives unrelated and ordinarily blocked work no responsive handling", () => {
+      repository.create({ title: "head", id: "head", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b", priority: 2 });
+      repository.create({
+        title: "ordinary dependent",
+        id: "ordinary",
+        ownerId: "actor-b",
+        blockedBy: ["prereq"],
+      });
+      repository.create({ title: "bystander", id: "bystander", ownerId: "actor-c" });
+      repository.create({ title: "urgent", id: "urgent", ownerId: "actor-a", responsive: true });
+
+      expect(effective("prereq", "ordinary", "bystander", "head")).toEqual([
+        false,
+        false,
+        false,
+        false,
+      ]);
+      expect(announced).toEqual([]);
+      expect(repository.listResponsiveReadyAttention()).toEqual([]);
     });
   });
 
