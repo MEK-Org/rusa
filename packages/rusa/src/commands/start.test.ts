@@ -3132,6 +3132,181 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
+  async function startClaudeChatHaltService() {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    const message = (text: string, name: string) =>
+      chatSource.emit({
+        name,
+        spaceName: "spaces/test",
+        spaceType: "DIRECT_MESSAGE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text,
+        mentionsSelf: false,
+        isDirectMessage: true,
+      });
+    return { chatClient, message };
+  }
+
+  it("validates /halt model: against the provider's scraped catalog, not the live pools", async () => {
+    // Claude has no model probe; its catalog on a live mesh is a durable
+    // `model_scrapes` row, which startup restores. Seed exactly that, so the
+    // gate below reads the catalog through the production restore path.
+    // `claude-opus-5` is in the catalog and in no actor's pool: only the root
+    // runs, and it runs claude-sonnet-5.
+    initDb(homeDir);
+    const scrapes = getRepositories().modelScrapes;
+    const scrapeId = scrapes.recordRaw({
+      provider: "claude",
+      scrapedAt: new Date().toISOString(),
+      rawOutput: "recorded claude model list",
+    });
+    scrapes.recordParsed(scrapeId, [
+      { displayLabel: "Claude Sonnet 5", identifier: "claude-sonnet-5", passable: true },
+      { displayLabel: "Claude Opus 5", identifier: "claude-opus-5", passable: true },
+    ]);
+    closeDb();
+    const { chatClient, message } = await startClaudeChatHaltService();
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // The premise this gate was rebuilt on. Nothing is running claude-opus-5,
+    // so a pool-based check would have refused this --- but the provider knows
+    // the model, and holding it before a rollout is exactly what an operator
+    // wants to do. It is accepted.
+    await message("/halt provider:claude model:claude-opus-5", "messages/halt-idle-model");
+    const idleAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(idleAck).toContain("Halted");
+    expect(idleAck).not.toContain("rejected");
+    expect(halt.isHalted("claude", "claude-opus-5")).toBe(true);
+    await message("/resume", "messages/resume-idle");
+    expect(halt.isHalted()).toBe(false);
+
+    // A transposed suffix: no run can ever be launched on this name, so a hold
+    // on it would be inert for every caller that can name its model.
+    await message("/halt provider:claude model:claude-sonnet-5-hihg", "messages/halt-typo");
+    const typoAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(typoAck).toContain("rejected");
+    expect(typoAck).toContain("claude-sonnet-5-hihg");
+    // The closest catalog entry is what the operator retypes.
+    expect(typoAck).toContain("closest: claude-sonnet-5");
+    // No hold at all: not on the misspelling, not on anything.
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5-hihg")).toBe(false);
+
+    // #630's sharp end. The refusal never took the single sentinel, so the
+    // corrected halt lands immediately --- with no /resume in between.
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-correct");
+    const correctAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(correctAck).toContain("Halted");
+    expect(correctAck).not.toContain("rejected");
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+
+    await message("/resume", "messages/resume-correct");
+    expect(halt.isHalted()).toBe(false);
+
+    // A comma list is refused whole. Holding the half that matched would leave
+    // the operator believing a scope they named is held when it is not.
+    await message(
+      "/halt provider:claude model:claude-sonnet-5,claude-sonnet-5-hihg",
+      "messages/halt-partial-list"
+    );
+    const partialAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(partialAck).toContain("rejected");
+    expect(partialAck).toContain("claude-sonnet-5-hihg");
+    expect(partialAck).toContain("No hold was placed");
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+
+    // Catalog membership is checked per requested provider/model pair. Codex
+    // has no recorded catalog, but Claude's catalog used to make this union
+    // check pass and falsely acknowledge a Codex hold. The rejection still
+    // leaves the sentinel free for the correctly scoped command.
+    await message(
+      "/halt provider:claude,codex model:claude-sonnet-5",
+      "messages/halt-mixed-provider-catalog"
+    );
+    const mixedAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(mixedAck).toContain("codex:claude-sonnet-5");
+    expect(mixedAck).toContain("No model catalog is recorded for codex");
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+    expect(halt.isHalted("codex", "claude-sonnet-5")).toBe(false);
+
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-after-mixed");
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+    await message("/resume", "messages/resume-after-mixed");
+    expect(halt.isHalted()).toBe(false);
+
+    clearProviderModelCatalog();
+  });
+
+  it("refuses a model-scoped claude halt on a mesh with no recorded claude catalog", async () => {
+    clearProviderModelCatalog();
+    const { chatClient, message } = await startClaudeChatHaltService();
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // A fresh install: no probe fills claude's catalog and no row has been
+    // recorded, so even the root's own model is unlisted. Refused by design,
+    // and the refusal says why and names the halt that still works.
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-uncatalogued");
+    const ack = chatClient.sent.at(-1)?.text ?? "";
+    expect(ack).toContain("rejected");
+    expect(ack).toContain("No model catalog is recorded for claude");
+    expect(ack).toContain("/halt provider:claude halts the whole provider");
+    expect(ack).not.toContain("closest:");
+    expect(halt.isHalted()).toBe(false);
+
+    await message("/halt provider:claude", "messages/halt-provider-wide");
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    expect(halt.isHalted("claude")).toBe(true);
+  });
+
+  it("answers an unparseable /halt with the syntax it accepts", async () => {
+    const { chatClient, message } = await startClaudeChatHaltService();
+
+    await message("/halt models:claude-sonnet-5", "messages/halt-typo-option");
+    const rejection = chatClient.sent.at(-1)?.text ?? "";
+    expect(rejection).toContain("unknown halt option");
+    // The operator mistyped the grammar, so the reply carries the grammar:
+    // both the provider-wide and the model-scoped form.
+    expect(rejection).toContain("/halt provider:");
+    expect(rejection).toContain("model:");
+    expect(new HaltSwitch(join(homeDir, "HALT")).isHalted()).toBe(false);
+  });
+
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
     const config = {

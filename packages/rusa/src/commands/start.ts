@@ -52,7 +52,13 @@ import {
   routeRunFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
-import { type HaltCommand, HaltSwitch, parseHaltCommand } from "../actor/halt-switch.js";
+import {
+  findUncataloguedHaltModels,
+  HALT_SYNTAX_HELP,
+  type HaltCommand,
+  HaltSwitch,
+  parseHaltCommand,
+} from "../actor/halt-switch.js";
 import {
   DEFAULT_ROOT_CHARTER,
   generateHandle,
@@ -208,7 +214,11 @@ import {
 import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
-import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import {
+  acceptableModelPins,
+  ingestKimiHostModels,
+  populateModelCatalogsFromDb,
+} from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import {
   describeModelConfigEntry,
@@ -3928,7 +3938,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         void cc
           .send(
             msg.spaceName,
-            `⛔ Halt command rejected: ${err instanceof Error ? err.message : String(err)}.`
+            `⛔ Halt command rejected: ${err instanceof Error ? err.message : String(err)}.` +
+              ` ${HALT_SYNTAX_HELP}`
           )
           .catch(() => {});
         return;
@@ -3949,6 +3960,76 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         if (haltCommand.until && Date.parse(haltCommand.until) <= Date.now()) {
           void cc
             .send(msg.spaceName, "⛔ Halt command rejected: until must be in the future.")
+            .catch(() => {});
+          return;
+        }
+        // A `model:` scope the provider's catalog does not list is a hold no
+        // run can ever meet, and taking the single halt sentinel for it is
+        // #630: the corrected halt is then refused until the inert one is
+        // resumed. Refuse instead, and offer back what to retype. This sits
+        // above `haltSwitch.halt` deliberately — below it, the sentinel, the
+        // queued-run flush, and the expiry timer would all have happened for a
+        // command being declined.
+        //
+        // The catalog, not the live pools: Rusa restores provider catalogs from
+        // durable `model_scrapes` at startup, so an idle provider still knows
+        // its models. Gating on which models some actor happens to be running
+        // would refuse a perfectly legitimate pre-emptive halt for no reason
+        // but timing. Not every provider has a probe that refreshes its row —
+        // claude has none, so its catalog is only whatever rows the operator
+        // has recorded, and a mesh with none refuses every model-scoped claude
+        // halt. That is the rule as asked for (#630): a model the database
+        // does not list is refused, and the provider-wide halt stays open.
+        // A provider/model halt is a Cartesian scope: `provider:claude,codex
+        // model:claude-sonnet-5` claims to hold that model for both providers.
+        // Do not validate against the union of their catalogs: that would let
+        // Claude make the command look valid while its Codex half is still an
+        // inert, acknowledged hold.
+        const providers = haltCommand.providers ?? [];
+        const models = haltCommand.models ?? [];
+        const uncatalogued = providers.flatMap((provider) => {
+          const catalogued = acceptableModelPins(provider) ?? [];
+          return findUncataloguedHaltModels(models, catalogued).map((model) => ({
+            provider,
+            catalogued,
+            ...model,
+          }));
+        });
+        if (uncatalogued.length > 0) {
+          const named = uncatalogued
+            .map(({ provider, model, nearest }) =>
+              nearest.length
+                ? `${provider}:${model} (closest: ${nearest.join(", ")})`
+                : `${provider}:${model}`
+            )
+            .join(", ");
+          // With nothing to suggest, the useful facts are *why* — a provider
+          // with no recorded models, not a misspelled name — and what still
+          // works. Keep that provider-specific when a multi-provider command
+          // mixes a catalogued provider with one that has no catalog.
+          const emptyCatalogProviders = [
+            ...new Set(
+              uncatalogued
+                .filter(({ catalogued }) => catalogued.length === 0)
+                .map(({ provider }) => provider)
+            ),
+          ];
+          const why = emptyCatalogProviders.length
+            ? ` No model catalog is recorded for ${emptyCatalogProviders.join(", ")}; /halt provider:${emptyCatalogProviders.join(",")} halts the whole provider.`
+            : "";
+          // A comma list is refused whole. Holding the half that matched would
+          // leave a named scope unheld while the acknowledgement implied
+          // otherwise. That is equally true when only some provider/model
+          // pairs in a multi-provider scope matched.
+          const partial =
+            uncatalogued.length < providers.length * models.length
+              ? " No hold was placed, including for the provider/model scopes that did match."
+              : " No hold was placed.";
+          void cc
+            .send(
+              msg.spaceName,
+              `⛔ Halt command rejected: the provider model catalogs do not list ${named}.${why}${partial}`
+            )
             .catch(() => {});
           return;
         }
