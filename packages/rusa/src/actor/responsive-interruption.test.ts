@@ -1,30 +1,87 @@
 import { describe, expect, it } from "vitest";
 import {
-  type JevChoiceClient,
+  AMBIGUOUS_FIXTURE,
+  CLEAR_MATCH_FIXTURE,
+  type FixtureEntry,
+  type ResponsiveInterruptionFixture,
+  SCALE_FIXTURE,
+} from "./fixtures/responsive-interruption.js";
+import {
+  type JevDecisionClient,
+  type JevDecisionRequest,
+  SHADOW_INTERRUPT_EMOJI,
+  SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
+  shadowPrediction,
+  shadowReactionTarget,
+  shadowVerdictEmoji,
 } from "./responsive-interruption.js";
 
+/**
+ * A client that answers from the fixture bodies rather than from ids, so a
+ * passing test means the decision shape carried real reasoning through — not
+ * that a stub recognised a name. It scores overlap of content words and is
+ * confident only when one candidate leads the field.
+ */
+function fixtureClient(fixture: ResponsiveInterruptionFixture): JevDecisionClient {
+  const byId = new Map<string, FixtureEntry>(
+    [fixture.incoming, ...fixture.candidates].map((entry) => [entry.id, entry])
+  );
+  const words = (text: string) =>
+    new Set(
+      text
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((word) => word.length > 3)
+    );
+  return {
+    decide: async (request) => {
+      const incoming = words(byId.get(request.input.incomingEntryId)?.body ?? "");
+      const scored = request.input.candidateEntryIds
+        .map((id) => {
+          const candidate = words(byId.get(id)?.body ?? "");
+          let shared = 0;
+          for (const word of incoming) if (candidate.has(word)) shared++;
+          return { id, score: shared };
+        })
+        .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+      const best = scored[0];
+      const runnerUp = scored[1];
+      if (!best || best.score === 0) return { verdict: "queue", confidence: 0.95 };
+      // A lead over the field is what makes a match a match. Without one this
+      // fake still leans toward interrupting, but says how weakly through its
+      // confidence: the confident guess the classifier's threshold exists to
+      // turn back. A fake that answered `queue` here would pass with the
+      // threshold deleted.
+      const lead = best.score - (runnerUp?.score ?? 0);
+      return {
+        verdict: "interrupt",
+        confidence: lead >= 2 ? 0.94 : 0.41,
+        rationale: `overlap ${best.score}, lead ${lead}`,
+        matchedCandidateIds:
+          lead >= 2 ? [best.id] : scored.filter((c) => c.score === best.score).map((c) => c.id),
+      };
+    },
+  };
+}
+
+const client = (decide: JevDecisionClient["decide"]): JevDecisionClient => ({ decide });
+
 describe("ShadowResponsiveInterruptionClassifier", () => {
-  it("uses two closed choices over stable inbox ids and emits a redacted queue decision", async () => {
-    const calls: Array<{ id: string; choices: readonly string[]; input: unknown }> = [];
-    const client: JevChoiceClient = {
-      choose: async (request) => {
-        calls.push(request);
-        if (request.id === "comparison") {
-          return {
-            choice: "selected-a",
-            confidence: 0.96,
-            probabilities: { "selected-a": 0.96 } as Record<string, number>,
-          };
-        }
+  it("asks one open-ended decision over the candidate ids and audits ids only", async () => {
+    const asked: JevDecisionRequest[] = [];
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: client(async (request) => {
+        asked.push(request);
         return {
-          choice: "unrelated",
-          confidence: 0.98,
-          probabilities: { unrelated: 0.98 } as Record<string, number>,
+          verdict: "interrupt",
+          confidence: 0.91,
+          rationale: "the arriving item cancels selected-a",
+          matchedCandidateIds: ["selected-a"],
         };
-      },
-    };
-    const classifier = new ShadowResponsiveInterruptionClassifier({ client, threshold: 0.8 });
+      }),
+    });
 
     const decision = await classifier.evaluate({
       incomingEntryId: "incoming-z",
@@ -32,38 +89,23 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       pendingEntryIds: ["pending-c"],
     });
 
-    expect(calls).toEqual([
-      {
-        id: "comparison",
-        choices: ["selected-a", "selected-b", "none"],
-        input: {
-          incomingEntryId: "incoming-z",
-          comparisonEntryIds: ["selected-a", "selected-b"],
-          phase: "comparison",
-        },
-      },
-      {
-        id: "relation",
-        choices: ["reversal", "refinement", "correction", "cancellation", "unrelated"],
-        input: {
-          incomingEntryId: "incoming-z",
-          comparisonEntryId: "selected-a",
-          phase: "relation",
-        },
-      },
-    ]);
-    expect(decision).toEqual({
-      outcome: "queue",
+    // One call, not a comparison round followed by a relation round.
+    expect(asked).toHaveLength(1);
+    expect(asked[0].input).toEqual({
       incomingEntryId: "incoming-z",
-      comparisonEntryId: "selected-a",
-      relation: "unrelated",
+      candidateEntryIds: ["selected-a", "selected-b"],
+      candidateSource: "selected",
+    });
+    expect(asked[0].question).toContain("should we interrupt");
+
+    expect(decision).toEqual({
+      outcome: "interrupt",
+      verdict: "interrupt",
+      confidence: 0.91,
+      matchedCandidateIds: ["selected-a"],
+      incomingEntryId: "incoming-z",
+      candidateSource: "selected",
       threshold: 0.8,
-      comparison: { choice: "selected-a", confidence: 0.96, probabilities: { "selected-a": 0.96 } },
-      relationDecision: {
-        choice: "unrelated",
-        confidence: 0.98,
-        probabilities: { unrelated: 0.98 },
-      },
       input: {
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a", "selected-b"],
@@ -72,138 +114,18 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
   });
 
-  it("compares against unselected rows only when nothing is selected", async () => {
-    const offered: Array<readonly string[]> = [];
-    const client: JevChoiceClient = {
-      choose: async (request) => {
-        if (request.id === "comparison") {
-          offered.push(request.choices);
-          return { choice: "pending-c", confidence: 1 };
-        }
-        return { choice: "refinement", confidence: 1 };
-      },
-    };
-    const classifier = new ShadowResponsiveInterruptionClassifier({ client, threshold: 0.8 });
-
-    await expect(
-      classifier.evaluate({
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: [],
-        pendingEntryIds: ["pending-c"],
-      })
-    ).resolves.toMatchObject({ outcome: "interrupt", comparisonEntryId: "pending-c" });
-    expect(offered).toEqual([["pending-c", "none"]]);
-  });
-
-  it("reports an unavailable decision when no client is wired", async () => {
-    const classifier = new ShadowResponsiveInterruptionClassifier({ threshold: 0.8 });
-
-    await expect(
-      classifier.evaluate({
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: ["selected-a"],
-        pendingEntryIds: ["pending-c"],
-      })
-    ).resolves.toEqual({
-      outcome: "queue",
-      reason: "unavailable",
-      incomingEntryId: "incoming-z",
-      comparisonEntryId: null,
-      relation: null,
-      threshold: 0.8,
-      input: {
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: ["selected-a"],
-        pendingEntryIds: ["pending-c"],
-      },
-    });
-  });
-
-  it("queues without asking when nothing can be compared against", async () => {
-    let asked = false;
+  it("keeps the model's prose out of the decision entirely", async () => {
+    // The rationale is useful to a human reading a live response and is exactly
+    // the field that could smuggle message text into a durable record. The
+    // seam accepts it; the decision never carries it.
     const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async () => {
-          asked = true;
-          return { choice: "none", confidence: 1 };
-        },
-      },
       threshold: 0.8,
-    });
-
-    await expect(
-      classifier.evaluate({
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: [],
-        pendingEntryIds: [],
-      })
-    ).resolves.toMatchObject({ outcome: "queue", reason: "no_comparison" });
-    expect(asked).toBe(false);
-  });
-
-  it("distinguishes a malformed confidence from an out-of-set choice", async () => {
-    const evaluate = (response: { choice: string; confidence: number }) =>
-      new ShadowResponsiveInterruptionClassifier({
-        client: { choose: async () => response },
-        threshold: 0.8,
-      }).evaluate({
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: ["selected-a"],
-        pendingEntryIds: [],
-      });
-
-    await expect(evaluate({ choice: "not-an-id", confidence: 1 })).resolves.toMatchObject({
-      outcome: "queue",
-      reason: "invalid_comparison_choice",
-    });
-    await expect(evaluate({ choice: "selected-a", confidence: Number.NaN })).resolves.toMatchObject(
-      {
-        outcome: "queue",
-        reason: "invalid_comparison_confidence",
-      }
-    );
-  });
-
-  it("separates a failed client call from an absent one", async () => {
-    const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async () => {
-          throw new Error("local fixture is down");
-        },
-      },
-      threshold: 0.8,
-    });
-
-    await expect(
-      classifier.evaluate({
-        incomingEntryId: "incoming-z",
-        selectedEntryIds: ["selected-a"],
-        pendingEntryIds: [],
-      })
-    ).resolves.toMatchObject({ outcome: "queue", reason: "client_error" });
-  });
-
-  it("keeps only offered choices and real weights out of a defective probability map", async () => {
-    const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async (request) =>
-          request.id === "comparison"
-            ? {
-                choice: "selected-a",
-                confidence: 1,
-                probabilities: {
-                  "selected-a": 0.9,
-                  "operator said: ship it now": 0.1,
-                  none: Number.POSITIVE_INFINITY,
-                } as Record<string, number>,
-              }
-            : {
-                choice: "refinement",
-                confidence: 1,
-                probabilities: { refinement: 1, "leaked note": 2 } as Record<string, number>,
-              },
-      },
-      threshold: 0.8,
+      client: client(async () => ({
+        verdict: "interrupt",
+        confidence: 0.99,
+        rationale: "because the operator wrote 'cancel the payroll run for alice@example.com'",
+        matchedCandidateIds: ["selected-a"],
+      })),
     });
 
     const decision = await classifier.evaluate({
@@ -212,111 +134,323 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       pendingEntryIds: [],
     });
 
+    expect(JSON.stringify(decision)).not.toContain("payroll");
+    expect(JSON.stringify(decision)).not.toContain("example.com");
+    expect(decision).not.toHaveProperty("rationale");
+  });
+
+  it("drops matched ids the client did not get offered", async () => {
+    // A defective or future client must not be able to write arbitrary text
+    // into the audit through the one free-form-looking field that survives.
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: client(async () => ({
+        verdict: "interrupt",
+        confidence: 0.99,
+        matchedCandidateIds: ["selected-a", "an entry that was never offered", "selected-a"],
+      })),
+    });
+
+    const decision = await classifier.evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: ["selected-a", "selected-b"],
+      pendingEntryIds: [],
+    });
+
     expect(decision).toMatchObject({
       outcome: "interrupt",
-      comparison: { probabilities: { "selected-a": 0.9 } },
-      relationDecision: { probabilities: { refinement: 1 } },
+      matchedCandidateIds: ["selected-a"],
     });
-    expect(JSON.stringify(decision)).not.toContain("ship it now");
-    expect(JSON.stringify(decision)).not.toContain("leaked note");
   });
 
-  it("keeps the rejected confidence on a below-threshold comparison", async () => {
+  it("prefers selected work and falls back to pending only when nothing is selected", async () => {
+    const asked: JevDecisionRequest[] = [];
     const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async () => ({
-          choice: "selected-a",
-          confidence: 0.68,
-          probabilities: { "selected-a": 0.68, none: 0.32 },
+      threshold: 0.8,
+      client: client(async (request) => {
+        asked.push(request);
+        return { verdict: "queue", confidence: 0.9 };
+      }),
+    });
+
+    await classifier.evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: [],
+      pendingEntryIds: ["pending-c", "pending-d"],
+    });
+
+    expect(asked[0].input).toEqual({
+      incomingEntryId: "incoming-z",
+      candidateEntryIds: ["pending-c", "pending-d"],
+      candidateSource: "pending",
+    });
+  });
+
+  it("never offers the arriving item as a candidate against itself", async () => {
+    const asked: JevDecisionRequest[] = [];
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: client(async (request) => {
+        asked.push(request);
+        return { verdict: "queue", confidence: 0.9 };
+      }),
+    });
+
+    await classifier.evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: ["selected-a", "incoming-z", "selected-a"],
+      pendingEntryIds: [],
+    });
+
+    expect(asked[0].input.candidateEntryIds).toEqual(["selected-a"]);
+  });
+
+  describe("fails closed to queue", () => {
+    const cases: Array<{ what: string; response: unknown; reason: string }> = [
+      {
+        what: "an unrecognised verdict",
+        response: { verdict: "maybe", confidence: 0.99 },
+        reason: "invalid_verdict",
+      },
+      {
+        what: "a confidence above one",
+        response: { verdict: "interrupt", confidence: 1.4 },
+        reason: "invalid_confidence",
+      },
+      {
+        what: "a NaN confidence",
+        response: { verdict: "interrupt", confidence: Number.NaN },
+        reason: "invalid_confidence",
+      },
+    ];
+    for (const { what, response, reason } of cases) {
+      it(`queues on ${what}`, async () => {
+        const classifier = new ShadowResponsiveInterruptionClassifier({
+          threshold: 0.8,
+          client: client(async () => response as never),
+        });
+        const decision = await classifier.evaluate({
+          incomingEntryId: "incoming-z",
+          selectedEntryIds: ["selected-a"],
+          pendingEntryIds: [],
+        });
+        expect(decision).toMatchObject({ outcome: "queue", reason });
+      });
+    }
+
+    it("queues when the client throws, without propagating", async () => {
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: client(async () => {
+          throw new Error("socket hang up");
         }),
-      },
-      threshold: 0.8,
-    });
-
-    // The threshold is what this feature exists to place, and it cannot be
-    // placed from records that keep only the decisions above it.
-    await expect(
-      classifier.evaluate({
+      });
+      const decision = await classifier.evaluate({
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
-      })
-    ).resolves.toMatchObject({
-      outcome: "queue",
-      reason: "low_confidence_comparison",
-      comparisonEntryId: "selected-a",
-      threshold: 0.8,
-      comparison: {
-        choice: "selected-a",
-        confidence: 0.68,
-        probabilities: { "selected-a": 0.68, none: 0.32 },
-      },
-    });
-  });
-
-  it("keeps both confidences on a below-threshold relation", async () => {
-    const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async (request) =>
-          request.id === "comparison"
-            ? { choice: "selected-a", confidence: 0.95 }
-            : { choice: "correction", confidence: 0.42 },
-      },
-      threshold: 0.8,
+      });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "client_error" });
+      // The failure text is the other route by which operational content could
+      // reach the audit. It does not.
+      expect(JSON.stringify(decision)).not.toContain("socket hang up");
     });
 
-    await expect(
-      classifier.evaluate({
+    it("queues when the client exceeds its deadline", async () => {
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        timeoutMs: 10,
+        client: client(() => new Promise(() => {})),
+      });
+      const decision = await classifier.evaluate({
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
-      })
-    ).resolves.toMatchObject({
-      outcome: "queue",
-      reason: "low_confidence_relation",
-      comparisonEntryId: "selected-a",
-      relation: "correction",
-      comparison: { choice: "selected-a", confidence: 0.95 },
-      relationDecision: { choice: "correction", confidence: 0.42 },
-    });
-  });
-
-  it("reports a malformed confidence as malformed even when the choice is a deliberate none", async () => {
-    const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: { choose: async () => ({ choice: "none", confidence: Number.NaN }) },
-      threshold: 0.8,
+      });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
     });
 
-    // A response that cannot be believed is not evidence of a deliberate
-    // "nothing matches" — the well-formedness check comes first on purpose.
-    await expect(
-      classifier.evaluate({
+    it("queues an interrupt the client is not confident enough about, keeping the confidence", async () => {
+      // A threshold cannot be tuned from records that discard the confidence
+      // they rejected.
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: client(async () => ({
+          verdict: "interrupt",
+          confidence: 0.62,
+          matchedCandidateIds: ["selected-a"],
+        })),
+      });
+      const decision = await classifier.evaluate({
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
-      })
-    ).resolves.toMatchObject({ outcome: "queue", reason: "invalid_comparison_confidence" });
-  });
-
-  it("queues a deliberate none choice without asking for a relation", async () => {
-    const calls: string[] = [];
-    const classifier = new ShadowResponsiveInterruptionClassifier({
-      client: {
-        choose: async (request) => {
-          calls.push(request.id);
-          return { choice: "none", confidence: 1 };
-        },
-      },
-      threshold: 0.8,
+      });
+      expect(decision).toMatchObject({
+        outcome: "queue",
+        reason: "low_confidence",
+        confidence: 0.62,
+        matchedCandidateIds: ["selected-a"],
+      });
     });
 
-    await expect(
-      classifier.evaluate({
+    it("queues with no client at all, and asks nothing", async () => {
+      const classifier = new ShadowResponsiveInterruptionClassifier({ threshold: 0.8 });
+      const decision = await classifier.evaluate({
+        incomingEntryId: "incoming-z",
+        selectedEntryIds: ["selected-a"],
+        pendingEntryIds: [],
+      });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "unavailable" });
+    });
+
+    it("queues without a round trip when there is nothing to compare against", async () => {
+      let asked = 0;
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: client(async () => {
+          asked++;
+          return { verdict: "interrupt", confidence: 0.99 };
+        }),
+      });
+      const decision = await classifier.evaluate({
         incomingEntryId: "incoming-z",
         selectedEntryIds: [],
-        pendingEntryIds: ["pending-c"],
-      })
-    ).resolves.toMatchObject({ outcome: "queue", reason: "no_comparison" });
-    expect(calls).toEqual(["comparison"]);
+        pendingEntryIds: [],
+      });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "no_candidates" });
+      expect(asked).toBe(0);
+    });
+  });
+
+  describe("against the synthetic corpus", () => {
+    const evaluate = (fixture: ResponsiveInterruptionFixture) =>
+      new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: fixtureClient(fixture),
+      }).evaluate({
+        incomingEntryId: fixture.incoming.id,
+        selectedEntryIds: fixture.candidates.map((entry) => entry.id),
+        pendingEntryIds: [],
+      });
+
+    it(`interrupts on ${CLEAR_MATCH_FIXTURE.name}`, async () => {
+      const decision = await evaluate(CLEAR_MATCH_FIXTURE);
+      expect(decision).toMatchObject({
+        outcome: "interrupt",
+        matchedCandidateIds: CLEAR_MATCH_FIXTURE.trueMatchIds,
+      });
+    });
+
+    it(`queues on ${AMBIGUOUS_FIXTURE.name} rather than guessing`, async () => {
+      // The cost of being wrong here is a false preemption of real work, so
+      // the right behaviour is an unconfident queue, not a plausible pick.
+      const decision = await evaluate(AMBIGUOUS_FIXTURE);
+      expect(decision).toMatchObject({ outcome: "queue", reason: "low_confidence" });
+    });
+
+    it(`still finds the one match inside ${SCALE_FIXTURE.name}`, async () => {
+      const decision = await evaluate(SCALE_FIXTURE);
+      expect(decision).toMatchObject({
+        outcome: "interrupt",
+        matchedCandidateIds: SCALE_FIXTURE.trueMatchIds,
+      });
+    });
+
+    it("offers every candidate at scale rather than a convenient first page", async () => {
+      const asked: JevDecisionRequest[] = [];
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: client(async (request) => {
+          asked.push(request);
+          return { verdict: "queue", confidence: 0.9 };
+        }),
+      });
+      await classifier.evaluate({
+        incomingEntryId: SCALE_FIXTURE.incoming.id,
+        selectedEntryIds: SCALE_FIXTURE.candidates.map((entry) => entry.id),
+        pendingEntryIds: [],
+      });
+      expect(asked[0].input.candidateEntryIds).toHaveLength(SCALE_FIXTURE.candidates.length);
+    });
+  });
+});
+
+describe("shadowVerdictEmoji", () => {
+  it("maps a would-interrupt to ✅ and a would-queue to ❌", () => {
+    expect(shadowVerdictEmoji("interrupt")).toBe(SHADOW_INTERRUPT_EMOJI);
+    expect(shadowVerdictEmoji("queue")).toBe(SHADOW_QUEUE_EMOJI);
+    expect(SHADOW_INTERRUPT_EMOJI).toBe("✅");
+    expect(SHADOW_QUEUE_EMOJI).toBe("❌");
+  });
+});
+
+describe("shadowPrediction", () => {
+  const decide = (decideFn?: JevDecisionClient["decide"]) =>
+    new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      timeoutMs: 10,
+      ...(decideFn ? { client: client(decideFn) } : {}),
+    }).evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: ["selected-a"],
+      pendingEntryIds: [],
+    });
+
+  it("is the model's verdict whenever the model answered", async () => {
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.9 })))
+    ).toBe("interrupt");
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "queue", confidence: 0.3 })))
+    ).toBe("queue");
+    // A weak interrupt turned back by the threshold is still a prediction.
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.5 })))
+    ).toBe("queue");
+  });
+
+  it("is nothing when no judgement was made", async () => {
+    expect(shadowPrediction(await decide())).toBe(null);
+    expect(
+      shadowPrediction(
+        await decide(async () => {
+          throw new Error("down");
+        })
+      )
+    ).toBe(null);
+    expect(shadowPrediction(await decide(() => new Promise(() => {})))).toBe(null);
+    expect(
+      shadowPrediction(await decide(async () => ({ verdict: "maybe", confidence: 0.9 })))
+    ).toBe(null);
+  });
+});
+
+describe("shadowReactionTarget", () => {
+  const gchat = (messageName: unknown) => ({ type: "gchat.message", messageName });
+
+  it("reacts on the arriving chat message with the verdict's emoji", () => {
+    expect(shadowReactionTarget(gchat("spaces/s/messages/m"), "interrupt")).toEqual({
+      messageName: "spaces/s/messages/m",
+      emoji: SHADOW_INTERRUPT_EMOJI,
+    });
+    expect(shadowReactionTarget(gchat("spaces/s/messages/m"), "queue")).toEqual({
+      messageName: "spaces/s/messages/m",
+      emoji: SHADOW_QUEUE_EMOJI,
+    });
+  });
+
+  it("has nothing to react to for an arrival that did not come from chat", () => {
+    // A GitHub or mesh arrival is classified just the same; it simply has no
+    // chat message to carry the verdict, so the audit row is the only record.
+    expect(shadowReactionTarget({ type: "issue_comment.created", commentId: 7 }, "interrupt")).toBe(
+      null
+    );
+  });
+
+  it("has nothing to react to when the chat pointer is missing or malformed", () => {
+    expect(shadowReactionTarget(gchat(undefined), "interrupt")).toBe(null);
+    expect(shadowReactionTarget(gchat(""), "interrupt")).toBe(null);
+    expect(shadowReactionTarget(gchat(42), "interrupt")).toBe(null);
   });
 });

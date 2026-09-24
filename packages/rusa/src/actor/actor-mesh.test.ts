@@ -80,7 +80,10 @@ import {
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
 import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
-import { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
+import {
+  SHADOW_INTERRUPT_EMOJI,
+  ShadowResponsiveInterruptionClassifier,
+} from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -307,6 +310,7 @@ function setup(
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     voiceTransferLogger?: ActorMeshOptions["voiceTransferLogger"];
     responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+    reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
     secretsDir?: string;
   } = {}
 ) {
@@ -383,6 +387,7 @@ function setup(
     providerGate: opts.providerGate,
     voiceTransferLogger: opts.voiceTransferLogger,
     responsiveInterruption: opts.responsiveInterruption,
+    reactToChatMessage: opts.reactToChatMessage,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -2803,10 +2808,12 @@ describe("ActorMesh", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
       client: {
-        choose: async (request) =>
-          request.id === "comparison"
-            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
-            : { choice: "refinement", confidence: 0.95 },
+        decide: async (request) => ({
+          verdict: "interrupt",
+          confidence: 0.95,
+          rationale: "the arriving message reverses the selected work",
+          matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
+        }),
       },
     });
     const { mesh, tick } = setup({
@@ -2888,6 +2895,184 @@ describe("ActorMesh", () => {
     expect(responsiveLists).toBe(1);
   });
 
+  it("surfaces the shadow verdict as a reaction on the chat message that arrived", async () => {
+    // Shadow mode changes no scheduling, so the reaction is the only place an
+    // operator sees a prediction in time to say it is wrong. It has to land on
+    // the arriving message itself, carrying the verdict's own emoji.
+    const inboxStore = createMemoryInboxStore();
+    const reactions: Array<{ messageName: string; emoji: string }> = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        decide: async () => ({ verdict: "interrupt", confidence: 0.95 }),
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      reactToChatMessage: async (messageName, emoji) => {
+        reactions.push({ messageName, emoji });
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([
+      { messageName: "spaces/S/messages/M", emoji: SHADOW_INTERRUPT_EMOJI },
+    ]);
+  });
+
+  it("posts no reaction when no classifier is configured", async () => {
+    // The gate is the classifier itself: a default install has none, so it
+    // must not touch the operator's chat space at all.
+    const inboxStore = createMemoryInboxStore();
+    const reactions: string[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      sharedProvider: provider,
+      reactToChatMessage: async (messageName) => {
+        reactions.push(messageName);
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([]);
+  });
+
+  it("posts no reaction when the classifier failed to reach a verdict", async () => {
+    // A client error is not a prediction of queue. Showing it as ❌ would put
+    // a judgement nobody made in front of the operator; the audit row alone
+    // records the failure.
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const reactions: string[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: {
+        decide: async () => {
+          throw new Error("decision service unavailable");
+        },
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      reactToChatMessage: async (messageName) => {
+        reactions.push(messageName);
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([]);
+    const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0]?.payload).toContain('"reason":"client_error"');
+  });
+
+  it("still records the shadow observation when the reaction cannot be posted", async () => {
+    // A chat space the bot cannot react in must not cost the measurement the
+    // feature exists to collect; the audit row is the durable record.
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      client: { decide: async () => ({ verdict: "queue", confidence: 0.95 }) },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      reactToChatMessage: async () => {
+        throw new Error("bot is not a member of this space");
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0]?.payload).toContain('"outcome":"queue"');
+  });
+
   it("observes each arriving responsive row once across repeated delivery pokes", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
@@ -2895,10 +3080,12 @@ describe("ActorMesh", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
       client: {
-        choose: async (request) =>
-          request.id === "comparison"
-            ? { choice: request.choices.at(0) ?? "none", confidence: 0.95 }
-            : { choice: "refinement", confidence: 0.95 },
+        decide: async (request) => ({
+          verdict: "interrupt",
+          confidence: 0.95,
+          rationale: "the arriving message reverses the selected work",
+          matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
+        }),
       },
     });
     const { mesh, tick } = setup({
