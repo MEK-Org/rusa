@@ -216,7 +216,7 @@ class _Banner extends StatelessWidget {
           Text(
             'Review artifact only — nothing here ships. Real dashboard components '
             'are tagged [existing]; proposed elements are tagged [proposed]. '
-            'One work item threads through queued → selected → recent activity.',
+            'One work item threads through queued -> selected -> recent activity.',
             style: TextStyle(
               color: MeshColors.textSecondary.withValues(alpha: 0.95),
               fontSize: 12,
@@ -525,7 +525,7 @@ class _SelectedPanel extends StatelessWidget {
       step: '2',
       title: 'SELECTED — actor detail · Work focus',
       subtitle:
-          'Tap the card → the same obligation opens focused in Work; the run '
+          'Tap the card -> the same obligation opens focused in Work; the run '
           'header shows who is working it, and selected-but-unfinished items '
           'stay listed instead of being implied by a yield note.',
       tag: _existingTag,
@@ -565,7 +565,7 @@ class _SelectedPanel extends StatelessWidget {
                   ),
                   const SizedBox(width: 4),
                   Text(
-                    'opens Work → focused node',
+                    'opens Work -> focused node',
                     style: kMonoStyle.copyWith(
                       color: MeshColors.textMuted,
                       fontSize: 10.5,
@@ -711,7 +711,7 @@ class _RecentActivityPanel extends StatelessWidget {
             drillThrough: 'run · selected notification · bounded output',
             errorTail: 'observed provider CLI failure · exit 1',
             recovery:
-                'retry 2/2 exhausted for this work → NEEDS ATTENTION; explicit action required',
+                'retry 2/2 exhausted for this work -> NEEDS ATTENTION; explicit action required',
           ),
           const Divider(height: 1, color: MeshColors.border),
           _RunOutcomeRow(
@@ -724,7 +724,7 @@ class _RecentActivityPanel extends StatelessWidget {
             obligationChanges: const ['none'],
             goalState: _GoalState.notCompleted,
             drillThrough: 'events · work tree',
-            recovery: '1 selected item left unhandled → re-queued for next run',
+            recovery: '1 selected item left unhandled -> re-queued for next run',
           ),
           const Divider(height: 1, color: MeshColors.border),
           const _ActivitySectionLabel(
