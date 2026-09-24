@@ -111,8 +111,10 @@ describe("dashboard branding from the configured root actor", () => {
     });
     const auth = { handle: async () => false, authorize } as unknown as DashboardAuth;
     const mesh = meshWithRoot({ handle: "ember-familiar" });
-    for (const path of ["/", "/index.html", "/dashboard"]) {
+    for (const path of ["/", "/index.html", "/dashboard", "/work/ob-123", "/actors/act-456"]) {
       const shell = await get(path, mesh, auth);
+      expect(shell.statusCode).toBe(200);
+      expect(shell.headers["Content-Type"]).toBe("text/html; charset=utf-8");
       expect(shell.body).toContain("<title>Ember Familiar</title>");
       expect(shell.body).toContain('rel="manifest"');
     }
