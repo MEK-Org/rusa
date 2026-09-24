@@ -17,6 +17,8 @@ import type { ProviderConfig } from "../config/types.js";
 import {
   antigravityActorConversationsDir,
   antigravityConversationsDir,
+  carryForwardAntigravityConversation,
+  ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
 import { getProviderModelCatalog } from "./model-catalog.js";
 import {
@@ -442,7 +444,10 @@ export class AntigravityProvider implements CodingProvider {
     const conversationsDir = opts.sandbox
       ? antigravityActorConversationsDir(opts.cwd)
       : this.conversationsDir;
-    if (opts.sandbox) mkdirSync(conversationsDir, { recursive: true, mode: 0o700 });
+    if (opts.sandbox) {
+      ensureAntigravityPrivateState(opts.cwd);
+      if (opts.session?.id) carryForwardAntigravityConversation(opts.cwd, opts.session.id);
+    }
     const incomingDbPath = opts.session?.id
       ? join(conversationsDir, `${opts.session.id}.db`)
       : undefined;

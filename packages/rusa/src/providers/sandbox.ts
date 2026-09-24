@@ -24,10 +24,11 @@ import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import {
-  antigravityActorConversationsDir,
-  antigravityActorScratchDir,
-  antigravityConversationsDir,
-  antigravityScratchDir,
+  ANTIGRAVITY_PRIVATE_STATE_DIRS,
+  ANTIGRAVITY_PRIVATE_STATE_FILES,
+  antigravityActorStateDir,
+  antigravityStateDir,
+  ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
@@ -817,15 +818,10 @@ function buildMeshActorBwrapArgs(o: {
   const tempPaths: string[] = [];
   const commandPrefix: string[] = [];
 
-  // `--bind` needs existing source and destination directories. The sandbox
-  // replaces the shared provider views below with actor-owned paths, so neither
-  // provider scratch nor conversation records can cross a worker boundary.
-  if (o.authMode === "antigravity") {
-    mkdirSync(antigravityScratchDir(), { recursive: true, mode: 0o700 });
-    mkdirSync(antigravityConversationsDir(), { recursive: true, mode: 0o700 });
-    mkdirSync(antigravityActorScratchDir(realActorDir), { recursive: true, mode: 0o700 });
-    mkdirSync(antigravityActorConversationsDir(realActorDir), { recursive: true, mode: 0o700 });
-  }
+  // The sandbox replaces agy's conversation-bearing state below with
+  // actor-owned paths, so neither provider scratch nor conversation content can
+  // cross a worker boundary. `--bind` needs both sides to exist first.
+  if (o.authMode === "antigravity") ensureAntigravityPrivateState(realActorDir);
 
   const args: string[] = [
     "--unshare-all",
@@ -905,15 +901,17 @@ function buildMeshActorBwrapArgs(o: {
     addWritableBindIfExists(args, dir, dir);
   }
   if (o.authMode === "antigravity") {
-    // agy keeps scratch and conversation records beneath the writable provider
-    // state directory. Overlay both after that broad bind: scratch stays private
-    // to this actor and conversation memory is unavailable to sibling workers.
-    args.push("--bind", antigravityActorScratchDir(realActorDir), antigravityScratchDir());
-    args.push(
-      "--bind",
-      antigravityActorConversationsDir(realActorDir),
-      antigravityConversationsDir()
-    );
+    // agy keeps scratch, transcripts, and conversation summaries beneath the
+    // writable provider state directory. Overlay each after that broad bind so
+    // the sandbox sees only this actor's copies; auth and config stay shared.
+    const hostState = antigravityStateDir();
+    const actorState = antigravityActorStateDir(realActorDir);
+    for (const path of [
+      ...ANTIGRAVITY_PRIVATE_STATE_DIRS,
+      ...ANTIGRAVITY_PRIVATE_STATE_FILES.map((file) => file.path),
+    ]) {
+      args.push("--bind", join(actorState, path), join(hostState, path));
+    }
   }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin

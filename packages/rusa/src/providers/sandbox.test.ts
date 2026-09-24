@@ -482,9 +482,9 @@ describe("sandbox bwrap args", () => {
   });
 
   it("shadows sibling worker directories and maps Antigravity state privately", async () => {
-    // The mesh worker layout: <home>/.rusa/workers/<id>. The provider's shared
-    // scratch path must be overlaid with a current-actor-only non-durable directory.
-    // The shared workers parent is shadowed and only this actor is rebound.
+    // The mesh worker layout: <home>/.rusa/workers/<id>. The shared workers
+    // parent is shadowed and only this actor is rebound; agy's shared scratch and
+    // conversation state are overlaid with current-actor-only copies.
     const home = mkdtempSync(join(tmpdir(), "mc-home-"));
     tempDirs.push(home);
     const workersDir = join(home, ".rusa", "workers");
@@ -537,28 +537,34 @@ describe("sandbox bwrap args", () => {
     expect(args[chdirIndex + 1]).toBe(actorDir);
     // The provider's state dir is the only home subtree bound read-write.
     expect(args.join(" ")).toContain(`--bind ${join(home, ".gemini")} ${join(home, ".gemini")}`);
-    const scratchDir = join(home, ".gemini", "antigravity-cli", "scratch");
     const providerStateBind = args.findIndex(
       (arg, index) =>
         arg === "--bind" &&
         args[index + 1] === join(home, ".gemini") &&
         args[index + 2] === join(home, ".gemini")
     );
-    const scratchOverlay = args.findIndex(
-      (arg, index) =>
-        arg === "--bind" &&
-        args[index + 1] === join(actorDir, ".antigravity-scratch") &&
-        args[index + 2] === scratchDir
-    );
-    expect(scratchOverlay).toBeGreaterThan(providerStateBind);
-    const conversationsDir = join(home, ".gemini", "antigravity-cli", "conversations");
-    const conversationsOverlay = args.findIndex(
-      (arg, index) =>
-        arg === "--bind" &&
-        args[index + 1] === join(actorDir, ".antigravity-conversations") &&
-        args[index + 2] === conversationsDir
-    );
-    expect(conversationsOverlay).toBeGreaterThan(providerStateBind);
+    // Every conversation-bearing agy path is overlaid with this actor's copy
+    // after the broad provider-state bind; auth and config are not.
+    const stateDir = join(home, ".gemini", "antigravity-cli");
+    const actorStateDir = join(actorDir, ".antigravity-state");
+    const overlaid = [
+      "scratch",
+      "conversations",
+      "brain",
+      "annotations",
+      "conversation_summaries.db",
+      "history.jsonl",
+    ];
+    for (const path of overlaid) {
+      const overlay = args.findIndex(
+        (arg, index) =>
+          arg === "--bind" &&
+          args[index + 1] === join(actorStateDir, path) &&
+          args[index + 2] === join(stateDir, path)
+      );
+      expect(overlay, path).toBeGreaterThan(providerStateBind);
+    }
+    expect(args).not.toContain(join(stateDir, "antigravity-oauth-token"));
   });
 
   it("shadows host-job audit artifacts out of mesh actor read/write scope", async () => {
