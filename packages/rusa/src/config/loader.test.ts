@@ -796,8 +796,45 @@ describe("loadConfig quota throttle", () => {
     expect(config.quota?.databasePath).toBe("/srv/rusa/quota.db");
   });
 
+  it("requires the full legacy and coordinator pair for compare-only mode", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: { socketPath: "/srv/rusa/coordinator.sock" },
+            throttle: { compareOnly: true },
+          },
+        })
+      )
+    ).toThrow(/compareOnly requires quota\.throttle\.enabled/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: { socketPath: "/srv/rusa/coordinator.sock" },
+            throttle: { enabled: true, compareOnly: true },
+          },
+        })
+      )
+    ).toThrow(/databasePath is required when quota\.throttle\.compareOnly is true/);
+
+    expect(
+      loadConfig(
+        writeConfig({
+          quota: {
+            databasePath: "/srv/rusa/legacy-quota.db",
+            coordinator: { socketPath: "/srv/rusa/coordinator.sock" },
+            throttle: { enabled: true, compareOnly: true },
+          },
+        })
+      ).quota?.throttle?.compareOnly
+    ).toBe(true);
+  });
+
   it.each([
     [{ enabled: "yes" }, /enabled must be a boolean/],
+    [{ compareOnly: "yes" }, /compareOnly must be a boolean/],
     [{ maxIntervalSeconds: 0 }, /maxIntervalSeconds/],
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {

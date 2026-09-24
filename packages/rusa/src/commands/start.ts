@@ -231,6 +231,7 @@ import {
   teardownFlutterOverlay,
 } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
+import { compareCoordinatorThrottle } from "../quota/compare-only-client.js";
 import {
   applyThrottleStatusToPacer,
   initialPacerIntervalSeconds,
@@ -243,6 +244,7 @@ import {
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
+import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
@@ -591,7 +593,7 @@ export function createStartRetireCleanups(
 /** Live handles the e2e runner uses to drive a started mesh in-process. */
 export interface RunStartE2EHandles {
   mesh: ActorMesh;
-  /** Read-only synchronization signal for the production coordinator client. */
+  /** Read-only synchronization signal for the interval currently applied to a pacer. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
   root: MeshActor;
   rootControl: RootControlService;
@@ -1335,6 +1337,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       ? "rusa-staging"
       : "rusa";
   const quotaProviders = configuredQuotaThrottleProviders(config);
+  // Stage 2 deliberately leaves this instance's legacy controller in charge.
+  // The config loader requires both its old database path and the coordinator
+  // socket when this temporary mode is enabled, so opening neither is a silent
+  // misconfiguration rather than a fallback.
+  const quotaThrottleCompareOnly = config.quota?.throttle?.compareOnly === true;
+  const legacyQuotaStore =
+    quotaThrottleCompareOnly && config.quota?.databasePath
+      ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
+      : null;
   const quotaCoordinatorClient = coordinatorSocketPath
     ? new QuotaCoordinatorClient({
         socketPath: coordinatorSocketPath,
@@ -1350,7 +1361,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         },
       })
     : null;
-  const quotaScrapesStore = getRepositories().quotaScrapes;
+  const quotaScrapesStore = legacyQuotaStore ?? getRepositories().quotaScrapes;
   // Shared across the `get_quota` MCP tool and the dashboard's `/api/quota`
   // endpoint  — one TTL cache, so neither surface probes independently.
   const quotaService = createQuotaService({
@@ -1508,30 +1519,47 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch {
     /* the flap check must never wedge startup */
   }
-  // Quota pacing is backed by the coordinator client reading published intervals.
+  // Normal pacing consumes coordinator publications. The narrow stage-2 canary
+  // instead keeps the legacy local controller authoritative and only observes
+  // the publication through the same client/mapping path.
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
   const providerPacers = new Map<string, ProviderPacer>();
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
-      const initialInterval = initialPacerIntervalSeconds(
-        quotaThrottleEnabled,
-        quotaCoordinatorClient,
-        providerName,
-        maxIntervalSeconds
-      );
+      const initialInterval = quotaThrottleCompareOnly
+        ? (legacyQuotaStore?.getProviderThrottle(providerName)?.intervalSeconds ?? 0)
+        : initialPacerIntervalSeconds(
+            quotaThrottleEnabled,
+            quotaCoordinatorClient,
+            providerName,
+            maxIntervalSeconds
+          );
       pacer = new ProviderPacer(initialInterval * 1000);
       providerPacers.set(providerName, pacer);
     }
     return pacer;
   };
-  // Admission projects the existing cached coordinator bucket representation.
-  // It starts no quota read: missing, stale, invalid, and tied evidence leaves
-  // selection in declared order, while a still-fresh trusted observation stays
-  // usable through a transient cold, unavailable, or incompatible response.
-  const weeklyQuotaFor = (providerName: string) =>
-    weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
+  // In compare-only mode the coordinator's mapped cache is observational only;
+  // admission remains on the legacy local result just as it was before stage 3.
+  const weeklyQuotaFor = (providerName: string) => {
+    if (quotaThrottleCompareOnly) {
+      const bucket = legacyQuotaStore
+        ?.getProviderThrottle(providerName)
+        ?.buckets.find((candidate) => candidate.key === `${providerName}:weekly`);
+      if (!bucket?.resetAtIso) return undefined;
+      return {
+        percentLeft: bucket.percentLeft,
+        observedAt: bucket.observedAt,
+        resetAtIso: bucket.resetAtIso,
+      };
+    }
+    // It starts no quota read: missing, stale, invalid, and tied evidence leaves
+    // selection in declared order, while a still-fresh trusted observation stays
+    // usable through a transient cold, unavailable, or incompatible response.
+    return weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
+  };
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1598,9 +1626,89 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       status.exhaustedUntil
     );
   };
+  const applyLegacyThrottleStatus = (providerName: QuotaThrottleProvider): boolean => {
+    const persisted = legacyQuotaStore?.getProviderThrottle(providerName);
+    if (!persisted) return false;
+    recordQuotaThrottleTick(
+      providerName,
+      {
+        intervalSeconds: persisted.intervalSeconds,
+        uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
+        expired: persisted.expired,
+        capped: persisted.capped,
+        buckets: persisted.buckets.map((bucket) => ({
+          key: bucket.key,
+          percentLeft: bucket.percentLeft,
+          timeRemainingPct: bucket.timeRemainingPct,
+          error: bucket.error,
+          requiredIntervalSeconds: bucket.requiredIntervalSeconds,
+        })),
+      },
+      persisted.updatedAt,
+      persisted.exhaustedUntil
+    );
+    return true;
+  };
+  if (quotaThrottleCompareOnly && legacyQuotaStore) {
+    legacyQuotaStore.configureController({ maxIntervalSeconds });
+    legacyQuotaStore.setControllerUpdatedListener((providerName) => {
+      if (quotaThrottleEnabled && isQuotaThrottleProvider(providerName)) {
+        applyLegacyThrottleStatus(providerName);
+      }
+    });
+    for (const providerName of quotaProviders) applyLegacyThrottleStatus(providerName);
+  }
   const tickQuotaThrottle = async (): Promise<void> => {
     if (!quotaThrottleEnabled || !quotaCoordinatorClient) return;
     try {
+      if (quotaThrottleCompareOnly && legacyQuotaStore) {
+        // This is the pre-flip controller path. It remains the only writer and
+        // the only interval applied to pacers while the coordinator publication
+        // is read solely as a stage-2 canary.
+        await Promise.all(
+          quotaProviders.map(async (providerName) => {
+            try {
+              await quotaService.getQuota(providerName);
+              legacyQuotaStore.advancePendingController({ maxIntervalSeconds }, providerName);
+              applyLegacyThrottleStatus(providerName);
+            } catch (err) {
+              console.warn(
+                `[quota-throttle] provider=${providerName} legacy compare tick failed: ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          })
+        );
+
+        const response = await quotaCoordinatorClient.getThrottle();
+        const failure = quotaCoordinatorClient.getLastThrottleReadFailure();
+        for (const providerName of quotaProviders) {
+          const coordinator = (() => {
+            if (!response) return failure ?? "cold";
+            if ("providers" in response && response.providers) {
+              const status = response.providers[providerName];
+              if (!status) return "incompatible" as const;
+              return "intervalSeconds" in status ? status : ("cold" as const);
+            }
+            if (
+              "provider" in response &&
+              response.provider === providerName &&
+              "intervalSeconds" in response
+            ) {
+              return response;
+            }
+            return "incompatible" as const;
+          })();
+          log.info("quota_throttle_compare", {
+            provider: providerName,
+            ...compareCoordinatorThrottle(
+              coordinator,
+              legacyQuotaStore.getProviderThrottle(providerName)
+            ),
+          });
+        }
+        return;
+      }
+
       const response = await quotaCoordinatorClient.getThrottle();
       if (response) {
         if ("providers" in response && response.providers) {
@@ -1622,7 +1730,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         `[quota-throttle] tickQuotaThrottle failed: ${err instanceof Error ? err.message : String(err)}`
       );
     } finally {
-      reconcileProviderPacersFromClient(pacerFor, quotaProviders, quotaCoordinatorClient);
+      if (!quotaThrottleCompareOnly) {
+        reconcileProviderPacersFromClient(pacerFor, quotaProviders, quotaCoordinatorClient);
+      }
     }
   };
 
@@ -4225,6 +4335,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // on a shutdown path that is about to close it.
     readyHeadSink = undefined;
     prerequisiteCancellationSink = undefined;
+    legacyQuotaStore?.close();
     closeDb();
     log.info("service_stopped", { reason });
     process.exit(getShutdownExitCode(reason));
@@ -4363,8 +4474,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // runner live handles so it can inject events and tear down deterministically.
   opts?.e2e?.onReady?.({
     mesh,
-    coordinatorAppliedInterval: (provider) =>
-      quotaCoordinatorClient?.getLastAppliedInterval(provider),
+    coordinatorAppliedInterval: (provider) => {
+      const pacer = providerPacers.get(provider);
+      return pacer ? pacer.interval / 1000 : undefined;
+    },
     root,
     rootControl,
     externalRoot,

@@ -91,6 +91,9 @@ export interface QuotaCoordinatorClientHealth {
   quota_client_service_connected: 0 | 1;
 }
 
+/** Why the most recent throttle read could not yield a mapped publication. */
+export type ThrottleReadFailure = "unavailable" | "incompatible";
+
 /**
  * First retry delay after a read the client could not use (§6.4).
  *
@@ -244,6 +247,7 @@ export class QuotaCoordinatorClient {
   private serviceConnected = false;
   private nextReadAllowedAtMs = 0;
   private reconnectBackoffMs = RECONNECT_BACKOFF_MIN_MS;
+  private lastThrottleReadFailure: ThrottleReadFailure | null = null;
   private readonly metrics: QuotaMetrics;
   private readonly source: string;
 
@@ -273,6 +277,15 @@ export class QuotaCoordinatorClient {
    */
   getHealth(): QuotaCoordinatorClientHealth {
     return { quota_client_service_connected: this.serviceConnected ? 1 : 0 };
+  }
+
+  /**
+   * Classify an unsuccessful `getThrottle` call without exposing its body or
+   * error text. Compare-only rollout logging uses this to distinguish a
+   * transport outage from a publication the current protocol cannot map.
+   */
+  getLastThrottleReadFailure(): ThrottleReadFailure | null {
+    return this.lastThrottleReadFailure;
   }
 
   getLastAppliedInterval(provider: string): number {
@@ -375,6 +388,7 @@ export class QuotaCoordinatorClient {
     // backoff window is skipped, which is indistinguishable to a caller from a
     // read that failed — both mean "no new interval", never "do not launch".
     if (this.nowMs() < this.nextReadAllowedAtMs) {
+      this.lastThrottleReadFailure = "unavailable";
       this.recordConnected(false);
       return null;
     }
@@ -405,7 +419,8 @@ export class QuotaCoordinatorClient {
       // An unreachable coordinator is a freshness event, not an error a caller
       // could turn into a launch gate (§5.7 rule 3), so every failure resolves
       // null instead of rejecting.
-      const fail = (err: unknown): void => {
+      const fail = (err: unknown, failure: ThrottleReadFailure = "unavailable"): void => {
+        this.lastThrottleReadFailure = failure;
         this.markUnavailable();
         this.options.logger?.warn(
           `[quota-client] Coordinator read failed for ${path}: ${
@@ -433,7 +448,7 @@ export class QuotaCoordinatorClient {
               parsed = JSON.parse(data);
               validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
             } catch (err) {
-              fail(err);
+              fail(err, "incompatible");
               return;
             }
 
@@ -442,6 +457,7 @@ export class QuotaCoordinatorClient {
             // the service serves it as 200 (handled below); a 503 carrying the
             // same envelope is the pre-#480 shape and is read the same way.
             if (res.statusCode === 503 && isNotReadyEnvelope(parsed)) {
+              this.lastThrottleReadFailure = null;
               this.markReachable();
               finish(null);
               return;
@@ -451,17 +467,20 @@ export class QuotaCoordinatorClient {
               if (provider) {
                 // A cold single-provider response (200 not_ready, §5.5, #480)
                 if (isNotReadyEnvelope(parsed)) {
+                  this.lastThrottleReadFailure = null;
                   this.markReachable();
                   finish(parsed as PublishedThrottleColdResponse);
                   return;
                 }
                 if (isValidSingleThrottlePayload(parsed, provider)) {
+                  this.lastThrottleReadFailure = null;
                   this.markReachable();
                   this.applyPublishedInterval(provider, parsed);
                   finish(parsed as PublishedThrottleResponse);
                   return;
                 }
               } else if (isValidCollectionThrottlePayload(parsed)) {
+                this.lastThrottleReadFailure = null;
                 this.markReachable();
                 // Per-provider entries of the collection body carry no `service`
                 // of their own; the envelope was validated once, above.
@@ -490,7 +509,8 @@ export class QuotaCoordinatorClient {
                     ? "invalid_payload"
                     : "not_an_object"
                 }`
-              )
+              ),
+              res.statusCode !== undefined && res.statusCode >= 500 ? "unavailable" : "incompatible"
             );
           });
         }

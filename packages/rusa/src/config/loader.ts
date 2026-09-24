@@ -80,6 +80,9 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
   if (quotaThrottle.enabled !== undefined && typeof quotaThrottle.enabled !== "boolean") {
     throw new Error("config.yaml: quota.throttle.enabled must be a boolean when set");
   }
+  if (quotaThrottle.compareOnly !== undefined && typeof quotaThrottle.compareOnly !== "boolean") {
+    throw new Error("config.yaml: quota.throttle.compareOnly must be a boolean when set");
+  }
   if (
     quotaThrottle.maxIntervalSeconds !== undefined &&
     (!Number.isFinite(quotaThrottle.maxIntervalSeconds) || quotaThrottle.maxIntervalSeconds <= 0)
@@ -355,6 +358,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       throw new Error(
         "config.yaml: quota.coordinator.socketPath is required when quota.throttle.enabled is true"
       );
+    }
+    if (quota.throttle?.compareOnly === true) {
+      if (quota.throttle.enabled !== true) {
+        throw new Error("config.yaml: quota.throttle.compareOnly requires quota.throttle.enabled");
+      }
+      if (!quota.databasePath) {
+        throw new Error(
+          "config.yaml: quota.databasePath is required when quota.throttle.compareOnly is true"
+        );
+      }
     }
   }
   const dashboard = parsed.dashboard;

@@ -294,10 +294,14 @@ To roll back stage 0 into the normal collection stage, remove the drop-in with
 switch is deliberately probe-on; do not leave a probe-off override in place
 when expecting fresh quota observations.
 
-The shipped client still has no compare-only mode: configuring its socket
-selects the normal client path and applies the coordinator publication.
-Compare-only remains follow-up work ([#503](https://github.com/MEK-Org/rusa/issues/503)).
-#499 predates the stage-0 switch and did not execute it.
+For a bounded stage-2 comparison, keep the legacy `quota.databasePath` and set
+`quota.throttle.enabled: true`, `quota.throttle.compareOnly: true`, and
+`quota.coordinator.socketPath` on one instance. It runs the existing local
+controller, reads and maps `GET /v1/throttle`, emits only the bounded comparison
+states (`match`, `mismatch`, `cold`, `stale`, `unavailable`, or `incompatible`),
+and applies only the local interval. Turn `compareOnly` off to return to the
+ordinary coordinator-client path; there is no persisted state to unwind. #499
+predates the stage-0 switch and did not execute this comparison.
 
 Instead, #499 used a separate staging coordinator with a fresh staging database
 and its normal probe loop to prove probing outside the instance, then restarted

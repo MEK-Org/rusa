@@ -90,6 +90,11 @@ export interface DashboardQuotaProviderConfig {
 export interface QuotaThrottleConfig {
   /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
   enabled?: boolean;
+  /**
+   * Temporary stage-2 rollout mode: retain the legacy local controller while
+   * reading and comparing (but never applying) coordinator publications.
+   */
+  compareOnly?: boolean;
   /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
   maxIntervalSeconds?: number;
   /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */

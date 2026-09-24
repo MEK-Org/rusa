@@ -40,6 +40,7 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("databasePath");
     expect(CONFIG_DOCS).not.toContain("poolId");
     expect(CONFIG_DOCS).toContain("quota.throttle:");
+    expect(CONFIG_DOCS).toContain("compareOnly");
     expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
   });
 

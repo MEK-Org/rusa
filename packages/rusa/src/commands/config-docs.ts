@@ -160,13 +160,15 @@ providers:
 
 quota:
 
-  databasePath             Dedicated SQLite path for quota evidence and controller decisions; required when
-                           quota.throttle.enabled is true. Instances sharing provider credentials should point at
-                           the same file outside either RUSA_HOME.
+  databasePath             Dedicated SQLite path for quota evidence and controller decisions. Required by
+                           quota.throttle.compareOnly, which intentionally retains the legacy controller.
                            Relative paths resolve against RUSA_HOME; ~/ and absolute paths are supported.
 quota.throttle:
 
-  enabled                  Optional boolean. Enables persisted closed-loop launch pacing.
+  enabled                  Optional boolean. Enables closed-loop launch pacing from the coordinator publication.
+  compareOnly              Temporary stage-2 boolean. Requires enabled, databasePath, and coordinator.socketPath;
+                           reads/maps the publication and logs a bounded comparison, but applies only databasePath's
+                           legacy local result. Turn it off to restore the normal coordinator client path.
   maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
   tickSeconds              Optional positive integer quota refresh interval.
 

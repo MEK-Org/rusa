@@ -33,6 +33,7 @@ import { buildE2EConfig } from "../e2e/provision.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
+import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
@@ -40,6 +41,7 @@ import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/m
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
+import { SharedQuotaStore } from "../quota/shared-store.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
@@ -875,6 +877,155 @@ describe("runStart webhook event routing (Phase 4)", () => {
       await expect(coldGate.result).resolves.toBe("codex");
       expect(afterCold).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
     } finally {
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it("reads and maps a coordinator publication but applies only the legacy interval in compare-only mode (#503)", async () => {
+    logCapture.lines.length = 0;
+    const socketPath = join(homeDir, "coordinator.sock");
+    const legacyDatabasePath = join(homeDir, "legacy-quota.db");
+    const now = Date.now();
+    const resetAtIso = new Date(now + 24 * 60 * 60 * 1000).toISOString();
+    const legacySnapshot = (scrapedAt: string, percentLeft: number): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: [
+        {
+          label: "Weekly quota",
+          kind: "weekly",
+          scope: "provider",
+          percentLeft,
+          resetAtIso,
+        },
+      ],
+    });
+
+    const seed = new SharedQuotaStore(legacyDatabasePath);
+    let legacyInterval: number;
+    try {
+      seed.configureController({ maxIntervalSeconds: 3600 });
+      for (const [scrapedAt, percentLeft] of [
+        [new Date(now - 10 * 60 * 1000).toISOString(), 90],
+        [new Date(now).toISOString(), 80],
+      ] as const) {
+        const snapshot = legacySnapshot(scrapedAt, percentLeft);
+        const id = seed.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+        seed.recordParsed(id, snapshot, snapshot);
+      }
+      const persisted = seed.getProviderThrottle("claude");
+      if (!persisted) throw new Error("expected a seeded legacy throttle");
+      legacyInterval = persisted.intervalSeconds;
+    } finally {
+      seed.close();
+    }
+
+    let throttleReads = 0;
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test-coordinator",
+      serverTime: new Date(now).toISOString(),
+    };
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname === "/v1/throttle") {
+        throttleReads += 1;
+        res.end(
+          JSON.stringify({
+            service,
+            providers: {
+              claude: {
+                provider: "claude",
+                intervalSeconds: legacyInterval + 17,
+                uncappedIntervalSeconds: legacyInterval + 17,
+                governingBucketKey: "claude:weekly",
+                capped: false,
+                expired: false,
+                exhaustedUntil: null,
+                updatedAt: new Date(now).toISOString(),
+                buckets: [],
+                freshness: { ageMs: 0, buckets: {}, stale: false, hardStale: false },
+              },
+            },
+          })
+        );
+        return;
+      }
+      if (url.pathname === "/v1/history") {
+        res.end(
+          JSON.stringify({
+            service,
+            provider: "claude",
+            since: "1970-01-01T00:00:00.000Z",
+            records: [],
+          })
+        );
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    const getQuotaSpy = vi
+      .spyOn(QuotaService.prototype, "getQuota")
+      .mockResolvedValue(legacySnapshot(new Date(now).toISOString(), 80));
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { claude: { cliCommand: "claude" } },
+        rootActor: { provider: "claude", model: "claude-sonnet-5", effort: "high" },
+        quota: {
+          databasePath: legacyDatabasePath,
+          coordinator: { socketPath },
+          throttle: { enabled: true, compareOnly: true, tickSeconds: 60 },
+        },
+      }),
+      "utf8"
+    );
+
+    try {
+      let appliedInterval: number | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              appliedInterval = handles.coordinatorAppliedInterval("claude");
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      expect(throttleReads).toBe(1);
+      expect(getQuotaSpy).toHaveBeenCalledWith("claude");
+      expect(appliedInterval).toBe(legacyInterval);
+      expect(appliedInterval).not.toBe(legacyInterval + 17);
+      const comparison = logCapture.lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .find((record) => record.msg === "quota_throttle_compare");
+      expect(comparison).toMatchObject({
+        provider: "claude",
+        outcome: "mismatch",
+        coordinatorState: "active",
+        legacyState: "active",
+        intervalMatch: false,
+        stateMatch: true,
+      });
+      expect(comparison).not.toHaveProperty("buckets");
+    } finally {
+      getQuotaSpy.mockRestore();
       await shutdownFn?.();
       shutdownFn = undefined;
       await new Promise<void>((resolve, reject) => {
