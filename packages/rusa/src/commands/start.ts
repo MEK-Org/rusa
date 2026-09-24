@@ -244,6 +244,7 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
+  DEFAULT_STALE_AFTER_MS,
   HISTORY_WINDOW_MS,
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
@@ -1538,12 +1539,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
-  // #655: admission may trust a lane-exhausted report only while the report is
-  // fresh and the coordinator's own hold has not elapsed. The default cadence
-  // is 5 minutes (tickSeconds ?? 300); past two missed ticks the claim "this
-  // lane is at zero" is stale, and the lane must be attempted again instead
-  // of being skipped or failed fast during a coordinator outage.
-  const LANE_EXHAUSTED_REPORT_STALE_MS = 10 * 60 * 1000;
+  // #655: use the coordinator's exact freshness contract for an exhausted
+  // lane: 15 minutes by default, or three configured throttle ticks. A client
+  // retains the last published response through a transient outage, so it must
+  // advance that same clock locally after the successful read rather than
+  // treating an old `freshness.stale === false` response as current forever.
+  const coordinatorStaleAfterMs = quotaThrottleConfig?.tickSeconds
+    ? quotaThrottleConfig.tickSeconds * 3 * 1000
+    : DEFAULT_STALE_AFTER_MS;
   const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
     const status = quotaThrottleStatuses.get(lane as QuotaThrottleProvider);
     if (!status || status.expired !== true) return false;
@@ -1551,7 +1554,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
     return (
       Number.isFinite(updatedAtMs) &&
-      nowMs - updatedAtMs <= LANE_EXHAUSTED_REPORT_STALE_MS &&
+      updatedAtMs <= nowMs &&
+      nowMs - updatedAtMs <= coordinatorStaleAfterMs &&
       Number.isFinite(exhaustedUntilMs) &&
       exhaustedUntilMs > nowMs
     );

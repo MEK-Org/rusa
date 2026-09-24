@@ -892,7 +892,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // providers payload `makeProviders` controls, so a test can flip lane
     // states between gates and wait for the next tick to consume them.
     const bootWithCoordinator = async (
-      makeProviders: () => Record<string, unknown>
+      makeProviders: () => Record<string, unknown>,
+      tickSeconds = 1
     ): Promise<{
       mesh: ActorMesh;
       appliedInterval: (provider: string) => number | undefined;
@@ -932,7 +933,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           geminiApiKey: "fake-gemini-key",
           quota: {
             coordinator: { socketPath },
-            throttle: { enabled: true, tickSeconds: 1 },
+            throttle: { enabled: true, tickSeconds },
           },
         }),
         "utf8"
@@ -980,6 +981,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         intervalSeconds?: number;
         expired?: boolean;
         exhaustedUntil?: string | null;
+        freshnessStale?: boolean;
+        updatedAt?: string;
       } = {}
     ) => ({
       provider,
@@ -991,12 +994,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       exhaustedUntil:
         opts.exhaustedUntil ??
         (opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null),
-      updatedAt: new Date().toISOString(),
+      updatedAt: opts.updatedAt ?? new Date().toISOString(),
       buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
       freshness: {
         ageMs: 0,
         buckets: { [`${provider}:weekly`]: 0 },
-        stale: false,
+        stale: opts.freshnessStale ?? false,
         hardStale: false,
       },
     });
@@ -1063,6 +1066,50 @@ describe("runStart webhook event routing (Phase 4)", () => {
           percentLeft: 0,
           expired: true,
           exhaustedUntil: new Date(Date.now() - 1_000).toISOString(),
+        }),
+      }));
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("does not skip an expired report past the coordinator's configured three-tick freshness window", async () => {
+      const { mesh, close } = await bootWithCoordinator(
+        () => ({
+          claude: throttleStatus("claude", {
+            percentLeft: 0,
+            expired: true,
+            exhaustedUntil: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
+            updatedAt: new Date(Date.now() - 4_000).toISOString(),
+            freshnessStale: true,
+          }),
+        }),
+        1
+      );
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("does not skip a future-dated exhausted report", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", {
+          percentLeft: 0,
+          expired: true,
+          exhaustedUntil: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
+          updatedAt: new Date(Date.now() + 60_000).toISOString(),
         }),
       }));
       try {

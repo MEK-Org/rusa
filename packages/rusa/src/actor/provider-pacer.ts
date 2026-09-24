@@ -524,7 +524,11 @@ export function submitPoolGate<C, T>(
     new Error("model pool exhausted");
 
   const rejectedHandle = (error: Error): RunStartHandle<T> => {
-    const result = Promise.reject<T>(error);
+    settled = true;
+    rejectResult(error);
+    // The returned handle's consumer normally awaits `result`, but attach a
+    // local observer too: an all-exhausted admission is terminal even if a
+    // caller abandons the handle before it can inspect the rejection.
     result.catch(() => {});
     return {
       result,
