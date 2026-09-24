@@ -66,6 +66,7 @@ import {
 } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
+import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import {
   type MeshEventSink,
@@ -1410,6 +1411,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
   if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
+  // Read when an inbox server is built, so every actor's selection sees the
+  // same chat backends the read tools do.
+  const inboxChatContextSources = (): InboxChatContextSources => ({
+    ...(chatClient ? { chatClient } : {}),
+    ...(slackClient ? { slackClient } : {}),
+    meshChat: getRepositories().meshChat,
+  });
 
   const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
@@ -2551,6 +2559,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             onHandled: () => mesh.inboxHandled(id),
             isFenced,
             isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
+            chatContext: inboxChatContextSources(),
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -3133,6 +3142,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       selected: () => mesh.selectedInboxEntries(rootId),
       onHandled: () => mesh.inboxHandled(rootId),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
+      chatContext: inboxChatContextSources(),
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
