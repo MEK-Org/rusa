@@ -225,11 +225,8 @@ class _ChatTabState extends State<ChatTab> {
 
                         final m = view.chat[i];
                         final senderId = m.senderId;
-                        final userPrincipalId =
-                            widget.store.dashboardConfig.value?.userPrincipalId;
-                        final isPrimarySender = senderId == 'human:operator' ||
-                            (userPrincipalId != null &&
-                                senderId == userPrincipalId);
+                        final isPrimarySender =
+                            widget.store.isViewer(senderId);
                         final senderHandle = isPrimarySender
                             ? widget.store.operatorDisplayLabel
                             : (handles[senderId] ?? senderId);

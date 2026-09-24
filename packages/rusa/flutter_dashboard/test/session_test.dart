@@ -38,7 +38,7 @@ class _Auth implements SessionAuth {
   Completer<SessionUser>? signInCompleter;
 
   @override
-  Stream<SessionUser?> userChanges() => changes.stream;
+  Stream<SessionUser?> authStateChanges() => changes.stream;
 
   @override
   Future<SessionUser> signInWithGoogle() async {
@@ -394,7 +394,7 @@ void main() {
   );
 
   test(
-    'a user-change event during sign-in does not mark the dashboard ready early',
+    'an auth-state event during sign-in does not mark the dashboard ready early',
     () async {
       final auth = _Auth(null);
       final pendingSignIn = Completer<SessionUser>();
@@ -470,71 +470,29 @@ void main() {
   });
 
   test(
-    'a mounted session notifies when a user profile update changes its label',
+    'an account switch while signed in expires the session instead of relabeling it',
     () async {
-      final auth = _Auth(_User('token', displayName: 'Ada Lovelace'));
-      final session = FirebaseDashboardSession(
-        auth,
-        client: _Client([http.Response('{}', 200)]),
+      final auth = _Auth(
+        _User('old-token', uid: 'old-user', displayName: 'Ada Lovelace'),
       );
-      var notifications = 0;
-      session.addListener(() => notifications++);
-
+      final client = _Client([http.Response('{}', 200)]);
+      final session = FirebaseDashboardSession(auth, client: client);
       session.start();
       await Future<void>.delayed(Duration.zero);
-      final beforeUpdate = notifications;
+      expect(session.status, DashboardSessionStatus.signedIn);
 
-      auth.currentUser = _User('token', displayName: 'Grace Hopper');
-      auth.changes.add(auth.currentUser);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(session.operatorDisplayName, 'Grace Hopper');
-      expect(notifications, greaterThan(beforeUpdate));
-
-      session.dispose();
-      await auth.close();
-    },
-  );
-
-  test(
-    'an account switch replaces the server session before updating the label',
-    () async {
-      final oldUser = _User(
-        'old-token',
-        uid: 'old-user',
-        displayName: 'Ada Lovelace',
-      );
       final newUser = _User(
         'new-token',
         uid: 'new-user',
         displayName: 'Grace Hopper',
       );
-      final auth = _Auth(oldUser);
-      final client = _Client([
-        http.Response('{}', 200), // start() session check
-        http.Response('{}', 200), // CSRF bootstrap for replacement
-        http.Response('{}', 200), // replacement session
-      ]);
-      final session = FirebaseDashboardSession(
-        auth,
-        client: client,
-        csrfToken: () => 'csrf-token',
-      );
-      session.start();
-      await Future<void>.delayed(Duration.zero);
-
       auth.currentUser = newUser;
       auth.changes.add(newUser);
       await Future<void>.delayed(Duration.zero);
-      await Future<void>.delayed(Duration.zero);
 
-      expect(session.operatorDisplayName, 'Grace Hopper');
-      expect(client.paths, [
-        '/api/auth/session',
-        '/api/auth/csrf',
-        '/api/auth/session',
-      ]);
-      expect(client.requestBodies.last, '{"idToken":"new-token"}');
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+      expect(client.paths, ['/api/auth/session']);
 
       session.dispose();
       await auth.close();

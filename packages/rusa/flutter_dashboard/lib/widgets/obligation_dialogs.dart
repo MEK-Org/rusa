@@ -28,7 +28,6 @@ Future<void> showCreateObligationDialog(
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
   final externalRefCtrl = TextEditingController();
   final priorityCtrl = TextEditingController();
-  String? selectedOwnerId;
   bool isSubmitting = false;
 
   await showDialog<void>(
@@ -122,8 +121,6 @@ Future<void> showCreateObligationDialog(
                     OwnerSelector(
                       store: store,
                       ownerIdCtrl: ownerIdCtrl,
-                      onSelected: (option) => selectedOwnerId = option.id,
-                      onTextChanged: () => selectedOwnerId = null,
                       decoration: const InputDecoration(
                         hintText: 'e.g. root, cloudy-porpoise',
                         hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
@@ -207,9 +204,7 @@ Future<void> showCreateObligationDialog(
 
                         final typedText = ownerIdCtrl.text.trim();
                         String resolvedId;
-                        if (selectedOwnerId != null) {
-                          resolvedId = selectedOwnerId!;
-                        } else if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                        if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
                           resolvedId = viewerOwnerId(viewerPrincipalId);
                         } else {
                           final matches = store.actorStates.value.actors.values
@@ -425,7 +420,6 @@ Future<void> showReassignObligationDialog(
   final formKey = GlobalKey<FormState>();
   final viewerPrincipalId = store.dashboardConfig.value?.userPrincipalId;
   final ownerIdCtrl = TextEditingController(text: '');
-  String? selectedOwnerId;
   var isSubmitting = false;
 
   await showDialog<void>(
@@ -452,8 +446,6 @@ Future<void> showReassignObligationDialog(
                 OwnerSelector(
                   store: store,
                   ownerIdCtrl: ownerIdCtrl,
-                  onSelected: (option) => selectedOwnerId = option.id,
-                  onTextChanged: () => selectedOwnerId = null,
                   decoration: const InputDecoration(
                     labelText: 'Owner ID or Handle *',
                     hintText: 'e.g. cloudy-porpoise, operator, or UUID',
@@ -481,9 +473,7 @@ Future<void> showReassignObligationDialog(
                     try {
                       final typedText = ownerIdCtrl.text.trim();
                       String resolvedId;
-                      if (selectedOwnerId != null) {
-                        resolvedId = selectedOwnerId!;
-                      } else if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
+                      if (isOperatorOwnerText(typedText, viewerPrincipalId)) {
                         resolvedId = viewerOwnerId(viewerPrincipalId);
                       } else {
                         final matches = store.actorStates.value.actors.values

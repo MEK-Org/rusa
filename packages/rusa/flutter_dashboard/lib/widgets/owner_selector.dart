@@ -9,16 +9,12 @@ class OwnerSelector extends StatelessWidget {
   final DashboardStore store;
   final TextEditingController ownerIdCtrl;
   final InputDecoration decoration;
-  final ValueChanged<OwnerOption>? onSelected;
-  final VoidCallback? onTextChanged;
 
   const OwnerSelector({
     super.key,
     required this.store,
     required this.ownerIdCtrl,
     required this.decoration,
-    this.onSelected,
-    this.onTextChanged,
   });
 
   @override
@@ -26,7 +22,6 @@ class OwnerSelector extends StatelessWidget {
     return Autocomplete<OwnerOption>(
       initialValue: TextEditingValue(text: ownerIdCtrl.text),
       displayStringForOption: (option) => option.display,
-      onSelected: onSelected,
       optionsBuilder: (textEditingValue) {
         final text = textEditingValue.text.toLowerCase();
         final actors = store.actorStates.value.actors.values
@@ -40,7 +35,7 @@ class OwnerSelector extends StatelessWidget {
           OwnerOption(
             kind: 'human',
             id: viewerOwnerId(store.dashboardConfig.value?.userPrincipalId),
-            handle: store.operatorDisplayName ?? kOperatorDisplayHandle,
+            handle: kOperatorDisplayHandle,
           ),
         ];
         final all = [...humans, ...actors];
@@ -72,7 +67,6 @@ class OwnerSelector extends StatelessWidget {
           ),
           validator: (value) => (value == null || value.trim().isEmpty) ? 'Owner ID is required' : null,
           onFieldSubmitted: (_) => onFieldSubmitted(),
-          onChanged: (_) => onTextChanged?.call(),
         );
       },
       optionsViewBuilder: (context, onSelected, options) {

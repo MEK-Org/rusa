@@ -1,6 +1,6 @@
 /// Resolves an actor/thread id to a human-safe display label. A raw id is
 /// never an acceptable result — every id resolves to one of four outcomes:
-/// the authenticated profile label for the verified viewing principal,
+/// the authenticated profile label for the viewing principal (either id),
 /// `Operator` for another `human:*` principal, `System component`
 /// for `system:*`, the known handle when [lookupHandle] finds one, or
 /// `Unknown actor` when it does not. The prefix check mirrors the server's

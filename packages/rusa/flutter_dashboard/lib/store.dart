@@ -163,10 +163,9 @@ class DashboardStore {
     ObligationsCache? obligationsCache,
     this.walkie,
     this.avatarFilePicker,
-    String? operatorDisplayName,
+    this.operatorDisplayName,
   }) : _api = api,
        _stream = stream,
-       _operatorDisplayName = operatorDisplayName,
        _quotaCache = quotaCache ?? const NoopQuotaCache(),
        _treePreferencesCache =
            treePreferencesCache ?? const NoopTreePreferencesCache(),
@@ -306,14 +305,7 @@ class DashboardStore {
   final AvatarFilePicker? avatarFilePicker;
 
   /// Authenticated profile text for presentation only; never an owner id.
-  String? _operatorDisplayName;
-
-  String? get operatorDisplayName => _operatorDisplayName;
-
-  /// Replaces presentation-only profile text after the session reports a user
-  /// update. Callers rebuild the visible dashboard around the same store, so
-  /// identity and the stream-backed workspace state remain intact.
-  void setOperatorDisplayName(String? value) => _operatorDisplayName = value;
+  final String? operatorDisplayName;
 
   String get operatorDisplayLabel {
     final label = operatorDisplayName?.trim();
@@ -471,10 +463,8 @@ class DashboardStore {
   /// `human:*` prefix, or the server-resolved durable user principal.
   bool isHuman(String? id) => isHumanPrincipal(id, userPrincipalId);
 
-  /// Whether [id] is the authenticated viewer's resolved principal for
-  /// display purposes. The legacy alias remains available to read old work,
-  /// but it cannot inherit this user's mutable profile label.
-  bool isViewer(String? id) => isVerifiedViewerPrincipal(id, userPrincipalId);
+  /// Whether [id] names the viewing person under either of their ids.
+  bool isViewer(String? id) => isViewerPrincipal(id, userPrincipalId);
 
   /// Resolves an actor/thread/principal id to a display label.
   String actorDisplay(String id) => actorDisplayLabel(
