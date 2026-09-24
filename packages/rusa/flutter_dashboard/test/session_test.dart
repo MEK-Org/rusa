@@ -7,9 +7,13 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/session.dart';
 
 class _User implements SessionUser {
-  _User(this.token, {this.photoUrl, this.displayName, this.email});
+  _User(this.token, {String? uid, this.photoUrl, this.displayName, this.email})
+    : uid = uid ?? token;
 
   final String token;
+
+  @override
+  final String uid;
 
   @override
   final String? photoUrl;
@@ -486,6 +490,51 @@ void main() {
 
       expect(session.operatorDisplayName, 'Grace Hopper');
       expect(notifications, greaterThan(beforeUpdate));
+
+      session.dispose();
+      await auth.close();
+    },
+  );
+
+  test(
+    'an account switch replaces the server session before updating the label',
+    () async {
+      final oldUser = _User(
+        'old-token',
+        uid: 'old-user',
+        displayName: 'Ada Lovelace',
+      );
+      final newUser = _User(
+        'new-token',
+        uid: 'new-user',
+        displayName: 'Grace Hopper',
+      );
+      final auth = _Auth(oldUser);
+      final client = _Client([
+        http.Response('{}', 200), // start() session check
+        http.Response('{}', 200), // CSRF bootstrap for replacement
+        http.Response('{}', 200), // replacement session
+      ]);
+      final session = FirebaseDashboardSession(
+        auth,
+        client: client,
+        csrfToken: () => 'csrf-token',
+      );
+      session.start();
+      await Future<void>.delayed(Duration.zero);
+
+      auth.currentUser = newUser;
+      auth.changes.add(newUser);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(session.operatorDisplayName, 'Grace Hopper');
+      expect(client.paths, [
+        '/api/auth/session',
+        '/api/auth/csrf',
+        '/api/auth/session',
+      ]);
+      expect(client.requestBodies.last, '{"idToken":"new-token"}');
 
       session.dispose();
       await auth.close();

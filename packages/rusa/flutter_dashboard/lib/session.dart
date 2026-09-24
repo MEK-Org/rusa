@@ -11,6 +11,8 @@ const sessionIdleDuration = Duration(hours: 1);
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
+  /// Stable Firebase identity, distinct from mutable profile presentation.
+  String get uid;
   String? get photoUrl;
   String? get displayName;
   String? get email;
@@ -35,6 +37,7 @@ abstract class DashboardSession extends ChangeNotifier
   bool get isIdle;
   String? get profilePhotoUrl;
   String get operatorDisplayName;
+  int get profilePresentationRevision;
   String? get browserTitle;
   String? get errorMessage;
 
@@ -65,6 +68,9 @@ class LocalDashboardSession extends DashboardSession {
 
   @override
   String get operatorDisplayName => 'Operator';
+
+  @override
+  int get profilePresentationRevision => 0;
 
   @override
   String? get browserTitle => null;
@@ -119,6 +125,11 @@ class FirebaseDashboardSession extends DashboardSession {
   Timer? _idleTimer;
   Future<void>? _renewing;
   SessionUser? _user;
+  // This stays on the server-confirmed account during an account transition.
+  // Do not let a new Firebase profile label render against the prior account's
+  // dashboard config while a replacement cookie is being established.
+  SessionUser? _presentationUser;
+  int _profilePresentationRevision = 0;
   DashboardSessionStatus _status = DashboardSessionStatus.signedOut;
   bool _idle = false;
   bool _creatingSession = false;
@@ -136,13 +147,19 @@ class FirebaseDashboardSession extends DashboardSession {
   bool get isIdle => _idle;
 
   @override
-  String? get profilePhotoUrl => _user?.photoUrl;
+  String? get profilePhotoUrl => _displayUser?.photoUrl;
 
   @override
   String get operatorDisplayName {
-    final user = _user ?? _auth.currentUser;
+    final user = _displayUser;
     return _firstProfileLabel(user?.displayName, user?.email);
   }
+
+  SessionUser? get _displayUser =>
+      _presentationUser ?? _user ?? _auth.currentUser;
+
+  @override
+  int get profilePresentationRevision => _profilePresentationRevision;
 
   @override
   String? get browserTitle => _browserTitle;
@@ -158,6 +175,7 @@ class FirebaseDashboardSession extends DashboardSession {
   void start() {
     _authSubscription = _auth.userChanges().listen(_onAuthStateChanged);
     _user = _auth.currentUser;
+    _presentationUser = _user;
     if (_user == null) {
       _setStatus(DashboardSessionStatus.signedOut);
       return;
@@ -167,6 +185,7 @@ class FirebaseDashboardSession extends DashboardSession {
   }
 
   void _onAuthStateChanged(SessionUser? user) {
+    final previous = _user;
     _user = user;
     if (user == null) {
       if (_status == DashboardSessionStatus.signedIn) unawaited(_expire());
@@ -177,10 +196,42 @@ class FirebaseDashboardSession extends DashboardSession {
       unawaited(checkSession());
       return;
     }
+    if (previous != null && previous.uid != user.uid) {
+      unawaited(_replaceSessionForAccount(user));
+      return;
+    }
+    _setPresentationUser(user);
     // A user-change event can carry a new profile photo/display name or a
-    // refreshed credential without changing signed-in state. The mounted page
-    // listens to this notification and updates only its presentation fields.
+    // refreshed credential without changing identity. The mounted page refreshes
+    // its server-resolved config before applying this presentation update.
     notifyListeners();
+  }
+
+  /// Account switches need a new server cookie before their profile is visible.
+  /// The dashboard page then reloads `/api/dashboard/config` before rendering
+  /// this user's label, so durable principal and presentation stay aligned.
+  Future<void> _replaceSessionForAccount(SessionUser user) async {
+    try {
+      final response = await _post(
+        'session',
+        idToken: await user.getIdToken(forceRefresh: true),
+      );
+      if (response.statusCode != 200 || _user?.uid != user.uid) {
+        if (_user?.uid == user.uid) await _expire();
+        return;
+      }
+      _setPresentationUser(user);
+      notifyListeners();
+    } catch (_) {
+      // A failed account transition must not keep a prior account's cookie
+      // paired with the new Firebase identity.
+      if (_user?.uid == user.uid) await _expire();
+    }
+  }
+
+  void _setPresentationUser(SessionUser user) {
+    _presentationUser = user;
+    _profilePresentationRevision++;
   }
 
   void _markSignedIn() {
@@ -272,9 +323,11 @@ class FirebaseDashboardSession extends DashboardSession {
       } catch (_) {
         await _auth.signOut();
         _user = null;
+        _presentationUser = null;
         rethrow;
       }
       _user = user;
+      _setPresentationUser(user);
       _markSignedIn();
     } finally {
       _creatingSession = false;
@@ -343,6 +396,7 @@ class FirebaseDashboardSession extends DashboardSession {
       _setIdle(true);
       await _auth.signOut();
       _user = null;
+      _presentationUser = null;
       _setStatus(DashboardSessionStatus.signedOut);
     } finally {
       _expiring = false;

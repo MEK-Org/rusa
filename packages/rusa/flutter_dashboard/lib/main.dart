@@ -253,6 +253,8 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   late final DashboardApi _api;
   late final DashboardStore _store;
+  int _profileSyncGeneration = 0;
+  late int _profilePresentationRevision;
 
   @override
   void initState() {
@@ -269,14 +271,27 @@ class _DashboardPageState extends State<DashboardPage> {
       walkie: webWalkieDeps(_api, widget.session),
       avatarFilePicker: WebAvatarFilePicker(),
     );
+    _profilePresentationRevision = widget.session.profilePresentationRevision;
     widget.session.addListener(_syncProfilePresentation);
     // Opens the SSE stream before the initial /threads fetch (seam-safe).
     _store.init();
   }
 
   void _syncProfilePresentation() {
+    final revision = widget.session.profilePresentationRevision;
+    if (revision == _profilePresentationRevision) return;
+    _profilePresentationRevision = revision;
+    unawaited(_refreshProfilePresentation());
+  }
+
+  Future<void> _refreshProfilePresentation() async {
+    final generation = ++_profileSyncGeneration;
+    // A Firebase account switch first replaces the server session. Reload the
+    // server-owned principal before applying the newly confirmed profile label.
+    await _store.refreshDashboardConfig();
+    if (!mounted || generation != _profileSyncGeneration) return;
     _store.setOperatorDisplayName(widget.session.operatorDisplayName);
-    if (mounted) setState(() {});
+    setState(() {});
   }
 
   @override

@@ -57,6 +57,9 @@ class _FirebaseSessionUser implements SessionUser {
   final User _user;
 
   @override
+  String get uid => _user.uid;
+
+  @override
   String? get photoUrl => _user.photoURL;
 
   @override
