@@ -76,6 +76,9 @@ try {
 const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
   emit(event.actorId, event.message, event.eventId)
 );
+// A registration can renew after an HTTP fault. It identifies this running
+// process, not its short-lived server session or the reusable enrollment token.
+const generation = randomUUID();
 let session = "";
 let leaderToken: string | undefined;
 let stopped = false;
@@ -172,6 +175,7 @@ async function run(): Promise<void> {
         }>("/register", {
           platform: process.platform,
           pid: process.pid,
+          generation,
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
           commitSha: tryGetCommitSha(repoRoot),
         });

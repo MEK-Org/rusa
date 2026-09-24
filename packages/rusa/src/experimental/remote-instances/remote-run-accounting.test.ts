@@ -125,7 +125,10 @@ describe("remote actor run accounting", () => {
       actorOptions,
       snapshot: () => {
         snapshotCalls++;
-        throw new Error("not admitted in this test");
+        return {
+          record: { id: ACTOR_ID } as ActorRecord,
+          prompt: "remote accounting fixture",
+        };
       },
       saveSession: () => {},
       onFailure: (error) => failures.push(error),
@@ -248,17 +251,22 @@ describe("remote actor run accounting", () => {
     expect(accountingErrors).toEqual([]);
   });
 
-  it("fails the in-flight run exactly once when the follower drops mid-run", async () => {
+  it("keeps an in-flight run open across transport loss and accepts its late same-generation result", async () => {
     bootActor();
     startRun();
     expect(openRuns()).toHaveLength(1);
 
-    followerDies();
-    await handle.exited;
-    // The failure path is asynchronous; let its accounting settle.
+    handle.detachHost();
+    const reconnected = new RemoteInstance("test-follower", process.platform, process.pid);
+    handle.attachHost(reconnected.createHost(ACTOR_ID));
+    reconnected.receive({ actorId: ACTOR_ID, message: { type: "ready", pid: 4242 } });
+    reconnected.receive({
+      actorId: ACTOR_ID,
+      message: { type: "request", requestId: 2, request: { op: "complete", result: RESULT } },
+    });
     await Promise.resolve();
 
-    expect(allRuns()).toEqual([{ outcome: "completed", success: 0 }]);
+    expect(allRuns()).toEqual([{ outcome: "completed", success: 1 }]);
     expect(accountingErrors).toEqual([]);
   });
 

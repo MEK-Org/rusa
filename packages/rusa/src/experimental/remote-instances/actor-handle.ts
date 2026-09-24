@@ -98,7 +98,7 @@ export class ActorHandle implements MeshActor {
     this.send({ type: "init", bootstrap: opts.bootstrap });
   }
 
-  private bindChannel(channel: ActorChannel): void {
+  private bindChannel(channel: ActorChannel, awaitStartup = true): void {
     let resolveReady!: (pid: number) => void;
     let rejectReady!: (error: Error) => void;
     this.ready = new Promise((resolve, reject) => {
@@ -108,10 +108,12 @@ export class ActorHandle implements MeshActor {
     // Factories are synchronous; boot failure can arrive before the caller awaits ready.
     void this.ready.catch(() => {});
     clearTimeout(this.startupTimer);
-    this.startupTimer = setTimeout(
-      () => this.fail(new Error("Remote actor startup timed out")),
-      10_000
-    );
+    if (awaitStartup) {
+      this.startupTimer = setTimeout(
+        () => this.fail(new Error("Remote actor startup timed out")),
+        10_000
+      );
+    }
     channel.on("message", (raw) => {
       const message = raw as ActorEvent;
       if (message.type === "ready") {
@@ -158,7 +160,9 @@ export class ActorHandle implements MeshActor {
     this.stateSettled = new Promise((resolve) => {
       this.settleState = resolve;
     });
-    this.bindChannel(newChannel);
+    // A reconnect is transport recovery, not a fresh actor boot. Its delayed
+    // state/ready report must not cancel a leader-retained admission after 10s.
+    this.bindChannel(newChannel, false);
     const freshSnapshot = this.opts.snapshot();
     const sessionId = freshSnapshot.record.sessionId ?? this.opts.bootstrap.sessionId;
     if (this.retainedAdmission) {
@@ -242,6 +246,13 @@ export class ActorHandle implements MeshActor {
     // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
+  }
+
+  /** Mark the current transport unavailable while preserving leader-owned run state. */
+  detachHost(): void {
+    if (this.terminated) return;
+    this.channel.removeAllListeners();
+    this.disconnect();
   }
 
   /** A transport loss is recoverable: keep only what attachHost can still act on. */

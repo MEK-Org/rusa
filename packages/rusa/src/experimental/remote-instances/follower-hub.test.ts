@@ -24,20 +24,72 @@ async function setup() {
     fetch(`${origin}${path}`, {
       headers: { authorization: `Bearer ${token}` },
     });
-  const register = async (id: string) => {
+  const register = async (id: string, generation = `${id}-process-one`) => {
     const response = await post("/register", {
       id,
       platform: "darwin",
       pid: 123,
+      generation,
       protocolVersion: INSTANCE_PROTOCOL_VERSION,
     });
     expect(response.status).toBe(200);
-    return { id, ...((await response.json()) as { session: string; leaderToken: string }) };
+    return {
+      id,
+      generation,
+      ...((await response.json()) as { session: string; leaderToken: string }),
+    };
   };
   return { hub, origin, token, post, get, register };
 }
 
 describe("leader follower gateway", () => {
+  it("rolls a same-process registration forward without dropping its actor channel", async () => {
+    const h = await setup();
+    const registrations: string[] = [];
+    h.hub.onRegister((follower) => registrations.push(follower.session));
+    const first = await h.register("mac", "mac-process-a");
+    const oldHost = h.hub.createHost("mac", "actor-1");
+    const oldPoll = h.post("/poll", first);
+
+    const renewed = await h.register("mac", "mac-process-a");
+
+    expect(renewed.session).not.toBe(first.session);
+    expect((await oldPoll).status).toBe(410);
+    expect(
+      (
+        await h.post("/events", {
+          ...first,
+          batchId: "stale-session",
+          events: [],
+        })
+      ).status
+    ).toBe(410);
+    expect(h.hub.list().find((follower) => follower.id === "mac")?.actors).toEqual(["actor-1"]);
+    expect(registrations).toEqual([first.session, renewed.session]);
+
+    const replacement = h.hub.rebindHost("mac", "actor-1");
+    expect(replacement).not.toBe(oldHost);
+  });
+
+  it("keeps lapsed contact advisory while refusing new dispatch until a heartbeat arrives", async () => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      const h = await setup();
+      const identity = await h.register("mac");
+
+      clock.mockReturnValue(start + 46_000);
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      expect(h.hub.list()).toHaveLength(1);
+      expect(() => h.hub.createHost("mac", "stale-actor")).toThrow("no recent contact");
+
+      expect((await h.post("/heartbeat", identity)).status).toBe(200);
+      expect(h.hub.createHost("mac", "fresh-actor")).toBeDefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("enforces safe bind and refuses wildcard or public addresses", async () => {
     const token = randomBytes(32).toString("hex");
     const hub = new FollowerHub(token);
@@ -55,16 +107,33 @@ describe("leader follower gateway", () => {
     }
   });
 
-  it("authenticates registration and rejects duplicate identities and stale sessions", async () => {
+  it("authenticates registration, fences a replacement process, and rejects stale sessions", async () => {
     const h = await setup();
     expect((await fetch(`${h.origin}/followers`)).status).toBe(401);
     const identity = await h.register("mac");
+    const oldHost = h.hub.createHost("mac", "actor-1");
+    const exited = once(oldHost, "exit");
+    const replacement = await h.post("/register", {
+      id: "mac",
+      platform: "darwin",
+      pid: 124,
+      generation: "mac-process-two",
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+    });
+    expect(replacement.status).toBe(200);
+    const replacementIdentity = {
+      id: "mac",
+      ...((await replacement.json()) as { session: string }),
+    };
+    await exited;
+    expect((await h.post("/events", { ...identity, batchId: "old", events: [] })).status).toBe(410);
     expect(
       (
         await h.post("/register", {
           id: "mac",
           platform: "darwin",
-          pid: 124,
+          pid: 123,
+          generation: "mac-process-one",
           protocolVersion: INSTANCE_PROTOCOL_VERSION,
         })
       ).status
@@ -74,7 +143,7 @@ describe("leader follower gateway", () => {
       409
     );
     expect(() => h.hub.createHost("unknown", "actor")).toThrow("not connected");
-    await h.post("/unregister", identity);
+    await h.post("/unregister", replacementIdentity);
     expect(h.hub.list()).toEqual([]);
   });
 
@@ -372,7 +441,7 @@ describe("leader follower gateway", () => {
 
     // Follower disconnects / re-registers (e.g. response was lost, socket reset, session expired)
     await h.post("/unregister", identity1);
-    const identity2 = await h.register("mac");
+    const identity2 = await h.register("mac", "mac-process-two");
     expect(identity2.session).not.toBe(identity1.session);
     // Same leader retains the exact same leaderToken
     expect(identity2.leaderToken).toBe(identity1.leaderToken);
@@ -418,7 +487,7 @@ describe("leader follower gateway", () => {
     expect(received[1]).toEqual({ type: "ready", pid: 789 });
   });
 
-  it("keeps a long-lived follower's just-processed replay fence through expiry and replacement", async () => {
+  it("keeps a long-lived follower's replay fence through advisory staleness and replacement", async () => {
     const start = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(start);
     try {
@@ -446,14 +515,13 @@ describe("leader follower gateway", () => {
       expect(first.status).toBe(200);
       expect(received).toEqual([{ type: "ready", pid: 456 }]);
 
-      // The connection expires 46 seconds after the accepted batch. Running
-      // the real sweep is deterministic here; with stale tracker freshness it
-      // would delete the fence in this same sweep.
+      // Lapsed contact is advisory. The sweep preserves the process and its
+      // replay tracker; a different authenticated process replaces it.
       clock.mockReturnValue(start + 3601_000 + 46_000);
       (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
-      expect(h.hub.list()).toEqual([]);
+      expect(h.hub.list()).toHaveLength(1);
 
-      const identity2 = await h.register("mac");
+      const identity2 = await h.register("mac", "mac-process-two");
       const replacementHost = h.hub.createHost("mac", "actor-1");
       replacementHost.on("message", (message) => received.push(message));
       const replay = await h.post("/events", {
@@ -481,6 +549,7 @@ describe("leader follower gateway", () => {
         id: "worker-sha",
         platform: "linux",
         pid: 321,
+        generation: "worker-sha-process-one",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
         commitSha: "1234567890abcdef1234567890abcdef12345678",
       });
