@@ -1079,37 +1079,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     });
 
-    it("does not skip an expired report past the coordinator's configured three-tick freshness window", async () => {
-      const { mesh, close } = await bootWithCoordinator(
-        () => ({
-          claude: throttleStatus("claude", {
-            percentLeft: 0,
-            expired: true,
-            exhaustedUntil: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
-            updatedAt: new Date(Date.now() - 4_000).toISOString(),
-            freshnessStale: true,
-          }),
-        }),
-        1
-      );
-      try {
-        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
-        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
-        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
-      } finally {
-        await shutdownFn?.();
-        shutdownFn = undefined;
-        await close();
-      }
-    });
-
-    it("does not skip a future-dated exhausted report", async () => {
+    it("does not skip an expired report the coordinator marks stale", async () => {
       const { mesh, close } = await bootWithCoordinator(() => ({
         claude: throttleStatus("claude", {
           percentLeft: 0,
           expired: true,
           exhaustedUntil: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
-          updatedAt: new Date(Date.now() + 60_000).toISOString(),
+          // The newest scrape can be current while the governing bucket is
+          // stale, so the coordinator's verdict must outrank `updatedAt`.
+          updatedAt: new Date().toISOString(),
+          freshnessStale: true,
         }),
       }));
       try {
