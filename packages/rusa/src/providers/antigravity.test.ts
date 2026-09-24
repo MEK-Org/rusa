@@ -1,6 +1,14 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import EventEmitter from "node:events";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -250,6 +258,94 @@ describe("AntigravityProvider", () => {
       expect.arrayContaining(["--", "agy", "-p", "test prompt", "--dangerously-skip-permissions"]),
       expect.objectContaining({ cwd: "/" })
     );
+  });
+
+  it("reads sandboxed quota state from the actor-private conversation store", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-agy-sandbox-home-"));
+    const actorDir = join(home, ".rusa", "workers", "actor-one");
+    const conversationId = "11111111-2222-4333-8444-555555555555";
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    mkdirSync(actorDir, { recursive: true });
+
+    try {
+      const provider = new AntigravityProvider(
+        "antigravity",
+        { cliCommand: "agy" },
+        "Gemini 3.5 Flash (Low)"
+      );
+      const child = mockChildProcess();
+      vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test prompt",
+        cwd: actorDir,
+        sandbox: { worktreePath: actorDir },
+        session: {},
+      });
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      const logFile = args[args.indexOf("--log-file") + 1];
+      const privateConversations = join(actorDir, ".antigravity-state", "conversations");
+      writeFileSync(
+        join(privateConversations, `${conversationId}.db-wal`),
+        JSON.stringify({
+          error: { code: 429, status: "RESOURCE_EXHAUSTED", reason: "QUOTA_EXHAUSTED" },
+        })
+      );
+      writeFileSync(logFile, `Print mode: conversation=${conversationId}, sending message`);
+      child.emit("close", 0);
+
+      const result = await runPromise;
+      expect(result.success).toBe(false);
+      expect(result.output).toContain("reason=QUOTA_EXHAUSTED");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("resumes a pre-existing sandboxed session from its carried-forward conversation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-agy-sandbox-home-"));
+    const actorDir = join(home, ".rusa", "workers", "actor-one");
+    const conversationId = "11111111-2222-4333-8444-555555555555";
+    const hostConversations = join(home, ".gemini", "antigravity-cli", "conversations");
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    mkdirSync(actorDir, { recursive: true });
+    mkdirSync(hostConversations, { recursive: true });
+    writeFileSync(join(hostConversations, `${conversationId}.db`), "persisted");
+
+    try {
+      const provider = new AntigravityProvider(
+        "antigravity",
+        { cliCommand: "agy" },
+        "Gemini 3.5 Flash (Low)"
+      );
+      const child = mockChildProcess();
+      vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+      const runPromise = provider.run({
+        prompt: "test prompt",
+        cwd: actorDir,
+        sandbox: { worktreePath: actorDir },
+        session: { id: conversationId },
+      });
+      const args = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+      expect(args[args.indexOf("--conversation") + 1]).toBe(conversationId);
+      expect(
+        readFileSync(
+          join(actorDir, ".antigravity-state", "conversations", `${conversationId}.db`),
+          "utf8"
+        )
+      ).toBe("persisted");
+      child.emit("close", 0);
+      await runPromise;
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
   });
 
   it("terminates subprocess and returns cancelled status when signal is aborted", async () => {
