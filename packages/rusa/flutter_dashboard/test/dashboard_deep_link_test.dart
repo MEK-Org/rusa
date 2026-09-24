@@ -32,6 +32,9 @@ class _TestSession extends DashboardSession {
   String? get profilePhotoUrl => null;
 
   @override
+  String get operatorDisplayName => 'Operator';
+
+  @override
   String? get browserTitle => null;
 
   @override
