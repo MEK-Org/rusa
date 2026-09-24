@@ -1185,6 +1185,144 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  it("re-evaluates queued admissions on quota coordinator exhaustion report, and does not re-evaluate on renewal or cadence ticks (#633)", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const observedAt = new Date().toISOString();
+    let claudeStatus = {
+      provider: "claude",
+      intervalSeconds: 0,
+      uncappedIntervalSeconds: 0,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null as string | null,
+      updatedAt: observedAt,
+      buckets: [
+        {
+          key: "claude:weekly",
+          percentLeft: 50,
+          timeRemainingPct: 50,
+          error: 0,
+        },
+      ],
+      freshness: {
+        ageMs: 0,
+        buckets: { "claude:weekly": 0 },
+        stale: false,
+        hardStale: false,
+      },
+    };
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test",
+      serverTime: observedAt,
+    };
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname !== "/v1/throttle") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          service,
+          providers: {
+            claude: claudeStatus,
+          },
+        })
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: {
+          coordinator: { socketPath },
+          throttle: { enabled: true, tickSeconds: 3600 },
+        },
+      }),
+      "utf8"
+    );
+
+    try {
+      let mesh: ActorMesh | undefined;
+      let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+
+      const reEvaluateSpy = vi.spyOn(mesh, "reEvaluateExhaustedQueuedRuns");
+
+      // 1. Initial unexhausted tick: does not trigger re-evaluation.
+      await triggerQuotaThrottleTick?.();
+      expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+      // 2. Newly reported quota exhaustion: triggers re-evaluation for affected provider.
+      claudeStatus = {
+        ...claudeStatus,
+        expired: true,
+        exhaustedUntil: "2099-09-23T15:00:00.000Z",
+        updatedAt: new Date().toISOString(),
+      };
+      await triggerQuotaThrottleTick?.();
+      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+      expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
+
+      // 3. A coordinator deadline revision while the lane remains exhausted is
+      // still the same exhaustion, not a cadence-triggered re-evaluation.
+      claudeStatus = {
+        ...claudeStatus,
+        exhaustedUntil: "2099-09-23T16:00:00.000Z",
+        updatedAt: new Date().toISOString(),
+      };
+      await triggerQuotaThrottleTick?.();
+      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+
+      // 4. Cadence tick with unchanged exhaustion: does NOT trigger re-evaluation.
+      await triggerQuotaThrottleTick?.();
+      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+
+      // 5. Quota renewal (expired: false): negative requirement - does NOT trigger re-evaluation.
+      claudeStatus = {
+        ...claudeStatus,
+        expired: false,
+        exhaustedUntil: null,
+        updatedAt: new Date().toISOString(),
+      };
+      await triggerQuotaThrottleTick?.();
+      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
     // The response gate keeps the coordinator warmup in flight without using
     // wall-clock timing. A ready dashboard must not expose its history API
