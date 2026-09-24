@@ -274,4 +274,69 @@ describe("inbox MCP server", () => {
       },
     });
   });
+
+  it("returns chat context alongside the reply hint when the run scope supplies chat sources", async () => {
+    store.append([
+      {
+        id: "peer-msg",
+        actorId: "actor-a",
+        source: "mesh:peer",
+        payload: { type: "mesh.message", messageId: "m2", fromId: "peer" },
+      },
+    ]);
+    const readEntries = (ids: string[]) =>
+      ids.map((id) => {
+        const entry = store.read("actor-a", id);
+        if (!entry) throw new Error("missing test entry");
+        return entry;
+      });
+    const client = await connect(
+      createInboxMcpServer(store, "actor-a", {
+        select: readEntries,
+        selected: () => ["peer-msg", "own"],
+        chatContext: {
+          meshChat: {
+            listForActor: () => [
+              {
+                id: "m2",
+                ts: "t2",
+                senderId: "peer",
+                recipientId: "actor-a",
+                body: "which PR?",
+                sessionId: null,
+              },
+              {
+                id: "m1",
+                ts: "t1",
+                senderId: "actor-a",
+                recipientId: "peer",
+                body: "PR #643 is up",
+                sessionId: null,
+              },
+            ],
+          },
+        },
+      })
+    );
+
+    const result = (await client.callTool({
+      name: "select",
+      arguments: { entry_ids: ["peer-msg", "own"] },
+    })) as CallToolResult;
+
+    expect(result.isError).not.toBe(true);
+    const entries = (dataOf(result) as { entries: Array<Record<string, unknown>> }).entries;
+    expect(entries[0]).toMatchObject({
+      id: "peer-msg",
+      chatContext: {
+        source: "mesh",
+        scope: "conversation",
+        messages: [
+          { messageId: "m1", sender: "actor-a", text: "PR #643 is up" },
+          { messageId: "m2", sender: "peer", text: "which PR?", selected: true },
+        ],
+      },
+    });
+    expect(entries[1]).not.toHaveProperty("chatContext");
+  });
 });

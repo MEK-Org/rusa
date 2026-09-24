@@ -95,7 +95,12 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
-import type { ShadowResponsiveInterruptionClassifier } from "./responsive-interruption.js";
+import {
+  type ResponsiveInterruptionVerdict,
+  type ShadowResponsiveInterruptionClassifier,
+  shadowPrediction,
+  shadowReactionTarget,
+} from "./responsive-interruption.js";
 import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
@@ -721,6 +726,12 @@ export interface ActorMeshOptions {
   /** Optional, shadow-only JEV policy; it never changes the v1 dispatch result. */
   responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
   /**
+   * Posts a shadow verdict as a reaction on the chat message that arrived.
+   * Only ever called when `responsiveInterruption` is also supplied, so an
+   * install without the opt-in policy posts nothing even if this is wired.
+   */
+  reactToChatMessage?: (messageName: string, emoji: string) => Promise<void>;
+  /**
    * The allow-list of grantable capability names — typically the keys of the
    * wiring's grantable-MCP registry. A grant of any name outside this set is
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
@@ -872,6 +883,7 @@ export class ActorMesh {
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly responsiveInterruption?: ShadowResponsiveInterruptionClassifier;
+  private readonly reactToChatMessage?: ActorMeshOptions["reactToChatMessage"];
   private readonly grantable: ReadonlySet<string>;
   private readonly secretsDir: string;
   private readonly log: (msg: string) => void;
@@ -947,6 +959,7 @@ export class ActorMesh {
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.responsiveInterruption = opts.responsiveInterruption;
+    this.reactToChatMessage = opts.reactToChatMessage;
     // A host-global capability is never grantable through the mesh (#549), so
     // a wiring that lists one — the maintenance servers are registered like
     // any other grantable server — neither advertises nor grants it here.
@@ -1171,6 +1184,9 @@ export class ActorMesh {
               this.accountRun(event.actorId, event.terminal.result, event.runId);
             } else {
               this.abandonInboxRun(event.actorId);
+              // A launched run that ended without a result still ended: a pool
+              // staged while it ran is due now, not at some later dispatch (#652).
+              if (event.terminal.started) this.applyPendingModel(event.actorId);
             }
             // A selection is run-scoped regardless of its terminal shape.
             this.clearSelection(event.actorId);
@@ -1397,6 +1413,11 @@ export class ActorMesh {
             detail: "shadow",
             payload: JSON.stringify({ baseline, decision }),
           });
+          // The audit row is recorded first and independently: a chat space
+          // the bot cannot react in must not cost the measurement this whole
+          // feature exists to collect.
+          const prediction = shadowPrediction(decision);
+          if (prediction) this.postShadowReaction(entry.payload, prediction, incomingEntryId);
         })
         .catch(() => {
           // `evaluate` resolves rather than throws, so this arm covers only a
@@ -1406,6 +1427,29 @@ export class ActorMesh {
           this.log(`responsive interruption shadow observation failed for ${incomingEntryId}`);
         });
     }
+  }
+
+  /**
+   * Show a shadow verdict where the operator already is, on the arriving chat
+   * message. Gated on the classifier's own presence rather than a separate
+   * knob, so the opt-in that turns the policy on is the same one that turns
+   * this on and a default install posts nothing.
+   */
+  private postShadowReaction(
+    payload: Readonly<Record<string, unknown>>,
+    outcome: ResponsiveInterruptionVerdict,
+    incomingEntryId: string
+  ): void {
+    const react = this.reactToChatMessage;
+    if (!react) return;
+    const target = shadowReactionTarget(payload, outcome);
+    if (!target) return;
+    // A reaction is an observation aid, never a delivery guarantee. Failures
+    // are logged rather than retried; the audit event already holds the
+    // verdict either way.
+    void react(target.messageName, target.emoji).catch(() =>
+      this.log(`responsive interruption shadow reaction failed for ${incomingEntryId}`)
+    );
   }
 
   /** Read the entire durable unhandled set minus the selected rows; a
@@ -1680,16 +1724,15 @@ export class ActorMesh {
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
-    // run after. A tuple staged while idle/queued is applied earlier, at that
-    // run's own dispatch through `beforeRun`, so this call is then a
-    // no-op — {@link applyPendingModel} tolerates being called from both.
+    // run after. A tuple set while idle/queued was already applied by
+    // {@link setActorModel}, so this call is then a no-op.
     this.applyPendingModel(actorId);
   }
 
   /**
-   * Close the run-scoped inbox state for an opportunity that never launched.
-   * Unlike {@link finishInboxRun}, this must not consume a staged model change:
-   * the next real dispatch still owns that transition.
+   * Close the run-scoped inbox state for a run that ended without a result.
+   * It does not consume a staged model change itself: the lifecycle `onEnd`
+   * applies one only when the abandoned run had actually launched.
    */
   abandonInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
@@ -4227,12 +4270,17 @@ export class ActorMesh {
    * the model for its own descendants (and never its own).
    * A pool of more than one entry, or a change of provider, requires a
    * portable (ledger/tail) actor — a native provider session can't move.
-   * The replacement is atomic (the whole pool or nothing). Takes effect at the
-   * end of the actor's current run if one is in flight; otherwise applies at
-   * the actor's next dispatch, before that run's run_start and launch (see
-   * {@link applyPendingModel}).
+   * The replacement is atomic (the whole pool or nothing). A run already in
+   * flight keeps its launched pool and the replacement applies when that run
+   * ends; an idle or queued actor has it applied and persisted now (#652), so
+   * it never waits in process memory for a dispatch that may not come before
+   * a restart.
    */
-  setActorModel(id: string, modelConfig: ModelConfigInput, requestedBy: string): void {
+  setActorModel(
+    id: string,
+    modelConfig: ModelConfigInput,
+    requestedBy: string
+  ): "applied" | "staged" {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.actors.get(id);
@@ -4280,17 +4328,21 @@ export class ActorMesh {
         `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
       );
     }
-    // Boundary contract (#199): an in-flight run completes on its
-    // already-launched pool, and the staged pool applies at that run's end.
-    // An idle or queued actor has no launched run yet, so the staged pool
-    // applies atomically at its next dispatch, before run_start is recorded
-    // and before launch (see {@link applyPendingModel}).
+    // Boundary contract (#199, #652): an in-flight run completes on its
+    // already-launched pool, and the staged pool applies at that run's end
+    // (see {@link finishInboxRun}). An idle or queued actor has no launched
+    // run, so there is nothing to wait for: apply and persist now. Staging is
+    // process memory, so a pool left staged here would be lost to a restart.
+    const desiredModelClass = isModelClassReference(modelConfig) ? modelConfig.class : undefined;
     this.actors.patch(id, {
       desiredModelConfig: validated,
       // An explicit replacement deliberately clears any prior class label;
       // equality with a class's current entries is not provenance.
-      desiredModelClass: isModelClassReference(modelConfig) ? modelConfig.class : undefined,
+      desiredModelClass,
     });
+    const phase = this.activeRunState(id)?.phase;
+    const staged = phase === "running" || phase === "winding_down";
+    if (!staged) this.applyPendingModel(id);
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -4305,9 +4357,9 @@ export class ActorMesh {
     // existing halt/resume path instead. Partially healthy pools still
     // re-quote normally, letting provider selection choose an eligible lane.
     if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
-      if (liveActor?.cancelQueuedRun?.()) return;
+      if (liveActor?.cancelQueuedRun?.()) return staged ? "staged" : "applied";
     } else if (liveActor?.rescheduleQueuedRun?.()) {
-      return;
+      return staged ? "staged" : "applied";
     }
 
     if (this.inboxStore && this.runs.isLive(id) && this.activeRunState(id) === null) {
@@ -4316,13 +4368,15 @@ export class ActorMesh {
         this.dispatch(id);
       }
     }
+    return staged ? "staged" : "applied";
   }
 
   /**
    * Apply the staged modelConfig replacement at whichever boundary the
-   * actor's current state puts it behind next: dispatch (queued/idle, from
-   * `beforeRun` just before that run's `run_start` is recorded and its provider
-   * launches) or run end (mid-run, from {@link finishInboxRun}).
+   * actor's current state puts it behind next. `setActorModel` applies the
+   * normal idle/queued case immediately; dispatch is the fallback for an
+   * overlay retained by an admission gap or an all-halted preflight. A
+   * mid-run overlay applies at run end (from {@link finishInboxRun}).
    * Public — like {@link finishInboxRun} and {@link actorQueued} — because both
    * factory-created workers and the externally-constructed root invoke it at
    * their dispatch boundary.
@@ -4636,12 +4690,12 @@ export class ActorMesh {
   }
 
   /**
-   * The modelConfig pool a thread's next run will actually launch on: a
-   * staged `desiredModelConfig` has not been applied to `modelConfig` yet
-   * (that happens in {@link applyPendingModel} at dispatch), so every
-   * halt-gate check must consult this instead of the record's current
-   * `modelConfig` — otherwise a staged move to an already-halted pool slips
-   * through a still-open old pool's gate.
+   * The modelConfig pool a thread's next run will actually launch on.
+   * An overlay is normally consumed immediately by `setActorModel`; when one
+   * remains for a run boundary (mid-run, an admission gap, or an all-halted
+   * preflight), every halt-gate check must still consult it instead of the
+   * record's current `modelConfig`. Otherwise a staged move to an
+   * already-halted pool slips through a still-open old pool's gate.
    */
   private launchModelConfig(id: string): ProviderModelConfig[] | undefined {
     const rec = this.actors.get(id);

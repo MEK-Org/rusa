@@ -866,7 +866,7 @@ export function createAgentExecMcpServer(
       description:
         "Replace an existing actor's declared provider/model/effort pool in-place in the actor repository without service restart — " +
         "a full replacement of the pool, not a per-field patch. " +
-        "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current run if one is in flight; otherwise applies at the actor's next dispatch, before that run starts and launches. " +
+        "Allowed for the actor's parent, or root for any actor including itself. If a run is in flight, it finishes on its current pool and the change applies and persists when that run ends; an idle or queued actor has the change applied and persisted immediately, and queued work is re-admitted against the new pool. " +
         "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
@@ -880,7 +880,12 @@ export function createAgentExecMcpServer(
       try {
         let targetId = actor_id;
         try {
-          mesh.setActorModel(targetId, model_config, selfId);
+          const outcome = mesh.setActorModel(targetId, model_config, selfId);
+          return toolOk(
+            outcome === "staged"
+              ? `staged modelConfig update for ${targetId}; applies when its current run ends`
+              : `applied modelConfig update for ${targetId}`
+          );
         } catch (err) {
           if (
             err instanceof Error &&
@@ -889,7 +894,12 @@ export function createAgentExecMcpServer(
             if (!UUID_REGEX.test(actor_id)) {
               const child = mesh.resolveDirectChildHandle(selfId, actor_id);
               targetId = child.id;
-              mesh.setActorModel(targetId, model_config, selfId);
+              const outcome = mesh.setActorModel(targetId, model_config, selfId);
+              return toolOk(
+                outcome === "staged"
+                  ? `staged modelConfig update for ${targetId}; applies when its current run ends`
+                  : `applied modelConfig update for ${targetId}`
+              );
             } else {
               throw err;
             }
@@ -897,7 +907,6 @@ export function createAgentExecMcpServer(
             throw err;
           }
         }
-        return toolOk(`staged modelConfig update for ${targetId}`);
       } catch (err) {
         return toolError(err);
       }

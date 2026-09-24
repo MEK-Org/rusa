@@ -11,7 +11,11 @@ const sessionIdleDuration = Duration(hours: 1);
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
+  /// Stable Firebase identity, distinct from mutable profile presentation.
+  String get uid;
   String? get photoUrl;
+  String? get displayName;
+  String? get email;
   Future<String> getIdToken({bool forceRefresh = false});
 }
 
@@ -29,6 +33,7 @@ abstract class DashboardSession extends ChangeNotifier
   DashboardSessionStatus get status;
   bool get isIdle;
   String? get profilePhotoUrl;
+  String get operatorDisplayName;
   String? get browserTitle;
   String? get errorMessage;
 
@@ -56,6 +61,9 @@ class LocalDashboardSession extends DashboardSession {
 
   @override
   String? get profilePhotoUrl => null;
+
+  @override
+  String get operatorDisplayName => 'Operator';
 
   @override
   String? get browserTitle => null;
@@ -129,6 +137,13 @@ class FirebaseDashboardSession extends DashboardSession {
   @override
   String? get profilePhotoUrl => _user?.photoUrl;
 
+  /// Read when the dashboard page mounts; a profile edit shows on next load.
+  @override
+  String get operatorDisplayName {
+    final user = _user ?? _auth.currentUser;
+    return _firstProfileLabel(user?.displayName, user?.email);
+  }
+
   @override
   String? get browserTitle => _browserTitle;
 
@@ -152,6 +167,7 @@ class FirebaseDashboardSession extends DashboardSession {
   }
 
   void _onAuthStateChanged(SessionUser? user) {
+    final previous = _user;
     _user = user;
     if (user == null) {
       if (_status == DashboardSessionStatus.signedIn) unawaited(_expire());
@@ -160,7 +176,11 @@ class FirebaseDashboardSession extends DashboardSession {
     if (_status == DashboardSessionStatus.signedOut && !_creatingSession) {
       _markSignedIn();
       unawaited(checkSession());
+      return;
     }
+    // A different account in the same browser would otherwise pair its profile
+    // with the prior account's server cookie; make the person sign in again.
+    if (previous != null && previous.uid != user.uid) unawaited(_expire());
   }
 
   void _markSignedIn() {
@@ -336,4 +356,14 @@ class FirebaseDashboardSession extends DashboardSession {
     _client.close();
     super.dispose();
   }
+}
+
+/// Profile fields are display-only. Principal identity and authorization remain
+/// server-owned; the dashboard falls back rather than exposing a raw id.
+String _firstProfileLabel(String? displayName, String? email) {
+  for (final value in [displayName, email]) {
+    final trimmed = value?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+  }
+  return 'Operator';
 }

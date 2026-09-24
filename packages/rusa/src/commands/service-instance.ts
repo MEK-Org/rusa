@@ -209,11 +209,17 @@ function splitEnvironmentAssignments(raw: string): string[] {
   return out;
 }
 
-/** The last `PATH=` among these assignments — last-wins, as systemd resolves it. */
-function lastPathAssignment(assignments: readonly string[]): string | null {
+/**
+ * The last `NAME=` among these assignments — last-wins, as systemd resolves it.
+ *
+ * The prefix is matched whole, so `RUSA_SLACK_BOT_TOKEN_PATH` can never be
+ * mistaken for `PATH`.
+ */
+function lastAssignment(assignments: readonly string[], name: string): string | null {
+  const prefix = `${name}=`;
   let found: string | null = null;
   for (const assignment of assignments) {
-    if (assignment.startsWith("PATH=")) found = assignment.slice("PATH=".length);
+    if (assignment.startsWith(prefix)) found = assignment.slice(prefix.length);
   }
   return found ? found : null;
 }
@@ -228,19 +234,47 @@ function lastPathAssignment(assignments: readonly string[]): string | null {
  * so a provider-capable `PATH` that lives in a drop-in — an established
  * operator mechanism here — would be missed entirely.
  *
- * Returns null when systemd cannot answer (no user manager, or the unit is not
- * loaded), which is why `readUnitPathEnv` remains as a fallback.
+ * Returns null when systemd cannot answer (no user manager) and equally when
+ * it answers that the unit assigns no `PATH`, which is why `readUnitPathEnv`
+ * remains as a fallback. {@link probeSystemdUnitPathEnv} keeps those two apart
+ * for callers that have to report which one they are looking at.
  */
 export function readSystemdUnitPathEnv(unitName: string): string | null {
+  return probeSystemdUnitPathEnv(unitName).path;
+}
+
+/** What systemd said about a unit's `PATH`, including whether it said anything. */
+export interface SystemdUnitPathProbe {
+  /**
+   * False only when the user manager could not be asked at all — no session
+   * bus, no user manager. `systemctl show` answers for a unit it has never
+   * heard of (exit 0, empty value), so a failure here is about the manager and
+   * never about the unit.
+   */
+  answered: boolean;
+  /** The assigned `PATH`, or null when the unit assigns none — or nobody answered. */
+  path: string | null;
+}
+
+/**
+ * {@link readSystemdUnitPathEnv}, keeping the distinction it throws away.
+ *
+ * "Systemd reports no PATH for this unit" and "systemd could not be asked" are
+ * the same `null` to a caller that only wants a `PATH`, and different answers
+ * to one that has to report what it knows: the first means the unit is not
+ * assigning a PATH, the second means nothing about the unit has been
+ * established at all.
+ */
+export function probeSystemdUnitPathEnv(unitName: string): SystemdUnitPathProbe {
   try {
     const raw = execFileSync(
       "systemctl",
       ["--user", "show", "-p", "Environment", "--value", unitName],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }
     );
-    return lastPathAssignment(splitEnvironmentAssignments(raw));
+    return { answered: true, path: lastAssignment(splitEnvironmentAssignments(raw), "PATH") };
   } catch {
-    return null;
+    return { answered: false, path: null };
   }
 }
 
@@ -255,12 +289,31 @@ export function readSystemdUnitPathEnv(unitName: string): string | null {
  * written before this directive existed inherits systemd's `/usr/bin:/bin`.
  */
 export function readUnitPathEnv(unitContents: string): string | null {
+  return readUnitEnvironment(unitContents, "PATH");
+}
+
+/**
+ * Read one `Environment=` assignment out of a unit file.
+ *
+ * Generalized over the variable name because an installed unit is the durable
+ * record of more than its `PATH`: the pool coordinator installer reads
+ * `RUSA_HOME` back out of a coordinator unit it is about to replace, so a
+ * transition adopts the home the running service actually uses rather than one
+ * inferred from the unit's name.
+ *
+ * Splitting each `Environment=` line into assignments rather than matching the
+ * rest of the line is what makes `Environment=PATH=/usr/bin FOO=bar` and its
+ * mirror both read correctly, and it is why the name is matched as a whole
+ * assignment prefix: `RUSA_SLACK_BOT_TOKEN_PATH` is not `PATH`.
+ */
+export function readUnitEnvironment(unitContents: string, name: string): string | null {
   let found: string | null = null;
   for (const line of unitContents.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("Environment=")) continue;
-    const fromLine = lastPathAssignment(
-      splitEnvironmentAssignments(trimmed.slice("Environment=".length))
+    const fromLine = lastAssignment(
+      splitEnvironmentAssignments(trimmed.slice("Environment=".length)),
+      name
     );
     if (fromLine) found = fromLine;
   }

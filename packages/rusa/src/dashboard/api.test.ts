@@ -3128,6 +3128,87 @@ describe("handleMeshApiRequest", () => {
         ).toEqual(["live-root", "quiet-done"]);
         expect(includedData.total).toBe(2);
       });
+
+      it("excludes quiet terminal descendants by default, includes them with includeTerminalRoots=true (#506)", async () => {
+        obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
+        obligations.create({
+          title: "live-child",
+          id: "live-child",
+          parentId: "live-root",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "done-child",
+          id: "done-child",
+          parentId: "live-root",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "under-done",
+          id: "under-done",
+          parentId: "done-child",
+          ownerId: "actor-1",
+        });
+        // Recurring, so completing it leaves it `scheduled` rather than
+        // terminal — the only way a non-terminal row ends up under a finished
+        // one, since the store refuses both to add a child to a terminal
+        // obligation and to finish one that still has a ready or waiting child.
+        obligations.setRecurrence(
+          "under-done",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        obligations.setTerminalStatus("under-done", "done", null, null, "system:mesh");
+        obligations.setTerminalStatus("done-child", "done", null, null, "system:mesh");
+
+        const ids = (body: string): string[] => {
+          const out: string[] = [];
+          const walk = (node: { obligation: { id: string }; children: unknown[] }): void => {
+            out.push(node.obligation.id);
+            for (const child of node.children) {
+              walk(child as { obligation: { id: string }; children: unknown[] });
+            }
+          };
+          for (const tree of JSON.parse(body).trees) {
+            walk(tree as { obligation: { id: string }; children: unknown[] });
+          }
+          return out.sort();
+        };
+
+        const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        // `under-done` is not terminal, but the tree view never renders it: it
+        // hides `done-child` and does not descend past it.
+        expect(ids(defaultRes.body)).toEqual(["live-child", "live-root"]);
+
+        const { res: includedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/forest?includeTerminalRoots=true"
+        );
+        expect(ids(includedRes.body)).toEqual([
+          "done-child",
+          "live-child",
+          "live-root",
+          "under-done",
+        ]);
+      });
+
+      it("leaves GET /api/mesh/obligations/:id/tree unpruned (#506)", async () => {
+        obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
+        obligations.create({
+          title: "done-child",
+          id: "done-child",
+          parentId: "live-root",
+          ownerId: "actor-1",
+        });
+        obligations.setTerminalStatus("done-child", "done", null, null, "system:mesh");
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/live-root/tree");
+        expect(res.statusCode).toBe(200);
+        expect(
+          JSON.parse(res.body).children.map((c: { obligation: { id: string } }) => c.obligation.id)
+        ).toEqual(["done-child"]);
+      });
     });
 
     describe("GET /api/mesh/obligations/:id", () => {

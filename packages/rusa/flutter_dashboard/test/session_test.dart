@@ -7,12 +7,22 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/session.dart';
 
 class _User implements SessionUser {
-  _User(this.token, {this.photoUrl});
+  _User(this.token, {String? uid, this.photoUrl, this.displayName, this.email})
+    : uid = uid ?? token;
 
   final String token;
 
   @override
+  final String uid;
+
+  @override
   final String? photoUrl;
+
+  @override
+  final String? displayName;
+
+  @override
+  final String? email;
 
   @override
   Future<String> getIdToken({bool forceRefresh = false}) async => token;
@@ -444,6 +454,50 @@ void main() {
     expect(session.status, DashboardSessionStatus.local);
     expect(session.isIdle, isFalse);
   });
+
+  test('profile display label prefers name, then email, then Operator', () {
+    final named = FirebaseDashboardSession(
+      _Auth(_User('token', displayName: 'Ada Lovelace')),
+    );
+    final emailed = FirebaseDashboardSession(
+      _Auth(_User('token', displayName: ' ', email: 'ada@example.test')),
+    );
+    final unnamed = FirebaseDashboardSession(_Auth(_User('token')));
+
+    expect(named.operatorDisplayName, 'Ada Lovelace');
+    expect(emailed.operatorDisplayName, 'ada@example.test');
+    expect(unnamed.operatorDisplayName, 'Operator');
+  });
+
+  test(
+    'an account switch while signed in expires the session instead of relabeling it',
+    () async {
+      final auth = _Auth(
+        _User('old-token', uid: 'old-user', displayName: 'Ada Lovelace'),
+      );
+      final client = _Client([http.Response('{}', 200)]);
+      final session = FirebaseDashboardSession(auth, client: client);
+      session.start();
+      await Future<void>.delayed(Duration.zero);
+      expect(session.status, DashboardSessionStatus.signedIn);
+
+      final newUser = _User(
+        'new-token',
+        uid: 'new-user',
+        displayName: 'Grace Hopper',
+      );
+      auth.currentUser = newUser;
+      auth.changes.add(newUser);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(session.status, DashboardSessionStatus.signedOut);
+      expect(auth.signOutCount, 1);
+      expect(client.paths, ['/api/auth/session']);
+
+      session.dispose();
+      await auth.close();
+    },
+  );
 
   test(
     'a refused stream reconnect checks the session and only a 401 expires it',

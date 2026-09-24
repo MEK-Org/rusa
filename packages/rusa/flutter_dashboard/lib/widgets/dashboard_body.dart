@@ -174,6 +174,7 @@ class _DashboardBodyState extends State<DashboardBody> {
                 ),
                 onLogout: widget.onLogout,
                 profilePhotoUrl: widget.profilePhotoUrl,
+                profileDisplayName: widget.store.operatorDisplayName,
               ),
               body: _chrome(
                 onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
@@ -199,6 +200,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       return MeshHeader(
         onLogout: widget.onLogout,
         profilePhotoUrl: widget.profilePhotoUrl,
+        profileDisplayName: widget.store.operatorDisplayName,
         store: widget.store,
         selected: _view,
         onSelect: _selectView,

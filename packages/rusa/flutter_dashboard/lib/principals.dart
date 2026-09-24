@@ -39,6 +39,9 @@ bool isViewerPrincipal(String? id, String? userPrincipalId) =>
     id != null && viewerPrincipalIds(userPrincipalId).contains(id);
 
 /// Whether typed owner text means "the viewing person" rather than an actor.
+///
+/// Profile data is deliberately absent here. It is mutable presentation data,
+/// rather than an identifier, and could collide with an actor handle.
 bool isOperatorOwnerText(String text, String? userPrincipalId) {
   final t = text.trim();
   return t == 'operator' ||

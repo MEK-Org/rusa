@@ -13,30 +13,68 @@ output of the drill script in this repository, not a worked example.
 
 ## 1. Units
 
-In the target architecture, the coordinator is provisioned once per **pool** —
-the set of instances sharing a quota database — and instances across
-environments (such as production and staging) are clients of that single shared
-coordinator.
-
-Today, the shipped installer (`packages/rusa/src/commands/install-service.ts`)
-installs coordinator units per environment (`rusa install-quota-coordinator --environment <env>`),
-deriving unit names from the instance's service basename (`<serviceBasename>-quota-coordinator.service`).
-In a multi-environment pool on a shared host, the coordinator is provisioned once
-for the pool, and other environments connect to its shared socket as clients rather
-than running duplicate coordinators. Decoupling unit installation from instance/environment
-basenames into an independent pool-level installer is tracked as a follow-up gap.
+The coordinator is provisioned once per **pool** — the set of instances sharing
+a quota database — and instances across environments (such as production and
+staging) are clients of that single shared coordinator. Since #507 the shipped
+installer provisions it that way: the unit names are fixed, and the service's
+home is an explicit property of the coordinator rather than a consequence of
+picking an instance environment.
 
 The coordinator runs under two `systemd --user` units:
 
 | Unit | Role |
 | --- | --- |
-| `<serviceBasename>-quota-coordinator.service` | the coordinator itself (`rusa quota-coordinator --home <RUSA_HOME>`) |
-| `<serviceBasename>-quota-coordinator-alert.service` | `OnFailure=` companion; notifies through the configured error chat |
+| `rusa-quota-coordinator.service` | the coordinator itself (`rusa quota-coordinator --home <its own home>`) |
+| `rusa-quota-coordinator-alert.service` | `OnFailure=` companion; notifies through the configured error chat |
 
 ```bash
-rusa install-quota-coordinator
+rusa install-quota-coordinator                   # adopts the home the installed unit already uses
+rusa install-quota-coordinator --home ~/.rusa    # name the pool coordinator's home outright
 rusa install-quota-coordinator --no-restart      # write and enable, start later
 ```
+
+The home is resolved in this order, and the installer prints which one it used:
+
+1. `--home <path>`;
+2. `RUSA_QUOTA_COORDINATOR_HOME`;
+3. adoption from the coordinator unit already on disk — preferring
+   `rusa-quota-coordinator.service`, because that unit is the one that survives
+   and therefore names the database that must keep being opened.
+
+With none of the three available the install stops and says so rather than
+guessing, and it refuses to point an installed coordinator at a *different*
+quota database unless `--allow-database-change` says that is the intent. There
+is no `--environment` flag: the pool coordinator is not production's or
+staging's.
+
+### Transition off the environment-derived units
+
+Installing used to derive the unit names from an instance's service basename, so
+a second environment produced a second coordinator — `rusa-staging-quota-coordinator.service`
+alongside `rusa-quota-coordinator.service` — probing the same providers against
+the same pool. Re-running the installer retires those duplicates: each is
+stopped, disabled, and its unit file removed, and the removal is idempotent, so
+a host that has already transitioned has nothing to do.
+
+Only the unit names this project has installed are ever candidates —
+`rusa-quota-coordinator.service` and `rusa-staging-quota-coordinator.service`
+with their `-alert` companions — so a coordinator-shaped unit in
+`~/.config/systemd/user` that rusa did not write is left alone.
+
+A unit file is removed only after that unit is observed to have stopped. If
+`systemctl --user disable --now` fails, the install stops there with the unit
+still installed rather than deleting the file out from under a running duplicate
+and starting a second coordinator beside it. Stop the unit by hand and re-run.
+
+Retiring a unit never touches a database. If a retired coordinator ran against a
+different home, the installer names that home and says its files are left where
+they are.
+
+The install prints a `Database identity` line whenever the check could not be
+made — an installed unit that names no `RUSA_HOME` — so "not verified" is never
+reported as though it were "verified identical". If the installed unit runs
+against a home whose config cannot be read, the install refuses rather than
+guessing which database that unit opens; `--allow-database-change` overrides.
 
 ### What the unit carries, and why
 
@@ -45,7 +83,9 @@ orchestrator unit (design §9.1). It sets:
 
 - `Environment=PATH=<the resolved user PATH>` — the provider CLIs, `bwrap` and
   `tmux` all have to be findable; systemd's default `/usr/bin:/bin` finds none
-  of them.
+  of them. The `PATH` is fixed at install time, so it can fall behind the
+  instance unit's; `pnpm --filter rusa run check:coordinator-path` compares
+  the two and names any provider CLI the coordinator can no longer resolve.
 - `Environment=XDG_RUNTIME_DIR=<runtime dir>` — the tmux socket and the
   coordinator's own listener. Set explicitly because a coordinator that falls
   back to `/tmp` for its socket is one whose clients cannot find it.
@@ -62,28 +102,29 @@ Install-time preflight creates `$RUSA_HOME/workers` (the probe creates
 `quota-probe-<provider>/` under it) and fails if it is not writable; missing
 `bwrap` or `tmux` is a warning, since a host may install them afterwards.
 
-Instance units declare `After=`/`Wants=` the coordinator unit — never
+Every client instance unit declares `After=`/`Wants=rusa-quota-coordinator.service`
+— the same one unit, whatever the instance's environment — and never
 `Requires=`. Under v1 an instance without the coordinator is degraded (it paces
 on its last applied interval), not stopped, and `Requires=` would turn a
 coordinator failure into an orchestrator outage. `rusa install-service` writes
 the ordering lines only when the coordinator unit already exists on disk, so an
 instance with no coordinator does not log a dependency warning on every start.
 
-**Install order does not matter.** The common case is the other one — the
-instance was installed months ago, and the coordinator arrives now — so
-`rusa install-quota-coordinator` retrofits the two lines into a matching
-instance unit it finds on disk, before its `daemon-reload`. It is idempotent
-(a unit that already orders after the coordinator is left byte-for-byte alone)
-and it does **not** restart the instance: the ordering is a boot-time
-relationship, it applies on the instance's next start, and restarting an
-orchestrator mid-run to install a `Wants=` would cost more than it buys. The
-command reports which of the two happened.
+**Install order does not matter, but the client installer owns the ordering.**
+`rusa install-service` writes those lines; `rusa install-quota-coordinator` does
+not edit instance units at all — provisioning the pool service and connecting a
+client to it are separate acts. When the instance was installed months ago and
+the coordinator arrives now, the coordinator installer *reports* which client
+units are missing the ordering and tells you to re-run `rusa install-service`
+for them. That re-run does not restart the instance by itself when invoked with
+`--no-restart`; the ordering is a boot-time relationship and applies on the
+instance's next start.
 
 ### Checking it
 
 ```bash
-systemctl --user status <basename>-quota-coordinator.service
-journalctl --user -u <basename>-quota-coordinator.service -f
+systemctl --user status rusa-quota-coordinator.service
+journalctl --user -u rusa-quota-coordinator.service -f
 curl --unix-socket "$XDG_RUNTIME_DIR/rusa-quota/coordinator.sock" \
   http://localhost/v1/readyz
 ```
@@ -228,12 +269,12 @@ rusa quota-coordinator --home "$RUSA_HOME" --probe-off
 For the installed user unit, add a temporary drop-in and restart it:
 
 ```bash
-systemctl --user edit <basename>-quota-coordinator.service
+systemctl --user edit rusa-quota-coordinator.service
 # Add exactly:
 # [Service]
 # Environment=RUSA_QUOTA_COORDINATOR_PROBE_OFF=1
 systemctl --user daemon-reload
-systemctl --user restart <basename>-quota-coordinator.service
+systemctl --user restart rusa-quota-coordinator.service
 ```
 
 The startup record carries `probeOff: true` and the journal records `Quota probe
@@ -248,7 +289,7 @@ drop-in is the unit's state, and changing the unit's state is the rollback
 below, not a flag an ad-hoc invocation can quietly win with.
 
 To roll back stage 0 into the normal collection stage, remove the drop-in with
-`systemctl --user revert <basename>-quota-coordinator.service`, then
+`systemctl --user revert rusa-quota-coordinator.service`, then
 `systemctl --user daemon-reload` and restart the unit. The absence of the
 switch is deliberately probe-on; do not leave a probe-off override in place
 when expecting fresh quota observations.
@@ -388,7 +429,7 @@ If the flip must be rolled back:
 2. **Stop production client:** Stop production instances (`systemctl --user stop <basename>.service`).
 3. **Stop the shared coordinator:** Stop the shared coordinator unit:
    ```bash
-   systemctl --user stop <basename>-quota-coordinator.service
+   systemctl --user stop rusa-quota-coordinator.service
    ```
    This ensures the coordinator socket is no longer listening. A staging
    instance still pointed at this socket does not resume in-process scraping —
@@ -423,7 +464,7 @@ If the flip must be rolled back:
    and verify local in-process scraping and pacing resume.
 8. **Coordinator lifecycle after rollback:**
    If staging is to continue using the shared coordinator, restart the coordinator
-   unit (`systemctl --user start <basename>-quota-coordinator.service`); its database
+   unit (`systemctl --user start rusa-quota-coordinator.service`); its database
    was preserved untouched. If the entire pool is reverting to pre-coordinator
    operation, leave the coordinator unit stopped and disabled.
 
@@ -499,10 +540,10 @@ the flip — a step performed on demand, not one that can wait for a timer.
 
 1. Stop the instances.
 2. Stop the coordinator:
-   `systemctl --user stop <basename>-quota-coordinator.service`.
+   `systemctl --user stop rusa-quota-coordinator.service`.
 3. `rusa quota-restore` (optionally `--from`).
 4. Start the coordinator:
-   `systemctl --user start <basename>-quota-coordinator.service`.
+   `systemctl --user start rusa-quota-coordinator.service`.
 5. Check `/v1/readyz` and the published throttle on `/v1/throttle`.
 6. Start the instances.
 
@@ -638,7 +679,7 @@ an exporter added later can read the same records without migrating a second
 emission path.
 
 ```bash
-journalctl --user -u <basename>-quota-coordinator.service -o cat \
+journalctl --user -u rusa-quota-coordinator.service -o cat \
   | jq 'select(.metric == "quota_service_scrapes_total")'
 ```
 

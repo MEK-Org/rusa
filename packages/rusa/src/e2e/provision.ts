@@ -97,6 +97,10 @@ export function buildE2EConfig(opts: {
     webhook: { port: 0, secret: "" },
     dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
     understanding: { rootNodeId: E2E_IU_ROOT_NODE_ID },
+    // E2E roots are disposable test environments. Do not let the host's disk
+    // state create unrelated responsive work; explicit disk-alert tests can
+    // still enable the sensor in their own startup config.
+    observability: { diskAlert: { enabled: false } },
     // An E2E instance is a coordinator client, never a second database owner.
     // Keep the one socket and pacing settings it needs, while excluding both
     // the legacy and coordinator-owned database paths from its configuration.

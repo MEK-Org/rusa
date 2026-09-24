@@ -57,6 +57,7 @@ describe("buildE2EConfig", () => {
     expect(loaded.geminiApiKey).toBeTruthy();
     expect(loaded.understanding?.rootNodeId).toBe(E2E_IU_ROOT_NODE_ID);
     expect(loaded.glassGoals).toBeUndefined();
+    expect(loaded.observability?.diskAlert).toEqual({ enabled: false });
   });
 
   it("uses an explicit fake root by default and threads a supplied selection", () => {
@@ -73,6 +74,7 @@ describe("buildE2EConfig", () => {
     expect(am.rootActor?.provider).toBe("antigravity");
     expect(am.rootActor?.effort).toBe("high");
     expect(am.chat?.projectId).toBe("e2e");
+    expect(am.observability?.diskAlert).toEqual({ enabled: false });
 
     // Still schema-valid with the actor-mesh edges present.
     writeFileSync(join(home, "config.yaml"), toYaml(am), "utf8");
@@ -90,6 +92,7 @@ describe("buildE2EConfig", () => {
       },
       geminiApiKey: "base-key-123",
       elevenlabsApiKey: "elevenlabs-test-key",
+      observability: { diskAlert: { enabled: true, thresholdPercent: 1 } },
       voice: {
         transcriptionProvider: "elevenlabs",
         supportedVoices: [
@@ -110,6 +113,7 @@ describe("buildE2EConfig", () => {
     expect(Object.keys(config.providers)).toEqual(["claude", "codex", "fake"]);
     expect(config.providers.fake?.cliCommand).toBe("fake");
     expect(config.geminiApiKey).toBe("base-key-123");
+    expect(config.observability?.diskAlert).toEqual({ enabled: false });
     expect(config.elevenlabsApiKey).toBeUndefined();
     // ElevenLabs-only voice config is omitted because elevenlabsApiKey is omitted in e2e
     expect(config.voice).toBeUndefined();

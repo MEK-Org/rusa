@@ -921,7 +921,8 @@ class _DetailViewState extends State<_DetailView> {
               ObligationCheckpointPanel(
                 obligation: o,
                 lookupHandle: (id) => store.actor(id)?.handle,
-                isHuman: (id) => store.isHuman(id),
+                isViewer: (id) => store.isViewer(id),
+                humanDisplayName: store.operatorDisplayName,
                 selectable: true,
               ),
             ],
@@ -945,7 +946,8 @@ class _DetailViewState extends State<_DetailView> {
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
                   lookupActorHandle: (id) => store.actor(id)?.handle,
-                  isHuman: (id) => store.isHuman(id),
+                  isViewer: (id) => store.isViewer(id),
+                  humanDisplayName: store.operatorDisplayName,
                   openLink: openLink,
                 ),
               const SizedBox(height: 16),
@@ -1342,6 +1344,8 @@ class _DetailViewState extends State<_DetailView> {
       reference: reference,
       action: edit,
       lookupActorHandle: (id) => store.actor(id)?.handle,
+      isViewer: store.isViewer,
+      humanDisplayName: store.operatorDisplayName,
       openLink: openLink,
     );
   }
