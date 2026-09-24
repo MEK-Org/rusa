@@ -50,29 +50,32 @@ through three places:
    selected inbox items separately from unselected backlog. Drill-through goes
    to Inbox, Events, and Work. Its snapshot instead says that work was selected
    for this run and names the next run-stage action.
-3. **Recent activity** — replace a yield-note feed with a run-settlement row:
-   terminal result and time; work identity; **Handled** inbox outcomes;
-   **Obligation changes**; goal state; and drill-through to the run, source, and
-   work record. Run-record outcomes are limited to observed CLI results,
-   interruption, and the current terminal accounting result. A dependency wait
-   appears in a separately labelled **Dependency waiting** section, and remote
-   contact loss appears as a transport observation with provider outcome
-   **unknown**, never as a fake provider failure.
+3. **Recent activity** — answer "what have the actors completed recently?" by
+   replacing the yield-note feed with handled work cards, newest first:
+   - Header: **Recent Activity** with a concise subtitle. The search bar and
+     status filter dropdown are removed per operator guidance.
+   - Column layout: `[Time] [Actor] [ Handled card [Optional "(+ N more)"]]`.
+   - Handled card: presents the handled source reference, item summary, and
+     the green resolution explanation container (matching the "Handled Inbox Items"
+     presentation in the actor inbox panel with "Handled: <time>" and
+     "Addressed: <resolution note>").
+   - Multi-item handling: coalesced inbox items or review threads display an
+     explicit `(+ N more)` badge.
+   - Completions focus: routine non-zero exits and transient run execution errors
+     do not appear as activity completions in this panel; it is dedicated to
+     actual completed/handled work.
 
-The screenshot deliberately includes these recovery cases:
+The screenshot illustrates this completed work flow:
 
-- A notification is handled with “waiting on design approval” while its linked
-  obligation remains **Waiting on operator** through a real dependency edge.
-  Handling a notification is never presented as completing the goal.
-- A provider failure occurs while the #664 notification is selected. That
-  notification remains unhandled; its work-specific retry budget is exhausted
-  and the row projects **Needs attention** with explicit drill-through.
-- A separately labelled remote-contact-loss observation says only that the
-  leader lost contact with the follower. It does not call the provider dead or
-  replace a later observed follower CLI result.
-- A deferred, unselected backlog item still appears in Queue. It was not
-  consumed by the failed selected run and does not spend that work's retry
-  budget.
+- Actor `kestrel-coder` handled the #664 feedback item with resolution explanation
+  "Packaged design proposal and repeatable Flutter render harness into PR #665;
+  awaiting operator review", with `(+ 1 more)` indicating coalesced items.
+- Actor `heron-reviewer` handled PR #661 review feedback with resolution
+  explanation "Verified socket-boundary outage regression and removed unsupported
+  cache retention; posted APPROVE", with `(+ 2 more)` for inline threads.
+- Actor `amber-owl` handled the stage-2 withdrawal decision on mesh chat with
+  resolution explanation "Completed stage-3 handoff confirmed; cancelled child
+  obligation 0fb4ecd9 and closed PR #666".
 
 ## Runtime direction for a later implementation
 

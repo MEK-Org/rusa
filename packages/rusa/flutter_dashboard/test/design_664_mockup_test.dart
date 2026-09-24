@@ -102,6 +102,18 @@ void main() {
             selectedModel: 'claude-opus-4-6',
             selectedEffort: 'high',
           ),
+          makeThread(
+            'heron-reviewer',
+            parent: 'root',
+            status: 'idle',
+            title: 'rusa reviewer',
+          ),
+          makeThread(
+            'amber-owl',
+            parent: 'root',
+            status: 'idle',
+            title: 'quota docs coder',
+          ),
         ]
         ..obligationsResult = [selectedObligation];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -135,6 +147,8 @@ void main() {
       await _settleImages(tester, [
         _portraitUrl(_kActorId),
         _portraitUrl('root'),
+        _portraitUrl('heron-reviewer'),
+        _portraitUrl('amber-owl'),
       ]);
 
       await _capture(key, '$_outDir/664_run_outcomes_mock.png');
@@ -181,7 +195,7 @@ class _MockSheet extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 16),
-        const _RecentActivityPanel(),
+        _RecentActivityPanel(store: store),
         const SizedBox(height: 16),
         const _FooterNotes(),
       ],
@@ -310,9 +324,8 @@ class _Panel extends StatelessWidget {
   }
 }
 
-/// The shared identity strip: this is the "same work item" the acceptance test
-/// asks a user to follow. Every surface renders this same heading + status +
-/// reference, so the eye can track it across panels.
+/// The shared identity strip: this is the work item whose progression through
+/// queued -> selected -> recent activity the mock demonstrates.
 class _IdentityRibbon extends StatelessWidget {
   const _IdentityRibbon({required this.obligation});
   final ObligationDto obligation;
@@ -330,7 +343,7 @@ class _IdentityRibbon extends StatelessWidget {
         children: [
           const Icon(Icons.linear_scale, size: 16, color: MeshColors.accent),
           const SizedBox(width: 10),
-          const ReferenceKindChip('SAME WORK ITEM'),
+          const ReferenceKindChip('WORK ITEM'),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
@@ -657,167 +670,108 @@ class _KeyValue extends StatelessWidget {
 // ── ③ Recent activity (proposed) ─────────────────────────────────────────────
 
 /// The proposed replacement for the "Recent Yields" section: rows keyed by
-/// RUN SETTLEMENT, each carrying the same work identity plus two DISTINCT
-/// outcome columns — handled messages vs obligation changes — plus bounded
-/// recovery state. A handled message is never rendered as goal completion.
+/// what actors have completed recently, answering "what have the actors
+/// completed recently?". Each row follows the structure:
+///   [Time] [Actor] [ Handled card [Optional "(+ N more)"] ]
+/// with resolution explanations matching the "Handled Inbox Items" presentation
+/// on the actor inbox panel. Non-zero exits and search/filter controls are removed.
 class _RecentActivityPanel extends StatelessWidget {
-  const _RecentActivityPanel();
+  const _RecentActivityPanel({required this.store});
+  final DashboardStore store;
 
   @override
   Widget build(BuildContext context) {
     return _Panel(
       step: '3',
-      title: 'RECENT ACTIVITY — replaces “Recent Yields”',
+      title: 'Recent Activity',
       subtitle:
-          'Run-record outcomes are separate from dependency waits and remote '
-          'contact observations. Only an observed CLI return/failure gets a '
-          'provider-result pill; a lost remote channel leaves that outcome unknown.',
+          'What actors have completed recently, newest first. Handled cards report '
+          'what was addressed, with resolution notes and completion time.',
       tag: _proposedTag,
       child: Column(
         children: [
-          const _ActivitySectionLabel('RUN-RECORD OUTCOMES'),
-          const SizedBox(height: 4),
-          _RunOutcomeRow(
-            pill: _OutcomePill.returnedOk(),
-            startLabel: '14:07:03',
-            duration: '2m 18s',
-            identityTitle: _kObligationHeading,
-            identityRef: _kObligationRef,
-            handled: const [
-              '#664 design-review notification handled at 14:07',
-              'note: waiting on design approval',
-            ],
-            obligationChanges: const [
-              'status unchanged · Waiting on operator',
-              'dependency edge: design approval',
-            ],
-            goalState: _GoalState.waiting,
-            drillThrough: 'handled notification · work tree',
+          _HandledActivityRow(
+            timeLabel: '14:07:03',
+            actorId: _kActorId,
+            actorHandle: _kHandle,
+            actorModel: 'claude-opus-4-6, high',
+            store: store,
+            sourceKind: 'GITHUB ISSUE',
+            sourceRef: _kObligationRef,
+            summary: 'issue_comment.created · UI proposal feedback on #664',
+            handledTime: '14:07:03',
+            addressedNote:
+                'Packaged design proposal and repeatable Flutter render harness into PR #665; awaiting operator review.',
+            moreCount: 1,
+            linkedObligation:
+                'Obligation: Render work-outcome dashboard mock-up',
           ),
           const Divider(height: 1, color: MeshColors.border),
-          _RunOutcomeRow(
-            pill: _OutcomePill.failed(),
-            startLabel: '14:12:40',
-            duration: '38s',
-            identityTitle: _kObligationHeading,
-            identityRef: _kObligationRef,
-            handled: const [
-              '0 handled — selected #664 notification remains unhandled',
-            ],
-            obligationChanges: const [
-              'none — Waiting on operator remains durable',
-            ],
-            goalState: _GoalState.notCompleted,
-            drillThrough: 'run · selected notification · bounded output',
-            errorTail: 'observed provider CLI failure · exit 1',
-            recovery:
-                'retry 2/2 exhausted for this work -> NEEDS ATTENTION; explicit action required',
+          _HandledActivityRow(
+            timeLabel: '13:42:18',
+            actorId: 'heron-reviewer',
+            actorHandle: 'heron-reviewer',
+            actorModel: 'gpt-5-turbo, high',
+            store: store,
+            sourceKind: 'GITHUB PR',
+            sourceRef: 'github:MEK-Org/rusa/pulls/661',
+            summary: 'pull_request_review.submitted · Review pass on PR #661',
+            handledTime: '13:42:18',
+            addressedNote:
+                'Verified socket-boundary outage regression and removed unsupported cache retention; posted APPROVE.',
+            moreCount: 2,
+            linkedObligation:
+                'Obligation: PR #661 — skip exhausted lanes; responsive pacing ranks',
           ),
           const Divider(height: 1, color: MeshColors.border),
-          _RunOutcomeRow(
-            pill: _OutcomePill.interrupted(),
-            startLabel: '08:58:02',
-            duration: '1m 03s',
-            identityTitle: _kObligationHeading,
-            identityRef: _kObligationRef,
-            handled: const ['0 handled — run cut off'],
-            obligationChanges: const ['none'],
-            goalState: _GoalState.notCompleted,
-            drillThrough: 'events · work tree',
-            recovery:
-                '1 selected item left unhandled -> re-queued for next run',
+          _HandledActivityRow(
+            timeLabel: '12:15:40',
+            actorId: 'amber-owl',
+            actorHandle: 'amber-owl',
+            actorModel: 'gemini-2.5-pro, high',
+            store: store,
+            sourceKind: 'MESH CHAT',
+            sourceRef: 'mesh:messages/e3c5ab08-c8d2-4d49-b889-c44d7d83d5be',
+            summary: 'mesh:message · Operator decision on stage-2 withdrawal',
+            handledTime: '12:15:40',
+            addressedNote:
+                'Completed stage-3 handoff confirmed; cancelled child obligation 0fb4ecd9 and closed PR #666.',
+            linkedObligation: 'Obligation: Add compare-only quota client',
           ),
-          const Divider(height: 1, color: MeshColors.border),
-          const _ActivitySectionLabel(
-            'NON-RUN CONTEXT — never a provider result',
-          ),
-          const _RemoteContactObservationRow(),
-          const Divider(height: 1, color: MeshColors.border),
-          const _DependencyWaitRow(),
         ],
       ),
     );
   }
 }
 
-enum _GoalState { completed, working, waiting, notCompleted }
-
-extension on _GoalState {
-  String get label => switch (this) {
-    _GoalState.completed => 'goal completed',
-    _GoalState.working => 'goal in progress — not a completion',
-    _GoalState.waiting => 'goal waiting on a real dependency',
-    _GoalState.notCompleted => 'goal NOT completed',
-  };
-  Color get color => switch (this) {
-    _GoalState.completed => MeshColors.statusActive,
-    _GoalState.working => MeshColors.textSecondary,
-    _GoalState.waiting => MeshColors.statusIdle,
-    _GoalState.notCompleted => MeshColors.statusIdle,
-  };
-}
-
-class _OutcomePill extends StatelessWidget {
-  const _OutcomePill._(this.label, this.color);
-  final String label;
-  final Color color;
-
-  factory _OutcomePill.returnedOk() => const _OutcomePill._(
-    'RETURNED · observed CLI ok',
-    MeshColors.statusActive,
-  );
-  factory _OutcomePill.failed() => const _OutcomePill._(
-    'FAILED · observed CLI exit 1',
-    MeshColors.statusHalted,
-  );
-  factory _OutcomePill.interrupted() =>
-      const _OutcomePill._('INTERRUPTED', MeshColors.statusIdle);
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-    decoration: BoxDecoration(
-      color: color.withValues(alpha: 0.14),
-      borderRadius: BorderRadius.circular(4),
-      border: Border.all(color: color.withValues(alpha: 0.45)),
-    ),
-    child: Text(
-      label,
-      style: kMonoStyle.copyWith(
-        fontSize: 10.5,
-        fontWeight: FontWeight.w700,
-        color: color,
-      ),
-    ),
-  );
-}
-
-class _RunOutcomeRow extends StatelessWidget {
-  const _RunOutcomeRow({
-    required this.pill,
-    required this.startLabel,
-    required this.duration,
-    required this.identityTitle,
-    required this.identityRef,
-    required this.handled,
-    required this.obligationChanges,
-    required this.goalState,
-    required this.drillThrough,
-    this.errorTail,
-    this.recovery,
+class _HandledActivityRow extends StatelessWidget {
+  const _HandledActivityRow({
+    required this.timeLabel,
+    required this.actorId,
+    required this.actorHandle,
+    required this.actorModel,
+    required this.store,
+    required this.sourceKind,
+    required this.sourceRef,
+    required this.summary,
+    required this.handledTime,
+    required this.addressedNote,
+    this.moreCount,
+    this.linkedObligation,
   });
 
-  final _OutcomePill pill;
-  final String startLabel;
-  final String duration;
-  final String identityTitle;
-  final String identityRef;
-  final List<String> handled;
-  final List<String> obligationChanges;
-  final _GoalState goalState;
-  final String drillThrough;
-  final String? errorTail;
-  final String? recovery;
+  final String timeLabel;
+  final String actorId;
+  final String actorHandle;
+  final String actorModel;
+  final DashboardStore store;
+  final String sourceKind;
+  final String sourceRef;
+  final String summary;
+  final String handledTime;
+  final String addressedNote;
+  final int? moreCount;
+  final String? linkedObligation;
 
   @override
   Widget build(BuildContext context) {
@@ -827,324 +781,185 @@ class _RunOutcomeRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 168,
-            child: Column(
+            width: 80,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                timeLabel,
+                style: kMonoStyle.copyWith(
+                  color: MeshColors.textMuted,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 170,
+            child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                pill,
-                const SizedBox(height: 5),
-                Text(
-                  startLabel,
-                  style: kMonoStyle.copyWith(
-                    color: MeshColors.textMuted,
-                    fontSize: 11,
-                  ),
+                ActorAvatarWithStatus(
+                  id: actorId,
+                  state: DotState.idle,
+                  size: 26,
+                  store: store,
                 ),
-                Text(
-                  'ran $duration',
-                  style: const TextStyle(
-                    color: MeshColors.textMuted,
-                    fontSize: 10.5,
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        actorHandle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: kMonoStyle.copyWith(
+                          color: MeshColors.textPrimary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        actorModel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: MeshColors.textSecondary,
+                          fontSize: 10.5,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
           ),
           const SizedBox(width: 12),
-          SizedBox(
-            width: 300,
+          Expanded(
             child: Container(
-              padding: const EdgeInsets.all(9),
+              padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: MeshColors.bgTertiary,
-                borderRadius: BorderRadius.circular(5),
+                borderRadius: BorderRadius.circular(6),
                 border: Border.all(color: MeshColors.border),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const ReferenceKindChip('SAME WORK ITEM'),
-                  const SizedBox(height: 5),
-                  Text(
-                    identityTitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: MeshColors.textPrimary,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ReferenceKindChip(sourceKind),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '$sourceRef   ·   $summary',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: MeshColors.textPrimary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      if (moreCount != null && moreCount! > 0) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: MeshColors.bgSecondary,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: MeshColors.border),
+                          ),
+                          child: Text(
+                            '(+ $moreCount more)',
+                            style: kMonoStyle.copyWith(
+                              color: MeshColors.accent,
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    identityRef,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textMuted,
-                      fontSize: 10,
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 9,
                     ),
-                  ),
-                  if (errorTail != null) ...[
-                    const SizedBox(height: 5),
-                    Text(
-                      errorTail!,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: MeshColors.statusHalted,
-                        fontSize: 10.5,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF0D201D),
+                      border: Border(
+                        left: BorderSide(
+                          color: MeshColors.statusActive,
+                          width: 2,
+                        ),
                       ),
                     ),
-                  ],
-                  if (recovery != null) ...[
-                    const SizedBox(height: 3),
-                    Text(
-                      recovery!,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: MeshColors.statusIdle,
-                        fontSize: 10.5,
-                      ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Handled: $handledTime',
+                          style: const TextStyle(
+                            color: Color(0xFF6EE7B7),
+                            fontSize: 11,
+                            fontFamily: kMonoFontFamily,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text.rich(
+                          TextSpan(
+                            style: const TextStyle(
+                              color: Color(0xFFC8DED7),
+                              fontSize: 12,
+                              height: 1.4,
+                            ),
+                            children: [
+                              const TextSpan(
+                                text: 'Addressed: ',
+                                style: TextStyle(fontWeight: FontWeight.w700),
+                              ),
+                              TextSpan(text: addressedNote),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (linkedObligation != null) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.account_tree_outlined,
+                          size: 13,
+                          color: MeshColors.textMuted,
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          linkedObligation!,
+                          style: kMonoStyle.copyWith(
+                            color: MeshColors.textMuted,
+                            fontSize: 10.5,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ],
               ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _OutcomeColumn(
-                  header: 'HANDLED',
-                  headerColor: MeshColors.accent,
-                  items: handled,
-                ),
-                const SizedBox(height: 8),
-                _OutcomeColumn(
-                  header: 'OBLIGATION CHANGES',
-                  headerColor: MeshColors.accent,
-                  items: obligationChanges,
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Text(
-                      'GOAL',
-                      style: TextStyle(
-                        color: goalState.color,
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 0.6,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      goalState.label,
-                      style: TextStyle(color: goalState.color, fontSize: 11),
-                    ),
-                    const Spacer(),
-                    Icon(
-                      Icons.open_in_new,
-                      size: 12,
-                      color: MeshColors.textMuted.withValues(alpha: 0.8),
-                    ),
-                    const SizedBox(width: 4),
-                    Text(
-                      drillThrough,
-                      style: kMonoStyle.copyWith(
-                        color: MeshColors.textMuted,
-                        fontSize: 10,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ActivitySectionLabel extends StatelessWidget {
-  const _ActivitySectionLabel(this.label);
-  final String label;
-
-  @override
-  Widget build(BuildContext context) => Align(
-    alignment: Alignment.centerLeft,
-    child: Padding(
-      padding: const EdgeInsets.fromLTRB(10, 9, 10, 5),
-      child: Text(
-        label,
-        style: kMonoStyle.copyWith(
-          color: MeshColors.textMuted,
-          fontSize: 9.5,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.6,
-        ),
-      ),
-    ),
-  );
-}
-
-class _OutcomeColumn extends StatelessWidget {
-  const _OutcomeColumn({
-    required this.header,
-    required this.headerColor,
-    required this.items,
-  });
-  final String header;
-  final Color headerColor;
-  final List<String> items;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          header,
-          style: TextStyle(
-            color: headerColor,
-            fontSize: 9.5,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.6,
-          ),
-        ),
-        const SizedBox(height: 3),
-        for (final item in items)
-          Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Padding(
-                  padding: EdgeInsets.only(top: 4),
-                  child: Icon(
-                    Icons.circle,
-                    size: 4,
-                    color: MeshColors.textMuted,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    item,
-                    style: const TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 11,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-/// A contact-loss observation stays outside the run-record outcomes. It says
-/// only what the leader observed; it never claims the remote provider died.
-class _RemoteContactObservationRow extends StatelessWidget {
-  const _RemoteContactObservationRow();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.symmetric(vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 168,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _OutcomePill._(
-                  'CONTACT LOST · transport',
-                  MeshColors.statusIdle,
-                ),
-                SizedBox(height: 5),
-                Text(
-                  '14:13:22',
-                  style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-          SizedBox(width: 12),
-          SizedBox(
-            width: 300,
-            child: Text(
-              'Remote follower contact lost',
-              style: TextStyle(color: MeshColors.textPrimary, fontSize: 12),
-            ),
-          ),
-          SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              'Provider result unknown — contact loss alone is not proof of a '
-              'provider CLI failure. Existing leader-side terminal accounting '
-              'is shown only by its own run record; #656 assessment is held.',
-              style: TextStyle(color: MeshColors.textSecondary, fontSize: 11),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// Delegation and dependency waits remain visible as a separately labelled
-/// state — a wait is NOT a run record and gets no fake run outcome.
-class _DependencyWaitRow extends StatelessWidget {
-  const _DependencyWaitRow();
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const SizedBox(
-            width: 168,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _OutcomePill._(
-                  'WAITING · dependency state',
-                  MeshColors.statusRetired,
-                ),
-                SizedBox(height: 5),
-                Text(
-                  'since 09:51',
-                  style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          const SizedBox(
-            width: 300,
-            child: Text(
-              'Delegated: review verdict from heron-reviewer',
-              style: TextStyle(color: MeshColors.textPrimary, fontSize: 12),
-            ),
-          ),
-          const SizedBox(width: 12),
-          const Expanded(
-            child: Text(
-              'No run record is active — the actor waits on a peer obligation. '
-              'Shown separately so a dependency never masquerades as a run result.',
-              style: TextStyle(color: MeshColors.textSecondary, fontSize: 11),
             ),
           ),
         ],
@@ -1179,13 +994,10 @@ class _FooterNotes extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           const Text(
-            '· Handled-message outcome and obligation-change outcome are separate '
-            'columns; a handled message is never rendered as a completed goal.\n'
-            '· Run settlement (return / fail / interrupt) comes from the run '
-            'record; the yield note is gone from normal progress.\n'
-            '· Interruption recovery is explicit: unhandled selected work is '
-            're-queued and named.\n'
-            '· Waits stay visible without a ceremonial yield row.',
+            '· Recent Activity answers “what have the actors completed recently?” via handled cards, replacing ceremonial yields.\n'
+            '· Handled cards show the resolution explanation (matching the actor inbox panel) and optional (+ N more) coalesced count.\n'
+            '· Routine non-zero exits / runtime failures do not appear as completions in this view; searches and filters are removed.\n'
+            '· Work identity threads across queued -> selected -> recent activity.',
             style: TextStyle(
               color: MeshColors.textSecondary,
               fontSize: 11.5,
@@ -1249,7 +1061,7 @@ Future<Uint8List> _portraitPng() async {
 
 Future<Map<String, Uint8List>> _portraits() async {
   final png = await _portraitPng();
-  return {_kActorId: png, 'root': png};
+  return {_kActorId: png, 'root': png, 'heron-reviewer': png, 'amber-owl': png};
 }
 
 class _FakeImageHttpOverrides extends HttpOverrides {
