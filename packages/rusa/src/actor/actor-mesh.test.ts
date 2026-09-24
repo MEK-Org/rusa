@@ -1945,6 +1945,7 @@ describe("ActorMesh", () => {
   it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
+    let worker = "";
     let resolveFirst!: (result: Partial<RunResult>) => void;
     let firstSignal: AbortSignal | undefined;
     let runIndex = 0;
@@ -1957,23 +1958,42 @@ describe("ActorMesh", () => {
       }
       return { success: true, exitCode: 0, output: "follow-up" };
     });
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: "ready",
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
     const { mesh, fake, tick } = setup({
       inboxStore,
       events: (event) => events.push(event),
       sharedProvider: provider,
+      obligations,
     });
-    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
     inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
     mesh.dispatch(worker);
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
+    const appendSpy = vi.spyOn(inboxStore, "append");
 
     // The running actor closed a prerequisite and made its own obligation
     // ready. The delivery is deferred until run completion so it does not
     // self-interrupt mid-run (#632).
     expect(
       mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+    ).toBe(true);
+    expect(
+      mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-self-2", intent: "also self-caused" },
+        true
+      )
     ).toBe(true);
     await Promise.resolve(); // flush the durable-append drain after the join wake
     expect(firstSignal?.aborted).toBe(false);
@@ -1988,16 +2008,24 @@ describe("ActorMesh", () => {
     resolveFirst({ success: true, exitCode: 0, output: "first" });
     await vi.advanceTimersByTimeAsync(0);
     await tick();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy.mock.calls[0]?.[0]).toHaveLength(2);
     expect(fake(worker).calls).toHaveLength(2);
     expect(
       inboxStore.entries.some(
         (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
       )
     ).toBe(true);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self-2"
+      )
+    ).toBe(true);
   });
 
   it("discards deferred responsive ready attention if obligation is no longer ready when run completes (#632)", async () => {
     const inboxStore = createMemoryInboxStore();
+    let worker = "";
     let resolveFirst!: (result: Partial<RunResult>) => void;
     let runIndex = 0;
     const provider = new FakeProvider(() => {
@@ -2014,7 +2042,7 @@ describe("ActorMesh", () => {
       get: (id: string) =>
         ({
           id,
-          ownerId: "root",
+          ownerId: worker,
           status: obligationStatus,
           effectiveResponsive: true,
         }) as unknown as Obligation,
@@ -2024,7 +2052,7 @@ describe("ActorMesh", () => {
       sharedProvider: provider,
       obligations,
     });
-    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
     inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
     mesh.dispatch(worker);

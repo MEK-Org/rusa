@@ -23,6 +23,7 @@ import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
+  type InboxAppendInput,
   type InboxEntry,
   type InboxPayload,
   type InboxRepository,
@@ -1518,8 +1519,9 @@ export class ActorMesh {
    * wakes clear the debt, which is what stops a second dispatch from
    * cancelling and re-queueing the run the first one just admitted. What is
    * left over is the case this exists for: work that became durable with no
-   * one attempting to schedule it, which now gets that attempt instead of
-   * waiting for the next boot.
+   * one attempting to schedule it, including self-caused ready attention
+   * flushed after its producer's run. That work gets one content-free attempt
+   * instead of waiting for the next boot.
    *
    * Deferring to a microtask is what gives the appending turn its chance, and
    * the store's contract asks a listener to stay cheap and hand off rather
@@ -1783,7 +1785,9 @@ export class ActorMesh {
    * finished (#632). An actor creating self-assigned obligations mid-run
    * buffers them so it cannot self-interrupt; once the run completes, this
    * checks whether each obligation is still live, owned, and ready, and
-   * appends attention entries to the inbox for a follow-up run.
+   * appends attention entries to the inbox for a follow-up run. The append
+   * listener is the sole scheduling seam: valid rows are committed together so
+   * one actor receives at most one advisory dispatch attempt.
    */
   private flushRunResponsiveReadyAttention(actorId: string): void {
     const pending = this.runResponsiveReadyAttention.get(actorId);
@@ -1792,40 +1796,42 @@ export class ActorMesh {
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return;
 
+    // The production mesh always wires this read through the obligation
+    // repository. An isolated embedder without it cannot prove that a
+    // buffered item is still live and responsive, so it must not deliver a
+    // potentially stale responsive wake.
+    const getObligation = this.obligations?.get;
+    if (!getObligation) return;
+
+    const entries: InboxAppendInput[] = [];
     for (const obligation of pending.values()) {
-      if (this.obligations?.get) {
-        const live = this.obligations.get(obligation.id);
-        if (
-          !live ||
-          this.resolveThreadId(live.ownerId) !== actorId ||
-          live.status !== "ready" ||
-          !live.effectiveResponsive
-        ) {
-          continue;
-        }
+      const live = getObligation(obligation.id);
+      if (
+        !live ||
+        this.resolveThreadId(live.ownerId) !== actorId ||
+        live.status !== "ready" ||
+        !live.effectiveResponsive
+      ) {
+        continue;
       }
       const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
       const entryId = deduplicatedInboxEntryId(
         `obligation-ready-responsive:${obligation.id}${episodeKey}`,
         actorId
       );
-      const entries = this.inboxStore.append([
-        {
-          id: entryId,
-          actorId,
-          source: `obligation:${obligation.id}`,
-          payload: {
-            type: "obligation.ready_responsive",
-            obligationId: obligation.id,
-            intent: obligation.intent ?? undefined,
-            priority: "responsive",
-          } as unknown as InboxPayload,
-        },
-      ]);
-      if (entries.length > 0) {
-        this.dispatch(actorId);
-      }
+      entries.push({
+        id: entryId,
+        actorId,
+        source: `obligation:${obligation.id}`,
+        payload: {
+          type: "obligation.ready_responsive",
+          obligationId: obligation.id,
+          intent: obligation.intent ?? undefined,
+          priority: "responsive",
+        } as unknown as InboxPayload,
+      });
     }
+    if (entries.length > 0) this.inboxStore.append(entries);
   }
 
   /**
