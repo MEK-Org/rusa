@@ -2537,14 +2537,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               const runId = runAccounting.activeRunId(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
               let focus: ResolvedInboxFocus | undefined;
-              const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
-                focus = inboxFocusResolver.select({
-                  runId,
-                  actorId: id,
-                  entries: selectedEntries,
-                  explicitObligationId: obligationId,
-                });
-              });
+              const entries = mesh.selectInboxEntries(
+                id,
+                entryIds,
+                (selectedEntries) => {
+                  focus = inboxFocusResolver.select({
+                    runId,
+                    actorId: id,
+                    entries: selectedEntries,
+                    explicitObligationId: obligationId,
+                  });
+                },
+                obligationId
+              );
               if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
               // Read after the selection commits: the same armed decision the
               // clean-yield check enforces is what states the rule here, so
@@ -3124,14 +3129,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const runId = runAccounting.activeRunId(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
         let focus: ResolvedInboxFocus | undefined;
-        const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
-          focus = inboxFocusResolver.select({
-            runId,
-            actorId: rootId,
-            entries: selectedEntries,
-            explicitObligationId: obligationId,
-          });
-        });
+        const entries = mesh.selectInboxEntries(
+          rootId,
+          entryIds,
+          (selectedEntries) => {
+            focus = inboxFocusResolver.select({
+              runId,
+              actorId: rootId,
+              entries: selectedEntries,
+              explicitObligationId: obligationId,
+            });
+          },
+          obligationId
+        );
         if (!focus) throw new Error(`run focus was not resolved for actor: ${rootId}`);
         return {
           entries,

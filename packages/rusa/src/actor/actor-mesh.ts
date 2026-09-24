@@ -1582,7 +1582,8 @@ export class ActorMesh {
   selectInboxEntries(
     actorId: string,
     entryIds: string[],
-    beforeCommit?: (entries: InboxEntry[]) => void
+    beforeCommit?: (entries: InboxEntry[]) => void,
+    focusedObligationId?: string
   ): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     const inboxStore = this.inboxStore;
@@ -1603,32 +1604,46 @@ export class ActorMesh {
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
-    // Note: STRICT_OBLIGATION_HANDLING_EXPERIMENT intentionally tracks only the
-    // actor's queue head (obligation.ready_head), asserting closure on that top
-    // commitment before clean yield. Behind-head responsive work
-    // (obligation.ready_responsive) alerts the actor of urgent work without
-    // asserting head-closure semantics on yield unless the actor selects it as head.
-    const headObligationIds = this.isEnrolledInExperiment(
+    // Snapshot the selected focus now. An explicit inbox focus is the selected
+    // obligation even when its supporting entry is an ordinary message; absent
+    // that, ready-head attention supplies the focus. The entry's delivery-time
+    // type cannot decide the rule because its obligation may have changed
+    // status before the actor selects it.
+    const focusedObligationIds = this.isEnrolledInExperiment(
       actorId,
       STRICT_OBLIGATION_HANDLING_EXPERIMENT
     )
-      ? entries.flatMap((entry) =>
-          entry.payload.type === "obligation.ready_head" &&
-          typeof entry.payload.obligationId === "string"
-            ? [entry.payload.obligationId]
-            : []
-        )
+      ? focusedObligationId !== undefined
+        ? [focusedObligationId]
+        : entries.flatMap((entry) =>
+            entry.payload.type === "obligation.ready_head" &&
+            typeof entry.payload.obligationId === "string"
+              ? [entry.payload.obligationId]
+              : []
+          )
       : [];
     // Fail closed, and fail here — before the selection commits, so nothing has
     // run yet and no clean yield can slip past unenforced. An enrolled actor in
     // a mesh without closure reads is a misconfiguration the root must fix by
     // wiring the port or unenrolling, not a run that silently opts out.
     const closure = this.obligations;
-    if (headObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
+    if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
         `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure reads (get, listDirectChildEdges, listPrerequisiteEdges) wired. Wire the closure port or unenroll the actor.`
       );
     }
+    // Membership and status are both selection-time facts. Keeping only ready
+    // focuses in the run state makes a later waiting -> ready transition stay
+    // unarmed, while a ready -> waiting transition retains the existing legal
+    // exit checks for the run that selected it. A transiently unreadable row
+    // remains fail-closed, as it did before status-aware selection: silently
+    // releasing a strict run on a failed closure read would be less safe.
+    const headObligationIds = supportsObligationClosureReads(closure)
+      ? [...new Set(focusedObligationIds)].filter((obligationId) => {
+          const focused = closure.get(obligationId);
+          return focused === null || focused.status === "ready";
+        })
+      : [];
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {

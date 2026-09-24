@@ -11037,6 +11037,18 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.selectInboxEntries(actorId, [entry.id]);
   }
 
+  function selectDirectFocus(mesh: ActorMesh, actorId: string, obligationId: string): void {
+    mesh.sendMessage(actorId, "focus this obligation", "root");
+    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    const entry = inboxStore.entries
+      .filter(
+        (candidate) => candidate.actorId === actorId && candidate.payload.type === "mesh.message"
+      )
+      .at(-1);
+    if (!entry) throw new Error("expected direct-focus inbox entry");
+    mesh.selectInboxEntries(actorId, [entry.id], undefined, obligationId);
+  }
+
   function worker(mesh: ActorMesh, charter = "worker"): string {
     return mesh.spawn({
       charter,
@@ -11068,6 +11080,70 @@ describe("strict obligation handling experiment (#382)", () => {
         payload: expect.stringContaining('"obligationId":"strict-head"'),
       })
     );
+  });
+
+  it("arms strict handling from the focused obligation status at selection", () => {
+    const { mesh } = strictMesh();
+
+    const directReady = worker(mesh, "direct ready");
+    mesh.enrollActorInExperiment(directReady, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "direct-ready", title: "Direct ready", ownerId: directReady });
+    selectDirectFocus(mesh, directReady, "direct-ready");
+    expect(mesh.runDisciplineNotice(directReady)).toContain("direct-ready");
+    expect(() => mesh.declareYield(directReady, "complete")).toThrow(
+      /selected head obligation direct-ready/
+    );
+
+    const directWaiting = worker(mesh, "direct waiting");
+    mesh.enrollActorInExperiment(directWaiting, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "direct-waiting", title: "Direct waiting", ownerId: directWaiting });
+    repo.create({ id: "direct-blocker", title: "Direct blocker", ownerId: directWaiting });
+    repo.addPrerequisite("direct-waiting", "direct-blocker", "system:mesh");
+    selectDirectFocus(mesh, directWaiting, "direct-waiting");
+    expect(mesh.runDisciplineNotice(directWaiting)).toBeUndefined();
+    // The selection-time decision remains stable when the focused work becomes ready later.
+    repo.setTerminalStatus("direct-blocker", "done", null, null, "system:mesh");
+    expect(repo.get("direct-waiting")?.status).toBe("ready");
+    expect(() => mesh.declareYield(directWaiting, "complete")).not.toThrow();
+
+    const staleHead = worker(mesh, "stale ready-head");
+    mesh.enrollActorInExperiment(staleHead, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "stale-head", title: "Stale head", ownerId: staleHead });
+    mesh.deliverReadyHeadAttention(staleHead, { id: "stale-head", intent: "stale" }, null);
+    repo.create({
+      id: "already-waiting-child",
+      parentId: "stale-head",
+      title: "Already waiting child",
+      ownerId: staleHead,
+      creatorId: staleHead,
+    });
+    expect(repo.get("stale-head")?.status).toBe("waiting");
+    mesh.actorQueued(staleHead, { responsive: false, mode: "ordinary" });
+    const staleEntry = inboxStore.entries.find(
+      (candidate) =>
+        candidate.actorId === staleHead &&
+        candidate.payload.type === "obligation.ready_head" &&
+        candidate.payload.obligationId === "stale-head"
+    );
+    if (!staleEntry) throw new Error("expected stale ready-head inbox entry");
+    mesh.selectInboxEntries(staleHead, [staleEntry.id]);
+    expect(mesh.runDisciplineNotice(staleHead)).toBeUndefined();
+    expect(() => mesh.declareYield(staleHead, "complete")).not.toThrow();
+
+    const currentHead = worker(mesh, "current ready-head");
+    mesh.enrollActorInExperiment(currentHead, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "current-head", title: "Current head", ownerId: currentHead });
+    selectHead(mesh, currentHead, "current-head");
+    expect(mesh.runDisciplineNotice(currentHead)).toContain("current-head");
+    expect(() => mesh.declareYield(currentHead, "complete")).toThrow(
+      /selected head obligation current-head/
+    );
+
+    const control = worker(mesh, "unenrolled direct control");
+    repo.create({ id: "control-direct", title: "Control direct", ownerId: control });
+    selectDirectFocus(mesh, control, "control-direct");
+    expect(mesh.runDisciplineNotice(control)).toBeUndefined();
+    expect(() => mesh.declareYield(control, "complete")).not.toThrow();
   });
 
   it("captures experiment membership at selection, so a root unenrollment applies next run", () => {
@@ -11122,18 +11198,11 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "blocked")).not.toThrow();
   });
 
-  it("rejects pre-existing or other-authored children, but accepts a newly added unmet prerequisite", () => {
+  it("rejects an other-authored child after ready selection, but accepts a newly added unmet prerequisite", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
     mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
     repo.create({ id: "parent", title: "Parent", ownerId: subject });
-    repo.create({
-      id: "old-child",
-      parentId: "parent",
-      title: "Old child",
-      ownerId: subject,
-      creatorId: subject,
-    });
     selectHead(mesh, subject, "parent");
     repo.create({
       id: "other-child",

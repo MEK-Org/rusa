@@ -1186,7 +1186,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
       if (!entry?.payload.obligationId)
         throw new Error(`ready-head inbox entry missing: ${actorId}`);
-      const selected = await call(inboxUrl, "select", { entry_ids: [entry.id] });
+      const selected = await call(inboxUrl, "select", {
+        entry_ids: [entry.id],
+        obligation_id: entry.payload.obligationId,
+      });
       expect(selected.isError).toBeFalsy();
       return { obligationId: entry.payload.obligationId, selection: payloadOf(selected), runId };
     };
