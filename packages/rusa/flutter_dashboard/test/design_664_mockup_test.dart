@@ -724,7 +724,8 @@ class _RecentActivityPanel extends StatelessWidget {
             obligationChanges: const ['none'],
             goalState: _GoalState.notCompleted,
             drillThrough: 'events · work tree',
-            recovery: '1 selected item left unhandled -> re-queued for next run',
+            recovery:
+                '1 selected item left unhandled -> re-queued for next run',
           ),
           const Divider(height: 1, color: MeshColors.border),
           const _ActivitySectionLabel(
