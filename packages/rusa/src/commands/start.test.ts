@@ -897,9 +897,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ): Promise<{
       mesh: ActorMesh;
       appliedInterval: (provider: string) => number | undefined;
+      makeUnavailable: () => void;
+      throttleRequestCount: () => number;
       close: () => Promise<void>;
     }> => {
       const socketPath = join(homeDir, "coordinator.sock");
+      let unavailable = false;
+      let throttleRequestCount = 0;
       const service = {
         protocolMajor: 1,
         protocolMinor: 0,
@@ -912,6 +916,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
         if (url.pathname !== "/v1/throttle") {
           res.statusCode = 404;
           res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+          return;
+        }
+        throttleRequestCount += 1;
+        if (unavailable) {
+          res.destroy();
           return;
         }
         res.end(JSON.stringify({ service, providers: makeProviders() }));
@@ -957,6 +966,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       return {
         mesh,
         appliedInterval,
+        makeUnavailable: () => {
+          unavailable = true;
+        },
+        throttleRequestCount: () => throttleRequestCount,
         close: () =>
           new Promise<void>((resolve, reject) => {
             coordinator.close((error) => (error ? reject(error) : resolve()));
@@ -1069,6 +1082,46 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }),
       }));
       try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("releases an expired lane at its published hold deadline during a coordinator outage", async () => {
+      const exhaustedUntil = Date.now() + 2_500;
+      const { mesh, close, makeUnavailable, throttleRequestCount } = await bootWithCoordinator(
+        () => ({
+          claude: throttleStatus("claude", {
+            percentLeft: 0,
+            expired: true,
+            exhaustedUntil: new Date(exhaustedUntil).toISOString(),
+          }),
+        })
+      );
+      try {
+        // The fresh publication's future hold gates the lane before the outage.
+        const blockedAttempt = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(
+          mesh.gateRun(blockedAttempt, [claudeEntry], true).result
+        ).rejects.toBeInstanceOf(PoolExhaustedError);
+        expect(blockedAttempt).not.toHaveBeenCalled();
+
+        // Later socket reads fail, leaving no new coordinator publication to
+        // clear the hold. The gate must still release at the published deadline.
+        const readsBeforeOutage = throttleRequestCount();
+        makeUnavailable();
+        await vi.waitFor(() => expect(throttleRequestCount()).toBeGreaterThan(readsBeforeOutage), {
+          timeout: 5_000,
+        });
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, exhaustedUntil - Date.now() + 100))
+        );
+
         const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
         await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
         expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));

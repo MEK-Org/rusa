@@ -244,7 +244,6 @@ import {
 } from "../quota/coordinator-client.js";
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
-  DEFAULT_STALE_AFTER_MS,
   HISTORY_WINDOW_MS,
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
@@ -1539,25 +1538,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
-  // #655: trust only a publication the coordinator itself marked fresh. A
-  // client retains that result through a transient read outage, but expires its
-  // local cache after three client ticks rather than treating it as current
-  // forever. This cache-retention window is not a reimplementation of the
-  // coordinator's governing-bucket freshness calculation.
-  const exhaustedReportCacheMaxAgeMs = quotaThrottleConfig?.tickSeconds
-    ? quotaThrottleConfig.tickSeconds * 3 * 1000
-    : DEFAULT_STALE_AFTER_MS;
+  // #655: only a coordinator-fresh publication can install an absolute
+  // exhaustion gate. Keep its published deadline through an unavailable read;
+  // the deadline itself releases the lane, without a second client freshness
+  // policy competing with the coordinator's governing-bucket verdict.
+  const coordinatorExhaustedUntilMs = new Map<QuotaThrottleProvider, number>();
   const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
-    const status = quotaThrottleStatuses.get(lane as QuotaThrottleProvider);
-    if (!status || status.expired !== true || status.coordinatorStale === true) return false;
-    const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
-    return (
-      typeof status.receivedAtMs === "number" &&
-      status.receivedAtMs <= nowMs &&
-      nowMs - status.receivedAtMs <= exhaustedReportCacheMaxAgeMs &&
-      Number.isFinite(exhaustedUntilMs) &&
-      exhaustedUntilMs > nowMs
-    );
+    return (coordinatorExhaustedUntilMs.get(lane as QuotaThrottleProvider) ?? 0) > nowMs;
   };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1579,13 +1566,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           pacer.deferUntil(exhaustedUntilMs);
         }
       }
+      const exhaustedUntilMs = exhaustedUntil ? Date.parse(exhaustedUntil) : Number.NaN;
+      if (
+        tick.expired &&
+        !coordinatorStale &&
+        Number.isFinite(exhaustedUntilMs) &&
+        exhaustedUntilMs > Date.now()
+      ) {
+        coordinatorExhaustedUntilMs.set(providerName, exhaustedUntilMs);
+      } else {
+        coordinatorExhaustedUntilMs.delete(providerName);
+      }
       quotaThrottleStatuses.set(providerName, {
         ...tick,
         intervalSeconds: safeIntervalSeconds,
         updatedAt: persistedUpdatedAt ?? new Date().toISOString(),
-        exhaustedUntil,
-        coordinatorStale,
-        receivedAtMs: Date.now(),
       });
       const errors = tick.buckets
         .map((bucket) => `${bucket.key}=${bucket.error.toFixed(1)}`)
