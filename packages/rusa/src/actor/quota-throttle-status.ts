@@ -17,4 +17,6 @@ export interface QuotaThrottleTick {
 
 export interface QuotaThrottleStatus extends QuotaThrottleTick {
   updatedAt: string;
+  /** Coordinator-declared end of an expired lane's absolute quota hold. */
+  exhaustedUntil?: string | null;
 }

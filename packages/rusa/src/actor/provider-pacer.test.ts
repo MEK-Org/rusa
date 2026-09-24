@@ -377,6 +377,32 @@ describe("ProviderPacer", () => {
 
       expect(winner?.config).toBe("cool");
     });
+
+    it("responsive selection retains the quote rule with only one comparable weekly reading (#655)", () => {
+      const now = Date.now();
+      const unknownButAvailable = new ProviderPacer(0, () => now);
+      const knownButHot = new ProviderPacer(0, () => now);
+      knownButHot.deferUntil(now + 3_600_000);
+      const winner = selectPoolLane(
+        [
+          { config: "unknown", lane: "unknown", pacer: unknownButAvailable },
+          {
+            config: "known",
+            lane: "known",
+            pacer: knownButHot,
+            weeklyQuota: {
+              percentLeft: 2,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now,
+        { responsive: true }
+      );
+
+      expect(winner?.config).toBe("unknown");
+    });
   });
 
   describe("submitPoolGate", () => {
@@ -645,6 +671,58 @@ describe("ProviderPacer", () => {
 
       // Promotion bypasses the mesh queue without stranding its selected lane.
       expect(b.pacer.waiting).toBe(0);
+    });
+
+    it("promote() reselects away from a lane reported exhausted after normal admission (#655)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a");
+      const b = laneFor("b");
+      let aExhausted = false;
+      const selected: Array<{ candidate: string; responsive: boolean }> = [];
+      const handle = submitPoolGate(async (config: string) => config, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        isExhausted: (config) => aExhausted && config === "a",
+        onSelected: (selection) =>
+          selected.push({ candidate: selection.candidate, responsive: selection.responsive }),
+      });
+      expect(selected).toEqual([{ candidate: "a", responsive: false }]);
+
+      aExhausted = true;
+      handle.promote();
+      await expect(handle.result).resolves.toBe("b");
+      expect(selected).toEqual([
+        { candidate: "a", responsive: false },
+        { candidate: "b", responsive: true },
+      ]);
+
+      release();
+    });
+
+    it("promote() fails instead of reselecting a known-exhausted pool (#655)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a");
+      const b = laneFor("b");
+      let exhausted = false;
+      const started = vi.fn(async (config: string) => config);
+      const handle = submitPoolGate(started, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        isExhausted: () => exhausted,
+        onResponsivePoolExhausted: () => new Error("all lanes exhausted"),
+      });
+
+      exhausted = true;
+      handle.promote();
+      release();
+      await expect(handle.result).rejects.toThrow("all lanes exhausted");
+      expect(started).not.toHaveBeenCalled();
     });
 
     it("cancel() rejects the outer handle and stops the reserved lane from starting", async () => {

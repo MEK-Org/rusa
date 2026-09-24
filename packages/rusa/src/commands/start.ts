@@ -1539,15 +1539,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   // #655: admission may trust a lane-exhausted report only while the report is
-  // fresh. The default coordinator cadence is 5 minutes (tickSeconds ?? 300);
-  // past two missed ticks the claim "this lane is at zero" is stale, and the
-  // lane must be attempted again instead of being skipped or failed fast.
+  // fresh and the coordinator's own hold has not elapsed. The default cadence
+  // is 5 minutes (tickSeconds ?? 300); past two missed ticks the claim "this
+  // lane is at zero" is stale, and the lane must be attempted again instead
+  // of being skipped or failed fast during a coordinator outage.
   const LANE_EXHAUSTED_REPORT_STALE_MS = 10 * 60 * 1000;
   const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
     const status = quotaThrottleStatuses.get(lane as QuotaThrottleProvider);
     if (!status || status.expired !== true) return false;
     const updatedAtMs = Date.parse(status.updatedAt);
-    return Number.isFinite(updatedAtMs) && nowMs - updatedAtMs <= LANE_EXHAUSTED_REPORT_STALE_MS;
+    const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
+    return (
+      Number.isFinite(updatedAtMs) &&
+      nowMs - updatedAtMs <= LANE_EXHAUSTED_REPORT_STALE_MS &&
+      Number.isFinite(exhaustedUntilMs) &&
+      exhaustedUntilMs > nowMs
+    );
   };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1572,6 +1579,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ...tick,
         intervalSeconds: safeIntervalSeconds,
         updatedAt: persistedUpdatedAt ?? new Date().toISOString(),
+        exhaustedUntil,
       });
       const errors = tick.buckets
         .map((bucket) => `${bucket.key}=${bucket.error.toFixed(1)}`)
@@ -2328,21 +2336,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      // #655: a responsive run must never reserve a lane the shared quota
-      // coordinator already reports at zero remaining quota — attempting it
-      // burns the provider call and reports a failure the coordinator knew
-      // about. Known-exhausted lanes are pre-filtered here, before selection;
-      // when that empties the pool the run fails fast with the skip summary
-      // instead of attempting a known-dead lane. Normal-priority selection is
-      // unchanged: its pacer queue already waits out a lane's deferral.
-      const skippedExhausted: PoolSkippedEntry[] = [];
+      // #655: submitPoolGate owns responsive selection and promotion alike.
+      // Its exhausted predicate prevents a later promotion from reselecting a
+      // lane that the coordinator learned was empty after initial admission.
+      // Normal-priority selection remains quote-first and keeps its existing
+      // pacing behavior until it is explicitly promoted.
       const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = [];
       for (const c of candidates) {
         const lane = providerThrottleKey(c.provider, config);
-        if (request.responsive === true && laneReportedExhausted(lane, Date.now())) {
-          skippedExhausted.push({ entry: { ...c }, reason: "exhausted" });
-          continue;
-        }
         lanes.push({
           config: c,
           lane,
@@ -2350,33 +2351,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           weeklyQuota: weeklyQuotaFor(lane),
         });
       }
-      if (lanes.length === 0) {
-        // Every configured lane is coordinator-reported exhausted; none was
-        // attempted. The message is the operator-facing pool summary and is
-        // surfaced verbatim at the run boundary (see actor.ts's catch).
-        const result = Promise.reject(
-          new PoolExhaustedError(
-            formatPoolExhaustedFailure({ attempted: [], skipped: skippedExhausted })
-          )
-        );
-        // Avoid an unhandled rejection when the caller only holds the handle
-        // briefly; the rejection is delivered through handle.result.
-        result.catch(() => {});
-        return {
-          result,
-          started: false,
-          promote: () => {},
-          cancel: () => false,
-        };
-      }
       // submitPoolGate owns selection for both priorities: normal work quotes
-      // healthy lanes and responsive work makes that same selection, then
-      // bypasses provider and mesh pacing after its lane is reserved.
+      // healthy lanes and responsive work excludes known-empty lanes, ranks
+      // survivors by headroom, then bypasses provider and mesh pacing once its
+      // lane is reserved.
       return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
         isHalted: (c) => isProviderHalted(c.provider, c.model),
+        isExhausted: (c) =>
+          laneReportedExhausted(providerThrottleKey(c.provider, config), Date.now()),
+        onResponsivePoolExhausted: () => {
+          const skipped: PoolSkippedEntry[] = candidates.map((entry) => ({
+            entry: { ...entry },
+            reason: isProviderHalted(entry.provider, entry.model) ? "halted" : "exhausted",
+          }));
+          return new PoolExhaustedError(formatPoolExhaustedFailure({ attempted: [], skipped }));
+        },
         onSelected: request.threadId
           ? (selection) => {
               const provider = selection.candidate.provider;

@@ -975,7 +975,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     const throttleStatus = (
       provider: string,
-      opts: { percentLeft?: number; intervalSeconds?: number; expired?: boolean } = {}
+      opts: {
+        percentLeft?: number;
+        intervalSeconds?: number;
+        expired?: boolean;
+        exhaustedUntil?: string | null;
+      } = {}
     ) => ({
       provider,
       intervalSeconds: opts.intervalSeconds ?? 0,
@@ -984,7 +989,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       capped: false,
       expired: opts.expired ?? false,
       exhaustedUntil:
-        opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null,
+        opts.exhaustedUntil ??
+        (opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null),
       updatedAt: new Date().toISOString(),
       buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
       freshness: {
@@ -1051,34 +1057,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
     });
 
-    it("responsive prefers the lane with more quota headroom even when it is pacing-hot", async () => {
-      // Both lanes have quota; claude has more weekly headroom. claude is
-      // pacing-hot (1h interval warmed below), codex is available now.
-      const { mesh, close, appliedInterval } = await bootWithCoordinator(() => ({
-        claude: throttleStatus("claude", { percentLeft: 80, intervalSeconds: 3600 }),
-        codex: throttleStatus("codex", { percentLeft: 20, intervalSeconds: 0 }),
+    it("does not skip a fresh expired report once its coordinator hold has elapsed", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", {
+          percentLeft: 0,
+          expired: true,
+          exhaustedUntil: new Date(Date.now() - 1_000).toISOString(),
+        }),
       }));
       try {
-        // Warm claude so its 1-hour interval quotes against a real start.
-        const warm = vi.fn(async (candidate: { provider: string }) => candidate.provider);
-        await expect(mesh.gateRun(warm, [claudeEntry], false).result).resolves.toBe("claude");
-        await vi.waitFor(() => expect(appliedInterval("claude")).toBe(3600), {
-          timeout: 5_000,
-        });
-
-        // Normal priority keeps quote-first selection: codex is available now.
-        const normalFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
-        await expect(mesh.gateRun(normalFn, [claudeEntry, codexEntry], false).result).resolves.toBe(
-          "codex"
-        );
-
-        // Responsive ranks by headroom among lanes with quota: claude wins
-        // despite being an hour deep into its pace, and starts immediately.
-        const responsiveFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
-        const responsiveGate = mesh.gateRun(responsiveFn, [claudeEntry, codexEntry], true);
-        await expect(responsiveGate.result).resolves.toBe("claude");
-        expect(responsiveFn).toHaveBeenCalledTimes(1);
-        expect(responsiveFn).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
       } finally {
         await shutdownFn?.();
         shutdownFn = undefined;

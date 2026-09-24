@@ -389,11 +389,12 @@ function weeklyQuotaHeadroom(
  * is what keeps concurrent wakes from double-booking the same slot.
  *
  * For a responsive request (`opts.responsive`), pacing never disqualifies a
- * lane: among lanes with trustworthy weekly quota evidence, the one with more
- * headroom against the remaining window always wins, no matter how hot any
- * lane is running against its pace (#655). Lanes at absolute zero are expected
- * to have been pre-filtered by the caller. With no trustworthy evidence the
- * responsive rule falls back to the same quote-based selection as normal work.
+ * lane: when at least two lanes have trustworthy weekly quota evidence, the
+ * one with more headroom against the remaining window always wins, no matter
+ * how hot any lane is running against its pace (#655). Lanes at absolute zero
+ * are expected to have been excluded by the caller. With fewer than two
+ * comparable observations, the responsive rule falls back to the same
+ * quote-based selection as normal work.
  */
 export function selectPoolLane<C>(
   candidates: readonly PoolLaneCandidate<C>[],
@@ -404,17 +405,15 @@ export function selectPoolLane<C>(
     // Absolute quota gates, pacing ranks: a lane that still has quota is
     // preferred by headroom regardless of its pacing quote, and a pacing-hot
     // lane is never disqualified — the reservation bypasses the queue anyway.
-    let best: PoolLaneCandidate<C> | undefined;
-    let bestHeadroom = Number.NEGATIVE_INFINITY;
-    for (const candidate of candidates) {
+    const comparable = candidates.flatMap((candidate) => {
       const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
-      if (headroom === undefined) continue;
-      if (headroom > bestHeadroom) {
-        bestHeadroom = headroom;
-        best = candidate;
-      }
+      return headroom === undefined ? [] : [{ candidate, headroom }];
+    });
+    if (comparable.length >= 2) {
+      return comparable.reduce((best, candidate) =>
+        candidate.headroom > best.headroom ? candidate : best
+      ).candidate;
     }
-    if (best) return best;
   }
 
   let best: PoolLaneCandidate<C> | undefined;
@@ -456,6 +455,14 @@ export interface SubmitPoolGateOptions<C>
   /** Excludes a declared candidate from selection (e.g. an emergency-halted provider). */
   isHalted?: (config: C) => boolean;
   /**
+   * Excludes a lane from responsive selection when an authoritative admission
+   * source says it has no quota. Normal admission retains its existing pacing
+   * behavior; a later promotion applies this same predicate before reselecting.
+   */
+  isExhausted?: (config: C) => boolean;
+  /** Builds the terminal error when every non-halted candidate is exhausted. */
+  onResponsivePoolExhausted?: (candidates: readonly C[]) => Error;
+  /**
    * Fires synchronously when the queued selection is first reserved, reselected,
    * or promoted in place, so callers can track its declared tuple and current
    * priority for cancellation and telemetry.
@@ -469,8 +476,8 @@ export interface SubmitPoolGateOptions<C>
  * Reserve the earliest-available declared candidate across multiple provider
  * lanes as a single composed {@link RunStartHandle}. A normal request paces
  * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
- * among non-halted candidates. Responsive priority keeps the absolute-quota
- * pre-filtering the caller applied, ranks the surviving lanes by quota
+ * among non-halted candidates. Responsive priority excludes coordinator-known
+ * exhausted lanes through this same selection path, ranks survivors by quota
  * headroom rather than pacing heat, and then skips pacing once its selected
  * lane has been reserved (#655).
  *
@@ -502,13 +509,29 @@ export function submitPoolGate<C, T>(
   let currentCandidate: PoolLaneCandidate<C> | undefined;
   let settled = false;
 
-  const healthy = (): readonly PoolLaneCandidate<C>[] => {
-    if (!opts.isHalted) return candidates;
-    const alive = candidates.filter((c) => !opts.isHalted?.(c.config));
+  const healthy = (responsive: boolean): readonly PoolLaneCandidate<C>[] => {
+    const alive = opts.isHalted ? candidates.filter((c) => !opts.isHalted?.(c.config)) : candidates;
     // Never produce an unreservable pool: if every declared candidate reads
     // as halted (e.g. a race with the halt map), fall back to the full pool
     // and let the caller's own beforeRun/halt gate remain the real authority.
-    return alive.length > 0 ? alive : candidates;
+    if (alive.length === 0) return candidates;
+    if (!responsive || !opts.isExhausted) return alive;
+    return alive.filter((c) => !opts.isExhausted?.(c.config));
+  };
+
+  const exhaustedError = (): Error =>
+    opts.onResponsivePoolExhausted?.(candidates.map((candidate) => candidate.config)) ??
+    new Error("model pool exhausted");
+
+  const rejectedHandle = (error: Error): RunStartHandle<T> => {
+    const result = Promise.reject<T>(error);
+    result.catch(() => {});
+    return {
+      result,
+      started: false,
+      promote: () => {},
+      cancel: () => false,
+    };
   };
 
   const reportSelection = (
@@ -556,8 +579,9 @@ export function submitPoolGate<C, T>(
   };
 
   const responsive = opts.responsive === true;
-  const initial = selectPoolLane(healthy(), now(), { responsive });
-  reserve(initial ?? candidates[0], responsive);
+  const initial = selectPoolLane(healthy(responsive), now(), { responsive });
+  if (!initial) return rejectedHandle(exhaustedError());
+  reserve(initial, responsive);
 
   return {
     result,
@@ -566,7 +590,16 @@ export function submitPoolGate<C, T>(
     },
     promote: () => {
       if (settled || inner?.started) return;
-      const target = selectPoolLane(healthy(), now(), { responsive: true }) ?? candidates[0];
+      const target = selectPoolLane(healthy(true), now(), { responsive: true });
+      if (!target) {
+        generation++;
+        settled = true;
+        const stale = inner;
+        inner = undefined;
+        stale?.cancel?.();
+        rejectResult(exhaustedError());
+        return;
+      }
       if (currentCandidate === target) {
         // The reservation stays put, but its queued priority has changed.
         // Publish that transition so dashboard/HALT state cannot report a
