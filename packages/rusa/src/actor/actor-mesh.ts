@@ -927,6 +927,20 @@ export class ActorMesh {
     }
   >();
   /**
+   * Responsive-ready attention buffered while an actor is mid-run (#632).
+   *
+   * Generalizes the ready-head deferral principle: an actor must not be
+   * interrupted mid-run by downstream results of its own actions. Delivering
+   * per mutation would trigger eager preemption or require complex mid-run
+   * join disambiguation; instead, self-caused attention is deferred until
+   * the run finishes, deduplicated per obligation, and flushed into the inbox
+   * if the obligation is still ready and responsive.
+   */
+  private readonly runResponsiveReadyAttention = new Map<
+    string,
+    Map<string, { id: string; intent: string | null; readyCount?: number }>
+  >();
+  /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
    * into children *before* marking itself retired, so an ancestor mid-retire
    * still reads `status: "active"` in the repository — see
@@ -1475,8 +1489,9 @@ export class ActorMesh {
    * The dispatch that schedules without interrupting. Responsive work still
    * passes the voice hold and is admitted; what it does not do is replace a
    * run already in flight. Private and named so "responsive but not
-   * preempting" cannot leak into a control path. Its two callers are event
-   * fan-out's non-owner copy and self-caused mid-run ready attention.
+   * preempting" cannot leak into a control path — its one caller is event
+   * fan-out, where only an event's effective owner may have its active run
+   * replaced. Self-caused mid-run ready attention is deferred to run end (#632).
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
     const resolved = this.resolveThreadId(dest);
@@ -1550,6 +1565,7 @@ export class ActorMesh {
     // head attention immediately, which is what every non-run producer wants.
     this.actorsInRun.add(actorId);
     this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1721,6 +1737,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
@@ -1739,6 +1756,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
   }
 
   /**
@@ -1758,6 +1776,56 @@ export class ActorMesh {
     // at all — in the last case there is no obligation to point the actor at.
     if (!net || net.to === null || net.to.id === net.from) return;
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
+  }
+
+  /**
+   * Deliver deferred responsive-ready attention for an actor whose run has
+   * finished (#632). An actor creating self-assigned obligations mid-run
+   * buffers them so it cannot self-interrupt; once the run completes, this
+   * checks whether each obligation is still live, owned, and ready, and
+   * appends attention entries to the inbox for a follow-up run.
+   */
+  private flushRunResponsiveReadyAttention(actorId: string): void {
+    const pending = this.runResponsiveReadyAttention.get(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
+    if (!pending || pending.size === 0 || !this.inboxStore) return;
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return;
+
+    for (const obligation of pending.values()) {
+      if (this.obligations?.get) {
+        const live = this.obligations.get(obligation.id);
+        if (
+          !live ||
+          this.resolveThreadId(live.ownerId) !== actorId ||
+          live.status !== "ready" ||
+          !live.effectiveResponsive
+        ) {
+          continue;
+        }
+      }
+      const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
+      const entryId = deduplicatedInboxEntryId(
+        `obligation-ready-responsive:${obligation.id}${episodeKey}`,
+        actorId
+      );
+      const entries = this.inboxStore.append([
+        {
+          id: entryId,
+          actorId,
+          source: `obligation:${obligation.id}`,
+          payload: {
+            type: "obligation.ready_responsive",
+            obligationId: obligation.id,
+            intent: obligation.intent ?? undefined,
+            priority: "responsive",
+          } as unknown as InboxPayload,
+        },
+      ]);
+      if (entries.length > 0) {
+        this.dispatch(actorId);
+      }
+    }
   }
 
   /**
@@ -1881,10 +1949,12 @@ export class ActorMesh {
     ownerId: string,
     obligation: { id: string; intent: string | null; readyCount?: number },
     /**
-     * The owner made its own obligation ready mid-run: it is already running
-     * and will see the obligation in its queue, so a normal follow-up nudge
-     * joins the run instead of preempting it. Any other cause is responsive
-     * and preempts — the v1 interrupt the inbox model admits.
+     * The owner made its own obligation ready mid-run: defer delivery until the
+     * end of the run (#632). Generalizes the ready-head deferral principle: an
+     * actor must not be interrupted mid-run by downstream results of its own
+     * actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+     * entries for any obligations that remain ready.
+     * Any other cause is external responsive work and preempts immediately.
      */
     selfCausedMidRun = false
   ): boolean {
@@ -1892,6 +1962,22 @@ export class ActorMesh {
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
+
+    // Mid-run self-caused ready attention: defer delivery until the end of
+    // the run. Generalizes the ready-head deferral principle (#632):
+    // an actor should not be interrupted mid-run by downstream results of its
+    // own actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+    // entries for any obligations that remain ready.
+    if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
+      let pending = this.runResponsiveReadyAttention.get(actorId);
+      if (!pending) {
+        pending = new Map();
+        this.runResponsiveReadyAttention.set(actorId, pending);
+      }
+      pending.set(obligation.id, obligation);
+      return true;
+    }
+
     const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
     const entryId = deduplicatedInboxEntryId(
       `obligation-ready-responsive:${obligation.id}${episodeKey}`,
@@ -1911,11 +1997,7 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) return false;
-    if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
-      this.dispatchJoiningActiveRun(actorId);
-    } else {
-      this.dispatch(actorId);
-    }
+    this.dispatch(actorId);
     return true;
   }
 
@@ -4615,6 +4697,7 @@ export class ActorMesh {
     this.unsubscribeInboxAppends?.();
     this.unsubscribeInboxAppends = undefined;
     this.appendWakesOwed.clear();
+    this.runResponsiveReadyAttention.clear();
     this.runs.closeAll();
   }
 
