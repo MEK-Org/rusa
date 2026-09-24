@@ -11146,6 +11146,56 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(control, "complete")).not.toThrow();
   });
 
+  it("unions selected ready heads with owned direct focus without arming foreign focus", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh, "union subject");
+    const other = worker(mesh, "other owner");
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "selected-head", title: "Selected head", ownerId: subject });
+    repo.create({ id: "owned-direct", title: "Owned direct", ownerId: subject });
+    repo.create({ id: "foreign-direct", title: "Foreign direct", ownerId: other });
+
+    // An explicit foreign focus cannot replace the selected head's closure
+    // requirement. It remains resolver context, not this actor's commitment.
+    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const headEntry = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === subject &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "selected-head"
+    );
+    if (!headEntry) throw new Error("expected selected ready-head entry");
+    mesh.selectInboxEntries(subject, [headEntry.id], undefined, "foreign-direct");
+    expect(mesh.runDisciplineNotice(subject)).toContain("selected-head");
+    expect(mesh.runDisciplineNotice(subject)).not.toContain("foreign-direct");
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation selected-head/
+    );
+    mesh.abandonInboxRun(subject);
+
+    // When both are owned and ready, each selection-time focus remains armed.
+    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const secondHeadEntry = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === subject &&
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === "selected-head" &&
+          !entry.handledAt
+      )
+      .at(-1);
+    if (!secondHeadEntry) throw new Error("expected second selected ready-head entry");
+    mesh.selectInboxEntries(subject, [secondHeadEntry.id], undefined, "owned-direct");
+    repo.setTerminalStatus("selected-head", "done", null, null, subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation owned-direct/
+    );
+    repo.setTerminalStatus("owned-direct", "done", null, null, subject);
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+  });
+
   it("captures experiment membership at selection, so a root unenrollment applies next run", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);

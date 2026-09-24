@@ -1604,23 +1604,28 @@ export class ActorMesh {
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
-    // Snapshot the selected focus now. An explicit inbox focus is the selected
-    // obligation even when its supporting entry is an ordinary message; absent
-    // that, ready-head attention supplies the focus. The entry's delivery-time
-    // type cannot decide the rule because its obligation may have changed
-    // status before the actor selects it.
-    const focusedObligationIds = this.isEnrolledInExperiment(
+    // Snapshot the selected focus now. A direct focus and selected ready-head
+    // attention both contribute: supplying an explicit id must not let an
+    // actor bypass a ready head included in the same selection. Direct focus
+    // only arms its owning actor; the resolver may record another live row as
+    // context, but strict clean-yield closure is a commitment of its owner.
+    const strictEnrolled = this.isEnrolledInExperiment(
       actorId,
       STRICT_OBLIGATION_HANDLING_EXPERIMENT
-    )
-      ? focusedObligationId !== undefined
-        ? [focusedObligationId]
-        : entries.flatMap((entry) =>
-            entry.payload.type === "obligation.ready_head" &&
-            typeof entry.payload.obligationId === "string"
-              ? [entry.payload.obligationId]
-              : []
-          )
+    );
+    const readyHeadObligationIds = strictEnrolled
+      ? entries.flatMap((entry) =>
+          entry.payload.type === "obligation.ready_head" &&
+          typeof entry.payload.obligationId === "string"
+            ? [entry.payload.obligationId]
+            : []
+        )
+      : [];
+    const focusedObligationIds = strictEnrolled
+      ? [
+          ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
+          ...readyHeadObligationIds,
+        ]
       : [];
     // Fail closed, and fail here — before the selection commits, so nothing has
     // run yet and no clean yield can slip past unenforced. An enrolled actor in
@@ -1641,7 +1646,16 @@ export class ActorMesh {
     const headObligationIds = supportsObligationClosureReads(closure)
       ? [...new Set(focusedObligationIds)].filter((obligationId) => {
           const focused = closure.get(obligationId);
-          return focused === null || focused.status === "ready";
+          // A ready-head read that vanishes remains fail-closed as before. An
+          // explicit focus must also belong to this actor before it can arm a
+          // run; a foreign row is never this actor's closure commitment.
+          if (focused === null) return readyHeadObligationIds.includes(obligationId);
+          return (
+            focused.status === "ready" &&
+            (readyHeadObligationIds.includes(obligationId) ||
+              (focusedObligationId === obligationId &&
+                this.resolveThreadId(focused.ownerId) === actorId))
+          );
         })
       : [];
     beforeCommit?.(entries);

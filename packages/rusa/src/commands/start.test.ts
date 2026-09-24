@@ -1188,7 +1188,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         throw new Error(`ready-head inbox entry missing: ${actorId}`);
       const selected = await call(inboxUrl, "select", {
         entry_ids: [entry.id],
-        obligation_id: entry.payload.obligationId,
       });
       expect(selected.isError).toBeFalsy();
       return { obligationId: entry.payload.obligationId, selection: payloadOf(selected), runId };
@@ -1222,6 +1221,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .meshEvents.listEventsByActors([optedIn], { limit: 20, kinds: ["run_yield_rejected"] })
         .events.some((event) => (event.payload ?? "").includes(strictHeadId))
     ).toBe(true);
+
+    // Direct focus takes the separate production path: an ordinary mesh
+    // message plus an explicit owned obligation, selected through the same
+    // live inbox MCP endpoint. It must arm independently of ready-head
+    // delivery and describe that commitment before the yield attempt.
+    const direct = spawnWorker("live direct-focus worker");
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: direct,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    const directId = getRepositories().obligations.create({
+      title: "live direct focus",
+      ownerId: direct,
+    }).id;
+    liveMesh.sendMessage(direct, "work the selected direct focus", "root");
+    const directRunId = await startLifecycleRun(
+      actorOf(direct),
+      { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      { queued: false }
+    );
+    const directInboxUrl = urlOf(actorOf(direct), "inbox");
+    const directListed = payloadOf(await call(directInboxUrl, "list", { status: "unhandled" })) as {
+      entries: Array<{ id: string; payload: { type: string } }>;
+    };
+    const directEntry = directListed.entries.find(
+      (candidate) => candidate.payload.type === "mesh.message"
+    );
+    if (!directEntry) throw new Error(`ordinary message inbox entry missing: ${direct}`);
+    const directSelection = await call(directInboxUrl, "select", {
+      entry_ids: [directEntry.id],
+      obligation_id: directId,
+    });
+    expect(directSelection.isError).toBeFalsy();
+    expect(String(payloadOf(directSelection).discipline)).toContain(directId);
+    const directRejected = await call(urlOf(actorOf(direct), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(directRejected.isError).toBe(true);
+    expect(JSON.stringify(directRejected)).toContain(`selected head obligation ${directId}`);
+    getRepositories().obligations.setTerminalStatus(directId, "done", null, null, "root");
+    expect(
+      (await call(urlOf(actorOf(direct), "mesh"), "yield_run", { status: "complete" })).isError
+    ).toBeFalsy();
+    await endLifecycleRun(actorOf(direct), directRunId, { success: true, output: "", exitCode: 0 });
 
     // Decomposing it through the worker's own obligations MCP is a legal exit.
     const child = await call(urlOf(actorOf(optedIn), "obligations"), "create_obligation", {
