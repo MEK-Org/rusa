@@ -88,4 +88,25 @@ describe("Antigravity private state", () => {
     );
     expect(carryForwardAntigravityConversation(actorDir, "not-a-conversation")).toBe(false);
   });
+
+  it("recovers and completes carry-forward if a prior attempt was interrupted", () => {
+    // Simulate an interrupted copy: partial staging artifacts and partial destination brain
+    const stagingDir = join(actorState, ".staging", OWN_ID);
+    mkdirSync(join(stagingDir, "conversations"), { recursive: true });
+    writeFileSync(join(stagingDir, "conversations", `${OWN_ID}.db`), "staged-partial");
+    mkdirSync(join(actorState, "brain", OWN_ID), { recursive: true });
+    writeFileSync(join(actorState, "brain", OWN_ID, "partial.txt"), "leftover");
+
+    expect(carryForwardAntigravityConversation(actorDir, OWN_ID)).toBe(true);
+
+    const privateFile = (...parts: string[]) => readFileSync(join(actorState, ...parts), "utf8");
+    expect(privateFile("conversations", `${OWN_ID}.db`)).toBe(`db-${OWN_ID}`);
+    expect(privateFile("conversations", `${OWN_ID}.db-wal`)).toBe(`wal-${OWN_ID}`);
+    expect(privateFile("annotations", `${OWN_ID}.pbtxt`)).toBe(`note-${OWN_ID}`);
+    expect(privateFile("brain", OWN_ID, ".system_generated", "logs", "transcript_full.jsonl")).toBe(
+      `transcript-${OWN_ID}`
+    );
+    expect(existsSync(join(actorState, "brain", OWN_ID, "partial.txt"))).toBe(false);
+    expect(existsSync(stagingDir)).toBe(false);
+  });
 });

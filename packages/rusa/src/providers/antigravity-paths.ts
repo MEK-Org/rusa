@@ -1,4 +1,13 @@
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -108,6 +117,12 @@ function isRealDir(path: string): boolean {
  * one, and silently drop the actor's context. `conversationId` is the actor's
  * own session record, so this copies exactly that conversation and nothing
  * else, and it leaves the host records unchanged.
+ *
+ * Staged atomically: files stage in an actor-private temporary directory before
+ * being moved to their final locations, and the primary DB is published last.
+ * If copying or publishing is interrupted, no private DB exists at the
+ * destination, allowing retries to cleanly start over rather than resuming
+ * incomplete context.
  */
 export function carryForwardAntigravityConversation(
   actorDir: string,
@@ -119,20 +134,55 @@ export function carryForwardAntigravityConversation(
   const db = join("conversations", `${conversationId}.db`);
   if (existsSync(join(actorStateDir, db)) || !isRegularFile(join(hostDir, db))) return false;
 
-  for (const suffix of ["", "-wal", "-shm"]) {
+  const stagingDir = join(actorStateDir, ".staging", conversationId);
+  rmSync(stagingDir, { recursive: true, force: true });
+  mkdirSync(join(stagingDir, "conversations"), { recursive: true, mode: 0o700 });
+
+  const suffixes = ["", "-wal", "-shm"] as const;
+  for (const suffix of suffixes) {
     const source = join(hostDir, `${db}${suffix}`);
-    if (isRegularFile(source)) copyFileSync(source, join(actorStateDir, `${db}${suffix}`));
+    if (isRegularFile(source)) {
+      copyFileSync(source, join(stagingDir, `${db}${suffix}`));
+    }
   }
-  const annotation = join("annotations", `${conversationId}.pbtxt`);
-  if (isRegularFile(join(hostDir, annotation))) {
-    copyFileSync(join(hostDir, annotation), join(actorStateDir, annotation));
+
+  const annotationRel = join("annotations", `${conversationId}.pbtxt`);
+  const annotationSource = join(hostDir, annotationRel);
+  if (isRegularFile(annotationSource)) {
+    mkdirSync(join(stagingDir, "annotations"), { recursive: true, mode: 0o700 });
+    copyFileSync(annotationSource, join(stagingDir, annotationRel));
   }
-  const brain = join("brain", conversationId);
-  if (isRealDir(join(hostDir, brain))) {
-    cpSync(join(hostDir, brain), join(actorStateDir, brain), {
+
+  const brainRel = join("brain", conversationId);
+  const brainSource = join(hostDir, brainRel);
+  if (isRealDir(brainSource)) {
+    mkdirSync(join(stagingDir, "brain"), { recursive: true, mode: 0o700 });
+    cpSync(brainSource, join(stagingDir, brainRel), {
       recursive: true,
       verbatimSymlinks: true,
     });
   }
+
+  // Publish from staging to destination. Auxiliary files (brain, annotations,
+  // WAL/SHM) are published first; the primary DB is published last so an
+  // interrupted sequence never leaves an orphan DB that tricks future retries.
+  if (existsSync(join(stagingDir, brainRel))) {
+    rmSync(join(actorStateDir, brainRel), { recursive: true, force: true });
+    renameSync(join(stagingDir, brainRel), join(actorStateDir, brainRel));
+  }
+  if (existsSync(join(stagingDir, annotationRel))) {
+    rmSync(join(actorStateDir, annotationRel), { force: true });
+    renameSync(join(stagingDir, annotationRel), join(actorStateDir, annotationRel));
+  }
+  for (const suffix of ["-wal", "-shm"] as const) {
+    const staged = join(stagingDir, `${db}${suffix}`);
+    if (existsSync(staged)) {
+      rmSync(join(actorStateDir, `${db}${suffix}`), { force: true });
+      renameSync(staged, join(actorStateDir, `${db}${suffix}`));
+    }
+  }
+  renameSync(join(stagingDir, db), join(actorStateDir, db));
+
+  rmSync(stagingDir, { recursive: true, force: true });
   return true;
 }
