@@ -256,7 +256,10 @@ const TERMINAL_STATUS_SQL = OBLIGATION_STATUSES.filter(isTerminalObligationStatu
  */
 const EFFECTIVE_PRIORITY_CTE = `
   WITH RECURSIVE responsive_reach(id) AS (
-    SELECT id FROM obligations WHERE responsive = 1
+    SELECT id
+    FROM obligations
+    WHERE responsive = 1
+      AND status NOT IN (${TERMINAL_STATUS_SQL})
     UNION
     SELECT edge.target_id
     FROM responsive_reach
@@ -264,6 +267,7 @@ const EFFECTIVE_PRIORITY_CTE = `
       SELECT parent_id AS source_id, id AS target_id
       FROM obligations
       WHERE parent_id IS NOT NULL
+        AND status NOT IN (${TERMINAL_STATUS_SQL})
       UNION ALL
       SELECT op.dependent_id, op.prerequisite_id
       FROM obligation_prerequisites op

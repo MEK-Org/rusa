@@ -623,6 +623,28 @@ describe("ObligationRepository", () => {
       expect(announced).toEqual([]);
     });
 
+    it("does not let a terminal responsive row seed inherited urgency", () => {
+      repository.create({
+        title: "terminal root",
+        id: "terminal-root",
+        ownerId: "actor-a",
+        responsive: true,
+      });
+      repository.create({
+        title: "legacy live child",
+        id: "legacy-live-child",
+        ownerId: "actor-a",
+        parentId: "terminal-root",
+      });
+
+      // Normal repository transitions prevent a terminal parent with live
+      // children. Retain the CTE's stronger edge invariant for a legacy or
+      // externally repaired row, rather than letting a terminal seed leak
+      // urgency into the live child.
+      db.prepare("UPDATE obligations SET status = 'done' WHERE id = 'terminal-root'").run();
+      expect(repository.require("legacy-live-child").effectiveResponsive).toBe(false);
+    });
+
     it("carries urgency to a waiting blocker's ready descendants", () => {
       repository.create({ title: "head", id: "head", ownerId: "actor-b", priority: 1 });
       repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
@@ -673,6 +695,27 @@ describe("ObligationRepository", () => {
       repository.markResponsive("plain-dependent", "system:mesh");
       expect(effective("marked")).toEqual([true]);
       expect(announced).toEqual(["edge-later", "marked"]);
+    });
+
+    it("carries the prerequisite-edge author to responsive delivery", () => {
+      const causes: Array<{ id: string; actingPrincipal: string }> = [];
+      repository.setResponsiveReadyListener((obligation, actingPrincipal) =>
+        causes.push({ id: obligation.id, actingPrincipal })
+      );
+      repository.create({ title: "owner head", id: "owner-head", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "blocker", id: "blocker", ownerId: "actor-b", priority: 2 });
+      repository.create({
+        title: "responsive dependent",
+        id: "responsive-dependent",
+        ownerId: "actor-a",
+        responsive: true,
+      });
+
+      repository.addPrerequisite("responsive-dependent", "blocker", "actor-a");
+
+      // `start.ts` turns this peer-authored cause into the existing preemptive
+      // responsive inbox path; ActorMesh covers that peer/self distinction.
+      expect(causes).toEqual([{ id: "blocker", actingPrincipal: "actor-a" }]);
     });
 
     it("keeps a shared blocker responsive until its last responsive dependent stops waiting", () => {
