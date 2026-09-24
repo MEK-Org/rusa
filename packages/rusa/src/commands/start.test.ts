@@ -3135,22 +3135,55 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
   });
 
-  it("validates /halt model: against the provider's scraped catalog, not the live pools", async () => {
+  async function startClaudeChatHaltService() {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
-    const config = {
-      github: { account: "mock-bot" },
-      providers: { claude: { cliCommand: "claude" } },
-      rootActor: { provider: "claude", model: "claude-sonnet-5" },
-      chat: {
-        projectId: "test",
-        subscription: "test",
-        pubsubKeyPath: "/dev/null",
-        gchat: "all",
-      },
-      geminiApiKey: "fake-gemini-key",
-    };
-    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "claude", model: "claude-sonnet-5" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    const message = (text: string, name: string) =>
+      chatSource.emit({
+        name,
+        spaceName: "spaces/test",
+        spaceType: "DIRECT_MESSAGE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text,
+        mentionsSelf: false,
+        isDirectMessage: true,
+      });
+    return { chatClient, message };
+  }
+
+  it("validates /halt model: against the provider's scraped catalog, not the live pools", async () => {
     // Claude has no model probe; its catalog on a live mesh is a durable
     // `model_scrapes` row, which startup restores. Seed exactly that, so the
     // gate below reads the catalog through the production restore path.
@@ -3168,30 +3201,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       { displayLabel: "Claude Opus 5", identifier: "claude-opus-5", passable: true },
     ]);
     closeDb();
-    const readyPromise = new Promise<void>((resolve) => {
-      runStart({
-        e2e: {
-          chatClient,
-          chatSource,
-          onReady: (handles) => {
-            shutdownFn = handles.shutdown;
-            resolve();
-          },
-        },
-      });
-    });
-    await readyPromise;
-    const message = (text: string, name: string) =>
-      chatSource.emit({
-        name,
-        spaceName: "spaces/test",
-        spaceType: "DIRECT_MESSAGE",
-        senderName: "users/operator",
-        senderDisplayName: "Operator",
-        text,
-        mentionsSelf: false,
-        isDirectMessage: true,
-      });
+    const { chatClient, message } = await startClaudeChatHaltService();
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
     // The premise this gate was rebuilt on. Nothing is running claude-opus-5,
@@ -3212,7 +3222,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const typoAck = chatClient.sent.at(-1)?.text ?? "";
     expect(typoAck).toContain("rejected");
     expect(typoAck).toContain("claude-sonnet-5-hihg");
-    expect(typoAck).toContain("the model catalog for claude does not list");
     // The closest catalog entry is what the operator retypes.
     expect(typoAck).toContain("closest: claude-sonnet-5");
     // No hold at all: not on the misspelling, not on anything.
@@ -3243,50 +3252,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(halt.isHalted()).toBe(false);
     expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
 
+    // Catalog membership is checked per requested provider/model pair. Codex
+    // has no recorded catalog, but Claude's catalog used to make this union
+    // check pass and falsely acknowledge a Codex hold. The rejection still
+    // leaves the sentinel free for the correctly scoped command.
+    await message(
+      "/halt provider:claude,codex model:claude-sonnet-5",
+      "messages/halt-mixed-provider-catalog"
+    );
+    const mixedAck = chatClient.sent.at(-1)?.text ?? "";
+    expect(mixedAck).toContain("codex:claude-sonnet-5");
+    expect(mixedAck).toContain("No model catalog is recorded for codex");
+    expect(halt.isHalted()).toBe(false);
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(false);
+    expect(halt.isHalted("codex", "claude-sonnet-5")).toBe(false);
+
+    await message("/halt provider:claude model:claude-sonnet-5", "messages/halt-after-mixed");
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    expect(halt.isHalted("claude", "claude-sonnet-5")).toBe(true);
+    await message("/resume", "messages/resume-after-mixed");
+    expect(halt.isHalted()).toBe(false);
+
     clearProviderModelCatalog();
   });
 
   it("refuses a model-scoped claude halt on a mesh with no recorded claude catalog", async () => {
     clearProviderModelCatalog();
-    const chatClient = new FakeChatClient();
-    const chatSource = new FakeChatSource();
-    const config = {
-      github: { account: "mock-bot" },
-      providers: { claude: { cliCommand: "claude" } },
-      rootActor: { provider: "claude", model: "claude-sonnet-5" },
-      chat: {
-        projectId: "test",
-        subscription: "test",
-        pubsubKeyPath: "/dev/null",
-        gchat: "all",
-      },
-      geminiApiKey: "fake-gemini-key",
-    };
-    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
-    const readyPromise = new Promise<void>((resolve) => {
-      runStart({
-        e2e: {
-          chatClient,
-          chatSource,
-          onReady: (handles) => {
-            shutdownFn = handles.shutdown;
-            resolve();
-          },
-        },
-      });
-    });
-    await readyPromise;
-    const message = (text: string, name: string) =>
-      chatSource.emit({
-        name,
-        spaceName: "spaces/test",
-        spaceType: "DIRECT_MESSAGE",
-        senderName: "users/operator",
-        senderDisplayName: "Operator",
-        text,
-        mentionsSelf: false,
-        isDirectMessage: true,
-      });
+    const { chatClient, message } = await startClaudeChatHaltService();
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
     // A fresh install: no probe fills claude's catalog and no row has been
@@ -3306,45 +3298,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("answers an unparseable /halt with the syntax it accepts", async () => {
-    const chatClient = new FakeChatClient();
-    const chatSource = new FakeChatSource();
-    const config = {
-      github: { account: "mock-bot" },
-      providers: { claude: { cliCommand: "claude" } },
-      rootActor: { provider: "claude", model: "claude-sonnet-5" },
-      chat: {
-        projectId: "test",
-        subscription: "test",
-        pubsubKeyPath: "/dev/null",
-        gchat: "all",
-      },
-      geminiApiKey: "fake-gemini-key",
-    };
-    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
-    const readyPromise = new Promise<void>((resolve) => {
-      runStart({
-        e2e: {
-          chatClient,
-          chatSource,
-          onReady: (handles) => {
-            shutdownFn = handles.shutdown;
-            resolve();
-          },
-        },
-      });
-    });
-    await readyPromise;
+    const { chatClient, message } = await startClaudeChatHaltService();
 
-    await chatSource.emit({
-      name: "messages/halt-typo-option",
-      spaceName: "spaces/test",
-      spaceType: "DIRECT_MESSAGE",
-      senderName: "users/operator",
-      senderDisplayName: "Operator",
-      text: "/halt models:claude-sonnet-5",
-      mentionsSelf: false,
-      isDirectMessage: true,
-    });
+    await message("/halt models:claude-sonnet-5", "messages/halt-typo-option");
     const rejection = chatClient.sent.at(-1)?.text ?? "";
     expect(rejection).toContain("unknown halt option");
     // The operator mistyped the grammar, so the reply carries the grammar:

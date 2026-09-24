@@ -3953,35 +3953,55 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // has recorded, and a mesh with none refuses every model-scoped claude
         // halt. That is the rule as asked for (#630): a model the database
         // does not list is refused, and the provider-wide halt stays open.
-        const catalogued = (haltCommand.providers ?? []).flatMap(
-          (provider) => acceptableModelPins(provider) ?? []
-        );
-        const uncatalogued = findUncataloguedHaltModels(haltCommand.models ?? [], catalogued);
+        // A provider/model halt is a Cartesian scope: `provider:claude,codex
+        // model:claude-sonnet-5` claims to hold that model for both providers.
+        // Do not validate against the union of their catalogs: that would let
+        // Claude make the command look valid while its Codex half is still an
+        // inert, acknowledged hold.
+        const providers = haltCommand.providers ?? [];
+        const models = haltCommand.models ?? [];
+        const uncatalogued = providers.flatMap((provider) => {
+          const catalogued = acceptableModelPins(provider) ?? [];
+          return findUncataloguedHaltModels(models, catalogued).map((model) => ({
+            provider,
+            catalogued,
+            ...model,
+          }));
+        });
         if (uncatalogued.length > 0) {
-          const providerScope = (haltCommand.providers ?? []).join(", ");
           const named = uncatalogued
-            .map((u) =>
-              u.nearest.length ? `${u.model} (closest: ${u.nearest.join(", ")})` : u.model
+            .map(({ provider, model, nearest }) =>
+              nearest.length
+                ? `${provider}:${model} (closest: ${nearest.join(", ")})`
+                : `${provider}:${model}`
             )
             .join(", ");
           // With nothing to suggest, the useful facts are *why* — a provider
           // with no recorded models, not a misspelled name — and what still
-          // works.
-          const why = catalogued.length
-            ? ""
-            : ` No model catalog is recorded for ${providerScope}; /halt provider:${(haltCommand.providers ?? []).join(",")} halts the whole provider.`;
+          // works. Keep that provider-specific when a multi-provider command
+          // mixes a catalogued provider with one that has no catalog.
+          const emptyCatalogProviders = [
+            ...new Set(
+              uncatalogued
+                .filter(({ catalogued }) => catalogued.length === 0)
+                .map(({ provider }) => provider)
+            ),
+          ];
+          const why = emptyCatalogProviders.length
+            ? ` No model catalog is recorded for ${emptyCatalogProviders.join(", ")}; /halt provider:${emptyCatalogProviders.join(",")} halts the whole provider.`
+            : "";
           // A comma list is refused whole. Holding the half that matched would
           // leave a named scope unheld while the acknowledgement implied
-          // otherwise, and the operator retypes the whole command anyway.
+          // otherwise. That is equally true when only some provider/model
+          // pairs in a multi-provider scope matched.
           const partial =
-            uncatalogued.length < (haltCommand.models?.length ?? 0)
-              ? " No hold was placed, including for the models that did match."
+            uncatalogued.length < providers.length * models.length
+              ? " No hold was placed, including for the provider/model scopes that did match."
               : " No hold was placed.";
           void cc
             .send(
               msg.spaceName,
-              `⛔ Halt command rejected: the model catalog for ${providerScope} does not` +
-                ` list ${named}.${why}${partial}`
+              `⛔ Halt command rejected: the provider model catalogs do not list ${named}.${why}${partial}`
             )
             .catch(() => {});
           return;
