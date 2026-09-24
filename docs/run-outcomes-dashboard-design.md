@@ -18,7 +18,15 @@ This design starts from `staging` commit `fc2fefff63181434f701ce043cb980a94303ba
 - `packages/rusa/src/db/repositories/actor-run-repository.ts` stores run focus
   and terminal rows. `src/actor/actor.ts`, `src/actor/actor-mesh.ts`, and
   `src/experimental/remote-instances/actor-handle.ts` provide the existing
-  local and remote terminal boundaries.
+  local and remote terminal boundaries. A follower's `result` message is the
+  observed remote CLI result; a lost follower channel is a separate leader-side
+  transport observation, not evidence that the provider CLI died.
+- At this baseline `ActorHandle.fail()` terminates an already-open remote run
+  with a synthetic unsuccessful result after a connection/startup failure. That
+  is the current leader-side accounting behavior being described, not a new
+  provider-death classification. The lease/heartbeat assessment in
+  [#656](https://github.com/MEK-Org/rusa/issues/656) is held separately; this
+  design does not change or endorse that transport behavior.
 - [#610](https://github.com/MEK-Org/rusa/issues/610) asks the queue to prefer an
   obligation card when the inbox source has an unambiguous obligation link.
 - [#664](https://github.com/MEK-Org/rusa/issues/664) and its
@@ -35,15 +43,21 @@ through three places:
 
 1. **Queued** — show it as upcoming work, not as proof that it has already been
    selected. Prefer the obligation card only for an unambiguous association, as
-   #610 requests. A separately labelled deferred entry remains in Queue.
+   #610 requests. Its snapshot shows the queue-stage checkpoint (why it is
+   waiting and what is next), not a later approval-wait checkpoint. A
+   separately labelled deferred entry remains in Queue.
 2. **Selected** — open the same card in the actor's work focus and list the
    selected inbox items separately from unselected backlog. Drill-through goes
-   to Inbox, Events, and Work.
+   to Inbox, Events, and Work. Its snapshot instead says that work was selected
+   for this run and names the next run-stage action.
 3. **Recent activity** — replace a yield-note feed with a run-settlement row:
    terminal result and time; work identity; **Handled** inbox outcomes;
    **Obligation changes**; goal state; and drill-through to the run, source, and
-   work record. A wait caused by a dependency is visible as a wait, not a fake
-   run result.
+   work record. Run-record outcomes are limited to observed CLI results,
+   interruption, and the current terminal accounting result. A dependency wait
+   appears in a separately labelled **Dependency waiting** section, and remote
+   contact loss appears as a transport observation with provider outcome
+   **unknown**, never as a fake provider failure.
 
 The screenshot deliberately includes these recovery cases:
 
@@ -53,6 +67,9 @@ The screenshot deliberately includes these recovery cases:
 - A provider failure occurs while the #664 notification is selected. That
   notification remains unhandled; its work-specific retry budget is exhausted
   and the row projects **Needs attention** with explicit drill-through.
+- A separately labelled remote-contact-loss observation says only that the
+  leader lost contact with the follower. It does not call the provider dead or
+  replace a later observed follower CLI result.
 - A deferred, unselected backlog item still appears in Queue. It was not
   consumed by the failed selected run and does not spend that work's retry
   budget.
@@ -60,10 +77,12 @@ The screenshot deliberately includes these recovery cases:
 ## Runtime direction for a later implementation
 
 Use the existing run id and terminal compare-and-set. A local provider return
-settles through the current actor result path; a thrown provider result settles
-as failed. The remote follower result is completed through the leader's actor
-handle; a failed remote channel closes an open run through the existing failure
-route. In every case, record one terminal outcome and never infer obligation
+or thrown provider error settles through the current actor result path. A remote
+provider result is observed only when the follower sends its result through the
+leader's actor handle. A lost remote channel must be labelled as contact loss
+with an unknown provider outcome; the current code's leader-side terminal
+accounting for an already-open run remains visible as such while #656 is
+assessed. In every case, record one terminal outcome and never infer obligation
 completion from an ordinary successful CLI return.
 
 After terminal settlement, reconcile only that run's selected inbox ids against
@@ -75,9 +94,11 @@ waiting uses its durable edge. Neither needs a routine `complete` or `blocked`
 yield label.
 
 The implementation test matrix should cover local success, local throw,
-interruption, duplicate remote completion, remote disconnect, and restart. Each
-case should demonstrate exactly one terminal record/event and preserve the
-separate handled-inbox and obligation-transition outcomes.
+interruption, duplicate remote completion, remote contact loss, and restart.
+Each case should demonstrate exactly one terminal record/event, preserve the
+separate handled-inbox and obligation-transition outcomes, and prove that a
+transport-loss display never claims a provider CLI failure without an observed
+CLI result.
 
 ## Review artifact
 

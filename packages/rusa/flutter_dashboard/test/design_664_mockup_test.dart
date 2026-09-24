@@ -58,7 +58,10 @@ void main() {
       HttpOverrides.global = _FakeImageHttpOverrides(await _portraits());
       addTearDown(() => HttpOverrides.global = null);
 
-      final obligation = makeObligation(
+      // Queue and selected views intentionally use two snapshots of the same
+      // work identity. A queued card must not borrow an approval-wait
+      // checkpoint from a later selected run.
+      final queuedObligation = makeObligation(
         _kObligationId,
         ownerId: _kActorId,
         title: _kObligationHeading,
@@ -66,9 +69,22 @@ void main() {
         externalRef: _kObligationRef,
         status: 'ready',
         checkpoint:
-            'Design mock-up rendered; waiting on operator design approval. '
-            'Next: preserve the selected notification until review settles.',
-        checkpointAt: '2026-09-23T09:40:00.000Z',
+            'Queued behind one run; no inbox item is selected yet. '
+            'Next: await the available provider lane.',
+        checkpointAt: '2026-09-23T09:38:00.000Z',
+        checkpointBy: _kActorId,
+      );
+      final selectedObligation = makeObligation(
+        _kObligationId,
+        ownerId: _kActorId,
+        title: _kObligationHeading,
+        intent: _kObligationIntent,
+        externalRef: _kObligationRef,
+        status: 'ready',
+        checkpoint:
+            'Selected for run 14:07; #664 feedback remains unhandled. '
+            'Next: record the run result before changing the obligation.',
+        checkpointAt: '2026-09-23T14:07:03.000Z',
         checkpointBy: _kActorId,
       );
       final api = FakeApi()
@@ -81,13 +97,13 @@ void main() {
             title: 'pool-selection implementer',
             queuePosition: 1,
             estimatedStartAt: '2026-09-23T09:52:00.000Z',
-            selectedObligation: obligation,
+            selectedObligation: selectedObligation,
             selectedProvider: 'claude',
             selectedModel: 'claude-opus-4-6',
             selectedEffort: 'high',
           ),
         ]
-        ..obligationsResult = [obligation];
+        ..obligationsResult = [selectedObligation];
       final store = DashboardStore(api: api, stream: FakeStream());
       await store.init();
       addTearDown(store.dispose);
@@ -105,7 +121,11 @@ void main() {
               key: key,
               child: SingleChildScrollView(
                 padding: const EdgeInsets.all(24),
-                child: _MockSheet(store: store, obligation: obligation),
+                child: _MockSheet(
+                  store: store,
+                  queuedObligation: queuedObligation,
+                  selectedObligation: selectedObligation,
+                ),
               ),
             ),
           ),
@@ -126,10 +146,15 @@ void main() {
 // ── The mock sheet ───────────────────────────────────────────────────────────
 
 class _MockSheet extends StatelessWidget {
-  const _MockSheet({required this.store, required this.obligation});
+  const _MockSheet({
+    required this.store,
+    required this.queuedObligation,
+    required this.selectedObligation,
+  });
 
   final DashboardStore store;
-  final ObligationDto obligation;
+  final ObligationDto queuedObligation;
+  final ObligationDto selectedObligation;
 
   @override
   Widget build(BuildContext context) {
@@ -138,17 +163,20 @@ class _MockSheet extends StatelessWidget {
       children: [
         const _Banner(),
         const SizedBox(height: 16),
-        _IdentityRibbon(obligation: obligation),
+        _IdentityRibbon(obligation: selectedObligation),
         const SizedBox(height: 16),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
-              child: _QueuedPanel(store: store, obligation: obligation),
+              child: _QueuedPanel(store: store, obligation: queuedObligation),
             ),
             const SizedBox(width: 16),
             Expanded(
-              child: _SelectedPanel(store: store, obligation: obligation),
+              child: _SelectedPanel(
+                store: store,
+                obligation: selectedObligation,
+              ),
             ),
           ],
         ),
@@ -641,13 +669,14 @@ class _RecentActivityPanel extends StatelessWidget {
       step: '3',
       title: 'RECENT ACTIVITY — replaces “Recent Yields”',
       subtitle:
-          'One row per settled run (or per genuine wait). Outcome pills come '
-          'from the run record — returned / failed / interrupted / waiting — '
-          'not from a yield note. Columns: HANDLED (inbox outcomes) vs '
-          'OBLIGATION CHANGES (actual tree movement) vs GOAL.',
+          'Run-record outcomes are separate from dependency waits and remote '
+          'contact observations. Only an observed CLI return/failure gets a '
+          'provider-result pill; a lost remote channel leaves that outcome unknown.',
       tag: _proposedTag,
       child: Column(
         children: [
+          const _ActivitySectionLabel('RUN-RECORD OUTCOMES'),
+          const SizedBox(height: 4),
           _RunOutcomeRow(
             pill: _OutcomePill.returnedOk(),
             startLabel: '14:07:03',
@@ -680,7 +709,7 @@ class _RecentActivityPanel extends StatelessWidget {
             ],
             goalState: _GoalState.notCompleted,
             drillThrough: 'run · selected notification · bounded output',
-            errorTail: 'provider CLI failed: coordinator unavailable',
+            errorTail: 'observed provider CLI failure · exit 1',
             recovery:
                 'retry 2/2 exhausted for this work → NEEDS ATTENTION; explicit action required',
           ),
@@ -697,6 +726,11 @@ class _RecentActivityPanel extends StatelessWidget {
             drillThrough: 'events · work tree',
             recovery: '1 selected item left unhandled → re-queued for next run',
           ),
+          const Divider(height: 1, color: MeshColors.border),
+          const _ActivitySectionLabel(
+            'NON-RUN CONTEXT — never a provider result',
+          ),
+          const _RemoteContactObservationRow(),
           const Divider(height: 1, color: MeshColors.border),
           const _DependencyWaitRow(),
         ],
@@ -727,10 +761,14 @@ class _OutcomePill extends StatelessWidget {
   final String label;
   final Color color;
 
-  factory _OutcomePill.returnedOk() =>
-      const _OutcomePill._('RETURNED · ok', MeshColors.statusActive);
-  factory _OutcomePill.failed() =>
-      const _OutcomePill._('FAILED · exit 1', MeshColors.statusHalted);
+  factory _OutcomePill.returnedOk() => const _OutcomePill._(
+    'RETURNED · observed CLI ok',
+    MeshColors.statusActive,
+  );
+  factory _OutcomePill.failed() => const _OutcomePill._(
+    'FAILED · observed CLI exit 1',
+    MeshColors.statusHalted,
+  );
   factory _OutcomePill.interrupted() =>
       const _OutcomePill._('INTERRUPTED', MeshColors.statusIdle);
 
@@ -932,6 +970,28 @@ class _RunOutcomeRow extends StatelessWidget {
   }
 }
 
+class _ActivitySectionLabel extends StatelessWidget {
+  const _ActivitySectionLabel(this.label);
+  final String label;
+
+  @override
+  Widget build(BuildContext context) => Align(
+    alignment: Alignment.centerLeft,
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(10, 9, 10, 5),
+      child: Text(
+        label,
+        style: kMonoStyle.copyWith(
+          color: MeshColors.textMuted,
+          fontSize: 9.5,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
+      ),
+    ),
+  );
+}
+
 class _OutcomeColumn extends StatelessWidget {
   const _OutcomeColumn({
     required this.header,
@@ -989,8 +1049,60 @@ class _OutcomeColumn extends StatelessWidget {
   }
 }
 
-/// Delegation and dependency waits remain visible as first-class rows — the
-/// point is that a wait is NOT a run and gets no fake run outcome.
+/// A contact-loss observation stays outside the run-record outcomes. It says
+/// only what the leader observed; it never claims the remote provider died.
+class _RemoteContactObservationRow extends StatelessWidget {
+  const _RemoteContactObservationRow();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 168,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _OutcomePill._(
+                  'CONTACT LOST · transport',
+                  MeshColors.statusIdle,
+                ),
+                SizedBox(height: 5),
+                Text(
+                  '14:13:22',
+                  style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(width: 12),
+          SizedBox(
+            width: 300,
+            child: Text(
+              'Remote follower contact lost',
+              style: TextStyle(color: MeshColors.textPrimary, fontSize: 12),
+            ),
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              'Provider result unknown — contact loss alone is not proof of a '
+              'provider CLI failure. Existing leader-side terminal accounting '
+              'is shown only by its own run record; #656 assessment is held.',
+              style: TextStyle(color: MeshColors.textSecondary, fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Delegation and dependency waits remain visible as a separately labelled
+/// state — a wait is NOT a run record and gets no fake run outcome.
 class _DependencyWaitRow extends StatelessWidget {
   const _DependencyWaitRow();
 
@@ -1007,7 +1119,7 @@ class _DependencyWaitRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 _OutcomePill._(
-                  'WAITING · dependency',
+                  'WAITING · dependency state',
                   MeshColors.statusRetired,
                 ),
                 SizedBox(height: 5),
@@ -1029,8 +1141,8 @@ class _DependencyWaitRow extends StatelessWidget {
           const SizedBox(width: 12),
           const Expanded(
             child: Text(
-              'No run is active — the actor waits on a peer obligation. Shown '
-              'so a dependency never masquerades as progress or as a yield.',
+              'No run record is active — the actor waits on a peer obligation. '
+              'Shown separately so a dependency never masquerades as a run result.',
               style: TextStyle(color: MeshColors.textSecondary, fontSize: 11),
             ),
           ),
