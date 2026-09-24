@@ -4384,6 +4384,9 @@ export class ActorMesh {
     }
 
     const appliedModelConfig = verified.modelConfig ?? newModelConfig;
+    // Publish before journalling. The durable `actor_model_set` event below is
+    // the record that this pool reached the actor, so a publication that threw
+    // must not leave that claim behind.
     this.onModelSet?.(id, appliedModelConfig, verified);
 
     this.recordEvent({
