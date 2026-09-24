@@ -1672,9 +1672,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               legacyQuotaStore.advancePendingController({ maxIntervalSeconds }, providerName);
               applyLegacyThrottleStatus(providerName);
             } catch (err) {
-              console.warn(
-                `[quota-throttle] provider=${providerName} legacy compare tick failed: ${err instanceof Error ? err.message : String(err)}`
-              );
+              log.warn("quota_throttle_legacy_compare_failed", {
+                provider: providerName,
+                err,
+              });
             }
           })
         );
