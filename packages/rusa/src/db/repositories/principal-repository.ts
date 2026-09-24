@@ -206,6 +206,72 @@ export class PrincipalRepository {
     })();
   }
 
+  /**
+   * Atomically confirm the identity of an explicitly provisioned unbound user.
+   *
+   * The maintenance migration is the production path that creates an unbound
+   * row; dashboard sign-in never creates one. Looking up the admission email
+   * and writing the external identity in the same transaction therefore lets a
+   * verified login confirm that prior provisioning without making email a
+   * general identity lookup or redirecting an existing principal.
+   *
+   * Returns undefined when no user was provisioned for the email, so a normal
+   * first sign-in can create its own bound user. A row that was concurrently
+   * claimed by this same identity is returned idempotently; every other bound,
+   * disabled, or identity-conflict state is refused without a partial write.
+   */
+  claimUnboundUserByEmail(
+    email: string,
+    identity: ExternalIdentity,
+    authenticatedAt: string
+  ): UserPrincipal | undefined {
+    const normalizedEmail = normalizeEmail(email);
+    return this.db.transaction(() => {
+      const user = this.findUserByEmail(normalizedEmail);
+      if (!user) return undefined;
+      // Let the resolver apply the same disabled-user refusal as an already
+      // bound identity. Nothing has been written, and this must not become an
+      // account-linking hint to an otherwise unauthorized caller.
+      if (user.disabledAt) return user;
+      if (user.identity) {
+        if (
+          user.identity.issuer === identity.issuer &&
+          user.identity.subject === identity.subject
+        ) {
+          return user;
+        }
+        throw new Error(
+          `PrincipalRepository: provisioned user '${user.id}' is already bound to another external identity`
+        );
+      }
+
+      this.assertIdentityAvailable(identity);
+      const result = this.db
+        .prepare(
+          `UPDATE users
+           SET firebase_issuer = ?, firebase_subject = ?, last_authenticated_at = ?
+           WHERE principal_id = ? AND email = ?
+             AND firebase_issuer IS NULL AND firebase_subject IS NULL`
+        )
+        .run(identity.issuer, identity.subject, authenticatedAt, user.id, normalizedEmail);
+      if (result.changes === 1) return this.requireUser(user.id);
+
+      // A second request may have committed the identical claim between this
+      // transaction's read and write. It is safe to return only that exact
+      // durable identity; any other replacement remains a conflict.
+      const current = this.requireUser(user.id);
+      if (
+        current.identity?.issuer === identity.issuer &&
+        current.identity.subject === identity.subject
+      ) {
+        return current;
+      }
+      throw new Error(
+        `PrincipalRepository: provisioned user '${user.id}' could not be claimed by this external identity`
+      );
+    })();
+  }
+
   /** Update admission metadata. The principal id and root are untouched. */
   updateEmail(principalId: string, email: string): UserPrincipal {
     return this.db.transaction(() => {

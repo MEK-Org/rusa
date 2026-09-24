@@ -6,6 +6,18 @@ import {
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 
+/** Safe response text for an admitted, verified account that cannot claim its
+ * explicitly provisioned principal. It intentionally names no email, user id,
+ * or competing external identity. */
+export const DASHBOARD_IDENTITY_CLAIM_ERROR = "Account setup needs administrator action";
+
+export class DashboardIdentityClaimError extends Error {
+  constructor(cause?: unknown) {
+    super(DASHBOARD_IDENTITY_CLAIM_ERROR, { cause });
+    this.name = "DashboardIdentityClaimError";
+  }
+}
+
 /** Called only after Firebase verification and the configured admission check.
  * Resolves identity, not permissions: this slice does not assign roots or migrate attribution. */
 export class DashboardIdentityResolver {
@@ -31,10 +43,13 @@ export class DashboardIdentityResolver {
     let user = repo.findUserByExternalIdentity(identity);
     if (!user) {
       try {
-        user = repo.createUser({ identity, email, createdAt: new Date().toISOString() });
+        user = repo.claimUnboundUserByEmail(email, identity, new Date().toISOString());
+        if (!user) user = repo.createUser({ identity, email, createdAt: new Date().toISOString() });
       } catch (error) {
         // Another serving process may have inserted this same verified identity.
-        // Never fall back to email or bind an existing pending/foreign identity implicitly.
+        // Resolve only that durable key after a race. The repository's email
+        // claim is the sole bounded exception for an explicitly provisioned
+        // unbound user; it never falls back to a pending or foreign identity.
         user = repo.findUserByExternalIdentity(identity);
         if (!user) throw this.conflict(error, email);
       }
@@ -54,7 +69,7 @@ export class DashboardIdentityResolver {
     this.repository().recordAuthentication(user.id, at);
   }
 
-  /** A verified identity whose email another row already holds fails closed as a bare 401.
+  /** A verified identity whose email another row already holds fails closed.
    * Without this record the operator sees a permanent sign-in loop and nothing else; the
    * address itself stays out of the log, so the row that holds it is named by id. */
   private conflict(error: unknown, email: string): unknown {
@@ -64,6 +79,6 @@ export class DashboardIdentityResolver {
       holderId: holder.id,
       holderBound: holder.identity !== undefined,
     });
-    return new Error("Verified email is already registered to another user", { cause: error });
+    return new DashboardIdentityClaimError(error);
   }
 }
