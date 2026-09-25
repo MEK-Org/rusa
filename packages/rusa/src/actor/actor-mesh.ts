@@ -1806,12 +1806,23 @@ export class ActorMesh {
     // repository. An isolated embedder without it cannot prove that a
     // buffered item is still live and responsive, so it must not deliver a
     // potentially stale responsive wake.
-    const getObligation = this.obligations?.get;
-    if (!getObligation) return;
+    const obligationPort = this.obligations;
+    if (!obligationPort?.get) return;
 
     const entries: InboxAppendInput[] = [];
     for (const obligation of pending.values()) {
-      const live = getObligation(obligation.id);
+      let live: Obligation | null;
+      try {
+        // Call through the port so class-backed implementations retain their
+        // receiver. A read failure fails this entry closed but must not abort
+        // the rest of finishInboxRun (notably staged model application).
+        live = obligationPort.get(obligation.id);
+      } catch (err) {
+        this.log(
+          `deferred responsive-ready read for ${obligation.id} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
       if (
         !live ||
         this.resolveThreadId(live.ownerId) !== actorId ||

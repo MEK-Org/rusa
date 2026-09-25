@@ -1942,7 +1942,7 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
+  it("defers self-caused responsive ready attention to the run end (#632)", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
     let worker = "";
@@ -1958,16 +1958,23 @@ describe("ActorMesh", () => {
       }
       return { success: true, exitCode: 0, output: "follow-up" };
     });
-    const obligations: MeshObligationPort = {
-      findLiveByExternalRef: () => null,
-      get: (id: string) =>
-        ({
+    class ClassBackedObligations implements MeshObligationPort {
+      findLiveByExternalRef() {
+        return null;
+      }
+
+      get(id: string) {
+        return {
           id,
-          ownerId: worker,
+          ownerId: this.ownerId(),
           status: "ready",
           effectiveResponsive: true,
-        }) as unknown as Obligation,
-    };
+        } as unknown as Obligation;
+      }
+
+      constructor(private readonly ownerId: () => string) {}
+    }
+    const obligations = new ClassBackedObligations(() => worker);
     const { mesh, fake, tick } = setup({
       inboxStore,
       events: (event) => events.push(event),
@@ -1995,7 +2002,7 @@ describe("ActorMesh", () => {
         true
       )
     ).toBe(true);
-    await Promise.resolve(); // flush the durable-append drain after the join wake
+    await Promise.resolve(); // flush the durable-append drain after the current run
     expect(firstSignal?.aborted).toBe(false);
     expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
     expect(fake(worker).calls).toHaveLength(1);
