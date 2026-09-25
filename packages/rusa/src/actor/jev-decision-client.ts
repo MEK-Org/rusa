@@ -125,13 +125,16 @@ export class HttpJevDecisionClient implements JevDecisionClient {
   }
 }
 
+/**
+ * The documented Choice answer is a distribution over the criteria. One that is
+ * not (a value outside [0, 1], or a total off 1 by more than rounding) says the
+ * answer is malformed, so it is not trusted to carry a verdict.
+ */
 function hasChoiceProbabilities(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const probabilities = value as Record<string, unknown>;
+  const { interrupt, queue } = value as Record<string, unknown>;
+  const isProbability = (p: unknown): p is number => typeof p === "number" && p >= 0 && p <= 1;
   return (
-    typeof probabilities.interrupt === "number" &&
-    typeof probabilities.queue === "number" &&
-    Number.isFinite(probabilities.interrupt) &&
-    Number.isFinite(probabilities.queue)
+    isProbability(interrupt) && isProbability(queue) && Math.abs(interrupt + queue - 1) <= 0.01
   );
 }

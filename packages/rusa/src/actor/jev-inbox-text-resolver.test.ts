@@ -74,6 +74,21 @@ describe("createJevInboxTextResolver", () => {
     expect(source.issueClient.getIssue).not.toHaveBeenCalled();
   });
 
+  it("does not stand the issue body in for a comment event with no usable id", async () => {
+    const source = deps(
+      entry({
+        source: "github:owner/repo/issues/7",
+        payload: { type: "issue_comment.created", commentId: "44" },
+      })
+    );
+
+    await expect(createJevInboxTextResolver(source)("actor", "entry")).resolves.toMatchObject({
+      text: null,
+    });
+    expect(source.issueClient.getIssue).not.toHaveBeenCalled();
+    expect(source.issueClient.listIssueComments).not.toHaveBeenCalled();
+  });
+
   it("reads obligation attention from its inline intent", async () => {
     const source = deps(
       entry({

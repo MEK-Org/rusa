@@ -40,7 +40,8 @@ it posts `https://api.typesafe.ai/v1/systemone` with a Bearer credential, model
 `jev-latest`, the resolved incoming and candidate entries (id, inbox source,
 payload type, text) as `state`, and one
 `choice` question named `interruption`. The choices are `interrupt` and
-`queue`; it accepts only a `choice` answer with those probabilities and a
+`queue`; it accepts only a `choice` answer whose probabilities for those two
+form a distribution (each in [0, 1], summing to 1 within rounding) and a
 numeric confidence.
 
 The shadow audit retains stable inbox IDs, candidate source, verdict/confidence,
@@ -52,7 +53,9 @@ on the arriving message with `✅` (would interrupt) or `❌` (would queue).
 
 If the credential file is absent, invalid, unreadable, or empty, the policy is
 unavailable. A candidate whose text cannot be read is still sent, by type, with
-null text. If the arriving item's own text cannot be read, the observation is
+null text. A GitHub comment or review event without a usable id counts as
+unreadable rather than falling back to the issue or PR body. If the arriving
+item's own text cannot be read, the observation is
 recorded as `input_unavailable` and nothing is sent. If transport, response
 parsing, or the timeout fails, that observation safely queues and posts no
 prediction reaction. No

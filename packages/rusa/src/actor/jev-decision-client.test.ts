@@ -119,6 +119,72 @@ describe("HttpJevDecisionClient", () => {
     ).rejects.toThrow("invalid interruption answer");
   });
 
+  it("rejects a Choice answer whose probabilities are not a distribution", async () => {
+    const client = new HttpJevDecisionClient(
+      "synthetic-key",
+      async (_actorId, id) => ({ id, source: "mesh:root", type: "mesh.message", text: "text" }),
+      async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          answers: {
+            interruption: {
+              type: "choice",
+              choice: "interrupt",
+              probabilities: { interrupt: -1, queue: 2 },
+              confidence: 0.99,
+            },
+          },
+        }),
+      })
+    );
+
+    await expect(
+      client.decide({
+        actorId: "worker",
+        question: "question",
+        input: {
+          incomingEntryId: "incoming",
+          candidateEntryIds: ["candidate"],
+          candidateSource: "selected",
+        },
+      })
+    ).rejects.toThrow("invalid interruption answer");
+  });
+
+  it("sends once and fails on a throttled response, carrying no request text", async () => {
+    const fetch = vi.fn<JevFetch>(async () => ({
+      ok: false,
+      status: 429,
+      json: async () => ({}),
+    }));
+    const client = new HttpJevDecisionClient(
+      "synthetic-key",
+      async (_actorId, id) => ({
+        id,
+        source: "mesh:root",
+        type: "mesh.message",
+        text: "real text",
+      }),
+      fetch
+    );
+
+    const failure = await client
+      .decide({
+        actorId: "worker",
+        question: "question",
+        input: {
+          incomingEntryId: "incoming",
+          candidateEntryIds: ["candidate"],
+          candidateSource: "selected",
+        },
+      })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("JEV decision service returned HTTP 429");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("fails as input-unavailable, without a request, when the arrival has no text", async () => {
     const fetch = vi.fn<JevFetch>();
     const client = new HttpJevDecisionClient(

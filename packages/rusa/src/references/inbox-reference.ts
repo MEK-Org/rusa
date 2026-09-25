@@ -46,15 +46,24 @@ export function gchatInboxMessageReference(
  * The reference holding the text an inbox entry is about, or undefined when the
  * entry names none. Inbox rows store pointers rather than bodies, so this is
  * the one mapping from a row to something {@link resolveReference} can read:
- * a mesh message id, the exact GitHub comment or review (or else the issue/PR
- * itself), the Chat message in its source space, or a Slack message.
+ * a mesh message id, the exact GitHub comment or review (or, for other GitHub
+ * events, the issue/PR itself), the Chat message in its source space, or a Slack message.
  */
 export function inboxEntryReference(
   entry: Pick<InboxEntry, "source" | "payload">
 ): string | undefined {
   const { source, payload } = entry;
   if (typeof payload.messageId === "string") return `mesh:messages/${payload.messageId}`;
-  if (source.startsWith("github:")) return githubInboxEventReference(source, payload) ?? source;
+  if (source.startsWith("github:")) {
+    // A comment or review event is about its own text. Without a usable id the
+    // issue/PR body would be different text, so such an event names nothing.
+    return (
+      githubInboxEventReference(source, payload) ??
+      (/^(issue_comment|pull_request_review_comment|pull_request_review)\./.test(payload.type)
+        ? undefined
+        : source)
+    );
+  }
   if (payload.type === "gchat.message") return gchatInboxMessageReference(source, payload);
   if (payload.type === "slack.message" && typeof payload.messageRef === "string") {
     return payload.messageRef;
