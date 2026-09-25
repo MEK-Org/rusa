@@ -4727,7 +4727,7 @@ export class ActorMesh {
     while (cursor && !seen.has(cursor)) {
       if (cursor === ancestorId) return true;
       seen.add(cursor);
-      cursor = this.actors.get(cursor)?.parentId ?? null;
+      cursor = this.actors.parentOf(cursor) ?? null;
     }
     return false;
   }
