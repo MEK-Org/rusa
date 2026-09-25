@@ -6,10 +6,12 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 5;
+export const INSTANCE_PROTOCOL_VERSION = 6;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
+/** The leader replaced a queued actor's pool; re-run the same admission against it. */
+export const COORDINATOR_MODEL_CONFIG_CHANGED_ERROR = "Coordinator model configuration changed";
 export interface Bootstrap {
   id: string;
   cwd: string;
@@ -81,6 +83,8 @@ export type Request =
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
+  /** Replace the follower Actor's next-run pool without resetting its runtime. */
+  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[] }
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }

@@ -1033,6 +1033,65 @@ describe("monolithic follower instance", () => {
     }
   });
 
+  it("re-quotes a follower admission with a pin applied while it waits in the provider gate", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 1_000);
+    const h = setup({ pacer });
+    const id = h.spawn("Re-quote a queued follower admission");
+
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+    h.mesh.setActorModel(
+      id,
+      [{ provider: "instance-fixture", model: "model-pinned-queued" }],
+      "root"
+    );
+
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "runStart")
+    );
+    const started = h.events.find(
+      (event) => event.actorId === id && event.event.type === "runStart"
+    )?.event;
+    expect(started?.type === "runStart" && started.selected).toMatchObject({
+      model: "model-pinned-queued",
+    });
+  });
+
+  it("re-quotes a retained follower admission after a model pin during a lease flap", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 1_000);
+    const h = setup({ pacer });
+    const id = h.spawn("Re-quote retained follower admission");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+    const queued = h.events.find(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )?.event;
+
+    h.remote.close();
+    await h.runtime(id).exited;
+    h.mesh.setActorModel(
+      id,
+      [{ provider: "instance-fixture", model: "model-pinned-retained" }],
+      "root"
+    );
+
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "runStart")
+    );
+    const started = h.events.find(
+      (event) => event.actorId === id && event.event.type === "runStart"
+    )?.event;
+    expect(started?.type === "runStart" && started.selected).toMatchObject({
+      model: "model-pinned-retained",
+    });
+    expect(started?.type === "runStart" && started.runId).toBe(
+      queued?.type === "queued" && queued.runId
+    );
+    expect(h.meshEvents.some((event) => event.kind === "run_abandoned")).toBe(false);
+  });
+
   it("keeps genuine close() permanently terminated and never re-dispatches", async () => {
     const h = setup();
     const id = h.spawn("Charter Negative");

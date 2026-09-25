@@ -1,12 +1,16 @@
 import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
-import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  RunStartStaleProviderError,
+} from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
 import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_ERROR,
   type LeaderCommand,
   type ProviderFactory,
@@ -164,6 +168,15 @@ export function createActorRuntime(
           } catch (err) {
             if (
               err instanceof Error &&
+              err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
+            ) {
+              // The leader cancelled a stale reservation after changing this
+              // Actor's pool. Actor's retry loop re-runs the same opportunity
+              // against the pool set by the preceding modelConfig command.
+              throw new RunStartStaleProviderError();
+            }
+            if (
+              err instanceof Error &&
               (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
                 err.message.includes("Coordinator disconnected"))
             ) {
@@ -265,6 +278,9 @@ export function createActorRuntime(
           send({ type: "fatal", error: String(error) });
           stop();
         });
+        break;
+      case "modelConfig":
+        actor?.setModelConfig(message.modelConfig as ProviderModelConfig[]);
         break;
       case "reply": {
         const call = pending.get(message.requestId);

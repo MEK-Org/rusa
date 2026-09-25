@@ -11,6 +11,7 @@ import type { ActorChannel } from "./actor-channel.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
   type LeaderCommand,
   type RunSnapshot,
@@ -56,6 +57,10 @@ export class ActorHandle implements MeshActor {
       release: () => void;
       /** Priority the leader actually admitted, which a promotion can raise after the request. */
       admission: { responsive: boolean };
+      /** Pool revision quoted when this reservation entered the leader gate. */
+      modelConfigGeneration: number;
+      /** The pool changed after this reservation quoted; retry it under the new pool. */
+      modelConfigStale: boolean;
     }
   >();
   private startupTimer?: ReturnType<typeof setTimeout>;
@@ -86,6 +91,8 @@ export class ActorHandle implements MeshActor {
   private settleState: (() => void) | undefined;
   /** Promotion requested between the follower's queued report and its admission request. */
   private pendingQueuedPromotion = false;
+  /** Incremented for each next-run pool replacement so stale gates can re-quote. */
+  private modelConfigGeneration = 0;
   private preemptSequence = 0;
   /** The one unanswered preempt; later responsive items coalesce behind its answer. */
   private outstandingPreempt: number | undefined;
@@ -267,7 +274,21 @@ export class ActorHandle implements MeshActor {
   }
 
   setModelConfig(modelConfig: ProviderModelConfig[]): void {
+    if (JSON.stringify(this.opts.bootstrap.modelConfig) === JSON.stringify(modelConfig)) return;
     this.opts.bootstrap.modelConfig = [...modelConfig];
+    this.modelConfigGeneration++;
+    this.send({ type: "modelConfig", modelConfig: [...modelConfig] });
+    // Keep remote placement at the same queued-start boundary as a local Actor:
+    // update the follower's pool first, then make each stale reservation retry
+    // the same opportunity through its current provider candidates. A retained
+    // reservation stays untouched until attachHost can perform that re-quote.
+    if (this.closed || !this.channel.connected) return;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started || gate.modelConfigGeneration === this.modelConfigGeneration)
+        continue;
+      gate.modelConfigStale = true;
+      gate.handle.cancel?.();
+    }
   }
 
   close(): void {
@@ -335,7 +356,17 @@ export class ActorHandle implements MeshActor {
   /** The follower reclaimed its ticket; the retained gate still owes the reply. */
   private claimRetainedAdmission(requestId: number): boolean {
     if (this.retainedAdmission?.requestId !== requestId) return false;
-    if (!this.gates.has(requestId)) return false;
+    const gate = this.gates.get(requestId);
+    if (!gate) return false;
+    if (gate.modelConfigGeneration !== this.modelConfigGeneration) {
+      // The follower has the replacement pool from attachHost's init, while
+      // this ticket was quoted under the old one. Reject it as stale so the
+      // follower's Actor retries the same queued opportunity under that pool.
+      this.retainedAdmission = undefined;
+      gate.modelConfigStale = true;
+      gate.handle.cancel?.();
+      return true;
+    }
     this.retainedAdmission = undefined;
     this.log.info("remote_admission_resumed", {
       actorId: this.id,
@@ -789,6 +820,7 @@ export class ActorHandle implements MeshActor {
                     ? this.opts.bootstrap.modelConfig
                     : request.candidates
                 ) as RawProviderModelConfig[];
+                const modelConfigGeneration = this.modelConfigGeneration;
                 const handle = ctx.gate(
                   async (selected) => {
                     // Provider pacing can delay this callback after the first
@@ -806,6 +838,18 @@ export class ActorHandle implements MeshActor {
                       return;
                     }
                     if (this.closed) throw new Error("Actor closed before admission");
+                    const gate = this.gates.get(requestId);
+                    if (
+                      gate?.modelConfigStale ||
+                      modelConfigGeneration !== this.modelConfigGeneration
+                    ) {
+                      this.send({
+                        type: "reply",
+                        requestId,
+                        error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                      });
+                      return;
+                    }
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
                     this.send({
@@ -822,9 +866,24 @@ export class ActorHandle implements MeshActor {
                   candidates,
                   admission.responsive
                 );
-                this.gates.set(requestId, { handle, release, admission });
+                this.gates.set(requestId, {
+                  handle,
+                  release,
+                  admission,
+                  modelConfigGeneration,
+                  modelConfigStale: false,
+                });
                 void handle.result.catch((error: Error) => {
+                  const gate = this.gates.get(requestId);
                   this.gates.delete(requestId);
+                  if (gate?.modelConfigStale) {
+                    this.send({
+                      type: "reply",
+                      requestId,
+                      error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                    });
+                    return;
+                  }
                   this.send({ type: "reply", requestId, error: error.message });
                   // A retained ticket that loses its place (the leader gave up, or
                   // pacing released it into a dead channel) ends the run it held:
