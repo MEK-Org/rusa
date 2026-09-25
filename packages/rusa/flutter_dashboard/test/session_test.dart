@@ -368,6 +368,27 @@ void main() {
     },
   );
 
+  test('an account-link conflict gives the dashboard a safe actionable error', () async {
+    final auth = _Auth(null);
+    final session = FirebaseDashboardSession(
+      auth,
+      client: _Client([http.Response('{}', 200), http.Response('{}', 409)]),
+      csrfToken: () => 'csrf-token',
+    );
+    session.start();
+
+    await expectLater(
+      session.signIn(),
+      throwsA(isA<DashboardAccountSetupError>()),
+    );
+    expect(DashboardAccountSetupError.message, contains('administrator'));
+    expect(auth.signOutCount, 1);
+    expect(session.status, DashboardSessionStatus.signedOut);
+
+    session.dispose();
+    await auth.close();
+  });
+
   test(
     'sign-in fails closed when the browser did not retain the server cookie',
     () async {

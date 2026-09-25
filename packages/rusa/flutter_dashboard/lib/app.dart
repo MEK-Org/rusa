@@ -208,6 +208,10 @@ class _SignInPageState extends State<SignInPage> {
     });
     try {
       await widget.session.signIn();
+    } on DashboardAccountSetupError {
+      if (mounted) {
+        setState(() => _error = DashboardAccountSetupError.message);
+      }
     } catch (_) {
       if (mounted) {
         setState(
