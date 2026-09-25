@@ -4655,7 +4655,7 @@ export class ActorMesh {
     for (
       let cursor: string | null | undefined = newParentId;
       cursor != null && !seen.has(cursor);
-      cursor = this.actors.parentOf(cursor)
+      cursor = this.actors.get(cursor)?.parentId
     ) {
       if (cursor === id) {
         throw new Error(`Cannot reparent ${id} under its own descendant ${newParentId} (cycle)`);
