@@ -99,7 +99,6 @@ describe("ResourceScope", () => {
     await scope.close();
 
     expect(dispose).toHaveBeenCalledOnce();
-    expect(scope.closed).toBe(true);
   });
 
   it("releases only what a partial acquisition took", async () => {
@@ -121,14 +120,14 @@ describe("ResourceScope", () => {
     expect(released).toEqual(["mcp server", "database"]);
   });
 
-  it("releases a resource acquired after close has begun immediately", async () => {
+  it("throws when a resource is acquired after close has begun", async () => {
     const scope = new ResourceScope();
     await scope.close();
     const dispose = vi.fn();
 
-    scope.acquire("late timer", dispose);
-    await Promise.resolve();
-
-    expect(dispose).toHaveBeenCalledOnce();
+    expect(() => scope.acquire("late timer", dispose)).toThrow(
+      "Cannot acquire resource 'late timer' on a ResourceScope that is already closing"
+    );
+    expect(dispose).not.toHaveBeenCalled();
   });
 });

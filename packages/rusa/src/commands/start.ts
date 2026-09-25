@@ -632,7 +632,9 @@ export interface RunStartE2EHandles {
   /** Trigger the production host disk sensor immediately. */
   emitSystemDiskCheck: () => Promise<void>;
   /** Trigger the same graceful shutdown a SIGTERM would. */
-  shutdown: () => Promise<void>;
+  shutdown: (reason?: "deploy" | null) => Promise<void>;
+  /** Factory for host-maintenance update tool deps, exposing the shutdown exit callback. */
+  updateToolDepsFor?: (selfId: string) => UpdateToolDeps;
 }
 
 /**
@@ -930,6 +932,7 @@ async function composeStart(
   resources: ResourceScope
 ): Promise<void> {
   const mcHome = resolveHome();
+  let shutdown: (reason?: "deploy" | null) => Promise<void>;
 
   // The service logger. `rusa start` is a service, so its diagnostics are JSON
   // records on stdout (journald's stream) rather than prose: a field says which
@@ -1326,16 +1329,15 @@ async function composeStart(
       preflight: (entry) => resolveProvider(config, entry.provider, entry.model, entry.effort),
     });
   } catch (err) {
-    if (!(err instanceof RootModelConfigStartupError)) throw err;
-    log.error("root_model_config_invalid", {
-      error: err.name,
-      rootId,
-      reason: err.message,
-      action: err.action,
-    });
-    await resources.close();
-    process.exit(1);
-    return;
+    if (err instanceof RootModelConfigStartupError) {
+      log.error("root_model_config_invalid", {
+        error: err.name,
+        rootId,
+        reason: err.message,
+        action: err.action,
+      });
+    }
+    throw err;
   }
   const rootModelConfigDescription = describeModelConfigPool(rootBootModelConfig.modelConfig);
   log.info("root_model_config_resolved", {
@@ -1976,11 +1978,10 @@ async function composeStart(
             "utf8"
           );
         },
-        // A successful self-update is a mesh shutdown even though it exits from
-        // inside the update tool instead of the SIGTERM shutdown path.
-        exit: (code) => {
-          e2eInstance.stopForMeshShutdown();
-          process.exit(code);
+        // A successful self-update is a committed mesh shutdown; route through
+        // shutdown("deploy") so all disposers are released in reverse order.
+        exit: (_code) => {
+          void shutdown("deploy");
         },
         log: (m) => console.log(m),
       },
@@ -3094,6 +3095,12 @@ async function composeStart(
     },
   });
   // Stops the root and any live workers; the actor repository is untouched.
+  // Ownership boundary: ResourceScope owns composition resources (servers,
+  // database, timers, sinks); ActorMesh owns in-flight actor run lifecycles.
+  // In-flight runs continue across mesh.shutdownAll(); if a late onEnd listener
+  // executes after database closure, ActorLifecycle.emit catches sync and async
+  // listener errors and reports them via reportListenerError, so late runs do
+  // not leave unhandled rejections.
   resources.acquire("actor mesh", () => mesh.shutdownAll());
   if (followerHub) {
     followerHub.onRegister((follower) => {
@@ -4187,8 +4194,9 @@ async function composeStart(
   }
 
   if (slackClient && config.slack && slackAppToken) {
+    let source: SlackSocketSource | undefined;
     try {
-      const source = new SlackSocketSource(
+      source = new SlackSocketSource(
         slackAppToken,
         (err) =>
           log.error("slack_event_failed", {
@@ -4211,9 +4219,10 @@ async function composeStart(
         });
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
       });
-      resources.acquire("slack source", () => source.close());
+      resources.acquire("slack source", () => source?.close());
       log.info("slack_socket_active");
     } catch (err) {
+      await source?.close().catch(() => {});
       log.error("slack_socket_start_failed", {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -4226,14 +4235,12 @@ async function composeStart(
   // retries rather than orphaning the instance. Once it succeeds, shutdown is
   // committed and every acquired resource is released, newest first, with
   // each failure contained and logged by the scope.
-  const shutdown = async (reason: "deploy" | null = null) => {
+  shutdown = async (reason: "deploy" | null = null) => {
     if (!running) return;
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
     await resources.close();
-    process.off("SIGINT", onShutdownSignal);
-    process.off("SIGTERM", onShutdownSignal);
     log.info("service_stopped", { reason });
     process.exit(getShutdownExitCode(reason));
   };
@@ -4246,13 +4253,13 @@ async function composeStart(
     );
   };
   // Installed before readiness is announced: until a listener exists, a
-  // signal takes its default action and kills the process unreleased. A
-  // committed shutdown removes them at its very end, so a repeated signal
-  // during release is absorbed; if boot fails first, the scope removes them.
+  // signal takes its default action and kills the process unreleased. Handlers
+  // are acquired late so their disposer runs early in resources.close(),
+  // unconditionally unregistering them; if a disposer hangs or a second signal
+  // arrives during release, the default process action acts as an exit escape hatch.
   process.on("SIGINT", onShutdownSignal);
   process.on("SIGTERM", onShutdownSignal);
   resources.acquire("shutdown signal handlers", () => {
-    if (!running) return;
     process.off("SIGINT", onShutdownSignal);
     process.off("SIGTERM", onShutdownSignal);
   });
@@ -4441,6 +4448,7 @@ async function composeStart(
     emitGitHubEvent: onEvent,
     emitSystemDiskCheck: () => diskAlert?.check() ?? Promise.resolve(),
     shutdown,
+    updateToolDepsFor,
   });
 
   // Keep the process alive until a signal triggers shutdown().

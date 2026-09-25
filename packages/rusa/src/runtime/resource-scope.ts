@@ -35,19 +35,15 @@ export class ResourceScope {
     this.onFailure = onFailure;
   }
 
-  get closed(): boolean {
-    return this.closing !== null;
-  }
-
   /**
-   * Register the disposer for a resource just acquired. A resource acquired
-   * after close has begun is released immediately instead of being dropped:
-   * there is no later close left to reach it.
+   * Register the disposer for a resource just acquired. Calling acquire after
+   * close has begun throws: late acquisition is unexpected and would race release.
    */
   acquire(resource: string, dispose: Disposer): void {
     if (this.closing) {
-      void this.attempt(resource, dispose);
-      return;
+      throw new Error(
+        `Cannot acquire resource '${resource}' on a ResourceScope that is already closing`
+      );
     }
     this.held.push({ resource, dispose });
   }

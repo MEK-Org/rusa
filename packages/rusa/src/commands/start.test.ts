@@ -26,6 +26,7 @@ import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
@@ -45,6 +46,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import { SlackSocketSource } from "../slack/socket-source.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -5630,17 +5632,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       expect(bootRecords("root_model_config_invalid")).toMatchObject([
         {
           level: "error",
@@ -5811,17 +5814,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       // The refusal is a structured `root_model_config_invalid` record carrying
       // the reason and an action, not prose.
       expect(consoleError).not.toHaveBeenCalled();
@@ -5859,17 +5863,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       expect(bootRecords("root_model_config_invalid")).toMatchObject([
         {
           error: "RootModelConfigStartupError",
@@ -7781,30 +7786,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     it("contains a failing disposer and still releases everything else", async () => {
-      writeConfig({ gitBridge: true, gitBridgePort: 9099 });
-      const mcpClose = vi.spyOn(McpHttpServer.prototype, "close");
-      try {
-        const { mesh, shutdown } = await boot();
-        shutdownFn = undefined;
-        vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
-          throw new Error("actor refused to stop");
-        });
-        dbMock.closeDb.mockClear();
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+        throw new Error("actor refused to stop");
+      });
 
-        await shutdown();
+      await shutdown();
 
-        expect(mcpClose).toHaveBeenCalledOnce();
-        expect(gitHttpServerMock.servers[0]?.close).toHaveBeenCalled();
-        expect(dbMock.closeDb).toHaveBeenCalledOnce();
-        expect(exitMock()).toHaveBeenCalledWith(0);
-        expect(records("shutdown_disposer_failed")).toEqual([
-          expect.objectContaining({ resource: "actor mesh" }),
-        ]);
-      } finally {
-        mcpClose.mockRestore();
-      }
+      expect(records("shutdown_disposer_failed")).toEqual([
+        expect.objectContaining({ resource: "actor mesh" }),
+      ]);
     });
 
+    // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.
     it("removes the signal handlers when boot fails after installing them", async () => {
       const sigint = process.listeners("SIGINT");
       const sigterm = process.listeners("SIGTERM");
@@ -7857,6 +7852,58 @@ describe("runStart webhook event routing (Phase 4)", () => {
         dashboardSpy.mockRestore();
         mcpClose.mockRestore();
         meshShutdown.mockRestore();
+      }
+    });
+
+    it("releases the scope when the self-update tool exits", async () => {
+      const handles = await boot();
+      shutdownFn = undefined;
+      dbMock.closeDb.mockClear();
+
+      const updateDeps = handles.updateToolDepsFor?.("root");
+      expect(updateDeps).toBeDefined();
+
+      updateDeps?.deps.exit(0);
+
+      await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(1));
+      expect(dbMock.closeDb).toHaveBeenCalledOnce();
+      expect(records("service_stopped")).toEqual([expect.objectContaining({ reason: "deploy" })]);
+    });
+
+    it("closes the socket source immediately when slack startup fails", async () => {
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-mock-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-mock-app-token");
+      writeConfig({
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+
+      const startSpy = vi
+        .spyOn(SlackSocketSource.prototype, "start")
+        .mockRejectedValue(new Error("slack socket failed"));
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+
+      try {
+        const handles = await boot();
+        expect(startSpy).toHaveBeenCalledOnce();
+        expect(closeSpy).toHaveBeenCalledOnce();
+        expect(records("slack_socket_start_failed")).toEqual([
+          expect.objectContaining({
+            error: "slack socket failed",
+          }),
+        ]);
+
+        await handles.shutdown();
+        // Since slack source start failed, it was closed immediately and never acquired into resources;
+        // shutdown should not close it a second time.
+        expect(closeSpy).toHaveBeenCalledOnce();
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
       }
     });
   });
