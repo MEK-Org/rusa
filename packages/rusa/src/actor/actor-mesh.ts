@@ -1,4 +1,11 @@
 import { randomUUID } from "node:crypto";
+import {
+  type ChatWakeMode,
+  type ChatWakeModeStore,
+  type ChatWakeModeView,
+  chatSpaceResource,
+  InMemoryChatWakeModeStore,
+} from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
@@ -694,6 +701,13 @@ export interface ActorMeshOptions {
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
+   * Durable per-space Google Chat wake modes (#692). Defaults to an in-memory
+   * store; the wiring supplies the SQLite-backed one. Only a space's current
+   * effective owner may read or change its mode — enforced here, never in the
+   * store.
+   */
+  chatWakeModes?: ChatWakeModeStore;
+  /**
    * The single external-event seam: the host-assembled EventManager, which
    * carries the one routing kernel as {@link EventManager.routing}. Mesh reads
    * its authority ladder from that manager rather than accepting a resolver
@@ -876,6 +890,7 @@ export class ActorMesh {
   private readonly experiments: ExperimentEnrollmentStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
+  private readonly chatWakeModes: ChatWakeModeStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
   /** Captured at selection so root enrollment changes never alter an active run. */
@@ -983,6 +998,7 @@ export class ActorMesh {
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
+    this.chatWakeModes = opts.chatWakeModes ?? new InMemoryChatWakeModeStore();
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
@@ -3108,6 +3124,70 @@ export class ActorMesh {
     const at = this.now();
     this.unsubscribeEventSource(resource, current.actorId, at);
     this.subscribeEventSource(resource, reclaimedBy, reclaimedBy);
+  }
+
+  /**
+   * The stored wake mode of a Google Chat space, or `undefined` when the space
+   * follows the built-in default (#692). Read by chat ingestion for every
+   * arriving message, so a change governs the next message; the host is the
+   * caller, so no ownership check applies here.
+   */
+  chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
+    return this.chatWakeModes.get(chatSpaceResource(space))?.mode;
+  }
+
+  /**
+   * Read a Google Chat space's wake mode as its current effective owner (#692).
+   * `mode: null` means no mode is stored and the built-in default applies.
+   */
+  getChatWakeMode(space: EventResource, callerId: string): ChatWakeModeView {
+    const resource = this.requireChatSpaceOwner(space, callerId, "read");
+    const setting = this.chatWakeModes.get(resource);
+    return setting
+      ? { resource, mode: setting.mode, setBy: setting.setBy, setAt: setting.setAt }
+      : { resource, mode: null };
+  }
+
+  /**
+   * Set (or, with `null`, clear back to the default) a Google Chat space's wake
+   * mode. Authority is the same effective ownership that governs delegating the
+   * space, so an actor can only change how a space it owns wakes it (#692).
+   * Records an audit event.
+   */
+  setChatWakeMode(
+    space: EventResource,
+    mode: ChatWakeMode | null,
+    callerId: string
+  ): ChatWakeModeView {
+    const resource = this.requireChatSpaceOwner(space, callerId, "change");
+    const setBy = this.resolveThreadId(callerId);
+    const setAt = this.now();
+    if (mode === null) {
+      this.chatWakeModes.clear(resource);
+    } else {
+      this.chatWakeModes.set({ resource, mode, setBy, setAt });
+    }
+    this.recordEvent({
+      kind: "chat_wake_mode_set",
+      actorId: setBy,
+      detail: resource,
+      payload: JSON.stringify({ mode }),
+    });
+    return mode === null ? { resource, mode: null } : { resource, mode, setBy, setAt };
+  }
+
+  private requireChatSpaceOwner(
+    space: EventResource,
+    callerId: string,
+    action: "read" | "change"
+  ): string {
+    const resource = chatSpaceResource(space);
+    if (this.effectiveOwnerOf(resource) !== this.resolveThreadId(callerId)) {
+      throw new Error(
+        `cannot ${action} the wake mode of ${resource}: caller is not its current effective owner`
+      );
+    }
+    return resource;
   }
 
   /**

@@ -134,6 +134,7 @@ import { GchatOAuth } from "../chat/gchat-oauth.js";
 import { PubsubChatSource } from "../chat/pubsub-source.js";
 import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
+import { chatMessageWakes } from "../chat/wake-mode.js";
 import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
@@ -2626,6 +2627,8 @@ async function composeStart(
     experimentEnrollments: getRepositories().experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
+    // Per-space Google Chat wake modes (#692), read by chat ingestion below.
+    chatWakeModes: getRepositories().chatWakeModes,
     // One seam: the manager carries the kernel built above, so mesh authority
     // and event delivery cannot diverge.
     eventManager,
@@ -4044,12 +4047,15 @@ async function composeStart(
   if (config.chat && chatClient) {
     const cc = chatClient;
     // The inbound handler is the same for the real puller and the e2e fake: a
-    // trigger (DM or @mention) persists a source-backed pointer and wakes the root.
+    // trigger persists a source-backed pointer and wakes the space's owner. What
+    // triggers is the space's wake mode (#692): `all` or `mentions` as its owner
+    // set it, else every message in a DM/two-person space and mentions elsewhere.
+    // The mode is read per message, so a change governs the next arrival.
     const onChat = async (msg: ChatMessage): Promise<void> => {
       if (config.chat?.excludedSpaces?.includes(msg.spaceName)) {
         return;
       }
-      const trigger = msg.isDirectMessage || msg.mentionsSelf;
+      const trigger = chatMessageWakes(msg, mesh.chatWakeModeFor(msg.spaceName));
       const who = msg.senderDisplayName ?? msg.senderName;
       console.log(`[chat] ${trigger ? "▶ trigger" : "·"} ${msg.spaceName} from ${who}`);
       if (!trigger) return;

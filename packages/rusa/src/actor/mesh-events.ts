@@ -178,6 +178,10 @@ export type MeshEventKind =
   // key, `payload` = { subscribedBy } on the add.
   | "event_source_subscriber_added"
   | "event_source_subscriber_removed"
+  // The effective owner of a Google Chat space set or cleared its wake mode
+  // (#692). `actorId` = the owner who wrote it, `detail` = the space resource,
+  // `payload` = { mode }, with `null` for a clear back to the default.
+  | "chat_wake_mode_set"
   | "stamp_invalid"
   // Host-plane `host-jobs` capability : a grantable systemd-run --user
   // runner for long host-side experiments. `actorId` = the submitting/owning

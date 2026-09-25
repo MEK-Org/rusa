@@ -3530,6 +3530,118 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries[0]?.seenAt).not.toBeNull();
   });
 
+  it("wakes each Google Chat space by its owner's wake mode, defaulting by space size (#692)", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const liveMesh = mesh;
+
+    const emit = (space: string, name: string, opts: { dm?: boolean; mention?: boolean } = {}) =>
+      chatSource.emit({
+        name: `${space}/messages/${name}`,
+        spaceName: space,
+        spaceType: opts.dm ? "DIRECT_MESSAGE" : "SPACE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text: "ordinary update",
+        mentionsSelf: opts.mention ?? false,
+        isDirectMessage: opts.dm ?? false,
+      });
+    const delivered = () =>
+      getRepositories()
+        .inbox.list("root", { status: "all", limit: 100 })
+        .entries.map((entry) => (entry.payload as { messageName?: string }).messageName)
+        .sort();
+
+    // Unset: a DM wakes on every message, a larger space only on a mention.
+    await emit("spaces/dm", "d1", { dm: true });
+    await emit("spaces/team", "t1");
+    await emit("spaces/team", "t2", { mention: true });
+    expect(delivered()).toEqual(["spaces/dm/messages/d1", "spaces/team/messages/t2"]);
+    expect(liveMesh.getChatWakeMode("gchat:spaces/team", "root")).toEqual({
+      resource: "gchat:spaces/team",
+      mode: null,
+    });
+
+    // Only the space's effective owner may change or read its mode.
+    const child = liveMesh.spawn({
+      charter: "not the chat owner",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    expect(() => liveMesh.setChatWakeMode("gchat:spaces/team", "all", child)).toThrow(
+      /not its current effective owner/
+    );
+    expect(() => liveMesh.getChatWakeMode("gchat:spaces/team", child)).toThrow(
+      /not its current effective owner/
+    );
+
+    // The owner flips each space independently; the next arriving message obeys.
+    liveMesh.setChatWakeMode("gchat:spaces/team", "all", "root");
+    liveMesh.setChatWakeMode("spaces/dm", "mentions", "root");
+    expect(getRepositories().chatWakeModes.get("gchat:spaces/team")?.mode).toBe("all");
+    expect(liveMesh.getChatWakeMode("gchat:spaces/dm", "root")).toMatchObject({
+      mode: "mentions",
+      setBy: "root",
+    });
+
+    await emit("spaces/team", "t3");
+    await emit("spaces/dm", "d2", { dm: true });
+    await emit("spaces/dm", "d3", { dm: true, mention: true });
+    await emit("spaces/other", "o1");
+    // A redelivered message is not duplicated, and a message dropped before the
+    // change is not resurrected by it.
+    await emit("spaces/team", "t3");
+    expect(delivered()).toEqual([
+      "spaces/dm/messages/d1",
+      "spaces/dm/messages/d3",
+      "spaces/team/messages/t2",
+      "spaces/team/messages/t3",
+    ]);
+
+    // Clearing restores the default for that space alone.
+    liveMesh.setChatWakeMode("gchat:spaces/team", null, "root");
+    await emit("spaces/team", "t4");
+    await emit("spaces/dm", "d4", { dm: true });
+    expect(delivered()).not.toContain("spaces/team/messages/t4");
+    expect(delivered()).not.toContain("spaces/dm/messages/d4");
+  });
+
   it("handles scoped/timed halt commands mechanically and requires resume before replacement", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();

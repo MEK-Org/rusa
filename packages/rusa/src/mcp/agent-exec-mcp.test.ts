@@ -669,6 +669,7 @@ describe("agent-execution MCP server", () => {
         "cancel_scheduled_message",
         "delegate_event_source",
         "enroll_actor_experiment",
+        "get_chat_wake_mode",
         "grant_capability",
         "introduce",
         "list_actor_experiments",
@@ -685,6 +686,7 @@ describe("agent-execution MCP server", () => {
         "send_message",
         "set_thread_charter",
         "set_actor_model",
+        "set_chat_wake_mode",
         "set_thread_title",
         "spawn_thread",
         "subscribe_event_source",
@@ -941,6 +943,7 @@ describe("agent-execution MCP server", () => {
       [
         "cancel_scheduled_message",
         "delegate_event_source",
+        "get_chat_wake_mode",
         "grant_capability",
         "introduce",
         "list_followers",
@@ -951,6 +954,7 @@ describe("agent-execution MCP server", () => {
         "revoke_capability",
         "send_message",
         "set_actor_model",
+        "set_chat_wake_mode",
         "spawn_thread",
         "subscribe_event_source",
         "transfer_voice_session",
@@ -2174,6 +2178,60 @@ describe("agent-execution MCP server", () => {
   });
 
   describe("Event source delegation tools (non-root, ISSUE_NUM §2)", () => {
+    it("lets only a chat space's effective owner read and set its wake mode (#692)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "space owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      mesh.subscribeEventSource("gchat:spaces", "root", "root");
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
+      });
+
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      let res = await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" });
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toContain("gchat:spaces/team: default");
+
+      res = await call(ownerClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" });
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toBe("gchat:spaces/team: all");
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("all");
+      // Another of root's spaces is untouched, and the owner has no say over it.
+      expect(mesh.chatWakeModeFor("spaces/other")).toBeUndefined();
+      res = await call(ownerClient, "set_chat_wake_mode", { space: "spaces/other", mode: "all" });
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(/not its current effective owner/);
+
+      // Having delegated the space away, root is no longer its owner either.
+      res = await call(rootClient, "set_chat_wake_mode", {
+        space: "gchat:spaces/team",
+        mode: "mentions",
+      });
+      expect(res.isError).toBe(true);
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("all");
+
+      // A space is the unit: the whole chat tree and a single thread are refused.
+      res = await call(rootClient, "set_chat_wake_mode", { space: "gchat:spaces", mode: "all" });
+      expect(res.isError).toBe(true);
+
+      res = await call(ownerClient, "set_chat_wake_mode", {
+        space: "spaces/team",
+        mode: "default",
+      });
+      expect(dataOf(res)).toContain("gchat:spaces/team: default");
+      expect(mesh.chatWakeModeFor("spaces/team")).toBeUndefined();
+    });
+
     it("lets a subscribed parent delegate to a child and reclaim the topic", async () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));

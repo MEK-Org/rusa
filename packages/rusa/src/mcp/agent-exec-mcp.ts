@@ -17,6 +17,7 @@ import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import type { ChatWakeModeView } from "../chat/wake-mode.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
@@ -713,6 +714,55 @@ export function createAgentExecMcpServer(
         );
         mesh.reclaimEventSource(resource, selfId);
         return toolOk(`reclaimed ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  // ── Chat wake mode (#692) ── How a Google Chat space wakes its owner. The
+  // authority is the same effective ownership that governs delegating the
+  // space, enforced in the mesh, so these tools add no permission of their own.
+  const chatSpaceInputSchema = {
+    space: z.string().describe("The Google Chat space, as gchat:spaces/<id> or spaces/<id>."),
+  };
+  const describeWakeMode = (view: ChatWakeModeView): string =>
+    view.mode === null
+      ? `${view.resource}: default (every message in a DM or two-person space, mentions elsewhere)`
+      : `${view.resource}: ${view.mode}`;
+
+  server.registerTool(
+    "get_chat_wake_mode",
+    {
+      title: "Read a chat space's wake mode",
+      description:
+        "Read whether a Google Chat space you currently own wakes you on mentions only, on all messages, or by the default (every message in a DM or two-person space, mentions in larger spaces).",
+      inputSchema: chatSpaceInputSchema,
+    },
+    async ({ space }) => {
+      try {
+        return toolOk(describeWakeMode(mesh.getChatWakeMode(space, selfId)));
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_chat_wake_mode",
+    {
+      title: "Set a chat space's wake mode",
+      description:
+        "Choose how a Google Chat space you currently own wakes you: `mentions` (only messages that @mention Rusa), `all` (every message), or `default` (every message in a DM or two-person space, mentions in larger spaces). Each space is set independently and the change applies from the next arriving message.",
+      inputSchema: {
+        ...chatSpaceInputSchema,
+        mode: z.enum(["mentions", "all", "default"]).describe("The wake mode for this space."),
+      },
+    },
+    async ({ space, mode }) => {
+      try {
+        const view = mesh.setChatWakeMode(space, mode === "default" ? null : mode, selfId);
+        return toolOk(describeWakeMode(view));
       } catch (err) {
         return toolError(err);
       }
