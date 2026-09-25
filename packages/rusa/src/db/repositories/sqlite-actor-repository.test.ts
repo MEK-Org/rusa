@@ -1018,5 +1018,9 @@ describe("SqliteActorRepository", () => {
     repository.upsert(steward);
     repository.patch("worker", { parentId: "steward" });
     expect(repository.parentOf("worker")).toBe("steward");
+
+    // Verify direct database updates are immediately visible without in-memory stale cache
+    db.prepare("UPDATE actors SET parent_id = 'root' WHERE id = 'worker'").run();
+    expect(repository.parentOf("worker")).toBe("root");
   });
 });

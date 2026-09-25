@@ -433,7 +433,6 @@ export class SqliteActorRepository implements ActorRepository {
   private readonly db: Database.Database;
   private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
   private parentStmt?: Database.Statement;
-  private readonly parentCache = new Map<string, string | null>();
 
   constructor(
     db: Database.Database,
@@ -532,23 +531,17 @@ export class SqliteActorRepository implements ActorRepository {
 
     // Process memory must advance only after the durable transaction commits.
     this.storeDesiredOverlay(record);
-    this.parentCache.set(record.id, record.parentId);
   }
 
   parentOf(id: string): string | null | undefined {
-    const cached = this.parentCache.get(id);
-    if (cached !== undefined) return cached;
     const row = this.getParentStmt().get(id) as { parent_id: string | null } | undefined;
-    if (!row) return undefined;
-    this.parentCache.set(id, row.parent_id);
-    return row.parent_id;
+    return row ? row.parent_id : undefined;
   }
 
   get(id: string): ActorRecord | undefined {
     const row = this.db.prepare("SELECT * FROM actors WHERE id = ?").get(id) as
       | ActorRow
       | undefined;
-    if (row) this.parentCache.set(row.id, row.parent_id);
     return row ? this.fromRow(row) : undefined;
   }
 
@@ -556,9 +549,6 @@ export class SqliteActorRepository implements ActorRepository {
     const rows = this.db
       .prepare("SELECT * FROM actors ORDER BY created_at, id")
       .all() as ActorRow[];
-    for (const row of rows) {
-      this.parentCache.set(row.id, row.parent_id);
-    }
     const lastHumanMessageByRecipient = new Map<string, LastHumanMessage>();
     // `/api/mesh/threads` lists every actor. Resolving the newest operator
     // message in `fromRow` turned that request into one full mesh_chat scan per

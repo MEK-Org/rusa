@@ -139,25 +139,26 @@ describe("list_subscriptions performance and event loop safety (#687)", () => {
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
 
     let getCallCount = 0;
+    let parentOfCallCount = 0;
     const origGet = actorRepo.get.bind(actorRepo);
     actorRepo.get = (id: string) => {
       getCallCount++;
       return origGet(id);
     };
+    const origParentOf = actorRepo.parentOf.bind(actorRepo);
+    actorRepo.parentOf = (id: string) => {
+      parentOfCallCount++;
+      return origParentOf(id);
+    };
 
-    const t0 = performance.now();
     const res = (await client.callTool({
       name: "list_subscriptions",
       arguments: {},
     })) as CallToolResult;
-    const elapsed = performance.now() - t0;
-
-    console.log(
-      `[PERF PROOF] list_subscriptions elapsed: ${elapsed.toFixed(1)} ms, actorRepo.get calls: ${getCallCount}`
-    );
 
     expect(res.isError).toBeFalsy();
     expect(getCallCount).toBe(0);
+    expect(parentOfCallCount).toBeGreaterThan(0);
     const data = JSON.parse((res.content[0] as { type: "text"; text: string }).text) as {
       owners: OwnerEntry[];
       subscribers: SubEntry[];

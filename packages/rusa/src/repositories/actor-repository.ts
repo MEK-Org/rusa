@@ -34,5 +34,5 @@ export interface ActorRepository {
    * Return the parent thread ID for an actor, null if root, or undefined if unknown.
    * Efficient path for tree and ancestry traversal without loading full records or chat history.
    */
-  parentOf?(id: string): string | null | undefined;
+  parentOf(id: string): string | null | undefined;
 }

@@ -1315,19 +1315,10 @@ export function createAgentExecMcpServer(
           // the ownership half read as the whole answer. When a canonical source
           // is queried, effectiveRoute reconciles live obligation claims against
           // stored subscriptions under that same unified inspection lens.
-          const subtreeCache = new Map<string, boolean>();
-          const inSubtreeCached = (targetId: string) => {
-            let res = subtreeCache.get(targetId);
-            if (res === undefined) {
-              res = inSubtree(targetId);
-              subtreeCache.set(targetId, res);
-            }
-            return res;
-          };
-          const owners = mesh.listSubscriptions().filter((row) => inSubtreeCached(row.actorId));
+          const owners = mesh.listSubscriptions().filter((row) => inSubtree(row.actorId));
           const subscribers = mesh
             .listEventSourceSubscriptions()
-            .filter((row) => inSubtreeCached(row.actorId));
+            .filter((row) => inSubtree(row.actorId));
 
           const hasResource = Boolean(
             args?.source ||
@@ -1348,7 +1339,7 @@ export function createAgentExecMcpServer(
             // non-actor principal (a human obligation owner) or an uncovered
             // source is not subtree state and stays answerable.
             const { principal } = effectiveRoute;
-            if (principal && mesh.actors.get(principal) && !inSubtreeCached(principal)) {
+            if (principal && mesh.actors.get(principal) && !inSubtree(principal)) {
               throw new Error(
                 `${selfId} may only inspect routes governed inside its own subtree (${resourceKey(resource)} is governed outside it; ${ACTOR_ADMIN_CAPABILITY} is subtree-scoped)`
               );
