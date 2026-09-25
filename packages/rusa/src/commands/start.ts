@@ -3023,7 +3023,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
         ) {
           try {
-            const newHost = followerHub.createHost(follower.id, record.id);
+            const newHost = followerHub.rebindHost(follower.id, record.id);
             (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
             mesh.dispatch(record.id);
           } catch (err) {

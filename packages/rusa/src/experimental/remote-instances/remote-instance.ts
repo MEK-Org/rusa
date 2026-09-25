@@ -73,7 +73,7 @@ export class FollowerDedupeTracker {
 
 /** Leader-side representation of one registered follower generation. */
 export class RemoteInstance {
-  readonly session = randomBytes(32).toString("hex");
+  session = randomBytes(32).toString("hex");
   readonly hosts = new Map<string, InstanceActorChannel>();
   readonly commands: FollowerCommand[] = [];
   seen = Date.now();
@@ -87,8 +87,24 @@ export class RemoteInstance {
     readonly pid: number,
     private readonly dedupeTracker: FollowerDedupeTracker = new FollowerDedupeTracker(),
     public commitSha?: string,
-    readonly protocolVersion: number = INSTANCE_PROTOCOL_VERSION
+    readonly protocolVersion: number = INSTANCE_PROTOCOL_VERSION,
+    /** Process-lifetime follower identity, distinct from the renewable HTTP session. */
+    readonly generation = randomBytes(16).toString("hex"),
+    /** Undefined for direct fixtures; the hub supplies its contact-age policy. */
+    private readonly staleAfterMs?: number
   ) {}
+
+  /** The same authenticated follower process recovered its HTTP session. */
+  renewSession(): void {
+    this.session = randomBytes(32).toString("hex");
+    this.seen = Date.now();
+    clearTimeout(this.pollTimer);
+    if (this.poll) {
+      this.poll.writeHead(410, { "content-type": "application/json" });
+      this.poll.end(JSON.stringify({ error: "Session replaced" }));
+      this.poll = undefined;
+    }
+  }
 
   hasBatch(batchId: string): boolean {
     return this.dedupeTracker.hasBatch(batchId);
@@ -104,6 +120,18 @@ export class RemoteInstance {
 
   recordEvent(eventId: string): void {
     this.dedupeTracker.recordEvent(eventId);
+  }
+
+  /** Contact gates new actor placement and follower updates, not existing actor commands. */
+  assertDispatchable(): void {
+    const error = this.staleContactError();
+    if (error) throw error;
+  }
+
+  private staleContactError(): Error | undefined {
+    return this.staleAfterMs !== undefined && Date.now() - this.seen > this.staleAfterMs
+      ? new Error(`Follower ${this.id} has no recent contact`)
+      : undefined;
   }
 
   enqueueCommand(command: FollowerCommand): void {
@@ -136,6 +164,22 @@ export class RemoteInstance {
 
   createHost(actorId: string): ActorChannel {
     if (this.hosts.has(actorId)) throw new Error("Actor already assigned");
+    return this.openHost(actorId);
+  }
+
+  /** Replace only the leader-side channel; the follower actor keeps running. */
+  rebindHost(actorId: string): ActorChannel {
+    const previous = this.hosts.get(actorId);
+    if (previous) {
+      // `attachHost()` removes the leader listener immediately after this call.
+      // Do not synthesize an exit: same-generation reconnect is not a run result.
+      previous.disconnect();
+      this.hosts.delete(actorId);
+    }
+    return this.openHost(actorId);
+  }
+
+  private openHost(actorId: string): ActorChannel {
     const host = new InstanceActorChannel(this.id, this.pid, (message) => {
       this.commands.push({ actorId, message });
       this.flush();
@@ -246,5 +290,9 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
       this.signalCode = message.signal;
       this.emit("exit", message.code, message.signal);
     } else this.emit("message", message);
+  }
+
+  disconnect(): void {
+    this.connected = false;
   }
 }

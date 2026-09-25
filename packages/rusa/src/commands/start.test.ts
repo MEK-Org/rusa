@@ -6437,6 +6437,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         id: "mac-mini",
         platform: "darwin",
         pid: 4242,
+        generation: "mac-mini-process-one",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
       }),
     });
@@ -6464,6 +6465,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ])
     );
 
+    // A session fault inside the same follower process must rebind the active
+    // host rather than treating the temporary loss as a new actor incarnation.
+    const sameProcessRegistration = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "mac-mini",
+        platform: "darwin",
+        pid: 4242,
+        generation: "mac-mini-process-one",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      }),
+    });
+    expect(sameProcessRegistration.status).toBe(200);
+    const renewed = (await sameProcessRegistration.json()) as { session: string };
+    expect(renewed.session).not.toBe(enrollment.session);
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/events`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            id: "mac-mini",
+            session: enrollment.session,
+            batchId: "stale-generation-event",
+            events: [],
+          }),
+        })
+      ).status
+    ).toBe(410);
+    const renewedPoll = await fetch(`http://127.0.0.1:${port}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "mac-mini", session: renewed.session }),
+    });
+    expect(renewedPoll.status).toBe(200);
+    await expect(renewedPoll.json()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "placed-worker",
+          message: expect.objectContaining({
+            type: "init",
+            bootstrap: expect.objectContaining({ reconnect: true }),
+          }),
+        }),
+      ])
+    );
+
     // Upsert a retired worker targeting the follower; on reconnect, the leader
     // must reconcile this by sending a stop command so the follower runtime is disposed.
     getRepositories().actors.upsert({
@@ -6481,7 +6530,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await fetch(`http://127.0.0.1:${port}/unregister`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify({ id: "mac-mini", session: enrollment.session }),
+      body: JSON.stringify({ id: "mac-mini", session: renewed.session }),
     });
 
     getRepositories().inbox.append([
@@ -6504,6 +6553,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         id: "mac-mini",
         platform: "darwin",
         pid: 4242,
+        generation: "mac-mini-process-two",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
       }),
     });
