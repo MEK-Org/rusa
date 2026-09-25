@@ -283,10 +283,16 @@ explicit cancellation, or a confirmed replacement process generation. Provider
 effects remain outside exactly-once guarantees.
 
 The gateway records authenticated last contact from the follower's long-poll and
-event requests and refuses new dispatch — including wakes for an already-hosted
-actor — to a generation with no recent contact. It does not expire channels or
-fail runs on a 45-second timer. Any future expiry policy must be chosen from
-measured contact-gap data and documented as a separate operational decision.
+event requests and emits one `follower_contact_stale` warning when fresh contact
+first lapses. It refuses new dispatch — including wakes for an already-hosted
+actor — to that generation, but leaves an already-queued command and existing
+channels intact for the next poll. Reattachment is not freshness-gated. It does
+not expire channels or fail runs on a 45-second timer. To recover, restore the
+follower's leader connectivity and let its same generation re-register and poll;
+to end a stranded run, use the normal actor cancellation or retirement control,
+whose stop command remains deliverable when contact returns. Any future expiry
+policy must be chosen from measured contact-gap data and documented as a separate
+operational decision.
 Provider process-tree cleanup after an abrupt crash still needs validation beyond
 this experiment.
 There is deliberately no per-actor Node crash isolation, matching the leader.

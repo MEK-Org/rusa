@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Logger } from "../../observability/logger.js";
 import { FollowerHub } from "./follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
@@ -9,9 +10,25 @@ const hubs: FollowerHub[] = [];
 afterEach(async () => {
   await Promise.all(hubs.splice(0).map((hub) => hub.close()));
 });
-async function setup() {
+function captureLogger(
+  records: Array<{ event: string; fields?: Record<string, unknown> }>
+): Logger {
+  let logger!: Logger;
+  const write = (event: string, fields?: Record<string, unknown>) =>
+    records.push({ event, fields });
+  logger = {
+    debug: write,
+    info: write,
+    warn: write,
+    error: write,
+    child: () => logger,
+  };
+  return logger;
+}
+
+async function setup(options?: { logger?: Logger }) {
   const token = randomBytes(32).toString("hex");
-  const hub = new FollowerHub(token);
+  const hub = new FollowerHub(token, options);
   hubs.push(hub);
   const origin = await hub.listen("127.0.0.1", 0);
   const post = (path: string, body: object) =>
@@ -77,12 +94,15 @@ describe("leader follower gateway", () => {
     try {
       const h = await setup();
       const identity = await h.register("mac");
-      const host = h.hub.createHost("mac", "existing-actor");
+      let host = h.hub.createHost("mac", "existing-actor");
 
       clock.mockReturnValue(start + 46_000);
       (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
       expect(h.hub.list()).toHaveLength(1);
       expect(() => h.hub.createHost("mac", "stale-actor")).toThrow("no recent contact");
+      const rebound = h.hub.rebindHost("mac", "existing-actor");
+      expect(rebound).not.toBe(host);
+      host = rebound;
       const rejection = vi.fn();
       expect(host.send({ type: "wake" }, rejection)).toBe(false);
       expect((rejection.mock.calls[0]?.[0] as Error).message).toContain("no recent contact");
@@ -102,6 +122,42 @@ describe("leader follower gateway", () => {
       expect(await (await h.post("/poll", identity)).json()).toEqual([
         { actorId: "existing-actor", message: { type: "wake" } },
       ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("warns once per lapsed-contact interval and clears the warning on a poll", async () => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    try {
+      const h = await setup({ logger: captureLogger(records) });
+      const identity = await h.register("mac");
+      h.hub.createHost("mac", "actor-1");
+
+      clock.mockReturnValue(start + 46_000);
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      expect(records.filter((record) => record.event === "follower_contact_stale")).toEqual([
+        {
+          event: "follower_contact_stale",
+          fields: { followerId: "mac", lastSeen: new Date(start).toISOString() },
+        },
+      ]);
+
+      const poll = h.post("/poll", identity);
+      await vi.waitFor(() =>
+        expect(h.hub.list().find((follower) => follower.id === "mac")?.lastSeen).toBe(
+          new Date(start + 46_000).toISOString()
+        )
+      );
+      h.hub.stopActor("mac", "actor-1");
+      await (await poll).json();
+
+      clock.mockReturnValue(start + 92_000);
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      expect(records.filter((record) => record.event === "follower_contact_stale")).toHaveLength(2);
     } finally {
       clock.mockRestore();
     }

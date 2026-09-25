@@ -82,6 +82,8 @@ export class FollowerHub {
   private static readonly STALE_AFTER_MS = 45_000;
   private readonly log: Logger;
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
+  /** Followers for which the current lapsed-contact interval has been reported. */
+  private readonly staleFollowerIds = new Set<string>();
   /** Generations that a confirmed replacement made permanently stale. */
   private readonly supersededGenerations = new Map<string, Set<string>>();
   private followers = new Map<string, RemoteInstance>();
@@ -96,6 +98,18 @@ export class FollowerHub {
     const now = Date.now();
     // Contact age is advisory. It gates new dispatch but does not prove that a
     // follower process or any in-flight provider run has ended.
+    for (const follower of this.followers.values()) {
+      if (
+        now - follower.seen > FollowerHub.STALE_AFTER_MS &&
+        !this.staleFollowerIds.has(follower.id)
+      ) {
+        this.staleFollowerIds.add(follower.id);
+        this.log.warn("follower_contact_stale", {
+          followerId: follower.id,
+          lastSeen: new Date(follower.seen).toISOString(),
+        });
+      }
+    }
     for (const [id, tracker] of this.dedupeTrackers) {
       if (!this.followers.has(id) && now - tracker.lastSeen > 3600_000) {
         this.dedupeTrackers.delete(id);
@@ -260,7 +274,6 @@ export class FollowerHub {
   rebindHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
-    follower.assertDispatchable();
     const host = follower.rebindHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)
@@ -317,6 +330,7 @@ export class FollowerHub {
   }
   private drop(follower: RemoteInstance): void {
     this.followers.delete(follower.id);
+    this.staleFollowerIds.delete(follower.id);
     follower.close();
     this.log.info("follower_disconnected", {
       followerId: follower.id,
@@ -452,6 +466,7 @@ export class FollowerHub {
       if (existing) {
         if (existing.generation === body.generation) {
           existing.renewSession();
+          this.staleFollowerIds.delete(existing.id);
           this.log.info("follower_reconnected", {
             followerId: existing.id,
             generation: existing.generation,
@@ -491,6 +506,7 @@ export class FollowerHub {
         FollowerHub.STALE_AFTER_MS
       );
       this.followers.set(follower.id, follower);
+      this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
         followerId: follower.id,
         platform: follower.platform,
@@ -517,6 +533,7 @@ export class FollowerHub {
       return;
     }
     follower.seen = Date.now();
+    this.staleFollowerIds.delete(follower.id);
     if (path === "/unregister") {
       this.drop(follower);
       reply(res, 200, {});
