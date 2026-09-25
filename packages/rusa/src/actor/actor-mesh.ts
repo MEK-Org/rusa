@@ -4352,13 +4352,7 @@ export class ActorMesh {
     // opportunity; a live provider run has no pending reservation, so it keeps
     // its launched pool through its normal run boundary.
     const liveActor = this.runs.liveActor(id);
-    // Do not turn a staged move onto an already-halted pool into a transient
-    // re-quote that `beforeRun` merely drops: retain the work through the
-    // existing halt/resume path instead. Partially healthy pools still
-    // re-quote normally, letting provider selection choose an eligible lane.
-    if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
-      if (liveActor?.cancelQueuedRun?.()) return staged ? "staged" : "applied";
-    } else if (liveActor?.rescheduleQueuedRun?.()) {
+    if (liveActor && this.requoteOrRetainQueuedRun(liveActor, validated)) {
       return staged ? "staged" : "applied";
     }
 
@@ -4765,6 +4759,49 @@ export class ActorMesh {
       }
     }
     return resumed;
+  }
+
+  /**
+   * Re-evaluate queued admissions pinned to a lane the quota coordinator has
+   * just reported exhausted, so each can re-pin to another pool entry or be
+   * held (#633). Matches on the recorded selection's `lane` — the canonical
+   * pacing key the coordinator reports — never the declared provider alias.
+   * A queued request with no recorded selection is pinned to nothing; its
+   * eventual quote already sees the deferred pacer.
+   *
+   * Stopgap: removed with the unified queueing model. Called only on a newly
+   * reported exhaustion — never on renewal, on a cadence, or any other trigger.
+   */
+  reEvaluateExhaustedQueuedRuns(exhaustedLane: string): string[] {
+    const affected: string[] = [];
+    for (const [id, actor] of this.runs.liveEntries()) {
+      if (this.runs.selectionFor(id)?.lane !== exhaustedLane) continue;
+      if (this.requoteOrRetainQueuedRun(actor, this.launchModelConfig(id))) {
+        affected.push(id);
+      }
+    }
+    return affected;
+  }
+
+  /**
+   * Pass a queued reservation back through admission so provider selection
+   * can choose an eligible lane. When the pool has nowhere to land — every
+   * candidate halted, or the mesh shutting down — retain the work through the
+   * halt/resume path instead: `prepareRun` would drop the fresh re-admission,
+   * losing the opportunity. The question here is whether the pool has anywhere
+   * to go, so it checks the whole pool rather than the reserved lane. Normal
+   * halt processing clears a #633 reservation before this hook sees it; the
+   * all-halted branch is retained for the shared `setModelConfig` path.
+   * Returns whether a queued reservation was acted on.
+   */
+  private requoteOrRetainQueuedRun(
+    actor: MeshActor,
+    modelConfig: readonly ProviderModelConfig[] | undefined
+  ): boolean {
+    if (this.allCandidatesHalted(modelConfig) || this.isShuttingDown()) {
+      return actor.cancelQueuedRun?.() === true;
+    }
+    return actor.rescheduleQueuedRun?.() === true;
   }
 
   private factoryContext(record: ActorRecord): ActorFactoryContext {
