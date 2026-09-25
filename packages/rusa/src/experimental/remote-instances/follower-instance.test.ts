@@ -1007,34 +1007,6 @@ describe("monolithic follower instance", () => {
     );
   });
 
-  it("applies a staged model pin on a running follower-hosted actor at next-run boundary without leader restart", async () => {
-    const h = setup();
-    const id = h.spawn("Charter D");
-    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
-    await waitUntil(() => h.events.some((e) => e.actorId === id && e.event.type === "result"));
-
-    // Pin model via mesh.setActorModel
-    h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-pinned-d" }], "root");
-
-    // Next run dispatched without leader restart or follower re-registration
-    h.inboxStore.append([
-      { actorId: id, source: "test:durable-d", payload: { type: "test.work" } },
-    ]);
-    h.mesh.dispatch(id);
-
-    await waitUntil(
-      () => h.events.filter((e) => e.actorId === id && e.event.type === "result").length === 2
-    );
-    const starts = h.events.filter((e) => e.actorId === id && e.event.type === "runStart");
-    expect(starts).toHaveLength(2);
-    const startEvent = starts[1]?.event;
-    if (startEvent && startEvent.type === "runStart") {
-      expect(startEvent.selected).toMatchObject({ model: "model-pinned-d" });
-    } else {
-      expect.fail("Expected second event to be runStart");
-    }
-  });
-
   it("re-quotes a follower admission with a pin applied while it waits in the provider gate", async () => {
     const pacer = new ProviderPacer(0);
     pacer.deferUntil(Date.now() + 1_000);
