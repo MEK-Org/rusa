@@ -131,6 +131,35 @@ describe("SqliteInboxRepository", () => {
     expect(store.countUnhandled("a")).toBe(0);
   });
 
+  it("round-trips an optional delivery role and rejects any other value", () => {
+    const [owner, subscriber, unannotated] = store.append([
+      { id: "o", actorId: "a", source: "chat", payload: { type: "m", deliveryRole: "owner" } },
+      {
+        id: "s",
+        actorId: "a",
+        source: "chat",
+        payload: { type: "m", deliveryRole: "subscriber" },
+      },
+      { id: "u", actorId: "a", source: "chat", payload: { type: "m" } },
+    ]);
+    expect(owner?.payload.deliveryRole).toBe("owner");
+    expect(subscriber?.payload.deliveryRole).toBe("subscriber");
+    expect(unannotated?.payload.deliveryRole).toBeUndefined();
+    expect(store.read("a", "s")?.payload.deliveryRole).toBe("subscriber");
+
+    expect(() =>
+      store.append([
+        {
+          id: "bad-role",
+          actorId: "a",
+          source: "chat",
+          payload: { type: "m", deliveryRole: "directed" } as never,
+        },
+      ])
+    ).toThrow(/payload\.deliveryRole/);
+    expect(store.read("a", "bad-role")).toBeNull();
+  });
+
   it("markHandled is owner-checked, all-or-nothing, and preserves the first timestamp", () => {
     store.append([
       { id: "a1", actorId: "a", source: "chat", payload: { type: "message.created" } },
