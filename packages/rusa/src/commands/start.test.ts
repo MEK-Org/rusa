@@ -897,6 +897,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ): Promise<{
       mesh: ActorMesh;
       appliedInterval: (provider: string) => number | undefined;
+      pacerQuote: (provider: string) => number;
+      triggerQuotaThrottleTick: () => Promise<void>;
       makeUnavailable: () => void;
       throttleRequestCount: () => number;
       close: () => Promise<void>;
@@ -950,22 +952,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       let mesh: ActorMesh | undefined;
       let appliedInterval: ((provider: string) => number | undefined) | undefined;
+      let pacerQuote: ((provider: string) => number) | undefined;
+      let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
       await new Promise<void>((resolve) => {
         void runStart({
           e2e: {
             onReady: (handles) => {
               mesh = handles.mesh;
               appliedInterval = handles.coordinatorAppliedInterval;
+              pacerQuote = handles.coordinatorPacerQuote;
+              triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
               shutdownFn = handles.shutdown;
               resolve();
             },
           },
         });
       });
-      if (!mesh || !appliedInterval) throw new Error("mesh not ready");
+      if (!mesh || !appliedInterval || !pacerQuote || !triggerQuotaThrottleTick) {
+        throw new Error("mesh not ready");
+      }
       return {
         mesh,
         appliedInterval,
+        pacerQuote,
+        triggerQuotaThrottleTick,
         makeUnavailable: () => {
           unavailable = true;
         },
@@ -1005,8 +1015,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       capped: false,
       expired: opts.expired ?? false,
       exhaustedUntil:
-        opts.exhaustedUntil ??
-        (opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null),
+        opts.exhaustedUntil !== undefined
+          ? opts.exhaustedUntil
+          : opts.expired === true
+            ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString()
+            : null,
       updatedAt: opts.updatedAt ?? new Date().toISOString(),
       buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
       freshness: {
@@ -1177,6 +1190,66 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect(message.match(/\(exhausted\)/g)).toHaveLength(2);
         expect(message).not.toContain("(pacing)");
         expect(attempted).not.toHaveBeenCalled();
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("re-evaluates queued admissions only after a newly deferred coordinator exhaustion (#633)", async () => {
+      let claudeStatus = throttleStatus("claude");
+      const { mesh, close, pacerQuote, triggerQuotaThrottleTick } = await bootWithCoordinator(
+        () => ({ claude: claudeStatus }),
+        3600
+      );
+      try {
+        const reEvaluateSpy = vi
+          .spyOn(mesh, "reEvaluateExhaustedQueuedRuns")
+          .mockImplementation((lane) => {
+            // The production pacer has already consumed the coordinator's
+            // deadline, so a re-quote cannot reserve the exhausted lane.
+            expect(pacerQuote(lane)).toBeGreaterThan(Date.now());
+            return [];
+          });
+
+        // Initial unexhausted publication does not trigger re-evaluation.
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        // An incomplete or malformed expired publication cannot defer the
+        // pacer. Neither consumes the edge, so the later usable deadline does.
+        claudeStatus = throttleStatus("claude", { expired: true, exhaustedUntil: null });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "not-a-timestamp",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T15:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+        expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
+
+        // Revising a deadline while the lane remains deferred is not a new
+        // exhaustion edge, and neither is the subsequent renewal.
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T16:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+
+        claudeStatus = throttleStatus("claude");
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
       } finally {
         await shutdownFn?.();
         shutdownFn = undefined;

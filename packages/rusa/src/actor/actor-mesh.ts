@@ -23,6 +23,7 @@ import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
+  type InboxAppendInput,
   type InboxEntry,
   type InboxPayload,
   type InboxRepository,
@@ -105,6 +106,8 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+type ResponsiveReadyAttention = { id: string; intent: string | null; readyCount?: number };
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -927,6 +930,24 @@ export class ActorMesh {
     }
   >();
   /**
+   * Responsive-ready attention buffered while an actor is mid-run (#632).
+   *
+   * Generalizes the ready-head deferral principle: an actor must not be
+   * interrupted mid-run by downstream results of its own actions. Delivering
+   * per mutation would trigger eager preemption or require complex mid-run
+   * join disambiguation; instead, self-caused attention is deferred until
+   * the run finishes, deduplicated per obligation, and flushed into the inbox
+   * if the obligation is still ready and responsive. The buffer is deliberately
+   * transient: a process loss re-derives this durable obligation fact through
+   * boot {@link reconcileResponsiveReadyAttention}; a live run always flushes
+   * through the lifecycle's result or non-result terminal path before another
+   * run opens its window.
+   */
+  private readonly runResponsiveReadyAttention = new Map<
+    string,
+    Map<string, ResponsiveReadyAttention>
+  >();
+  /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
    * into children *before* marking itself retired, so an ancestor mid-retire
    * still reads `status: "active"` in the repository — see
@@ -1475,8 +1496,9 @@ export class ActorMesh {
    * The dispatch that schedules without interrupting. Responsive work still
    * passes the voice hold and is admitted; what it does not do is replace a
    * run already in flight. Private and named so "responsive but not
-   * preempting" cannot leak into a control path. Its two callers are event
-   * fan-out's non-owner copy and self-caused mid-run ready attention.
+   * preempting" cannot leak into a control path — its one caller is event
+   * fan-out, where only an event's effective owner may have its active run
+   * replaced. Self-caused mid-run ready attention is deferred to run end (#632).
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
     const resolved = this.resolveThreadId(dest);
@@ -1503,8 +1525,9 @@ export class ActorMesh {
    * wakes clear the debt, which is what stops a second dispatch from
    * cancelling and re-queueing the run the first one just admitted. What is
    * left over is the case this exists for: work that became durable with no
-   * one attempting to schedule it, which now gets that attempt instead of
-   * waiting for the next boot.
+   * one attempting to schedule it, including self-caused ready attention
+   * flushed after its producer's run. That work gets one content-free attempt
+   * instead of waiting for the next boot.
    *
    * Deferring to a microtask is what gives the appending turn its chance, and
    * the store's contract asks a listener to stay cheap and hand off rather
@@ -1550,6 +1573,7 @@ export class ActorMesh {
     // head attention immediately, which is what every non-run producer wants.
     this.actorsInRun.add(actorId);
     this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1721,6 +1745,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
@@ -1739,6 +1764,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
   }
 
   /**
@@ -1758,6 +1784,56 @@ export class ActorMesh {
     // at all — in the last case there is no obligation to point the actor at.
     if (!net || net.to === null || net.to.id === net.from) return;
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
+  }
+
+  /**
+   * Deliver deferred responsive-ready attention for an actor whose run has
+   * finished (#632). An actor creating self-assigned obligations mid-run
+   * buffers them so it cannot self-interrupt; once the run completes, this
+   * checks whether each obligation is still live, owned, and ready, and
+   * appends attention entries to the inbox for a follow-up run. The append
+   * listener is the sole scheduling seam: valid rows are committed together so
+   * one actor receives at most one advisory dispatch attempt.
+   */
+  private flushRunResponsiveReadyAttention(actorId: string): void {
+    const pending = this.runResponsiveReadyAttention.get(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
+    if (!pending || pending.size === 0 || !this.inboxStore) return;
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return;
+
+    // The production mesh always wires this read through the obligation
+    // repository. An isolated embedder without it cannot prove that a
+    // buffered item is still live and responsive, so it must not deliver a
+    // potentially stale responsive wake.
+    const obligationPort = this.obligations;
+    if (!obligationPort?.get) return;
+
+    const entries: InboxAppendInput[] = [];
+    for (const obligation of pending.values()) {
+      let live: Obligation | null;
+      try {
+        // Call through the port so class-backed implementations retain their
+        // receiver. A read failure fails this entry closed but must not abort
+        // the rest of finishInboxRun (notably staged model application).
+        live = obligationPort.get(obligation.id);
+      } catch (err) {
+        this.log(
+          `deferred responsive-ready read for ${obligation.id} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
+      if (
+        !live ||
+        this.resolveThreadId(live.ownerId) !== actorId ||
+        live.status !== "ready" ||
+        !live.effectiveResponsive
+      ) {
+        continue;
+      }
+      entries.push(this.responsiveReadyAttentionEntry(actorId, obligation));
+    }
+    if (entries.length > 0) this.inboxStore.append(entries);
   }
 
   /**
@@ -1877,14 +1953,40 @@ export class ActorMesh {
    * `readyCount` makes every new episode a distinct entry; a replay of the
    * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
    */
+  private responsiveReadyAttentionEntry(
+    actorId: string,
+    obligation: ResponsiveReadyAttention
+  ): InboxAppendInput {
+    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
+    return {
+      id: deduplicatedInboxEntryId(
+        `obligation-ready-responsive:${obligation.id}${episodeKey}`,
+        actorId
+      ),
+      actorId,
+      source: `obligation:${obligation.id}`,
+      payload: {
+        type: "obligation.ready_responsive",
+        obligationId: obligation.id,
+        intent: obligation.intent ?? undefined,
+        priority: "responsive",
+      } as unknown as InboxPayload,
+    };
+  }
+
   deliverResponsiveReadyAttention(
     ownerId: string,
-    obligation: { id: string; intent: string | null; readyCount?: number },
+    obligation: ResponsiveReadyAttention,
     /**
-     * The owner made its own obligation ready mid-run: it is already running
-     * and will see the obligation in its queue, so a normal follow-up nudge
-     * joins the run instead of preempting it. Any other cause is responsive
-     * and preempts — the v1 interrupt the inbox model admits.
+     * The owner made its own obligation ready mid-run: defer delivery until the
+     * end of the run (#632). Generalizes the ready-head deferral principle: an
+     * actor must not be interrupted mid-run by downstream results of its own
+     * actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+     * entries for any obligations that remain ready.
+     * Any other cause is external responsive work and preempts immediately.
+     * This path only covers the ready-responsive sink that carries its acting
+     * principal; self-scheduled messages and event fan-out have separate
+     * delivery semantics and remain outside this slice.
      */
     selfCausedMidRun = false
   ): boolean {
@@ -1892,30 +1994,27 @@ export class ActorMesh {
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
-    const entryId = deduplicatedInboxEntryId(
-      `obligation-ready-responsive:${obligation.id}${episodeKey}`,
-      actorId
-    );
+
+    // Mid-run self-caused ready attention: defer delivery until the end of
+    // the run. Generalizes the ready-head deferral principle (#632):
+    // an actor should not be interrupted mid-run by downstream results of its
+    // own actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+    // entries for any obligations that remain ready.
+    if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
+      let pending = this.runResponsiveReadyAttention.get(actorId);
+      if (!pending) {
+        pending = new Map();
+        this.runResponsiveReadyAttention.set(actorId, pending);
+      }
+      pending.set(obligation.id, obligation);
+      return true;
+    }
+
     const entries = this.inboxStore.append([
-      {
-        id: entryId,
-        actorId,
-        source: `obligation:${obligation.id}`,
-        payload: {
-          type: "obligation.ready_responsive",
-          obligationId: obligation.id,
-          intent: obligation.intent ?? undefined,
-          priority: "responsive",
-        } as unknown as InboxPayload,
-      },
+      this.responsiveReadyAttentionEntry(actorId, obligation),
     ]);
     if (entries.length === 0) return false;
-    if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
-      this.dispatchJoiningActiveRun(actorId);
-    } else {
-      this.dispatch(actorId);
-    }
+    this.dispatch(actorId);
     return true;
   }
 
@@ -4352,13 +4451,7 @@ export class ActorMesh {
     // opportunity; a live provider run has no pending reservation, so it keeps
     // its launched pool through its normal run boundary.
     const liveActor = this.runs.liveActor(id);
-    // Do not turn a staged move onto an already-halted pool into a transient
-    // re-quote that `beforeRun` merely drops: retain the work through the
-    // existing halt/resume path instead. Partially healthy pools still
-    // re-quote normally, letting provider selection choose an eligible lane.
-    if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
-      if (liveActor?.cancelQueuedRun?.()) return staged ? "staged" : "applied";
-    } else if (liveActor?.rescheduleQueuedRun?.()) {
+    if (liveActor && this.requoteOrRetainQueuedRun(liveActor, validated)) {
       return staged ? "staged" : "applied";
     }
 
@@ -4615,6 +4708,7 @@ export class ActorMesh {
     this.unsubscribeInboxAppends?.();
     this.unsubscribeInboxAppends = undefined;
     this.appendWakesOwed.clear();
+    this.runResponsiveReadyAttention.clear();
     this.runs.closeAll();
   }
 
@@ -4765,6 +4859,49 @@ export class ActorMesh {
       }
     }
     return resumed;
+  }
+
+  /**
+   * Re-evaluate queued admissions pinned to a lane the quota coordinator has
+   * just reported exhausted, so each can re-pin to another pool entry or be
+   * held (#633). Matches on the recorded selection's `lane` — the canonical
+   * pacing key the coordinator reports — never the declared provider alias.
+   * A queued request with no recorded selection is pinned to nothing; its
+   * eventual quote already sees the deferred pacer.
+   *
+   * Stopgap: removed with the unified queueing model. Called only on a newly
+   * reported exhaustion — never on renewal, on a cadence, or any other trigger.
+   */
+  reEvaluateExhaustedQueuedRuns(exhaustedLane: string): string[] {
+    const affected: string[] = [];
+    for (const [id, actor] of this.runs.liveEntries()) {
+      if (this.runs.selectionFor(id)?.lane !== exhaustedLane) continue;
+      if (this.requoteOrRetainQueuedRun(actor, this.launchModelConfig(id))) {
+        affected.push(id);
+      }
+    }
+    return affected;
+  }
+
+  /**
+   * Pass a queued reservation back through admission so provider selection
+   * can choose an eligible lane. When the pool has nowhere to land — every
+   * candidate halted, or the mesh shutting down — retain the work through the
+   * halt/resume path instead: `prepareRun` would drop the fresh re-admission,
+   * losing the opportunity. The question here is whether the pool has anywhere
+   * to go, so it checks the whole pool rather than the reserved lane. Normal
+   * halt processing clears a #633 reservation before this hook sees it; the
+   * all-halted branch is retained for the shared `setModelConfig` path.
+   * Returns whether a queued reservation was acted on.
+   */
+  private requoteOrRetainQueuedRun(
+    actor: MeshActor,
+    modelConfig: readonly ProviderModelConfig[] | undefined
+  ): boolean {
+    if (this.allCandidatesHalted(modelConfig) || this.isShuttingDown()) {
+      return actor.cancelQueuedRun?.() === true;
+    }
+    return actor.rescheduleQueuedRun?.() === true;
   }
 
   private factoryContext(record: ActorRecord): ActorFactoryContext {

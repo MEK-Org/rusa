@@ -609,6 +609,10 @@ export interface RunStartE2EHandles {
   mesh: ActorMesh;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
+  /** Test-only read of the production pacer's next normal-start quote. */
+  coordinatorPacerQuote: (provider: string) => number;
+  /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
+  triggerQuotaThrottleTick?: () => Promise<void>;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1564,6 +1568,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
     return (coordinatorExhaustedUntilMs.get(lane as QuotaThrottleProvider) ?? 0) > nowMs;
   };
+  // #633 stopgap state: whether each lane is presently exhausted, and the
+  // mesh's re-evaluation hook. The hook is assigned once the mesh exists; the
+  // boot tick runs before that, when no queued admission can exist yet, and
+  // later admissions quote against the pacer that boot tick already deferred.
+  const deferredExhaustedProviders = new Set<string>();
+  let onLaneExhausted: ((lane: string) => void) | undefined;
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1621,6 +1631,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     status: PublishedThrottleProviderStatus
   ): void => {
     const pacer = pacerFor(providerName);
+    // The pacer must be deferred before queued admissions are re-evaluated
+    // below, or each re-quote re-pins to the lane that just exhausted.
     applyThrottleStatusToPacer(pacer, status);
     recordQuotaThrottleTick(
       providerName,
@@ -1641,6 +1653,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       status.exhaustedUntil,
       status.freshness.stale
     );
+    // Stopgap for #633, removed with the unified queueing model: re-evaluate
+    // queued admissions only when this is a newly deferred coordinator
+    // exhaustion. `expired` without a future, parseable deadline cannot defer
+    // the pacer, so retain no edge: a later usable deadline must still re-quote.
+    const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
+    const hasDeferredExhaustion =
+      status.expired && Number.isFinite(exhaustedUntilMs) && exhaustedUntilMs > Date.now();
+    const isNewExhaustion = hasDeferredExhaustion && !deferredExhaustedProviders.has(providerName);
+    if (hasDeferredExhaustion) {
+      deferredExhaustedProviders.add(providerName);
+    } else {
+      deferredExhaustedProviders.delete(providerName);
+    }
+    if (isNewExhaustion) onLaneExhausted?.(providerName);
   };
   const tickQuotaThrottle = async (): Promise<void> => {
     if (!quotaThrottleEnabled || !quotaCoordinatorClient) return;
@@ -2985,6 +3011,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+  onLaneExhausted = (lane) => mesh.reEvaluateExhaustedQueuedRuns(lane);
 
   if (followerHub) {
     followerHub.onRegister((follower) => {
@@ -4504,6 +4531,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
+    coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
+    triggerQuotaThrottleTick: tickQuotaThrottle,
     root,
     rootControl,
     externalRoot,
