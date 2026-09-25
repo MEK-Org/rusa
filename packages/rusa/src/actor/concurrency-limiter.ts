@@ -142,3 +142,17 @@ export class RunStartStaleProviderError extends Error {
     this.name = "RunStartStaleProviderError";
   }
 }
+
+/**
+ * Expected admission signal when pool selection finds every configured lane
+ * ineligible before any attempt — currently only the all-exhausted case, where
+ * the shared quota coordinator reports zero remaining quota on each lane. The
+ * message is the operator-facing pool-exhausted summary, already formatted, so
+ * the run boundary must surface it verbatim (no stack).
+ */
+export class PoolExhaustedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolExhaustedError";
+  }
+}

@@ -294,9 +294,15 @@ To roll back stage 0 into the normal collection stage, remove the drop-in with
 switch is deliberately probe-on; do not leave a probe-off override in place
 when expecting fresh quota observations.
 
-The shipped client still has no compare-only mode: configuring its socket
-selects the normal client path and applies the coordinator publication.
-Compare-only remains follow-up work ([#503](https://github.com/MEK-Org/rusa/issues/503)).
+The shipped client has no compare-only mode, and none is planned: configuring
+its socket selects the normal client path and applies the coordinator
+publication. Rollout stage 2 (design §8.3) was skipped and overtaken. The
+stage-3 handoff described below completed first: the copied coordinator
+database is authoritative, and the legacy database has been backed up,
+archived, and fenced. That leaves no legacy controller whose local result a
+comparison could validate the handoff against, so
+[#503](https://github.com/MEK-Org/rusa/issues/503) was closed as not planned
+([closing comment](https://github.com/MEK-Org/rusa/issues/503#issuecomment-5812179742)).
 #499 predates the stage-0 switch and did not execute it.
 
 Instead, #499 used a separate staging coordinator with a fresh staging database

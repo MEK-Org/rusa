@@ -12,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ActorOptions } from "../actor/actor.js";
+import {
+  type ActorOptions,
+  formatPoolExhaustedFailure,
+  type PoolSkippedEntry,
+} from "../actor/actor.js";
 import {
   type ActorFactoryContext,
   ActorMesh,
@@ -29,6 +33,7 @@ import {
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
+import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
@@ -604,6 +609,10 @@ export interface RunStartE2EHandles {
   mesh: ActorMesh;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
+  /** Test-only read of the production pacer's next normal-start quote. */
+  coordinatorPacerQuote: (provider: string) => number;
+  /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
+  triggerQuotaThrottleTick?: () => Promise<void>;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1551,11 +1560,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
+  // #655: only a coordinator-fresh publication can install an absolute
+  // exhaustion gate. Keep its published deadline through an unavailable read;
+  // the deadline itself releases the lane, without a second client freshness
+  // policy competing with the coordinator's governing-bucket verdict.
+  const coordinatorExhaustedUntilMs = new Map<QuotaThrottleProvider, number>();
+  const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
+    return (coordinatorExhaustedUntilMs.get(lane as QuotaThrottleProvider) ?? 0) > nowMs;
+  };
+  // #633 stopgap state: whether each lane is presently exhausted, and the
+  // mesh's re-evaluation hook. The hook is assigned once the mesh exists; the
+  // boot tick runs before that, when no queued admission can exist yet, and
+  // later admissions quote against the pacer that boot tick already deferred.
+  const deferredExhaustedProviders = new Set<string>();
+  let onLaneExhausted: ((lane: string) => void) | undefined;
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
     persistedUpdatedAt?: string,
-    exhaustedUntil?: string | null
+    exhaustedUntil?: string | null,
+    coordinatorStale = false
   ): void => {
     try {
       const pacer = pacerFor(providerName);
@@ -1569,6 +1593,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         if (Number.isFinite(exhaustedUntilMs)) {
           pacer.deferUntil(exhaustedUntilMs);
         }
+      }
+      const exhaustedUntilMs = exhaustedUntil ? Date.parse(exhaustedUntil) : Number.NaN;
+      if (
+        tick.expired &&
+        !coordinatorStale &&
+        Number.isFinite(exhaustedUntilMs) &&
+        exhaustedUntilMs > Date.now()
+      ) {
+        coordinatorExhaustedUntilMs.set(providerName, exhaustedUntilMs);
+      } else {
+        coordinatorExhaustedUntilMs.delete(providerName);
       }
       quotaThrottleStatuses.set(providerName, {
         ...tick,
@@ -1596,6 +1631,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     status: PublishedThrottleProviderStatus
   ): void => {
     const pacer = pacerFor(providerName);
+    // The pacer must be deferred before queued admissions are re-evaluated
+    // below, or each re-quote re-pins to the lane that just exhausted.
     applyThrottleStatusToPacer(pacer, status);
     recordQuotaThrottleTick(
       providerName,
@@ -1613,8 +1650,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         })),
       },
       status.updatedAt,
-      status.exhaustedUntil
+      status.exhaustedUntil,
+      status.freshness.stale
     );
+    // Stopgap for #633, removed with the unified queueing model: re-evaluate
+    // queued admissions only when this is a newly deferred coordinator
+    // exhaustion. `expired` without a future, parseable deadline cannot defer
+    // the pacer, so retain no edge: a later usable deadline must still re-quote.
+    const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
+    const hasDeferredExhaustion =
+      status.expired && Number.isFinite(exhaustedUntilMs) && exhaustedUntilMs > Date.now();
+    const isNewExhaustion = hasDeferredExhaustion && !deferredExhaustedProviders.has(providerName);
+    if (hasDeferredExhaustion) {
+      deferredExhaustedProviders.add(providerName);
+    } else {
+      deferredExhaustedProviders.delete(providerName);
+    }
+    if (isNewExhaustion) onLaneExhausted?.(providerName);
   };
   const tickQuotaThrottle = async (): Promise<void> => {
     if (!quotaThrottleEnabled || !quotaCoordinatorClient) return;
@@ -2330,23 +2382,39 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
+      // #655: submitPoolGate owns responsive selection and promotion alike.
+      // Its exhausted predicate prevents a later promotion from reselecting a
+      // lane that the coordinator learned was empty after initial admission.
+      // Normal-priority selection remains quote-first and keeps its existing
+      // pacing behavior until it is explicitly promoted.
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = [];
+      for (const c of candidates) {
         const lane = providerThrottleKey(c.provider, config);
-        return {
+        lanes.push({
           config: c,
           lane,
           pacer: pacerFor(lane),
           weeklyQuota: weeklyQuotaFor(lane),
-        };
-      });
+        });
+      }
       // submitPoolGate owns selection for both priorities: normal work quotes
-      // healthy lanes and responsive work makes that same selection, then
-      // bypasses provider and mesh pacing after its lane is reserved.
+      // healthy lanes and responsive work excludes known-empty lanes, ranks
+      // survivors by headroom, then bypasses provider and mesh pacing once its
+      // lane is reserved.
       return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
         isHalted: (c) => isProviderHalted(c.provider, c.model),
+        isExhausted: (c) =>
+          laneReportedExhausted(providerThrottleKey(c.provider, config), Date.now()),
+        onResponsivePoolExhausted: () => {
+          const skipped: PoolSkippedEntry[] = candidates.map((entry) => ({
+            entry: { ...entry },
+            reason: isProviderHalted(entry.provider, entry.model) ? "halted" : "exhausted",
+          }));
+          return new PoolExhaustedError(formatPoolExhaustedFailure({ attempted: [], skipped }));
+        },
         onSelected: request.threadId
           ? (selection) => {
               const provider = selection.candidate.provider;
@@ -2943,6 +3011,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+  onLaneExhausted = (lane) => mesh.reEvaluateExhaustedQueuedRuns(lane);
 
   if (followerHub) {
     followerHub.onRegister((follower) => {
@@ -3421,6 +3490,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
       const now = Date.now();
       const lane = providerThrottleKey(entry.provider, config);
+      // #655: name a coordinator-known-empty lane `exhausted` rather than the
+      // `pacing` its deferred pacer would report — the operator can then tell
+      // a known-zero lane from a transiently hot one.
+      if (laneReportedExhausted(lane, now)) {
+        return { eligible: false, reason: "exhausted" };
+      }
       if (pacerFor(lane).quote(now) > now) {
         return { eligible: false, reason: "pacing" };
       }
@@ -4456,6 +4531,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
+    coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
+    triggerQuotaThrottleTick: tickQuotaThrottle,
     root,
     rootControl,
     externalRoot,

@@ -615,7 +615,8 @@ It is not, after #573, an access-control boundary for the socket.
 - **The canary becomes free.** An instance can read `GET /v1/throttle` and
   *compare* it against what it would have applied, logging the difference and
   applying nothing, for as long as anyone wants. There is no such thing as a
-  half-committed reservation to unwind. §8.3 stage 2 is built on this.
+  half-committed reservation to unwind. §8.3 stage 2 was designed on this;
+  the rollout skipped it (§8.3).
 - **The scrape becomes independently deployable.** A regression in scraping or
   parsing is contained to one unit, and rolling it back does not roll back the
   orchestrator. The cost, stated honestly, is that two units now have to be
@@ -1481,15 +1482,15 @@ not to do it.
 ### 8.3 Canary and rollback
 
 The original table is the intended rollout design, not a statement that every
-mode is present in the #499 build. The side-effect-free client read plane makes
-the planned stage 2 especially cheap once
-[#503](https://github.com/MEK-Org/rusa/issues/503) ships.
+mode is present in the #499 build. Stage 2 was skipped. The stage-3 handoff
+completed before a compare-only mode shipped, and
+[#503](https://github.com/MEK-Org/rusa/issues/503) was closed as not planned.
 
 | Stage | Action | Verifies | Rollback |
 | --- | --- | --- | --- |
 | 0 | **Shipped in [#502](https://github.com/MEK-Org/rusa/issues/502):** install the unit; set `RUSA_QUOTA_COORDINATOR_PROBE_OFF=1` in its temporary systemd drop-in (or use `rusa quota-coordinator --probe-off`) so service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `healthz`/`readyz`, `GET /v1/throttle` matches what the file says and carries the expected `service.protocolMajor`, backups run, read metrics appear, and no scrape/controller metric advances | Remove the drop-in (`systemctl --user revert`), reload and restart for normal probe-on operation; or stop and remove the unit. Nothing touched. |
 | 1 | Enable the probe loop, still against the copy. Instances still scraping. | **The probe works outside an instance process** — bwrap, tmux, provider CLI auth, LLM parse (A5, A5a). Compare the copy's observations against the live file's for the same slots. | Disable the probe loop, or stop the unit. |
-| 2 | **Planned, not shipped** ([#503](https://github.com/MEK-Org/rusa/issues/503)): point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
+| 2 | **Skipped; overtaken by stage 3** ([#503](https://github.com/MEK-Org/rusa/issues/503) closed as not planned). The design: point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. Once the copied coordinator database was authoritative and the legacy database was archived and fenced, no legacy controller remained to compare against. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | None: the mode never shipped. |
 | 3 | **Revised stage-3 flip** (A6; the copied-database shape, provenance in §8.1 and the runbook — when no coordinator database exists yet, the designed `rusa quota-coordinator --relocate` rename of §8.2 applies instead): Back up legacy DB (`rusa quota-backup`). Archive legacy `quota.db` (+WAL/SHM) and create empty mode-0700 directory path fence at legacy path. Copied coordinator DB remains authoritative (no rename or `--relocate`). Start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances; stop shared coordinator unit (satisfying `quota-restore` socket check); remove directory path fence; restore legacy DB from backup (`rusa quota-restore`, which verifies it); restore instance config (`databasePath`); restart instances. Coordinator DB is preserved untouched. |
 
 The #499 staging proof substituted for the two absent modes. It started a
@@ -1567,7 +1568,8 @@ Two things about stage 1, the first of which is settled:
 Stage 2 is the stage that would be impossible under revision 5. A reservation
 canary had to actually reserve, so a canaried instance's behaviour changed the
 moment it was enabled; a publication canary can read and compare indefinitely
-while changing nothing. That difference is the concrete form of §4.2.
+while changing nothing. That difference is the concrete form of §4.2. It remains
+the design rationale, even though the rollout skipped stage 2 (see the table).
 
 **Upgrade order, always:** service first, instances second. The service must
 serve the old and the new `protocolMinor`; a `protocolMajor` bump means stopping

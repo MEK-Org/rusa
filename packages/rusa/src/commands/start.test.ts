@@ -19,6 +19,7 @@ import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import { type ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
+import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -881,6 +882,380 @@ describe("runStart webhook event routing (Phase 4)", () => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
     }
+  });
+
+  describe("model pool selection honors coordinator exhaustion (#655)", () => {
+    const claudeEntry = { provider: "claude", model: "claude-sonnet-5", effort: "high" };
+    const codexEntry = { provider: "codex", model: "gpt-5.6", effort: "high" };
+
+    // Boots runStart against a real coordinator socket whose /v1/throttle
+    // providers payload `makeProviders` controls, so a test can flip lane
+    // states between gates and wait for the next tick to consume them.
+    const bootWithCoordinator = async (
+      makeProviders: () => Record<string, unknown>,
+      tickSeconds = 1
+    ): Promise<{
+      mesh: ActorMesh;
+      appliedInterval: (provider: string) => number | undefined;
+      pacerQuote: (provider: string) => number;
+      triggerQuotaThrottleTick: () => Promise<void>;
+      makeUnavailable: () => void;
+      throttleRequestCount: () => number;
+      close: () => Promise<void>;
+    }> => {
+      const socketPath = join(homeDir, "coordinator.sock");
+      let unavailable = false;
+      let throttleRequestCount = 0;
+      const service = {
+        protocolMajor: 1,
+        protocolMinor: 0,
+        serverVersion: "test",
+        serverTime: new Date().toISOString(),
+      };
+      const coordinator = createServer((req, res) => {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        res.setHeader("content-type", "application/json");
+        if (url.pathname !== "/v1/throttle") {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+          return;
+        }
+        throttleRequestCount += 1;
+        if (unavailable) {
+          res.destroy();
+          return;
+        }
+        res.end(JSON.stringify({ service, providers: makeProviders() }));
+      });
+      await new Promise<void>((resolve, reject) => {
+        coordinator.once("error", reject);
+        coordinator.listen(socketPath, resolve);
+      });
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: {
+            antigravity: { cliCommand: "agy" },
+            claude: { cliCommand: "claude" },
+            codex: { cliCommand: "codex" },
+          },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          geminiApiKey: "fake-gemini-key",
+          quota: {
+            coordinator: { socketPath },
+            throttle: { enabled: true, tickSeconds },
+          },
+        }),
+        "utf8"
+      );
+
+      let mesh: ActorMesh | undefined;
+      let appliedInterval: ((provider: string) => number | undefined) | undefined;
+      let pacerQuote: ((provider: string) => number) | undefined;
+      let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              appliedInterval = handles.coordinatorAppliedInterval;
+              pacerQuote = handles.coordinatorPacerQuote;
+              triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh || !appliedInterval || !pacerQuote || !triggerQuotaThrottleTick) {
+        throw new Error("mesh not ready");
+      }
+      return {
+        mesh,
+        appliedInterval,
+        pacerQuote,
+        triggerQuotaThrottleTick,
+        makeUnavailable: () => {
+          unavailable = true;
+        },
+        throttleRequestCount: () => throttleRequestCount,
+        close: () =>
+          new Promise<void>((resolve, reject) => {
+            coordinator.close((error) => (error ? reject(error) : resolve()));
+          }),
+      };
+    };
+
+    const weeklyBucket = (provider: string, percentLeft: number) => ({
+      key: `${provider}:weekly`,
+      percentLeft,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 300,
+      observedAt: new Date().toISOString(),
+      resetAtIso: new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000).toISOString(),
+    });
+    const throttleStatus = (
+      provider: string,
+      opts: {
+        percentLeft?: number;
+        intervalSeconds?: number;
+        expired?: boolean;
+        exhaustedUntil?: string | null;
+        freshnessStale?: boolean;
+        updatedAt?: string;
+      } = {}
+    ) => ({
+      provider,
+      intervalSeconds: opts.intervalSeconds ?? 0,
+      uncappedIntervalSeconds: opts.intervalSeconds ?? 0,
+      governingBucketKey: `${provider}:weekly`,
+      capped: false,
+      expired: opts.expired ?? false,
+      exhaustedUntil:
+        opts.exhaustedUntil !== undefined
+          ? opts.exhaustedUntil
+          : opts.expired === true
+            ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString()
+            : null,
+      updatedAt: opts.updatedAt ?? new Date().toISOString(),
+      buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
+      freshness: {
+        ageMs: 0,
+        buckets: { [`${provider}:weekly`]: 0 },
+        stale: opts.freshnessStale ?? false,
+        hardStale: false,
+      },
+    });
+
+    it("responsive runs on a hot lane with quota while a coordinator-exhausted lane is skipped; normal waits", async () => {
+      // claude: coordinator-reported exhausted. codex: quota left, but pacing
+      // hot once its interval widens below.
+      let codexInterval = 0;
+      const { mesh, close, appliedInterval } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", { percentLeft: 0, expired: true }),
+        codex: throttleStatus("codex", { percentLeft: 50, intervalSeconds: codexInterval }),
+      }));
+      try {
+        // Heat codex: one normal gate starts on it immediately (interval 0),
+        // giving the lane a real start timestamp for the widened interval to
+        // pace against.
+        const warm = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(warm, [codexEntry], false).result).resolves.toBe("codex");
+
+        // Widen codex to a 1-hour pace and wait for the tick to apply it;
+        // its quote is now an hour out.
+        codexInterval = 3600;
+        await vi.waitFor(() => expect(appliedInterval("codex")).toBe(3600), {
+          timeout: 5_000,
+        });
+
+        // Responsive: the coordinator-exhausted claude lane is pre-filtered,
+        // and the pacing-hot codex lane still runs immediately because pacing
+        // never gates responsive work.
+        const responsiveFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const responsiveGate = mesh.gateRun(responsiveFn, [claudeEntry, codexEntry], true);
+        await expect(responsiveGate.result).resolves.toBe("codex");
+        expect(responsiveFn).toHaveBeenCalledTimes(1);
+        expect(responsiveFn).toHaveBeenCalledWith(expect.objectContaining({ provider: "codex" }));
+
+        // Normal: unchanged deferral — the run waits out codex's pace instead
+        // of attempting the exhausted claude lane early.
+        const normalFn = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const normalGate = mesh.gateRun(normalFn, [claudeEntry, codexEntry], false);
+        let normalSettled = false;
+        void normalGate.result.then(
+          () => {
+            normalSettled = true;
+          },
+          () => {
+            normalSettled = true;
+          }
+        );
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(normalSettled).toBe(false);
+        expect(normalGate.started).toBe(false);
+        expect(normalFn).not.toHaveBeenCalled();
+        normalGate.cancel?.();
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("does not skip a fresh expired report once its coordinator hold has elapsed", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", {
+          percentLeft: 0,
+          expired: true,
+          exhaustedUntil: new Date(Date.now() - 1_000).toISOString(),
+        }),
+      }));
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("releases an expired lane at its published hold deadline during a coordinator outage", async () => {
+      const exhaustedUntil = Date.now() + 2_500;
+      const { mesh, close, makeUnavailable, throttleRequestCount } = await bootWithCoordinator(
+        () => ({
+          claude: throttleStatus("claude", {
+            percentLeft: 0,
+            expired: true,
+            exhaustedUntil: new Date(exhaustedUntil).toISOString(),
+          }),
+        })
+      );
+      try {
+        // The fresh publication's future hold gates the lane before the outage.
+        const blockedAttempt = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(
+          mesh.gateRun(blockedAttempt, [claudeEntry], true).result
+        ).rejects.toBeInstanceOf(PoolExhaustedError);
+        expect(blockedAttempt).not.toHaveBeenCalled();
+
+        // Later socket reads fail, leaving no new coordinator publication to
+        // clear the hold. The gate must still release at the published deadline.
+        const readsBeforeOutage = throttleRequestCount();
+        makeUnavailable();
+        await vi.waitFor(() => expect(throttleRequestCount()).toBeGreaterThan(readsBeforeOutage), {
+          timeout: 5_000,
+        });
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, exhaustedUntil - Date.now() + 100))
+        );
+
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("does not skip an expired report the coordinator marks stale", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", {
+          percentLeft: 0,
+          expired: true,
+          exhaustedUntil: new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString(),
+          // The newest scrape can be current while the governing bucket is
+          // stale, so the coordinator's verdict must outrank `updatedAt`.
+          updatedAt: new Date().toISOString(),
+          freshnessStale: true,
+        }),
+      }));
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        await expect(mesh.gateRun(attempted, [claudeEntry], true).result).resolves.toBe("claude");
+        expect(attempted).toHaveBeenCalledWith(expect.objectContaining({ provider: "claude" }));
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("fails fast naming every lane exhausted when the coordinator reports zero on the whole pool", async () => {
+      const { mesh, close } = await bootWithCoordinator(() => ({
+        claude: throttleStatus("claude", { percentLeft: 0, expired: true }),
+        codex: throttleStatus("codex", { percentLeft: 0, expired: true }),
+      }));
+      try {
+        const attempted = vi.fn(async (candidate: { provider: string }) => candidate.provider);
+        const gate = mesh.gateRun(attempted, [claudeEntry, codexEntry], true);
+
+        const failure = await gate.result.then(
+          () => {
+            throw new Error("expected the gate to reject");
+          },
+          (error: unknown) => error
+        );
+        expect(failure).toBeInstanceOf(PoolExhaustedError);
+        const message = failure instanceof Error ? failure.message : String(failure);
+        expect(message).toContain("model pool exhausted");
+        expect(message).toContain("none was attempted");
+        expect(message.match(/\(exhausted\)/g)).toHaveLength(2);
+        expect(message).not.toContain("(pacing)");
+        expect(attempted).not.toHaveBeenCalled();
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
+
+    it("re-evaluates queued admissions only after a newly deferred coordinator exhaustion (#633)", async () => {
+      let claudeStatus = throttleStatus("claude");
+      const { mesh, close, pacerQuote, triggerQuotaThrottleTick } = await bootWithCoordinator(
+        () => ({ claude: claudeStatus }),
+        3600
+      );
+      try {
+        const reEvaluateSpy = vi
+          .spyOn(mesh, "reEvaluateExhaustedQueuedRuns")
+          .mockImplementation((lane) => {
+            // The production pacer has already consumed the coordinator's
+            // deadline, so a re-quote cannot reserve the exhausted lane.
+            expect(pacerQuote(lane)).toBeGreaterThan(Date.now());
+            return [];
+          });
+
+        // Initial unexhausted publication does not trigger re-evaluation.
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        // An incomplete or malformed expired publication cannot defer the
+        // pacer. Neither consumes the edge, so the later usable deadline does.
+        claudeStatus = throttleStatus("claude", { expired: true, exhaustedUntil: null });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "not-a-timestamp",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T15:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+        expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
+
+        // Revising a deadline while the lane remains deferred is not a new
+        // exhaustion edge, and neither is the subsequent renewal.
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T16:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+
+        claudeStatus = throttleStatus("claude");
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {

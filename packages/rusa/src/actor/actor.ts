@@ -25,6 +25,7 @@ import {
   createActorLifecycle,
 } from "./actor-lifecycle.js";
 import {
+  PoolExhaustedError,
   RunStartCancelledError,
   type RunStartHandle,
   RunStartStaleProviderError,
@@ -128,13 +129,14 @@ export interface ActorOptions {
    * Non-blocking, synchronous probe to verify candidate eligibility during
    * in-run recovery. Represents the non-blocking half of the admission gate
    * contract (submitPoolGate's isHalted check plus ProviderPacer.quote), not a
-   * new scheduler: checks whether the candidate provider is halted or
-   * currently pace-deferred without entering an asynchronous wait queue. When
-   * omitted, candidates are treated as eligible.
+   * new scheduler: checks whether the candidate provider is halted,
+   * coordinator-reported exhausted, or currently pace-deferred without entering
+   * an asynchronous wait queue. When omitted, candidates are treated as
+   * eligible.
    */
   recoveryEligibility?: (
     entry: RawProviderModelConfig
-  ) => { eligible: true } | { eligible: false; reason: "halted" | "pacing" };
+  ) => { eligible: true } | { eligible: false; reason: "halted" | "pacing" | "exhausted" };
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
   debounceMs?: number;
   /** Per-run provider timeout. */
@@ -230,9 +232,10 @@ export interface PoolFallbackDiagnostic {
   remainingAfter: number;
   /**
    * When this candidate was skipped rather than attempted (e.g. because it was
-   * halted or pacing-deferred), the reason for skipping. Omitted on live attempts.
+   * halted, coordinator-reported exhausted, or pacing-deferred), the reason for
+   * skipping. Omitted on live attempts.
    */
-  skipReason?: "halted" | "pacing";
+  skipReason?: "halted" | "pacing" | "exhausted";
 }
 
 /**
@@ -999,7 +1002,14 @@ export class Actor {
       if (runId) await this.lifecycle.emit("onError", { actorId: this.id, runId, error: err });
       result = {
         success: false,
-        output: err instanceof Error ? (err.stack ?? err.message) : String(err),
+        // A PoolExhaustedError carries the operator-facing pool summary as its
+        // message; pasting a stack here would bury it (#655).
+        output:
+          err instanceof PoolExhaustedError
+            ? err.message
+            : err instanceof Error
+              ? (err.stack ?? err.message)
+              : String(err),
         exitCode: 1,
         sessionId,
       };
@@ -1240,13 +1250,13 @@ function sameModelConfigEntry(a: RawProviderModelConfig, b: RawProviderModelConf
 /** A configured pool entry skipped during recovery without an attempt. */
 export interface PoolSkippedEntry {
   entry: RawProviderModelConfig;
-  reason: "halted" | "pacing";
+  reason: "halted" | "pacing" | "exhausted";
 }
 
 /**
  * The terminal report when every configured pool entry was tried or evaluated
  * and either failed with classified capacity/quota exhaustion or was skipped
- * as currently ineligible (halted or pacing). Actionable on purpose:
+ * as currently ineligible (halted, exhausted, or pacing). Actionable on purpose:
  * it names the condition, lists what was attempted in order, lists skipped
  * candidates with their reasons, says what clears the condition (reset timers,
  * operator unhalt), and what an operator can do about it. Only configured entry
@@ -1256,7 +1266,7 @@ export interface PoolSkippedEntry {
 export function formatPoolExhaustedFailure(input: {
   /** Every entry attempted, launch first, then the chain in tried order. */
   attempted: readonly RawProviderModelConfig[];
-  /** Entries in the recovery chain that were skipped due to halt or pacing. */
+  /** Entries in the recovery chain that were skipped due to halt, exhaustion, or pacing. */
   skipped?: readonly PoolSkippedEntry[];
 }): string {
   const isSingle = input.attempted.length === 1 && (!input.skipped || input.skipped.length === 0);
@@ -1264,12 +1274,22 @@ export function formatPoolExhaustedFailure(input: {
 
   if (input.skipped && input.skipped.length > 0) {
     const totalConfigured = input.attempted.length + input.skipped.length;
-    lines.push(
-      `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
-    );
-    lines.push(
-      `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
-    );
+    if (input.attempted.length === 0) {
+      // Fail-fast admission (e.g. #655: every lane already reported exhausted):
+      // nothing was spent on an attempt, so the summary names only the skips.
+      lines.push(
+        totalConfigured === 1
+          ? "model pool exhausted: the configured pool entry is currently ineligible; none was attempted."
+          : `model pool exhausted: all ${totalConfigured} configured pool entries are currently ineligible; none was attempted.`
+      );
+    } else {
+      lines.push(
+        `model pool exhausted: ${input.attempted.length} of ${totalConfigured} configured pool ${totalConfigured === 1 ? "entry" : "entries"} reported provider capacity/quota exhaustion; ${input.skipped.length} skipped as currently ineligible.`
+      );
+      lines.push(
+        `Attempted in order: ${input.attempted.map(describeModelConfigEntry).join(" -> ")}.`
+      );
+    }
     lines.push(
       `Skipped in order: ${input.skipped.map((s) => `${describeModelConfigEntry(s.entry)} (${s.reason})`).join(", ")}.`
     );

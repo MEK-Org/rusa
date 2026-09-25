@@ -481,10 +481,10 @@ describe("sandbox bwrap args", () => {
     });
   });
 
-  it("buildActorBwrapArgs leaves siblings readable (open read) and scopes writes to its own dir + /tmp", async () => {
-    // The mesh worker layout: <home>/.rusa/workers/<id>. Visibility is open —
-    // an actor may read any other actor's repo — so the workers tree is NOT tmpfs'd.
-    // Write isolation comes from only re-binding this actor's own dir rw (plus /tmp).
+  it("shadows sibling worker directories and maps Antigravity state privately", async () => {
+    // The mesh worker layout: <home>/.rusa/workers/<id>. The shared workers
+    // parent is shadowed and only this actor is rebound; agy's shared scratch and
+    // conversation state are overlaid with current-actor-only copies.
     const home = mkdtempSync(join(tmpdir(), "mc-home-"));
     tempDirs.push(home);
     const workersDir = join(home, ".rusa", "workers");
@@ -505,11 +505,13 @@ describe("sandbox bwrap args", () => {
     const { buildActorBwrapArgs } = await import("./sandbox.js");
     const { args } = buildActorBwrapArgs(actorDir, "antigravity");
 
-    // Nothing in the workers tree is shadowed — a sibling actor's dir stays visible.
+    // The workers tree is shadowed, then only this actor directory is recreated
+    // for the writable bind below.
     const tmpfsTargets = args.filter((_, i) => args[i - 1] === "--tmpfs");
-    expect(tmpfsTargets).not.toContain(workersDir);
+    expect(tmpfsTargets).toContain(workersDir);
     expect(tmpfsTargets).not.toContain(home);
-    // Only /tmp is tmpfs'd (writable scratch); the host root is ro-bound (read-all).
+    // /tmp is tmpfs'd for writes; the host root remains read-only beneath the
+    // worker-tree shadow.
     expect(tmpfsTargets).toContain("/tmp");
     expect(args).toContain("--ro-bind");
     // The real home is kept (read-only via ro-bind /); no synthetic HOME remapping.
@@ -527,10 +529,42 @@ describe("sandbox bwrap args", () => {
     expectSetenv(args, "npm_config_cache", "/tmp/cache/npm");
     // The actor's own dir is a writable bind, re-bound in place + chdir'd.
     expect(args.join(" ")).toContain(`--bind ${actorDir} ${actorDir}`);
+    const actorDirTarget = args.findIndex(
+      (arg, index) => arg === "--dir" && args[index + 1] === actorDir
+    );
+    expect(actorDirTarget).toBeGreaterThan(-1);
     const chdirIndex = args.indexOf("--chdir");
     expect(args[chdirIndex + 1]).toBe(actorDir);
     // The provider's state dir is the only home subtree bound read-write.
     expect(args.join(" ")).toContain(`--bind ${join(home, ".gemini")} ${join(home, ".gemini")}`);
+    const providerStateBind = args.findIndex(
+      (arg, index) =>
+        arg === "--bind" &&
+        args[index + 1] === join(home, ".gemini") &&
+        args[index + 2] === join(home, ".gemini")
+    );
+    // Every conversation-bearing agy path is overlaid with this actor's copy
+    // after the broad provider-state bind; auth and config are not.
+    const stateDir = join(home, ".gemini", "antigravity-cli");
+    const actorStateDir = join(actorDir, ".antigravity-state");
+    const overlaid = [
+      "scratch",
+      "conversations",
+      "brain",
+      "annotations",
+      "conversation_summaries.db",
+      "history.jsonl",
+    ];
+    for (const path of overlaid) {
+      const overlay = args.findIndex(
+        (arg, index) =>
+          arg === "--bind" &&
+          args[index + 1] === join(actorStateDir, path) &&
+          args[index + 2] === join(stateDir, path)
+      );
+      expect(overlay, path).toBeGreaterThan(providerStateBind);
+    }
+    expect(args).not.toContain(join(stateDir, "antigravity-oauth-token"));
   });
 
   it("shadows host-job audit artifacts out of mesh actor read/write scope", async () => {

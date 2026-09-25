@@ -18,6 +18,7 @@ import { createActorLifecycle } from "./actor-lifecycle.js";
 import type { ActorRecord } from "./actor-record.js";
 import {
   ConcurrencyLimiter,
+  PoolExhaustedError,
   RunStartCancelledError,
   type RunStartHandle,
 } from "./concurrency-limiter.js";
@@ -1534,6 +1535,61 @@ describe("Actor", () => {
     });
     expect(message).toContain("all 1 configured pool entry");
     expect(message).toContain("switch to a portable actor (context.type: portable)");
+  });
+
+  it("reports the fail-fast all-skipped shape without an attempted list (#655)", () => {
+    const message = formatPoolExhaustedFailure({
+      attempted: [],
+      skipped: [
+        { entry: { provider: "claude", model: "opus" }, reason: "exhausted" },
+        { entry: { provider: "codex", model: "gpt" }, reason: "exhausted" },
+      ],
+    });
+    expect(message).toContain("model pool exhausted");
+    expect(message).toContain("all 2 configured pool entries are currently ineligible");
+    expect(message).toContain("none was attempted");
+    expect(message).toContain("claude:opus (exhausted)");
+    expect(message).toContain("codex:gpt (exhausted)");
+    expect(message).not.toContain("Attempted in order");
+  });
+
+  it("surfaces a fail-fast pool exhaustion rejection verbatim, without a stack (#655)", async () => {
+    const seen: RunResult[] = [];
+    const actor = makeActor(
+      {
+        modelConfig: [
+          { provider: "claude", model: "first" },
+          { provider: "codex", model: "second" },
+        ],
+        gate: () =>
+          Promise.reject(
+            new PoolExhaustedError(
+              formatPoolExhaustedFailure({
+                attempted: [],
+                skipped: [
+                  { entry: { provider: "claude", model: "first" }, reason: "exhausted" },
+                  { entry: { provider: "codex", model: "second" }, reason: "exhausted" },
+                ],
+              })
+            )
+          ),
+        onRunEnd: (r) => seen.push(r),
+      },
+      new FakeProvider()
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.success).toBe(false);
+    expect(seen[0]?.output).toContain("model pool exhausted");
+    expect(seen[0]?.output).toContain("none was attempted");
+    expect(seen[0]?.output).toContain("claude:first (exhausted)");
+    expect(seen[0]?.output).toContain("codex:second (exhausted)");
+    // The summary is the whole output: no stack frames from the run boundary.
+    expect(seen[0]?.output).not.toContain("PoolExhaustedError");
+    expect(seen[0]?.output).not.toContain("    at ");
   });
 
   it("surfaces an actionable, ordered pool-exhaustion error without provider output", async () => {

@@ -327,6 +327,82 @@ describe("ProviderPacer", () => {
     it("returns undefined for an empty candidate list", () => {
       expect(selectPoolLane([], Date.now())).toBeUndefined();
     });
+
+    it("responsive selection prefers quota headroom over pacing heat (#655)", () => {
+      const now = Date.now();
+      // The higher-headroom lane is pacing-hot (deferred); the lower-headroom
+      // lane is available right now. Absolute quota gates, pacing ranks: the
+      // responsive run takes the lane with more quota headroom, and pacing
+      // heat never disqualifies it.
+      const hot = new ProviderPacer(0, () => now);
+      hot.deferUntil(now + 3_600_000);
+      const cool = new ProviderPacer(0, () => now);
+      const resetAtIso = new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString();
+      const observedAt = new Date(now).toISOString();
+      const candidates = [
+        {
+          config: "hot-high-headroom",
+          lane: "a",
+          pacer: hot,
+          weeklyQuota: { percentLeft: 80, observedAt, resetAtIso },
+        },
+        {
+          config: "cool-low-headroom",
+          lane: "b",
+          pacer: cool,
+          weeklyQuota: { percentLeft: 20, observedAt, resetAtIso },
+        },
+      ];
+
+      expect(selectPoolLane(candidates, now, { responsive: true })?.config).toBe(
+        "hot-high-headroom"
+      );
+      // Normal priority keeps the quote-first rule: the pacing-hot lane waits.
+      expect(selectPoolLane(candidates, now)?.config).toBe("cool-low-headroom");
+    });
+
+    it("responsive selection falls back to the quote rule without trustworthy evidence (#655)", () => {
+      const now = Date.now();
+      const hot = new ProviderPacer(0, () => now);
+      hot.deferUntil(now + 3_600_000);
+      const cool = new ProviderPacer(0, () => now);
+      const winner = selectPoolLane(
+        [
+          { config: "hot", lane: "a", pacer: hot },
+          { config: "cool", lane: "b", pacer: cool },
+        ],
+        now,
+        { responsive: true }
+      );
+
+      expect(winner?.config).toBe("cool");
+    });
+
+    it("responsive selection retains the quote rule with only one comparable weekly reading (#655)", () => {
+      const now = Date.now();
+      const unknownButAvailable = new ProviderPacer(0, () => now);
+      const knownButHot = new ProviderPacer(0, () => now);
+      knownButHot.deferUntil(now + 3_600_000);
+      const winner = selectPoolLane(
+        [
+          { config: "unknown", lane: "unknown", pacer: unknownButAvailable },
+          {
+            config: "known",
+            lane: "known",
+            pacer: knownButHot,
+            weeklyQuota: {
+              percentLeft: 2,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now,
+        { responsive: true }
+      );
+
+      expect(winner?.config).toBe("unknown");
+    });
   });
 
   describe("submitPoolGate", () => {
@@ -356,6 +432,34 @@ describe("ProviderPacer", () => {
       await vi.advanceTimersByTimeAsync(0);
       await expect(handle.result).resolves.toBe("b");
       expect(started).toEqual(["b"]);
+    });
+
+    it("starts the responsive headroom winner without waiting out its pace (#655)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const now = Date.now();
+      const hot = laneFor("hot");
+      hot.pacer.deferUntil(now + 3_600_000);
+      const cool = laneFor("cool");
+      const resetAtIso = new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString();
+      const observedAt = new Date(now).toISOString();
+      const started: string[] = [];
+      const handle = submitPoolGate(
+        async (config: string) => {
+          started.push(config);
+          return config;
+        },
+        [
+          { ...hot, weeklyQuota: { percentLeft: 80, observedAt, resetAtIso } },
+          { ...cool, weeklyQuota: { percentLeft: 20, observedAt, resetAtIso } },
+        ],
+        {
+          responsive: true,
+          enqueueNormal: (fn) => mesh.enqueue(fn),
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("hot");
+      expect(started).toEqual(["hot"]);
     });
 
     it("responsive requests choose the same earliest available healthy candidate as normal admission while bypassing pacing", async () => {
@@ -567,6 +671,58 @@ describe("ProviderPacer", () => {
 
       // Promotion bypasses the mesh queue without stranding its selected lane.
       expect(b.pacer.waiting).toBe(0);
+    });
+
+    it("promote() reselects away from a lane reported exhausted after normal admission (#655)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a");
+      const b = laneFor("b");
+      let aExhausted = false;
+      const selected: Array<{ candidate: string; responsive: boolean }> = [];
+      const handle = submitPoolGate(async (config: string) => config, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        isExhausted: (config) => aExhausted && config === "a",
+        onSelected: (selection) =>
+          selected.push({ candidate: selection.candidate, responsive: selection.responsive }),
+      });
+      expect(selected).toEqual([{ candidate: "a", responsive: false }]);
+
+      aExhausted = true;
+      handle.promote();
+      await expect(handle.result).resolves.toBe("b");
+      expect(selected).toEqual([
+        { candidate: "a", responsive: false },
+        { candidate: "b", responsive: true },
+      ]);
+
+      release();
+    });
+
+    it("promote() fails instead of reselecting a known-exhausted pool (#655)", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a");
+      const b = laneFor("b");
+      let exhausted = false;
+      const started = vi.fn(async (config: string) => config);
+      const handle = submitPoolGate(started, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        isExhausted: () => exhausted,
+        onResponsivePoolExhausted: () => new Error("all lanes exhausted"),
+      });
+
+      exhausted = true;
+      handle.promote();
+      release();
+      await expect(handle.result).rejects.toThrow("all lanes exhausted");
+      expect(started).not.toHaveBeenCalled();
     });
 
     it("cancel() rejects the outer handle and stops the reserved lane from starting", async () => {
