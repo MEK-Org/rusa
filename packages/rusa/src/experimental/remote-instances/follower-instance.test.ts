@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
+import type { LeaderCommand, ProviderFactory } from "./protocol.js";
 
 const instances: ReturnType<typeof createHarness>[] = [];
 const dirs: string[] = [];
@@ -15,6 +16,7 @@ function setup(
     pacer?: ProviderPacer;
     startupTimeoutMs?: number;
     stateStaleTimeoutMs?: number;
+    providerFactory?: ProviderFactory;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -29,7 +31,7 @@ function setup(
       ? () => {
           throw new Error("test provider initialization failed");
         }
-      : undefined,
+      : options.providerFactory,
   });
   instances.push(h);
   return h;
@@ -1054,6 +1056,80 @@ describe("monolithic follower instance", () => {
     )?.event;
     expect(started?.type === "runStart" && started.selected).toMatchObject({
       model: "model-pinned-queued",
+    });
+  });
+
+  it("does not re-quote a queued admission when its pool is republished unchanged", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 1_000);
+    const h = setup({ pacer });
+    const id = h.spawn("Keep an unchanged queued remote pool");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+    const runtime = h.runtime(id);
+    const sent: LeaderCommand[] = [];
+    const send = runtime.channel.send.bind(runtime.channel);
+    runtime.channel.send = (message, callback) => {
+      sent.push(message);
+      return send(message, callback);
+    };
+    runtime.setModelConfig([{ provider: "instance-fixture", model: "scripted" }]);
+
+    expect(sent.filter((message) => message.type === "modelConfig")).toEqual([]);
+    expect(pacer.waiting).toBe(1);
+  });
+
+  it("executes the follower provider constructed for a staged pin", async () => {
+    const executedModels: string[] = [];
+    const constructedModels: string[] = [];
+    let releaseInitialRun: (() => void) | undefined;
+    let initialRunStarted = false;
+    const h = setup({
+      providerFactory: (_bridge, _options, selected) => {
+        constructedModels.push(selected?.model ?? "missing");
+        return {
+          name: "instance-fixture",
+          providerName: "instance-fixture",
+          model: selected?.model,
+          async run() {
+            executedModels.push(selected?.model ?? "missing");
+            if (!initialRunStarted) {
+              initialRunStarted = true;
+              await new Promise<void>((resolve) => {
+                releaseInitialRun = resolve;
+              });
+            }
+            return { success: true, output: "", exitCode: 0, model: selected?.model };
+          },
+        };
+      },
+    });
+    const id = h.spawn("Execute the staged follower pin");
+    await waitUntil(() => initialRunStarted && h.runtime(id).isRunning);
+
+    h.mesh.setActorModel(
+      id,
+      [{ provider: "instance-fixture", model: "model-pinned-executed" }],
+      "root"
+    );
+    releaseInitialRun?.();
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "result")
+    );
+    await waitUntil(() => h.actors.get(id)?.modelConfig?.[0]?.model === "model-pinned-executed");
+    h.inboxStore.append([
+      { actorId: id, source: "test:durable-executed-pin", payload: { type: "test.work" } },
+    ]);
+    h.mesh.dispatch(id);
+
+    await waitUntil(
+      () =>
+        h.events.filter((event) => event.actorId === id && event.event.type === "result").length ===
+        2
+    );
+    expect({ constructedModels, executedModels }).toEqual({
+      constructedModels: ["scripted", "model-pinned-executed"],
+      executedModels: ["scripted", "model-pinned-executed"],
     });
   });
 

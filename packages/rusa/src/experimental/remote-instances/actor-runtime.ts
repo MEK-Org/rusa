@@ -5,8 +5,8 @@ import {
   RunStartStaleProviderError,
 } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
-import type { ProviderModelConfig } from "../../providers/model-config.js";
-import type { McpServerSpec } from "../../providers/types.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
+import type { CodingProvider, McpServerSpec } from "../../providers/types.js";
 import {
   type ActorEvent,
   type Bootstrap,
@@ -99,29 +99,38 @@ export function createActorRuntime(
     }
     let snapshot: RunSnapshot;
     sessionId = bootstrap.sessionId;
-    const provider = await createProvider(
-      {
-        sendMessage: (to, body) => request({ op: "sendMessage", to, body }).result,
-        yieldRun: (status, note) => {
-          if (!actor) throw new Error("Actor is not initialized");
-          actor.declareYield(status, note);
-        },
+    const bridge = {
+      sendMessage: (to: string, body: string) => request({ op: "sendMessage", to, body }).result,
+      yieldRun: (status?: string, note?: string) => {
+        if (!actor) throw new Error("Actor is not initialized");
+        actor.declareYield(status, note);
       },
-      bootstrap.providerOptions ?? {}
-    );
-    if (stopping) return;
+    };
+    const providerOptions = bootstrap.providerOptions ?? {};
     mcpServers.splice(0, mcpServers.length, ...(bootstrap.mcpServers ?? []));
-    // One provider per remote actor: the bootstrap names the single declared
-    // candidate, so selection resolves back to it whatever the leader reserved.
     const modelConfig = bootstrap.modelConfig?.length
       ? [...bootstrap.modelConfig]
-      : [{ provider: provider.providerName ?? provider.name }];
+      : [{ provider: String(providerOptions.name ?? "unknown") }];
+    const providers = new Map<string, CodingProvider>();
+    const resolveProvider = (selected: RawProviderModelConfig): CodingProvider => {
+      const key = JSON.stringify(selected);
+      let provider = providers.get(key);
+      if (!provider) {
+        provider = createProvider(bridge, providerOptions, selected);
+        providers.set(key, provider);
+      }
+      return provider;
+    };
+    // Construct the bootstrap tuple before ready so a bad follower provider
+    // still rejects startup. Later runs resolve their own admitted tuple.
+    resolveProvider(modelConfig[0]);
+    if (stopping) return;
     actor = new Actor({
       ...bootstrap.actorOptions,
       id: bootstrap.id,
       cwd: bootstrap.cwd,
       modelConfig,
-      resolveProvider: () => provider,
+      resolveProvider,
       mcpServers,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
       loadSessionId: () => sessionId,
@@ -193,9 +202,6 @@ export function createActorRuntime(
           if (snapshot.mcpServers) {
             // Actor holds the array by reference, matching the in-process tool refresh path.
             mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
-          }
-          if (snapshot.record.modelConfig?.length) {
-            actor?.setModelConfig(snapshot.record.modelConfig as ProviderModelConfig[]);
           }
           // The leader's pacing gate owns selection; the follower runs what it reserved.
           return await fn(snapshot.selected ?? candidates[0]);

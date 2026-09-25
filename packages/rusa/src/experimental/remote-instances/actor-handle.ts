@@ -38,6 +38,22 @@ export interface ActorHandleOptions {
   stateStaleTimeoutMs?: number;
 }
 
+function sameModelConfigPool(
+  current: readonly RawProviderModelConfig[] | undefined,
+  next: readonly RawProviderModelConfig[]
+): boolean {
+  return Boolean(
+    current &&
+      current.length === next.length &&
+      current.every(
+        (entry, index) =>
+          entry.provider === next[index]?.provider &&
+          entry.model === next[index]?.model &&
+          entry.effort === next[index]?.effort
+      )
+  );
+}
+
 /** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
 export class ActorHandle implements MeshActor {
   readonly id: string;
@@ -57,7 +73,7 @@ export class ActorHandle implements MeshActor {
       release: () => void;
       /** Priority the leader actually admitted, which a promotion can raise after the request. */
       admission: { responsive: boolean };
-      /** Pool revision quoted when this reservation entered the leader gate. */
+      /** Pool revision this reservation quoted; used if it survives a flap. */
       modelConfigGeneration: number;
       /** The pool changed after this reservation quoted; retry it under the new pool. */
       modelConfigStale: boolean;
@@ -93,6 +109,8 @@ export class ActorHandle implements MeshActor {
   private pendingQueuedPromotion = false;
   /** Incremented for each next-run pool replacement so stale gates can re-quote. */
   private modelConfigGeneration = 0;
+  /** Last pool sent to this follower; kept apart from the caller-owned bootstrap object. */
+  private modelConfig: RawProviderModelConfig[] | undefined;
   private preemptSequence = 0;
   /** The one unanswered preempt; later responsive items coalesce behind its answer. */
   private outstandingPreempt: number | undefined;
@@ -105,6 +123,7 @@ export class ActorHandle implements MeshActor {
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
+    this.modelConfig = opts.bootstrap.modelConfig ? [...opts.bootstrap.modelConfig] : undefined;
     this.channel = opts.host;
     this.log = (opts.logger ?? nullLogger).child({
       component: "remote-instance",
@@ -216,7 +235,7 @@ export class ActorHandle implements MeshActor {
       bootstrap: {
         ...this.opts.bootstrap,
         ...(sessionId ? { sessionId } : {}),
-        modelConfig: freshSnapshot.record.modelConfig ?? this.opts.bootstrap.modelConfig,
+        modelConfig: freshSnapshot.record.modelConfig ?? this.modelConfig,
         mcpServers: freshSnapshot.mcpServers,
         reconnect: true,
         // Invite the follower to re-announce the admission this handle kept.
@@ -274,8 +293,8 @@ export class ActorHandle implements MeshActor {
   }
 
   setModelConfig(modelConfig: ProviderModelConfig[]): void {
-    if (JSON.stringify(this.opts.bootstrap.modelConfig) === JSON.stringify(modelConfig)) return;
-    this.opts.bootstrap.modelConfig = [...modelConfig];
+    if (sameModelConfigPool(this.modelConfig, modelConfig)) return;
+    this.modelConfig = [...modelConfig];
     this.modelConfigGeneration++;
     this.send({ type: "modelConfig", modelConfig: [...modelConfig] });
     // Keep remote placement at the same queued-start boundary as a local Actor:
@@ -284,8 +303,7 @@ export class ActorHandle implements MeshActor {
     // reservation stays untouched until attachHost can perform that re-quote.
     if (this.closed || !this.channel.connected) return;
     for (const gate of this.gates.values()) {
-      if (gate.handle.started || gate.modelConfigGeneration === this.modelConfigGeneration)
-        continue;
+      if (gate.handle.started) continue;
       gate.modelConfigStale = true;
       gate.handle.cancel?.();
     }
@@ -815,11 +833,7 @@ export class ActorHandle implements MeshActor {
                 const finished = new Promise<void>((resolve) => {
                   release = resolve;
                 });
-                const candidates = (
-                  this.opts.bootstrap.modelConfig?.length
-                    ? this.opts.bootstrap.modelConfig
-                    : request.candidates
-                ) as RawProviderModelConfig[];
+                const candidates = request.candidates as RawProviderModelConfig[];
                 const modelConfigGeneration = this.modelConfigGeneration;
                 const handle = ctx.gate(
                   async (selected) => {

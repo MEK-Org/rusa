@@ -9,14 +9,14 @@ export interface ProviderSelection {
   effort?: string;
 }
 
-/** Construct an ordinary provider adapter inside the follower instance. */
-export const createProvider: ProviderFactory = (_bridge, options) => {
+/** Construct the provider adapter for the tuple the leader admitted. */
+export const createProvider: ProviderFactory = (_bridge, options, selected) => {
   const selection = options as unknown as ProviderSelection;
   // The provider registry reads only providers; other service config stays in the parent.
   return resolveProvider(
     { providers: selection.providers } as RusaConfig,
-    selection.name,
-    selection.model,
-    selection.effort
+    selected?.provider ?? selection.name,
+    selected?.model ?? selection.model,
+    selected?.effort ?? selection.effort
   );
 };

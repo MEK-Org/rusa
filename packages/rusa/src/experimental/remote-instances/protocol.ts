@@ -16,11 +16,7 @@ export interface Bootstrap {
   id: string;
   cwd: string;
   sessionId?: string;
-  /**
-   * The actor's declared candidate pool. Remote placement carries a single
-   * candidate today: the follower builds one provider from `providerOptions`,
-   * so a longer pool has nothing to resolve a second candidate with.
-   */
+  /** The actor's declared candidate pool. */
   modelConfig?: RawProviderModelConfig[];
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
@@ -60,8 +56,10 @@ export interface ProviderBridge {
 
 export type ProviderFactory = (
   bridge: ProviderBridge,
-  options: Record<string, unknown>
-) => CodingProvider | Promise<CodingProvider>;
+  options: Record<string, unknown>,
+  /** The leader-admitted tuple that this adapter must execute. */
+  selected?: RawProviderModelConfig
+) => CodingProvider;
 
 export type Request =
   | { op: "beforeRun"; mode: ActorRunMode }
