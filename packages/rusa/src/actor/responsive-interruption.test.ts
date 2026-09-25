@@ -9,6 +9,7 @@ import {
 import {
   type JevDecisionClient,
   type JevDecisionRequest,
+  JevInputUnavailableError,
   SHADOW_INTERRUPT_EMOJI,
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -84,6 +85,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     const decision = await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a", "selected-b"],
       pendingEntryIds: ["pending-c"],
@@ -129,6 +131,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     const decision = await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a"],
       pendingEntryIds: [],
@@ -156,6 +159,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     const decision = await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a"],
       pendingEntryIds: [],
@@ -178,6 +182,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     const decision = await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a", "selected-b"],
       pendingEntryIds: [],
@@ -200,6 +205,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: [],
       pendingEntryIds: ["pending-c", "pending-d"],
@@ -223,6 +229,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
 
     await classifier.evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a", "incoming-z", "selected-a"],
       pendingEntryIds: [],
@@ -256,6 +263,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
           client: client(async () => response as never),
         });
         const decision = await classifier.evaluate({
+          actorId: "actor",
           incomingEntryId: "incoming-z",
           selectedEntryIds: ["selected-a"],
           pendingEntryIds: [],
@@ -272,6 +280,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         }),
       });
       const decision = await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
@@ -282,6 +291,25 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       expect(JSON.stringify(decision)).not.toContain("socket hang up");
     });
 
+    it("records a missing arrival text apart from a failed call", async () => {
+      const classifier = new ShadowResponsiveInterruptionClassifier({
+        threshold: 0.8,
+        client: client(async () => {
+          throw new JevInputUnavailableError();
+        }),
+      });
+      const decision = await classifier.evaluate({
+        actorId: "actor",
+        incomingEntryId: "incoming-z",
+        selectedEntryIds: ["selected-a"],
+        pendingEntryIds: [],
+      });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "input_unavailable" });
+      expect(shadowPrediction(decision)).toBe(null);
+      // The lookup key serves the client only; the audit stays ids of entries.
+      expect(decision.input).not.toHaveProperty("actorId");
+    });
+
     it("queues when the client exceeds its deadline", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
@@ -289,6 +317,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         client: client(() => new Promise(() => {})),
       });
       const decision = await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
@@ -308,6 +337,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         })),
       });
       const decision = await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
@@ -323,6 +353,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     it("queues with no client at all, and asks nothing", async () => {
       const classifier = new ShadowResponsiveInterruptionClassifier({ threshold: 0.8 });
       const decision = await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: "incoming-z",
         selectedEntryIds: ["selected-a"],
         pendingEntryIds: [],
@@ -340,6 +371,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         }),
       });
       const decision = await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: "incoming-z",
         selectedEntryIds: [],
         pendingEntryIds: [],
@@ -355,6 +387,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         threshold: 0.8,
         client: fixtureClient(fixture),
       }).evaluate({
+        actorId: "actor",
         incomingEntryId: fixture.incoming.id,
         selectedEntryIds: fixture.candidates.map((entry) => entry.id),
         pendingEntryIds: [],
@@ -393,6 +426,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         }),
       });
       await classifier.evaluate({
+        actorId: "actor",
         incomingEntryId: SCALE_FIXTURE.incoming.id,
         selectedEntryIds: SCALE_FIXTURE.candidates.map((entry) => entry.id),
         pendingEntryIds: [],
@@ -418,6 +452,7 @@ describe("shadowPrediction", () => {
       timeoutMs: 10,
       ...(decideFn ? { client: client(decideFn) } : {}),
     }).evaluate({
+      actorId: "actor",
       incomingEntryId: "incoming-z",
       selectedEntryIds: ["selected-a"],
       pendingEntryIds: [],

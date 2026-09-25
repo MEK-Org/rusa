@@ -37,9 +37,21 @@ export interface JevDecisionClient {
   ): Promise<JevDecisionResponse>;
 }
 
+/**
+ * Thrown by a client that could not read the arriving item's text. Recorded as
+ * `input_unavailable` so the audit separates "nothing to decide on" from a
+ * failed call.
+ */
+export class JevInputUnavailableError extends Error {
+  constructor() {
+    super("JEV decision input text is unavailable");
+    this.name = "JevInputUnavailableError";
+  }
+}
+
 export interface JevDecisionRequest {
   /** Host-local lookup key. It is not copied into the durable decision audit. */
-  actorId?: string;
+  actorId: string;
   /** The open-ended decision put to the model, verbatim. */
   question: string;
   input: {
@@ -134,8 +146,8 @@ export function shadowReactionTarget(
 }
 
 export interface ResponsiveInterruptionInput {
-  /** Host-local lookup key for a live client; omitted by isolated policy tests. */
-  actorId?: string;
+  /** Host-local lookup key for a live client; not copied into the audit. */
+  actorId: string;
   incomingEntryId: string;
   /** The primary candidate set. Whenever it is non-empty it is the only set. */
   selectedEntryIds: readonly string[];
@@ -148,7 +160,7 @@ interface DecisionBase {
   candidateSource: ResponsiveInterruptionCandidateSource;
   threshold: number;
   /** IDs only: message bodies and other operational content never enter the audit. */
-  input: ResponsiveInterruptionInput;
+  input: Omit<ResponsiveInterruptionInput, "actorId">;
 }
 
 /**
@@ -159,6 +171,7 @@ interface DecisionBase {
 export type ResponsiveInterruptionQueueReason =
   | "unavailable"
   | "client_error"
+  | "input_unavailable"
   | "timeout"
   | "no_candidates"
   | "invalid_verdict"
@@ -187,11 +200,11 @@ export type ResponsiveInterruptionDecision =
     });
 
 /**
- * How long a decision may take before the policy stops waiting on it.
- * Uncalibrated placeholder: no live client exists yet to measure. The number,
- * and whether an abandoned request should be cancelled through an
- * `AbortSignal` on the request rather than merely no longer awaited, belong to
- * the live-client slice.
+ * How long a decision may take before the policy stops waiting on it. The
+ * budget covers the live client's source reads as well as its HTTP request,
+ * and expiry aborts both through the `AbortSignal` passed to `decide`.
+ * Uncalibrated placeholder: shadow mode delays nothing, and `timeout` is
+ * recorded as its own reason, so the shadow data is what calibrates it.
  */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
@@ -249,7 +262,7 @@ export class ShadowResponsiveInterruptionClassifier {
 
     let response: JevDecisionResponse;
     try {
-      response = await this.withDeadline({
+      response = await this.withDeadline(this.client, {
         actorId: input.actorId,
         question: RESPONSIVE_INTERRUPTION_QUESTION,
         input: { incomingEntryId: input.incomingEntryId, candidateEntryIds, candidateSource },
@@ -257,7 +270,8 @@ export class ShadowResponsiveInterruptionClassifier {
     } catch (err) {
       // The error text is the other route by which operational content could
       // reach the audit, so only the fact of failure is recorded.
-      return queue(err === DEADLINE_EXCEEDED ? "timeout" : "client_error");
+      if (err === DEADLINE_EXCEEDED) return queue("timeout");
+      return queue(err instanceof JevInputUnavailableError ? "input_unavailable" : "client_error");
     }
 
     if (!isConfidence(response?.confidence)) return queue("invalid_confidence");
@@ -287,9 +301,10 @@ export class ShadowResponsiveInterruptionClassifier {
    * resolves would leak a pending observation per arrival; in a later
    * authoritative mode it would stall the arrival itself.
    */
-  private async withDeadline(request: JevDecisionRequest): Promise<JevDecisionResponse> {
-    const client = this.client;
-    if (!client) throw new Error("JEV decision client is unavailable");
+  private async withDeadline(
+    client: JevDecisionClient,
+    request: JevDecisionRequest
+  ): Promise<JevDecisionResponse> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {

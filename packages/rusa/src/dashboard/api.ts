@@ -168,7 +168,7 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
-import { parseReference } from "../references/reference.js";
+import { gchatInboxMessageReference } from "../references/inbox-reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -523,43 +523,6 @@ function parsePositiveInt(url: URL, name: string): number | undefined {
 function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
   return Math.min(requested, maxLimit);
-}
-
-/**
- * The `gchat:spaces/S/messages/M` reference a Google Chat inbox entry is
- * about, or undefined when its payload names no message in its source space.
- *
- * A chat event's `source` is the containing space (routing granularity), so
- * resolving that would show the wrong entity; the message itself is the
- * payload's `messageName`, which is Google's resource name and so already
- * the reference path.
- */
-function gchatInboxMessageReference(source: string, payload: InboxPayload): string | undefined {
-  if (payload.type !== "gchat.message" || typeof payload.messageName !== "string") {
-    return undefined;
-  }
-  try {
-    const reference = parseReference(`gchat:${payload.messageName}`);
-    const sourceReference = parseReference(source);
-    const [messageCollection, messageSpace, messageKind] = reference.segments;
-    const [sourceCollection, sourceSpace] = sourceReference.segments;
-    // This is the exact Google message resource form, not the cache's broader
-    // internal entity classifier. The source must be the message's containing
-    // space: an inbox payload cannot use this rendering path to name a message
-    // in a different space.
-    return reference.scheme === "gchat" &&
-      reference.segments.length === 4 &&
-      messageCollection === "spaces" &&
-      messageKind === "messages" &&
-      sourceReference.scheme === "gchat" &&
-      sourceReference.segments.length === 2 &&
-      sourceCollection === "spaces" &&
-      messageSpace === sourceSpace
-      ? reference.key
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**

@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { HttpJevDecisionClient, JEV_SYSTEM_ONE_URL } from "./jev-decision-client.js";
+import {
+  HttpJevDecisionClient,
+  JEV_MAX_CANDIDATES,
+  JEV_SYSTEM_ONE_URL,
+  type JevFetch,
+} from "./jev-decision-client.js";
+import { JevInputUnavailableError } from "./responsive-interruption.js";
 
 describe("HttpJevDecisionClient", () => {
   it("sends resolved live text only in the typed System One request", async () => {
@@ -26,6 +32,7 @@ describe("HttpJevDecisionClient", () => {
     const resolve = vi.fn(async (_actorId: string, id: string) => ({
       id,
       source: "mesh:root",
+      type: "mesh.message",
       text: id === "incoming" ? "Stop the deployment" : "Deploy the service",
     }));
     const client = new HttpJevDecisionClient("synthetic-key", resolve, fetch);
@@ -69,7 +76,7 @@ describe("HttpJevDecisionClient", () => {
   it("rejects malformed answers without inventing a verdict", async () => {
     const client = new HttpJevDecisionClient(
       "synthetic-key",
-      async (_actorId, id) => ({ id, source: "mesh:root", text: "text" }),
+      async (_actorId, id) => ({ id, source: "mesh:root", type: "mesh.message", text: "text" }),
       async () => ({ ok: true, status: 200, json: async () => ({ answers: {} }) })
     );
 
@@ -89,7 +96,7 @@ describe("HttpJevDecisionClient", () => {
   it("rejects an incomplete documented Choice response", async () => {
     const client = new HttpJevDecisionClient(
       "synthetic-key",
-      async (_actorId, id) => ({ id, source: "mesh:root", text: "text" }),
+      async (_actorId, id) => ({ id, source: "mesh:root", type: "mesh.message", text: "text" }),
       async () => ({
         ok: true,
         status: 200,
@@ -110,5 +117,79 @@ describe("HttpJevDecisionClient", () => {
         },
       })
     ).rejects.toThrow("invalid interruption answer");
+  });
+
+  it("fails as input-unavailable, without a request, when the arrival has no text", async () => {
+    const fetch = vi.fn<JevFetch>();
+    const client = new HttpJevDecisionClient(
+      "synthetic-key",
+      async (_actorId, id) => ({
+        id,
+        source: "obligation:o",
+        type: "scheduled.wake",
+        text: id === "incoming" ? null : "text",
+      }),
+      fetch
+    );
+    await expect(
+      client.decide({
+        actorId: "worker",
+        question: "question",
+        input: {
+          incomingEntryId: "incoming",
+          candidateEntryIds: ["candidate"],
+          candidateSource: "selected",
+        },
+      })
+    ).rejects.toBeInstanceOf(JevInputUnavailableError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("sends textless candidates by type and caps how many are read", async () => {
+    let body: Record<string, unknown> | undefined;
+    const fetch = vi.fn<JevFetch>(async (_url, init) => {
+      body = JSON.parse(init.body) as Record<string, unknown>;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          answers: {
+            interruption: {
+              type: "choice",
+              choice: "queue",
+              probabilities: { interrupt: 0.1, queue: 0.9 },
+              confidence: 0.9,
+            },
+          },
+        }),
+      };
+    });
+    const resolve = vi.fn(async (_actorId: string, id: string) => ({
+      id,
+      source: "mesh:root",
+      type: id === "c0" ? "scheduled.wake" : "mesh.message",
+      text: id === "c0" ? null : `text ${id}`,
+    }));
+    const candidateEntryIds = Array.from({ length: JEV_MAX_CANDIDATES + 5 }, (_, i) => `c${i}`);
+    const client = new HttpJevDecisionClient("synthetic-key", resolve, fetch);
+
+    await expect(
+      client.decide({
+        actorId: "worker",
+        question: "question",
+        input: { incomingEntryId: "incoming", candidateEntryIds, candidateSource: "pending" },
+      })
+    ).resolves.toEqual({ verdict: "queue", confidence: 0.9 });
+
+    expect(resolve).toHaveBeenCalledTimes(JEV_MAX_CANDIDATES + 1);
+    const state = body?.state as { candidates: unknown[]; omittedCandidates?: number };
+    expect(state.candidates).toHaveLength(JEV_MAX_CANDIDATES);
+    expect(state.candidates[0]).toEqual({
+      id: "c0",
+      source: "mesh:root",
+      type: "scheduled.wake",
+      text: null,
+    });
+    expect(state.omittedCandidates).toBe(5);
   });
 });

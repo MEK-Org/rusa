@@ -1444,6 +1444,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     config.jevApiKeyFile === undefined
       ? undefined
       : new ShadowResponsiveInterruptionClassifier({
+          // Uncalibrated placeholder until shadow data exists. It only decides
+          // which recorded prediction (and chat reaction) a confident-enough
+          // interrupt gets; shadow mode never changes scheduling.
           threshold: 0.8,
           ...(jevApiKey
             ? {

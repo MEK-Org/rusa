@@ -1,19 +1,30 @@
-import type {
-  JevDecisionClient,
-  JevDecisionRequest,
-  JevDecisionResponse,
+import {
+  type JevDecisionClient,
+  type JevDecisionRequest,
+  type JevDecisionResponse,
+  JevInputUnavailableError,
 } from "./responsive-interruption.js";
 
 /** The documented TypeSafe System One endpoint used for this narrow shadow policy. */
 export const JEV_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone";
 /** An alias rather than a pinned release lets the operator's TypeSafe account select its current model. */
 export const JEV_DEFAULT_MODEL = "jev-latest";
+/**
+ * Most candidates resolved and sent per decision, in the scheduler's order.
+ * Uncalibrated placeholder: the `pending` fallback can be a whole inbox, and
+ * this bounds source reads and request size until shadow data says otherwise.
+ * The count left out is still sent, so the model knows the list was cut.
+ */
+export const JEV_MAX_CANDIDATES = 20;
 
 export interface JevResolvedInboxEntry {
   id: string;
   source: string;
-  /** Full source text, held only for the duration of this request. */
-  text: string;
+  /** Inbox payload type, so a candidate without readable text still says what it is. */
+  type: string;
+  /** Source text (bounded), or null when the source could not be read. Never persisted. */
+  text: string | null;
+  truncated?: true;
 }
 
 /** Host-owned resolution boundary; neither the scheduler nor its audit stores text. */
@@ -44,17 +55,18 @@ export class HttpJevDecisionClient implements JevDecisionClient {
     request: JevDecisionRequest,
     options: { signal?: AbortSignal } = {}
   ): Promise<JevDecisionResponse> {
-    const actorId = request.actorId;
-    if (!actorId) throw new Error("JEV decision requires an actor id");
+    const { actorId } = request;
     const { incomingEntryId, candidateEntryIds, candidateSource } = request.input;
+    const sent = candidateEntryIds.slice(0, JEV_MAX_CANDIDATES);
     const [incoming, ...candidates] = await Promise.all(
-      [incomingEntryId, ...candidateEntryIds].map((entryId) =>
+      [incomingEntryId, ...sent].map((entryId) =>
         this.resolveEntry(actorId, entryId, options.signal)
       )
     );
-    if (!incoming || candidates.some((entry) => entry === undefined)) {
-      throw new Error("JEV decision could not resolve an inbox entry");
-    }
+    // Without the arriving item's text there is nothing to decide. That is an
+    // input gap, not a transport failure, and the audit keeps them apart.
+    if (!incoming || incoming.text === null) throw new JevInputUnavailableError();
+    const omittedCandidates = candidateEntryIds.length - sent.length;
 
     const response = await this.fetchImpl(JEV_SYSTEM_ONE_URL, {
       method: "POST",
@@ -69,6 +81,7 @@ export class HttpJevDecisionClient implements JevDecisionClient {
           incoming,
           candidates,
           candidateSource,
+          ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
         },
         questions: {
           interruption: {
