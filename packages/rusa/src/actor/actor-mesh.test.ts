@@ -9157,6 +9157,37 @@ describe("ActorMesh", () => {
         expect(t.preemptions()).toEqual([target]);
       });
 
+      it("routes by the role it computed, not one the raw event payload claims", async () => {
+        // The timer normalizer spreads `rawPayload`, so a `deliveryRole`
+        // inside it reaches the fan-out. Routing's answer must replace it in
+        // both directions before the seam reads it (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        for (const claimed of ["subscriber", "owner"] as const) {
+          await t.mesh.deliverExternalEvent({
+            ...responsiveIssueEvent,
+            rawPayload: { ...responsiveIssueEvent.rawPayload, deliveryRole: claimed },
+          });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+
+        const roles = (actorId: string) =>
+          t.unhandledResponsive(actorId).map((entry) => entry.payload.deliveryRole);
+        expect(roles(owner)).toEqual(["owner", "owner"]);
+        expect(roles(watcher)).toEqual(["subscriber", "subscriber"]);
+        // A claimed "subscriber" cannot turn the owner's wake into a join, and
+        // a claimed "owner" cannot make the subscriber's copy preempt.
+        expect(t.signals.get(owner)?.aborted).toBe(true);
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([owner]);
+      });
+
       it("treats an unstated timer priority as normal on the row and in the wake alike", async () => {
         // The persisted copy and the nudge that carries it must agree about
         // the same event. An unstated priority once persisted as responsive
