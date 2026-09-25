@@ -2240,6 +2240,9 @@ describe("agent-execution MCP server", () => {
       });
       expect(dataOf(res)).toContain("gchat:spaces/team: default");
       expect(mesh.chatWakeModeFor("spaces/team")).toBeUndefined();
+      // An unparseable or non-space resource returns undefined without throwing (#695).
+      expect(mesh.chatWakeModeFor("malformed space name")).toBeUndefined();
+      expect(mesh.chatWakeModeFor("gchat:spaces")).toBeUndefined();
     });
 
     it("lets a subscribed parent delegate to a child and reclaim the topic", async () => {

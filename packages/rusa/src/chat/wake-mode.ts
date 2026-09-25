@@ -55,6 +55,23 @@ export function chatSpaceResource(space: string): string {
 }
 
 /**
+ * Try to resolve a space string into a canonical `gchat:spaces/<id>` resource.
+ * Returns `undefined` if the input is malformed, empty, or does not name
+ * exactly one space, rather than throwing.
+ *
+ * Used by inbound ingestion where unexpected inputs must not abort processing,
+ * while {@link chatSpaceResource} remains strict for owner-facing tools (#695).
+ */
+export function tryChatSpaceResource(space: string): string | undefined {
+  if (typeof space !== "string" || !space.trim()) return undefined;
+  try {
+    return chatSpaceResource(space);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Durable per-space wake modes. SQLite in production
  * (`DbChatWakeModeStore`), in-memory for tests. Authority lives in the mesh,
  * never in the store: the store records whatever the mesh already accepted.

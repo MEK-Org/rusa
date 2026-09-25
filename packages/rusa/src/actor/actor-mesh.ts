@@ -5,6 +5,7 @@ import {
   type ChatWakeModeView,
   chatSpaceResource,
   InMemoryChatWakeModeStore,
+  tryChatSpaceResource,
 } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
@@ -3131,9 +3132,15 @@ export class ActorMesh {
    * follows the built-in default (#692). Read by chat ingestion for every
    * arriving message, so a change governs the next message; the host is the
    * caller, so no ownership check applies here.
+   *
+   * An unexpected or unparseable inbound space name cannot have a stored mode;
+   * it falls back safely to `undefined` so ingestion keeps the built-in default
+   * without throwing before the emergency halt brake (#695 review).
    */
   chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
-    return this.chatWakeModes.get(chatSpaceResource(space))?.mode;
+    const resource = tryChatSpaceResource(space);
+    if (!resource) return undefined;
+    return this.chatWakeModes.get(resource)?.mode;
   }
 
   /**

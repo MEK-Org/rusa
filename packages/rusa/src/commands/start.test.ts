@@ -3639,6 +3639,36 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await emit("spaces/dm", "d4", { dm: true });
     expect(delivered()).not.toContain("spaces/team/messages/t4");
     expect(delivered()).not.toContain("spaces/dm/messages/d4");
+
+    // An unexpected inbound space name (e.g. thread-qualified, which chatSpaceResource
+    // rejects as not naming a single space) safely falls back to default mode
+    // without throwing, so it reaches inbox delivery and emergency halt (#695).
+    await emit("spaces/team/threads/t1", "u1", { mention: true });
+    expect(delivered()).toContain("spaces/team/threads/t1/messages/u1");
+
+    // Emergency halt brake functions even when the inbound space name is unparseable for wake mode
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/halt1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/halt",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/resume1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/resume",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Resumed");
   });
 
   it("handles scoped/timed halt commands mechanically and requires resume before replacement", async () => {

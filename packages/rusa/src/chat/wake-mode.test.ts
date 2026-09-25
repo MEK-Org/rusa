@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { chatMessageWakes, chatSpaceResource, InMemoryChatWakeModeStore } from "./wake-mode.js";
+import {
+  chatMessageWakes,
+  chatSpaceResource,
+  InMemoryChatWakeModeStore,
+  tryChatSpaceResource,
+} from "./wake-mode.js";
 
 describe("chat wake mode (#692)", () => {
   const dm = { isDirectMessage: true, mentionsSelf: false };
@@ -28,6 +33,17 @@ describe("chat wake mode (#692)", () => {
     expect(() => chatSpaceResource("gchat:spaces")).toThrow(/one space/);
     expect(() => chatSpaceResource("gchat:spaces/AAA/threads/T")).toThrow(/one space/);
     expect(() => chatSpaceResource("github:dummy-org/dummy-repo")).toThrow(/one space/);
+  });
+
+  it("tryChatSpaceResource safely parses valid space names and returns undefined otherwise", () => {
+    expect(tryChatSpaceResource("spaces/AAA")).toBe("gchat:spaces/AAA");
+    expect(tryChatSpaceResource("AAA")).toBe("gchat:spaces/AAA");
+    expect(tryChatSpaceResource("gchat:spaces/AAA")).toBe("gchat:spaces/AAA");
+    expect(tryChatSpaceResource("gchat:spaces")).toBeUndefined();
+    expect(tryChatSpaceResource("gchat:spaces/AAA/threads/T")).toBeUndefined();
+    expect(tryChatSpaceResource("github:dummy-org/dummy-repo")).toBeUndefined();
+    expect(tryChatSpaceResource("malformed space name")).toBeUndefined();
+    expect(tryChatSpaceResource("")).toBeUndefined();
   });
 
   it("stores and clears per space in memory", () => {
