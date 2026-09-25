@@ -72,6 +72,12 @@ export class ActorHandle implements MeshActor {
   /** True from reattach until the follower reports which run, if any, survived the gap. */
   private stateStale = false;
   /**
+   * The stale-state deadline released held wakes before any report arrived.
+   * The leader's booked state still says nothing about the follower, so the
+   * first report that does arrive keeps its reattach meaning.
+   */
+  private stateUnconfirmed = false;
+  /**
    * Resolves with that first report. The mesh preempts before it nudges, and a
    * wake that overtook the deferred preempt would have its dirty bit cancelled
    * by it, so wakes wait here until the preempt decision has been sent.
@@ -162,6 +168,7 @@ export class ActorHandle implements MeshActor {
     // The follower kept its Actor across the gap; its first state report says
     // whether a run admitted before the loss is still in flight.
     this.stateStale = true;
+    this.stateUnconfirmed = false;
     this.settleState?.();
     this.stateSettled = new Promise((resolve) => {
       this.settleState = resolve;
@@ -174,15 +181,16 @@ export class ActorHandle implements MeshActor {
         actorId: this.id,
         target: this.opts.target ?? this.channel.nodeId,
       });
+      // Only wake delivery waits on this deadline. A missing report is not
+      // proof the follower gave up a retained ticket: its resume claim, its
+      // first report, or a fresh admission still decides that (#602/#604).
       this.stateStale = false;
-      this.state = "idle";
-      this.opts.context.onRuntimeStateChanged("idle");
+      this.stateUnconfirmed = true;
       if (this.pendingPreempt) {
         this.pendingPreempt = false;
         this.applyPreempt();
       }
       this.settleState?.();
-      void this.cancelRetainedAdmission();
     }, staleTimeout);
     // A reconnect is transport recovery, not a fresh actor boot. Its delayed
     // state/ready report must not cancel a leader-retained admission after 10s.
@@ -490,7 +498,11 @@ export class ActorHandle implements MeshActor {
 
   /** Displace whatever the follower's latest state report says is in the way. */
   private applyPreempt(): void {
-    if (this.isQueued) {
+    if (this.stateUnconfirmed) {
+      // Nothing reported since reattach: promote a ticket the leader holds, or
+      // let the follower's own Actor decide whether a run is in the way.
+      if (!this.promoteQueuedAdmissions()) this.sendPreempt();
+    } else if (this.isQueued) {
       if (!this.promoteQueuedAdmissions()) this.pendingQueuedPromotion = true;
     } else if (this.isRunning) {
       this.sendPreempt();
@@ -552,10 +564,11 @@ export class ActorHandle implements MeshActor {
       case "state": {
         clearTimeout(this.stateStaleTimer);
         this.stateStaleTimer = undefined;
-        const reattachReport = this.stateStale;
+        const reattachReport = this.stateStale || this.stateUnconfirmed;
         this.state = message.state;
         this.yielded = message.yielded;
         this.stateStale = false;
+        this.stateUnconfirmed = false;
         if (message.state !== "queued") this.pendingQueuedPromotion = false;
         if (this.pendingPreempt) {
           this.pendingPreempt = false;

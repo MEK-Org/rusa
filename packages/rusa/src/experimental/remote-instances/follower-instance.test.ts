@@ -878,6 +878,89 @@ describe("monolithic follower instance", () => {
     );
   });
 
+  it("keeps a retained admission when the reattach report lands after the stale-state deadline", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 1000);
+    const h = setup({ pacer, stateStaleTimeoutMs: 50 });
+    const id = h.spawn("Keep the ticket past a slow report");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+    const queuedRun = h.events.find(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )?.event;
+
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Hold every command on the reattached channel, in order, so the follower's
+    // resume claim and its first state report both land after the deadline.
+    const reconnect = h.reconnect();
+    const dispatch = h.follower.dispatch.bind(h.follower);
+    const held: Parameters<typeof dispatch>[0][] = [];
+    h.follower.dispatch = (envelope) => {
+      held.push(envelope);
+    };
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await waitUntil(() =>
+      h.logs.some((log) => log.event === "remote_state_stale_timeout" && log.fields?.actorId === id)
+    );
+    // A late report is not an abandoned admission: the ticket keeps its place.
+    expect(pacer.waiting).toBe(1);
+    expect(h.meshEvents.some((event) => event.kind === "run_abandoned")).toBe(false);
+
+    h.follower.dispatch = dispatch;
+    for (const envelope of held.splice(0)) dispatch(envelope);
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === id && event.event.type === "runStart")
+    );
+    const started = h.events.find(
+      (event) => event.actorId === id && event.event.type === "runStart"
+    )?.event;
+    expect(started?.type === "runStart" && started.runId).toBe(
+      queuedRun?.type === "queued" && queuedRun.runId
+    );
+    expect(h.meshEvents.some((event) => event.kind === "run_abandoned")).toBe(false);
+  });
+
+  it("asks the follower to preempt when its reattach state report never arrives", async () => {
+    const h = setup({ delayMs: 1500, stateStaleTimeoutMs: 50 });
+    const id = h.spawn("Run through a silent reattach");
+    await waitUntil(() => h.runtime(id).isRunning);
+
+    h.remote.close();
+    await h.runtime(id).exited;
+    h.dispatchResponsive(id);
+    await waitUntil(() =>
+      h.logs.some((log) => log.event === "remote_preempt_deferred" && log.fields?.actorId === id)
+    );
+
+    // The follower keeps executing but never reports state after the reattach,
+    // so the leader cannot tell a running follower from an idle one.
+    const beforeReattach = h.events.length;
+    const reconnect = h.reconnect();
+    const receive = reconnect.receive.bind(reconnect);
+    reconnect.receive = (event) => {
+      if (event.message.type === "state") return;
+      receive(event);
+    };
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    h.mesh.dispatch(id);
+
+    await waitUntil(() =>
+      h.events
+        .slice(beforeReattach)
+        .some(
+          (event) =>
+            event.actorId === id &&
+            event.event.type === "preempted" &&
+            event.event.preempted &&
+            event.event.phase === "running"
+        )
+    );
+    expect(h.meshEvents).toContainEqual(
+      expect.objectContaining({ kind: "run_preempted", actorId: id, detail: "running" })
+    );
+  });
+
   it("recovers an omitted actor handle without termination when boot re-registration omits it initially", async () => {
     const h = setup({ startupTimeoutMs: 50 });
     const first = h.spawn("First actor");
