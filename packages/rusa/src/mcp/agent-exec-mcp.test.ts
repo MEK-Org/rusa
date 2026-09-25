@@ -2190,22 +2190,32 @@ describe("agent-execution MCP server", () => {
       });
       const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       mesh.subscribeEventSource("gchat:spaces", "root", "root");
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      // The mode belongs to the space, not to its then-current owner: a later
+      // owner inherits the space's behavior and may change it.
+      let res = await call(rootClient, "set_chat_wake_mode", {
+        space: "gchat:spaces/team",
+        mode: "all",
+      });
+      expect(res.isError).toBeFalsy();
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
       });
 
-      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
-        (await client.callTool({ name, arguments: args })) as CallToolResult;
-
-      let res = await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" });
-      expect(res.isError).toBeFalsy();
-      expect(dataOf(res)).toContain("gchat:spaces/team: default");
-
-      res = await call(ownerClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" });
+      res = await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" });
       expect(res.isError).toBeFalsy();
       expect(dataOf(res)).toBe("gchat:spaces/team: all");
-      expect(mesh.chatWakeModeFor("spaces/team")).toBe("all");
+
+      res = await call(ownerClient, "set_chat_wake_mode", {
+        space: "spaces/team",
+        mode: "mentions",
+      });
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toBe("gchat:spaces/team: mentions");
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
       // Another of root's spaces is untouched, and the owner has no say over it.
       expect(mesh.chatWakeModeFor("spaces/other")).toBeUndefined();
       res = await call(ownerClient, "set_chat_wake_mode", { space: "spaces/other", mode: "all" });
@@ -2218,7 +2228,7 @@ describe("agent-execution MCP server", () => {
         mode: "mentions",
       });
       expect(res.isError).toBe(true);
-      expect(mesh.chatWakeModeFor("spaces/team")).toBe("all");
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
 
       // A space is the unit: the whole chat tree and a single thread are refused.
       res = await call(rootClient, "set_chat_wake_mode", { space: "gchat:spaces", mode: "all" });

@@ -32,7 +32,7 @@ describe("chat wake mode (#692)", () => {
 
   it("stores and clears per space in memory", () => {
     const store = new InMemoryChatWakeModeStore();
-    const setting = { resource: "gchat:spaces/A", mode: "all" as const, setBy: "root", setAt: "t" };
+    const setting = { resource: "gchat:spaces/A", mode: "all" as const };
     store.set(setting);
     expect(store.get("gchat:spaces/A")).toEqual(setting);
     expect(store.get("gchat:spaces/B")).toBeUndefined();

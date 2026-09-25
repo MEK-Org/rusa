@@ -19,14 +19,13 @@ export type ChatWakeMode = (typeof CHAT_WAKE_MODES)[number];
 export interface ChatWakeModeSetting {
   resource: string;
   mode: ChatWakeMode;
-  setBy: string;
-  setAt: string;
 }
 
 /** What an owner reads back: `mode: null` means no mode is stored and the default applies. */
-export type ChatWakeModeView =
-  | { resource: string; mode: ChatWakeMode; setBy: string; setAt: string }
-  | { resource: string; mode: null };
+export interface ChatWakeModeView {
+  resource: string;
+  mode: ChatWakeMode | null;
+}
 
 /**
  * The canonical `gchat:spaces/<id>` resource for one Google Chat space, from

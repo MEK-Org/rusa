@@ -3617,7 +3617,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().chatWakeModes.get("gchat:spaces/team")?.mode).toBe("all");
     expect(liveMesh.getChatWakeMode("gchat:spaces/dm", "root")).toMatchObject({
       mode: "mentions",
-      setBy: "root",
     });
 
     await emit("spaces/team", "t3");

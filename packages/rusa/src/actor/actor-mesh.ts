@@ -3143,9 +3143,7 @@ export class ActorMesh {
   getChatWakeMode(space: EventResource, callerId: string): ChatWakeModeView {
     const resource = this.requireChatSpaceOwner(space, callerId, "read");
     const setting = this.chatWakeModes.get(resource);
-    return setting
-      ? { resource, mode: setting.mode, setBy: setting.setBy, setAt: setting.setAt }
-      : { resource, mode: null };
+    return { resource, mode: setting?.mode ?? null };
   }
 
   /**
@@ -3161,11 +3159,10 @@ export class ActorMesh {
   ): ChatWakeModeView {
     const resource = this.requireChatSpaceOwner(space, callerId, "change");
     const setBy = this.resolveThreadId(callerId);
-    const setAt = this.now();
     if (mode === null) {
       this.chatWakeModes.clear(resource);
     } else {
-      this.chatWakeModes.set({ resource, mode, setBy, setAt });
+      this.chatWakeModes.set({ resource, mode });
     }
     this.recordEvent({
       kind: "chat_wake_mode_set",
@@ -3173,7 +3170,7 @@ export class ActorMesh {
       detail: resource,
       payload: JSON.stringify({ mode }),
     });
-    return mode === null ? { resource, mode: null } : { resource, mode, setBy, setAt };
+    return { resource, mode };
   }
 
   private requireChatSpaceOwner(

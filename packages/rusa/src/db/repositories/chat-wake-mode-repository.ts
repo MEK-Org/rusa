@@ -4,8 +4,6 @@ import type { ChatWakeMode, ChatWakeModeSetting, ChatWakeModeStore } from "../..
 type WakeModeRow = {
   resource: string;
   mode: ChatWakeMode;
-  set_by: string;
-  set_at: string;
 };
 
 /**
@@ -18,26 +16,20 @@ export class DbChatWakeModeStore implements ChatWakeModeStore {
 
   get(resource: string): ChatWakeModeSetting | undefined {
     const row = this.db
-      .prepare(
-        "SELECT resource, mode, set_by, set_at FROM chat_space_wake_modes WHERE resource = ?"
-      )
+      .prepare("SELECT resource, mode FROM chat_space_wake_modes WHERE resource = ?")
       .get(resource) as WakeModeRow | undefined;
-    return row
-      ? { resource: row.resource, mode: row.mode, setBy: row.set_by, setAt: row.set_at }
-      : undefined;
+    return row ? { resource: row.resource, mode: row.mode } : undefined;
   }
 
   set(setting: ChatWakeModeSetting): void {
     this.db
       .prepare(
-        `INSERT INTO chat_space_wake_modes (resource, mode, set_by, set_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO chat_space_wake_modes (resource, mode)
+         VALUES (?, ?)
          ON CONFLICT(resource) DO UPDATE SET
-           mode = excluded.mode,
-           set_by = excluded.set_by,
-           set_at = excluded.set_at`
+           mode = excluded.mode`
       )
-      .run(setting.resource, setting.mode, setting.setBy, setting.setAt);
+      .run(setting.resource, setting.mode);
   }
 
   clear(resource: string): void {

@@ -14,8 +14,9 @@ import type { Migration } from "./types.js";
  * need not have an exact ownership row to have an owner — it may bubble to the
  * owner of `gchat:spaces` — and a delegation should not silently reset how the
  * space behaves. Authority to write a row is checked by the mesh against the
- * space's current effective owner, not stored here. `set_by` is unconstrained
- * text like `event_source_owners.subscribed_by`.
+ * space's current effective owner, not stored here. The mesh event ledger
+ * records who made each change and when; this table keeps only the current
+ * behavior.
  */
 export const chatSpaceWakeModes: Migration = {
   id: "0051_chat_space_wake_modes",
@@ -23,9 +24,7 @@ export const chatSpaceWakeModes: Migration = {
     db.exec(`
       CREATE TABLE chat_space_wake_modes (
         resource TEXT PRIMARY KEY,
-        mode TEXT NOT NULL CHECK (mode IN ('mentions', 'all')),
-        set_by TEXT NOT NULL,
-        set_at TEXT NOT NULL
+        mode TEXT NOT NULL CHECK (mode IN ('mentions', 'all'))
       );
     `);
   },
