@@ -840,6 +840,12 @@ export class UnifiedAdmissionQueue<C> {
    * (reorderable, cancellable) rather than draining into per-lane FIFOs.
    * `selectPoolLane` keeps the weekly-headroom tie-break among idle lanes.
    *
+   * This is greedy, as requested in #633: when several lanes are idle in one
+   * pass, an earlier actor may take the lane a later, narrower actor needed
+   * while another idle lane goes unused until its next event. With one idle
+   * lane per pass it is the same as each lane claiming its first compatible
+   * actor.
+   *
    * An item only ever claims one of its own declared candidates, so a lane
    * never admits a model it does not gate: a model-scoped lane (e.g. Fable
    * under #588) is a distinct candidate lane, not a provider-wide match.
@@ -869,6 +875,8 @@ export class UnifiedAdmissionQueue<C> {
     const originalOnSelected = item.opts.onSelected;
     const originalOnStarted = item.opts.onStarted;
     let started = false;
+    // A one-candidate pool: a later promote() bypasses pacing on this same
+    // lane or fails as exhausted, and never transfers the claim.
     const inner = submitPoolGate(item.fn, [selected], {
       ...item.opts,
       responsive: item.responsive,

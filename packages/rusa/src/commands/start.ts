@@ -2385,7 +2385,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           config: c,
           lane,
           pacer: pacerFor(lane),
-          weeklyQuota: weeklyQuotaFor(lane),
+          // Read at claim time, not enqueue time: an actor can wait past the
+          // reading it arrived with, and a stale one drops the tie-break.
+          get weeklyQuota() {
+            return weeklyQuotaFor(lane);
+          },
         });
       }
       return admissionQueue.enqueue((selected) => fn(selected), lanes, {

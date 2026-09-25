@@ -1011,31 +1011,14 @@ describe("ActorMesh", () => {
   });
 
   it("rebuilds the unified admission list from unhandled inbox work after a leader restart (#672)", async () => {
-    // The durable inbox is the only record that survives a restart: rows
-    // committed before this mesh existed, with no scheduler state beside them.
     const inboxStore = createMemoryInboxStore();
     inboxStore.append([
       { actorId: "t1", source: "mesh:root", payload: payload("mesh.message") },
       { actorId: "t2", source: "mesh:root", payload: payload("mesh.message") },
     ]);
-    const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
-    const lane = new ProviderPacer(0);
-    lane.deferUntil(Date.now() + 60_000);
-    const { mesh, registry, fake } = setup({
-      inboxStore,
-      providerGate: (fn, candidates, request) =>
-        queue.enqueue(
-          fn,
-          candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
-          {
-            responsive: request.responsive,
-            threadId: request.threadId,
-            enqueueNormal: request.enqueueNormal,
-          }
-        ),
-    });
+    const actors = new InMemoryActorRepository();
     for (const id of ["t1", "t2"]) {
-      registry.upsert({
+      actors.upsert({
         id,
         charter: "resumed work",
         parentId: "root",
@@ -1043,19 +1026,44 @@ describe("ActorMesh", () => {
         createdAt: "2026-01-01T00:00:00Z",
       });
     }
-    mesh.rehydrateAll();
-    mesh.reconcileInbox();
+    const leader = (lane: ProviderPacer) => {
+      const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
+      const harness = setup({
+        inboxStore,
+        actors,
+        providerGate: (fn, candidates, request) =>
+          queue.enqueue(
+            fn,
+            candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
+            {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+            }
+          ),
+      });
+      harness.mesh.rehydrateAll();
+      harness.mesh.reconcileInbox();
+      return { ...harness, queue };
+    };
+
+    // The first leader accepts both actors into its list, then dies before
+    // its lane opens: the list, and nothing else, is lost.
+    const closed = new ProviderPacer(0);
+    closed.deferUntil(Date.now() + 24 * 60 * 60_000);
+    const first = leader(closed);
     await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(first.queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
+    first.mesh.shutdownAll();
 
-    // One unclaimed opportunity per actor, in the one list, none started.
-    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
-    expect(fake("t1").calls).toHaveLength(0);
-    expect(fake("t2").calls).toHaveLength(0);
-
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(fake("t1").calls).toHaveLength(1);
-    expect(fake("t2").calls).toHaveLength(1);
-    expect(queue.snapshot()).toEqual([]);
+    // A replacement leader has only the durable inbox to go on.
+    const second = leader(new ProviderPacer(0));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(second.fake("t1").calls).toHaveLength(1);
+    expect(second.fake("t2").calls).toHaveLength(1);
+    expect(first.fake("t1").calls).toHaveLength(0);
+    expect(first.fake("t2").calls).toHaveLength(0);
+    expect(second.queue.snapshot()).toEqual([]);
   });
 
   it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {

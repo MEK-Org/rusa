@@ -785,7 +785,7 @@ describe("UnifiedAdmissionQueue", () => {
     pacer: new ProviderPacer(intervalMs, () => Date.now()),
   });
 
-  it("keeps unclaimed work reorderable and lets responsive work bypass the normal wait", async () => {
+  it("claims unclaimed work in its reordered list order", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const queue = new UnifiedAdmissionQueue<string>();
     const delayed = laneFor("delayed", 60_000);
@@ -812,13 +812,54 @@ describe("UnifiedAdmissionQueue", () => {
     expect(queue.reorder("two", "one")).toBe(true);
     expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["two", "one"]);
 
-    one.promote();
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(two.result).resolves.toBe("two");
+    expect(started).toEqual(["two"]);
+    await vi.advanceTimersByTimeAsync(60_000);
     await expect(one.result).resolves.toBe("one");
-    expect(started).toEqual(["one"]);
-    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["two"]);
-    expect(two.cancel?.()).toBe(true);
-    await expect(two.result).rejects.toThrow(/cancelled before start/);
+    expect(started).toEqual(["two", "one"]);
+  });
+
+  it("promotes waiting work past pacing, and claimed work only on its own lane", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    b.pacer.deferUntil(Date.now() + 60_000);
+    let releaseBlocker!: () => void;
+    queue.enqueue(
+      () => new Promise<string>((resolve) => (releaseBlocker = () => resolve("blocker"))),
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const selected: Array<{ id: string; lane: string; responsive: boolean }> = [];
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(async (config) => config, lanes, {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        onSelected: ({ lane, responsive }) => selected.push({ id, lane, responsive }),
+      });
+    // `claimed` holds lane a, staged behind the full mesh; `waiting` has only
+    // the deferred lane b, so it is still unclaimed.
+    const claimed = run("claimed", [a, b]);
+    const waiting = run("waiting", [b]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "claimed", estimatedStartAt: null }),
+      expect.objectContaining({ threadId: "waiting" }),
+    ]);
+
+    waiting.promote();
+    claimed.promote();
+    await expect(waiting.result).resolves.toBe("b");
+    await expect(claimed.result).resolves.toBe("a");
+    expect(selected).toEqual([
+      { id: "claimed", lane: "a", responsive: false },
+      { id: "waiting", lane: "b", responsive: true },
+      { id: "claimed", lane: "a", responsive: true },
+    ]);
+    releaseBlocker();
   });
 
   it("skips a blocked head for a compatible actor, never letting a provider-wide lane claim a model-scoped one", async () => {
@@ -1067,18 +1108,36 @@ describe("UnifiedAdmissionQueue", () => {
     await expect(handle.result).resolves.toBe("fast");
   });
 
-  it("keeps the weekly-headroom tie-break among idle lanes", async () => {
+  it("breaks an idle-lane tie on the weekly headroom read at claim time", async () => {
     const mesh = new ConcurrencyLimiter(2);
     const queue = new UnifiedAdmissionQueue<string>();
-    const now = Date.now();
-    const resetAtIso = new Date(now + 3.5 * 24 * 60 * 60 * 1000).toISOString();
-    const observedAt = new Date(now).toISOString();
-    const lean = { ...laneFor("lean"), weeklyQuota: { percentLeft: 10, observedAt, resetAtIso } };
-    const roomy = { ...laneFor("roomy"), weeklyQuota: { percentLeft: 80, observedAt, resetAtIso } };
-    const handle = queue.enqueue(async (config) => config, [lean, roomy], {
+    const resetAtIso = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const percentLeft = new Map([
+      ["first", 80],
+      ["second", 10],
+    ]);
+    // start.ts supplies the reading through a getter over the latest
+    // coordinator publication, as these candidates do.
+    const withQuota = (config: string) => ({
+      ...laneFor(config),
+      get weeklyQuota() {
+        const observedAt = new Date(Date.now()).toISOString();
+        return { percentLeft: percentLeft.get(config) ?? 0, observedAt, resetAtIso };
+      },
+    });
+    const first = withQuota("first");
+    const second = withQuota("second");
+    first.pacer.deferUntil(Date.now() + 60 * 60_000);
+    second.pacer.deferUntil(Date.now() + 60 * 60_000);
+    const handle = queue.enqueue(async (config) => config, [first, second], {
       threadId: "picker",
       enqueueNormal: (fn) => mesh.enqueue(fn),
     });
-    await expect(handle.result).resolves.toBe("roomy");
+
+    // Headroom reverses while the actor waits past the enqueue-time reading.
+    percentLeft.set("first", 10);
+    percentLeft.set("second", 80);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    await expect(handle.result).resolves.toBe("second");
   });
 });
