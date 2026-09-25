@@ -629,117 +629,105 @@ void main() {
       estimatedStartAt: estimatedStartAt,
     );
 
-    test('sorts by ascending estimated start time', () {
+    test('sorts by admission position, not by estimate (#570)', () {
       final snapshot = ActorStateSnapshot(
-        orderedIds: const ['late', 'early', 'mid'],
+        orderedIds: const ['second', 'third', 'first'],
         actors: {
-          'late': ActorViewState(
+          // The later entry can have the earlier estimate: it waits on a
+          // different lane. The list shows real admission order anyway.
+          'second': ActorViewState(
             thread: queuedThread(
-              'late',
+              'second',
+              queuePosition: 1,
               estimatedStartAt: '2026-01-01T00:00:30.000Z',
             ),
             runState: RunState.queued,
           ),
-          'early': ActorViewState(
+          'third': ActorViewState(
             thread: queuedThread(
-              'early',
+              'third',
+              queuePosition: 2,
               estimatedStartAt: '2026-01-01T00:00:10.000Z',
             ),
             runState: RunState.queued,
           ),
-          'mid': ActorViewState(
-            thread: queuedThread(
-              'mid',
-              estimatedStartAt: '2026-01-01T00:00:20.000Z',
-            ),
-            runState: RunState.queued,
-          ),
-        },
-      );
-
-      expect(snapshot.queuedActors.map((a) => a.id), ['early', 'mid', 'late']);
-    });
-
-    test('places unknown estimates after every known estimate', () {
-      final snapshot = ActorStateSnapshot(
-        orderedIds: const ['unknown', 'known'],
-        actors: {
-          'unknown': ActorViewState(
-            thread: queuedThread('unknown', queuePosition: 0),
-            runState: RunState.queued,
-          ),
-          'known': ActorViewState(
-            thread: queuedThread(
-              'known',
-              estimatedStartAt: '2026-01-01T00:05:00.000Z',
-            ),
-            runState: RunState.queued,
-          ),
-        },
-      );
-
-      expect(snapshot.queuedActors.map((a) => a.id), ['known', 'unknown']);
-    });
-
-    test(
-      'breaks ties on equal estimated start time deterministically by id',
-      () {
-        final snapshot = ActorStateSnapshot(
-          orderedIds: const ['zeta', 'alpha'],
-          actors: {
-            'zeta': ActorViewState(
-              thread: queuedThread(
-                'zeta',
-                estimatedStartAt: '2026-01-01T00:00:10.000Z',
-              ),
-              runState: RunState.queued,
-            ),
-            'alpha': ActorViewState(
-              thread: queuedThread(
-                'alpha',
-                estimatedStartAt: '2026-01-01T00:00:10.000Z',
-              ),
-              runState: RunState.queued,
-            ),
-          },
-        );
-
-        // Same ordering regardless of insertion/orderedIds order — proves the
-        // comparator is symmetric rather than always favoring one side.
-        expect(snapshot.queuedActors.map((a) => a.id), ['alpha', 'zeta']);
-
-        final reversed = ActorStateSnapshot(
-          orderedIds: const ['alpha', 'zeta'],
-          actors: snapshot.actors,
-        );
-        expect(reversed.queuedActors.map((a) => a.id), ['alpha', 'zeta']);
-      },
-    );
-
-    test('breaks ties among unknown estimates by lane position then id', () {
-      final snapshot = ActorStateSnapshot(
-        orderedIds: const ['b-pos1', 'a-pos0', 'c-pos1'],
-        actors: {
-          'b-pos1': ActorViewState(
-            thread: queuedThread('b-pos1', queuePosition: 1),
-            runState: RunState.queued,
-          ),
-          'a-pos0': ActorViewState(
-            thread: queuedThread('a-pos0', queuePosition: 0),
-            runState: RunState.queued,
-          ),
-          'c-pos1': ActorViewState(
-            thread: queuedThread('c-pos1', queuePosition: 1),
+          'first': ActorViewState(
+            thread: queuedThread('first', queuePosition: 0),
             runState: RunState.queued,
           ),
         },
       );
 
       expect(snapshot.queuedActors.map((a) => a.id), [
-        'a-pos0',
-        'b-pos1',
-        'c-pos1',
+        'first',
+        'second',
+        'third',
       ]);
+    });
+
+    test('places queued actors outside the list last, by id', () {
+      final snapshot = ActorStateSnapshot(
+        orderedIds: const ['zeta', 'listed', 'alpha'],
+        actors: {
+          'zeta': ActorViewState(
+            thread: queuedThread('zeta'),
+            runState: RunState.queued,
+          ),
+          'listed': ActorViewState(
+            thread: queuedThread('listed', queuePosition: 4),
+            runState: RunState.queued,
+          ),
+          'alpha': ActorViewState(
+            thread: queuedThread('alpha'),
+            runState: RunState.queued,
+          ),
+        },
+      );
+
+      expect(snapshot.queuedActors.map((a) => a.id), [
+        'listed',
+        'alpha',
+        'zeta',
+      ]);
+      final reversed = ActorStateSnapshot(
+        orderedIds: const ['alpha', 'listed', 'zeta'],
+        actors: snapshot.actors,
+      );
+      expect(reversed.queuedActors.map((a) => a.id), [
+        'listed',
+        'alpha',
+        'zeta',
+      ]);
+    });
+  });
+
+  group('ThreadDto admission fields (#570)', () {
+    test('parses lanes, claim and skip, defaulting when absent', () {
+      final claimed = ThreadDto.fromJson({
+        'id': 'a',
+        'handle': 'a-handle',
+        'status': 'active',
+        'queuePosition': 0,
+        'admissionClaimed': true,
+        'compatibleLanes': ['claude', 'codex'],
+        'claimedLane': 'codex',
+        'admissionSkip': {'lane': 'agy', 'count': 2},
+      });
+      expect(claimed.admissionClaimed, isTrue);
+      expect(claimed.compatibleLanes, ['claude', 'codex']);
+      expect(claimed.claimedLane, 'codex');
+      expect(claimed.admissionSkip?.lane, 'agy');
+      expect(claimed.admissionSkip?.count, 2);
+
+      final older = ThreadDto.fromJson({
+        'id': 'b',
+        'handle': 'b-handle',
+        'status': 'active',
+      });
+      expect(older.admissionClaimed, isFalse);
+      expect(older.compatibleLanes, isEmpty);
+      expect(older.claimedLane, isNull);
+      expect(older.admissionSkip, isNull);
     });
   });
 

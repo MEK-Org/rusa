@@ -19,6 +19,10 @@ export 'models.dart' show DotState;
 
 enum _RuntimePhase { uninitialized, syncing, live }
 
+/// How an operator's admission-list move ended: applied, refused because the
+/// list changed under the view, or failed for another reported reason.
+enum QueueReorderOutcome { moved, stale, failed }
+
 const int _kRuntimeDeltaBufferCap = 100;
 const Duration _kRuntimeRetryInitial = Duration(milliseconds: 250);
 const Duration _kRuntimeRetryMax = Duration(seconds: 5);
@@ -1296,6 +1300,38 @@ class DashboardStore {
     } catch (e) {
       _error.add('$e');
     }
+  }
+
+  /// Move an unclaimed queued actor within the admission list (#570), then
+  /// resync so the view shows the server's order either way. A 409 means the
+  /// list changed under [observedOrder]; nothing moved, and the caller says so.
+  /// Any other failure is reported after the resync, which would clear it.
+  Future<QueueReorderOutcome> reorderQueuedActor({
+    required String threadId,
+    required String? beforeThreadId,
+    required List<String> observedOrder,
+  }) async {
+    QueueReorderOutcome outcome;
+    String? failure;
+    try {
+      await _api.reorderAdmissionQueue(
+        threadId: threadId,
+        beforeThreadId: beforeThreadId,
+        observedOrder: observedOrder,
+      );
+      outcome = QueueReorderOutcome.moved;
+    } on DashboardApiException catch (e) {
+      outcome = e.status == 409
+          ? QueueReorderOutcome.stale
+          : QueueReorderOutcome.failed;
+      if (outcome == QueueReorderOutcome.failed) failure = '$e';
+    } catch (e) {
+      outcome = QueueReorderOutcome.failed;
+      failure = '$e';
+    }
+    await _requestRuntimeSync();
+    _error.add(failure);
+    return outcome;
   }
 
   /// Bypass queue and quota throttle to run an actor immediately.

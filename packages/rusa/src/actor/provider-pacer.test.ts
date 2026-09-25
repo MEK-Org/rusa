@@ -820,6 +820,121 @@ describe("UnifiedAdmissionQueue", () => {
     expect(started).toEqual(["two", "one"]);
   });
 
+  it("applies an operator reorder only against the unclaimed order it observed (#570)", () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const delayed = laneFor("delayed", 60_000);
+    delayed.pacer.deferUntil(Date.now() + 60_000);
+    const run = (id: string) =>
+      queue.enqueue(async () => id, [delayed], {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+    run("one");
+    run("two");
+
+    expect(queue.reorderObserved(["one", "two"], "two", "one")).toEqual({
+      status: "ok",
+      order: ["two", "one"],
+    });
+    // The operator's view still shows the old order: nothing moves.
+    expect(queue.reorderObserved(["one", "two"], "one")).toEqual({
+      status: "stale",
+      order: ["two", "one"],
+    });
+    // An arrival the operator has not seen also makes the view stale.
+    run("three");
+    expect(queue.reorderObserved(["two", "one"], "one", "two")).toEqual({
+      status: "stale",
+      order: ["two", "one", "three"],
+    });
+    // A current view with an actor that is not in it is a bad request.
+    expect(queue.reorderObserved(["two", "one", "three"], "missing")).toEqual({
+      status: "invalid",
+      order: ["two", "one", "three"],
+    });
+    expect(queue.unclaimedOrder()).toEqual(["two", "one", "three"]);
+  });
+
+  it("shows claimed entries with their lane but never lets them move or anchor a move (#570)", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    b.pacer.deferUntil(Date.now() + 60_000);
+    let releaseBlocker!: () => void;
+    queue.enqueue(
+      () => new Promise<string>((resolve) => (releaseBlocker = () => resolve("blocker"))),
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(async (config) => config, lanes, {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+    run("claimed", [a, b]);
+    run("waiting", [b, b]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({
+        threadId: "claimed",
+        claimed: true,
+        compatibleLanes: ["a", "b"],
+        claimedLane: "a",
+      }),
+      expect.objectContaining({
+        threadId: "waiting",
+        claimed: false,
+        compatibleLanes: ["b"],
+        claimedLane: null,
+      }),
+    ]);
+    expect(queue.unclaimedOrder()).toEqual(["waiting"]);
+    expect(queue.reorderObserved(["claimed", "waiting"], "claimed")).toMatchObject({
+      status: "stale",
+    });
+    expect(queue.reorderObserved(["waiting"], "claimed")).toMatchObject({ status: "invalid" });
+    expect(queue.reorderObserved(["waiting"], "waiting", "claimed")).toMatchObject({
+      status: "invalid",
+    });
+    releaseBlocker();
+  });
+
+  it("records a compatibility skip when a later actor claims a lane the waiting one cannot use (#570)", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const open = laneFor("open", 60_000);
+    const closed = laneFor("closed", 60_000);
+    closed.pacer.deferUntil(Date.now() + 120_000);
+    open.pacer.deferUntil(Date.now() + 1_000);
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(async (config) => config, lanes, {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+    run("head", [closed]);
+    run("flexible", [closed, open]);
+    const narrow = run("narrow", [open]);
+    // Nothing has been passed over yet: a projected wait is not a skip.
+    expect(queue.snapshot().map((entry) => entry.skip)).toEqual([null, null, null]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    // `flexible` claimed `open`; `head` cannot use it, so it was skipped.
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "head", skip: { lane: "open", count: 1 } }),
+      expect.objectContaining({ threadId: "narrow", skip: null }),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(narrow.result).resolves.toBe("open");
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "head", skip: { lane: "open", count: 2 } }),
+    ]);
+  });
+
   it("promotes waiting work past pacing, and claimed work only on its own lane", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const queue = new UnifiedAdmissionQueue<string>();

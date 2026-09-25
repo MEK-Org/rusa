@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -561,49 +563,68 @@ void main() {
   );
 
   testWidgets(
-    'OverviewTab lists queued actors in estimated run order with estimate labels',
+    'OverviewTab lists queued actors in admission order with lane-aware labels (#570)',
     (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()
           ..threadsResult = [
             makeThread('root', runState: RunState.idle),
             makeThread(
-              'late',
+              'first',
               parent: 'root',
               runState: RunState.queued,
+              queuePosition: 0,
+              compatibleLanes: const ['claude'],
               estimatedStartAt: '2026-01-01T00:00:30.000Z',
-              pacingIntervalMs: 36000000,
-            ),
-            makeThread(
-              'early',
-              parent: 'root',
-              runState: RunState.queued,
-              estimatedStartAt: '2026-01-01T00:00:10.000Z',
               pacingIntervalMs: 36000000,
             ),
             // A lane with no pacing gap whose clock was pushed out by an
             // explicit deferral: quote the estimate, never "every 0s".
             makeThread(
-              'deferred',
-              parent: 'root',
-              runState: RunState.queued,
-              estimatedStartAt: '2026-01-01T00:00:20.000Z',
-              pacingIntervalMs: 0,
-            ),
-            // No estimate at position 0 is the staged head holding for a
-            // mesh concurrency slot; position 1 is the request behind it.
-            makeThread(
-              'unknown',
-              parent: 'root',
-              runState: RunState.queued,
-              queuePosition: 0,
-              pacingIntervalMs: 36000000,
-            ),
-            makeThread(
-              'behind',
+              'second',
               parent: 'root',
               runState: RunState.queued,
               queuePosition: 1,
+              compatibleLanes: const ['codex'],
+              estimatedStartAt: '2026-01-01T00:00:20.000Z',
+              pacingIntervalMs: 0,
+            ),
+            // The earliest estimate, but later in the list: the list shows
+            // admission order, not a projection sorted by estimate.
+            makeThread(
+              'third',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 2,
+              compatibleLanes: const ['claude'],
+              estimatedStartAt: '2026-01-01T00:00:10.000Z',
+              pacingIntervalMs: 36000000,
+            ),
+            // Nothing ahead of it shares its lane, so it is next on it.
+            makeThread(
+              'lone',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 3,
+              compatibleLanes: const ['agy'],
+              pacingIntervalMs: 36000000,
+            ),
+            // Waits behind first, third (claude) and lone (agy), not second.
+            makeThread(
+              'wide',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 4,
+              compatibleLanes: const ['agy', 'claude'],
+              pacingIntervalMs: 36000000,
+            ),
+            // Global position 5, but only second shares its lane.
+            makeThread(
+              'narrow',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 5,
+              compatibleLanes: const ['codex'],
               pacingIntervalMs: 36000000,
             ),
           ];
@@ -614,30 +635,204 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('5 queued'), findsOneWidget);
-        // Each card says when it runs in relative terms; these estimates have
-        // already passed, so those runs are due.
+        expect(find.text('6 queued'), findsOneWidget);
+        // These estimates have already passed, so those runs are due.
         expect(find.text('Starting shortly'), findsNWidgets(3));
         expect(find.text('Runs when a slot frees up'), findsOneWidget);
-        expect(find.text('Runs after 1 queued run'), findsOneWidget);
+        expect(
+          find.text('Runs after 3 queued runs on its lanes'),
+          findsOneWidget,
+        );
+        expect(
+          find.text('Runs after 1 queued run on its lanes'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Runs after 5'), findsNothing);
         // The queued list no longer quotes provider pacing.
         expect(find.textContaining('pacing every'), findsNothing);
+        expect(find.text('Lanes: agy · claude'), findsOneWidget);
+        expect(find.text('Lane: codex'), findsNWidgets(2));
+        expect(
+          find.textContaining(
+            'Manual ordering resets when the leader restarts.',
+          ),
+          findsOneWidget,
+        );
 
-        // Rendered in estimated run order: early, deferred, late, then the
-        // unknown-ETA entries by lane position.
-        final earlyY = tester.getTopLeft(find.text('early-handle')).dy;
-        final deferredY = tester.getTopLeft(find.text('deferred-handle')).dy;
-        final lateY = tester.getTopLeft(find.text('late-handle')).dy;
-        final unknownY = tester.getTopLeft(find.text('unknown-handle')).dy;
-        final behindY = tester.getTopLeft(find.text('behind-handle')).dy;
-        expect(earlyY, lessThan(deferredY));
-        expect(deferredY, lessThan(lateY));
-        expect(lateY, lessThan(unknownY));
-        expect(unknownY, lessThan(behindY));
+        final ys = [
+          for (final id in ['first', 'second', 'third', 'lone', 'wide'])
+            tester.getTopLeft(find.text('$id-handle')).dy,
+        ];
+        for (var i = 1; i < ys.length; i++) {
+          expect(ys[i - 1], lessThan(ys[i]));
+        }
         await store.dispose();
       });
     },
   );
+
+  group('OverviewTab admission reorder (#570)', () {
+    List<ThreadDto> admissionThreads() => [
+      makeThread('root', runState: RunState.idle),
+      makeThread(
+        'held',
+        parent: 'root',
+        runState: RunState.queued,
+        queuePosition: 0,
+        admissionClaimed: true,
+        compatibleLanes: const ['claude'],
+        claimedLane: 'claude',
+      ),
+      makeThread(
+        'alpha',
+        parent: 'root',
+        runState: RunState.queued,
+        queuePosition: 1,
+        compatibleLanes: const ['codex'],
+        admissionSkip: const AdmissionSkip(lane: 'claude', count: 2),
+      ),
+      makeThread(
+        'beta',
+        parent: 'root',
+        runState: RunState.queued,
+        queuePosition: 2,
+        compatibleLanes: const ['claude', 'codex'],
+      ),
+    ];
+
+    IconButton moveButton(WidgetTester tester, String tooltip) =>
+        tester.widget<IconButton>(
+          find.ancestor(
+            of: find.byTooltip(tooltip),
+            matching: find.byType(IconButton),
+          ),
+        );
+
+    testWidgets('shows claimed and skipped entries; only unclaimed ones move', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()..threadsResult = admissionThreads();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('Claimed · claude, waiting for a run slot'),
+          findsOneWidget,
+        );
+        expect(
+          find.text(
+            'Passed over 2 times by later runs on claude, '
+            'a lane this actor cannot use',
+          ),
+          findsOneWidget,
+        );
+        expect(find.byTooltip('Move up held-handle'), findsNothing);
+        expect(find.byTooltip('Move down held-handle'), findsNothing);
+        expect(moveButton(tester, 'Move up alpha-handle').onPressed, isNull);
+        expect(
+          moveButton(tester, 'Move down alpha-handle').onPressed,
+          isNotNull,
+        );
+        expect(moveButton(tester, 'Move up beta-handle').onPressed, isNotNull);
+        expect(moveButton(tester, 'Move down beta-handle').onPressed, isNull);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('moves an entry from the keyboard with the order it showed', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()..threadsResult = admissionThreads();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        bool focusedOn(String tooltip) {
+          var within = false;
+          final context = FocusManager.instance.primaryFocus?.context;
+          context?.visitAncestorElements((element) {
+            final widget = element.widget;
+            if (widget is Tooltip && widget.message == tooltip) {
+              within = true;
+              return false;
+            }
+            return true;
+          });
+          return within;
+        }
+
+        for (var i = 0; i < 80 && !focusedOn('Move down alpha-handle'); i++) {
+          await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+          await tester.pump();
+        }
+        expect(focusedOn('Move down alpha-handle'), isTrue);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.pump();
+        await Future<void>.delayed(Duration.zero);
+        await tester.pump();
+
+        expect(api.admissionReorderCalls, hasLength(1));
+        final call = api.admissionReorderCalls.single;
+        expect(call.threadId, 'alpha');
+        expect(call.beforeThreadId, isNull);
+        expect(call.observedOrder, ['alpha', 'beta']);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('says so and moves nothing when the queue changed first', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = admissionThreads()
+          ..admissionReorderError = DashboardApiException(
+            Uri.parse('http://localhost/api/mesh/admission-queue/reorder'),
+            409,
+            '{"error":"admission queue changed","order":["beta","alpha"]}',
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        await tester.ensureVisible(find.byTooltip('Move up beta-handle'));
+        await tester.pump();
+        await tester.tap(find.byTooltip('Move up beta-handle'));
+        await tester.pump();
+        for (var i = 0; i < 5; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          await tester.pump();
+        }
+
+        expect(api.admissionReorderCalls.single.beforeThreadId, 'alpha');
+        expect(api.admissionReorderCalls.single.observedOrder, [
+          'alpha',
+          'beta',
+        ]);
+        expect(
+          find.text(
+            'The queue changed before your move; nothing was moved. '
+            'Showing the current order.',
+          ),
+          findsOneWidget,
+        );
+        await store.dispose();
+      });
+    });
+  });
 
   testWidgets(
     'OverviewTab shows running actor context and live focus changes without a queued placeholder',

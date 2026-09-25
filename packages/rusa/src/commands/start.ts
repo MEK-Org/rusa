@@ -3917,7 +3917,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   ? null
                   : new Date(entry.estimatedStartAt).toISOString(),
               pacingIntervalMs: entry.pacingIntervalMs,
+              claimed: entry.claimed,
+              compatibleLanes: entry.compatibleLanes,
+              claimedLane: entry.claimedLane,
+              skip: entry.skip,
             })),
+          reorderAdmissionQueue: ({ observedOrder, threadId, beforeThreadId }) =>
+            admissionQueue.reorderObserved(observedOrder, threadId, beforeThreadId),
           // Current work is the durable inbox focus for this actor's active
           // run. It deliberately reads through the run ledger: a completed
           // focus is history, not the next queued run's selected work.

@@ -39,6 +39,10 @@ ThreadDto makeThread(
   int? moreInboxItemsCount,
   String? voiceName,
   int? pacingIntervalMs,
+  bool admissionClaimed = false,
+  List<String> compatibleLanes = const [],
+  String? claimedLane,
+  AdmissionSkip? admissionSkip,
   String? selectedProvider,
   String? selectedModel,
   String? selectedEffort,
@@ -73,6 +77,10 @@ ThreadDto makeThread(
       ? null
       : VoiceConfigDto(provider: 'google', config: {'voiceName': voiceName}),
   pacingIntervalMs: pacingIntervalMs,
+  admissionClaimed: admissionClaimed,
+  compatibleLanes: compatibleLanes,
+  claimedLane: claimedLane,
+  admissionSkip: admissionSkip,
   selectedProvider: selectedProvider,
   selectedModel: selectedModel,
   selectedEffort: selectedEffort,
@@ -511,6 +519,27 @@ class FakeApi extends DashboardApi {
   Future<void> interruptActor(String actorId) async {
     interruptCalls.add(actorId);
     final err = interruptError;
+    if (err != null) throw err;
+  }
+
+  final admissionReorderCalls =
+      <
+        ({String threadId, String? beforeThreadId, List<String> observedOrder})
+      >[];
+  DashboardApiException? admissionReorderError;
+
+  @override
+  Future<void> reorderAdmissionQueue({
+    required String threadId,
+    required String? beforeThreadId,
+    required List<String> observedOrder,
+  }) async {
+    admissionReorderCalls.add((
+      threadId: threadId,
+      beforeThreadId: beforeThreadId,
+      observedOrder: observedOrder,
+    ));
+    final err = admissionReorderError;
     if (err != null) throw err;
   }
 

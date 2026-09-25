@@ -623,6 +623,11 @@ export function submitPoolGate<C, T>(
   };
 }
 
+/** Distinct lanes among an admission's declared candidates, in declared order. */
+function lanesOf<C>(item: { candidates: readonly PoolLaneCandidate<C>[] }): string[] {
+  return [...new Set(item.candidates.map((candidate) => candidate.lane))];
+}
+
 /** A lane can claim new work only with nothing queued or staged and no pacing delay left. */
 function isIdleLane(pacer: ProviderPacer, now: number): boolean {
   return pacer.waiting === 0 && pacer.quote(now) <= now;
@@ -644,7 +649,25 @@ export interface UnifiedAdmissionQueueSnapshot {
   estimatedStartAt: number | null;
   /** Interval of the lane supplying `estimatedStartAt`, rounded for the wire. */
   pacingIntervalMs: number;
+  /** Holds a lane and waits on mesh concurrency; shown but never reorderable. */
+  claimed: boolean;
+  /** Distinct lanes among the entry's declared candidates, in declared order. */
+  compatibleLanes: string[];
+  /** The lane a claimed entry holds; `null` while unclaimed. */
+  claimedLane: string | null;
+  /**
+   * Set once a later entry has claimed a lane this unclaimed entry cannot use
+   * while it kept waiting: the most recent such lane and how many times.
+   * Recorded at claim time, so it reports what happened, not a projection.
+   */
+  skip: { lane: string; count: number } | null;
 }
+
+/** Outcome of an operator reorder checked against the order the UI observed. */
+export type AdmissionReorderResult =
+  | { status: "ok"; order: string[] }
+  | { status: "stale"; order: string[] }
+  | { status: "invalid"; order: string[] };
 
 interface WaitingAdmission<C, T> {
   fn: (config: C) => Promise<T>;
@@ -654,6 +677,7 @@ interface WaitingAdmission<C, T> {
   state: "waiting" | "claimed" | "settled";
   inner?: RunStartHandle<T>;
   claimedLane?: PoolLaneCandidate<C>;
+  skip?: { lane: string; count: number };
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
   result: Promise<T>;
@@ -744,6 +768,10 @@ export class UnifiedAdmissionQueue<C> {
           position,
           estimatedStartAt: null,
           pacingIntervalMs: Math.round(item.claimedLane?.pacer.interval ?? 0),
+          claimed: true,
+          compatibleLanes: lanesOf(item),
+          claimedLane: item.claimedLane?.lane ?? null,
+          skip: null,
         });
       }
       position++;
@@ -772,6 +800,10 @@ export class UnifiedAdmissionQueue<C> {
           position,
           estimatedStartAt: eta,
           pacingIntervalMs: lane ? Math.round(lane.interval) : 0,
+          claimed: false,
+          compatibleLanes: lanesOf(item),
+          claimedLane: null,
+          skip: item.skip ? { ...item.skip } : null,
         });
       }
       position++;
@@ -795,6 +827,34 @@ export class UnifiedAdmissionQueue<C> {
     const to = beforeThreadId === undefined ? this.waiting.length : indexOf(beforeThreadId);
     this.waiting.splice(to, 0, item);
     return true;
+  }
+
+  /** Unclaimed actors' thread ids in list order: the only part `reorder` moves. */
+  unclaimedOrder(): string[] {
+    const order: string[] = [];
+    for (const item of this.waiting) if (item.opts.threadId) order.push(item.opts.threadId);
+    return order;
+  }
+
+  /**
+   * An operator reorder (#570) applied only if the list is still the one the
+   * operator saw: `observed` must equal `unclaimedOrder()` exactly, so a
+   * claim, arrival, cancellation or another reorder in between makes the
+   * request `stale` instead of moving an actor relative to a list nobody saw.
+   * A claimed actor is never in that order, so it can be neither moved nor
+   * used as an anchor.
+   */
+  reorderObserved(
+    observed: readonly string[],
+    threadId: string,
+    beforeThreadId?: string
+  ): AdmissionReorderResult {
+    const current = this.unclaimedOrder();
+    if (observed.length !== current.length || observed.some((id, i) => id !== current[i])) {
+      return { status: "stale", order: current };
+    }
+    if (!this.reorder(threadId, beforeThreadId)) return { status: "invalid", order: current };
+    return { status: "ok", order: this.unclaimedOrder() };
   }
 
   /** Re-quote live lane state after a quota/controller update. */
@@ -853,13 +913,24 @@ export class UnifiedAdmissionQueue<C> {
   private claimNormal(): void {
     const now = this.now();
     const busy = new Set<ProviderPacer>();
+    const passed: Array<WaitingAdmission<C, unknown>> = [];
     for (const item of [...this.waiting]) {
       const idle = this.healthy(item, false).filter(
         (candidate) => !busy.has(candidate.pacer) && isIdleLane(candidate.pacer, now)
       );
       const selected = selectPoolLane(idle, now);
-      if (!selected) continue;
+      if (!selected) {
+        passed.push(item);
+        continue;
+      }
       busy.add(selected.pacer);
+      // Every earlier actor still waiting was passed over for this one. Only
+      // one whose own lanes exclude the claiming lane counts as a
+      // compatibility skip; the rest were held by that lane's halt for them.
+      for (const earlier of passed) {
+        if (earlier.candidates.some((candidate) => candidate.lane === selected.lane)) continue;
+        earlier.skip = { lane: selected.lane, count: (earlier.skip?.count ?? 0) + 1 };
+      }
       this.claim(item, selected);
     }
   }
