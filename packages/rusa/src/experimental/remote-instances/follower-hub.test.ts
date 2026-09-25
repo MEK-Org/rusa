@@ -1,9 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../observability/logger.js";
 import { FollowerHub } from "./follower-hub.js";
+import { FollowerUpdateTriggerStore } from "./follower-update-trigger-store.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const hubs: FollowerHub[] = [];
@@ -26,7 +30,7 @@ function captureLogger(
   return logger;
 }
 
-async function setup(options?: { logger?: Logger }) {
+async function setup(options?: { logger?: Logger; triggerStore?: FollowerUpdateTriggerStore }) {
   const token = randomBytes(32).toString("hex");
   const hub = new FollowerHub(token, options);
   hubs.push(hub);
@@ -734,6 +738,54 @@ describe("leader follower gateway", () => {
       const updatedInfo = h.hub.list().find((f) => f.id === "worker-update");
       expect(updatedInfo?.updateStatus?.status).toBe("building");
       expect(updatedInfo?.updateStatus?.step).toBe("build");
+    });
+
+    it("keeps the authenticated manual endpoint usable after an automatic failure", async () => {
+      const root = mkdtempSync(join(tmpdir(), "follower-manual-override-"));
+      try {
+        const targetSha = "a".repeat(40);
+        const store = new FollowerUpdateTriggerStore(root);
+        store.createTrigger({ targetSha, branch: "staging" });
+        const h = await setup({ triggerStore: store });
+        h.hub.armReconciliation();
+        const identity = await h.register("worker-retry");
+
+        const automatic = h.hub.getFollowerUpdateStatus("worker-retry");
+        expect(automatic?.status).toBe("pending");
+
+        await h.post("/events", {
+          ...identity,
+          batchId: "automatic-failure",
+          events: [
+            {
+              eventId: "automatic-failure-event",
+              actorId: "$instance",
+              message: {
+                type: "update_status",
+                updateId: automatic?.updateId,
+                status: "failed",
+                error: "build failed",
+                newSha: targetSha,
+              },
+            },
+          ],
+        });
+        expect(store.hasFailed("worker-retry", targetSha)).toBe(true);
+
+        const retry = await h.post("/followers/worker-retry/update", {
+          targetSha,
+          branch: "staging",
+        });
+        expect(retry.status).toBe(200);
+        expect((await retry.json()) as { ok: boolean }).toMatchObject({ ok: true });
+
+        const updatedStatus = h.hub.getFollowerUpdateStatus("worker-retry");
+        expect(updatedStatus?.status).toBe("pending");
+        expect(updatedStatus?.updateId).toBeDefined();
+        expect(updatedStatus?.updateId).not.toBe(automatic?.updateId);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
 
     it("ignores a stale status while an update is active", async () => {

@@ -14,6 +14,12 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
+import {
+  antigravityActorConversationsDir,
+  antigravityConversationsDir,
+  carryForwardAntigravityConversation,
+  ensureAntigravityPrivateState,
+} from "./antigravity-paths.js";
 import { getProviderModelCatalog } from "./model-catalog.js";
 import {
   type ModelEffortSelection,
@@ -30,6 +36,8 @@ import {
   unattributedTokenUsage,
 } from "./token-accounting.js";
 import type { CodingProvider, McpServerSpec, RunOptions, RunResult } from "./types.js";
+
+export { antigravityConversationsDir, antigravityScratchDir } from "./antigravity-paths.js";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_TAIL_BYTES = 2 * 1024 * 1024;
@@ -155,20 +163,6 @@ export interface AntigravityQuotaRefusal {
   reason: "QUOTA_EXHAUSTED";
   retryDelay?: string;
   quotaResetTimeStamp?: string;
-}
-
-export function antigravityConversationsDir(): string {
-  return join(homedir(), ".gemini", "antigravity-cli", "conversations");
-}
-
-/**
- * Where the CLI keeps its per-worker workspaces, one directory per actor that
- * has ever run under it. rusa does not create these — it addresses them so a
- * retired actor's can be deleted rather than left readable to every worker that
- * comes after (see `actor/workspace-sweep.ts`).
- */
-export function antigravityScratchDir(): string {
-  return join(homedir(), ".gemini", "antigravity-cli", "scratch");
 }
 
 interface ConversationFileWatermark {
@@ -444,8 +438,18 @@ export class AntigravityProvider implements CodingProvider {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const command = this.config.cliCommand ?? "agy";
     const selection = resolveAntigravitySelection(this.model, this.effort);
+    // The sandbox overlays the CLI's shared conversations path with this
+    // actor-owned directory. Read it from the same host path so resume, quota
+    // classification, and token accounting observe the sandboxed invocation.
+    const conversationsDir = opts.sandbox
+      ? antigravityActorConversationsDir(opts.cwd)
+      : this.conversationsDir;
+    if (opts.sandbox) {
+      ensureAntigravityPrivateState(opts.cwd);
+      if (opts.session?.id) carryForwardAntigravityConversation(opts.cwd, opts.session.id);
+    }
     const incomingDbPath = opts.session?.id
-      ? join(this.conversationsDir, `${opts.session.id}.db`)
+      ? join(conversationsDir, `${opts.session.id}.db`)
       : undefined;
     const generationCursor = incomingDbPath ? agyGenerationCursor(incomingDbPath) : -1;
 
@@ -667,10 +671,7 @@ export class AntigravityProvider implements CodingProvider {
       const sessionId = result.sessionId ?? opts.session?.id;
       const extracted =
         sessionId && generationCursor !== undefined
-          ? extractAgyTokenUsageFromDb(
-              join(this.conversationsDir, `${sessionId}.db`),
-              generationCursor
-            )
+          ? extractAgyTokenUsageFromDb(join(conversationsDir, `${sessionId}.db`), generationCursor)
           : null;
       const model = extracted?.model ?? this.model ?? null;
       return {
@@ -681,7 +682,7 @@ export class AntigravityProvider implements CodingProvider {
       };
     };
     const quotaRefusalWatermarks = opts.session?.id
-      ? conversationWatermarks(opts.session.id, this.conversationsDir)
+      ? conversationWatermarks(opts.session.id, conversationsDir)
       : undefined;
 
     return runSubprocess({
@@ -766,7 +767,7 @@ export class AntigravityProvider implements CodingProvider {
         if (exitCode === 0) {
           const refusal = classifyAntigravityQuotaRefusal(
             sessionId,
-            this.conversationsDir,
+            conversationsDir,
             quotaRefusalWatermarks
           );
           if (refusal) {
