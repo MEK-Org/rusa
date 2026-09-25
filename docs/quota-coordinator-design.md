@@ -254,10 +254,14 @@ under v1:
 - **Responsive runs bypass pacing but still charge the clock.** A responsive
   request skips the queue entirely (`provider-pacer.ts:173-175`) and lands in
   `start()`, which advances the clock like any other start.
-- **Admission order is one leader-local list, not one FIFO per lane.** Each
-  provider lane synchronously claims the first compatible unclaimed actor,
-  then the established `ProviderPacer` and mesh-concurrency path own that
-  accepted start. The read-only global snapshot and same-priority reorder hook
+- **Admission order is one leader-local list, not one FIFO per lane.** An
+  idle provider lane (nothing queued or staged, no pacing delay left)
+  synchronously claims the first compatible unclaimed actor, then the
+  established `ProviderPacer` and mesh-concurrency path own that accepted
+  start. At most one claimed-but-unstarted actor waits per lane; the rest
+  stay unclaimed in the list. An actor only ever claims one of its own
+  declared candidates, so a model-scoped lane (Fable under #588) is a
+  distinct candidate lane that a provider-wide lane cannot claim through. The read-only global snapshot and same-priority reorder hook
   are intentionally ephemeral controls for #570: a leader restart reconstructs
   work from the durable inbox through `RunManager.dispatch`, not from a second
   queue table. A crash after a lane claim and before completion has the normal
