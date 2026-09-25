@@ -3160,6 +3160,13 @@ export class ActorMesh {
    * ({@link scheduleAppendedWork}) gives an owner's copy the ordinary
    * dispatch and a subscriber's copy a wake that joins rather than replaces
    * its active run. A subscriber-only route therefore preempts nobody.
+   *
+   * What the one-turn rule guarantees is therefore resolution plus append,
+   * not the wake. The wake is advisory and arrives a microtask later, so a
+   * retirement already queued can land first; the run manager then refuses
+   * and logs that dispatch. The row is the same either way: it was appended
+   * while its recipient was live, exactly as when the wake was synchronous
+   * and the retirement followed it.
    */
   async deliverExternalEvent(raw: RawIntegrationEvent): Promise<DurableEventDelivery> {
     if (!this.eventManager) {

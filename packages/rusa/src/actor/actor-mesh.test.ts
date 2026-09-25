@@ -7704,19 +7704,21 @@ describe("ActorMesh", () => {
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
 
-      // Recipient liveness, the durable append, and the wake are one turn.
-      // Suspend anywhere between them and a retirement lands after a recipient
-      // was resolved as live: the row is still written (SqliteInboxRepository.append
+      // Recipient liveness and the durable append are one turn. Suspend
+      // between them and a retirement lands after a recipient was resolved as
+      // live: the row is still written (SqliteInboxRepository.append
       // validates only non-empty actor ids, and the inbox table has no actor
-      // foreign key), leaving durable unhandled work nobody alive can take,
-      // and the wake then fails. A microtask queued before the call is the
-      // tightest interleaving available — it runs at the first suspension
-      // point inside delivery, if the code has one at all. This now runs
+      // foreign key), leaving durable unhandled work nobody alive can take.
+      // The wake is not part of that turn: the after-commit seam issues it a
+      // microtask later (#632), so here it runs after the retirement and is
+      // refused, and this case asserts nothing about it. A microtask queued
+      // before the call is the tightest interleaving available — it runs at
+      // the first suspension point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
       // Under #540, an actor cannot retire while holding a live event subscription.
       // A directed target targets the worker without a subscription blocker on worker,
-      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // while exercising the exact same synchronous liveness-check -> append
       // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
@@ -9084,6 +9086,35 @@ describe("ActorMesh", () => {
         expect(t.preemptions()).toEqual([]);
         expect(t.unhandledResponsive(watcherA)).toHaveLength(1);
         expect(t.unhandledResponsive(watcherB)).toHaveLength(1);
+      });
+
+      it("coalesces one turn's mixed roles for an actor to the preempting wake, in either order", async () => {
+        // Fan-out destinations are deduplicated per event, so a mixed debt
+        // needs two appends before the drain: a subscriber copy plus any
+        // owner or unannotated row in the same turn (#632).
+        const t = setupTwoRunningActors();
+        const subscriberFirst = t.mesh.spawn({ charter: "subscriber first", parentId: "root" });
+        const ownerFirst = t.mesh.spawn({ charter: "owner first", parentId: "root" });
+        await t.startRun(subscriberFirst);
+        await t.startRun(ownerFirst);
+        const copy = (actorId: string, deliveryRole?: "owner" | "subscriber") =>
+          t.inboxStore.append([
+            {
+              actorId,
+              source: ISSUE,
+              payload: { ...payload("issues.opened"), priority: "responsive", deliveryRole },
+            },
+          ]);
+
+        copy(subscriberFirst, "subscriber");
+        copy(subscriberFirst, "owner");
+        copy(ownerFirst);
+        copy(ownerFirst, "subscriber");
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.signals.get(subscriberFirst)?.aborted).toBe(true);
+        expect(t.signals.get(ownerFirst)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([subscriberFirst, ownerFirst]);
       });
 
       it("still quick-starts an idle subscriber as responsive work", async () => {
