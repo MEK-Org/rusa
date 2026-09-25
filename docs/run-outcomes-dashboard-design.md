@@ -64,6 +64,30 @@ through three places:
    - Completions focus: routine non-zero exits and transient run execution errors
      do not appear as activity completions in this panel; it is dedicated to
      actual completed/handled work.
+   - Obligation changes: the list is one newest-first feed with two card kinds
+     in the same `[Time] [Actor] [card]` row. Besides the handled card, an
+     **obligation card** reports a terminal `done`/`cancelled` transition with
+     the obligation's `terminal_note` and `resolution_ref`. Its source is the
+     existing `obligation_history` stream: rows whose payload `after.status` is
+     terminal (matched on the payload, because a combined mutation is recorded
+     under its primary `mutation_kind`), attributed through `acting_principal`.
+     `id` is strictly monotonic, so a bounded page reads `ORDER BY id DESC`
+     without a new index or schema change. When the same run handled an inbox
+     item and moved its linked obligation, the transition stays the label under
+     that handled card; only unmatched transitions get their own row. The
+     screenshot illustrates the handled case.
+
+Recent Activity is not where unresolved work is discovered. Selected work that
+a run leaves unhandled stays visible on the surfaces that own it:
+
+- **Selected / Work focus**: the item remains under "Selected work this run"
+  after the run ends, with its retry count. After bounded retries are exhausted
+  it carries a **Needs attention** badge until a meaningful change or explicit
+  operator action clears it.
+- **Queue**: the same card shows the Needs attention badge instead of an
+  ordinary queued checkpoint.
+- **Actor tree / overview row**: the owning actor carries the badge, so the
+  case is discoverable without opening the actor.
 
 The screenshot illustrates this completed work flow:
 
@@ -114,6 +138,10 @@ flutter test test/design_664_mockup_test.dart
 It writes `screenshots/664_run_outcomes_mock.png`. The test is intentionally a
 design-only harness: it uses existing dashboard widgets for the visual language
 and small labelled proposed elements for the not-yet-implemented activity rows.
+Font loading, avatar image stubbing, and capture come from
+`test/screenshot_support.dart`, shared with `test/screenshots_test.dart`. The
+selected panel is a mid-run snapshot (14:07:03); the Recent Activity row for
+the same item is the later handled state (14:21:37).
 
 ## Scope boundary
 

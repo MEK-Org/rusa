@@ -15,14 +15,9 @@
 //
 // and it writes flutter_dashboard/screenshots/664_run_outcomes_mock.png.
 
-import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
-import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart' show FontLoader;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -32,6 +27,7 @@ import 'package:rusa_dashboard/widgets/obligation_card.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 
 import 'fakes.dart';
+import 'screenshot_support.dart';
 
 final String _outDir = '${Directory.current.path}/screenshots';
 
@@ -45,17 +41,20 @@ const _kObligationIntent =
     'Deliver a source-grounded design proposal and rendered mock-up before '
     'runtime implementation. Public request on 2026-09-23.';
 const _kObligationRef = 'github:MEK-Org/rusa/issues/664';
+const _portraitIds = [_kActorId, 'root', 'heron-reviewer', 'amber-owl'];
 
 void main() {
   setUpAll(() async {
-    await _loadFonts();
+    await loadFonts();
   });
 
   testWidgets('renders the #664 work-identity / run-outcomes design mock-up', (
     tester,
   ) async {
     await tester.runAsync(() async {
-      HttpOverrides.global = _FakeImageHttpOverrides(await _portraits());
+      HttpOverrides.global = FakeImageHttpOverrides(
+        await portraits(_portraitIds),
+      );
       addTearDown(() => HttpOverrides.global = null);
 
       // Queue and selected views intentionally use two snapshots of the same
@@ -144,14 +143,9 @@ void main() {
         ),
       );
       await tester.pump();
-      await _settleImages(tester, [
-        _portraitUrl(_kActorId),
-        _portraitUrl('root'),
-        _portraitUrl('heron-reviewer'),
-        _portraitUrl('amber-owl'),
-      ]);
+      await settleImages(tester, portraitUrls(_portraitIds));
 
-      await _capture(key, '$_outDir/664_run_outcomes_mock.png');
+      await captureBoundary(key, '$_outDir/664_run_outcomes_mock.png');
       expect(tester.takeException(), isNull);
     });
   });
@@ -563,7 +557,7 @@ class _SelectedPanel extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    '$_kHandle · run started 14:07 · local CLI',
+                    '$_kHandle · run started 14:07 · mid-run snapshot 14:07:03',
                     style: kMonoStyle.copyWith(
                       color: MeshColors.textPrimary,
                       fontSize: 11.5,
@@ -691,7 +685,7 @@ class _RecentActivityPanel extends StatelessWidget {
       child: Column(
         children: [
           _HandledActivityRow(
-            timeLabel: '14:07:03',
+            timeLabel: '14:21:37',
             actorId: _kActorId,
             actorHandle: _kHandle,
             actorModel: 'claude-opus-4-6, high',
@@ -699,7 +693,7 @@ class _RecentActivityPanel extends StatelessWidget {
             sourceKind: 'GITHUB ISSUE',
             sourceRef: _kObligationRef,
             summary: 'issue_comment.created · UI proposal feedback on #664',
-            handledTime: '14:07:03',
+            handledTime: '14:21:37',
             addressedNote:
                 'Packaged design proposal and repeatable Flutter render harness into PR #665; awaiting operator review.',
             moreCount: 1,
@@ -1008,173 +1002,4 @@ class _FooterNotes extends StatelessWidget {
       ),
     );
   }
-}
-
-// ── Capture + image settling (mirrors test/screenshots_test.dart) ────────────
-
-Future<void> _settleImages(WidgetTester tester, List<String> urls) async {
-  await tester.pump();
-  final ctx = tester.element(find.byType(MaterialApp));
-  for (final url in urls) {
-    await precacheImage(NetworkImage(url), ctx);
-  }
-  await tester.pump(const Duration(milliseconds: 80));
-  await tester.pump(const Duration(milliseconds: 80));
-}
-
-Future<void> _capture(GlobalKey key, String path) async {
-  final boundary =
-      key.currentContext!.findRenderObject()! as RenderRepaintBoundary;
-  final image = await boundary.toImage(pixelRatio: 2.0);
-  final bytes = (await image.toByteData(
-    format: ui.ImageByteFormat.png,
-  ))!.buffer.asUint8List();
-  final file = File(path)..createSync(recursive: true);
-  file.writeAsBytesSync(bytes);
-}
-
-String _portraitUrl(String id) =>
-    Uri.base.resolve('/api/mesh/avatar/$id.png').toString();
-
-Future<Uint8List> _portraitPng() async {
-  const w = 120.0, h = 168.0;
-  final recorder = ui.PictureRecorder();
-  final canvas = Canvas(recorder, const Rect.fromLTWH(0, 0, w, h));
-  canvas.drawRect(
-    const Rect.fromLTWH(0, 0, w, h),
-    Paint()
-      ..shader = ui.Gradient.linear(Offset.zero, const Offset(w, h), const [
-        Color(0xFF38BDF8),
-        Color(0xFF6366F1),
-      ]),
-  );
-  canvas.drawCircle(
-    const Offset(w * 0.5, w * 0.46),
-    w * 0.34,
-    Paint()..color = Colors.white.withValues(alpha: 0.9),
-  );
-  final picture = recorder.endRecording();
-  final image = await picture.toImage(w.toInt(), h.toInt());
-  final data = await image.toByteData(format: ui.ImageByteFormat.png);
-  return data!.buffer.asUint8List();
-}
-
-Future<Map<String, Uint8List>> _portraits() async {
-  final png = await _portraitPng();
-  return {_kActorId: png, 'root': png, 'heron-reviewer': png, 'amber-owl': png};
-}
-
-class _FakeImageHttpOverrides extends HttpOverrides {
-  _FakeImageHttpOverrides(this.byId);
-  final Map<String, Uint8List> byId;
-  @override
-  HttpClient createHttpClient(SecurityContext? context) =>
-      _FakeHttpClient(byId);
-}
-
-class _FakeHttpClient implements HttpClient {
-  _FakeHttpClient(this.byId);
-  final Map<String, Uint8List> byId;
-  @override
-  bool autoUncompress = true;
-
-  @override
-  Future<HttpClientRequest> getUrl(Uri url) async {
-    final name = url.pathSegments.isEmpty ? '' : url.pathSegments.last;
-    final id = name.endsWith('.png')
-        ? name.substring(0, name.length - 4)
-        : name;
-    final bytes = byId[id] ?? byId.values.first;
-    return _FakeHttpClientRequest(bytes);
-  }
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-class _FakeHttpClientRequest implements HttpClientRequest {
-  _FakeHttpClientRequest(this.bytes);
-  final Uint8List bytes;
-  @override
-  final HttpHeaders headers = _FakeHttpHeaders();
-  @override
-  Future<HttpClientResponse> close() async => _FakeHttpClientResponse(bytes);
-  @override
-  Future<HttpClientResponse> get done => close();
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-class _FakeHttpClientResponse extends Stream<List<int>>
-    implements HttpClientResponse {
-  _FakeHttpClientResponse(this.bytes);
-  final Uint8List bytes;
-  @override
-  int get statusCode => HttpStatus.ok;
-  @override
-  int get contentLength => bytes.length;
-  @override
-  HttpClientResponseCompressionState get compressionState =>
-      HttpClientResponseCompressionState.notCompressed;
-  @override
-  StreamSubscription<List<int>> listen(
-    void Function(List<int> event)? onData, {
-    Function? onError,
-    void Function()? onDone,
-    bool? cancelOnError,
-  }) => Stream<List<int>>.fromIterable([bytes]).listen(
-    onData,
-    onError: onError,
-    onDone: onDone,
-    cancelOnError: cancelOnError,
-  );
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-class _FakeHttpHeaders implements HttpHeaders {
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-// ── Fonts (from the Flutter SDK cache, derived from the test VM path) ────────
-
-Future<void> _loadFonts() async {
-  final dir = _materialFontsDir();
-  if (dir == null) return; // best-effort: fall back to box glyphs
-
-  Future<void> load(String family, List<String> files) async {
-    final loader = FontLoader(family);
-    var any = false;
-    for (final f in files) {
-      final file = File('$dir/$f');
-      if (file.existsSync()) {
-        loader.addFont(
-          Future.value(file.readAsBytesSync().buffer.asByteData()),
-        );
-        any = true;
-      }
-    }
-    if (any) await loader.load();
-  }
-
-  const roboto = ['Roboto-Regular.ttf', 'Roboto-Medium.ttf', 'Roboto-Bold.ttf'];
-  await load('Roboto', roboto);
-  await load('system-ui', roboto);
-  await load('monospace', roboto);
-  await load('MaterialIcons', [
-    'MaterialIcons-Regular.otf',
-    'MaterialIcons-Regular.ttf',
-  ]);
-}
-
-String? _materialFontsDir() {
-  final exe = Platform.resolvedExecutable;
-  const marker = '/bin/cache/';
-  final idx = exe.indexOf(marker);
-  if (idx < 0) return null;
-  final root = exe.substring(0, idx);
-  final dir = '$root/bin/cache/artifacts/material_fonts';
-  return Directory(dir).existsSync() ? dir : null;
 }
