@@ -1,4 +1,14 @@
 import {
+  APIError,
+  type ChoiceCriteria,
+  type ChoiceQuestion,
+  choice,
+  type EntryType,
+  type Fetch,
+  type SystemOneResult,
+  TypeSafeClient,
+} from "@typesafe-ai/sdk";
+import {
   type JevDecisionClient,
   type JevDecisionRequest,
   type JevDecisionResponse,
@@ -34,22 +44,72 @@ export type ResolveJevInboxEntry = (
   signal?: AbortSignal
 ) => Promise<JevResolvedInboxEntry>;
 
+export interface JevFetchInit {
+  method: string;
+  headers: Record<string, string>;
+  body: string;
+  signal?: AbortSignal;
+}
+
 export type JevFetch = (
   input: string,
-  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }
-) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+  init: JevFetchInit
+) => Promise<Response | { ok: boolean; status: number; json(): Promise<unknown> }>;
+
+function adaptFetch(fetchImpl: JevFetch): Fetch {
+  return async (input: string, init?: RequestInit): Promise<Response> => {
+    const rawHeaders = init?.headers ?? {};
+    const headers: Record<string, string> =
+      rawHeaders instanceof Headers
+        ? Object.fromEntries(rawHeaders.entries())
+        : (rawHeaders as Record<string, string>);
+    const res = await fetchImpl(input, {
+      method: init?.method ?? "POST",
+      headers,
+      body: typeof init?.body === "string" ? init.body : JSON.stringify(init?.body ?? {}),
+      signal: init?.signal ?? undefined,
+    });
+    if (res instanceof Response) return res;
+    if (
+      typeof (res as Response).clone === "function" &&
+      typeof (res as Response).text === "function"
+    ) {
+      return res as Response;
+    }
+    const data = await res.json();
+    return new Response(JSON.stringify(data), {
+      status: res.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
 
 /**
- * Minimal TypeSafe transport behind the existing JEV seam. It intentionally
- * sends one typed Choice question and does no retry: every retry would resend
- * real inbox text, while the shadow scheduler already fails safely to queue.
+ * TypeSafe transport behind the existing JEV seam leveraging the official
+ * `@typesafe-ai/sdk` client. It configures single-send (`maxRetries: 0`) and
+ * disables SDK logging to ensure no prompt content or retry leaks occur, while
+ * the shadow scheduler fails safely to queue.
  */
 export class HttpJevDecisionClient implements JevDecisionClient {
+  private readonly client: TypeSafeClient;
+
   constructor(
-    private readonly apiKey: string,
+    apiKey: string,
     private readonly resolveEntry: ResolveJevInboxEntry,
-    private readonly fetchImpl: JevFetch = globalThis.fetch as unknown as JevFetch
-  ) {}
+    fetchImpl: JevFetch = globalThis.fetch as unknown as JevFetch,
+    client?: TypeSafeClient
+  ) {
+    this.client =
+      client ??
+      new TypeSafeClient({
+        apiKey,
+        baseURL: new URL(JEV_SYSTEM_ONE_URL).origin,
+        fetch: adaptFetch(fetchImpl),
+        retry: { maxRetries: 0 },
+        logLevel: "off",
+        dangerouslyAllowBrowser: true,
+      });
+  }
 
   async decide(
     request: JevDecisionRequest,
@@ -68,44 +128,36 @@ export class HttpJevDecisionClient implements JevDecisionClient {
     if (!incoming || incoming.text === null) throw new JevInputUnavailableError();
     const omittedCandidates = candidateEntryIds.length - sent.length;
 
-    const response = await this.fetchImpl(JEV_SYSTEM_ONE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      signal: options.signal,
-      body: JSON.stringify({
-        model: JEV_DEFAULT_MODEL,
-        state: {
-          incoming,
-          candidates,
-          candidateSource,
-          ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
-        },
-        questions: {
-          interruption: {
-            type: "choice",
-            instructions: request.question,
-            criteria: {
+    let result: SystemOneResult<{ interruption: ChoiceQuestion<ChoiceCriteria> }>;
+    try {
+      result = await this.client.systemOne(
+        {
+          model: JEV_DEFAULT_MODEL,
+          state: {
+            incoming,
+            candidates,
+            candidateSource,
+            ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
+          } as unknown as EntryType,
+          questions: {
+            interruption: choice(request.question, {
               interrupt:
                 "The arriving item bears on the listed work clearly enough that continuing would waste or spoil it.",
               queue: "The arriving item can safely wait in the queue.",
-            },
+            }),
           },
         },
-      }),
-    });
-    if (!response.ok) throw new Error(`JEV decision service returned HTTP ${response.status}`);
-
-    let parsed: unknown;
-    try {
-      parsed = await response.json();
-    } catch {
-      throw new Error("JEV decision service returned invalid JSON");
+        { signal: options.signal }
+      );
+    } catch (err) {
+      if (err instanceof APIError) {
+        throw new Error(`JEV decision service returned HTTP ${err.status}`);
+      }
+      throw err;
     }
+
     const answer = (
-      parsed as {
+      result as {
         answers?: Record<
           string,
           { type?: unknown; choice?: unknown; probabilities?: unknown; confidence?: unknown }

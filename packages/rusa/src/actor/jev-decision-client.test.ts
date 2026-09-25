@@ -55,9 +55,10 @@ describe("HttpJevDecisionClient", () => {
 
     expect(resolve).toHaveBeenCalledWith("worker", "incoming", controller.signal);
     expect(resolve).toHaveBeenCalledWith("worker", "candidate", controller.signal);
-    expect(calls).toEqual([
-      { url: JEV_SYSTEM_ONE_URL, init: expect.objectContaining({ signal: controller.signal }) },
-    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(JEV_SYSTEM_ONE_URL);
+    expect(calls[0].init.signal).toBeDefined();
+    expect(calls[0].init.signal?.aborted).toBe(false);
     const [firstCall] = calls;
     expect(firstCall).toBeDefined();
     if (!firstCall) throw new Error("expected a JEV request");
@@ -257,5 +258,37 @@ describe("HttpJevDecisionClient", () => {
       text: null,
     });
     expect(state.omittedCandidates).toBe(5);
+  });
+
+  it("aborts the request when signal is cancelled", async () => {
+    const fetch = vi.fn<JevFetch>(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ answers: {} }),
+    }));
+    const resolve = vi.fn(async (_actorId: string, id: string) => ({
+      id,
+      source: "mesh:root",
+      type: "mesh.message",
+      text: "text",
+    }));
+    const client = new HttpJevDecisionClient("synthetic-key", resolve, fetch);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      client.decide(
+        {
+          actorId: "worker",
+          question: "question",
+          input: {
+            incomingEntryId: "incoming",
+            candidateEntryIds: ["candidate"],
+            candidateSource: "selected",
+          },
+        },
+        { signal: controller.signal }
+      )
+    ).rejects.toThrow();
   });
 });
