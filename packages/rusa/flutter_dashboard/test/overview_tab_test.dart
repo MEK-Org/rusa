@@ -609,7 +609,8 @@ void main() {
               compatibleLanes: const ['agy'],
               pacingIntervalMs: 36000000,
             ),
-            // Waits behind first, third (claude) and lone (agy), not second.
+            // Shares a lane with first, third (claude) and lone (agy), not
+            // second. This is compatibility context, not a start-order claim.
             makeThread(
               'wide',
               parent: 'root',
@@ -640,14 +641,14 @@ void main() {
         expect(find.text('Starting shortly'), findsNWidgets(3));
         expect(find.text('Runs when a slot frees up'), findsOneWidget);
         expect(
-          find.text('Runs after 3 queued runs on its lanes'),
+          find.text('3 earlier queued actors share a compatible lane'),
           findsOneWidget,
         );
         expect(
-          find.text('Runs after 1 queued run on its lanes'),
+          find.text('1 earlier queued actor shares a compatible lane'),
           findsOneWidget,
         );
-        expect(find.textContaining('Runs after 5'), findsNothing);
+        expect(find.textContaining('Runs after'), findsNothing);
         // The queued list no longer quotes provider pacing.
         expect(find.textContaining('pacing every'), findsNothing);
         expect(find.text('Lanes: agy · claude'), findsOneWidget);
@@ -666,6 +667,63 @@ void main() {
         for (var i = 1; i < ys.length; i++) {
           expect(ys[i - 1], lessThan(ys[i]));
         }
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'OverviewTab names shared compatibility without promising queue order (#570)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'first-shared',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 0,
+              compatibleLanes: const ['claude'],
+            ),
+            makeThread(
+              'incompatible',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 1,
+              compatibleLanes: const ['codex'],
+            ),
+            makeThread(
+              'second-shared',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 2,
+              compatibleLanes: const ['claude'],
+            ),
+            makeThread(
+              'target',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 3,
+              compatibleLanes: const ['claude'],
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(
+          find.text('2 earlier queued actors share a compatible lane'),
+          findsOneWidget,
+        );
+        expect(
+          find.text('3 earlier queued actors share a compatible lane'),
+          findsNothing,
+        );
+        expect(find.textContaining('Runs after'), findsNothing);
         await store.dispose();
       });
     },

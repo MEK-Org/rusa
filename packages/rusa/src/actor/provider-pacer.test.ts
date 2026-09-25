@@ -856,7 +856,7 @@ describe("UnifiedAdmissionQueue", () => {
     expect(queue.unclaimedOrder()).toEqual(["two", "one", "three"]);
   });
 
-  it("shows claimed entries with their lane but never lets them move or anchor a move (#570)", async () => {
+  it("makes a claim race stale before invalidating a claimed target (#570)", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const queue = new UnifiedAdmissionQueue<string>();
     const a = laneFor("a");
@@ -893,9 +893,15 @@ describe("UnifiedAdmissionQueue", () => {
       }),
     ]);
     expect(queue.unclaimedOrder()).toEqual(["waiting"]);
-    expect(queue.reorderObserved(["claimed", "waiting"], "claimed")).toMatchObject({
+    // The operator saw `claimed` while it was still unclaimed. Its claim is a
+    // concurrent list change, so the observed-order check wins over the later
+    // "claimed entries cannot move" validation.
+    expect(queue.reorderObserved(["claimed", "waiting"], "claimed")).toEqual({
       status: "stale",
+      order: ["waiting"],
     });
+    // A request rendered after that claim has the live unclaimed order, and
+    // now correctly identifies the claimed target as invalid.
     expect(queue.reorderObserved(["waiting"], "claimed")).toMatchObject({ status: "invalid" });
     expect(queue.reorderObserved(["waiting"], "waiting", "claimed")).toMatchObject({
       status: "invalid",
@@ -938,8 +944,13 @@ describe("UnifiedAdmissionQueue", () => {
   it("promotes waiting work past pacing, and claimed work only on its own lane", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const queue = new UnifiedAdmissionQueue<string>();
-    const a = laneFor("a");
-    const b = laneFor("b");
+    const quota = (percentLeft: number) => ({
+      percentLeft,
+      observedAt: new Date(Date.now()).toISOString(),
+      resetAtIso: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
+    });
+    const a = { ...laneFor("a"), weeklyQuota: quota(10) };
+    const b = { ...laneFor("b"), weeklyQuota: quota(90) };
     b.pacer.deferUntil(Date.now() + 60_000);
     let releaseBlocker!: () => void;
     queue.enqueue(
@@ -965,6 +976,10 @@ describe("UnifiedAdmissionQueue", () => {
       expect.objectContaining({ threadId: "waiting" }),
     ]);
 
+    // Normal admission chose a because b was deferred. At promotion time b
+    // has decisively better weekly headroom, so a generic pool promotion
+    // would transfer to b. A claimed admission must retain its a-only pool.
+    expect(selectPoolLane([a, b], Date.now(), { responsive: true })?.lane).toBe("b");
     waiting.promote();
     claimed.promote();
     await expect(waiting.result).resolves.toBe("b");

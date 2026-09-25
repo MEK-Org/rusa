@@ -1348,8 +1348,10 @@ class _OverviewTabState extends State<OverviewTab> {
   /// estimate as "Runs in ~8 min", or — when it can't honestly quote one —
   /// what the run is waiting on. A claimed entry already holds its lane and
   /// waits for a mesh concurrency slot; an unclaimed one without an estimate
-  /// waits behind the [ahead] entries that share one of its lanes. Entries on
-  /// lanes it cannot use are not counted: `queuePosition` is global.
+  /// shows how many earlier entries share one of its lanes. That overlap is
+  /// context, not a promise of start order: another entry can take a different
+  /// lane, and a later entry can skip this one. Entries on lanes it cannot use
+  /// are not counted: `queuePosition` is global.
   String _queueStartLabel(ActorViewState actor, int ahead) {
     final estimate = actor.estimatedStartAt;
     if (estimate != null) {
@@ -1363,13 +1365,13 @@ class _OverviewTabState extends State<OverviewTab> {
       return 'Runs when a slot frees up';
     }
     return ahead == 1
-        ? 'Runs after 1 queued run on its lanes'
-        : 'Runs after $ahead queued runs on its lanes';
+        ? '1 earlier queued actor shares a compatible lane'
+        : '$ahead earlier queued actors share a compatible lane';
   }
 
-  /// Entries ahead of [actor] in the admission list that can use one of its
-  /// lanes — the only ones it actually waits behind. An entry whose lanes are
-  /// unknown counts, so a missing lane list never understates the wait.
+  /// Entries ahead of [actor] in the admission list that share one of its
+  /// lanes. An entry whose lanes are unknown counts, so a missing lane list
+  /// never understates the compatible-lane context.
   int _queuedAheadOnSharedLanes(
     ActorViewState actor,
     List<ActorViewState> queued,
