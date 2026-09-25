@@ -56,9 +56,12 @@ export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
   QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS;
 /**
  * Largest observation gap integrated as a single step. Never infer more area
- * than one normal five-minute observation slot from an unobserved gap.
+ * than one normal thirty-minute observation slot (1800s) from an unobserved gap.
+ * Under routine ~30m manual and scrape readings, this allows a normal 30-minute
+ * interval to integrate its full error without discarding area, while strictly
+ * bounding unobserved gaps against integral windup across long outages or pauses (#690).
  */
-export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
+export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = 30 * 60; // 1800s (30 minutes)
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
@@ -138,6 +141,7 @@ export type ManualObservationResult =
 
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
+  maxIntegralStepSeconds?: number;
 }
 
 export interface QuotaControllerResetResult {
@@ -902,9 +906,8 @@ export class SharedQuotaStore {
       dtSeconds > 0 ? dtSeconds / (QUOTA_DERIVATIVE_TAU_SECONDS + dtSeconds) : 1;
     const previousDerivative = cycleChanged ? 0 : (previous?.controllerDerivative ?? 0);
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-    const integralDtSeconds = cycleChanged
-      ? 0
-      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
+    const maxIntegralStepSeconds = opts.maxIntegralStepSeconds ?? QUOTA_INTEGRAL_MAX_STEP_SECONDS;
+    const integralDtSeconds = cycleChanged ? 0 : Math.min(dtSeconds, maxIntegralStepSeconds);
     const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
     const candidateIntegral = previousIntegral + error * integralDtSeconds;
     const rawWithoutIntegral =

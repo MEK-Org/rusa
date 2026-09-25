@@ -1898,5 +1898,59 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(result.freshness?.stale).toBe(true);
       expect(client.getHealth().quota_client_service_connected).toBe(0);
     });
+
+    it("#690: getLastAppliedInterval respects service-published hardStaleAfterMs over client default", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-690-hardstale-"));
+      const socketPath = join(root, "coordinator.sock");
+      let nowMs = 1_000_000;
+
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            provider: "claude",
+            intervalSeconds: 300,
+            uncappedIntervalSeconds: 300,
+            governingBucketKey: "claude:weekly",
+            capped: false,
+            expired: false,
+            exhaustedUntil: null,
+            updatedAt: new Date(nowMs).toISOString(),
+            buckets: [],
+            freshness: {
+              ageMs: 0,
+              buckets: {},
+              stale: false,
+              hardStale: false,
+              mode: "manual",
+              staleAfterMs: 3_600_000,
+              hardStaleAfterMs: 7_200_000, // 120m from service
+              resetWaiting: false,
+            },
+          })
+        );
+      });
+
+      const client = new QuotaCoordinatorClient({
+        socketPath,
+        configuredProviders: ["claude"],
+        maxIntervalSeconds: 36000,
+        hardStaleAfterMs: 3_600_000, // client default was 60m
+        now: () => nowMs,
+      });
+
+      await client.getThrottle("claude");
+      expect(client.getLastAppliedInterval("claude")).toBe(300);
+
+      // Advance clock by 90 minutes (5_400_000 ms)
+      // This is > client's default 60m, but < service's published 120m hardStaleAfterMs.
+      nowMs += 5_400_000;
+      expect(client.getLastAppliedInterval("claude")).toBe(300);
+
+      // Advance clock past 120 minutes (total elapsed > 7_200_000 ms)
+      nowMs += 2_000_000;
+      expect(client.getLastAppliedInterval("claude")).toBe(36000); // capped to maxIntervalSeconds
+    });
   });
 });

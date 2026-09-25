@@ -6,6 +6,8 @@ import {
 } from "./coordinator-metrics.js";
 import {
   DEFAULT_HARD_STALE_AFTER_MS,
+  DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
+  DEFAULT_MANUAL_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
   publishedThrottle,
@@ -52,6 +54,8 @@ export interface QuotaCollectionLoopOptions {
    */
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
+  manualStaleAfterMs?: number;
+  manualHardStaleAfterMs?: number;
   /** Metric sink; defaults to the discarding one. */
   metrics?: QuotaMetrics;
   /** Timer seams for tests. */
@@ -110,6 +114,8 @@ export class QuotaCollectionLoop {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
+  private readonly manualStaleAfterMs: number;
+  private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
@@ -122,6 +128,12 @@ export class QuotaCollectionLoop {
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.hardStaleAfterMs = options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+    this.manualStaleAfterMs =
+      options.manualStaleAfterMs ?? options.staleAfterMs ?? DEFAULT_MANUAL_STALE_AFTER_MS;
+    this.manualHardStaleAfterMs =
+      options.manualHardStaleAfterMs ??
+      options.hardStaleAfterMs ??
+      DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
     this.metrics = options.metrics ?? nullQuotaMetrics;
     this.setIntervalFn = options.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalFn =
@@ -274,11 +286,13 @@ export class QuotaCollectionLoop {
     for (const provider of this.options.providers) {
       const stored = this.options.store.getProviderThrottle(provider);
       if (!stored) continue;
+      const { mode } = this.options.store.getQuotaReadingMode(provider);
       const published = publishedThrottle(stored, {
         maxIntervalSeconds: this.maxIntervalSeconds,
-        staleAfterMs: this.staleAfterMs,
-        hardStaleAfterMs: this.hardStaleAfterMs,
+        staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
+        hardStaleAfterMs: mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
         nowMs,
+        mode,
       });
       this.metrics.gauge(
         QUOTA_SERVICE_METRICS.publishedIntervalSeconds,

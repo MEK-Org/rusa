@@ -1154,21 +1154,16 @@ export class QuotaService {
     if (this.deps.ttlMs !== undefined) {
       return this.deps.ttlMs;
     }
+    // #690: Routine provider readings target ~30 minutes across all providers
+    // (codex, claude, agy, kimi). Keep 30-minute probe cache floor so expensive
+    // interactive scrapes are not churned while QuotaCollectionLoop continues
+    // ticking fast (5m) for controller evaluation and manual observation ingestion.
     switch (provider) {
       case "claude":
       case "agy":
-        return 5 * 60 * 1000; // ~5 minutes
       case "codex":
-        // Keep 30 minutes for codex due to placeholder responses on fast status requests.
-        // Tracked in ISSUE_NUM, must not lower this until codex placeholder-handling lands.
-        return 30 * 60 * 1000;
       case "kimi":
-        // Was 60s from when the /usage pty scrape ran ~51s (only ~9s of useful
-        // freshness → retries kept stalling). The panel-anchored scrape
-        // is now ~8s, and kimi's windows are 5h/weekly — no need for sub-minute
-        // freshness. Match claude/agy at 5min so the (expensive) pty scrape
-        // isn't re-run every minute.
-        return 5 * 60 * 1000; // ~5 minutes
+        return 30 * 60 * 1000;
     }
   }
 

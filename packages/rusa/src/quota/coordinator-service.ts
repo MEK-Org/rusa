@@ -13,6 +13,8 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
   DEFAULT_HARD_STALE_AFTER_MS,
+  DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
+  DEFAULT_MANUAL_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
   isValidManualQuotaObservation,
@@ -87,6 +89,8 @@ export interface QuotaCoordinatorServiceOptions {
   maxIntervalSeconds?: number;
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
+  manualStaleAfterMs?: number;
+  manualHardStaleAfterMs?: number;
   version?: string;
   now?: () => number;
   /** Metric sink; defaults to the discarding one. */
@@ -106,6 +110,8 @@ export class QuotaCoordinatorService {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
+  private readonly manualStaleAfterMs: number;
+  private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
 
   constructor(readonly options: QuotaCoordinatorServiceOptions) {
@@ -114,6 +120,12 @@ export class QuotaCoordinatorService {
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.hardStaleAfterMs = options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+    this.manualStaleAfterMs =
+      options.manualStaleAfterMs ?? options.staleAfterMs ?? DEFAULT_MANUAL_STALE_AFTER_MS;
+    this.manualHardStaleAfterMs =
+      options.manualHardStaleAfterMs ??
+      options.hardStaleAfterMs ??
+      DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
   }
 
   private getServiceInfo(): QuotaCoordinatorServiceInfo {
@@ -423,11 +435,13 @@ export class QuotaCoordinatorService {
           return;
         }
 
+        const { mode } = this.options.store.getQuotaReadingMode(provider);
         const published = publishedThrottle(stored, {
           maxIntervalSeconds: this.maxIntervalSeconds,
-          staleAfterMs: this.staleAfterMs,
-          hardStaleAfterMs: this.hardStaleAfterMs,
+          staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
+          hardStaleAfterMs: mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
           nowMs,
+          mode,
         });
 
         this.sendJson(res, 200, {
@@ -442,12 +456,15 @@ export class QuotaCoordinatorService {
       const providersMap: Record<string, PublishedThrottleLaneStatus> = {};
       for (const p of this.configuredProviders) {
         const stored = this.options.store.getProviderThrottle(p);
+        const { mode } = this.options.store.getQuotaReadingMode(p);
         providersMap[p] = stored
           ? publishedThrottle(stored, {
               maxIntervalSeconds: this.maxIntervalSeconds,
-              staleAfterMs: this.staleAfterMs,
-              hardStaleAfterMs: this.hardStaleAfterMs,
+              staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
+              hardStaleAfterMs:
+                mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
               nowMs,
+              mode,
             })
           : this.coldThrottle(p);
       }

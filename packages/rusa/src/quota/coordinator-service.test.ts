@@ -602,6 +602,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       maxIntervalSeconds: serviceOpts.maxIntervalSeconds,
       staleAfterMs: serviceOpts.staleAfterMs,
       hardStaleAfterMs: serviceOpts.hardStaleAfterMs,
+      mode: "scrape",
     });
 
     expect(res.json.provider).toBe(expected.provider);
@@ -705,7 +706,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
     // The older unexpired, omitted bucket still shows its true age in the
     // per-bucket map, but it does not govern the provider's freshness.
-    expect(calculateFreshness(status, options)).toEqual({
+    expect(calculateFreshness(status, options)).toMatchObject({
       ageMs: 2 * 60_000,
       buckets: { "codex:weekly": 2 * 60_000, "codex:five_hour": 10 * 60 * 60_000 },
       stale: false,
@@ -1221,5 +1222,169 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(published.freshness.stale).toBe(true);
     expect(published.freshness.hardStale).toBe(true);
     expect(published.intervalSeconds).toBe(3600);
+  });
+
+  it("#690: /v1/throttle exposes freshness mode, thresholds, and resetWaiting", async () => {
+    store.configureController({ maxIntervalSeconds: 3600 });
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["kimi", "claude"],
+    });
+    await service.start();
+
+    // Default scrape mode for kimi
+    const nowMs = Date.now();
+    const idKimi = store.recordRaw({
+      provider: "kimi",
+      scrapedAt: new Date(nowMs - 10_000).toISOString(),
+      rawOutput: "raw",
+    });
+    store.recordParsed(
+      idKimi,
+      {
+        provider: "kimi",
+        status: "available",
+        scrapedAt: new Date(nowMs - 10_000).toISOString(),
+        limits: [
+          {
+            kind: "session",
+            label: "5h",
+            percentLeft: 90,
+            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
+          },
+        ],
+      },
+      {
+        provider: "kimi",
+        status: "available",
+        scrapedAt: new Date(nowMs - 10_000).toISOString(),
+        limits: [
+          {
+            kind: "session",
+            label: "5h",
+            percentLeft: 90,
+            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
+          },
+        ],
+      }
+    );
+
+    const scrapeRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
+    expect(scrapeRes.status).toBe(200);
+    expect(scrapeRes.json.freshness).toMatchObject({
+      mode: "scrape",
+      stale: false,
+      hardStale: false,
+      resetWaiting: false,
+    });
+    expect(scrapeRes.json.freshness.staleAfterMs).toBeGreaterThan(0);
+    expect(scrapeRes.json.freshness.hardStaleAfterMs).toBeGreaterThanOrEqual(
+      scrapeRes.json.freshness.staleAfterMs
+    );
+
+    // Switch claude to manual mode and record an observation
+    const switchRes = await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "manual" })
+    );
+    expect(switchRes.status).toBe(200);
+
+    const manualObservedAt = new Date(nowMs - 70 * 60 * 1000).toISOString(); // 70m ago (> 60m soft, < 120m hard)
+    const idClaude = store.recordRaw({
+      provider: "claude",
+      scrapedAt: manualObservedAt,
+      rawOutput: "manual",
+    });
+    store.recordParsed(
+      idClaude,
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt: manualObservedAt,
+        limits: [
+          {
+            kind: "session",
+            label: "Session",
+            percentLeft: 80,
+            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
+          },
+        ],
+      },
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt: manualObservedAt,
+        limits: [
+          {
+            kind: "session",
+            label: "Session",
+            percentLeft: 80,
+            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
+          },
+        ],
+      }
+    );
+
+    const manualRes = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(manualRes.status).toBe(200);
+    expect(manualRes.json.freshness).toMatchObject({
+      mode: "manual",
+      staleAfterMs: 3_600_000, // 60m default
+      hardStaleAfterMs: 7_200_000, // 120m default
+      stale: true, // 70m > 60m
+      hardStale: false, // 70m < 120m
+      resetWaiting: false,
+    });
+
+    // Collection route carries the same freshness fields
+    const collRes = await makeRequest(socketPath, "/v1/throttle");
+    expect(collRes.status).toBe(200);
+    expect(collRes.json.providers.claude.freshness).toMatchObject({
+      mode: "manual",
+      stale: true,
+      hardStale: false,
+    });
+    expect(collRes.json.providers.kimi.freshness.mode).toBe("scrape");
+  });
+
+  it("#690: /v1/throttle detects resetWaiting when window resetAt has passed without fresh reading", async () => {
+    store.configureController({ maxIntervalSeconds: 3600 });
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["kimi"],
+    });
+    await service.start();
+
+    const nowMs = Date.now();
+    const observedAt = new Date(nowMs - 20 * 60 * 1000).toISOString(); // 20m ago
+    const resetAt = new Date(nowMs - 5 * 60 * 1000).toISOString(); // reset 5m ago, observed 20m ago => resetWaiting: true
+    const id = store.recordRaw({
+      provider: "kimi",
+      scrapedAt: observedAt,
+      rawOutput: "raw",
+    });
+    store.recordParsed(
+      id,
+      {
+        provider: "kimi",
+        status: "available",
+        scrapedAt: observedAt,
+        limits: [{ kind: "session", label: "5h", percentLeft: 10, resetAtIso: resetAt }],
+      },
+      {
+        provider: "kimi",
+        status: "available",
+        scrapedAt: observedAt,
+        limits: [{ kind: "session", label: "5h", percentLeft: 10, resetAtIso: resetAt }],
+      }
+    );
+
+    const res = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
+    expect(res.status).toBe(200);
+    expect(res.json.freshness.resetWaiting).toBe(true);
   });
 });

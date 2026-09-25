@@ -996,7 +996,7 @@ describe("SharedQuotaStore PID integral term", () => {
       const rows = reasonedRows(store, "claude");
       expect(rows).toHaveLength(13);
       expect(QUOTA_INTEGRAL_TIME_SECONDS).toBe(2 * QUOTA_DERIVATIVE_TAU_SECONDS);
-      expect(QUOTA_INTEGRAL_MAX_STEP_SECONDS).toBe(5 * 60);
+      expect(QUOTA_INTEGRAL_MAX_STEP_SECONDS).toBe(30 * 60);
 
       // A cold start has no elapsed time to integrate over, so the first
       // decision is the pure proportional one a PD controller would have made.
@@ -1194,6 +1194,101 @@ describe("SharedQuotaStore PID integral term", () => {
       const gapped = reasonedRows(store, "claude").at(-1) as ReasonedRow;
       expect(gapped.integral).toBeCloseTo(gapped.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
       expect(gapped.integral).toBeLessThan(gapped.error * 24 * 60 * 60);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("accumulates the same integral area for six 5m observations vs one 30m observation under stable error (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-step-compare-"));
+    roots.push(root);
+    const store5m = new SharedQuotaStore(join(root, "store5m.db"));
+    const store30m = new SharedQuotaStore(join(root, "store30m.db"));
+    try {
+      store5m.configureController({ maxIntervalSeconds: 36000 });
+      store30m.configureController({ maxIntervalSeconds: 36000 });
+
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const standingError = 10;
+
+      // In store5m, record 7 observations (t=0, 5m, 10m, 15m, 20m, 25m, 30m) with constant error
+      for (let i = 0; i <= 6; i++) {
+        const obsMs = startMs + i * 5 * 60 * 1000;
+        const timeRemainingPct = ((Date.parse(reset) - obsMs) / weeklyMs) * 100;
+        recordObservation(
+          store5m,
+          "claude",
+          new Date(obsMs).toISOString(),
+          timeRemainingPct - standingError,
+          reset
+        );
+      }
+
+      // In store30m, record 2 observations (t=0 and t=30m) with the same constant error
+      const t0 = startMs;
+      const t30 = startMs + 30 * 60 * 1000;
+      const timeRemainingPct0 = ((Date.parse(reset) - t0) / weeklyMs) * 100;
+      const timeRemainingPct30 = ((Date.parse(reset) - t30) / weeklyMs) * 100;
+      recordObservation(
+        store30m,
+        "claude",
+        new Date(t0).toISOString(),
+        timeRemainingPct0 - standingError,
+        reset
+      );
+      recordObservation(
+        store30m,
+        "claude",
+        new Date(t30).toISOString(),
+        timeRemainingPct30 - standingError,
+        reset
+      );
+
+      const rows5m = reasonedRows(store5m, "claude");
+      const rows30m = reasonedRows(store30m, "claude");
+
+      expect(rows5m).toHaveLength(7);
+      expect(rows30m).toHaveLength(2);
+
+      const final5m = rows5m.at(-1) as ReasonedRow;
+      const final30m = rows30m.at(-1) as ReasonedRow;
+
+      // Both should have integrated standingError * 1800s
+      expect(final5m.integral).toBeCloseTo(standingError * 1800, 4);
+      expect(final30m.integral).toBeCloseTo(standingError * 1800, 4);
+      expect(final30m.integral).toBeCloseTo(final5m.integral, 4);
+    } finally {
+      store5m.close();
+      store30m.close();
+    }
+  });
+
+  it("bounds long gaps to 30m step and resets anti-windup on window reset / refill (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-antiwindup-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const reset1 = "2030-01-08T00:00:00.000Z";
+
+      // Initial observation at t=0
+      recordObservation(store, "kimi", "2030-01-01T00:00:00.000Z", 90, reset1);
+      // Long gap of 2 hours (7200s): must be clamped to 1800s (30m)
+      recordObservation(store, "kimi", "2030-01-01T02:00:00.000Z", 80, reset1);
+
+      const afterLongGap = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
+      // Integrated dt must be bounded by 1800s, not 7200s
+      expect(afterLongGap.integral).toBeCloseTo(afterLongGap.error * 1800, 4);
+
+      // Now simulate a window reset / refill: resetMoves or quotaRefilled
+      const reset2 = "2030-01-15T00:00:00.000Z";
+      recordObservation(store, "kimi", "2030-01-08T00:05:00.000Z", 98, reset2);
+
+      const afterReset = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
+      // Cycle changed zeroes integralDtSeconds and previousIntegral
+      expect(afterReset.integral).toBe(0);
     } finally {
       store.close();
     }

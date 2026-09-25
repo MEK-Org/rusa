@@ -1198,6 +1198,47 @@ class QuotaThrottleBucketDto {
   };
 }
 
+/// Applied freshness metadata and thresholds from the coordinator (#690).
+class QuotaFreshnessDto {
+  const QuotaFreshnessDto({
+    this.ageMs,
+    this.stale = false,
+    this.hardStale = false,
+    this.mode,
+    this.staleAfterMs,
+    this.hardStaleAfterMs,
+    this.resetWaiting = false,
+  });
+
+  final int? ageMs;
+  final bool stale;
+  final bool hardStale;
+  final String? mode;
+  final int? staleAfterMs;
+  final int? hardStaleAfterMs;
+  final bool resetWaiting;
+
+  factory QuotaFreshnessDto.fromJson(Map<String, dynamic> j) => QuotaFreshnessDto(
+    ageMs: (j['ageMs'] as num?)?.toInt(),
+    stale: j['stale'] as bool? ?? false,
+    hardStale: j['hardStale'] as bool? ?? false,
+    mode: j['mode'] as String?,
+    staleAfterMs: (j['staleAfterMs'] as num?)?.toInt(),
+    hardStaleAfterMs: (j['hardStaleAfterMs'] as num?)?.toInt(),
+    resetWaiting: j['resetWaiting'] as bool? ?? false,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'ageMs': ageMs,
+    'stale': stale,
+    'hardStale': hardStale,
+    if (mode != null) 'mode': mode,
+    if (staleAfterMs != null) 'staleAfterMs': staleAfterMs,
+    if (hardStaleAfterMs != null) 'hardStaleAfterMs': hardStaleAfterMs,
+    'resetWaiting': resetWaiting,
+  };
+}
+
 /// Latest adaptive start interval for one provider, when quota pacing is enabled.
 class QuotaThrottleDto {
   const QuotaThrottleDto({
@@ -1206,6 +1247,7 @@ class QuotaThrottleDto {
     this.capped = false,
     required this.buckets,
     required this.updatedAt,
+    this.freshness,
   });
 
   final double intervalSeconds;
@@ -1213,6 +1255,7 @@ class QuotaThrottleDto {
   final bool capped;
   final List<QuotaThrottleBucketDto> buckets;
   final String updatedAt;
+  final QuotaFreshnessDto? freshness;
 
   factory QuotaThrottleDto.fromJson(Map<String, dynamic> j) => QuotaThrottleDto(
     intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble() ?? 0,
@@ -1222,6 +1265,9 @@ class QuotaThrottleDto {
         .map((e) => QuotaThrottleBucketDto.fromJson(e as Map<String, dynamic>))
         .toList(),
     updatedAt: j['updatedAt'] as String? ?? '',
+    freshness: j['freshness'] is Map<String, dynamic>
+        ? QuotaFreshnessDto.fromJson(j['freshness'] as Map<String, dynamic>)
+        : null,
   );
 
   Map<String, dynamic> toJson() => {
@@ -1230,6 +1276,7 @@ class QuotaThrottleDto {
     'capped': capped,
     'buckets': buckets.map((bucket) => bucket.toJson()).toList(),
     'updatedAt': updatedAt,
+    if (freshness != null) 'freshness': freshness!.toJson(),
   };
 }
 

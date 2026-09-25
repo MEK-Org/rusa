@@ -6,6 +6,8 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 export const COORDINATOR_PROTOCOL_MINOR = 1;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
+export const DEFAULT_MANUAL_STALE_AFTER_MS = 3_600_000; // 60 min (target for paced manual mode, #690)
+export const DEFAULT_MANUAL_HARD_STALE_AFTER_MS = 7_200_000; // 120 min (2 hours fail-safe threshold, #690)
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 /**
@@ -30,6 +32,10 @@ export interface QuotaFreshness {
   buckets: Record<string, number>;
   stale: boolean;
   hardStale: boolean;
+  mode?: "manual" | "scrape";
+  staleAfterMs?: number;
+  hardStaleAfterMs?: number;
+  resetWaiting?: boolean;
 }
 
 export interface PublishedThrottleProviderStatus {
@@ -202,6 +208,7 @@ export interface PublishedThrottleOptions {
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
   nowMs?: number;
+  mode?: "manual" | "scrape";
 }
 
 export class ProtocolMismatchError extends Error {
@@ -220,11 +227,15 @@ export class ProtocolMismatchError extends Error {
 
 export function calculateFreshness(
   stored: PersistedQuotaProviderStatus,
-  options?: { staleAfterMs?: number; hardStaleAfterMs?: number; nowMs?: number }
+  options?: PublishedThrottleOptions
 ): QuotaFreshness {
   const nowMs = options?.nowMs ?? Date.now();
-  const staleAfterMs = options?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
-  const hardStaleAfterMs = options?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  const mode = options?.mode;
+  const defaultStale = mode === "manual" ? DEFAULT_MANUAL_STALE_AFTER_MS : DEFAULT_STALE_AFTER_MS;
+  const defaultHardStale =
+    mode === "manual" ? DEFAULT_MANUAL_HARD_STALE_AFTER_MS : DEFAULT_HARD_STALE_AFTER_MS;
+  const staleAfterMs = options?.staleAfterMs ?? defaultStale;
+  const hardStaleAfterMs = Math.max(staleAfterMs, options?.hardStaleAfterMs ?? defaultHardStale);
 
   const buckets: Record<string, number> = {};
   const currentAges: number[] = [];
@@ -265,11 +276,34 @@ export function calculateFreshness(
   const stale = ageMs > staleAfterMs;
   const hardStale = ageMs > hardStaleAfterMs;
 
+  // Window reset-wait distinction (#690): if any window has passed its reset
+  // instant (resetAtIso <= nowMs), but the observation was taken before that reset,
+  // the coordinator is waiting for a fresh post-reset observation. This must never
+  // be conflated with an observed zero or fresh usage reading.
+  const resetWaiting =
+    stored.buckets && stored.buckets.length > 0
+      ? stored.buckets.some((b) => {
+          if (!b.resetAtIso) return false;
+          const resetMs = Date.parse(b.resetAtIso);
+          const observedMs = Date.parse(b.observedAt);
+          return (
+            Number.isFinite(resetMs) &&
+            resetMs <= nowMs &&
+            Number.isFinite(observedMs) &&
+            observedMs < resetMs
+          );
+        })
+      : false;
+
   return {
     ageMs,
     buckets,
     stale,
     hardStale,
+    mode,
+    staleAfterMs,
+    hardStaleAfterMs,
+    resetWaiting,
   };
 }
 
