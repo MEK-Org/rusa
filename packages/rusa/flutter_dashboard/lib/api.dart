@@ -257,6 +257,33 @@ class DashboardApi {
     }
   }
 
+  /// `POST /api/mesh/admission-queue/reorder` — move an unclaimed queued
+  /// actor before [beforeThreadId], or to the end when it is null (#570).
+  /// [observedOrder] is the unclaimed order this view rendered; the server
+  /// applies nothing and answers 409 if the live list has changed since.
+  Future<void> reorderAdmissionQueue({
+    required String threadId,
+    required String? beforeThreadId,
+    required List<String> observedOrder,
+  }) async {
+    final uri = _u('/api/mesh/admission-queue/reorder');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'threadId': threadId,
+        'beforeThreadId': beforeThreadId,
+        'observedOrder': observedOrder,
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   /// `POST /api/mesh/actors/:actorId/run-now` — bypass queue and quota throttling for an actor.
   Future<void> runNowActor(String actorId) async {
     final uri = _u('/api/mesh/actors/$actorId/run-now');

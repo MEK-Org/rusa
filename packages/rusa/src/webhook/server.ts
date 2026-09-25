@@ -148,6 +148,8 @@ export interface DashboardMeshRefs {
   queuedThreadIds?: () => Set<string>;
   /** Per-lane provider queue snapshots; see `DashboardDataDeps`. */
   providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
+  /** Operator reorder of the unclaimed admission list; see `DashboardDataDeps`. */
+  reorderAdmissionQueue?: DashboardDataDeps["reorderAdmissionQueue"];
   /** Active-run inbox focus projection; see `DashboardDataDeps`. */
   selectedObligationForActor?: DashboardDataDeps["selectedObligationForActor"];
   /** Active-run selected inbox items projection; see `DashboardDataDeps`. */
@@ -600,6 +602,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,
           providerQueueSnapshots: options.mesh.providerQueueSnapshots,
+          reorderAdmissionQueue: options.mesh.reorderAdmissionQueue,
           selectedObligationForActor: options.mesh.selectedObligationForActor,
           selectedInboxItemsForActor: options.mesh.selectedInboxItemsForActor,
           rootIdentity: options.mesh.rootIdentity,

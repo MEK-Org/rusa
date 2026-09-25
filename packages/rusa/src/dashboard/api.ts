@@ -115,7 +115,20 @@ export interface DashboardDataDeps {
     position: number;
     estimatedStartAt: string | null;
     pacingIntervalMs: number;
+    claimed?: boolean;
+    compatibleLanes?: string[];
+    claimedLane?: string | null;
   }>;
+  /**
+   * Operator reorder of the unclaimed admission list (#570), applied only when
+   * `observedOrder` is still the live unclaimed order — see
+   * `UnifiedAdmissionQueue.reorderObserved`. Absent → the route 503s.
+   */
+  reorderAdmissionQueue?: (request: {
+    observedOrder: string[];
+    threadId: string;
+    beforeThreadId?: string;
+  }) => { status: "ok" | "stale" | "invalid"; order: string[] };
   /**
    * Current selected obligation for an actor's active run. This is a
    * projection of the durable inbox focus, not a second selection model; it
@@ -338,6 +351,12 @@ interface ThreadDto {
    * lifetime as `estimatedStartAt`.
    */
   pacingIntervalMs?: number | null;
+  /** In the admission list holding a lane, waiting on mesh concurrency; never reorderable. */
+  admissionClaimed?: boolean;
+  /** Provider lanes this queued actor can start on; empty when not queued. */
+  compatibleLanes?: string[];
+  /** The lane a claimed admission holds, else `null`. */
+  claimedLane?: string | null;
 }
 
 /**
@@ -800,6 +819,69 @@ export async function handleMeshApiRequest(
             sendJson(res, 201, { id });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/admission-queue/reorder — operator reorder of the unclaimed
+    // admission list (#570). The body carries the unclaimed order the operator
+    // saw; if the live list differs, nothing moves and 409 returns the current
+    // order. The order is leader-local memory and resets on leader restart.
+    if (pathname === "/api/mesh/admission-queue/reorder") {
+      const reorder = deps?.reorderAdmissionQueue;
+      if (!reorder) {
+        sendJson(res, 503, { error: "admission queue unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          const body =
+            typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : {};
+          const { threadId, beforeThreadId, observedOrder } = body;
+          if (
+            typeof threadId !== "string" ||
+            !(
+              beforeThreadId === undefined ||
+              beforeThreadId === null ||
+              typeof beforeThreadId === "string"
+            ) ||
+            !Array.isArray(observedOrder) ||
+            !observedOrder.every((id) => typeof id === "string")
+          ) {
+            sendJson(res, 400, {
+              error: "threadId, observedOrder (string[]) and optional beforeThreadId are required",
+            });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          const result = reorder({
+            observedOrder,
+            threadId,
+            beforeThreadId: typeof beforeThreadId === "string" ? beforeThreadId : undefined,
+          });
+          if (result.status === "stale") {
+            sendJson(res, 409, { error: "admission queue changed", order: result.order });
+          } else if (result.status === "invalid") {
+            sendJson(res, 400, { error: "not an unclaimed queued actor", order: result.order });
+          } else {
+            deps?.logger?.info("admission_queue_reordered", {
+              principal,
+              threadId,
+              beforeThreadId: typeof beforeThreadId === "string" ? beforeThreadId : null,
+            });
+            sendJson(res, 200, { ok: true, order: result.order });
           }
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
@@ -1873,6 +1955,9 @@ export async function handleMeshApiRequest(
           queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
           estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
           pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
+          admissionClaimed: providerQueueSnapshots.get(r.id)?.claimed ?? false,
+          compatibleLanes: providerQueueSnapshots.get(r.id)?.compatibleLanes ?? [],
+          claimedLane: providerQueueSnapshots.get(r.id)?.claimedLane ?? null,
           selectedProvider: selection?.provider ?? null,
           selectedLane: selection?.lane ?? null,
           selectedModel: selection?.model ?? null,

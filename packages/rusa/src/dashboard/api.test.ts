@@ -167,6 +167,7 @@ describe("handleMeshApiRequest", () => {
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
   let rootReparents: Array<{ id: string; parentId: string; principal: string }>;
+  let admissionReorders: unknown[];
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -183,6 +184,7 @@ describe("handleMeshApiRequest", () => {
     }).id;
     rootSpawns = [];
     rootReparents = [];
+    admissionReorders = [];
     const mockMesh = {
       sendHumanMessage: (
         toId: string,
@@ -222,6 +224,10 @@ describe("handleMeshApiRequest", () => {
           rootReparents.push({ id, parentId, principal });
         },
       } as unknown as RootControlService,
+      reorderAdmissionQueue: (request) => {
+        admissionReorders.push(request);
+        return { status: "ok", order: [] };
+      },
     };
   });
 
@@ -235,6 +241,11 @@ describe("handleMeshApiRequest", () => {
       ["POST", "/api/mesh/obligations", JSON.stringify({ ownerId: UUID_A, title: "t" })],
       ["POST", "/api/mesh/obligations/task/status", JSON.stringify({ status: "done" })],
       ["POST", "/api/mesh/obligations/task/reassign", JSON.stringify({ ownerId: UUID_A })],
+      [
+        "POST",
+        "/api/mesh/admission-queue/reorder",
+        JSON.stringify({ threadId: UUID_A, observedOrder: [UUID_A] }),
+      ],
     ];
 
     async function expectAllRejected(localDeps: DashboardDataDeps, fragment: string) {
@@ -249,6 +260,7 @@ describe("handleMeshApiRequest", () => {
       }
       expect(rootSpawns).toEqual([]);
       expect(rootReparents).toEqual([]);
+      expect(admissionReorders).toEqual([]);
       expect(meshChat.listForActor(UUID_A)).toEqual([]);
       expect(obligations.get("task")?.ownerId).toBe(UUID_A);
     }
@@ -1889,6 +1901,145 @@ describe("handleMeshApiRequest", () => {
     // Not in any pacer's snapshot at all — not merely an unknown ETA.
     expect(byId(UUID_C).queuePosition).toBeNull();
     expect(byId(UUID_C).estimatedStartAt).toBeNull();
+  });
+
+  describe("admission list and operator reorder (#570)", () => {
+    /**
+     * The route over a stub queue: `reorderObserved`'s semantics are pinned in
+     * provider-pacer.test.ts, so these cover only parsing, auth order, status
+     * mapping and logging.
+     */
+    function wire(
+      result: ReturnType<NonNullable<DashboardDataDeps["reorderAdmissionQueue"]>>,
+      logger?: DashboardDataDeps["logger"]
+    ) {
+      const calls: unknown[] = [];
+      const localDeps = {
+        ...deps,
+        ...(logger ? { logger } : {}),
+        reorderAdmissionQueue: (request) => {
+          calls.push(request);
+          return result;
+        },
+      } satisfies DashboardDataDeps;
+      return { localDeps, calls };
+    }
+
+    const reorder = (localDeps: DashboardDataDeps, body: unknown) =>
+      call(localDeps, "POST", "/api/mesh/admission-queue/reorder", JSON.stringify(body)).then(
+        async ({ res }) => {
+          await settled(res);
+          return { status: res.statusCode, body: JSON.parse(res.body) };
+        }
+      );
+
+    it("GET /api/mesh/threads exposes each entry's lanes and claim state", async () => {
+      actors.upsert(rec("root", null, "active"));
+      actors.upsert(rec(UUID_A, "root", "active"));
+      actors.upsert(rec(UUID_B, "root", "active"));
+      deps = {
+        ...deps,
+        providerQueueSnapshots: () => [
+          {
+            threadId: UUID_A,
+            position: 0,
+            estimatedStartAt: null,
+            pacingIntervalMs: 0,
+            claimed: true,
+            compatibleLanes: ["claude", "codex"],
+            claimedLane: "codex",
+          },
+          {
+            threadId: UUID_B,
+            position: 1,
+            estimatedStartAt: null,
+            pacingIntervalMs: 0,
+            claimed: false,
+            compatibleLanes: ["claude"],
+            claimedLane: null,
+          },
+        ],
+      };
+
+      const { res } = await call(deps, "GET", "/api/mesh/threads");
+      const byId = (id: string) =>
+        JSON.parse(res.body).threads.find((t: { id: string }) => t.id === id);
+      expect(byId(UUID_A)).toMatchObject({
+        admissionClaimed: true,
+        compatibleLanes: ["claude", "codex"],
+        claimedLane: "codex",
+      });
+      expect(byId(UUID_B)).toMatchObject({
+        admissionClaimed: false,
+        compatibleLanes: ["claude"],
+        claimedLane: null,
+      });
+      expect(byId("root")).toMatchObject({
+        admissionClaimed: false,
+        compatibleLanes: [],
+        claimedLane: null,
+      });
+    });
+
+    it("returns 200 with the new order, maps a null anchor to append, and logs who moved it", async () => {
+      const { logger, records } = recordingLogger();
+      const { localDeps, calls } = wire({ status: "ok", order: [UUID_B, UUID_A] }, logger);
+
+      const moved = await reorder(localDeps, {
+        threadId: UUID_A,
+        beforeThreadId: null,
+        observedOrder: [UUID_A, UUID_B],
+      });
+      expect(moved).toEqual({ status: 200, body: { ok: true, order: [UUID_B, UUID_A] } });
+      expect(calls).toEqual([
+        { observedOrder: [UUID_A, UUID_B], threadId: UUID_A, beforeThreadId: undefined },
+      ]);
+      expect(records()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            msg: "admission_queue_reordered",
+            principal: LOCAL_USER,
+            threadId: UUID_A,
+            beforeThreadId: null,
+          }),
+        ])
+      );
+    });
+
+    it("maps a stale reorder to 409 and an invalid target to 400, each with the live order", async () => {
+      const body = { threadId: UUID_A, beforeThreadId: UUID_B, observedOrder: [UUID_A, UUID_B] };
+      const stale = wire({ status: "stale", order: [UUID_B, UUID_A] });
+      expect(await reorder(stale.localDeps, body)).toEqual({
+        status: 409,
+        body: { error: "admission queue changed", order: [UUID_B, UUID_A] },
+      });
+      expect(stale.calls).toEqual([body]);
+
+      const invalid = wire({ status: "invalid", order: [UUID_B] });
+      expect(await reorder(invalid.localDeps, body)).toEqual({
+        status: 400,
+        body: { error: "not an unclaimed queued actor", order: [UUID_B] },
+      });
+    });
+
+    it("rejects malformed requests without calling the queue, and 503s when it is not wired", async () => {
+      const { localDeps, calls } = wire({ status: "ok", order: [UUID_A] });
+      expect((await reorder(localDeps, { threadId: UUID_A })).status).toBe(400);
+      expect((await reorder(localDeps, { observedOrder: [UUID_A] })).status).toBe(400);
+      expect(
+        (await reorder(localDeps, { threadId: UUID_A, observedOrder: [UUID_A, 7] })).status
+      ).toBe(400);
+      expect(
+        (await reorder(localDeps, { threadId: UUID_A, beforeThreadId: 7, observedOrder: [] }))
+          .status
+      ).toBe(400);
+      expect(calls).toEqual([]);
+
+      const { reorderAdmissionQueue: _omitted, ...unwired } = localDeps;
+      expect((await reorder(unwired, { threadId: UUID_A, observedOrder: [UUID_A] })).status).toBe(
+        503
+      );
+    });
   });
 
   it("GET /api/mesh/threads reflects dynamic pacing changes on the next request", async () => {

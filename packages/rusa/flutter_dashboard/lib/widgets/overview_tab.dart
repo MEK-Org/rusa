@@ -804,16 +804,23 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Queue entries are separate from idle actors, sorted by expected run
-  /// order (`ActorStateSnapshot.queuedActors`). Each entry shows the
-  /// scheduler's current estimate, or an honest "unknown" when pacing state
-  /// doesn't support one yet.
+  /// The leader's one admission list (#570), in real admission order
+  /// (`ActorStateSnapshot.queuedActors`): claimed entries holding a lane
+  /// first, then unclaimed ones in the order lanes scan them. Each entry
+  /// shows its lanes and when it expects to run; unclaimed entries can be
+  /// moved, and each move carries the order this view rendered so a list
+  /// that changed underneath is refused rather than reshuffled.
   Widget _buildQueuedActorsSection() {
     return StreamBuilder<ActorStateSnapshot>(
       stream: widget.store.actorStates,
       builder: (context, snap) {
         final snapshot = snap.data ?? widget.store.actorStates.value;
         final queued = snapshot.queuedActors;
+        final unclaimed = [
+          for (final actor in queued)
+            if (!actor.admissionClaimed && actor.queuePosition != null)
+              actor.id,
+        ];
         return Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
@@ -838,9 +845,10 @@ class _OverviewTabState extends State<OverviewTab> {
               ),
               const SizedBox(height: 4),
               const Text(
-                'Actors waiting for a provider slot, sorted by expected run '
-                'order. Each shows the scheduler\'s current estimate, which '
-                'shifts as pacing changes.',
+                'Actors waiting for a provider slot, in the order provider '
+                'lanes will take them. Each lane takes the first actor it can '
+                'run, so an actor can start ahead of one whose lanes are '
+                'busy. Manual ordering resets when the leader restarts.',
                 style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 14),
@@ -856,6 +864,8 @@ class _OverviewTabState extends State<OverviewTab> {
                     child: _buildActorContextCard(
                       actor,
                       queued: true,
+                      queueAhead: _queuedAheadOnSharedLanes(actor, queued),
+                      queueMove: _queueMoveControls(actor, unclaimed),
                       selection: actor.reservedSelection,
                     ),
                   ),
@@ -882,10 +892,13 @@ class _OverviewTabState extends State<OverviewTab> {
     ActorViewState actor, {
     double? width,
     bool queued = false,
+    int queueAhead = 0,
+    Widget? queueMove,
     RunModelSelection? selection,
   }) {
     final selectedObligation = actor.selectedObligation;
-    final startLabel = queued ? _queueStartLabel(actor) : null;
+    final startLabel = queued ? _queueStartLabel(actor, queueAhead) : null;
+    final laneLabel = queued ? _queueLaneLabel(actor) : null;
     final header = InkWell(
       onTap: () => _navigateToActor(actor.id),
       borderRadius: BorderRadius.circular(6),
@@ -953,6 +966,18 @@ class _OverviewTabState extends State<OverviewTab> {
                       ),
                     ),
                   ],
+                  if (laneLabel != null) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      laneLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.textSecondary,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -993,6 +1018,19 @@ class _OverviewTabState extends State<OverviewTab> {
             ),
             child: focusContent,
           );
+    // Move controls sit beside, not inside, the header's navigation target.
+    final headed = queueMove == null
+        ? header
+        : Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: header),
+              Padding(
+                padding: const EdgeInsets.only(top: 4, right: 4),
+                child: queueMove,
+              ),
+            ],
+          );
     return Container(
       width: width,
       decoration: BoxDecoration(
@@ -1010,7 +1048,7 @@ class _OverviewTabState extends State<OverviewTab> {
             return Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Expanded(child: header),
+                Expanded(child: headed),
                 Expanded(
                   flex: 3,
                   child: Padding(
@@ -1024,7 +1062,7 @@ class _OverviewTabState extends State<OverviewTab> {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              header,
+              headed,
               if (focus != null)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -1295,23 +1333,125 @@ class _OverviewTabState extends State<OverviewTab> {
 
   /// When a queued card expects to run, in relative terms: the pacer's
   /// estimate as "Runs in ~8 min", or — when it can't honestly quote one —
-  /// what the run is waiting on. A null estimate at lane position 0 is the
-  /// staged head holding for a mesh concurrency slot; further back, a request
-  /// behind that head.
-  String _queueStartLabel(ActorViewState actor) {
+  /// what the run is waiting on. A claimed entry already holds its lane and
+  /// waits for a mesh concurrency slot; an unclaimed one without an estimate
+  /// shows how many earlier entries share one of its lanes. That overlap is
+  /// context, not a promise of start order: another entry can take a different
+  /// lane, and a later entry can start first. Entries on lanes it cannot use
+  /// are not counted: `queuePosition` is global.
+  String _queueStartLabel(ActorViewState actor, int ahead) {
     final estimate = actor.estimatedStartAt;
     if (estimate != null) {
       final startsIn = formatStartsIn(estimate);
       return startsIn == null ? 'Starting shortly' : 'Runs $startsIn';
     }
-    final position = actor.queuePosition;
-    if (position == 0) return 'Runs when a slot frees up';
-    if (position != null) {
-      return position == 1
-          ? 'Runs after 1 queued run'
-          : 'Runs after $position queued runs';
+    if (actor.queuePosition == null) {
+      return actor.waitingOn ?? 'Waiting for a provider slot';
     }
-    return actor.waitingOn ?? 'Waiting for a provider slot';
+    if (actor.admissionClaimed || ahead == 0) {
+      return 'Runs when a slot frees up';
+    }
+    return ahead == 1
+        ? '1 earlier queued actor shares a compatible lane'
+        : '$ahead earlier queued actors share a compatible lane';
+  }
+
+  /// Entries ahead of [actor] in the admission list that share one of its
+  /// lanes. A claimed entry competes only for the lane it holds, since its
+  /// claim never transfers. An entry whose lanes are unknown counts, so a
+  /// missing lane list never understates the compatible-lane context.
+  int _queuedAheadOnSharedLanes(
+    ActorViewState actor,
+    List<ActorViewState> queued,
+  ) {
+    final position = actor.queuePosition;
+    if (position == null) return 0;
+    final lanes = actor.compatibleLanes.toSet();
+    return queued.where((other) {
+      final otherPosition = other.queuePosition;
+      final held = other.admissionClaimed ? other.claimedLane : null;
+      final otherLanes = held == null ? other.compatibleLanes : [held];
+      return otherPosition != null &&
+          otherPosition < position &&
+          (lanes.isEmpty ||
+              otherLanes.isEmpty ||
+              otherLanes.any(lanes.contains));
+    }).length;
+  }
+
+  /// The lanes an admission can start on, or the one a claimed entry holds.
+  String? _queueLaneLabel(ActorViewState actor) {
+    final claimed = actor.claimedLane;
+    if (actor.admissionClaimed && claimed != null) {
+      return 'Claimed · $claimed, waiting for a run slot';
+    }
+    if (actor.compatibleLanes.isEmpty) return null;
+    final noun = actor.compatibleLanes.length == 1 ? 'Lane' : 'Lanes';
+    return '$noun: ${actor.compatibleLanes.join(' · ')}';
+  }
+
+  /// Move up/down buttons for an unclaimed entry; claimed entries and actors
+  /// outside the list get none. Each is a focusable [IconButton], so Tab
+  /// reaches it and Enter/Space activates it.
+  Widget? _queueMoveControls(ActorViewState actor, List<String> unclaimed) {
+    final index = unclaimed.indexOf(actor.id);
+    if (index < 0 || unclaimed.length < 2) return null;
+    // `beforeThreadId` semantics: move up = before the previous entry; move
+    // down = before the entry after next, or to the end.
+    final String? upBefore = index > 0 ? unclaimed[index - 1] : null;
+    final canDown = index < unclaimed.length - 1;
+    final String? downBefore = index + 2 < unclaimed.length
+        ? unclaimed[index + 2]
+        : null;
+    Widget button({
+      required IconData icon,
+      required String label,
+      required bool enabled,
+      required String? before,
+    }) => IconButton(
+      icon: Icon(icon, size: 18),
+      tooltip: '$label ${actor.handle}',
+      visualDensity: VisualDensity.compact,
+      color: MeshColors.textSecondary,
+      onPressed: enabled
+          ? () => _moveQueued(actor.id, before, List.of(unclaimed))
+          : null,
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        button(
+          icon: Icons.arrow_upward,
+          label: 'Move up',
+          enabled: index > 0,
+          before: upBefore,
+        ),
+        button(
+          icon: Icons.arrow_downward,
+          label: 'Move down',
+          enabled: canDown,
+          before: downBefore,
+        ),
+      ],
+    );
+  }
+
+  Future<void> _moveQueued(
+    String threadId,
+    String? beforeThreadId,
+    List<String> observedOrder,
+  ) async {
+    final outcome = await widget.store.reorderQueuedActor(
+      threadId: threadId,
+      beforeThreadId: beforeThreadId,
+      observedOrder: observedOrder,
+    );
+    if (!mounted || outcome != QueueReorderOutcome.stale) return;
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      const SnackBar(
+        content: Text('The queue changed before your move; nothing was moved.'),
+      ),
+    );
   }
 }
 
