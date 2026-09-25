@@ -256,11 +256,11 @@ describe("remote actor run accounting", () => {
     startRun();
     expect(openRuns()).toHaveLength(1);
 
-    handle.detachHost();
-    const reconnected = new RemoteInstance("test-follower", process.platform, process.pid);
-    handle.attachHost(reconnected.createHost(ACTOR_ID));
-    reconnected.receive({ actorId: ACTOR_ID, message: { type: "ready", pid: 4242 } });
-    reconnected.receive({
+    // The production registration listener rebinds the hub's retained remote
+    // instance before calling ActorHandle.attachHost().
+    handle.attachHost(remote.rebindHost(ACTOR_ID));
+    remote.receive({ actorId: ACTOR_ID, message: { type: "ready", pid: 4242 } });
+    remote.receive({
       actorId: ACTOR_ID,
       message: { type: "request", requestId: 2, request: { op: "complete", result: RESULT } },
     });

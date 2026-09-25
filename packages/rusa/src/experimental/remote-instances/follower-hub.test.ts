@@ -71,20 +71,37 @@ describe("leader follower gateway", () => {
     expect(replacement).not.toBe(oldHost);
   });
 
-  it("keeps lapsed contact advisory while refusing new dispatch until a heartbeat arrives", async () => {
+  it("keeps lapsed contact advisory while refusing a stale actor wake until its next poll", async () => {
     const start = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(start);
     try {
       const h = await setup();
       const identity = await h.register("mac");
+      const host = h.hub.createHost("mac", "existing-actor");
 
       clock.mockReturnValue(start + 46_000);
       (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
       expect(h.hub.list()).toHaveLength(1);
       expect(() => h.hub.createHost("mac", "stale-actor")).toThrow("no recent contact");
+      const rejection = vi.fn();
+      expect(host.send({ type: "wake" }, rejection)).toBe(false);
+      expect((rejection.mock.calls[0]?.[0] as Error).message).toContain("no recent contact");
+      // Cancellation remains available; only fresh work is contact-gated.
+      expect(host.send({ type: "stop" }, (error) => expect(error).toBeNull())).toBe(true);
 
-      expect((await h.post("/heartbeat", identity)).status).toBe(200);
-      expect(h.hub.createHost("mac", "fresh-actor")).toBeDefined();
+      const poll = h.post("/poll", identity);
+      await vi.waitFor(() =>
+        expect(h.hub.list().find((follower) => follower.id === "mac")?.lastSeen).toBe(
+          new Date(start + 46_000).toISOString()
+        )
+      );
+      expect(host.send({ type: "wake" }, (error) => expect(error).toBeNull())).toBe(true);
+      expect(await (await poll).json()).toEqual([
+        { actorId: "existing-actor", message: { type: "stop" } },
+      ]);
+      expect(await (await h.post("/poll", identity)).json()).toEqual([
+        { actorId: "existing-actor", message: { type: "wake" } },
+      ]);
     } finally {
       clock.mockRestore();
     }
@@ -144,6 +161,18 @@ describe("leader follower gateway", () => {
     );
     expect(() => h.hub.createHost("unknown", "actor")).toThrow("not connected");
     await h.post("/unregister", replacementIdentity);
+    // Losing its replacement must not let an old live process reclaim this id.
+    expect(
+      (
+        await h.post("/register", {
+          id: "mac",
+          platform: "darwin",
+          pid: 123,
+          generation: "mac-process-one",
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        })
+      ).status
+    ).toBe(409);
     expect(h.hub.list()).toEqual([]);
   });
 

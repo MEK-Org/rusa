@@ -82,7 +82,7 @@ export class FollowerHub {
   private static readonly STALE_AFTER_MS = 45_000;
   private readonly log: Logger;
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
-  /** Generations that a confirmed replacement or unregister made permanently stale. */
+  /** Generations that a confirmed replacement made permanently stale. */
   private readonly supersededGenerations = new Map<string, Set<string>>();
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
@@ -192,7 +192,7 @@ export class FollowerHub {
   ): FollowerUpdateStatus {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
-    this.assertDispatchable(follower);
+    follower.assertDispatchable();
     if (follower.isUpdateInProgress()) {
       throw new Error(`Follower ${followerId} already has an update in progress`);
     }
@@ -248,7 +248,7 @@ export class FollowerHub {
   createHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
-    this.assertDispatchable(follower);
+    follower.assertDispatchable();
     const host = follower.createHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)
@@ -260,7 +260,7 @@ export class FollowerHub {
   rebindHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
-    this.assertDispatchable(follower);
+    follower.assertDispatchable();
     const host = follower.rebindHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)
@@ -332,12 +332,6 @@ export class FollowerHub {
       this.supersededGenerations.set(follower.id, generations);
     }
     generations.add(follower.generation);
-  }
-
-  private assertDispatchable(follower: RemoteInstance): void {
-    if (Date.now() - follower.seen > FollowerHub.STALE_AFTER_MS) {
-      throw new Error(`Follower ${follower.id} has no recent contact`);
-    }
   }
 
   private getDedupeTracker(followerId: string): FollowerDedupeTracker {
@@ -450,14 +444,10 @@ export class FollowerHub {
       const existing = this.followers.get(body.id);
       const superseded = this.supersededGenerations.get(body.id);
       if (superseded?.has(body.generation)) {
-        // An explicit unregister can race the follower's last 410 response. It
-        // may resume only while no newer generation owns this follower ID.
-        if (existing) {
-          reply(res, 409, { error: "Follower generation was superseded" });
-          return;
-        }
-        superseded.delete(body.generation);
-        if (superseded.size === 0) this.supersededGenerations.delete(body.id);
+        // An older process must never reclaim this ID, even after its newer
+        // replacement has stopped; its session and any queued work are stale.
+        reply(res, 409, { error: "Follower generation was superseded" });
+        return;
       }
       if (existing) {
         if (existing.generation === body.generation) {
@@ -497,7 +487,8 @@ export class FollowerHub {
         tracker,
         commitSha,
         body.protocolVersion as number,
-        body.generation
+        body.generation,
+        FollowerHub.STALE_AFTER_MS
       );
       this.followers.set(follower.id, follower);
       this.log.info("follower_connected", {
@@ -527,13 +518,8 @@ export class FollowerHub {
     }
     follower.seen = Date.now();
     if (path === "/unregister") {
-      this.supersedeGeneration(follower);
       this.drop(follower);
       reply(res, 200, {});
-      return;
-    }
-    if (path === "/heartbeat") {
-      reply(res, 200, { ok: true, lastSeen: new Date(follower.seen).toISOString() });
       return;
     }
     if (path === "/poll") {

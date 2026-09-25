@@ -89,7 +89,9 @@ export class RemoteInstance {
     public commitSha?: string,
     readonly protocolVersion: number = INSTANCE_PROTOCOL_VERSION,
     /** Process-lifetime follower identity, distinct from the renewable HTTP session. */
-    readonly generation = randomBytes(16).toString("hex")
+    readonly generation = randomBytes(16).toString("hex"),
+    /** Undefined for direct fixtures; the hub supplies its contact-age policy. */
+    private readonly staleAfterMs?: number
   ) {}
 
   /** The same authenticated follower process recovered its HTTP session. */
@@ -118,6 +120,22 @@ export class RemoteInstance {
 
   recordEvent(eventId: string): void {
     this.dedupeTracker.recordEvent(eventId);
+  }
+
+  /** Fresh work is rejected at both host creation and existing-host send boundaries. */
+  assertDispatchable(): void {
+    const error = this.staleContactError();
+    if (error) throw error;
+  }
+
+  private commandDispatchError(message: LeaderCommand): Error | undefined {
+    return message.type === "wake" ? this.staleContactError() : undefined;
+  }
+
+  private staleContactError(): Error | undefined {
+    return this.staleAfterMs !== undefined && Date.now() - this.seen > this.staleAfterMs
+      ? new Error(`Follower ${this.id} has no recent contact`)
+      : undefined;
   }
 
   enqueueCommand(command: FollowerCommand): void {
@@ -166,10 +184,15 @@ export class RemoteInstance {
   }
 
   private openHost(actorId: string): ActorChannel {
-    const host = new InstanceActorChannel(this.id, this.pid, (message) => {
-      this.commands.push({ actorId, message });
-      this.flush();
-    });
+    const host = new InstanceActorChannel(
+      this.id,
+      this.pid,
+      (message) => {
+        this.commands.push({ actorId, message });
+        this.flush();
+      },
+      (message) => this.commandDispatchError(message)
+    );
     this.hosts.set(actorId, host);
     host.once("exit", () => this.hosts.delete(actorId));
     return host;
@@ -253,7 +276,8 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   constructor(
     readonly nodeId: string,
     readonly pid: number,
-    private readonly enqueue: (message: LeaderCommand) => void
+    private readonly enqueue: (message: LeaderCommand) => void,
+    private readonly dispatchError: (message: LeaderCommand) => Error | undefined
   ) {
     super();
   }
@@ -261,6 +285,11 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   send(message: LeaderCommand, callback: (error: Error | null) => void): boolean {
     if (!this.connected) {
       callback(new Error("Remote instance actor disconnected"));
+      return false;
+    }
+    const error = this.dispatchError(message);
+    if (error) {
+      callback(error);
       return false;
     }
     this.enqueue(message);
