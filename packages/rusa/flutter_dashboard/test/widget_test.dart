@@ -1796,6 +1796,33 @@ void main() {
     });
 
     test(
+      'explains both reset-waiting and hard-stale overdue status when both are active (#690)',
+      () {
+        expect(
+          quotaThrottleTooltip(
+            const QuotaThrottleDto(
+              intervalSeconds: 36000,
+              expired: false,
+              capped: true,
+              updatedAt: '2026-09-25T13:42:29.000Z',
+              buckets: [],
+              freshness: QuotaFreshnessDto(
+                mode: 'manual',
+                stale: true,
+                hardStale: true,
+                resetWaiting: true,
+              ),
+            ),
+          ),
+          'Normal launch pacing: one start every 10.0h\n'
+          'Freshness (manual): window reset; awaiting fresh reading (estimated)\n'
+          'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
+          'limited to the configured maximum interval',
+        );
+      },
+    );
+
+    test(
       'renders only pacing line when not expired and no buckets driving pace',
       () {
         final tooltip = quotaThrottleTooltip(

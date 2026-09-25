@@ -9,7 +9,7 @@ import {
   DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
-  manualSoftStaleAfterMs,
+  freshnessThresholds,
   publishedThrottle,
 } from "./coordinator-protocol.js";
 import type { SharedQuotaStore } from "./shared-store.js";
@@ -113,7 +113,6 @@ export class QuotaCollectionLoop {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
-  private readonly manualStaleAfterMs: number;
   private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
@@ -131,12 +130,19 @@ export class QuotaCollectionLoop {
     // move the other's fail-safe (#690).
     this.manualHardStaleAfterMs =
       options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
-    this.manualStaleAfterMs = manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
     this.metrics = options.metrics ?? nullQuotaMetrics;
     this.setIntervalFn = options.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalFn =
       options.clearIntervalFn ??
       ((handle) => clearInterval(handle as Parameters<typeof clearInterval>[0]));
+  }
+
+  private freshnessThresholds(mode: "manual" | "scrape" | undefined) {
+    return freshnessThresholds(mode, {
+      scrapeStaleAfterMs: this.staleAfterMs,
+      scrapeHardStaleAfterMs: this.hardStaleAfterMs,
+      manualHardStaleAfterMs: this.manualHardStaleAfterMs,
+    });
   }
 
   private stat(provider: string): QuotaCollectionStats {
@@ -287,8 +293,7 @@ export class QuotaCollectionLoop {
       const { mode } = this.options.store.getQuotaReadingMode(provider);
       const published = publishedThrottle(stored, {
         maxIntervalSeconds: this.maxIntervalSeconds,
-        staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
-        hardStaleAfterMs: mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
+        ...this.freshnessThresholds(mode),
         nowMs,
         mode,
       });

@@ -799,7 +799,9 @@ describe("loadConfig quota throttle", () => {
   it.each([
     [{ enabled: "yes" }, /enabled must be a boolean/],
     [{ maxIntervalSeconds: 0 }, /maxIntervalSeconds/],
-    [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
+    [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer less than 600/],
+    [{ tickSeconds: 600 }, /tickSeconds must be a positive integer less than 600/],
+    [{ tickSeconds: 1800 }, /tickSeconds must be a positive integer less than 600/],
     [{ manualHardStaleSeconds: 0 }, /manualHardStaleSeconds must be a positive integer/],
     [{ manualHardStaleSeconds: 90.5 }, /manualHardStaleSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {

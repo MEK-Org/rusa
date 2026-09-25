@@ -1057,6 +1057,9 @@ String quotaThrottleTooltip(QuotaThrottleDto throttle) {
     final modeLabel = f.mode == 'manual' ? 'manual' : 'scrape';
     if (f.resetWaiting) {
       lines.add('Freshness ($modeLabel): window reset; awaiting fresh reading (estimated)');
+      if (f.hardStale) {
+        lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
+      }
     } else if (f.hardStale) {
       lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
     } else if (f.stale) {

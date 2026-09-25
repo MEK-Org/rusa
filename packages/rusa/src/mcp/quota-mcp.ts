@@ -1150,13 +1150,15 @@ export class QuotaService {
     }
   }
 
-  private getTtlMs(_provider: "claude" | "codex" | "agy" | "kimi"): number {
+  private getTtlMs(): number {
     if (this.deps.ttlMs !== undefined) {
       return this.deps.ttlMs;
     }
     // #690: routine provider readings target ~30 minutes across all providers,
     // so expensive interactive scrapes are not churned while QuotaCollectionLoop
-    // keeps ticking every 5m for controller evaluation and manual ingestion.
+    // keeps ticking every 5m for manual observation ingestion and metric publication.
+    // (Controller evaluation on scrape lanes advances when a fresh 30m probe lands;
+    // manual lanes advance as operator observations arrive).
     // Codex must not go lower until its placeholder handling lands.
     return QUOTA_PROBE_TTL_MS;
   }
@@ -1182,7 +1184,7 @@ export class QuotaService {
     }
     const now = (this.deps.now ?? Date.now)();
     const cached = this.cache.get(provider);
-    const ttl = this.getTtlMs(provider);
+    const ttl = this.getTtlMs();
     if (cached && now - cached.timestamp < ttl) {
       return { state: cached.state, didProbe: false };
     }
@@ -1245,7 +1247,7 @@ export class QuotaService {
       };
     }
     const cached = this.cache.get(provider);
-    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs(provider);
+    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs();
     if (!isFresh) {
       // Stale or cold → refresh in the background; do not await the probe.
       // Probe startup is deferred off the synchronous request call stack via

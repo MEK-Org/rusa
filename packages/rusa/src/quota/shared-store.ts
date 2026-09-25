@@ -48,8 +48,9 @@ export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;
 /**
  * Integral time: how long a standing error must persist before the integral
  * term contributes as much period as the proportional term already does. One
- * hour is deliberately conservative for this five-minute observation loop and
- * is twice the existing derivative filter's time constant.
+ * hour is deliberately conservative for routine observation loops (from
+ * 5-minute ticks to 30-minute probe cadences) and is twice the existing
+ * derivative filter's time constant.
  */
 export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;
 export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
@@ -1028,7 +1029,7 @@ export class SharedQuotaStore {
    * shows it as such (`governingBucketKey: null`, no buckets). The variant's
    * first step is also not quite a cold start — the gap since the zeroed row
    * feeds the integral (`error × min(dt, QUOTA_INTEGRAL_MAX_STEP_SECONDS)`,
-   * at most a twelfth of the proportional term) and its retained
+   * at most half of the proportional term (`(QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS) × QUOTA_INTEGRAL_MAX_STEP_SECONDS = 120/3600 × 1800 = 60 s/pt`)) and its retained
    * `controller_error` feeds the raw derivative — but that is bounded and
    * would not on its own have disqualified it.
    *

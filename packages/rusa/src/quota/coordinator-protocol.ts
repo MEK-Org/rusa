@@ -11,6 +11,16 @@ export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
  * is due, so a healthy lane reading one full TTL old is still fresh.
  */
 export function scrapeStaleAfterMs(tickSeconds: number): number {
+  if (
+    !Number.isFinite(tickSeconds) ||
+    !Number.isInteger(tickSeconds) ||
+    tickSeconds <= 0 ||
+    tickSeconds >= 600
+  ) {
+    throw new RangeError(
+      `tickSeconds (${tickSeconds}) must be a positive integer less than 600 to preserve scrape hard-stale timing`
+    );
+  }
   return QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000;
 }
 export const DEFAULT_STALE_AFTER_MS = scrapeStaleAfterMs(300); // 45 min (30m TTL + 3 x 300s)
@@ -24,6 +34,35 @@ export const DEFAULT_MANUAL_HARD_STALE_AFTER_MS = 7_200_000; // 120 min; `quota.
 /** Manual soft stale never exceeds its hard threshold, so the pair stays ordered. */
 export function manualSoftStaleAfterMs(manualHardStaleAfterMs: number): number {
   return Math.min(DEFAULT_MANUAL_STALE_AFTER_MS, manualHardStaleAfterMs);
+}
+
+export interface FreshnessThresholdsConfig {
+  scrapeStaleAfterMs?: number;
+  scrapeHardStaleAfterMs?: number;
+  staleAfterMs?: number;
+  hardStaleAfterMs?: number;
+  manualHardStaleAfterMs?: number;
+}
+
+/**
+ * Single helper for deriving resolved soft and hard freshness thresholds (#690).
+ * In manual mode, thresholds are isolated: soft stale is min(60m, manualHard)
+ * so the pair stays ordered. Manual mode never inherits scrape options.
+ * In scrape mode, soft stale defaults to 45m (30m TTL + 3*300s) and hard to 60m.
+ */
+export function freshnessThresholds(
+  mode: "manual" | "scrape" | undefined,
+  config?: FreshnessThresholdsConfig
+): { staleAfterMs: number; hardStaleAfterMs: number } {
+  if (mode === "manual") {
+    const hardStaleAfterMs = config?.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+    const staleAfterMs = manualSoftStaleAfterMs(hardStaleAfterMs);
+    return { staleAfterMs, hardStaleAfterMs };
+  }
+  const staleAfterMs = config?.scrapeStaleAfterMs ?? config?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const hardStaleAfterMs =
+    config?.scrapeHardStaleAfterMs ?? config?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  return { staleAfterMs, hardStaleAfterMs };
 }
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
@@ -248,11 +287,9 @@ export function calculateFreshness(
 ): QuotaFreshness {
   const nowMs = options?.nowMs ?? Date.now();
   const mode = options?.mode;
-  const defaultStale = mode === "manual" ? DEFAULT_MANUAL_STALE_AFTER_MS : DEFAULT_STALE_AFTER_MS;
-  const defaultHardStale =
-    mode === "manual" ? DEFAULT_MANUAL_HARD_STALE_AFTER_MS : DEFAULT_HARD_STALE_AFTER_MS;
-  const staleAfterMs = options?.staleAfterMs ?? defaultStale;
-  const hardStaleAfterMs = Math.max(staleAfterMs, options?.hardStaleAfterMs ?? defaultHardStale);
+  const defaultThresholds = freshnessThresholds(mode);
+  const staleAfterMs = options?.staleAfterMs ?? defaultThresholds.staleAfterMs;
+  const hardStaleAfterMs = options?.hardStaleAfterMs ?? defaultThresholds.hardStaleAfterMs;
 
   const buckets: Record<string, number> = {};
   const currentAges: number[] = [];

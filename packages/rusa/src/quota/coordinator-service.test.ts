@@ -12,10 +12,12 @@ import {
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  freshnessThresholds,
   MANUAL_QUOTA_OBSERVATION_PATH,
   ProtocolMismatchError,
   publishedThrottle,
   QUOTA_READING_MODE_PATH,
+  scrapeStaleAfterMs,
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
 import { QuotaCoordinatorService, SERVED_ROUTES, WRITE_ROUTES } from "./coordinator-service.js";
@@ -1462,5 +1464,44 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const res = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
     expect(res.status).toBe(200);
     expect(res.json.freshness.resetWaiting).toBe(true);
+  });
+
+  it("#690: scrapeStaleAfterMs rejects tickSeconds >= 600 or invalid", () => {
+    expect(() => scrapeStaleAfterMs(600)).toThrow(RangeError);
+    expect(() => scrapeStaleAfterMs(1800)).toThrow(RangeError);
+    expect(() => scrapeStaleAfterMs(0)).toThrow(RangeError);
+    expect(() => scrapeStaleAfterMs(-1)).toThrow(RangeError);
+    expect(() => scrapeStaleAfterMs(1.5)).toThrow(RangeError);
+    expect(scrapeStaleAfterMs(300)).toBe(45 * 60 * 1000);
+  });
+
+  it("#690: freshnessThresholds isolates manual and scrape modes", () => {
+    const manualDefault = freshnessThresholds("manual");
+    expect(manualDefault).toEqual({
+      staleAfterMs: 60 * 60 * 1000,
+      hardStaleAfterMs: 120 * 60 * 1000,
+    });
+
+    const scrapeDefault = freshnessThresholds("scrape");
+    expect(scrapeDefault).toEqual({
+      staleAfterMs: 45 * 60 * 1000,
+      hardStaleAfterMs: 60 * 60 * 1000,
+    });
+
+    // Manual hard-stale below 60m clamps soft stale
+    const tunedManual = freshnessThresholds("manual", { manualHardStaleAfterMs: 30 * 60 * 1000 });
+    expect(tunedManual).toEqual({
+      staleAfterMs: 30 * 60 * 1000,
+      hardStaleAfterMs: 30 * 60 * 1000,
+    });
+
+    // Scrape hard stale remains 60m and is not raised
+    const scrapeWithLongTick = freshnessThresholds("scrape", {
+      staleAfterMs: scrapeStaleAfterMs(500),
+    });
+    expect(scrapeWithLongTick).toEqual({
+      staleAfterMs: 30 * 60 * 1000 + 3 * 500 * 1000, // 55m
+      hardStaleAfterMs: 60 * 60 * 1000,
+    });
   });
 });

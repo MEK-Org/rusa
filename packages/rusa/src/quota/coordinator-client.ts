@@ -291,12 +291,8 @@ export class QuotaCoordinatorClient {
     }
 
     // §5.7 Rule 2: Past hardStaleAfterMs since its last successful read, the client widens to maxIntervalSeconds on its own.
-    // Client matches the service's published hard-stale policy (#690) when available.
     const nowMs = this.nowMs();
-    const publishedHardStaleAfterMs =
-      this.lastPublishedStatuses.get(provider)?.freshness?.hardStaleAfterMs;
-    const hardStaleAfterMs =
-      publishedHardStaleAfterMs ?? this.options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+    const hardStaleAfterMs = this.options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
     if (nowMs - lastRead > hardStaleAfterMs) {
       return Math.max(lastApplied, maxInterval);
     }

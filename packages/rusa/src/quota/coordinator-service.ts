@@ -16,6 +16,7 @@ import {
   DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  freshnessThresholds,
   isValidManualQuotaObservation,
   MANUAL_QUOTA_OBSERVATION_PATH,
   type ManualQuotaObservationResponse,
@@ -109,7 +110,6 @@ export class QuotaCoordinatorService {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
-  private readonly manualStaleAfterMs: number;
   private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
 
@@ -123,7 +123,18 @@ export class QuotaCoordinatorService {
     // move the other's fail-safe (#690).
     this.manualHardStaleAfterMs =
       options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
-    this.manualStaleAfterMs = manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
+  }
+
+  private freshnessThresholds(mode: "manual" | "scrape" | undefined) {
+    return freshnessThresholds(mode, {
+      scrapeStaleAfterMs: this.staleAfterMs,
+      scrapeHardStaleAfterMs: this.hardStaleAfterMs,
+      manualHardStaleAfterMs: this.manualHardStaleAfterMs,
+    });
+  }
+
+  get manualStaleAfterMs(): number {
+    return manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
   }
 
   private getServiceInfo(): QuotaCoordinatorServiceInfo {
@@ -436,8 +447,7 @@ export class QuotaCoordinatorService {
         const { mode } = this.options.store.getQuotaReadingMode(provider);
         const published = publishedThrottle(stored, {
           maxIntervalSeconds: this.maxIntervalSeconds,
-          staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
-          hardStaleAfterMs: mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
+          ...this.freshnessThresholds(mode),
           nowMs,
           mode,
         });
@@ -458,9 +468,7 @@ export class QuotaCoordinatorService {
         providersMap[p] = stored
           ? publishedThrottle(stored, {
               maxIntervalSeconds: this.maxIntervalSeconds,
-              staleAfterMs: mode === "manual" ? this.manualStaleAfterMs : this.staleAfterMs,
-              hardStaleAfterMs:
-                mode === "manual" ? this.manualHardStaleAfterMs : this.hardStaleAfterMs,
+              ...this.freshnessThresholds(mode),
               nowMs,
               mode,
             })
