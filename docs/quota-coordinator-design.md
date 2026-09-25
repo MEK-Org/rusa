@@ -261,8 +261,15 @@ under v1:
   start. At most one claimed-but-unstarted actor waits per lane; the rest
   stay unclaimed in the list. An actor only ever claims one of its own
   declared candidates, so a model-scoped lane (Fable under #588) is a
-  distinct candidate lane that a provider-wide lane cannot claim through. The read-only global snapshot and same-priority reorder hook
-  are intentionally ephemeral controls for #570: a leader restart reconstructs
+  distinct candidate lane that a provider-wide lane cannot claim through.
+  Responsive work never waits in the list: it claims a healthy lane at once
+  and bypasses pacing. A claim is consumed, never released or transferred, so
+  a lane deferred after claiming keeps its one unstarted actor until the
+  deferral ends, even if another of that actor's lanes is idle; everything
+  still unclaimed moves freely. The snapshot's projected starts stack one
+  interval per entry on each lane and are `null` behind a claim waiting on
+  mesh concurrency. The read-only global snapshot and reorder hook are
+  intentionally ephemeral controls for #570: a leader restart reconstructs
   work from the durable inbox through `RunManager.dispatch`, not from a second
   queue table. A crash after a lane claim and before completion has the normal
   accepted-start ambiguity; it is recovered as unhandled inbox work on the

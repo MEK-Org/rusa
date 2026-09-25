@@ -635,14 +635,15 @@ export interface UnifiedAdmissionQueueSnapshot {
   /** Zero-based position in the one global list, before lane compatibility filtering. */
   position: number;
   /**
-   * The current quote from this entry's best compatible lane, if one is
-   * available. This is a projection, never a reservation: an earlier item
-   * may claim that lane before this entry does.
+   * Projected start on this entry's earliest compatible lane, stacking one
+   * interval per earlier entry projected onto the same lane, as the old
+   * per-lane FIFO did. A projection, never a reservation. `null` when it
+   * cannot be honestly quoted: the entry is claimed and waiting on mesh
+   * concurrency, or every lane it could use holds such a claim.
    */
   estimatedStartAt: number | null;
   /** Interval of the lane supplying `estimatedStartAt`, rounded for the wire. */
   pacingIntervalMs: number;
-  responsive: boolean;
 }
 
 interface WaitingAdmission<C, T> {
@@ -675,15 +676,14 @@ export class UnifiedAdmissionQueue<C> {
   /** Claimed items until they settle; read only by `snapshot`. */
   private readonly claimed = new Set<WaitingAdmission<C, unknown>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private draining = false;
-  private drainAgain = false;
 
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   /**
-   * Append one actor's pending start, or place responsive work at the front.
-   * The returned handle can promote/cancel while the actor is still unclaimed;
-   * after a synchronous lane claim it delegates to the normal pacer handle.
+   * Append one actor's pending start, or claim responsive work at once: it
+   * never waits in the list. The returned handle can promote/cancel while the
+   * actor is still unclaimed; after a lane claim it delegates to the normal
+   * pacer handle.
    */
   enqueue<T>(
     fn: (config: C) => Promise<T>,
@@ -709,8 +709,12 @@ export class UnifiedAdmissionQueue<C> {
       reject,
       result,
     };
-    this.insert(item as WaitingAdmission<C, unknown>);
-    this.drain();
+    if (item.responsive) {
+      this.claimResponsive(item as WaitingAdmission<C, unknown>);
+    } else {
+      this.waiting.push(item as WaitingAdmission<C, unknown>);
+      this.drain();
+    }
 
     return {
       result,
@@ -740,22 +744,34 @@ export class UnifiedAdmissionQueue<C> {
           position,
           estimatedStartAt: null,
           pacingIntervalMs: Math.round(item.claimedLane?.pacer.interval ?? 0),
-          responsive: item.responsive,
         });
       }
       position++;
     }
+    // Each lane's next projected start. A lane already holding a claim has no
+    // honest time until that claim starts, so it offers none.
+    const next = new Map<ProviderPacer, number | null>();
+    const projected = (pacer: ProviderPacer): number | null => {
+      if (!next.has(pacer)) next.set(pacer, pacer.waiting > 0 ? null : pacer.quote(now));
+      return next.get(pacer) ?? null;
+    };
     for (const item of this.waiting) {
-      const candidate = selectPoolLane(this.healthy(item, item.responsive), now, {
-        responsive: item.responsive,
-      });
+      let lane: ProviderPacer | undefined;
+      let eta: number | null = null;
+      for (const candidate of this.healthy(item, false)) {
+        const at = projected(candidate.pacer);
+        if (at !== null && (eta === null || at < eta)) {
+          lane = candidate.pacer;
+          eta = at;
+        }
+      }
+      if (lane && eta !== null) next.set(lane, eta + lane.interval);
       if (item.opts.threadId) {
         snapshot.push({
           threadId: item.opts.threadId,
           position,
-          estimatedStartAt: candidate ? candidate.pacer.quote(now) : null,
-          pacingIntervalMs: candidate ? Math.round(candidate.pacer.interval) : 0,
-          responsive: item.responsive,
+          estimatedStartAt: eta,
+          pacingIntervalMs: lane ? Math.round(lane.interval) : 0,
         });
       }
       position++;
@@ -764,36 +780,20 @@ export class UnifiedAdmissionQueue<C> {
   }
 
   /**
-   * Move an unclaimed actor before another unclaimed actor of the same
-   * priority. `beforeThreadId` omitted moves it to the end of its own priority
-   * partition. Claims and responsive priority are never rewritten.
+   * Move an unclaimed actor before another unclaimed actor, or to the end
+   * when `beforeThreadId` is omitted. Claims are never rewritten. No re-scan
+   * follows: after a drain no unclaimed actor has an idle lane, so order only
+   * matters at the next lane event.
    */
   reorder(threadId: string, beforeThreadId?: string): boolean {
-    const from = this.waiting.findIndex((item) => item.opts.threadId === threadId);
-    if (from < 0) return false;
-    const item = this.waiting[from];
-    if (!item || item.state !== "waiting") return false;
-    const priority = item.responsive;
-    this.waiting.splice(from, 1);
-
-    let target = -1;
-    if (beforeThreadId !== undefined) {
-      target = this.waiting.findIndex(
-        (candidate) =>
-          candidate.opts.threadId === beforeThreadId && candidate.responsive === priority
-      );
-      if (target < 0) {
-        this.waiting.splice(from, 0, item);
-        return false;
-      }
-    } else {
-      target = this.waiting.reduce(
-        (end, candidate, index) => (candidate.responsive === priority ? index + 1 : end),
-        0
-      );
-    }
-    this.waiting.splice(target, 0, item);
-    this.drain();
+    const indexOf = (id: string) => this.waiting.findIndex((item) => item.opts.threadId === id);
+    const from = indexOf(threadId);
+    if (from < 0 || threadId === beforeThreadId) return false;
+    if (beforeThreadId !== undefined && indexOf(beforeThreadId) < 0) return false;
+    const [item] = this.waiting.splice(from, 1);
+    if (!item) return false;
+    const to = beforeThreadId === undefined ? this.waiting.length : indexOf(beforeThreadId);
+    this.waiting.splice(to, 0, item);
     return true;
   }
 
@@ -802,28 +802,14 @@ export class UnifiedAdmissionQueue<C> {
     this.drain();
   }
 
-  private insert(item: WaitingAdmission<C, unknown>): void {
-    if (!item.responsive) {
-      this.waiting.push(item);
-      return;
-    }
-    // Responsive arrivals keep their arrival order while remaining ahead of
-    // every normal entry. `promote` moves an existing actor to this same front.
-    const firstNormal = this.waiting.findIndex((candidate) => !candidate.responsive);
-    this.waiting.splice(firstNormal < 0 ? this.waiting.length : firstNormal, 0, item);
-  }
-
   private promote<T>(item: WaitingAdmission<C, T>): void {
     if (item.state === "claimed") {
       item.inner?.promote();
       return;
     }
-    if (item.state !== "waiting" || item.responsive) return;
+    if (item.state !== "waiting") return;
     item.responsive = true;
-    const index = this.waiting.indexOf(item as WaitingAdmission<C, unknown>);
-    if (index >= 0) this.waiting.splice(index, 1);
-    this.waiting.unshift(item as WaitingAdmission<C, unknown>);
-    this.drain();
+    this.claimResponsive(item as WaitingAdmission<C, unknown>);
   }
 
   private cancel<T>(item: WaitingAdmission<C, T>): boolean {
@@ -835,35 +821,15 @@ export class UnifiedAdmissionQueue<C> {
   }
 
   private drain(): void {
-    if (this.draining) {
-      this.drainAgain = true;
-      return;
-    }
-    this.draining = true;
-    try {
-      do {
-        this.drainAgain = false;
-        this.clearTimer();
-        this.claimResponsive();
-        this.claimNormal();
-        this.schedule();
-      } while (this.drainAgain);
-    } finally {
-      this.draining = false;
-    }
+    this.claimNormal();
+    this.schedule();
   }
 
-  private claimResponsive(): void {
-    for (;;) {
-      const item = this.waiting.find((candidate) => candidate.responsive);
-      if (!item) return;
-      const selected = selectPoolLane(this.healthy(item, true), this.now(), { responsive: true });
-      if (!selected) {
-        this.settleWaiting(item, this.exhaustedError(item));
-        continue;
-      }
-      this.claim(item, selected);
-    }
+  /** Responsive work bypasses pacing, so it claims any healthy lane now or fails. */
+  private claimResponsive(item: WaitingAdmission<C, unknown>): void {
+    const selected = selectPoolLane(this.healthy(item, true), this.now(), { responsive: true });
+    if (selected) this.claim(item, selected);
+    else this.settleWaiting(item, this.exhaustedError(item));
   }
 
   /**
@@ -882,7 +848,6 @@ export class UnifiedAdmissionQueue<C> {
     const now = this.now();
     const busy = new Set<ProviderPacer>();
     for (const item of [...this.waiting]) {
-      if (item.responsive) continue;
       const idle = this.healthy(item, false).filter(
         (candidate) => !busy.has(candidate.pacer) && isIdleLane(candidate.pacer, now)
       );
@@ -894,15 +859,16 @@ export class UnifiedAdmissionQueue<C> {
   }
 
   private claim(item: WaitingAdmission<C, unknown>, selected: PoolLaneCandidate<C>): void {
+    if (item.state !== "waiting") return;
     const index = this.waiting.indexOf(item);
-    if (index < 0 || item.state !== "waiting") return;
-    this.waiting.splice(index, 1);
+    if (index >= 0) this.waiting.splice(index, 1);
     item.state = "claimed";
     item.claimedLane = selected;
     this.claimed.add(item);
     const selectedIndex = item.candidates.indexOf(selected);
     const originalOnSelected = item.opts.onSelected;
     const originalOnStarted = item.opts.onStarted;
+    let started = false;
     const inner = submitPoolGate(item.fn, [selected], {
       ...item.opts,
       responsive: item.responsive,
@@ -911,18 +877,23 @@ export class UnifiedAdmissionQueue<C> {
           ...selection,
           declaredIndex: selectedIndex,
         }),
+      // A start frees the lane. The re-scan runs as a microtask because this
+      // callback fires inside the pacer's own start bookkeeping.
       onStarted: () => {
+        started = true;
         originalOnStarted?.();
         queueMicrotask(() => this.refresh());
       },
     });
     item.inner = inner;
     // A claim that settles without starting (cancel, stale provider, mesh
-    // rejection) frees its lane just as a start does.
+    // rejection) frees its lane just as a start does. One that started has
+    // already re-scanned, and its freed mesh slot starts the next staged claim
+    // through the limiter, which re-scans from that start.
     const release = () => {
       item.state = "settled";
       this.claimed.delete(item);
-      queueMicrotask(() => this.refresh());
+      if (!started) queueMicrotask(() => this.refresh());
     };
     inner.result.then(
       (value) => {
@@ -965,11 +936,11 @@ export class UnifiedAdmissionQueue<C> {
   }
 
   private schedule(): void {
+    this.clearTimer();
     if (this.waiting.length === 0) return;
     const now = this.now();
     let next: number | undefined;
     for (const item of this.waiting) {
-      if (item.responsive) continue;
       for (const candidate of this.healthy(item, false)) {
         // A busy lane frees up through its claimed item's start or
         // settlement, which refreshes; only a pacing delay needs a timer.

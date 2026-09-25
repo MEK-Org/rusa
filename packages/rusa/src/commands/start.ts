@@ -3590,14 +3590,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     refreshLiveActorMcp(rootId);
   }
   if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
+  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
+  // replaying nothing would otherwise leave the admission list unscanned.
+  const resumeAfterHalt = (): string[] => {
+    const resumed = mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    admissionQueue.refresh();
+    return resumed;
+  };
   const scheduleHaltExpiry = (until?: string) => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     haltExpiryTimer = null;
     if (!until) return;
     const delay = Date.parse(until) - Date.now();
     if (delay <= 0) {
-      mesh.resumeCancelledRuns();
-      mesh.reconcileUnseenInbox();
+      resumeAfterHalt();
       return;
     }
     haltExpiryTimer = setTimeout(
@@ -3609,8 +3616,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           return;
         }
         if (state) return;
-        const resumed = mesh.resumeCancelledRuns();
-        mesh.reconcileUnseenInbox();
+        const resumed = resumeAfterHalt();
         console.warn(
           `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
         );
@@ -4146,8 +4152,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         haltSwitch.resume();
         if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
         haltExpiryTimer = null;
-        const resumed = mesh.resumeCancelledRuns();
-        mesh.reconcileUnseenInbox();
+        const resumed = resumeAfterHalt();
         console.warn(`[mesh] ▶ HALT cleared via chat by ${who}`);
         void cc
           .send(
