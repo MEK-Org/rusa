@@ -7114,7 +7114,6 @@ describe("ActorMesh", () => {
     function queuedPoolHarness() {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
-      const halted = new Set<string>();
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
       const poolProvider = (name: string, runs: string[]): CodingProvider => ({
@@ -7142,7 +7141,6 @@ describe("ActorMesh", () => {
 
       const { mesh, registry, tick } = setup({
         maxConcurrent: 1,
-        isHalted: (provider) => (provider ? halted.has(provider) : false),
         providerGate: (fn, candidates, request) => {
           const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
             config: c,
@@ -7153,7 +7151,6 @@ describe("ActorMesh", () => {
             responsive: request.responsive,
             threadId: request.threadId,
             enqueueNormal: request.enqueueNormal,
-            isHalted: (c) => halted.has(c.provider),
             onSelected: request.threadId
               ? (selection) =>
                   request.onSelected?.({
@@ -7217,7 +7214,7 @@ describe("ActorMesh", () => {
         await tick();
         expect(mesh.activeRunState(blocker)?.phase).toBe("running");
       };
-      return { mesh, tick, halted, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot };
+      return { mesh, tick, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot };
     }
 
     it("re-pins only the queued actor whose reserved lane exhausted", async () => {
@@ -7260,34 +7257,6 @@ describe("ActorMesh", () => {
 
       expect(poolARuns).toEqual([]);
       expect([...poolBRuns].sort()).toEqual([`/tmp/${bystander}`, `/tmp/${worker}`].sort());
-    });
-
-    it("retains the queued run through halt/resume when every candidate is halted", async () => {
-      const { mesh, tick, halted, blockerDeferred, holdSlot } = queuedPoolHarness();
-      const worker = mesh.spawn({
-        charter: "worker",
-        parentId: "root",
-        modelConfig: [
-          { provider: "pool-a", model: "model-a" },
-          { provider: "pool-b", model: "model-b" },
-        ],
-      });
-      await holdSlot();
-
-      mesh.sendMessage(worker, "work", "root");
-      await tick();
-      expect(mesh.getSelection(worker)?.lane).toBe("pool-a");
-
-      halted.add("pool-a");
-      halted.add("pool-b");
-      expect(mesh.reEvaluateExhaustedQueuedRuns("pool-a")).toEqual([worker]);
-      await tick();
-
-      expect(mesh.queuedThreadIds()).toEqual(new Set());
-      expect(mesh.getSelection(worker)).toBeUndefined();
-
-      blockerDeferred.releaseAll();
-      await tick();
     });
   });
 

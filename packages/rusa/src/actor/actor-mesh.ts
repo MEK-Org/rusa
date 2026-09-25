@@ -4789,7 +4789,9 @@ export class ActorMesh {
    * candidate halted, or the mesh shutting down — retain the work through the
    * halt/resume path instead: `prepareRun` would drop the fresh re-admission,
    * losing the opportunity. The question here is whether the pool has anywhere
-   * to go, so it checks the whole pool rather than the reserved lane.
+   * to go, so it checks the whole pool rather than the reserved lane. Normal
+   * halt processing clears a #633 reservation before this hook sees it; the
+   * all-halted branch is retained for the shared `setModelConfig` path.
    * Returns whether a queued reservation was acted on.
    */
   private requoteOrRetainQueuedRun(

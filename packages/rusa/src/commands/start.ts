@@ -609,6 +609,8 @@ export interface RunStartE2EHandles {
   mesh: ActorMesh;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
+  /** Test-only read of the production pacer's next normal-start quote. */
+  coordinatorPacerQuote: (provider: string) => number;
   /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
   triggerQuotaThrottleTick?: () => Promise<void>;
   root: MeshActor;
@@ -1570,7 +1572,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // mesh's re-evaluation hook. The hook is assigned once the mesh exists; the
   // boot tick runs before that, when no queued admission can exist yet, and
   // later admissions quote against the pacer that boot tick already deferred.
-  const exhaustedProviders = new Set<string>();
+  const deferredExhaustedProviders = new Set<string>();
   let onLaneExhausted: ((lane: string) => void) | undefined;
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1652,13 +1654,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       status.freshness.stale
     );
     // Stopgap for #633, removed with the unified queueing model: re-evaluate
-    // queued admissions pinned to this lane only on a newly reported
-    // exhaustion — never on renewal, an unchanged cadence tick, or otherwise.
-    const isNewExhaustion = status.expired && !exhaustedProviders.has(providerName);
-    if (status.expired) {
-      exhaustedProviders.add(providerName);
+    // queued admissions only when this is a newly deferred coordinator
+    // exhaustion. `expired` without a future, parseable deadline cannot defer
+    // the pacer, so retain no edge: a later usable deadline must still re-quote.
+    const exhaustedUntilMs = status.exhaustedUntil ? Date.parse(status.exhaustedUntil) : Number.NaN;
+    const hasDeferredExhaustion =
+      status.expired && Number.isFinite(exhaustedUntilMs) && exhaustedUntilMs > Date.now();
+    const isNewExhaustion = hasDeferredExhaustion && !deferredExhaustedProviders.has(providerName);
+    if (hasDeferredExhaustion) {
+      deferredExhaustedProviders.add(providerName);
     } else {
-      exhaustedProviders.delete(providerName);
+      deferredExhaustedProviders.delete(providerName);
     }
     if (isNewExhaustion) onLaneExhausted?.(providerName);
   };
@@ -4525,6 +4531,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
+    coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
     triggerQuotaThrottleTick: tickQuotaThrottle,
     root,
     rootControl,

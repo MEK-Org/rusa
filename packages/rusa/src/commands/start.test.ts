@@ -897,6 +897,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ): Promise<{
       mesh: ActorMesh;
       appliedInterval: (provider: string) => number | undefined;
+      pacerQuote: (provider: string) => number;
+      triggerQuotaThrottleTick: () => Promise<void>;
       makeUnavailable: () => void;
       throttleRequestCount: () => number;
       close: () => Promise<void>;
@@ -950,22 +952,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       let mesh: ActorMesh | undefined;
       let appliedInterval: ((provider: string) => number | undefined) | undefined;
+      let pacerQuote: ((provider: string) => number) | undefined;
+      let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
       await new Promise<void>((resolve) => {
         void runStart({
           e2e: {
             onReady: (handles) => {
               mesh = handles.mesh;
               appliedInterval = handles.coordinatorAppliedInterval;
+              pacerQuote = handles.coordinatorPacerQuote;
+              triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
               shutdownFn = handles.shutdown;
               resolve();
             },
           },
         });
       });
-      if (!mesh || !appliedInterval) throw new Error("mesh not ready");
+      if (!mesh || !appliedInterval || !pacerQuote || !triggerQuotaThrottleTick) {
+        throw new Error("mesh not ready");
+      }
       return {
         mesh,
         appliedInterval,
+        pacerQuote,
+        triggerQuotaThrottleTick,
         makeUnavailable: () => {
           unavailable = true;
         },
@@ -1005,8 +1015,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       capped: false,
       expired: opts.expired ?? false,
       exhaustedUntil:
-        opts.exhaustedUntil ??
-        (opts.expired === true ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString() : null),
+        opts.exhaustedUntil !== undefined
+          ? opts.exhaustedUntil
+          : opts.expired === true
+            ? new Date(Date.now() + 2 * 60 * 60 * 1_000).toISOString()
+            : null,
       updatedAt: opts.updatedAt ?? new Date().toISOString(),
       buckets: [weeklyBucket(provider, opts.percentLeft ?? 50)],
       freshness: {
@@ -1183,144 +1196,66 @@ describe("runStart webhook event routing (Phase 4)", () => {
         await close();
       }
     });
-  });
 
-  it("re-evaluates queued admissions on quota coordinator exhaustion report, and does not re-evaluate on renewal or cadence ticks (#633)", async () => {
-    const socketPath = join(homeDir, "coordinator.sock");
-    const observedAt = new Date().toISOString();
-    let claudeStatus = {
-      provider: "claude",
-      intervalSeconds: 0,
-      uncappedIntervalSeconds: 0,
-      governingBucketKey: "claude:weekly",
-      capped: false,
-      expired: false,
-      exhaustedUntil: null as string | null,
-      updatedAt: observedAt,
-      buckets: [
-        {
-          key: "claude:weekly",
-          percentLeft: 50,
-          timeRemainingPct: 50,
-          error: 0,
-        },
-      ],
-      freshness: {
-        ageMs: 0,
-        buckets: { "claude:weekly": 0 },
-        stale: false,
-        hardStale: false,
-      },
-    };
-    const service = {
-      protocolMajor: 1,
-      protocolMinor: 0,
-      serverVersion: "test",
-      serverTime: observedAt,
-    };
-    const coordinator = createServer((req, res) => {
-      const url = new URL(req.url ?? "/", "http://localhost");
-      res.setHeader("content-type", "application/json");
-      if (url.pathname !== "/v1/throttle") {
-        res.statusCode = 404;
-        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
-        return;
-      }
-      res.end(
-        JSON.stringify({
-          service,
-          providers: {
-            claude: claudeStatus,
-          },
-        })
+    it("re-evaluates queued admissions only after a newly deferred coordinator exhaustion (#633)", async () => {
+      let claudeStatus = throttleStatus("claude");
+      const { mesh, close, pacerQuote, triggerQuotaThrottleTick } = await bootWithCoordinator(
+        () => ({ claude: claudeStatus }),
+        3600
       );
-    });
-    await new Promise<void>((resolve, reject) => {
-      coordinator.once("error", reject);
-      coordinator.listen(socketPath, resolve);
-    });
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: {
-          antigravity: { cliCommand: "agy" },
-          claude: { cliCommand: "claude" },
-        },
-        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-        geminiApiKey: "fake-gemini-key",
-        quota: {
-          coordinator: { socketPath },
-          throttle: { enabled: true, tickSeconds: 3600 },
-        },
-      }),
-      "utf8"
-    );
+      try {
+        const reEvaluateSpy = vi
+          .spyOn(mesh, "reEvaluateExhaustedQueuedRuns")
+          .mockImplementation((lane) => {
+            // The production pacer has already consumed the coordinator's
+            // deadline, so a re-quote cannot reserve the exhausted lane.
+            expect(pacerQuote(lane)).toBeGreaterThan(Date.now());
+            return [];
+          });
 
-    try {
-      let mesh: ActorMesh | undefined;
-      let triggerQuotaThrottleTick: (() => Promise<void>) | undefined;
-      await new Promise<void>((resolve) => {
-        void runStart({
-          e2e: {
-            onReady: (handles) => {
-              mesh = handles.mesh;
-              triggerQuotaThrottleTick = handles.triggerQuotaThrottleTick;
-              shutdownFn = handles.shutdown;
-              resolve();
-            },
-          },
+        // Initial unexhausted publication does not trigger re-evaluation.
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        // An incomplete or malformed expired publication cannot defer the
+        // pacer. Neither consumes the edge, so the later usable deadline does.
+        claudeStatus = throttleStatus("claude", { expired: true, exhaustedUntil: null });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
+
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "not-a-timestamp",
         });
-      });
-      if (!mesh) throw new Error("mesh not ready");
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).not.toHaveBeenCalled();
 
-      const reEvaluateSpy = vi.spyOn(mesh, "reEvaluateExhaustedQueuedRuns");
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T15:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+        expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
 
-      // 1. Initial unexhausted tick: does not trigger re-evaluation.
-      await triggerQuotaThrottleTick?.();
-      expect(reEvaluateSpy).not.toHaveBeenCalled();
+        // Revising a deadline while the lane remains deferred is not a new
+        // exhaustion edge, and neither is the subsequent renewal.
+        claudeStatus = throttleStatus("claude", {
+          expired: true,
+          exhaustedUntil: "2099-09-23T16:00:00.000Z",
+        });
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
 
-      // 2. Newly reported quota exhaustion: triggers re-evaluation for affected provider.
-      claudeStatus = {
-        ...claudeStatus,
-        expired: true,
-        exhaustedUntil: "2099-09-23T15:00:00.000Z",
-        updatedAt: new Date().toISOString(),
-      };
-      await triggerQuotaThrottleTick?.();
-      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-      expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
-
-      // 3. A coordinator deadline revision while the lane remains exhausted is
-      // still the same exhaustion, not a cadence-triggered re-evaluation.
-      claudeStatus = {
-        ...claudeStatus,
-        exhaustedUntil: "2099-09-23T16:00:00.000Z",
-        updatedAt: new Date().toISOString(),
-      };
-      await triggerQuotaThrottleTick?.();
-      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-
-      // 4. Cadence tick with unchanged exhaustion: does NOT trigger re-evaluation.
-      await triggerQuotaThrottleTick?.();
-      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-
-      // 5. Quota renewal (expired: false): negative requirement - does NOT trigger re-evaluation.
-      claudeStatus = {
-        ...claudeStatus,
-        expired: false,
-        exhaustedUntil: null,
-        updatedAt: new Date().toISOString(),
-      };
-      await triggerQuotaThrottleTick?.();
-      expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-    } finally {
-      await shutdownFn?.();
-      shutdownFn = undefined;
-      await new Promise<void>((resolve, reject) => {
-        coordinator.close((error) => (error ? reject(error) : resolve()));
-      });
-    }
+        claudeStatus = throttleStatus("claude");
+        await triggerQuotaThrottleTick();
+        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        await shutdownFn?.();
+        shutdownFn = undefined;
+        await close();
+      }
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
