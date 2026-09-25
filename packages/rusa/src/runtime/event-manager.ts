@@ -140,9 +140,10 @@ export interface NormalizedIntegrationEvent {
 /**
  * What one external event durably produced. `entries` is the append result in
  * delivery order; `ownerIds` is the ladder's own answer to who the effective
- * owners were, so the after-commit wake can tell an owner's copy from a
- * subscriber's without re-routing. A non-owner recipient's copy is an ordinary
- * responsive wake: it must not abort a run that event does not belong to.
+ * owners were. Scheduling does not read `ownerIds`: each entry carries its own
+ * durable `deliveryRole`, which the after-commit wake uses so a non-owner
+ * recipient's copy joins rather than aborts a run that event does not belong
+ * to (#632).
  */
 export interface DurableEventDelivery {
   entries: readonly InboxEntry[];
@@ -698,11 +699,11 @@ export class EventManager {
   private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
     const resource = raw.rawResource ?? "system:events";
     // `raw.priority` is the only field that decides the persisted row's
-    // priority: it is the field the wake in `ActorMesh.deliverExternalEvent`
-    // reads, on the same condition the GitHub normalizer applies, and an
-    // unstated value is normal. A `priority` carried inside `rawPayload` is
-    // dropped rather than honoured, so the row and the wake cannot disagree
-    // about one event through either door (#477).
+    // priority: the after-commit wake reads it off the row, on the same
+    // condition the GitHub normalizer applies, and an unstated value is
+    // normal. A `priority` carried inside `rawPayload` is dropped rather than
+    // honoured, so the row and the wake cannot disagree about one event
+    // through either door (#477).
     const { priority: _payloadCarried, ...rest } = raw.rawPayload;
     const payload: InboxPayload = { ...rest };
     if (raw.priority === "responsive") payload.priority = "responsive";
@@ -790,6 +791,10 @@ export class EventManager {
     });
     if (deliverable.length === 0) return { entries: [], ownerIds: [] };
 
+    // Each copy records the relationship it was delivered under, from the same
+    // snapshot that ordered the destinations: an owner copy wins when one actor
+    // is in both sets. The after-commit wake reads only this, so it never has
+    // to route the event again (#632).
     const newItems: InboxAppendInput[] = deliverable.map((actorId) => ({
       id: normalized.dedupeKey
         ? deduplicatedInboxEntryId(normalized.dedupeKey, actorId)
@@ -797,7 +802,10 @@ export class EventManager {
       actorId,
       source: resource,
       deliveredAt: normalized.deliveredAt,
-      payload: normalized.payload,
+      payload: {
+        ...normalized.payload,
+        deliveryRole: recipients.ownerIds.includes(actorId) ? "owner" : "subscriber",
+      },
     }));
 
     const entries = this.inboxStore.append(newItems);

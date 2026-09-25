@@ -18,22 +18,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
-import { type ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
+import { ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
+import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
+import { RootModelConfigStartupError } from "../actor/root-model-config.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
+import { McpHttpServer } from "../mcp/http-server.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import type { DiskUsageAlertDeps } from "../observability/disk-alert.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
@@ -42,6 +46,7 @@ import type { CodingProvider, RunResult } from "../providers/types.js";
 import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
+import { SlackSocketSource } from "../slack/socket-source.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -181,6 +186,16 @@ vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
   refreshConfiguredProviderModelCatalogs: modelScrapeMock.refreshConfiguredProviderModelCatalogs,
 }));
 
+// A passthrough, so a shutdown test can see when the service closes the
+// database relative to everything else it releases.
+const dbMock = vi.hoisted(() => ({ closeDb: vi.fn() }));
+
+vi.mock("../db/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../db/index.js")>();
+  dbMock.closeDb.mockImplementation(actual.closeDb);
+  return { ...actual, closeDb: dbMock.closeDb };
+});
+
 // Structured records go to a synchronous fd-1 sink that bypasses
 // `process.stdout.write`; route every logger built during a test into this
 // capture so a boot record can be asserted the way an operator would read it.
@@ -206,6 +221,8 @@ import {
   getShutdownExitCode,
   isLegacyWorktreeKey,
   mechanicallySubscribeCreatedResource,
+  type RunStartE2EHandles,
+  type RunStartOptions,
   reactToQueuedInboxEntries,
   runStart,
   shouldBindDashboardServer,
@@ -1190,66 +1207,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect(message.match(/\(exhausted\)/g)).toHaveLength(2);
         expect(message).not.toContain("(pacing)");
         expect(attempted).not.toHaveBeenCalled();
-      } finally {
-        await shutdownFn?.();
-        shutdownFn = undefined;
-        await close();
-      }
-    });
-
-    it("re-evaluates queued admissions only after a newly deferred coordinator exhaustion (#633)", async () => {
-      let claudeStatus = throttleStatus("claude");
-      const { mesh, close, pacerQuote, triggerQuotaThrottleTick } = await bootWithCoordinator(
-        () => ({ claude: claudeStatus }),
-        3600
-      );
-      try {
-        const reEvaluateSpy = vi
-          .spyOn(mesh, "reEvaluateExhaustedQueuedRuns")
-          .mockImplementation((lane) => {
-            // The production pacer has already consumed the coordinator's
-            // deadline, so a re-quote cannot reserve the exhausted lane.
-            expect(pacerQuote(lane)).toBeGreaterThan(Date.now());
-            return [];
-          });
-
-        // Initial unexhausted publication does not trigger re-evaluation.
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        // An incomplete or malformed expired publication cannot defer the
-        // pacer. Neither consumes the edge, so the later usable deadline does.
-        claudeStatus = throttleStatus("claude", { expired: true, exhaustedUntil: null });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "not-a-timestamp",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "2099-09-23T15:00:00.000Z",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-        expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
-
-        // Revising a deadline while the lane remains deferred is not a new
-        // exhaustion edge, and neither is the subsequent renewal.
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "2099-09-23T16:00:00.000Z",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-
-        claudeStatus = throttleStatus("claude");
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
       } finally {
         await shutdownFn?.();
         shutdownFn = undefined;
@@ -5675,17 +5632,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       expect(bootRecords("root_model_config_invalid")).toMatchObject([
         {
           level: "error",
@@ -5856,17 +5814,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       // The refusal is a structured `root_model_config_invalid` record carrying
       // the reason and an action, not prose.
       expect(consoleError).not.toHaveBeenCalled();
@@ -5904,17 +5863,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       logCapture.lines.length = 0;
       let ready = false;
 
-      await runStart({
-        e2e: {
-          onReady: (handles) => {
-            ready = true;
-            shutdownFn = handles.shutdown;
+      await expect(
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              ready = true;
+              shutdownFn = handles.shutdown;
+            },
           },
-        },
-      });
+        })
+      ).rejects.toThrow(RootModelConfigStartupError);
 
       expect(ready).toBe(false);
-      expect(process.exit).toHaveBeenCalledWith(1);
       expect(bootRecords("root_model_config_invalid")).toMatchObject([
         {
           error: "RootModelConfigStartupError",
@@ -7354,6 +7314,639 @@ describe("runStart webhook event routing (Phase 4)", () => {
       excludedCount: 1,
       configuredCount: 2,
       activeCount: 1,
+    });
+  });
+
+  describe("service composition and disposal", () => {
+    type McpSpec = { name: string; url: string };
+    type E2EOptions = Omit<NonNullable<RunStartOptions["e2e"]>, "onReady">;
+
+    const mcpServersOf = (actor: unknown): McpSpec[] =>
+      (actor as { opts: { mcpServers: McpSpec[] } }).opts.mcpServers;
+
+    const withWorker = (workerId: string): void => {
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            legacyRootThread,
+            {
+              id: workerId,
+              charter: "composition worker",
+              parentId: "root",
+              status: "active",
+              createdAt: "2026-09-25T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+    };
+
+    const writeConfig = (extra: Record<string, unknown>): void => {
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+          geminiApiKey: "fake-gemini-key",
+          ...extra,
+        }),
+        "utf8"
+      );
+    };
+
+    const chatConfig = {
+      chat: {
+        projectId: "test",
+        subscription: "test",
+        pubsubKeyPath: "/dev/null",
+        gchat: "all",
+        errorChat: "spaces/operator-dm",
+      },
+    };
+
+    const boot = async (e2e: E2EOptions = {}): Promise<RunStartE2EHandles> => {
+      let ready: RunStartE2EHandles | undefined;
+      await new Promise<void>((resolve, reject) => {
+        runStart({
+          e2e: {
+            ...e2e,
+            onReady: (handles) => {
+              ready = handles;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        }).catch(reject);
+      });
+      if (!ready) throw new Error("service not ready");
+      return ready;
+    };
+
+    const workerOf = (mesh: ActorMesh, workerId: string): Actor => {
+      const worker = mesh.get(workerId);
+      if (!worker) throw new Error(`${workerId} not rehydrated`);
+      return worker as Actor;
+    };
+
+    const records = (msg: string): Record<string, unknown>[] =>
+      logCapture.lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((record) => record.msg === msg);
+
+    type SignalListener = ReturnType<typeof process.listeners>[number];
+    const addedListeners = (signal: NodeJS.Signals, before: SignalListener[]): SignalListener[] =>
+      process.listeners(signal).filter((listener) => !before.includes(listener));
+
+    const exitMock = () => process.exit as unknown as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      logCapture.lines.length = 0;
+    });
+
+    it("mounts the exact per-actor MCP sets for the root and a rehydrated worker", async () => {
+      withWorker("set-worker");
+      const { mesh, root } = await boot();
+      const rootServers = mcpServersOf(root);
+      const workerServers = mcpServersOf(workerOf(mesh, "set-worker"));
+
+      expect(rootServers.map((server) => server.name)).toEqual([
+        "understanding",
+        "stuck-loop-detector",
+        "quota",
+        "tracker",
+        "repo",
+        "mesh",
+        "inbox",
+        "obligations",
+        "mesh-chat-read",
+        "pnpm-install",
+        "pnpm-hardlinks",
+        "update",
+      ]);
+      expect(workerServers.map((server) => server.name)).toEqual([
+        "tracker",
+        "repo",
+        "understanding",
+        "stuck-loop-detector",
+        "quota",
+        "mesh",
+        "inbox",
+        "obligations",
+        "mesh-chat-read",
+        "pnpm-install",
+      ]);
+      // Every worker endpoint is the worker's own; none is shared with root.
+      const rootUrls = new Set(rootServers.map((server) => server.url));
+      expect(workerServers.filter((server) => rootUrls.has(server.url))).toEqual([]);
+    });
+
+    it("adds chat read to both sets and chat write to the root only when chat is configured", async () => {
+      writeConfig(chatConfig);
+      withWorker("chat-set-worker");
+      const { mesh, root } = await boot({
+        chatClient: new FakeChatClient(),
+        chatSource: new FakeChatSource(),
+      });
+
+      expect(mcpServersOf(root).map((server) => server.name)).toEqual([
+        "understanding",
+        "stuck-loop-detector",
+        "quota",
+        "chat-read",
+        "tracker",
+        "repo",
+        "mesh",
+        "inbox",
+        "obligations",
+        "mesh-chat-read",
+        "pnpm-install",
+        "chat-write",
+        "pnpm-hardlinks",
+        "update",
+      ]);
+      expect(mcpServersOf(workerOf(mesh, "chat-set-worker")).map((server) => server.name)).toEqual([
+        "tracker",
+        "repo",
+        "understanding",
+        "stuck-loop-detector",
+        "quota",
+        "chat-read",
+        "mesh",
+        "inbox",
+        "obligations",
+        "mesh-chat-read",
+        "pnpm-install",
+      ]);
+    });
+
+    it("fences every worker endpoint on yield, and of root's only agent execution", async () => {
+      setIssueClient(new MockIssueClient() as unknown as IssueClient);
+      withWorker("fence-worker");
+      const { mesh, root } = await boot();
+      vi.spyOn(mesh, "isYielded").mockReturnValue(true);
+
+      // One argument-valid call per server, so the only thing that can refuse
+      // it is the fence. Root's pnpm-install, repo and update are not called:
+      // unfenced, those would do real work.
+      const probes: Record<string, { tool: string; args: Record<string, unknown> }> = {
+        tracker: { tool: "list_open_issues", args: { repo: "dummy-org/dummy-repo" } },
+        repo: { tool: "merge_pull_request", args: { repo: "dummy-org/dummy-repo", prNumber: 1 } },
+        understanding: { tool: "overview", args: {} },
+        "stuck-loop-detector": { tool: "list_open_commitments", args: {} },
+        quota: { tool: "list_models", args: {} },
+        mesh: { tool: "list_threads", args: {} },
+        inbox: { tool: "list", args: {} },
+        obligations: { tool: "list_owned", args: {} },
+        "mesh-chat-read": { tool: "list_messages", args: {} },
+        "pnpm-install": { tool: "pnpm_install", args: {} },
+        "pnpm-hardlinks": { tool: "force_relink_workers", args: {} },
+      };
+      const fencedByServer = async (
+        servers: McpSpec[],
+        skip: string[] = []
+      ): Promise<Record<string, boolean>> => {
+        const fenced: Record<string, boolean> = {};
+        for (const server of servers) {
+          const probe = probes[server.name];
+          if (!probe || skip.includes(server.name)) continue;
+          const client = new Client({ name: "fence-probe", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+          try {
+            const result = await client.callTool({ name: probe.tool, arguments: probe.args });
+            const text = (result.content as { text?: string }[])
+              .map((part) => part.text ?? "")
+              .join("");
+            fenced[server.name] = text.includes("Run is over");
+          } finally {
+            await client.close();
+          }
+        }
+        return fenced;
+      };
+
+      expect(await fencedByServer(mcpServersOf(workerOf(mesh, "fence-worker")))).toEqual({
+        tracker: true,
+        repo: true,
+        understanding: true,
+        "stuck-loop-detector": true,
+        quota: true,
+        mesh: true,
+        inbox: true,
+        obligations: true,
+        "mesh-chat-read": true,
+        "pnpm-install": true,
+      });
+      expect(await fencedByServer(mcpServersOf(root), ["repo", "pnpm-install"])).toEqual({
+        understanding: false,
+        "stuck-loop-detector": false,
+        quota: false,
+        tracker: false,
+        mesh: true,
+        inbox: false,
+        obligations: false,
+        "mesh-chat-read": false,
+        "pnpm-hardlinks": false,
+      });
+    });
+
+    it("records the same run accounting, events and logs for root and worker runs", async () => {
+      withWorker("parity-worker");
+      const { mesh, root } = await boot();
+      const selected = { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" };
+
+      const project = async (actor: Actor) => {
+        const failed = await startLifecycleRun(actor, selected);
+        await actor.lifecycle.emit("onError", {
+          actorId: actor.id,
+          runId: failed,
+          error: new Error("provider crashed"),
+        });
+        await endLifecycleRun(actor, failed, { success: false, exitCode: 1, output: "boom" });
+        const succeeded = await startLifecycleRun(actor, selected, { responsive: true });
+        await endLifecycleRun(actor, succeeded, { success: true, exitCode: 0, output: "done" });
+        const coalesced = await startLifecycleRun(actor, selected);
+        await abandonLifecycleRun(actor, coalesced, "coalesced", true);
+        const cancelled = randomUUID();
+        await abandonLifecycleRun(actor, cancelled, "start-cancelled", false);
+
+        const runIds = [failed, succeeded, coalesced, cancelled];
+        const alias = (text: string | null | undefined) =>
+          runIds.reduce<string | null>(
+            (out, id, index) => out?.split(id).join(`run-${index}`) ?? null,
+            text ?? null
+          );
+        const events = getRepositories()
+          .meshEvents.listEventsByActors([actor.id], {
+            limit: 50,
+            kinds: ["run_queued", "run_start", "run_end", "run_abandoned"],
+          })
+          .events.map((event) => ({
+            kind: event.kind,
+            detail: event.detail,
+            success: event.success,
+            body: event.body,
+            payload: alias(event.payload),
+          }));
+        const runs = runIds.map((runId) => {
+          const row = getDb()
+            .prepare(
+              "SELECT outcome, success, exit_code, output, abandon_reason FROM actor_runs WHERE id = ?"
+            )
+            .get(runId);
+          return row ?? null;
+        });
+        const logs = logCapture.lines
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((record) => record.actorId === actor.id && record.component === "actor-run")
+          .map(({ time: _time, pid: _pid, hostname: _host, actorId: _actorId, ...rest }) => ({
+            ...rest,
+            runId: alias(rest.runId as string | undefined),
+          }));
+        return { events, runs, logs, selection: undefined };
+      };
+
+      const workerProjection = await project(workerOf(mesh, "parity-worker"));
+      const rootProjection = await project(root as Actor);
+
+      expect(workerProjection.events.length).toBeGreaterThan(0);
+      expect(workerProjection.logs.length).toBeGreaterThan(0);
+      expect(workerProjection.runs.filter(Boolean).length).toBe(3);
+      expect(rootProjection).toEqual(workerProjection);
+    });
+
+    it("releases resources newest first, ingress before the mesh, and clears every obligation sink before the database closes", async () => {
+      writeConfig({ ...chatConfig, gitBridge: true, gitBridgePort: 9098 });
+      const readyHeadListener = vi.spyOn(ObligationRepository.prototype, "setReadyHeadListener");
+      const cancellationListener = vi.spyOn(
+        ObligationRepository.prototype,
+        "setCancellationAttentionListener"
+      );
+      const responsiveListener = vi.spyOn(
+        ObligationRepository.prototype,
+        "setResponsiveReadyListener"
+      );
+      const dashboardClose = vi.fn(async () => {});
+      const dashboardSpy = vi
+        .spyOn(webhookServer, "startDashboardServer")
+        .mockResolvedValue({ close: dashboardClose });
+      const probeSettled = vi.fn();
+      modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockImplementationOnce(
+        async (deps: { signal?: AbortSignal }) => {
+          await new Promise<void>((resolve) => {
+            // Settles a macrotask after abort: only an awaited probe finishes
+            // before the database is closed.
+            deps.signal?.addEventListener("abort", () => setTimeout(resolve, 20), { once: true });
+          });
+          probeSettled();
+        }
+      );
+      const chatSource = new FakeChatSource();
+      const chatClose = vi.spyOn(chatSource, "close");
+      const notifierClose = vi.spyOn(CoalescingNotifier.prototype, "close");
+      const mcpClose = vi.spyOn(McpHttpServer.prototype, "close");
+
+      try {
+        const { mesh, shutdown } = await boot({
+          chatClient: new FakeChatClient(),
+          chatSource,
+          dashboard: true,
+        });
+        shutdownFn = undefined;
+        const gitBridge = gitHttpServerMock.servers[0];
+        if (!gitBridge) throw new Error("git bridge not started");
+        const meshShutdown = vi.spyOn(mesh, "shutdownAll");
+        const deliveries = [
+          vi.spyOn(mesh, "deliverReadyHeadAttention").mockReturnValue(true),
+          vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockReturnValue(true),
+          vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockReturnValue(true),
+        ];
+        const fireObligationListeners = () => {
+          readyHeadListener.mock.lastCall?.[0]?.({
+            ownerId: "root",
+            epoch: 1,
+            head: null,
+            previousHeadId: null,
+            sequence: 1,
+          } as never);
+          cancellationListener.mock.lastCall?.[0]?.({
+            dependentId: "dependent",
+            dependentOwnerId: "root",
+            prerequisiteId: "prerequisite",
+          } as never);
+          responsiveListener.mock.lastCall?.[0]?.(
+            { id: "obligation", ownerId: "root", intent: "x", readyCount: 1 } as never,
+            "root"
+          );
+        };
+        // The captured listeners reach the live mesh before shutdown...
+        fireObligationListeners();
+        expect(deliveries.map((delivery) => delivery.mock.calls.length)).toEqual([1, 1, 1]);
+        // ...and none of them reaches it by the time the database closes.
+        let deliveredAtClose: number[] = [];
+        dbMock.closeDb.mockClear();
+        dbMock.closeDb.mockImplementationOnce(() => {
+          fireObligationListeners();
+          deliveredAtClose = deliveries.map((delivery) => delivery.mock.calls.length);
+          closeDb();
+        });
+
+        await shutdown();
+
+        expect(deliveredAtClose).toEqual([1, 1, 1]);
+        const order = (
+          [
+            ["probe settled", probeSettled],
+            ["chat source", chatClose],
+            ["dashboard", dashboardClose],
+            ["mesh", meshShutdown],
+            ["error notifier", notifierClose],
+            ["mcp", mcpClose],
+            ["git bridge", gitBridge.close],
+            ["database", dbMock.closeDb],
+          ] as const
+        )
+          .map(([name, fn]) => {
+            const [first] = (fn as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
+            if (first === undefined) throw new Error(`${name} was not released`);
+            return [name, first] as const;
+          })
+          .sort((a, b) => a[1] - b[1])
+          .map(([name]) => name);
+        expect(order).toEqual([
+          "probe settled",
+          "chat source",
+          "dashboard",
+          "mesh",
+          "error notifier",
+          "mcp",
+          "git bridge",
+          "database",
+        ]);
+        expect(exitMock()).toHaveBeenCalledOnce();
+      } finally {
+        dashboardSpy.mockRestore();
+        notifierClose.mockRestore();
+        mcpClose.mockRestore();
+        readyHeadListener.mockRestore();
+        cancellationListener.mockRestore();
+        responsiveListener.mockRestore();
+      }
+    });
+
+    it("releases once and exits once across repeated shutdowns, and leaves no signal handler behind", async () => {
+      const sigint = process.listeners("SIGINT");
+      const sigterm = process.listeners("SIGTERM");
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      expect(addedListeners("SIGINT", sigint)).toHaveLength(1);
+      expect(addedListeners("SIGTERM", sigterm)).toHaveLength(1);
+      const meshShutdown = vi.spyOn(mesh, "shutdownAll");
+      dbMock.closeDb.mockClear();
+
+      await Promise.all([shutdown(), shutdown()]);
+      await shutdown();
+
+      expect(e2eInstanceManagerMock.stopForMeshShutdown).toHaveBeenCalledOnce();
+      expect(meshShutdown).toHaveBeenCalledOnce();
+      expect(dbMock.closeDb).toHaveBeenCalledOnce();
+      expect(exitMock()).toHaveBeenCalledOnce();
+      expect(exitMock()).toHaveBeenCalledWith(0);
+      expect(records("service_stopped")).toHaveLength(1);
+      expect(addedListeners("SIGINT", sigint)).toEqual([]);
+      expect(addedListeners("SIGTERM", sigterm)).toEqual([]);
+    });
+
+    it("keeps the mesh up when the e2e stop fails, and a later signal retries the shutdown", async () => {
+      const sigterm = process.listeners("SIGTERM");
+      const { mesh } = await boot();
+      const [onSigterm] = addedListeners("SIGTERM", sigterm);
+      if (!onSigterm) throw new Error("no SIGTERM handler registered");
+      const meshShutdown = vi.spyOn(mesh, "shutdownAll");
+      e2eInstanceManagerMock.stopForMeshShutdown.mockImplementationOnce(() => {
+        throw new Error("systemctl stop failed");
+      });
+
+      onSigterm("SIGTERM");
+      await vi.waitFor(() => expect(records("shutdown_not_committed")).toHaveLength(1));
+
+      // Not committed: nothing was released and the mesh is still serving.
+      expect(meshShutdown).not.toHaveBeenCalled();
+      expect(exitMock()).not.toHaveBeenCalled();
+      expect(() => getRepositories()).not.toThrow();
+      expect(addedListeners("SIGTERM", sigterm)).toEqual([onSigterm]);
+
+      onSigterm("SIGTERM");
+      await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(0));
+      expect(e2eInstanceManagerMock.stopForMeshShutdown).toHaveBeenCalledTimes(2);
+      expect(meshShutdown).toHaveBeenCalledOnce();
+      shutdownFn = undefined;
+    });
+
+    it("contains a failing disposer and still releases everything else", async () => {
+      writeConfig({ gitBridge: true, gitBridgePort: 9100 });
+      const { mesh, shutdown } = await boot();
+      shutdownFn = undefined;
+      const mcpClose = vi.spyOn(McpHttpServer.prototype, "close");
+      const gitBridge = gitHttpServerMock.servers[0];
+      if (!gitBridge) throw new Error("git bridge not started");
+      dbMock.closeDb.mockClear();
+      try {
+        vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+          throw new Error("actor refused to stop");
+        });
+
+        await shutdown();
+
+        expect(records("shutdown_disposer_failed")).toEqual([
+          expect.objectContaining({ resource: "actor mesh" }),
+        ]);
+        // #389 requires attempting every later disposer even after a failure:
+        // the release must run past the mesh all the way to the database and
+        // the process still exits.
+        expect(mcpClose).toHaveBeenCalledOnce();
+        expect(gitBridge.close).toHaveBeenCalled();
+        expect(dbMock.closeDb).toHaveBeenCalledOnce();
+        expect(exitMock()).toHaveBeenCalledWith(0);
+      } finally {
+        mcpClose.mockRestore();
+      }
+    });
+
+    // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.
+    it("removes the signal handlers when boot fails after installing them", async () => {
+      const sigint = process.listeners("SIGINT");
+      const sigterm = process.listeners("SIGTERM");
+      const meshShutdown = vi.spyOn(ActorMesh.prototype, "shutdownAll");
+      dbMock.closeDb.mockClear();
+      try {
+        await expect(
+          runStart({
+            e2e: {
+              onReady: () => {
+                throw new Error("runner rejected the handles");
+              },
+            },
+          })
+        ).rejects.toThrow("runner rejected the handles");
+
+        expect(addedListeners("SIGINT", sigint)).toEqual([]);
+        expect(addedListeners("SIGTERM", sigterm)).toEqual([]);
+        expect(meshShutdown).toHaveBeenCalledOnce();
+        expect(dbMock.closeDb).toHaveBeenCalledOnce();
+        expect(exitMock()).not.toHaveBeenCalled();
+      } finally {
+        meshShutdown.mockRestore();
+      }
+    });
+
+    it("releases what a partial boot acquired and rethrows the boot failure", async () => {
+      writeConfig({ gitBridge: true, gitBridgePort: 9100 });
+      const sigterm = process.listeners("SIGTERM");
+      const dashboardSpy = vi
+        .spyOn(webhookServer, "startDashboardServer")
+        .mockRejectedValue(new Error("listen EADDRINUSE"));
+      const mcpClose = vi.spyOn(McpHttpServer.prototype, "close");
+      const meshShutdown = vi.spyOn(ActorMesh.prototype, "shutdownAll");
+      const onReady = vi.fn();
+      dbMock.closeDb.mockClear();
+      try {
+        await expect(runStart({ e2e: { dashboard: true, onReady } })).rejects.toThrow(
+          "listen EADDRINUSE"
+        );
+
+        expect(onReady).not.toHaveBeenCalled();
+        expect(meshShutdown).toHaveBeenCalledOnce();
+        expect(mcpClose).toHaveBeenCalledOnce();
+        expect(gitHttpServerMock.servers[0]?.close).toHaveBeenCalled();
+        expect(dbMock.closeDb).toHaveBeenCalledOnce();
+        expect(addedListeners("SIGTERM", sigterm)).toEqual([]);
+        expect(exitMock()).not.toHaveBeenCalled();
+      } finally {
+        dashboardSpy.mockRestore();
+        mcpClose.mockRestore();
+        meshShutdown.mockRestore();
+      }
+    });
+
+    it("releases the scope when the self-update tool exits", async () => {
+      const handles = await boot();
+      shutdownFn = undefined;
+      dbMock.closeDb.mockClear();
+
+      const updateDeps = handles.updateToolDepsFor?.("root");
+      expect(updateDeps).toBeDefined();
+
+      updateDeps?.deps.exit(0);
+
+      // The updater asks for exit(0): a committed deploy must be a clean unit
+      // stop, not the deploy default of 1 (failed unit under OnFailure).
+      await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(0));
+      expect(dbMock.closeDb).toHaveBeenCalledOnce();
+      expect(records("service_stopped")).toEqual([expect.objectContaining({ reason: "deploy" })]);
+    });
+
+    it("logs and stays up when the deploy shutdown aborts before commit", async () => {
+      const handles = await boot();
+      shutdownFn = undefined;
+      dbMock.closeDb.mockClear();
+      e2eInstanceManagerMock.stopForMeshShutdown.mockImplementationOnce(() => {
+        throw new Error("systemctl stop failed");
+      });
+
+      const updateDeps = handles.updateToolDepsFor?.("root");
+      expect(updateDeps).toBeDefined();
+      updateDeps?.deps.exit(0);
+
+      // The update orchestrator has already reported restarting by the time
+      // exit runs, so an abort here must be loud and must NOT exit: the
+      // service stays up (the mesh is drained) and a later signal retries.
+      await vi.waitFor(() => expect(records("shutdown_not_committed")).toHaveLength(1));
+      expect(records("shutdown_not_committed")[0]).toEqual(
+        expect.objectContaining({ reason: "deploy" })
+      );
+      expect(exitMock()).not.toHaveBeenCalled();
+      expect(dbMock.closeDb).not.toHaveBeenCalled();
+      expect(records("service_stopped")).toEqual([]);
+    });
+
+    it("closes the socket source immediately when slack startup fails", async () => {
+      const secretsDir = join(homeDir, "secrets");
+      mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(secretsDir, "slack-bot-token"), "xoxb-mock-bot-token");
+      writeFileSync(join(secretsDir, "slack-app-token"), "xapp-mock-app-token");
+      writeConfig({
+        slack: {
+          botTokenPath: join(secretsDir, "slack-bot-token"),
+          appTokenPath: join(secretsDir, "slack-app-token"),
+        },
+      });
+
+      const startSpy = vi
+        .spyOn(SlackSocketSource.prototype, "start")
+        .mockRejectedValue(new Error("slack socket failed"));
+      const closeSpy = vi.spyOn(SlackSocketSource.prototype, "close").mockResolvedValue(undefined);
+
+      try {
+        const handles = await boot();
+        expect(startSpy).toHaveBeenCalledOnce();
+        expect(closeSpy).toHaveBeenCalledOnce();
+        expect(records("slack_socket_start_failed")).toEqual([
+          expect.objectContaining({
+            error: "slack socket failed",
+          }),
+        ]);
+
+        await handles.shutdown();
+        // Since slack source start failed, it was closed immediately and never acquired into resources;
+        // shutdown should not close it a second time.
+        expect(closeSpy).toHaveBeenCalledOnce();
+      } finally {
+        startSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
     });
   });
 });

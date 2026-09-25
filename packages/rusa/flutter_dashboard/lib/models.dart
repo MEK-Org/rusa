@@ -201,6 +201,9 @@ class ThreadDto {
     this.queuePosition,
     this.estimatedStartAt,
     this.pacingIntervalMs,
+    this.admissionClaimed = false,
+    this.compatibleLanes = const [],
+    this.claimedLane,
     this.selectedProvider,
     this.selectedModel,
     this.selectedEffort,
@@ -275,8 +278,10 @@ class ThreadDto {
   final String? commitmentKind;
   final String? waitingOn;
 
-  /// 0-based position within this actor's own provider lane; not comparable
-  /// across actors on different lanes. Null when not in a provider queue.
+  /// 0-based position in the leader's one admission list, shared by every
+  /// provider lane: claimed entries first, then unclaimed ones in the order
+  /// lanes will scan them. Comparable across actors; an entry ahead may be
+  /// waiting on a lane this actor cannot use. Null when not in the list.
   final int? queuePosition;
 
   /// ISO-8601 estimate of this actor's provider run start, or null when the
@@ -287,6 +292,16 @@ class ThreadDto {
   /// when the actor is not in a pacer queue. Zero means the lane has no
   /// pacing gap, so any future [estimatedStartAt] is an explicit deferral.
   final int? pacingIntervalMs;
+
+  /// The admission entry already holds a lane ([claimedLane]) and waits only
+  /// on a mesh concurrency slot. Shown in the list, never reorderable.
+  final bool admissionClaimed;
+
+  /// Provider lanes this queued actor can start on; empty when not queued.
+  final List<String> compatibleLanes;
+
+  /// The lane a claimed admission holds, else null.
+  final String? claimedLane;
 
   /// The candidate a genuinely queued run has reserved from its pool: the
   /// declared provider alias, model, and effort it will start with. Null when
@@ -342,6 +357,9 @@ class ThreadDto {
     int? queuePosition,
     String? estimatedStartAt,
     int? pacingIntervalMs,
+    bool? admissionClaimed,
+    List<String>? compatibleLanes,
+    Object? claimedLane = _keepThreadField,
     Object? selectedProvider = _keepThreadField,
     Object? selectedModel = _keepThreadField,
     Object? selectedEffort = _keepThreadField,
@@ -391,6 +409,11 @@ class ThreadDto {
     queuePosition: queuePosition ?? this.queuePosition,
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     pacingIntervalMs: pacingIntervalMs ?? this.pacingIntervalMs,
+    admissionClaimed: admissionClaimed ?? this.admissionClaimed,
+    compatibleLanes: compatibleLanes ?? this.compatibleLanes,
+    claimedLane: identical(claimedLane, _keepThreadField)
+        ? this.claimedLane
+        : claimedLane as String?,
     selectedProvider: identical(selectedProvider, _keepThreadField)
         ? this.selectedProvider
         : selectedProvider as String?,
@@ -457,6 +480,11 @@ class ThreadDto {
     // from a REAL, so decode through num rather than let one fractional
     // number reject the entire thread snapshot.
     pacingIntervalMs: (j['pacingIntervalMs'] as num?)?.round(),
+    admissionClaimed: j['admissionClaimed'] as bool? ?? false,
+    compatibleLanes:
+        (j['compatibleLanes'] as List?)?.whereType<String>().toList() ??
+        const [],
+    claimedLane: j['claimedLane'] as String?,
     selectedProvider: j['selectedProvider'] as String?,
     selectedModel: j['selectedModel'] as String?,
     selectedEffort: j['selectedEffort'] as String?,
@@ -739,6 +767,9 @@ class ActorViewState {
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
   int? get pacingIntervalMs => thread.pacingIntervalMs;
+  bool get admissionClaimed => thread.admissionClaimed;
+  List<String> get compatibleLanes => thread.compatibleLanes;
+  String? get claimedLane => thread.claimedLane;
   String? get selectedProvider => thread.selectedProvider;
   String? get selectedModel => thread.selectedModel;
   String? get selectedEffort => thread.selectedEffort;
@@ -800,25 +831,12 @@ class ActorViewState {
 /// Normalized snapshot of all actor states across the mesh.
 /// Serves as the single source of truth for the actor tree, detail panel,
 /// and overview tab.
-/// Orders queued actors by expected run order. Actors with a parseable
-/// `estimatedStartAt` sort ascending by that time; actors without one (an
-/// honest "unknown", not a fabricated instant) sort after all known times.
-/// Within either group, ties break by `queuePosition` then by `id`, so the
-/// result is fully deterministic and stable across rebuilds.
+/// Orders queued actors in real admission order (#570): by their global
+/// `queuePosition` in the leader's one list, so the view is the order lanes
+/// scan, not a re-sort by estimate. Queued actors outside that list (no
+/// position) follow, and `id` breaks any remaining tie so the result is
+/// deterministic across rebuilds.
 int _compareQueuedActors(ActorViewState a, ActorViewState b) {
-  final aTime = a.estimatedStartAt == null
-      ? null
-      : DateTime.tryParse(a.estimatedStartAt!)?.millisecondsSinceEpoch;
-  final bTime = b.estimatedStartAt == null
-      ? null
-      : DateTime.tryParse(b.estimatedStartAt!)?.millisecondsSinceEpoch;
-
-  if (aTime != null && bTime != null && aTime != bTime) {
-    return aTime.compareTo(bTime);
-  }
-  if (aTime != null && bTime == null) return -1;
-  if (aTime == null && bTime != null) return 1;
-
   final aPos = a.queuePosition;
   final bPos = b.queuePosition;
   if (aPos != null && bPos != null && aPos != bPos) return aPos.compareTo(bPos);
@@ -866,10 +884,8 @@ class ActorStateSnapshot {
   List<ActorViewState> get runningActors =>
       all.where((a) => a.isRunning || a.isWindingDown).toList();
 
-  /// Queued actors sorted by expected run order: known estimated start
-  /// times first (ascending), then actors with no honest estimate yet, each
-  /// group broken deterministically by lane position and finally by id so
-  /// ties never reorder between rebuilds.
+  /// Queued actors in admission-list order: claimed entries, then unclaimed
+  /// ones by list position, then queued actors outside the list, by id.
   List<ActorViewState> get queuedActors =>
       all.where((a) => a.isQueued).toList()..sort(_compareQueuedActors);
 

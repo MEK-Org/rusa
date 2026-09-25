@@ -5,11 +5,13 @@ import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../ac
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
   type LeaderCommand,
   type RunSnapshot,
@@ -32,6 +34,24 @@ export interface ActorHandleOptions {
   actorOptions?: ActorOptions;
   target?: string;
   logger?: Logger;
+  startupTimeoutMs?: number;
+  stateStaleTimeoutMs?: number;
+}
+
+function sameModelConfigPool(
+  current: readonly RawProviderModelConfig[] | undefined,
+  next: readonly RawProviderModelConfig[]
+): boolean {
+  return Boolean(
+    current &&
+      current.length === next.length &&
+      current.every(
+        (entry, index) =>
+          entry.provider === next[index]?.provider &&
+          entry.model === next[index]?.model &&
+          entry.effort === next[index]?.effort
+      )
+  );
 }
 
 /** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
@@ -53,9 +73,14 @@ export class ActorHandle implements MeshActor {
       release: () => void;
       /** Priority the leader actually admitted, which a promotion can raise after the request. */
       admission: { responsive: boolean };
+      /** Pool revision this reservation quoted; used if it survives a flap. */
+      modelConfigGeneration: number;
+      /** The pool changed after this reservation quoted; retry it under the new pool. */
+      modelConfigStale: boolean;
     }
   >();
   private startupTimer?: ReturnType<typeof setTimeout>;
+  private stateStaleTimer?: ReturnType<typeof setTimeout>;
   /** True between the leader admitting a run and that same run's terminal accounting. */
   private runOpen = false;
   /** Identity minted by the leader-side execution coordinator before admission. */
@@ -68,6 +93,12 @@ export class ActorHandle implements MeshActor {
   /** True from reattach until the follower reports which run, if any, survived the gap. */
   private stateStale = false;
   /**
+   * The stale-state deadline released held wakes before any report arrived.
+   * The leader's booked state still says nothing about the follower, so the
+   * first report that does arrive keeps its reattach meaning.
+   */
+  private stateUnconfirmed = false;
+  /**
    * Resolves with that first report. The mesh preempts before it nudges, and a
    * wake that overtook the deferred preempt would have its dirty bit cancelled
    * by it, so wakes wait here until the preempt decision has been sent.
@@ -76,6 +107,10 @@ export class ActorHandle implements MeshActor {
   private settleState: (() => void) | undefined;
   /** Promotion requested between the follower's queued report and its admission request. */
   private pendingQueuedPromotion = false;
+  /** Incremented for each next-run pool replacement so stale gates can re-quote. */
+  private modelConfigGeneration = 0;
+  /** Last pool sent to this follower; kept apart from the caller-owned bootstrap object. */
+  private modelConfig: RawProviderModelConfig[] | undefined;
   private preemptSequence = 0;
   /** The one unanswered preempt; later responsive items coalesce behind its answer. */
   private outstandingPreempt: number | undefined;
@@ -88,6 +123,7 @@ export class ActorHandle implements MeshActor {
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
+    this.modelConfig = opts.bootstrap.modelConfig ? [...opts.bootstrap.modelConfig] : undefined;
     this.channel = opts.host;
     this.log = (opts.logger ?? nullLogger).child({
       component: "remote-instance",
@@ -109,10 +145,12 @@ export class ActorHandle implements MeshActor {
     void this.ready.catch(() => {});
     clearTimeout(this.startupTimer);
     if (awaitStartup) {
-      this.startupTimer = setTimeout(
-        () => this.fail(new Error("Remote actor startup timed out")),
-        10_000
-      );
+      const startupTimeout = this.opts.startupTimeoutMs ?? 10_000;
+      this.startupTimer = setTimeout(() => {
+        const error = new Error("Remote actor startup timed out");
+        rejectReady(error);
+        this.fail(error);
+      }, startupTimeout);
     }
     channel.on("message", (raw) => {
       const message = raw as ActorEvent;
@@ -156,10 +194,30 @@ export class ActorHandle implements MeshActor {
     // The follower kept its Actor across the gap; its first state report says
     // whether a run admitted before the loss is still in flight.
     this.stateStale = true;
+    this.stateUnconfirmed = false;
     this.settleState?.();
     this.stateSettled = new Promise((resolve) => {
       this.settleState = resolve;
     });
+    clearTimeout(this.stateStaleTimer);
+    const staleTimeout = this.opts.stateStaleTimeoutMs ?? 10_000;
+    this.stateStaleTimer = setTimeout(() => {
+      if (!this.stateStale || this.closed) return;
+      this.log.warn("remote_state_stale_timeout", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      // Only wake delivery waits on this deadline. A missing report is not
+      // proof the follower gave up a retained ticket: its resume claim, its
+      // first report, or a fresh admission still decides that (#602/#604).
+      this.stateStale = false;
+      this.stateUnconfirmed = true;
+      if (this.pendingPreempt) {
+        this.pendingPreempt = false;
+        this.applyPreempt();
+      }
+      this.settleState?.();
+    }, staleTimeout);
     // A reconnect is transport recovery, not a fresh actor boot. Its delayed
     // state/ready report must not cancel a leader-retained admission after 10s.
     this.bindChannel(newChannel, false);
@@ -177,7 +235,7 @@ export class ActorHandle implements MeshActor {
       bootstrap: {
         ...this.opts.bootstrap,
         ...(sessionId ? { sessionId } : {}),
-        modelConfig: freshSnapshot.record.modelConfig ?? this.opts.bootstrap.modelConfig,
+        modelConfig: freshSnapshot.record.modelConfig ?? this.modelConfig,
         mcpServers: freshSnapshot.mcpServers,
         reconnect: true,
         // Invite the follower to re-announce the admission this handle kept.
@@ -234,11 +292,30 @@ export class ActorHandle implements MeshActor {
     return { preempted: false };
   }
 
+  setModelConfig(modelConfig: ProviderModelConfig[]): void {
+    if (sameModelConfigPool(this.modelConfig, modelConfig)) return;
+    this.modelConfig = [...modelConfig];
+    this.modelConfigGeneration++;
+    this.send({ type: "modelConfig", modelConfig: [...modelConfig] });
+    // Keep remote placement at the same queued-start boundary as a local Actor:
+    // update the follower's pool first, then make each stale reservation retry
+    // the same opportunity through its current provider candidates. A retained
+    // reservation stays untouched until attachHost can perform that re-quote.
+    if (this.closed || !this.channel.connected) return;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started) continue;
+      gate.modelConfigStale = true;
+      gate.handle.cancel?.();
+    }
+  }
+
   close(): void {
     if (this.terminated) return;
     this.terminated = true;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.outstandingPreempt = undefined;
@@ -253,6 +330,8 @@ export class ActorHandle implements MeshActor {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
     // An unanswered preempt is re-decided against the follower's reattach state.
     this.pendingPreempt ||= this.outstandingPreempt !== undefined;
     this.outstandingPreempt = undefined;
@@ -295,7 +374,17 @@ export class ActorHandle implements MeshActor {
   /** The follower reclaimed its ticket; the retained gate still owes the reply. */
   private claimRetainedAdmission(requestId: number): boolean {
     if (this.retainedAdmission?.requestId !== requestId) return false;
-    if (!this.gates.has(requestId)) return false;
+    const gate = this.gates.get(requestId);
+    if (!gate) return false;
+    if (gate.modelConfigGeneration !== this.modelConfigGeneration) {
+      // The follower has the replacement pool from attachHost's init, while
+      // this ticket was quoted under the old one. Reject it as stale so the
+      // follower's Actor retries the same queued opportunity under that pool.
+      this.retainedAdmission = undefined;
+      gate.modelConfigStale = true;
+      gate.handle.cancel?.();
+      return true;
+    }
     this.retainedAdmission = undefined;
     this.log.info("remote_admission_resumed", {
       actorId: this.id,
@@ -368,11 +457,10 @@ export class ActorHandle implements MeshActor {
 
   private fail(error: Error): void {
     if (this.closed) return;
-    // On a live channel the leader is giving up on this follower actor (startup
-    // timeout, fatal, protocol error) and must tell it to stop. A dead channel is
-    // a transport loss that attachHost can still recover.
-    if (this.channel.connected) this.close();
-    else this.disconnect();
+    // Termination stays strictly reserved for a genuine actor close() (e.g. thread retirement).
+    // A connection error, startup timeout, or transport loss disconnects the handle so attachHost
+    // can still recover and rebind on reconnect.
+    this.disconnect();
     // A retained admission still owns its run: the claim that resumes it, or the
     // cancellation that drops it, decides that run's outcome instead.
     const retained = this.retainedAdmission !== undefined;
@@ -459,7 +547,11 @@ export class ActorHandle implements MeshActor {
 
   /** Displace whatever the follower's latest state report says is in the way. */
   private applyPreempt(): void {
-    if (this.isQueued) {
+    if (this.stateUnconfirmed) {
+      // Nothing reported since reattach: promote a ticket the leader holds, or
+      // let the follower's own Actor decide whether a run is in the way.
+      if (!this.promoteQueuedAdmissions()) this.sendPreempt();
+    } else if (this.isQueued) {
       if (!this.promoteQueuedAdmissions()) this.pendingQueuedPromotion = true;
     } else if (this.isRunning) {
       this.sendPreempt();
@@ -519,10 +611,13 @@ export class ActorHandle implements MeshActor {
         this.fail(new Error(message.error));
         break;
       case "state": {
-        const reattachReport = this.stateStale;
+        clearTimeout(this.stateStaleTimer);
+        this.stateStaleTimer = undefined;
+        const reattachReport = this.stateStale || this.stateUnconfirmed;
         this.state = message.state;
         this.yielded = message.yielded;
         this.stateStale = false;
+        this.stateUnconfirmed = false;
         if (message.state !== "queued") this.pendingQueuedPromotion = false;
         if (this.pendingPreempt) {
           this.pendingPreempt = false;
@@ -738,6 +833,8 @@ export class ActorHandle implements MeshActor {
                 const finished = new Promise<void>((resolve) => {
                   release = resolve;
                 });
+                const candidates = request.candidates as RawProviderModelConfig[];
+                const modelConfigGeneration = this.modelConfigGeneration;
                 const handle = ctx.gate(
                   async (selected) => {
                     // Provider pacing can delay this callback after the first
@@ -755,6 +852,18 @@ export class ActorHandle implements MeshActor {
                       return;
                     }
                     if (this.closed) throw new Error("Actor closed before admission");
+                    const gate = this.gates.get(requestId);
+                    if (
+                      gate?.modelConfigStale ||
+                      modelConfigGeneration !== this.modelConfigGeneration
+                    ) {
+                      this.send({
+                        type: "reply",
+                        requestId,
+                        error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                      });
+                      return;
+                    }
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
                     this.send({
@@ -768,12 +877,27 @@ export class ActorHandle implements MeshActor {
                     });
                     await finished;
                   },
-                  request.candidates,
+                  candidates,
                   admission.responsive
                 );
-                this.gates.set(requestId, { handle, release, admission });
+                this.gates.set(requestId, {
+                  handle,
+                  release,
+                  admission,
+                  modelConfigGeneration,
+                  modelConfigStale: false,
+                });
                 void handle.result.catch((error: Error) => {
+                  const gate = this.gates.get(requestId);
                   this.gates.delete(requestId);
+                  if (gate?.modelConfigStale) {
+                    this.send({
+                      type: "reply",
+                      requestId,
+                      error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
+                    });
+                    return;
+                  }
                   this.send({ type: "reply", requestId, error: error.message });
                   // A retained ticket that loses its place (the leader gave up, or
                   // pacing released it into a dead channel) ends the run it held:

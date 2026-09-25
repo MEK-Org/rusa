@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConcurrencyLimiter } from "./concurrency-limiter.js";
-import { ProviderPacer, selectPoolLane, submitPoolGate } from "./provider-pacer.js";
+import {
+  ProviderPacer,
+  selectPoolLane,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 
 describe("ProviderPacer", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -767,5 +772,470 @@ describe("ProviderPacer", () => {
         responsive: false,
       });
     });
+  });
+});
+
+describe("UnifiedAdmissionQueue", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const laneFor = (config: string, intervalMs = 0) => ({
+    config,
+    lane: config,
+    pacer: new ProviderPacer(intervalMs, () => Date.now()),
+  });
+
+  it("claims unclaimed work in its reordered list order", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const delayed = laneFor("delayed", 60_000);
+    delayed.pacer.deferUntil(Date.now() + 60_000);
+    const started: string[] = [];
+    const run = (id: string) =>
+      queue.enqueue(
+        async () => {
+          started.push(id);
+          return id;
+        },
+        [delayed],
+        { threadId: id, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+    const one = run("one");
+    const two = run("two");
+    // Projected starts stack one interval per entry on the shared lane.
+    const opensAt = Date.now() + 60_000;
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "one", position: 0, estimatedStartAt: opensAt }),
+      expect.objectContaining({ threadId: "two", position: 1, estimatedStartAt: opensAt + 60_000 }),
+    ]);
+    expect(queue.reorder("two", "one")).toBe(true);
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["two", "one"]);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(two.result).resolves.toBe("two");
+    expect(started).toEqual(["two"]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(one.result).resolves.toBe("one");
+    expect(started).toEqual(["two", "one"]);
+  });
+
+  it("applies an operator reorder only against the unclaimed order it observed (#570)", () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const delayed = laneFor("delayed", 60_000);
+    delayed.pacer.deferUntil(Date.now() + 60_000);
+    const run = (id: string) =>
+      queue.enqueue(async () => id, [delayed], {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+    run("one");
+    run("two");
+
+    expect(queue.reorderObserved(["one", "two"], "two", "one")).toEqual({
+      status: "ok",
+      order: ["two", "one"],
+    });
+    // The operator's view still shows the old order: nothing moves.
+    expect(queue.reorderObserved(["one", "two"], "one")).toEqual({
+      status: "stale",
+      order: ["two", "one"],
+    });
+    // An arrival the operator has not seen also makes the view stale.
+    run("three");
+    expect(queue.reorderObserved(["two", "one"], "one", "two")).toEqual({
+      status: "stale",
+      order: ["two", "one", "three"],
+    });
+    // A current view with an actor that is not in it is a bad request.
+    expect(queue.reorderObserved(["two", "one", "three"], "missing")).toEqual({
+      status: "invalid",
+      order: ["two", "one", "three"],
+    });
+    expect(queue.unclaimedOrder()).toEqual(["two", "one", "three"]);
+  });
+
+  it("makes a claim race stale before invalidating a claimed target (#570)", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    b.pacer.deferUntil(Date.now() + 60_000);
+    let releaseBlocker!: () => void;
+    queue.enqueue(
+      () => new Promise<string>((resolve) => (releaseBlocker = () => resolve("blocker"))),
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(async (config) => config, lanes, {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+    run("claimed", [a, b]);
+    run("waiting", [b, b]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({
+        threadId: "claimed",
+        claimed: true,
+        compatibleLanes: ["a", "b"],
+        claimedLane: "a",
+      }),
+      expect.objectContaining({
+        threadId: "waiting",
+        claimed: false,
+        compatibleLanes: ["b"],
+        claimedLane: null,
+      }),
+    ]);
+    expect(queue.unclaimedOrder()).toEqual(["waiting"]);
+    // The operator saw `claimed` while it was still unclaimed. Its claim is a
+    // concurrent list change, so the observed-order check wins over the later
+    // "claimed entries cannot move" validation.
+    expect(queue.reorderObserved(["claimed", "waiting"], "claimed")).toEqual({
+      status: "stale",
+      order: ["waiting"],
+    });
+    // A request rendered after that claim has the live unclaimed order, and
+    // now correctly identifies the claimed target as invalid.
+    expect(queue.reorderObserved(["waiting"], "claimed")).toMatchObject({ status: "invalid" });
+    expect(queue.reorderObserved(["waiting"], "waiting", "claimed")).toMatchObject({
+      status: "invalid",
+    });
+    releaseBlocker();
+  });
+
+  it("promotes waiting work past pacing, and claimed work only on its own lane", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const quota = (percentLeft: number) => ({
+      percentLeft,
+      observedAt: new Date(Date.now()).toISOString(),
+      resetAtIso: new Date(Date.now() + 6 * 24 * 60 * 60_000).toISOString(),
+    });
+    const a = { ...laneFor("a"), weeklyQuota: quota(10) };
+    const b = { ...laneFor("b"), weeklyQuota: quota(90) };
+    b.pacer.deferUntil(Date.now() + 60_000);
+    let releaseBlocker!: () => void;
+    queue.enqueue(
+      () => new Promise<string>((resolve) => (releaseBlocker = () => resolve("blocker"))),
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const selected: Array<{ id: string; lane: string; responsive: boolean }> = [];
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(async (config) => config, lanes, {
+        threadId: id,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        onSelected: ({ lane, responsive }) => selected.push({ id, lane, responsive }),
+      });
+    // `claimed` holds lane a, staged behind the full mesh; `waiting` has only
+    // the deferred lane b, so it is still unclaimed.
+    const claimed = run("claimed", [a, b]);
+    const waiting = run("waiting", [b]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "claimed", estimatedStartAt: null }),
+      expect.objectContaining({ threadId: "waiting" }),
+    ]);
+
+    // Normal admission chose a because b was deferred. At promotion time b
+    // has decisively better weekly headroom, so a generic pool promotion
+    // would transfer to b. A claimed admission must retain its a-only pool.
+    expect(selectPoolLane([a, b], Date.now(), { responsive: true })?.lane).toBe("b");
+    waiting.promote();
+    claimed.promote();
+    await expect(waiting.result).resolves.toBe("b");
+    await expect(claimed.result).resolves.toBe("a");
+    expect(selected).toEqual([
+      { id: "claimed", lane: "a", responsive: false },
+      { id: "waiting", lane: "b", responsive: true },
+      { id: "claimed", lane: "a", responsive: true },
+    ]);
+    releaseBlocker();
+  });
+
+  it("skips a blocked head for a compatible actor, never letting a provider-wide lane claim a model-scoped one", async () => {
+    const mesh = new ConcurrencyLimiter(2);
+    const queue = new UnifiedAdmissionQueue<{ provider: string; model: string }>();
+    const genericClaude = new ProviderPacer(0, () => Date.now());
+    const fableOnly = new ProviderPacer(0, () => Date.now());
+    // The Fable-scoped gate is closed; the Claude-wide lane is idle. A Fable
+    // start must wait for its own gate, not slip through the wider one.
+    fableOnly.deferUntil(Date.now() + 5_000);
+    const selected: string[] = [];
+    const run = (threadId: string, candidate: { provider: string; model: string }, lane: string) =>
+      queue.enqueue(
+        async (config) => {
+          selected.push(`${config.provider}/${config.model}@${lane}`);
+          return config.model;
+        },
+        [{ config: candidate, lane, pacer: lane === "claude" ? genericClaude : fableOnly }],
+        { threadId, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+    const fable = run("fable", { provider: "claude", model: "fable" }, "claude:fable");
+    const generic = run("generic", { provider: "claude", model: "sonnet" }, "claude");
+
+    await expect(generic.result).resolves.toBe("sonnet");
+    expect(selected).toEqual(["claude/sonnet@claude"]);
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({
+        threadId: "fable",
+        position: 0,
+        estimatedStartAt: Date.now() + 5_000,
+      }),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(fable.result).resolves.toBe("fable");
+    expect(selected).toEqual(["claude/sonnet@claude", "claude/fable@claude:fable"]);
+  });
+
+  it("claims an actor at most once when several compatible lanes open together", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    a.pacer.deferUntil(Date.now() + 1_000);
+    b.pacer.deferUntil(Date.now() + 1_000);
+    const runs: string[] = [];
+    const selections: number[] = [];
+
+    const only = queue.enqueue(
+      async (config) => {
+        runs.push(config);
+        return config;
+      },
+      [a, b],
+      {
+        threadId: "only",
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        onSelected: (selection) => selections.push(selection.declaredIndex),
+      }
+    );
+    // Both lanes reach capacity on the same tick, and a refresh (e.g. a
+    // coordinator publication) re-enters the scan at the same moment.
+    await vi.advanceTimersByTimeAsync(1_000);
+    queue.refresh();
+    await vi.advanceTimersByTimeAsync(0);
+
+    await expect(only.result).resolves.toBe("a");
+    expect(runs).toEqual(["a"]);
+    expect(selections).toEqual([0]);
+    expect(a.pacer.waiting + b.pacer.waiting).toBe(0);
+  });
+
+  it("holds unclaimed work in the list while mesh concurrency is full, one staged claim per lane", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    const releases: Array<() => void> = [];
+    const started: string[] = [];
+    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
+      queue.enqueue(
+        () => {
+          started.push(id);
+          return new Promise<string>((resolve) => releases.push(() => resolve(id)));
+        },
+        lanes,
+        { threadId: id, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+    const first = run("first", [a]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["first"]);
+
+    const second = run("second", [a]);
+    const third = run("third", [b]);
+    const fourth = run("fourth", [a, b]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Lane a claimed `second`, lane b claimed `third`; both wait on the one
+    // mesh slot. `fourth` stays unclaimed rather than queueing behind a lane.
+    expect(started).toEqual(["first"]);
+    expect(a.pacer.waiting).toBe(1);
+    expect(b.pacer.waiting).toBe(1);
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "second", position: 0, estimatedStartAt: null }),
+      expect.objectContaining({ threadId: "third", position: 1, estimatedStartAt: null }),
+      expect.objectContaining({ threadId: "fourth", position: 2 }),
+    ]);
+
+    releases.shift()?.();
+    await expect(first.result).resolves.toBe("first");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["first", "second"]);
+    // Lane a is idle again, so it claims the waiting `fourth`.
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["third", "fourth"]);
+
+    for (const expected of ["second", "third", "fourth"]) {
+      releases.shift()?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(started).toContain(expected);
+    }
+    await expect(Promise.all([second.result, third.result, fourth.result])).resolves.toEqual([
+      "second",
+      "third",
+      "fourth",
+    ]);
+  });
+
+  it("cancels a claimed-but-unstarted actor and lets its lane claim the next one", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    let releaseBlocker!: () => void;
+    const started: string[] = [];
+    const blocker = queue.enqueue(
+      () => {
+        started.push("blocker");
+        return new Promise<string>((resolve) => {
+          releaseBlocker = () => resolve("blocker");
+        });
+      },
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const run = (id: string) =>
+      queue.enqueue(
+        async () => {
+          started.push(id);
+          return id;
+        },
+        [a],
+        { threadId: id, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+    const claimed = run("claimed");
+    const next = run("next");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["claimed", "next"]);
+    expect(a.pacer.waiting).toBe(1);
+
+    expect(claimed.cancel?.()).toBe(true);
+    await expect(claimed.result).rejects.toThrow(/cancelled before start/);
+    await vi.advanceTimersByTimeAsync(0);
+    // The freed lane claimed `next`; it now waits on the mesh slot.
+    expect(queue.snapshot()).toEqual([
+      expect.objectContaining({ threadId: "next", position: 0, estimatedStartAt: null }),
+    ]);
+
+    releaseBlocker();
+    await expect(blocker.result).resolves.toBe("blocker");
+    await expect(next.result).resolves.toBe("next");
+    expect(started).toEqual(["blocker", "next"]);
+  });
+
+  it("leaves a claimed actor on its lane when that lane is deferred before the start", async () => {
+    // #672 consumes a claim: no release/transfer. At most one actor per lane
+    // pays this, waiting out the deferral while another of its lanes is idle.
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const a = laneFor("a");
+    const b = laneFor("b");
+    let releaseBlocker!: () => void;
+    const blocker = queue.enqueue(
+      () => new Promise<string>((resolve) => (releaseBlocker = () => resolve("blocker"))),
+      [a],
+      { threadId: "blocker", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const started: string[] = [];
+    const claimed = queue.enqueue(
+      async (config) => {
+        started.push(config);
+        return config;
+      },
+      [a, b],
+      { threadId: "claimed", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    expect(a.pacer.waiting).toBe(1);
+
+    a.pacer.deferUntil(Date.now() + 60_000);
+    queue.refresh();
+    releaseBlocker();
+    await expect(blocker.result).resolves.toBe("blocker");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual([]);
+    expect(b.pacer.waiting).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(claimed.result).resolves.toBe("a");
+  });
+
+  it("starts a waiting actor on another compatible lane when that lane gains capacity first", async () => {
+    const mesh = new ConcurrencyLimiter(2);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const slow = laneFor("slow");
+    slow.pacer.deferUntil(Date.now() + 60 * 60_000);
+    const fast = laneFor("fast", 60_000);
+    // A start on `fast` opens its 60s pacing gap.
+    await expect(
+      queue.enqueue(async (config) => config, [fast], {
+        threadId: "earlier",
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      }).result
+    ).resolves.toBe("fast");
+
+    const started: string[] = [];
+    const handle = queue.enqueue(
+      async (config) => {
+        started.push(config);
+        return config;
+      },
+      [slow, fast],
+      { threadId: "waiter", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["waiter"]);
+
+    // A controller publication shortens `fast`'s interval and refreshes the
+    // list, as start.ts does on every throttle tick. Nothing re-pins the
+    // actor: the lane simply becomes a processor that can claim it.
+    fast.pacer.setInterval(1_000);
+    queue.refresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(started).toEqual(["fast"]);
+    await expect(handle.result).resolves.toBe("fast");
+  });
+
+  it("breaks an idle-lane tie on the weekly headroom read at claim time", async () => {
+    const mesh = new ConcurrencyLimiter(2);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const resetAtIso = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const percentLeft = new Map([
+      ["first", 80],
+      ["second", 10],
+    ]);
+    // start.ts supplies the reading through a getter over the latest
+    // coordinator publication, as these candidates do.
+    const withQuota = (config: string) => ({
+      ...laneFor(config),
+      get weeklyQuota() {
+        const observedAt = new Date(Date.now()).toISOString();
+        return { percentLeft: percentLeft.get(config) ?? 0, observedAt, resetAtIso };
+      },
+    });
+    const first = withQuota("first");
+    const second = withQuota("second");
+    first.pacer.deferUntil(Date.now() + 60 * 60_000);
+    second.pacer.deferUntil(Date.now() + 60 * 60_000);
+    const handle = queue.enqueue(async (config) => config, [first, second], {
+      threadId: "picker",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+    });
+
+    // Headroom reverses while the actor waits past the enqueue-time reading.
+    percentLeft.set("first", 10);
+    percentLeft.set("second", 80);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    await expect(handle.result).resolves.toBe("second");
   });
 });

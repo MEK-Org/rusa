@@ -81,7 +81,12 @@ import {
   type ScheduledMessage,
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
-import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import {
+  type PoolLaneCandidate,
+  ProviderPacer,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -1003,6 +1008,62 @@ describe("ActorMesh", () => {
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
     expect(logs).toContain("dispatch(not-live) refused — no live actor");
+  });
+
+  it("rebuilds the unified admission list from unhandled inbox work after a leader restart (#672)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    inboxStore.append([
+      { actorId: "t1", source: "mesh:root", payload: payload("mesh.message") },
+      { actorId: "t2", source: "mesh:root", payload: payload("mesh.message") },
+    ]);
+    const actors = new InMemoryActorRepository();
+    for (const id of ["t1", "t2"]) {
+      actors.upsert({
+        id,
+        charter: "resumed work",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const leader = (lane: ProviderPacer) => {
+      const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
+      const harness = setup({
+        inboxStore,
+        actors,
+        providerGate: (fn, candidates, request) =>
+          queue.enqueue(
+            fn,
+            candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
+            {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+            }
+          ),
+      });
+      harness.mesh.rehydrateAll();
+      harness.mesh.reconcileInbox();
+      return { ...harness, queue };
+    };
+
+    // The first leader accepts both actors into its list, then dies before
+    // its lane opens: the list, and nothing else, is lost.
+    const closed = new ProviderPacer(0);
+    closed.deferUntil(Date.now() + 24 * 60 * 60_000);
+    const first = leader(closed);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(first.queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
+    first.mesh.shutdownAll();
+
+    // A replacement leader has only the durable inbox to go on.
+    const second = leader(new ProviderPacer(0));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(second.fake("t1").calls).toHaveLength(1);
+    expect(second.fake("t2").calls).toHaveLength(1);
+    expect(first.fake("t1").calls).toHaveLength(0);
+    expect(first.fake("t2").calls).toHaveLength(0);
+    expect(second.queue.snapshot()).toEqual([]);
   });
 
   it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
@@ -7304,158 +7365,6 @@ describe("ActorMesh", () => {
     });
   });
 
-  describe("re-evaluate queued admissions on quota exhaustion (#633)", () => {
-    // A blocker occupies the single concurrency slot so workers stay queued
-    // with a recorded selection; pool lanes pace through real ProviderPacers.
-    function queuedPoolHarness() {
-      const poolARuns: string[] = [];
-      const poolBRuns: string[] = [];
-      const liveActors = new Map<string, Actor>();
-      const blockerDeferred = deferredProvider();
-      const poolProvider = (name: string, runs: string[]): CodingProvider => ({
-        name,
-        providerName: name,
-        run: async (runOpts) => {
-          runs.push(runOpts.cwd);
-          liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-          return { success: true, exitCode: 0, output: name };
-        },
-      });
-      const providerByName = new Map<string, CodingProvider>([
-        ["pool-a", poolProvider("pool-a", poolARuns)],
-        ["pool-b", poolProvider("pool-b", poolBRuns)],
-      ]);
-      const pacers = new Map<string, ProviderPacer>();
-      const pacerFor = (name: string): ProviderPacer => {
-        let pacer = pacers.get(name);
-        if (!pacer) {
-          pacer = new ProviderPacer(0);
-          pacers.set(name, pacer);
-        }
-        return pacer;
-      };
-
-      const { mesh, registry, tick } = setup({
-        maxConcurrent: 1,
-        providerGate: (fn, candidates, request) => {
-          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
-            config: c,
-            lane: c.provider,
-            pacer: pacerFor(c.provider),
-          }));
-          return submitPoolGate(fn, lanes, {
-            responsive: request.responsive,
-            threadId: request.threadId,
-            enqueueNormal: request.enqueueNormal,
-            onSelected: request.threadId
-              ? (selection) =>
-                  request.onSelected?.({
-                    provider: selection.candidate.provider,
-                    lane: selection.lane,
-                    model: selection.candidate.model ?? "",
-                    effort: selection.candidate.effort,
-                    declaredIndex: selection.declaredIndex,
-                    eligibleAt: selection.eligibleAt,
-                    responsive: selection.responsive,
-                  })
-              : undefined,
-          });
-        },
-        createActor: (ctx) => {
-          let actor!: Actor;
-          const isBlocker = ctx.record.charter === "blocker";
-          actor = new Actor({
-            id: ctx.record.id,
-            cwd: `/tmp/${ctx.record.id}`,
-            modelConfig: isBlocker
-              ? [{ provider: "blocker", model: "model-blocker" }]
-              : (ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }]),
-            resolveProvider: isBlocker
-              ? () => ({
-                  ...blockerDeferred.provider,
-                  run: async (runOpts) => {
-                    const result = await blockerDeferred.provider.run(runOpts);
-                    if (result.success) actor.declareYield();
-                    return result;
-                  },
-                })
-              : (selected) => {
-                  const base = providerByName.get(selected.provider);
-                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
-                  return base;
-                },
-            mcpServers: [],
-            loadSessionId: () => ctx.getRecord()?.sessionId,
-            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
-            buildPrompt: () => ({ prompt: "work" }),
-            gate: ctx.gate,
-            beforeRun: ctx.beforeRun,
-            lifecycle: ctx.lifecycle,
-            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-            debounceMs: DEBOUNCE,
-          });
-          liveActors.set(ctx.record.id, actor);
-          return actor;
-        },
-      });
-
-      const blocker = mesh.spawn({
-        charter: "blocker",
-        parentId: "root",
-        modelConfig: { provider: "blocker", model: "model-blocker" },
-      });
-      const holdSlot = async () => {
-        mesh.sendMessage(blocker, "hold the slot", "root");
-        await tick();
-        expect(mesh.activeRunState(blocker)?.phase).toBe("running");
-      };
-      return { mesh, tick, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot };
-    }
-
-    it("re-pins only the queued actor whose reserved lane exhausted", async () => {
-      const { mesh, tick, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot } =
-        queuedPoolHarness();
-      const worker = mesh.spawn({
-        charter: "worker",
-        parentId: "root",
-        modelConfig: [
-          { provider: "pool-a", model: "model-a" },
-          { provider: "pool-b", model: "model-b" },
-        ],
-      });
-      const bystander = mesh.spawn({
-        charter: "bystander",
-        parentId: "root",
-        modelConfig: [{ provider: "pool-b", model: "model-b" }],
-      });
-      await holdSlot();
-
-      // Equal quotes: declaration order reserves pool-a for the worker.
-      mesh.sendMessage(worker, "work", "root");
-      mesh.sendMessage(bystander, "work", "root");
-      await tick();
-      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
-      expect(mesh.getSelection(worker)?.lane).toBe("pool-a");
-      expect(mesh.getSelection(bystander)?.lane).toBe("pool-b");
-
-      // The coordinator's exhaustion defers pool-a before re-evaluation runs.
-      pacerFor("pool-a").deferUntil(Date.now() + 60_000);
-      expect(mesh.reEvaluateExhaustedQueuedRuns("pool-a")).toEqual([worker]);
-      await tick();
-
-      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
-      expect(mesh.getSelection(worker)?.lane).toBe("pool-b");
-
-      blockerDeferred.releaseAll();
-      await tick();
-      await tick();
-
-      expect(poolARuns).toEqual([]);
-      expect([...poolBRuns].sort()).toEqual([`/tmp/${bystander}`, `/tmp/${worker}`].sort());
-    });
-  });
-
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {
     const { mesh, registry } = setup();
     const steward = mesh.spawn({ charter: "steward", parentId: "root" });
@@ -7704,19 +7613,21 @@ describe("ActorMesh", () => {
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
 
-      // Recipient liveness, the durable append, and the wake are one turn.
-      // Suspend anywhere between them and a retirement lands after a recipient
-      // was resolved as live: the row is still written (SqliteInboxRepository.append
+      // Recipient liveness and the durable append are one turn. Suspend
+      // between them and a retirement lands after a recipient was resolved as
+      // live: the row is still written (SqliteInboxRepository.append
       // validates only non-empty actor ids, and the inbox table has no actor
-      // foreign key), leaving durable unhandled work nobody alive can take,
-      // and the wake then fails. A microtask queued before the call is the
-      // tightest interleaving available — it runs at the first suspension
-      // point inside delivery, if the code has one at all. This now runs
+      // foreign key), leaving durable unhandled work nobody alive can take.
+      // The wake is not part of that turn: the after-commit seam issues it a
+      // microtask later (#632), so here it runs after the retirement and is
+      // refused, and this case asserts nothing about it. A microtask queued
+      // before the call is the tightest interleaving available — it runs at
+      // the first suspension point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
       // Under #540, an actor cannot retire while holding a live event subscription.
       // A directed target targets the worker without a subscription blocker on worker,
-      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // while exercising the exact same synchronous liveness-check -> append
       // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
@@ -8199,17 +8110,21 @@ describe("ActorMesh", () => {
         source: string;
         payload: { type: string; [key: string]: unknown };
       }> = [];
+      const appendListeners: Array<(items: readonly InboxEntry[]) => void> = [];
       const inboxStore = {
         append: (inputs: typeof appended) => {
           order.push("persist");
           appended.push(...inputs);
-          return inputs.map((input, index) => ({
+          const inserted = inputs.map((input, index) => ({
             ...input,
             id: `entry-${index}`,
             deliveredAt: new Date("2026-01-01T00:00:00Z"),
             seenAt: null,
             handledAt: null,
+            handledNote: null,
           }));
+          for (const listener of appendListeners) listener(inserted);
+          return inserted;
         },
         markSeen: () => {
           order.push("seen");
@@ -8228,9 +8143,12 @@ describe("ActorMesh", () => {
             (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
           ).length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
-        // Partial fake: it never notifies, so the only wake here is whatever the
-        // mesh path under test sends itself.
-        onItemsAppended: () => () => {},
+        // Event delivery no longer wakes its recipients itself (#632); the
+        // after-commit notification is the one wake, as in the durable store.
+        onItemsAppended: (listener: (items: readonly InboxEntry[]) => void) => {
+          appendListeners.push(listener);
+          return () => {};
+        },
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -8251,7 +8169,11 @@ describe("ActorMesh", () => {
         {
           actorId,
           source: "github:dummy-org/dummy-repo/issues/903",
-          payload: { type: "issue_comment.created", commentId: 4959289232 },
+          payload: {
+            type: "issue_comment.created",
+            commentId: 4959289232,
+            deliveryRole: "owner",
+          },
         },
       ]);
       expect(fake(actorId).calls).toHaveLength(1);
@@ -9008,8 +8930,17 @@ describe("ActorMesh", () => {
         await t.startRun(owner);
         await t.startRun(watcher);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
-        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
+
+        // Each copy carries the role it was routed under; the append seam, not
+        // the delivery call, turns that into preempt versus join (#632).
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([
+          [owner, "owner"],
+          [watcher, "subscriber"],
+        ]);
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
@@ -9052,13 +8983,47 @@ describe("ActorMesh", () => {
         await t.startRun(watcherA);
         await t.startRun(watcherB);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
 
+        expect(delivery.entries.map((entry) => entry.payload.deliveryRole)).toEqual([
+          "subscriber",
+          "subscriber",
+        ]);
         expect(t.signals.get(watcherA)?.aborted).toBe(false);
         expect(t.signals.get(watcherB)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([]);
         expect(t.unhandledResponsive(watcherA)).toHaveLength(1);
         expect(t.unhandledResponsive(watcherB)).toHaveLength(1);
+      });
+
+      it("coalesces one turn's mixed roles for an actor to the preempting wake, in either order", async () => {
+        // Fan-out destinations are deduplicated per event, so a mixed debt
+        // needs two appends before the drain: a subscriber copy plus any
+        // owner or unannotated row in the same turn (#632).
+        const t = setupTwoRunningActors();
+        const subscriberFirst = t.mesh.spawn({ charter: "subscriber first", parentId: "root" });
+        const ownerFirst = t.mesh.spawn({ charter: "owner first", parentId: "root" });
+        await t.startRun(subscriberFirst);
+        await t.startRun(ownerFirst);
+        const copy = (actorId: string, deliveryRole?: "owner" | "subscriber") =>
+          t.inboxStore.append([
+            {
+              actorId,
+              source: ISSUE,
+              payload: { ...payload("issues.opened"), priority: "responsive", deliveryRole },
+            },
+          ]);
+
+        copy(subscriberFirst, "subscriber");
+        copy(subscriberFirst, "owner");
+        copy(ownerFirst);
+        copy(ownerFirst, "subscriber");
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.signals.get(subscriberFirst)?.aborted).toBe(true);
+        expect(t.signals.get(ownerFirst)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([subscriberFirst, ownerFirst]);
       });
 
       it("still quick-starts an idle subscriber as responsive work", async () => {
@@ -9074,6 +9039,61 @@ describe("ActorMesh", () => {
         await vi.advanceTimersByTimeAsync(0);
 
         expect(t.runs.get(watcher)).toBe(1);
+        expect(t.preemptions()).toEqual([owner]);
+      });
+
+      it("persists a landed directive as the owner's copy and preempts its target", async () => {
+        // A directive makes its live target the sole owner and excludes
+        // subscribers, so it is the owner role rather than a third one (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        const target = t.mesh.spawn({ charter: "target", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(target);
+
+        const delivery = await t.mesh.deliverExternalEvent({
+          ...responsiveIssueEvent,
+          directedTarget: target,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([[target, "owner"]]);
+        expect(t.signals.get(target)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([target]);
+      });
+
+      it("routes by the role it computed, not one the raw event payload claims", async () => {
+        // The timer normalizer spreads `rawPayload`, so a `deliveryRole`
+        // inside it reaches the fan-out. Routing's answer must replace it in
+        // both directions before the seam reads it (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        for (const claimed of ["subscriber", "owner"] as const) {
+          await t.mesh.deliverExternalEvent({
+            ...responsiveIssueEvent,
+            rawPayload: { ...responsiveIssueEvent.rawPayload, deliveryRole: claimed },
+          });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+
+        const roles = (actorId: string) =>
+          t.unhandledResponsive(actorId).map((entry) => entry.payload.deliveryRole);
+        expect(roles(owner)).toEqual(["owner", "owner"]);
+        expect(roles(watcher)).toEqual(["subscriber", "subscriber"]);
+        // A claimed "subscriber" cannot turn the owner's wake into a join, and
+        // a claimed "owner" cannot make the subscriber's copy preempt.
+        expect(t.signals.get(owner)?.aborted).toBe(true);
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([owner]);
       });
 

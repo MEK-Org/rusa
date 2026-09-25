@@ -283,6 +283,7 @@ describe("EventManager", () => {
         threadName: "spaces/AAA/threads/TTT",
         senderName: "users/123",
         priority: "responsive",
+        deliveryRole: "owner",
       });
       expect(entries[0].id).toBe(deduplicatedInboxEntryId("spaces/AAA/messages/BBB", "actor-chat"));
     });
@@ -941,7 +942,10 @@ describe("EventManager", () => {
         },
       });
       expect(ready.entries.map((entry) => entry.actorId)).toEqual(["repo-owner"]);
-      expect(ready.entries[0].payload).toEqual({ type: "pull_request.ready_for_review" });
+      expect(ready.entries[0].payload).toEqual({
+        type: "pull_request.ready_for_review",
+        deliveryRole: "owner",
+      });
 
       const readyOpened = await em.handleExternalEvent(opened(false, 602));
       expect(readyOpened.entries.map((entry) => entry.actorId)).toEqual(["repo-owner"]);

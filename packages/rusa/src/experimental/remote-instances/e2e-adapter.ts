@@ -16,9 +16,8 @@ export function instanceWorkerFactory(
     // Only an omitted target means "run here". A defined-but-unusable one falls
     // through to the hub, which refuses it by name.
     if (target === undefined) return new Actor(options);
-    // The follower constructs exactly one provider from the bootstrap, so a
-    // multi-candidate pool has no honest remote meaning yet. Refuse it rather
-    // than silently running whichever candidate happens to be first.
+    // Remote placement admits one candidate at a time. Refuse a multi-candidate
+    // pool rather than silently choosing its first entry.
     if (options.modelConfig.length > 1) {
       throw new Error(
         `actor ${record.id} declares ${options.modelConfig.length} candidates; remote placement supports a single declared provider/model`
@@ -36,7 +35,10 @@ export function instanceWorkerFactory(
         sessionId: options.loadSessionId(),
         modelConfig: [...options.modelConfig],
         providerOptions: {
-          providers: { [name]: config.providers[name] },
+          // Provider definitions contain only adapter metadata. The follower
+          // selects this map at the next-run boundary, including a valid
+          // cross-provider staged pin, without reading leader configuration.
+          providers: config.providers,
           name,
           model: declared?.model,
           effort: declared?.effort,

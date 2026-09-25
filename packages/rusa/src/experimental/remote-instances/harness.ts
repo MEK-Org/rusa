@@ -36,10 +36,13 @@ export function createHarness(options: {
    * to be admitted; without it the mesh keeps its unpaced default gate.
    */
   pacer?: ProviderPacer;
+  startupTimeoutMs?: number;
+  stateStaleTimeoutMs?: number;
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
   let remote = new RemoteInstance("test-follower", process.platform, process.pid);
+  const remotes = [remote];
   const follower = new FollowerInstance(
     options.cwd,
     false,
@@ -125,6 +128,12 @@ export function createHarness(options: {
       messages.push({ fromId: message.senderId, toId: message.recipientId, body: message.body });
       return `message-${messages.length}`;
     },
+    onModelSet: (actorId, newModelConfig) => {
+      const liveActor = mesh.get(actorId);
+      if (liveActor && typeof liveActor.setModelConfig === "function") {
+        liveActor.setModelConfig(newModelConfig);
+      }
+    },
     createActor: (context) => {
       let cursor = 0;
       let admittedCursor = 0;
@@ -146,6 +155,8 @@ export function createHarness(options: {
       const runtime = new ActorHandle({
         host: remote.createHost(context.record.id),
         context,
+        startupTimeoutMs: options.startupTimeoutMs,
+        stateStaleTimeoutMs: options.stateStaleTimeoutMs,
         bootstrap: {
           id: context.record.id,
           cwd: options.cwd,
@@ -226,6 +237,7 @@ export function createHarness(options: {
     },
     reconnect() {
       remote = new RemoteInstance("test-follower", process.platform, process.pid);
+      remotes.push(remote);
       wire(remote);
       return remote;
     },
@@ -245,9 +257,9 @@ export function createHarness(options: {
     },
     async close() {
       mesh.shutdownAll();
+      for (const r of remotes) r.close();
       await Promise.all([...runtimes.values()].map((runtime) => runtime.exited));
       follower.close();
-      remote.close();
       inboxDb.close();
     },
   };

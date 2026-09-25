@@ -2,9 +2,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { ProviderFactory } from "./protocol.js";
 
 /** Deterministic stand-in, not an LLM or a desktop implementation. */
-export const createProvider: ProviderFactory = (bridge, options) => ({
+export const createProvider: ProviderFactory = (bridge, options, selected) => ({
   name: "instance-fixture",
   providerName: "instance-fixture",
+  model: selected?.model,
   async run(run) {
     const prompt = JSON.parse(run.prompt) as {
       parentId: string;
@@ -17,13 +18,20 @@ export const createProvider: ProviderFactory = (bridge, options) => ({
     const report = {
       pid: process.pid,
       sessionId,
+      model: selected?.model,
       resumed: Boolean(run.session?.id),
       charter: prompt.charter,
       messages: prompt.messages,
     };
     await bridge.sendMessage(prompt.parentId, JSON.stringify(report));
     bridge.yieldRun("complete", "Scripted instance round trip complete");
-    return { success: true, output: JSON.stringify(report), exitCode: 0, sessionId };
+    return {
+      success: true,
+      output: JSON.stringify(report),
+      exitCode: 0,
+      sessionId,
+      model: selected?.model,
+    };
   },
 });
 
