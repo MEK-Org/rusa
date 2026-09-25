@@ -39,8 +39,6 @@ export function manualSoftStaleAfterMs(manualHardStaleAfterMs: number): number {
 export interface FreshnessThresholdsConfig {
   scrapeStaleAfterMs?: number;
   scrapeHardStaleAfterMs?: number;
-  staleAfterMs?: number;
-  hardStaleAfterMs?: number;
   manualHardStaleAfterMs?: number;
 }
 
@@ -59,9 +57,8 @@ export function freshnessThresholds(
     const staleAfterMs = manualSoftStaleAfterMs(hardStaleAfterMs);
     return { staleAfterMs, hardStaleAfterMs };
   }
-  const staleAfterMs = config?.scrapeStaleAfterMs ?? config?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
-  const hardStaleAfterMs =
-    config?.scrapeHardStaleAfterMs ?? config?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  const staleAfterMs = config?.scrapeStaleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const hardStaleAfterMs = config?.scrapeHardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
   return { staleAfterMs, hardStaleAfterMs };
 }
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;

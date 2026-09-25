@@ -1414,6 +1414,10 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
   });
 
   it("#690: a manual hard-stale override below 60m pulls manual soft stale down with it", () => {
+    expect(freshnessThresholds("manual", { manualHardStaleAfterMs: 30 * 60_000 })).toEqual({
+      staleAfterMs: 30 * 60_000,
+      hardStaleAfterMs: 30 * 60_000,
+    });
     const tuned = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -1421,7 +1425,6 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       manualHardStaleAfterMs: 30 * 60_000,
     });
     expect(tuned).toMatchObject({
-      manualStaleAfterMs: 30 * 60_000,
       manualHardStaleAfterMs: 30 * 60_000,
       staleAfterMs: DEFAULT_STALE_AFTER_MS,
       hardStaleAfterMs: DEFAULT_HARD_STALE_AFTER_MS,
@@ -1497,7 +1500,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
     // Scrape hard stale remains 60m and is not raised
     const scrapeWithLongTick = freshnessThresholds("scrape", {
-      staleAfterMs: scrapeStaleAfterMs(500),
+      scrapeStaleAfterMs: scrapeStaleAfterMs(500),
     });
     expect(scrapeWithLongTick).toEqual({
       staleAfterMs: 30 * 60 * 1000 + 3 * 500 * 1000, // 55m

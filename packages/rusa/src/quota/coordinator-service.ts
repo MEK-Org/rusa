@@ -21,7 +21,6 @@ import {
   MANUAL_QUOTA_OBSERVATION_PATH,
   type ManualQuotaObservationResponse,
   manualQuotaObservationProblem,
-  manualSoftStaleAfterMs,
   type PublishedThrottleColdStatus,
   type PublishedThrottleLaneStatus,
   publishedThrottle,
@@ -131,10 +130,6 @@ export class QuotaCoordinatorService {
       scrapeHardStaleAfterMs: this.hardStaleAfterMs,
       manualHardStaleAfterMs: this.manualHardStaleAfterMs,
     });
-  }
-
-  get manualStaleAfterMs(): number {
-    return manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
   }
 
   private getServiceInfo(): QuotaCoordinatorServiceInfo {
