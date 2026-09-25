@@ -254,21 +254,10 @@ export class PrincipalRepository {
              AND firebase_issuer IS NULL AND firebase_subject IS NULL`
         )
         .run(identity.issuer, identity.subject, authenticatedAt, user.id, normalizedEmail);
-      if (result.changes === 1) return this.requireUser(user.id);
-
-      // A second request may have committed the identical claim between this
-      // transaction's read and write. It is safe to return only that exact
-      // durable identity; any other replacement remains a conflict.
-      const current = this.requireUser(user.id);
-      if (
-        current.identity?.issuer === identity.issuer &&
-        current.identity.subject === identity.subject
-      ) {
-        return current;
+      if (result.changes !== 1) {
+        throw new Error(`PrincipalRepository: provisioned user '${user.id}' could not be claimed`);
       }
-      throw new Error(
-        `PrincipalRepository: provisioned user '${user.id}' could not be claimed by this external identity`
-      );
+      return this.requireUser(user.id);
     })();
   }
 

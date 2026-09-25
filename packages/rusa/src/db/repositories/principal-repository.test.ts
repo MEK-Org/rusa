@@ -99,6 +99,21 @@ describe("PrincipalRepository", () => {
     expect(principals.findUserByExternalIdentity(IDENTITY)).toEqual(bound);
   });
 
+  it("refuses an unbound-email claim when another principal already holds the identity", () => {
+    const pending = principals.createUser({ email: "owner@example.com", createdAt: CREATED_AT });
+    const holder = principals.createUser({
+      email: "other@example.com",
+      identity: IDENTITY,
+      createdAt: CREATED_AT,
+    });
+
+    expect(() =>
+      principals.claimUnboundUserByEmail("owner@example.com", IDENTITY, "2026-09-06T10:00:00.000Z")
+    ).toThrow(/identity is already bound to user/);
+    expect(principals.getUser(pending.id)?.identity).toBeUndefined();
+    expect(principals.getUser(holder.id)?.identity).toEqual(IDENTITY);
+  });
+
   it("refuses to rebind a bound user or to take an identity another user holds", () => {
     const owner = principals.createUser({
       email: "owner@example.com",

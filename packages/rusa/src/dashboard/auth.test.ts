@@ -560,7 +560,7 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(firebase.verifySessionCookie).toHaveBeenCalledWith("cookie-1", true);
   });
 
-  it("binds a migrated legacy operator to its first admitted Google sign-in without replacing its principal", async () => {
+  it("keeps repeated first sign-in requests bound to the migrated principal", async () => {
     const migrated = executeLegacyPrincipalMigration(db, {
       email: "owner@example.com",
       apply: true,

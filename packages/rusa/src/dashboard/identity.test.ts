@@ -4,11 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { nullLogger } from "../observability/logger.js";
-import {
-  DASHBOARD_IDENTITY_CLAIM_ERROR,
-  DashboardIdentityClaimError,
-  DashboardIdentityResolver,
-} from "./identity.js";
+import { DashboardIdentityClaimError, DashboardIdentityResolver } from "./identity.js";
 
 let db: Database.Database;
 let repo: PrincipalRepository;
@@ -50,19 +46,6 @@ it("claims the explicitly provisioned unbound user matching a verified email", (
   expect(repo.getUser(pending.id)?.identity).toEqual({ issuer: ISSUER, subject: "uid" });
 });
 
-it("keeps one provisioned principal when equivalent first sign-ins race", () => {
-  const pending = repo.createUser({
-    email: "owner@example.com",
-    createdAt: new Date().toISOString(),
-  });
-
-  const [first, second] = [resolver.resolve(token()), resolver.resolve(token())];
-
-  expect(first.id).toBe(pending.id);
-  expect(second.id).toBe(pending.id);
-  expect(db.prepare("SELECT COUNT(*) AS n FROM users").get()).toEqual({ n: 1 });
-});
-
 it("never rebinds a user already held by another identity", () => {
   const pending = repo.createUser({
     email: "owner@example.com",
@@ -73,11 +56,11 @@ it("never rebinds a user already held by another identity", () => {
     { issuer: ISSUER, subject: "different" },
     new Date().toISOString()
   );
-  expect(() => resolver.resolve(token())).toThrow();
+  expect(() => resolver.resolve(token())).toThrow(DashboardIdentityClaimError);
   expect(repo.getUser(pending.id)?.identity?.subject).toBe("different");
 });
 
-it("never lets an identity held by another principal claim a provisioned email", () => {
+it("never reassigns an existing identity holder to a provisioned email", () => {
   const pending = repo.createUser({
     email: "owner@example.com",
     createdAt: new Date().toISOString(),
@@ -88,7 +71,14 @@ it("never lets an identity held by another principal claim a provisioned email",
     createdAt: new Date().toISOString(),
   });
 
-  expect(() => resolver.resolve(token())).toThrow(DashboardIdentityClaimError);
+  let resolutionError: unknown;
+  try {
+    resolver.resolve(token());
+  } catch (error) {
+    resolutionError = error;
+  }
+  expect(resolutionError).toBeInstanceOf(Error);
+  expect(resolutionError).not.toBeInstanceOf(DashboardIdentityClaimError);
 
   expect(repo.getUser(pending.id)?.identity).toBeUndefined();
   expect(repo.getUser(holder.id)?.identity).toEqual({ issuer: ISSUER, subject: "uid" });
@@ -123,14 +113,18 @@ it("names the conflicting bound row without logging its email", () => {
     holderId: pending.id,
     holderBound: true,
   });
-  // The same collision on a returning user's email change is reported the same way.
+  // A returning-user email collision preserves the staging 401 boundary.
   const returning = logged.resolve(token({ email: "other@example.com" }));
   warn.mockClear();
-  expect(() => logged.resolve(token())).toThrow(DASHBOARD_IDENTITY_CLAIM_ERROR);
-  expect(warn).toHaveBeenCalledWith("dashboard_identity_email_conflict", {
-    holderId: pending.id,
-    holderBound: true,
-  });
+  let updateError: unknown;
+  try {
+    logged.resolve(token());
+  } catch (error) {
+    updateError = error;
+  }
+  expect(updateError).toBeInstanceOf(Error);
+  expect(updateError).not.toBeInstanceOf(DashboardIdentityClaimError);
+  expect(warn).not.toHaveBeenCalled();
   expect(repo.getUser(returning.id)?.email).toBe("other@example.com");
   // The address itself never reaches the record.
   expect(JSON.stringify(warn.mock.calls)).not.toContain("owner@example.com");

@@ -46,21 +46,18 @@ export class DashboardIdentityResolver {
         user = repo.claimUnboundUserByEmail(email, identity, new Date().toISOString());
         if (!user) user = repo.createUser({ identity, email, createdAt: new Date().toISOString() });
       } catch (error) {
-        // Another serving process may have inserted this same verified identity.
-        // Resolve only that durable key after a race. The repository's email
-        // claim is the sole bounded exception for an explicitly provisioned
-        // unbound user; it never falls back to a pending or foreign identity.
+        // Another serving process may have claimed this same provisioned email.
+        // Resolve only that durable key; a different email is the first-sign-in
+        // conflict the claim error intentionally reports without exposing it.
         user = repo.findUserByExternalIdentity(identity);
-        if (!user) throw this.conflict(error, email);
+        if (!user || user.email !== email) throw this.conflict(error, email);
       }
     }
     if (user.disabledAt) throw new Error("User disabled");
     if (user.email !== email) {
-      try {
-        user = repo.updateEmail(user.id, email);
-      } catch (error) {
-        throw this.conflict(error, email);
-      }
+      // Returning users preserve the existing generic authentication failure
+      // for an email collision; account-setup guidance is first-sign-in only.
+      user = repo.updateEmail(user.id, email);
     }
     return user;
   }
