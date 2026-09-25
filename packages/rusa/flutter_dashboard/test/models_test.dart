@@ -702,7 +702,7 @@ void main() {
   });
 
   group('ThreadDto admission fields (#570)', () {
-    test('parses lanes, claim and skip, defaulting when absent', () {
+    test('parses lanes and claim, defaulting when absent', () {
       final claimed = ThreadDto.fromJson({
         'id': 'a',
         'handle': 'a-handle',
@@ -711,13 +711,10 @@ void main() {
         'admissionClaimed': true,
         'compatibleLanes': ['claude', 'codex'],
         'claimedLane': 'codex',
-        'admissionSkip': {'lane': 'agy', 'count': 2},
       });
       expect(claimed.admissionClaimed, isTrue);
       expect(claimed.compatibleLanes, ['claude', 'codex']);
       expect(claimed.claimedLane, 'codex');
-      expect(claimed.admissionSkip?.lane, 'agy');
-      expect(claimed.admissionSkip?.count, 2);
 
       final older = ThreadDto.fromJson({
         'id': 'b',
@@ -727,7 +724,6 @@ void main() {
       expect(older.admissionClaimed, isFalse);
       expect(older.compatibleLanes, isEmpty);
       expect(older.claimedLane, isNull);
-      expect(older.admissionSkip, isNull);
     });
   });
 

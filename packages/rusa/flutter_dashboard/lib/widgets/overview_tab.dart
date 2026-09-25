@@ -899,7 +899,6 @@ class _OverviewTabState extends State<OverviewTab> {
     final selectedObligation = actor.selectedObligation;
     final startLabel = queued ? _queueStartLabel(actor, queueAhead) : null;
     final laneLabel = queued ? _queueLaneLabel(actor) : null;
-    final skip = queued ? actor.admissionSkip : null;
     final header = InkWell(
       onTap: () => _navigateToActor(actor.id),
       borderRadius: BorderRadius.circular(6),
@@ -975,18 +974,6 @@ class _OverviewTabState extends State<OverviewTab> {
                       overflow: TextOverflow.ellipsis,
                       style: kMonoStyle.copyWith(
                         color: MeshColors.textSecondary,
-                        fontSize: 11,
-                      ),
-                    ),
-                  ],
-                  if (skip != null) ...[
-                    const SizedBox(height: 2),
-                    Text(
-                      _queueSkipLabel(skip),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: MeshColors.textMuted,
                         fontSize: 11,
                       ),
                     ),
@@ -1350,7 +1337,7 @@ class _OverviewTabState extends State<OverviewTab> {
   /// waits for a mesh concurrency slot; an unclaimed one without an estimate
   /// shows how many earlier entries share one of its lanes. That overlap is
   /// context, not a promise of start order: another entry can take a different
-  /// lane, and a later entry can skip this one. Entries on lanes it cannot use
+  /// lane, and a later entry can start first. Entries on lanes it cannot use
   /// are not counted: `queuePosition` is global.
   String _queueStartLabel(ActorViewState actor, int ahead) {
     final estimate = actor.estimatedStartAt;
@@ -1401,17 +1388,6 @@ class _OverviewTabState extends State<OverviewTab> {
     if (actor.compatibleLanes.isEmpty) return null;
     final noun = actor.compatibleLanes.length == 1 ? 'Lane' : 'Lanes';
     return '$noun: ${actor.compatibleLanes.join(' · ')}';
-  }
-
-  /// [AdmissionSkip.count] totals skips across lanes; [AdmissionSkip.lane] is
-  /// only the latest, so a repeated count is never attributed to one lane.
-  String _queueSkipLabel(AdmissionSkip skip) {
-    if (skip.count == 1) {
-      return 'Passed over once by a later run on ${skip.lane}, '
-          'a lane this actor cannot use';
-    }
-    return 'Passed over ${skip.count} times by later runs on lanes this '
-        'actor cannot use, most recently ${skip.lane}';
   }
 
   /// Move up/down buttons for an unclaimed entry; claimed entries and actors

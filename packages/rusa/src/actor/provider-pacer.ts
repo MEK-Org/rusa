@@ -655,13 +655,6 @@ export interface UnifiedAdmissionQueueSnapshot {
   compatibleLanes: string[];
   /** The lane a claimed entry holds; `null` while unclaimed. */
   claimedLane: string | null;
-  /**
-   * Set once a later entry has claimed a lane this unclaimed entry cannot use
-   * while it kept waiting: `count` totals every such skip across lanes, and
-   * `lane` is only the most recent one. Recorded at claim time, so it reports
-   * what happened, not a projection; it lives only as long as the entry.
-   */
-  skip: { lane: string; count: number } | null;
 }
 
 /** Outcome of an operator reorder checked against the order the UI observed. */
@@ -678,7 +671,6 @@ interface WaitingAdmission<C, T> {
   state: "waiting" | "claimed" | "settled";
   inner?: RunStartHandle<T>;
   claimedLane?: PoolLaneCandidate<C>;
-  skip?: { lane: string; count: number };
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
   result: Promise<T>;
@@ -772,7 +764,6 @@ export class UnifiedAdmissionQueue<C> {
           claimed: true,
           compatibleLanes: lanesOf(item),
           claimedLane: item.claimedLane?.lane ?? null,
-          skip: null,
         });
       }
       position++;
@@ -804,7 +795,6 @@ export class UnifiedAdmissionQueue<C> {
           claimed: false,
           compatibleLanes: lanesOf(item),
           claimedLane: null,
-          skip: item.skip ? { ...item.skip } : null,
         });
       }
       position++;
@@ -917,24 +907,13 @@ export class UnifiedAdmissionQueue<C> {
   private claimNormal(): void {
     const now = this.now();
     const busy = new Set<ProviderPacer>();
-    const passed: Array<WaitingAdmission<C, unknown>> = [];
     for (const item of [...this.waiting]) {
       const idle = this.healthy(item, false).filter(
         (candidate) => !busy.has(candidate.pacer) && isIdleLane(candidate.pacer, now)
       );
       const selected = selectPoolLane(idle, now);
-      if (!selected) {
-        passed.push(item);
-        continue;
-      }
+      if (!selected) continue;
       busy.add(selected.pacer);
-      // Every earlier actor still waiting was passed over for this one. Only
-      // one whose own lanes exclude the claiming lane counts as a
-      // compatibility skip; the rest were held by that lane's halt for them.
-      for (const earlier of passed) {
-        if (earlier.candidates.some((candidate) => candidate.lane === selected.lane)) continue;
-        earlier.skip = { lane: selected.lane, count: (earlier.skip?.count ?? 0) + 1 };
-      }
       this.claim(item, selected);
     }
   }

@@ -118,7 +118,6 @@ export interface DashboardDataDeps {
     claimed?: boolean;
     compatibleLanes?: string[];
     claimedLane?: string | null;
-    skip?: { lane: string; count: number } | null;
   }>;
   /**
    * Operator reorder of the unclaimed admission list (#570), applied only when
@@ -358,8 +357,6 @@ interface ThreadDto {
   compatibleLanes?: string[];
   /** The lane a claimed admission holds, else `null`. */
   claimedLane?: string | null;
-  /** A later actor claimed a lane this one cannot use while it waited. */
-  admissionSkip?: { lane: string; count: number } | null;
 }
 
 /**
@@ -1961,7 +1958,6 @@ export async function handleMeshApiRequest(
           admissionClaimed: providerQueueSnapshots.get(r.id)?.claimed ?? false,
           compatibleLanes: providerQueueSnapshots.get(r.id)?.compatibleLanes ?? [],
           claimedLane: providerQueueSnapshots.get(r.id)?.claimedLane ?? null,
-          admissionSkip: providerQueueSnapshots.get(r.id)?.skip ?? null,
           selectedProvider: selection?.provider ?? null,
           selectedLane: selection?.lane ?? null,
           selectedModel: selection?.model ?? null,

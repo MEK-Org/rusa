@@ -172,20 +172,6 @@ class InboxEntryDto {
   int get hashCode => Object.hash(id, actorId, source, deliveredAt, handledAt);
 }
 
-/// Later admissions passed a waiting actor over [count] times in total on
-/// lanes it cannot use; [lane] is the most recent such lane (#570).
-class AdmissionSkip {
-  const AdmissionSkip({required this.lane, required this.count});
-
-  factory AdmissionSkip.fromJson(Map<String, dynamic> j) => AdmissionSkip(
-    lane: j['lane'] as String? ?? '',
-    count: (j['count'] as num?)?.round() ?? 0,
-  );
-
-  final String lane;
-  final int count;
-}
-
 /// A mesh thread/actor, as returned by `GET /api/mesh/threads`.
 class ThreadDto {
   const ThreadDto({
@@ -218,7 +204,6 @@ class ThreadDto {
     this.admissionClaimed = false,
     this.compatibleLanes = const [],
     this.claimedLane,
-    this.admissionSkip,
     this.selectedProvider,
     this.selectedModel,
     this.selectedEffort,
@@ -318,10 +303,6 @@ class ThreadDto {
   /// The lane a claimed admission holds, else null.
   final String? claimedLane;
 
-  /// Set once a later actor claimed a lane this one cannot use while it kept
-  /// waiting: the total count across lanes, and the latest such lane.
-  final AdmissionSkip? admissionSkip;
-
   /// The candidate a genuinely queued run has reserved from its pool: the
   /// declared provider alias, model, and effort it will start with. Null when
   /// the actor is idle or running, or while nothing has been reserved yet.
@@ -379,7 +360,6 @@ class ThreadDto {
     bool? admissionClaimed,
     List<String>? compatibleLanes,
     Object? claimedLane = _keepThreadField,
-    Object? admissionSkip = _keepThreadField,
     Object? selectedProvider = _keepThreadField,
     Object? selectedModel = _keepThreadField,
     Object? selectedEffort = _keepThreadField,
@@ -434,9 +414,6 @@ class ThreadDto {
     claimedLane: identical(claimedLane, _keepThreadField)
         ? this.claimedLane
         : claimedLane as String?,
-    admissionSkip: identical(admissionSkip, _keepThreadField)
-        ? this.admissionSkip
-        : admissionSkip as AdmissionSkip?,
     selectedProvider: identical(selectedProvider, _keepThreadField)
         ? this.selectedProvider
         : selectedProvider as String?,
@@ -508,11 +485,6 @@ class ThreadDto {
         (j['compatibleLanes'] as List?)?.whereType<String>().toList() ??
         const [],
     claimedLane: j['claimedLane'] as String?,
-    admissionSkip: j['admissionSkip'] is Map
-        ? AdmissionSkip.fromJson(
-            (j['admissionSkip'] as Map).cast<String, dynamic>(),
-          )
-        : null,
     selectedProvider: j['selectedProvider'] as String?,
     selectedModel: j['selectedModel'] as String?,
     selectedEffort: j['selectedEffort'] as String?,
@@ -798,7 +770,6 @@ class ActorViewState {
   bool get admissionClaimed => thread.admissionClaimed;
   List<String> get compatibleLanes => thread.compatibleLanes;
   String? get claimedLane => thread.claimedLane;
-  AdmissionSkip? get admissionSkip => thread.admissionSkip;
   String? get selectedProvider => thread.selectedProvider;
   String? get selectedModel => thread.selectedModel;
   String? get selectedEffort => thread.selectedEffort;

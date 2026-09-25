@@ -1933,7 +1933,7 @@ describe("handleMeshApiRequest", () => {
         }
       );
 
-    it("GET /api/mesh/threads exposes each entry's lanes, claim state and skip", async () => {
+    it("GET /api/mesh/threads exposes each entry's lanes and claim state", async () => {
       actors.upsert(rec("root", null, "active"));
       actors.upsert(rec(UUID_A, "root", "active"));
       actors.upsert(rec(UUID_B, "root", "active"));
@@ -1948,7 +1948,6 @@ describe("handleMeshApiRequest", () => {
             claimed: true,
             compatibleLanes: ["claude", "codex"],
             claimedLane: "codex",
-            skip: null,
           },
           {
             threadId: UUID_B,
@@ -1958,7 +1957,6 @@ describe("handleMeshApiRequest", () => {
             claimed: false,
             compatibleLanes: ["claude"],
             claimedLane: null,
-            skip: { lane: "codex", count: 2 },
           },
         ],
       };
@@ -1970,19 +1968,16 @@ describe("handleMeshApiRequest", () => {
         admissionClaimed: true,
         compatibleLanes: ["claude", "codex"],
         claimedLane: "codex",
-        admissionSkip: null,
       });
       expect(byId(UUID_B)).toMatchObject({
         admissionClaimed: false,
         compatibleLanes: ["claude"],
         claimedLane: null,
-        admissionSkip: { lane: "codex", count: 2 },
       });
       expect(byId("root")).toMatchObject({
         admissionClaimed: false,
         compatibleLanes: [],
         claimedLane: null,
-        admissionSkip: null,
       });
     });
 

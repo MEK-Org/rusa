@@ -765,7 +765,6 @@ void main() {
         runState: RunState.queued,
         queuePosition: 1,
         compatibleLanes: const ['codex'],
-        admissionSkip: const AdmissionSkip(lane: 'claude', count: 2),
       ),
       makeThread(
         'beta',
@@ -784,7 +783,7 @@ void main() {
           ),
         );
 
-    testWidgets('shows claimed and skipped entries; only unclaimed ones move', (
+    testWidgets('shows claimed entries; only unclaimed ones move', (
       tester,
     ) async {
       await tester.runAsync(() async {
@@ -798,13 +797,6 @@ void main() {
 
         expect(
           find.text('Claimed · claude, waiting for a run slot'),
-          findsOneWidget,
-        );
-        expect(
-          find.text(
-            'Passed over 2 times by later runs on lanes this actor cannot '
-            'use, most recently claude',
-          ),
           findsOneWidget,
         );
         expect(find.byTooltip('Move up held-handle'), findsNothing);

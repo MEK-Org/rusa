@@ -909,50 +909,6 @@ describe("UnifiedAdmissionQueue", () => {
     releaseBlocker();
   });
 
-  it("records a compatibility skip when a later actor claims a lane the waiting one cannot use (#570)", async () => {
-    const mesh = new ConcurrencyLimiter(4);
-    const queue = new UnifiedAdmissionQueue<string>();
-    const open = laneFor("open", 60_000);
-    const closed = laneFor("closed", 60_000);
-    const later = laneFor("later", 60_000);
-    closed.pacer.deferUntil(Date.now() + 120_000);
-    open.pacer.deferUntil(Date.now() + 1_000);
-    later.pacer.deferUntil(Date.now() + 2_000);
-    const run = (id: string, lanes: ReturnType<typeof laneFor>[]) =>
-      queue.enqueue(async (config) => config, lanes, {
-        threadId: id,
-        enqueueNormal: (fn) => mesh.enqueue(fn),
-      });
-    run("head", [closed]);
-    run("flexible", [closed, open]);
-    const narrow = run("narrow", [open]);
-    run("tail", [later]);
-    // Nothing has been passed over yet: a projected wait is not a skip.
-    expect(queue.snapshot().map((entry) => entry.skip)).toEqual([null, null, null, null]);
-
-    await vi.advanceTimersByTimeAsync(1_000);
-    // `flexible` claimed `open`; `head` cannot use it, so it was skipped.
-    expect(queue.snapshot()).toEqual([
-      expect.objectContaining({ threadId: "head", skip: { lane: "open", count: 1 } }),
-      expect.objectContaining({ threadId: "narrow", skip: null }),
-      expect.objectContaining({ threadId: "tail", skip: null }),
-    ]);
-
-    // `tail` claims `later`: the count totals skips across lanes, and the
-    // lane names only the most recent one.
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(queue.snapshot()).toEqual([
-      expect.objectContaining({ threadId: "head", skip: { lane: "later", count: 2 } }),
-      expect.objectContaining({ threadId: "narrow", skip: { lane: "later", count: 1 } }),
-    ]);
-
-    await vi.advanceTimersByTimeAsync(59_000);
-    await expect(narrow.result).resolves.toBe("open");
-    expect(queue.snapshot()).toEqual([
-      expect.objectContaining({ threadId: "head", skip: { lane: "open", count: 3 } }),
-    ]);
-  });
-
   it("promotes waiting work past pacing, and claimed work only on its own lane", async () => {
     const mesh = new ConcurrencyLimiter(1);
     const queue = new UnifiedAdmissionQueue<string>();
