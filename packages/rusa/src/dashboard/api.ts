@@ -104,12 +104,11 @@ export interface DashboardDataDeps {
   /** Optional yield check for testing runState without full mesh instance. */
   isYielded?: (actorId: string) => boolean;
   /**
-   * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
-   * flattened across lanes. `position` is 0-based within its own provider
-   * lane (not globally comparable across lanes); `estimatedStartAt` is an
-   * ISO-8601 projection or `null` when it can't be honestly quoted yet;
-   * `pacingIntervalMs` is the lane's whole-millisecond start spacing — see
-   * `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   * Read-only snapshot of the leader's one admission list, across lanes.
+   * `position` is 0-based in that list; `estimatedStartAt` is an ISO-8601
+   * projection or `null` when it can't be honestly quoted yet;
+   * `pacingIntervalMs` is the projecting lane's whole-millisecond start
+   * spacing — see `UnifiedAdmissionQueue.snapshot` for the full contract.
    */
   providerQueueSnapshots?: () => Array<{
     threadId: string;
@@ -322,16 +321,14 @@ interface ThreadDto {
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
   /**
-   * 0-based position within this actor's provider lane, or `null` when the
-   * actor isn't in a provider queue right now. Not comparable across
-   * different provider lanes — only meaningful relative to other actors on
-   * the same lane.
+   * 0-based position in the leader's one admission list, or `null` when the
+   * actor isn't waiting to start right now.
    */
   queuePosition?: number | null;
   /**
    * ISO-8601 estimate of when this actor's provider run will start, or
    * `null` when the estimate can't be honestly quoted yet (see
-   * `ProviderPacer.getQueueSnapshot`). Recomputed on every request from
+   * `UnifiedAdmissionQueue.snapshot`). Recomputed on every request from
    * live pacer state — never persisted, and shifts as pacing changes.
    */
   estimatedStartAt?: string | null;

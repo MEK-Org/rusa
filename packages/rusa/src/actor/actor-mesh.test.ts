@@ -81,7 +81,12 @@ import {
   type ScheduledMessage,
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
-import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import {
+  type PoolLaneCandidate,
+  ProviderPacer,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -1003,6 +1008,62 @@ describe("ActorMesh", () => {
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
     expect(logs).toContain("dispatch(not-live) refused — no live actor");
+  });
+
+  it("rebuilds the unified admission list from unhandled inbox work after a leader restart (#672)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    inboxStore.append([
+      { actorId: "t1", source: "mesh:root", payload: payload("mesh.message") },
+      { actorId: "t2", source: "mesh:root", payload: payload("mesh.message") },
+    ]);
+    const actors = new InMemoryActorRepository();
+    for (const id of ["t1", "t2"]) {
+      actors.upsert({
+        id,
+        charter: "resumed work",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const leader = (lane: ProviderPacer) => {
+      const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
+      const harness = setup({
+        inboxStore,
+        actors,
+        providerGate: (fn, candidates, request) =>
+          queue.enqueue(
+            fn,
+            candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
+            {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+            }
+          ),
+      });
+      harness.mesh.rehydrateAll();
+      harness.mesh.reconcileInbox();
+      return { ...harness, queue };
+    };
+
+    // The first leader accepts both actors into its list, then dies before
+    // its lane opens: the list, and nothing else, is lost.
+    const closed = new ProviderPacer(0);
+    closed.deferUntil(Date.now() + 24 * 60 * 60_000);
+    const first = leader(closed);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(first.queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
+    first.mesh.shutdownAll();
+
+    // A replacement leader has only the durable inbox to go on.
+    const second = leader(new ProviderPacer(0));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(second.fake("t1").calls).toHaveLength(1);
+    expect(second.fake("t2").calls).toHaveLength(1);
+    expect(first.fake("t1").calls).toHaveLength(0);
+    expect(first.fake("t2").calls).toHaveLength(0);
+    expect(second.queue.snapshot()).toEqual([]);
   });
 
   it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
@@ -7301,158 +7362,6 @@ describe("ActorMesh", () => {
       expect(poolBRuns).toEqual([`/tmp/${worker}`]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
-    });
-  });
-
-  describe("re-evaluate queued admissions on quota exhaustion (#633)", () => {
-    // A blocker occupies the single concurrency slot so workers stay queued
-    // with a recorded selection; pool lanes pace through real ProviderPacers.
-    function queuedPoolHarness() {
-      const poolARuns: string[] = [];
-      const poolBRuns: string[] = [];
-      const liveActors = new Map<string, Actor>();
-      const blockerDeferred = deferredProvider();
-      const poolProvider = (name: string, runs: string[]): CodingProvider => ({
-        name,
-        providerName: name,
-        run: async (runOpts) => {
-          runs.push(runOpts.cwd);
-          liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-          return { success: true, exitCode: 0, output: name };
-        },
-      });
-      const providerByName = new Map<string, CodingProvider>([
-        ["pool-a", poolProvider("pool-a", poolARuns)],
-        ["pool-b", poolProvider("pool-b", poolBRuns)],
-      ]);
-      const pacers = new Map<string, ProviderPacer>();
-      const pacerFor = (name: string): ProviderPacer => {
-        let pacer = pacers.get(name);
-        if (!pacer) {
-          pacer = new ProviderPacer(0);
-          pacers.set(name, pacer);
-        }
-        return pacer;
-      };
-
-      const { mesh, registry, tick } = setup({
-        maxConcurrent: 1,
-        providerGate: (fn, candidates, request) => {
-          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
-            config: c,
-            lane: c.provider,
-            pacer: pacerFor(c.provider),
-          }));
-          return submitPoolGate(fn, lanes, {
-            responsive: request.responsive,
-            threadId: request.threadId,
-            enqueueNormal: request.enqueueNormal,
-            onSelected: request.threadId
-              ? (selection) =>
-                  request.onSelected?.({
-                    provider: selection.candidate.provider,
-                    lane: selection.lane,
-                    model: selection.candidate.model ?? "",
-                    effort: selection.candidate.effort,
-                    declaredIndex: selection.declaredIndex,
-                    eligibleAt: selection.eligibleAt,
-                    responsive: selection.responsive,
-                  })
-              : undefined,
-          });
-        },
-        createActor: (ctx) => {
-          let actor!: Actor;
-          const isBlocker = ctx.record.charter === "blocker";
-          actor = new Actor({
-            id: ctx.record.id,
-            cwd: `/tmp/${ctx.record.id}`,
-            modelConfig: isBlocker
-              ? [{ provider: "blocker", model: "model-blocker" }]
-              : (ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }]),
-            resolveProvider: isBlocker
-              ? () => ({
-                  ...blockerDeferred.provider,
-                  run: async (runOpts) => {
-                    const result = await blockerDeferred.provider.run(runOpts);
-                    if (result.success) actor.declareYield();
-                    return result;
-                  },
-                })
-              : (selected) => {
-                  const base = providerByName.get(selected.provider);
-                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
-                  return base;
-                },
-            mcpServers: [],
-            loadSessionId: () => ctx.getRecord()?.sessionId,
-            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
-            buildPrompt: () => ({ prompt: "work" }),
-            gate: ctx.gate,
-            beforeRun: ctx.beforeRun,
-            lifecycle: ctx.lifecycle,
-            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-            debounceMs: DEBOUNCE,
-          });
-          liveActors.set(ctx.record.id, actor);
-          return actor;
-        },
-      });
-
-      const blocker = mesh.spawn({
-        charter: "blocker",
-        parentId: "root",
-        modelConfig: { provider: "blocker", model: "model-blocker" },
-      });
-      const holdSlot = async () => {
-        mesh.sendMessage(blocker, "hold the slot", "root");
-        await tick();
-        expect(mesh.activeRunState(blocker)?.phase).toBe("running");
-      };
-      return { mesh, tick, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot };
-    }
-
-    it("re-pins only the queued actor whose reserved lane exhausted", async () => {
-      const { mesh, tick, pacerFor, poolARuns, poolBRuns, blockerDeferred, holdSlot } =
-        queuedPoolHarness();
-      const worker = mesh.spawn({
-        charter: "worker",
-        parentId: "root",
-        modelConfig: [
-          { provider: "pool-a", model: "model-a" },
-          { provider: "pool-b", model: "model-b" },
-        ],
-      });
-      const bystander = mesh.spawn({
-        charter: "bystander",
-        parentId: "root",
-        modelConfig: [{ provider: "pool-b", model: "model-b" }],
-      });
-      await holdSlot();
-
-      // Equal quotes: declaration order reserves pool-a for the worker.
-      mesh.sendMessage(worker, "work", "root");
-      mesh.sendMessage(bystander, "work", "root");
-      await tick();
-      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
-      expect(mesh.getSelection(worker)?.lane).toBe("pool-a");
-      expect(mesh.getSelection(bystander)?.lane).toBe("pool-b");
-
-      // The coordinator's exhaustion defers pool-a before re-evaluation runs.
-      pacerFor("pool-a").deferUntil(Date.now() + 60_000);
-      expect(mesh.reEvaluateExhaustedQueuedRuns("pool-a")).toEqual([worker]);
-      await tick();
-
-      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
-      expect(mesh.getSelection(worker)?.lane).toBe("pool-b");
-
-      blockerDeferred.releaseAll();
-      await tick();
-      await tick();
-
-      expect(poolARuns).toEqual([]);
-      expect([...poolBRuns].sort()).toEqual([`/tmp/${bystander}`, `/tmp/${worker}`].sort());
     });
   });
 
