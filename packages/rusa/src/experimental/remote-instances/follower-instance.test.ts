@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
@@ -370,6 +370,40 @@ describe("monolithic follower instance", () => {
     expect(started?.type === "runStart" && started.runId).toBe(
       queuedRun?.type === "queued" && queuedRun.runId
     );
+  });
+
+  it("does not let the reattach startup deadline drop a retained admission", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 60_000);
+    const h = setup({ pacer });
+    const id = h.spawn("Keep this retained admission");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    const reconnect = h.reconnect();
+    const dispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      if (envelope.message.type !== "init") dispatch(envelope);
+    };
+    h.runtime(id).attachHost(reconnect.createHost(id));
+
+    vi.useFakeTimers();
+    try {
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(pacer.waiting).toBe(1);
+      expect(
+        h.meshEvents.some(
+          (event) =>
+            event.kind === "run_abandoned" &&
+            event.actorId === id &&
+            event.detail === "start-cancelled"
+        )
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("recovers a run admitted before a lease flap when disconnect abandons it at start", async () => {

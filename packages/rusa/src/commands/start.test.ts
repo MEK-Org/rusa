@@ -1561,7 +1561,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
       if (!entry?.payload.obligationId)
         throw new Error(`ready-head inbox entry missing: ${actorId}`);
-      const selected = await call(inboxUrl, "select", { entry_ids: [entry.id] });
+      const selected = await call(inboxUrl, "select", {
+        entry_ids: [entry.id],
+      });
       expect(selected.isError).toBeFalsy();
       return { obligationId: entry.payload.obligationId, selection: payloadOf(selected), runId };
     };
@@ -1594,6 +1596,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .meshEvents.listEventsByActors([optedIn], { limit: 20, kinds: ["run_yield_rejected"] })
         .events.some((event) => (event.payload ?? "").includes(strictHeadId))
     ).toBe(true);
+
+    // Direct focus takes the separate production path: an ordinary mesh
+    // message plus an explicit owned obligation, selected through the same
+    // live inbox MCP endpoint. It must arm independently of ready-head
+    // delivery and describe that commitment before the yield attempt.
+    const direct = spawnWorker("live direct-focus worker");
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: direct,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    const directId = getRepositories().obligations.create({
+      title: "live direct focus",
+      ownerId: direct,
+    }).id;
+    liveMesh.sendMessage(direct, "work the selected direct focus", "root");
+    const directRunId = await startLifecycleRun(
+      actorOf(direct),
+      { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      { queued: false }
+    );
+    const directInboxUrl = urlOf(actorOf(direct), "inbox");
+    const directListed = payloadOf(await call(directInboxUrl, "list", { status: "unhandled" })) as {
+      entries: Array<{ id: string; payload: { type: string } }>;
+    };
+    const directEntry = directListed.entries.find(
+      (candidate) => candidate.payload.type === "mesh.message"
+    );
+    if (!directEntry) throw new Error(`ordinary message inbox entry missing: ${direct}`);
+    const directSelection = await call(directInboxUrl, "select", {
+      entry_ids: [directEntry.id],
+      obligation_id: directId,
+    });
+    expect(directSelection.isError).toBeFalsy();
+    expect(String(payloadOf(directSelection).discipline)).toContain(directId);
+    const directRejected = await call(urlOf(actorOf(direct), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(directRejected.isError).toBe(true);
+    expect(JSON.stringify(directRejected)).toContain(`selected head obligation ${directId}`);
+    getRepositories().obligations.setTerminalStatus(directId, "done", null, null, "root");
+    expect(
+      (await call(urlOf(actorOf(direct), "mesh"), "yield_run", { status: "complete" })).isError
+    ).toBeFalsy();
+    await endLifecycleRun(actorOf(direct), directRunId, { success: true, output: "", exitCode: 0 });
 
     // Decomposing it through the worker's own obligations MCP is a legal exit.
     const child = await call(urlOf(actorOf(optedIn), "obligations"), "create_obligation", {
@@ -6447,6 +6497,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         id: "mac-mini",
         platform: "darwin",
         pid: 4242,
+        generation: "mac-mini-process-one",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
       }),
     });
@@ -6474,6 +6525,54 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ])
     );
 
+    // A session fault inside the same follower process must rebind the active
+    // host rather than treating the temporary loss as a new actor incarnation.
+    const sameProcessRegistration = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "mac-mini",
+        platform: "darwin",
+        pid: 4242,
+        generation: "mac-mini-process-one",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      }),
+    });
+    expect(sameProcessRegistration.status).toBe(200);
+    const renewed = (await sameProcessRegistration.json()) as { session: string };
+    expect(renewed.session).not.toBe(enrollment.session);
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/events`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            id: "mac-mini",
+            session: enrollment.session,
+            batchId: "stale-generation-event",
+            events: [],
+          }),
+        })
+      ).status
+    ).toBe(410);
+    const renewedPoll = await fetch(`http://127.0.0.1:${port}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "mac-mini", session: renewed.session }),
+    });
+    expect(renewedPoll.status).toBe(200);
+    await expect(renewedPoll.json()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "placed-worker",
+          message: expect.objectContaining({
+            type: "init",
+            bootstrap: expect.objectContaining({ reconnect: true }),
+          }),
+        }),
+      ])
+    );
+
     // Upsert a retired worker targeting the follower; on reconnect, the leader
     // must reconcile this by sending a stop command so the follower runtime is disposed.
     getRepositories().actors.upsert({
@@ -6491,7 +6590,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await fetch(`http://127.0.0.1:${port}/unregister`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify({ id: "mac-mini", session: enrollment.session }),
+      body: JSON.stringify({ id: "mac-mini", session: renewed.session }),
     });
 
     getRepositories().inbox.append([
@@ -6514,6 +6613,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         id: "mac-mini",
         platform: "darwin",
         pid: 4242,
+        generation: "mac-mini-process-two",
         protocolVersion: INSTANCE_PROTOCOL_VERSION,
       }),
     });

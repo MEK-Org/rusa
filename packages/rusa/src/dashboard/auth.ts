@@ -12,7 +12,11 @@ import {
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { UserPrincipal } from "../principals/principal-ref.js";
 import { DashboardCsrf } from "./csrf.js";
-import { DashboardIdentityResolver } from "./identity.js";
+import {
+  DASHBOARD_IDENTITY_CLAIM_ERROR,
+  DashboardIdentityClaimError,
+  DashboardIdentityResolver,
+} from "./identity.js";
 
 export const SESSION_COOKIE = "__Host-rusa_session";
 export const SESSION_MS = 5 * 24 * 60 * 60 * 1000;
@@ -283,7 +287,9 @@ export class DashboardAuth {
       // An unreachable Firebase is reported as unavailable so the browser retries rather
       // than discarding a still-valid session.
       if (isTransient(error)) json(res, 503, { error: "Authentication unavailable" });
-      else json(res, 401, { error: "Authentication required" });
+      else if (error instanceof DashboardIdentityClaimError) {
+        json(res, 409, { error: DASHBOARD_IDENTITY_CLAIM_ERROR });
+      } else json(res, 401, { error: "Authentication required" });
     }
     return true;
   }
