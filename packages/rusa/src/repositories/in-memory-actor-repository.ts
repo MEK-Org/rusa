@@ -26,6 +26,10 @@ export class InMemoryActorRepository implements ActorRepository {
     return this.list().filter((record) => record.parentId === parentId);
   }
 
+  parentOf(id: string): string | null | undefined {
+    return this.records.get(id)?.parentId;
+  }
+
   patch(id: string, changes: ActorRecordPatch): void {
     const existing = this.records.get(id);
     if (existing) this.upsert({ ...existing, ...changes, id });

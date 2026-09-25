@@ -991,4 +991,32 @@ describe("SqliteActorRepository", () => {
     db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
     expect(repository.get("root")?.voiceConfig).toBeUndefined();
   });
+
+  it("resolves parentOf efficiently without loading full records or chat history (#687)", () => {
+    repository.upsert(root);
+    const worker: ActorRecord = {
+      id: "worker",
+      charter: "Worker",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-09T12:00:00.000Z",
+    };
+    repository.upsert(worker);
+
+    expect(repository.parentOf("root")).toBeNull();
+    expect(repository.parentOf("worker")).toBe("root");
+    expect(repository.parentOf("non-existent")).toBeUndefined();
+
+    // Verify patch updates parentOf
+    const steward: ActorRecord = {
+      id: "steward",
+      charter: "Steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-09T12:00:00.000Z",
+    };
+    repository.upsert(steward);
+    repository.patch("worker", { parentId: "steward" });
+    expect(repository.parentOf("worker")).toBe("steward");
+  });
 });

@@ -30,4 +30,9 @@ export interface ActorRepository {
    * document the row already holds exactly as it found it (#626).
    */
   setModelSelection(id: string, changes: ModelSelectionChange): void;
+  /**
+   * Return the parent thread ID for an actor, null if root, or undefined if unknown.
+   * Efficient path for tree and ancestry traversal without loading full records or chat history.
+   */
+  parentOf?(id: string): string | null | undefined;
 }
