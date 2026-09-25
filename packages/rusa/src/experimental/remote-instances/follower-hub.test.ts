@@ -92,7 +92,7 @@ describe("leader follower gateway", () => {
     expect(replacement).not.toBe(oldHost);
   });
 
-  it("keeps lapsed contact advisory while refusing a stale actor wake until its next poll", async () => {
+  it("keeps lapsed contact advisory while leaving an existing actor's commands queued", async () => {
     const start = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(start);
     try {
@@ -107,10 +107,9 @@ describe("leader follower gateway", () => {
       const rebound = h.hub.rebindHost("mac", "existing-actor");
       expect(rebound).not.toBe(host);
       host = rebound;
-      const rejection = vi.fn();
-      expect(host.send({ type: "wake" }, rejection)).toBe(false);
-      expect((rejection.mock.calls[0]?.[0] as Error).message).toContain("no recent contact");
-      // Cancellation remains available; only fresh work is contact-gated.
+      // Contact gates only new placement. Existing actor commands stay queued so
+      // their callback cannot tear down an in-flight handle while contact lapses.
+      expect(host.send({ type: "wake" }, (error) => expect(error).toBeNull())).toBe(true);
       expect(host.send({ type: "stop" }, (error) => expect(error).toBeNull())).toBe(true);
 
       const poll = h.post("/poll", identity);
@@ -121,10 +120,8 @@ describe("leader follower gateway", () => {
       );
       expect(host.send({ type: "wake" }, (error) => expect(error).toBeNull())).toBe(true);
       expect(await (await poll).json()).toEqual([
-        { actorId: "existing-actor", message: { type: "stop" } },
-      ]);
-      expect(await (await h.post("/poll", identity)).json()).toEqual([
         { actorId: "existing-actor", message: { type: "wake" } },
+        { actorId: "existing-actor", message: { type: "stop" } },
       ]);
     } finally {
       clock.mockRestore();
@@ -184,56 +181,68 @@ describe("leader follower gateway", () => {
     }
   });
 
-  it("authenticates registration, fences a replacement process, and rejects stale sessions", async () => {
-    const h = await setup();
-    expect((await fetch(`${h.origin}/followers`)).status).toBe(401);
-    const identity = await h.register("mac");
-    const oldHost = h.hub.createHost("mac", "actor-1");
-    const exited = once(oldHost, "exit");
-    const replacement = await h.post("/register", {
-      id: "mac",
-      platform: "darwin",
-      pid: 124,
-      generation: "mac-process-two",
-      protocolVersion: INSTANCE_PROTOCOL_VERSION,
-    });
-    expect(replacement.status).toBe(200);
-    const replacementIdentity = {
-      id: "mac",
-      ...((await replacement.json()) as { session: string }),
-    };
-    await exited;
-    expect((await h.post("/events", { ...identity, batchId: "old", events: [] })).status).toBe(410);
-    expect(
-      (
-        await h.post("/register", {
-          id: "mac",
-          platform: "darwin",
-          pid: 123,
-          generation: "mac-process-one",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-        })
-      ).status
-    ).toBe(409);
-    expect((await h.post("/poll", { id: "mac", session: "wrong" })).status).toBe(410);
-    expect((await h.post("/register", { id: "old", platform: "darwin", pid: 124 })).status).toBe(
-      409
-    );
-    expect(() => h.hub.createHost("unknown", "actor")).toThrow("not connected");
-    await h.post("/unregister", replacementIdentity);
-    // Losing its replacement must not let an old live process reclaim this id.
-    expect(
-      (
-        await h.post("/register", {
-          id: "mac",
-          platform: "darwin",
-          pid: 123,
-          generation: "mac-process-one",
-          protocolVersion: INSTANCE_PROTOCOL_VERSION,
-        })
-      ).status
-    ).toBe(409);
-    expect(h.hub.list()).toEqual([]);
+  it("authenticates registration, fences superseded generations for the leader lifetime, and rejects stale sessions", async () => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      const h = await setup();
+      expect((await fetch(`${h.origin}/followers`)).status).toBe(401);
+      const identity = await h.register("mac");
+      const oldHost = h.hub.createHost("mac", "actor-1");
+      const exited = once(oldHost, "exit");
+      const replacement = await h.post("/register", {
+        id: "mac",
+        platform: "darwin",
+        pid: 124,
+        generation: "mac-process-two",
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      });
+      expect(replacement.status).toBe(200);
+      const replacementIdentity = {
+        id: "mac",
+        ...((await replacement.json()) as { session: string }),
+      };
+      await exited;
+      expect((await h.post("/events", { ...identity, batchId: "old", events: [] })).status).toBe(
+        410
+      );
+      expect(
+        (
+          await h.post("/register", {
+            id: "mac",
+            platform: "darwin",
+            pid: 123,
+            generation: "mac-process-one",
+            protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          })
+        ).status
+      ).toBe(409);
+      expect((await h.post("/poll", { id: "mac", session: "wrong" })).status).toBe(410);
+      expect((await h.post("/register", { id: "old", platform: "darwin", pid: 124 })).status).toBe(
+        409
+      );
+      expect(() => h.hub.createHost("unknown", "actor")).toThrow("not connected");
+      await h.post("/unregister", replacementIdentity);
+
+      // Dedupe state may expire, but an older process must remain fenced for
+      // this leader lifetime rather than reclaiming its former follower ID.
+      clock.mockReturnValue(start + 3601_000);
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      expect(
+        (
+          await h.post("/register", {
+            id: "mac",
+            platform: "darwin",
+            pid: 123,
+            generation: "mac-process-one",
+            protocolVersion: INSTANCE_PROTOCOL_VERSION,
+          })
+        ).status
+      ).toBe(409);
+      expect(h.hub.list()).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("routes multiple actors on one follower and keeps the follower after retirement", async () => {

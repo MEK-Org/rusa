@@ -122,14 +122,10 @@ export class RemoteInstance {
     this.dedupeTracker.recordEvent(eventId);
   }
 
-  /** Fresh work is rejected at both host creation and existing-host send boundaries. */
+  /** Contact gates new actor placement and follower updates, not existing actor commands. */
   assertDispatchable(): void {
     const error = this.staleContactError();
     if (error) throw error;
-  }
-
-  private commandDispatchError(message: LeaderCommand): Error | undefined {
-    return message.type === "wake" ? this.staleContactError() : undefined;
   }
 
   private staleContactError(): Error | undefined {
@@ -184,15 +180,10 @@ export class RemoteInstance {
   }
 
   private openHost(actorId: string): ActorChannel {
-    const host = new InstanceActorChannel(
-      this.id,
-      this.pid,
-      (message) => {
-        this.commands.push({ actorId, message });
-        this.flush();
-      },
-      (message) => this.commandDispatchError(message)
-    );
+    const host = new InstanceActorChannel(this.id, this.pid, (message) => {
+      this.commands.push({ actorId, message });
+      this.flush();
+    });
     this.hosts.set(actorId, host);
     host.once("exit", () => this.hosts.delete(actorId));
     return host;
@@ -276,8 +267,7 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   constructor(
     readonly nodeId: string,
     readonly pid: number,
-    private readonly enqueue: (message: LeaderCommand) => void,
-    private readonly dispatchError: (message: LeaderCommand) => Error | undefined
+    private readonly enqueue: (message: LeaderCommand) => void
   ) {
     super();
   }
@@ -285,11 +275,6 @@ class InstanceActorChannel extends EventEmitter implements ActorChannel {
   send(message: LeaderCommand, callback: (error: Error | null) => void): boolean {
     if (!this.connected) {
       callback(new Error("Remote instance actor disconnected"));
-      return false;
-    }
-    const error = this.dispatchError(message);
-    if (error) {
-      callback(error);
       return false;
     }
     this.enqueue(message);

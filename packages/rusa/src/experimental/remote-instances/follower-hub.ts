@@ -113,7 +113,6 @@ export class FollowerHub {
     for (const [id, tracker] of this.dedupeTrackers) {
       if (!this.followers.has(id) && now - tracker.lastSeen > 3600_000) {
         this.dedupeTrackers.delete(id);
-        this.supersededGenerations.delete(id);
       }
     }
   }

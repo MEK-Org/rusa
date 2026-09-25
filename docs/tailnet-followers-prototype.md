@@ -285,10 +285,10 @@ effects remain outside exactly-once guarantees.
 
 The gateway records authenticated last contact from the follower's long-poll and
 event requests and emits one `follower_contact_stale` warning when fresh contact
-first lapses. It refuses new dispatch — including wakes for an already-hosted
-actor — to that generation, but leaves an already-queued command and existing
-channels intact for the next poll. Reattachment is not freshness-gated. It does
-not expire channels or fail runs on a 45-second timer. To recover, restore the
+first lapses. It refuses new actor placement and follower updates for that
+generation, but leaves existing actor channels and their queued commands intact
+for the next poll. Reattachment is not freshness-gated. It does not expire
+channels or fail runs on a 45-second timer. To recover, restore the
 follower's leader connectivity and let its same generation re-register and poll;
 to end a stranded run, use the normal actor cancellation or retirement control,
 whose stop command remains deliverable when contact returns. Any future expiry
