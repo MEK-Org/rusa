@@ -172,8 +172,8 @@ class InboxEntryDto {
   int get hashCode => Object.hash(id, actorId, source, deliveredAt, handledAt);
 }
 
-/// A later admission claimed [lane], which the waiting actor cannot use,
-/// [count] times while it waited (#570).
+/// Later admissions passed a waiting actor over [count] times in total on
+/// lanes it cannot use; [lane] is the most recent such lane (#570).
 class AdmissionSkip {
   const AdmissionSkip({required this.lane, required this.count});
 
@@ -319,7 +319,7 @@ class ThreadDto {
   final String? claimedLane;
 
   /// Set once a later actor claimed a lane this one cannot use while it kept
-  /// waiting: the latest such lane and how many times it happened.
+  /// waiting: the total count across lanes, and the latest such lane.
   final AdmissionSkip? admissionSkip;
 
   /// The candidate a genuinely queued run has reserved from its pool: the

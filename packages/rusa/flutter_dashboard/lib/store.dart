@@ -1305,7 +1305,8 @@ class DashboardStore {
   /// Move an unclaimed queued actor within the admission list (#570), then
   /// resync so the view shows the server's order either way. A 409 means the
   /// list changed under [observedOrder]; nothing moved, and the caller says so.
-  /// Any other failure is reported after the resync, which would clear it.
+  /// A successful resync clears the error stream itself; a failed one leaves
+  /// its own error, which only a move failure may replace.
   Future<QueueReorderOutcome> reorderQueuedActor({
     required String threadId,
     required String? beforeThreadId,
@@ -1330,7 +1331,7 @@ class DashboardStore {
       failure = '$e';
     }
     await _requestRuntimeSync();
-    _error.add(failure);
+    if (failure != null) _error.add(failure);
     return outcome;
   }
 

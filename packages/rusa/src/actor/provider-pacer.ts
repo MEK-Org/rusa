@@ -657,8 +657,9 @@ export interface UnifiedAdmissionQueueSnapshot {
   claimedLane: string | null;
   /**
    * Set once a later entry has claimed a lane this unclaimed entry cannot use
-   * while it kept waiting: the most recent such lane and how many times.
-   * Recorded at claim time, so it reports what happened, not a projection.
+   * while it kept waiting: `count` totals every such skip across lanes, and
+   * `lane` is only the most recent one. Recorded at claim time, so it reports
+   * what happened, not a projection; it lives only as long as the entry.
    */
   skip: { lane: string; count: number } | null;
 }
@@ -841,6 +842,9 @@ export class UnifiedAdmissionQueue<C> {
    * operator saw: `observed` must equal `unclaimedOrder()` exactly, so a
    * claim, arrival, cancellation or another reorder in between makes the
    * request `stale` instead of moving an actor relative to a list nobody saw.
+   * The check is deliberately whole-list rather than target-and-anchor: a
+   * move means "this position in the list I saw", and the dashboard resyncs
+   * after a 409, so a busy queue costs a retry, never a misplaced actor.
    * A claimed actor is never in that order, so it can be neither moved nor
    * used as an anchor.
    */

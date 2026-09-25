@@ -90,6 +90,27 @@ void main() {
       await store.dispose();
     });
 
+    test('keeps a failed resync error after a 409', () async {
+      final api = FakeApi()
+        ..admissionReorderError = DashboardApiException(
+          Uri.parse('http://localhost/api/mesh/admission-queue/reorder'),
+          409,
+          '{"error":"admission queue changed"}',
+        );
+      final store = await bootedQueue(api);
+      api.threadsError = Exception('threads unavailable');
+
+      final outcome = await store.reorderQueuedActor(
+        threadId: 'b',
+        beforeThreadId: 'a',
+        observedOrder: const ['a', 'b'],
+      );
+
+      expect(outcome, QueueReorderOutcome.stale);
+      expect(store.error.value, contains('threads unavailable'));
+      await store.dispose();
+    });
+
     test('surfaces any other refusal as an error', () async {
       final api = FakeApi()
         ..admissionReorderError = DashboardApiException(

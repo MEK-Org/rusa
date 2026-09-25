@@ -8,9 +8,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
-import { ConcurrencyLimiter } from "../actor/concurrency-limiter.js";
 import { generateHandle } from "../actor/handle-generator.js";
-import { ProviderPacer, UnifiedAdmissionQueue } from "../actor/provider-pacer.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
 import {
   AvatarGenerationCoordinator,
@@ -1906,35 +1904,25 @@ describe("handleMeshApiRequest", () => {
   });
 
   describe("admission list and operator reorder (#570)", () => {
-    /** A live queue whose one lane stays closed, so every entry waits unclaimed. */
-    function closedQueue(ids: string[]) {
-      const queue = new UnifiedAdmissionQueue<string>();
-      const lane = new ProviderPacer(60_000, () => Date.now());
-      lane.deferUntil(Date.now() + 3_600_000);
-      const mesh = new ConcurrencyLimiter(1);
-      for (const id of ids) {
-        void queue
-          .enqueue(async () => id, [{ config: "claude", lane: "claude", pacer: lane }], {
-            threadId: id,
-            enqueueNormal: (fn) => mesh.enqueue(fn),
-          })
-          .result.catch(() => {});
-      }
-      return queue;
-    }
-
-    function wire(queue: UnifiedAdmissionQueue<string>, logger?: DashboardDataDeps["logger"]) {
-      return {
+    /**
+     * The route over a stub queue: `reorderObserved`'s semantics are pinned in
+     * provider-pacer.test.ts, so these cover only parsing, auth order, status
+     * mapping and logging.
+     */
+    function wire(
+      result: ReturnType<NonNullable<DashboardDataDeps["reorderAdmissionQueue"]>>,
+      logger?: DashboardDataDeps["logger"]
+    ) {
+      const calls: unknown[] = [];
+      const localDeps = {
         ...deps,
         ...(logger ? { logger } : {}),
-        providerQueueSnapshots: () =>
-          queue.snapshot().map((entry) => ({
-            ...entry,
-            estimatedStartAt: null,
-          })),
-        reorderAdmissionQueue: ({ observedOrder, threadId, beforeThreadId }) =>
-          queue.reorderObserved(observedOrder, threadId, beforeThreadId),
+        reorderAdmissionQueue: (request) => {
+          calls.push(request);
+          return result;
+        },
       } satisfies DashboardDataDeps;
+      return { localDeps, calls };
     }
 
     const reorder = (localDeps: DashboardDataDeps, body: unknown) =>
@@ -1998,63 +1986,59 @@ describe("handleMeshApiRequest", () => {
       });
     });
 
-    it("moves an unclaimed actor when the observed order is current, and logs who did it", async () => {
+    it("returns 200 with the new order, maps a null anchor to append, and logs who moved it", async () => {
       const { logger, records } = recordingLogger();
-      const queue = closedQueue([UUID_A, UUID_B, UUID_C]);
-      const localDeps = wire(queue, logger);
+      const { localDeps, calls } = wire({ status: "ok", order: [UUID_B, UUID_A] }, logger);
 
       const moved = await reorder(localDeps, {
-        threadId: UUID_C,
-        beforeThreadId: UUID_A,
-        observedOrder: [UUID_A, UUID_B, UUID_C],
-      });
-      expect(moved).toEqual({ status: 200, body: { ok: true, order: [UUID_C, UUID_A, UUID_B] } });
-      const toEnd = await reorder(localDeps, {
-        threadId: UUID_C,
+        threadId: UUID_A,
         beforeThreadId: null,
-        observedOrder: [UUID_C, UUID_A, UUID_B],
+        observedOrder: [UUID_A, UUID_B],
       });
-      expect(toEnd.body.order).toEqual([UUID_A, UUID_B, UUID_C]);
+      expect(moved).toEqual({ status: 200, body: { ok: true, order: [UUID_B, UUID_A] } });
+      expect(calls).toEqual([
+        { observedOrder: [UUID_A, UUID_B], threadId: UUID_A, beforeThreadId: undefined },
+      ]);
       expect(records()).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             msg: "admission_queue_reordered",
             principal: LOCAL_USER,
-            threadId: UUID_C,
-            beforeThreadId: UUID_A,
+            threadId: UUID_A,
+            beforeThreadId: null,
           }),
         ])
       );
     });
 
-    it("rejects a stale reorder with 409 and the live order, moving nothing", async () => {
-      const queue = closedQueue([UUID_A, UUID_B]);
-      const localDeps = wire(queue);
-      // Another operator's move lands first.
-      queue.reorder(UUID_B, UUID_A);
-
-      const stale = await reorder(localDeps, {
-        threadId: UUID_A,
-        observedOrder: [UUID_A, UUID_B],
-      });
-      expect(stale).toEqual({
+    it("maps a stale reorder to 409 and an invalid target to 400, each with the live order", async () => {
+      const body = { threadId: UUID_A, beforeThreadId: UUID_B, observedOrder: [UUID_A, UUID_B] };
+      const stale = wire({ status: "stale", order: [UUID_B, UUID_A] });
+      expect(await reorder(stale.localDeps, body)).toEqual({
         status: 409,
         body: { error: "admission queue changed", order: [UUID_B, UUID_A] },
       });
-      expect(queue.unclaimedOrder()).toEqual([UUID_B, UUID_A]);
+      expect(stale.calls).toEqual([body]);
+
+      const invalid = wire({ status: "invalid", order: [UUID_B] });
+      expect(await reorder(invalid.localDeps, body)).toEqual({
+        status: 400,
+        body: { error: "not an unclaimed queued actor", order: [UUID_B] },
+      });
     });
 
-    it("rejects malformed and non-queued requests without calling the queue", async () => {
-      const queue = closedQueue([UUID_A]);
-      const localDeps = wire(queue);
+    it("rejects malformed requests without calling the queue, and 503s when it is not wired", async () => {
+      const { localDeps, calls } = wire({ status: "ok", order: [UUID_A] });
       expect((await reorder(localDeps, { threadId: UUID_A })).status).toBe(400);
       expect((await reorder(localDeps, { observedOrder: [UUID_A] })).status).toBe(400);
       expect(
         (await reorder(localDeps, { threadId: UUID_A, observedOrder: [UUID_A, 7] })).status
       ).toBe(400);
-      expect(await reorder(localDeps, { threadId: UUID_B, observedOrder: [UUID_A] })).toMatchObject(
-        { status: 400, body: { order: [UUID_A] } }
-      );
+      expect(
+        (await reorder(localDeps, { threadId: UUID_A, beforeThreadId: 7, observedOrder: [] }))
+          .status
+      ).toBe(400);
+      expect(calls).toEqual([]);
 
       const { reorderAdmissionQueue: _omitted, ...unwired } = localDeps;
       expect((await reorder(unwired, { threadId: UUID_A, observedOrder: [UUID_A] })).status).toBe(

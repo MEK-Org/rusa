@@ -679,32 +679,43 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [
             makeThread('root', runState: RunState.idle),
+            // Declared claude and codex, but its claim holds codex and never
+            // transfers, so it no longer competes for claude.
+            makeThread(
+              'held',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 0,
+              admissionClaimed: true,
+              compatibleLanes: const ['claude', 'codex'],
+              claimedLane: 'codex',
+            ),
             makeThread(
               'first-shared',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 0,
+              queuePosition: 1,
               compatibleLanes: const ['claude'],
             ),
             makeThread(
               'incompatible',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 1,
+              queuePosition: 2,
               compatibleLanes: const ['codex'],
             ),
             makeThread(
               'second-shared',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 2,
+              queuePosition: 3,
               compatibleLanes: const ['claude'],
             ),
             makeThread(
               'target',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 3,
+              queuePosition: 4,
               compatibleLanes: const ['claude'],
             ),
           ];
@@ -722,6 +733,13 @@ void main() {
         expect(
           find.text('3 earlier queued actors share a compatible lane'),
           findsNothing,
+        );
+        // `held` and `first-shared`; `incompatible` and `second-shared` each
+        // share one lane with a single earlier entry.
+        expect(find.text('Runs when a slot frees up'), findsNWidgets(2));
+        expect(
+          find.text('1 earlier queued actor shares a compatible lane'),
+          findsNWidgets(2),
         );
         expect(find.textContaining('Runs after'), findsNothing);
         await store.dispose();
@@ -784,8 +802,8 @@ void main() {
         );
         expect(
           find.text(
-            'Passed over 2 times by later runs on claude, '
-            'a lane this actor cannot use',
+            'Passed over 2 times by later runs on lanes this actor cannot '
+            'use, most recently claude',
           ),
           findsOneWidget,
         );
@@ -868,6 +886,15 @@ void main() {
 
         await tester.ensureVisible(find.byTooltip('Move up beta-handle'));
         await tester.pump();
+        // Another operator's move already landed on the server.
+        api.threadsResult = [
+          for (final thread in admissionThreads())
+            switch (thread.id) {
+              'alpha' => thread.copyWith(queuePosition: 2),
+              'beta' => thread.copyWith(queuePosition: 1),
+              _ => thread,
+            },
+        ];
         await tester.tap(find.byTooltip('Move up beta-handle'));
         await tester.pump();
         for (var i = 0; i < 5; i++) {
@@ -881,11 +908,13 @@ void main() {
           'beta',
         ]);
         expect(
-          find.text(
-            'The queue changed before your move; nothing was moved. '
-            'Showing the current order.',
-          ),
+          find.text('The queue changed before your move; nothing was moved.'),
           findsOneWidget,
+        );
+        // The resync after the 409 rendered the server's changed order.
+        expect(
+          tester.getTopLeft(find.text('beta-handle')).dy,
+          lessThan(tester.getTopLeft(find.text('alpha-handle')).dy),
         );
         await store.dispose();
       });

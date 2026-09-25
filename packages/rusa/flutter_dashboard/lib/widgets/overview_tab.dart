@@ -1370,8 +1370,9 @@ class _OverviewTabState extends State<OverviewTab> {
   }
 
   /// Entries ahead of [actor] in the admission list that share one of its
-  /// lanes. An entry whose lanes are unknown counts, so a missing lane list
-  /// never understates the compatible-lane context.
+  /// lanes. A claimed entry competes only for the lane it holds, since its
+  /// claim never transfers. An entry whose lanes are unknown counts, so a
+  /// missing lane list never understates the compatible-lane context.
   int _queuedAheadOnSharedLanes(
     ActorViewState actor,
     List<ActorViewState> queued,
@@ -1381,11 +1382,13 @@ class _OverviewTabState extends State<OverviewTab> {
     final lanes = actor.compatibleLanes.toSet();
     return queued.where((other) {
       final otherPosition = other.queuePosition;
+      final held = other.admissionClaimed ? other.claimedLane : null;
+      final otherLanes = held == null ? other.compatibleLanes : [held];
       return otherPosition != null &&
           otherPosition < position &&
           (lanes.isEmpty ||
-              other.compatibleLanes.isEmpty ||
-              other.compatibleLanes.any(lanes.contains));
+              otherLanes.isEmpty ||
+              otherLanes.any(lanes.contains));
     }).length;
   }
 
@@ -1400,10 +1403,15 @@ class _OverviewTabState extends State<OverviewTab> {
     return '$noun: ${actor.compatibleLanes.join(' · ')}';
   }
 
+  /// [AdmissionSkip.count] totals skips across lanes; [AdmissionSkip.lane] is
+  /// only the latest, so a repeated count is never attributed to one lane.
   String _queueSkipLabel(AdmissionSkip skip) {
-    final times = skip.count == 1 ? 'once' : '${skip.count} times';
-    return 'Passed over $times by later runs on ${skip.lane}, '
-        'a lane this actor cannot use';
+    if (skip.count == 1) {
+      return 'Passed over once by a later run on ${skip.lane}, '
+          'a lane this actor cannot use';
+    }
+    return 'Passed over ${skip.count} times by later runs on lanes this '
+        'actor cannot use, most recently ${skip.lane}';
   }
 
   /// Move up/down buttons for an unclaimed entry; claimed entries and actors
@@ -1465,10 +1473,7 @@ class _OverviewTabState extends State<OverviewTab> {
     if (!mounted || outcome != QueueReorderOutcome.stale) return;
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
       const SnackBar(
-        content: Text(
-          'The queue changed before your move; nothing was moved. '
-          'Showing the current order.',
-        ),
+        content: Text('The queue changed before your move; nothing was moved.'),
       ),
     );
   }
