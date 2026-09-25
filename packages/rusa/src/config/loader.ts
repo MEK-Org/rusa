@@ -564,6 +564,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
   // geminiApiKey and mistralApiKey are optional at config-validation time;
   // individual consumers gate the features that require them.
+  if (parsed.jevApiKeyFile !== undefined) {
+    if (typeof parsed.jevApiKeyFile !== "string" || !parsed.jevApiKeyFile.trim()) {
+      throw new Error("config.yaml: jevApiKeyFile must be a non-empty secret filename when set");
+    }
+    parsed.jevApiKeyFile = parsed.jevApiKeyFile.trim();
+  }
   if (parsed.deployBranch !== undefined) {
     if (typeof parsed.deployBranch !== "string" || !parsed.deployBranch.trim()) {
       throw new Error("config.yaml: deployBranch must be a non-empty string when set");

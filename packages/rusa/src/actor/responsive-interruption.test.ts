@@ -139,6 +139,32 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     expect(decision).not.toHaveProperty("rationale");
   });
 
+  it("aborts the client request when the shadow deadline expires", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.8,
+      timeoutMs: 5,
+      client: client(
+        (_request, options) =>
+          new Promise((_resolve, reject) => {
+            receivedSignal = options?.signal;
+            options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), {
+              once: true,
+            });
+          })
+      ),
+    });
+
+    const decision = await classifier.evaluate({
+      incomingEntryId: "incoming-z",
+      selectedEntryIds: ["selected-a"],
+      pendingEntryIds: [],
+    });
+
+    expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
   it("drops matched ids the client did not get offered", async () => {
     // A defective or future client must not be able to write arbitrary text
     // into the audit through the one free-form-looking field that survives.

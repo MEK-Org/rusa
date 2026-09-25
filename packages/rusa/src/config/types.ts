@@ -418,6 +418,12 @@ export interface RusaConfig {
   elevenlabsApiKey?: string;
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
+  /**
+   * Optional basename of the host-plane JEV credential file directly under
+   * `$RUSA_HOME/secrets`. Setting it opts in to shadow-only responsive
+   * interruption observations; absence preserves today's scheduler exactly.
+   */
+  jevApiKeyFile?: string;
   webhook: WebhookConfig;
   /** Explicit provider/model selection for the root actor. */
   rootActor?: RootActorConfig;

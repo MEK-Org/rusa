@@ -1426,7 +1426,7 @@ export class ActorMesh {
       if (entry.payload.type === "operator.run_now") continue;
       const incomingEntryId = entry.id;
       void classifier
-        .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .evaluate({ actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
         .then((decision) => {
           this.recordEvent({
             kind: "responsive_interruption_shadow",
