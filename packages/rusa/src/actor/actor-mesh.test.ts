@@ -13,6 +13,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
+import type { Obligation } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import type { Logger } from "../observability/logger.js";
 import { FakeProvider } from "../providers/fake-provider.js";
@@ -46,6 +47,7 @@ import type {
   ActorFactoryContext,
   ActorMeshOptions,
   LiveObligationSummary,
+  MeshObligationPort,
   RetireCleanup,
   SpawnRequest,
 } from "./actor-mesh.js";
@@ -1940,9 +1942,10 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
+  it("defers self-caused responsive ready attention to the run end (#632)", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
+    let worker = "";
     let resolveFirst!: (result: Partial<RunResult>) => void;
     let firstSignal: AbortSignal | undefined;
     let runIndex = 0;
@@ -1954,6 +1957,201 @@ describe("ActorMesh", () => {
         });
       }
       return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    class ClassBackedObligations implements MeshObligationPort {
+      findLiveByExternalRef() {
+        return null;
+      }
+
+      get(id: string) {
+        return {
+          id,
+          ownerId: this.ownerId(),
+          status: "ready",
+          effectiveResponsive: true,
+        } as unknown as Obligation;
+      }
+
+      constructor(private readonly ownerId: () => string) {}
+    }
+    const obligations = new ClassBackedObligations(() => worker);
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      obligations,
+    });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    const appendSpy = vi.spyOn(inboxStore, "append");
+
+    // The running actor closed a prerequisite and made its own obligation
+    // ready. The delivery is deferred until run completion so it does not
+    // self-interrupt mid-run (#632).
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+    ).toBe(true);
+    expect(
+      mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-self-2", intent: "also self-caused" },
+        true
+      )
+    ).toBe(true);
+    await Promise.resolve(); // flush the durable-append drain after the current run
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(false);
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy.mock.calls[0]?.[0]).toHaveLength(2);
+    expect(fake(worker).calls).toHaveLength(2);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(true);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self-2"
+      )
+    ).toBe(true);
+  });
+
+  it("discards deferred responsive ready attention if obligation is no longer ready when run completes (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let worker = "";
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let runIndex = 0;
+    const provider = new FakeProvider(() => {
+      if (runIndex++ === 0) {
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    let obligationStatus = "ready";
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: obligationStatus,
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      sharedProvider: provider,
+      obligations,
+    });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // Actor makes an obligation ready mid-run:
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-closed", intent: "temp ready" }, true)
+    ).toBe(true);
+
+    // But before the run completes, the obligation is marked done (or subordinated):
+    obligationStatus = "done";
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+
+    // Since the obligation was done when the run flushed, no inbox entry was delivered and no follow-up was scheduled:
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-closed"
+      )
+    ).toBe(false);
+  });
+
+  it("reconciles self-caused responsive attention deferred by a process loss (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    let worker = "";
+    let runIndex = 0;
+    const provider = new FakeProvider(() => {
+      if (runIndex++ === 0) return new Promise<Partial<RunResult>>(() => {});
+      return { success: true, exitCode: 0, output: "restarted" };
+    });
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: "ready",
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
+    const first = setup({ actors, inboxStore, sharedProvider: provider, obligations });
+    worker = first.mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    first.mesh.dispatch(worker);
+    await first.tick();
+    expect(
+      first.mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-recovered", intent: "survives restart" },
+        true
+      )
+    ).toBe(true);
+    expect(inboxStore.entries.some((entry) => entry.source === "obligation:ob-recovered")).toBe(
+      false
+    );
+
+    // A restart loses the transient buffer, then rehydrates actors and derives
+    // the still-ready responsive fact from durable obligation state.
+    const restarted = setup({ actors, inboxStore });
+    restarted.mesh.rehydrateAll();
+    restarted.mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-recovered", ownerId: worker, intent: "survives restart" },
+      ],
+    });
+    await restarted.tick();
+
+    expect(
+      inboxStore.entries.filter(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-recovered"
+      )
+    ).toHaveLength(1);
+  });
+
+  it("preempts active run when responsive ready attention is external (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>(() => {});
+      }
+      return { success: true, exitCode: 0, output: "interrupted-follow-up" };
     });
     const { mesh, fake, tick } = setup({
       inboxStore,
@@ -1967,25 +2165,23 @@ describe("ActorMesh", () => {
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
 
-    // The running actor closed a prerequisite and made its own obligation
-    // ready. The entry is durably responsive, so it is scheduled and admitted
-    // as responsive — but the actor will see it in its own worklist, so the
-    // run it is already doing is not thrown away.
+    // External caller (selfCausedMidRun = false) delivers responsive ready attention:
     expect(
-      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+      mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-ext", intent: "external responsive" },
+        false
+      )
     ).toBe(true);
-    await Promise.resolve(); // flush the durable-append drain after the join wake
-    expect(firstSignal?.aborted).toBe(false);
-    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
-    expect(fake(worker).calls).toHaveLength(1);
-
-    resolveFirst({ success: true, exitCode: 0, output: "first" });
     await vi.advanceTimersByTimeAsync(0);
     await tick();
-    expect(fake(worker).calls).toHaveLength(2);
+
+    // External responsive work immediately preempts the active run:
+    expect(firstSignal?.aborted).toBe(true);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(true);
     expect(
       inboxStore.entries.some(
-        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-ext"
       )
     ).toBe(true);
   });
