@@ -17,6 +17,7 @@ import {
   formatPoolExhaustedFailure,
   type PoolSkippedEntry,
 } from "../actor/actor.js";
+import type { ActorLifecycle } from "../actor/actor-lifecycle.js";
 import {
   type ActorFactoryContext,
   ActorMesh,
@@ -176,7 +177,7 @@ import {
   mountGrantedServers,
 } from "../mcp/grantable-servers.js";
 import { McpHttpServer } from "../mcp/http-server.js";
-import { createInboxMcpServer, INBOX_MCP_NAME } from "../mcp/inbox-mcp.js";
+import { createInboxMcpServer, INBOX_MCP_NAME, type SelectedInboxRun } from "../mcp/inbox-mcp.js";
 import { createMeshChatMcpServer, MESH_CHAT_MCP_NAME } from "../mcp/mesh-chat-mcp.js";
 import { createObligationsMcpServer, OBLIGATIONS_MCP_NAME } from "../mcp/obligations-mcp.js";
 import type { PnpmHardlinksToolDeps } from "../mcp/pnpm-hardlinks-mcp.js";
@@ -272,6 +273,7 @@ import {
   EventManager,
   HierarchicalEventSourceResolver,
 } from "../runtime/event-manager.js";
+import { ResourceScope } from "../runtime/resource-scope.js";
 import { readSlackToken, SlackClient } from "../slack/slack-client.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
@@ -905,6 +907,28 @@ export function createSelectedInboxEntriesAccessor(
  * unused).
  */
 export async function runStart(opts?: RunStartOptions): Promise<void> {
+  // The one disposer owner for everything the composition acquires. A boot
+  // that fails part-way releases exactly what it took and rethrows; a
+  // committed shutdown releases the same scope. Either way is idempotent.
+  const resources = new ResourceScope();
+  try {
+    await composeStart(opts, resources);
+  } catch (err) {
+    await resources.close();
+    throw err;
+  }
+}
+
+/**
+ * The process composition. Constructs the runtime owners in one direction —
+ * database and obligation sinks, loopback servers, event routing, mesh,
+ * lifecycle listeners, ingress, maintenance jobs — and registers each acquired
+ * resource with `resources` as it is taken, so release runs in reverse.
+ */
+async function composeStart(
+  opts: RunStartOptions | undefined,
+  resources: ResourceScope
+): Promise<void> {
   const mcHome = resolveHome();
 
   // The service logger. `rusa start` is a service, so its diagnostics are JSON
@@ -965,6 +989,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     secrets: readSecrets,
     context: { component: "start" },
   });
+  resources.reportFailuresTo(({ resource, error }) =>
+    log.error("shutdown_disposer_failed", { resource, err: error })
+  );
   if (config.chat?.errorChat) {
     log.warn("chat_error_chat_deprecated", { replacement: "observability.errorSink" });
   }
@@ -1011,6 +1038,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
 
   const database = initDb(mcHome);
+  resources.acquire("database", () => closeDb());
   log.info("database_ready", { home: mcHome });
 
   const modelClasses = getRepositories().modelClasses;
@@ -1132,6 +1160,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
     responsiveReadySink?.(obligation, actingPrincipal)
   );
+  // Released just before the database closes. The repository's listeners are
+  // closures over these sinks; clearing the sinks rather than the listeners
+  // stops a dead mesh being reachable through them without touching a
+  // database that is about to close.
+  resources.acquire("obligation attention sinks", () => {
+    readyHeadSink = undefined;
+    prerequisiteCancellationSink = undefined;
+    responsiveReadySink = undefined;
+  });
 
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
@@ -1202,6 +1239,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const gitBridgeServer = config.gitBridge
     ? startGitHttpServer(mcHome, gitBridgePort, { bindHost: gitBridgeBindHost })
     : null;
+  if (gitBridgeServer) {
+    resources.acquire("git bridge server", async () => {
+      if (typeof gitBridgeServer.closeAllConnections === "function") {
+        gitBridgeServer.closeAllConnections();
+      }
+      await new Promise<void>((resolve) => gitBridgeServer.close(() => resolve()));
+    });
+  }
   const issueClient: IssueClient = config.gitBridge
     ? new GitBridgeIssueClient(baseIssueClient, { port: gitBridgePort })
     : baseIssueClient;
@@ -1288,6 +1333,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       reason: err.message,
       action: err.action,
     });
+    await resources.close();
     process.exit(1);
     return;
   }
@@ -1434,6 +1480,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
+  resources.acquire("mcp http server", () => mcpHttp.close());
   const sharedMcp = mcpHttp.urls();
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
@@ -1498,7 +1545,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootProviderName = rootActor.provider;
   const isProviderHalted = (providerName?: string, modelName?: string) =>
     haltSwitch.isHalted(providerName ?? rootProviderName, modelName);
-  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   if (haltSwitch.hasActiveHalt()) {
     const why = haltSwitch.reason();
     console.warn(`[mesh] ⛔ HALT sentinel present${why ? ` (${why})` : ""} — runs are paused`);
@@ -2156,6 +2202,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
     followerHub = new FollowerHub(token, { logger: log, triggerStore: followerTriggerStore });
     await followerHub.listen(config.followers.bind, config.followers.port);
+    const hub = followerHub;
+    resources.acquire("follower gateway", () => hub.close());
     log.info("follower_gateway_started", {
       bind: config.followers.bind,
       port: config.followers.port,
@@ -2228,6 +2276,184 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const supportedVoiceCatalog = buildSupportedVoiceCatalog(credentialValidSupportedVoices, {
     availableProviders: availableVoiceProviders,
   });
+
+  // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
+  // for the root, which has no parent — to the statically configured error chat.
+  // The raw delivery to the human's error chat.
+  const sendToErrorChat = sendErrorSink
+    ? (text: string) => {
+        void sendErrorSink(text).catch((err) => {
+          console.warn(
+            `[failure-sink] error chat post failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        });
+      }
+    : null;
+  // Governor: alert eagerly on the first failure, then coalesce a storm into one
+  // summary per growing window (so a rate-limit cascade can't DM the human 14×).
+  // Acquired before the mesh so it is released after it: stopping actors can
+  // still report failures, and close cancels any summary they leave pending.
+  const errorNotifier = sendToErrorChat ? new CoalescingNotifier({ send: sendToErrorChat }) : null;
+  if (errorNotifier) resources.acquire("error notifier", () => errorNotifier.close());
+
+  // The run lifecycle every actor shares, root and worker alike: durable run
+  // accounting; run logs and mesh events; then portable-context compaction and
+  // failure routing. Registered in that order, which is the order the
+  // lifecycle notifies them.
+  const addRunLifecycleListeners = (
+    lifecycle: ActorLifecycle,
+    id: string,
+    firstSelected: RawProviderModelConfig
+  ): void => {
+    // Which entry actually ran, for the failure-notice label. A declared pool
+    // can move while idle, so this is captured at lifecycle start.
+    let lastSelected = firstSelected;
+    lifecycle.add({
+      onStart: (event) => {
+        lastSelected = event.selected;
+        mesh.clearSelection(id);
+        const launchConfig = projectActorRunLaunchConfig(event.selected);
+        runAccounting.begin(id, event.runId, launchConfig);
+      },
+      onEnd: (event) => {
+        if (event.terminal.kind === "abandoned") {
+          if (event.terminal.started) {
+            runAccounting.abandon(id, event.runId, event.terminal.reason);
+          }
+          return;
+        }
+        runAccounting.complete(id, event.runId, event.terminal.result);
+      },
+    });
+    lifecycle.add({
+      onQueued: (event) => {
+        mesh.recordEvent({
+          kind: "run_queued",
+          actorId: id,
+          detail: event.mode,
+        });
+      },
+      onStart: (event) => {
+        const launchConfig = projectActorRunLaunchConfig(event.selected);
+        runLogger(id, event.runId).info("run_start", {
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
+          responsive: event.responsive,
+        });
+        mesh.recordEvent({
+          kind: "run_start",
+          actorId: id,
+          detail: event.injectRecord
+            ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
+            : undefined,
+          body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
+          payload: JSON.stringify({
+            provider: launchConfig.provider,
+            model: launchConfig.model,
+            effort: launchConfig.effort,
+            responsive: event.responsive,
+            runId: event.runId,
+          }),
+        });
+      },
+      onError: (event) => {
+        runLogger(id, event.runId).error("run_error", {
+          error: event.error instanceof Error ? event.error.message : String(event.error),
+        });
+      },
+      onEnd: async (event) => {
+        activeRunSelections.delete(id);
+        if (event.terminal.kind === "abandoned") {
+          runLogger(id, event.runId).warn("run_abandoned", {
+            reason: event.terminal.reason,
+            started: event.terminal.started,
+          });
+          mesh.recordEvent({
+            kind: "run_abandoned",
+            actorId: id,
+            detail: event.terminal.reason,
+            payload: JSON.stringify({
+              started: event.terminal.started,
+            } satisfies RunAbandonedPayload),
+          });
+          return;
+        }
+        const { result } = event.terminal;
+        logRunEnd(runLogger(id, event.runId), result);
+        mesh.recordEvent({
+          kind: "run_end",
+          actorId: id,
+          success: result.success,
+          detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+          body: result.output,
+          payload: runEndPayload({ ...result, runId: event.runId }),
+        });
+      },
+    });
+    lifecycle.add({
+      onEnd: async (event) => {
+        if (event.terminal.kind === "abandoned") return;
+        const { result } = event.terminal;
+        const compacted = await compactPortableActorAfterRun(id);
+        if (compacted) {
+          mesh.recordEvent({
+            kind: "portable_context_compacted",
+            actorId: id,
+            detail: describeCompaction(compacted),
+            body: JSON.stringify(compacted),
+          });
+        }
+        if (!result.success && !result.capped) {
+          await routeRunFailure(
+            failureSink,
+            id,
+            result,
+            formatProviderLabel(
+              {
+                providerName: lastSelected.provider,
+                model: lastSelected.model,
+                effort: lastSelected.effort,
+              },
+              result.model
+            )
+          );
+        }
+      },
+    });
+  };
+
+  // One inbox selection for every actor's inbox server: the selection commits
+  // with the run's focus resolved inside it, against the actor's active run.
+  const inboxSelectFor =
+    (id: string) =>
+    (entryIds: string[], obligationId?: string): SelectedInboxRun => {
+      const runId = runAccounting.activeRunId(id);
+      if (!runId) throw new Error(`actor has no active durable run: ${id}`);
+      let focus: ResolvedInboxFocus | undefined;
+      const entries = mesh.selectInboxEntries(
+        id,
+        entryIds,
+        (selectedEntries) => {
+          focus = inboxFocusResolver.select({
+            runId,
+            actorId: id,
+            entries: selectedEntries,
+            explicitObligationId: obligationId,
+          });
+        },
+        obligationId
+      );
+      if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
+      // Read after the selection commits: the same armed decision the
+      // clean-yield check enforces is what states the rule here, so the two
+      // can never disagree about this run.
+      return {
+        entries,
+        focus,
+        discipline: mesh.runDisciplineNotice(id),
+      };
+    };
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
   mesh = new ActorMesh({
@@ -2592,33 +2818,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
-            select: (entryIds, obligationId) => {
-              const runId = runAccounting.activeRunId(id);
-              if (!runId) throw new Error(`actor has no active durable run: ${id}`);
-              let focus: ResolvedInboxFocus | undefined;
-              const entries = mesh.selectInboxEntries(
-                id,
-                entryIds,
-                (selectedEntries) => {
-                  focus = inboxFocusResolver.select({
-                    runId,
-                    actorId: id,
-                    entries: selectedEntries,
-                    explicitObligationId: obligationId,
-                  });
-                },
-                obligationId
-              );
-              if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
-              // Read after the selection commits: the same armed decision the
-              // clean-yield check enforces is what states the rule here, so
-              // the two can never disagree about this run.
-              return {
-                entries,
-                focus,
-                discipline: mesh.runDisciplineNotice(id),
-              };
-            },
+            select: inboxSelectFor(id),
             selected: () => mesh.selectedInboxEntries(id),
             onHandled: () => mesh.inboxHandled(id),
             isFenced,
@@ -2761,121 +2961,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        // Which declared candidate actually ran, for the failure-notice label.
-        let lastSelected: RawProviderModelConfig = modelConfigPool[0];
-        ctx.lifecycle.add({
-          onStart: (event) => {
-            lastSelected = event.selected;
-            mesh.clearSelection(id);
-            const launchConfig = projectActorRunLaunchConfig(event.selected);
-            runAccounting.begin(id, event.runId, launchConfig);
-          },
-          onEnd: (event) => {
-            if (event.terminal.kind === "abandoned") {
-              if (event.terminal.started) {
-                runAccounting.abandon(id, event.runId, event.terminal.reason);
-              }
-              return;
-            }
-            runAccounting.complete(id, event.runId, event.terminal.result);
-          },
-        });
-        ctx.lifecycle.add({
-          onQueued: (event) => {
-            mesh.recordEvent({
-              kind: "run_queued",
-              actorId: id,
-              detail: event.mode,
-            });
-          },
-          onStart: (event) => {
-            const launchConfig = projectActorRunLaunchConfig(event.selected);
-            runLogger(id, event.runId).info("run_start", {
-              provider: launchConfig.provider,
-              model: launchConfig.model,
-              effort: launchConfig.effort,
-              responsive: event.responsive,
-            });
-            mesh.recordEvent({
-              kind: "run_start",
-              actorId: id,
-              detail: event.injectRecord
-                ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
-                : undefined,
-              body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
-              payload: JSON.stringify({
-                provider: launchConfig.provider,
-                model: launchConfig.model,
-                effort: launchConfig.effort,
-                responsive: event.responsive,
-                runId: event.runId,
-              }),
-            });
-          },
-          onError: (event) => {
-            runLogger(id, event.runId).error("run_error", {
-              error: event.error instanceof Error ? event.error.message : String(event.error),
-            });
-          },
-          onEnd: async (event) => {
-            activeRunSelections.delete(id);
-            if (event.terminal.kind === "abandoned") {
-              runLogger(id, event.runId).warn("run_abandoned", {
-                reason: event.terminal.reason,
-                started: event.terminal.started,
-              });
-              mesh.recordEvent({
-                kind: "run_abandoned",
-                actorId: id,
-                detail: event.terminal.reason,
-                payload: JSON.stringify({
-                  started: event.terminal.started,
-                } satisfies RunAbandonedPayload),
-              });
-              return;
-            }
-            const { result } = event.terminal;
-            logRunEnd(runLogger(id, event.runId), result);
-            mesh.recordEvent({
-              kind: "run_end",
-              actorId: id,
-              success: result.success,
-              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-              body: result.output,
-              payload: runEndPayload({ ...result, runId: event.runId }),
-            });
-          },
-        });
-        ctx.lifecycle.add({
-          onEnd: async (event) => {
-            if (event.terminal.kind === "abandoned") return;
-            const { result } = event.terminal;
-            const compacted = await compactPortableActorAfterRun(id);
-            if (compacted) {
-              mesh.recordEvent({
-                kind: "portable_context_compacted",
-                actorId: id,
-                detail: describeCompaction(compacted),
-                body: JSON.stringify(compacted),
-              });
-            }
-            if (!result.success && !result.capped) {
-              await routeRunFailure(
-                failureSink,
-                id,
-                result,
-                formatProviderLabel(
-                  {
-                    providerName: lastSelected.provider,
-                    model: lastSelected.model,
-                    effort: lastSelected.effort,
-                  },
-                  result.model
-                )
-              );
-            }
-          },
-        });
+        addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -3007,6 +3093,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+  // Stops the root and any live workers; the actor repository is untouched.
+  resources.acquire("actor mesh", () => mesh.shutdownAll());
   if (followerHub) {
     followerHub.onRegister((follower) => {
       for (const record of actors.list()) {
@@ -3076,21 +3164,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
-  // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
-  // for the root, which has no parent — to the statically configured error chat.
-  // The raw delivery to the human's error chat.
-  const sendToErrorChat = sendErrorSink
-    ? (text: string) => {
-        void sendErrorSink(text).catch((err) => {
-          console.warn(
-            `[failure-sink] error chat post failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        });
-      }
-    : null;
-  // Governor: alert eagerly on the first failure, then coalesce a storm into one
-  // summary per growing window (so a rate-limit cascade can't DM the human 14×).
-  const errorNotifier = sendToErrorChat ? new CoalescingNotifier({ send: sendToErrorChat }) : null;
   webhookSilenceDetector = new WebhookSilenceDetector({
     notify: sendToErrorChat ?? undefined,
     log: (m) => console.warn(m),
@@ -3183,30 +3256,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
-      select: (entryIds, obligationId) => {
-        const runId = runAccounting.activeRunId(rootId);
-        if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
-        let focus: ResolvedInboxFocus | undefined;
-        const entries = mesh.selectInboxEntries(
-          rootId,
-          entryIds,
-          (selectedEntries) => {
-            focus = inboxFocusResolver.select({
-              runId,
-              actorId: rootId,
-              entries: selectedEntries,
-              explicitObligationId: obligationId,
-            });
-          },
-          obligationId
-        );
-        if (!focus) throw new Error(`run focus was not resolved for actor: ${rootId}`);
-        return {
-          entries,
-          focus,
-          discipline: mesh.runDisciplineNotice(rootId),
-        };
-      },
+      select: inboxSelectFor(rootId),
       selected: () => mesh.selectedInboxEntries(rootId),
       onHandled: () => mesh.inboxHandled(rootId),
       isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
@@ -3314,123 +3364,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mesh.actorRuntimeStateChanged(rootId, state)
         )
       : null;
-  // Which entry actually ran, for the failure-notice label. Root's declared
-  // pool can move while idle, so this is captured at lifecycle start.
-  let rootLastSelected: RawProviderModelConfig = rootBootModelConfig.modelConfig[0];
   const rootLifecycle = mesh.lifecycleFor(rootId);
-  rootLifecycle.add({
-    onStart: (event) => {
-      rootLastSelected = event.selected;
-      mesh.clearSelection(rootId);
-      const launchConfig = projectActorRunLaunchConfig(event.selected);
-      runAccounting.begin(rootId, event.runId, launchConfig);
-    },
-    onEnd: (event) => {
-      if (event.terminal.kind === "abandoned") {
-        if (event.terminal.started) {
-          runAccounting.abandon(rootId, event.runId, event.terminal.reason);
-        }
-        return;
-      }
-      runAccounting.complete(rootId, event.runId, event.terminal.result);
-    },
-  });
-  rootLifecycle.add({
-    onQueued: (event) => {
-      mesh.recordEvent({
-        kind: "run_queued",
-        actorId: rootId,
-        detail: event.mode,
-      });
-    },
-    onStart: (event) => {
-      const launchConfig = projectActorRunLaunchConfig(event.selected);
-      runLogger(rootId, event.runId).info("run_start", {
-        provider: launchConfig.provider,
-        model: launchConfig.model,
-        effort: launchConfig.effort,
-        responsive: event.responsive,
-      });
-      mesh.recordEvent({
-        kind: "run_start",
-        actorId: rootId,
-        detail: event.injectRecord
-          ? `ctx ${event.injectRecord.bytes}B/${event.injectRecord.runCount}r/${event.injectRecord.hash.slice(0, 12)}`
-          : undefined,
-        body: event.injectRecord ? JSON.stringify(event.injectRecord) : undefined,
-        payload: JSON.stringify({
-          provider: launchConfig.provider,
-          model: launchConfig.model,
-          effort: launchConfig.effort,
-          responsive: event.responsive,
-          runId: event.runId,
-        }),
-      });
-    },
-    onError: (event) => {
-      runLogger(rootId, event.runId).error("run_error", {
-        error: event.error instanceof Error ? event.error.message : String(event.error),
-      });
-    },
-    onEnd: async (event) => {
-      activeRunSelections.delete(rootId);
-      if (event.terminal.kind === "abandoned") {
-        runLogger(rootId, event.runId).warn("run_abandoned", {
-          reason: event.terminal.reason,
-          started: event.terminal.started,
-        });
-        mesh.recordEvent({
-          kind: "run_abandoned",
-          actorId: rootId,
-          detail: event.terminal.reason,
-          payload: JSON.stringify({
-            started: event.terminal.started,
-          } satisfies RunAbandonedPayload),
-        });
-        return;
-      }
-      const { result } = event.terminal;
-      logRunEnd(runLogger(rootId, event.runId), result);
-      mesh.recordEvent({
-        kind: "run_end",
-        actorId: rootId,
-        success: result.success,
-        detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-        body: result.output,
-        payload: runEndPayload({ ...result, runId: event.runId }),
-      });
-    },
-  });
-  rootLifecycle.add({
-    onEnd: async (event) => {
-      if (event.terminal.kind === "abandoned") return;
-      const { result } = event.terminal;
-      const compacted = await compactPortableActorAfterRun(rootId);
-      if (compacted) {
-        mesh.recordEvent({
-          kind: "portable_context_compacted",
-          actorId: rootId,
-          detail: describeCompaction(compacted),
-          body: JSON.stringify(compacted),
-        });
-      }
-      if (!result.success && !result.capped) {
-        await routeRunFailure(
-          failureSink,
-          rootId,
-          result,
-          formatProviderLabel(
-            {
-              providerName: rootLastSelected.provider,
-              model: rootLastSelected.model,
-              effort: rootLastSelected.effort,
-            },
-            result.model
-          )
-        );
-      }
-    },
-  });
+  addRunLifecycleListeners(rootLifecycle, rootId, rootBootModelConfig.modelConfig[0]);
   let root: MeshActor;
   const rootActorOptions: ActorOptions = {
     id: rootId,
@@ -3602,6 +3537,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     admissionQueue.refresh();
     return resumed;
   };
+  let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  resources.acquire("halt expiry timer", () => {
+    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
+    haltExpiryTimer = null;
+  });
   const scheduleHaltExpiry = (until?: string) => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     haltExpiryTimer = null;
@@ -3832,6 +3772,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           : undefined,
       })
     : null;
+  if (webhookServer) resources.acquire("webhook server", () => webhookServer.close());
   // Walkie-talkie routes require the selected transcription provider key.
   // Speech provider keys stay on the host. Actor TTS is selected per reply.
   voiceService =
@@ -3996,12 +3937,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         voice: voiceService ? { service: voiceService } : undefined,
       })
     : null;
-  if (dashboardServer) console.log(`[dashboard] http://${dashboardBindHost}:${dashboardPort}`);
+  if (dashboardServer) {
+    resources.acquire("dashboard server", () => dashboardServer.close());
+    console.log(`[dashboard] http://${dashboardBindHost}:${dashboardPort}`);
+  }
 
   // ── Google Chat inbound (optional; disabled when config.chat is absent) ──
-  let chatSource: ChatSource | null = null;
-  let slackSource: SlackSocketSource | null = null;
-  let weSubscriber: WorkspaceEventsSubscriber | null = null;
   if (config.chat && chatClient) {
     const cc = chatClient;
     // The inbound handler is the same for the real puller and the e2e fake: a
@@ -4177,8 +4118,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
     if (opts?.e2e?.chatSource) {
       // e2e: an injected fake source — skip the real pubsub/OAuth subscription.
-      chatSource = opts.e2e.chatSource;
-      await chatSource.start(onChat);
+      const source = opts.e2e.chatSource;
+      await source.start(onChat);
+      resources.acquire("chat source", () => source.close());
       console.log("[chat] e2e fake chat source active");
     } else if (gchat) {
       const g = gchat;
@@ -4212,18 +4154,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           }
         };
-        weSubscriber = new WorkspaceEventsSubscriber({
+        const subscriber = new WorkspaceEventsSubscriber({
           topic,
           getToken: () => oauth.token(),
           logger: chatLogger,
           onLapse,
         });
+        resources.acquire("chat subscription", () => subscriber.close());
         // Resolves whether or not the first pass succeeded: the subscriber logs
         // `chat_subscription_*` records and keeps retrying with backoff, so a
         // failure here never blocks the puller below.
-        await weSubscriber.start();
+        await subscriber.start();
 
-        chatSource = new PubsubChatSource({
+        const source = new PubsubChatSource({
           projectId: config.chat.projectId,
           subscription: config.chat.subscription,
           keyFilename: config.chat.pubsubKeyPath,
@@ -4232,20 +4175,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           listSpaceMembers: (space, options) => g.listSpaceMembers(space, options),
           log: (m) => console.log(`[chat] ${m}`),
         });
-        await chatSource.start(onChat);
+        await source.start(onChat);
+        resources.acquire("chat source", () => source.close());
         console.log(`[chat] puller active as ${identity.email ?? identity.userId}`);
       } catch (err) {
         console.error(
           `[chat] failed to start chat puller: ${err instanceof Error ? err.message : String(err)}`
         );
-        chatSource = null;
       }
     }
   }
 
   if (slackClient && config.slack && slackAppToken) {
     try {
-      slackSource = new SlackSocketSource(
+      const source = new SlackSocketSource(
         slackAppToken,
         (err) =>
           log.error("slack_event_failed", {
@@ -4253,7 +4196,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           }),
         (event) => log.info("slack_event_received", event)
       );
-      await slackSource.start(async (msg) => {
+      await source.start(async (msg) => {
         await mesh.deliverExternalEvent({
           sourceType: "slack",
           rawPayload: {
@@ -4268,14 +4211,51 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
         log.info("slack_message_delivered", { channel: msg.channel, eventId: msg.eventId });
       });
+      resources.acquire("slack source", () => source.close());
       log.info("slack_socket_active");
     } catch (err) {
       log.error("slack_socket_start_failed", {
         error: err instanceof Error ? err.message : String(err),
       });
-      slackSource = null;
     }
   }
+
+  let running = true;
+  // Two phases. Stopping the supervised e2e unit comes first and is not yet a
+  // commitment: if systemctl fails, the mesh stays up and a later signal
+  // retries rather than orphaning the instance. Once it succeeds, shutdown is
+  // committed and every acquired resource is released, newest first, with
+  // each failure contained and logged by the scope.
+  const shutdown = async (reason: "deploy" | null = null) => {
+    if (!running) return;
+    e2eInstance.stopForMeshShutdown();
+    running = false;
+    console.log("\n🛑 Shutting down...");
+    await resources.close();
+    process.off("SIGINT", onShutdownSignal);
+    process.off("SIGTERM", onShutdownSignal);
+    log.info("service_stopped", { reason });
+    process.exit(getShutdownExitCode(reason));
+  };
+  const onShutdownSignal = () => {
+    shutdown().catch((err) =>
+      log.error("shutdown_not_committed", {
+        err,
+        action: "the service is still running; signal again to retry shutdown",
+      })
+    );
+  };
+  // Installed before readiness is announced: until a listener exists, a
+  // signal takes its default action and kills the process unreleased. A
+  // committed shutdown removes them at its very end, so a repeated signal
+  // during release is absorbed; if boot fails first, the scope removes them.
+  process.on("SIGINT", onShutdownSignal);
+  process.on("SIGTERM", onShutdownSignal);
+  resources.acquire("shutdown signal handlers", () => {
+    if (!running) return;
+    process.off("SIGINT", onShutdownSignal);
+    process.off("SIGTERM", onShutdownSignal);
+  });
 
   console.log("\n✓ Root actor live. Waiting for events...\n");
 
@@ -4298,119 +4278,39 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   followerHub?.armReconciliation();
 
   // ── Lifecycle ──
-  let running = true;
-  let webhookSilenceCheck: ReturnType<typeof setInterval> | null = null;
-  let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
-  let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
-  let quotaHistoryCheck: ReturnType<typeof setInterval> | null = null;
-  let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
+  // Recurring maintenance jobs. Each interval is released by the scope that
+  // owns every other resource, so shutdown and a failed boot stop them alike.
+  const everyInterval = (resource: string, tick: () => void, ms: number) => {
+    const handle = setInterval(tick, ms);
+    handle.unref?.();
+    resources.acquire(resource, () => clearInterval(handle));
+  };
   // The interval handle says nothing about a probe already in flight, so keep
   // both a way to stop one (the signal) and a way to wait for it (the promise).
+  // Acquired before the probe interval, so the interval stops first and no new
+  // probe starts behind the abort. Abort reaches the probe running now - it
+  // kills the spawned tree synchronously - and awaiting it is what gives the
+  // prober's `finally` a turn to remove its temp dir before the database
+  // closes and process.exit ends the loop.
   const modelProbeAbort = new AbortController();
   let modelProbeInFlight: Promise<void> | null = null;
-  const shutdown = async (reason: "deploy" | null = null) => {
-    if (!running) return;
-    // Stop the supervised e2e unit before committing this process to shutdown.
-    // If systemctl fails, keep the mesh alive and let a later signal retry; do
-    // not orphan the instance by proceeding to process.exit.
-    e2eInstance.stopForMeshShutdown();
-    running = false;
-    console.log("\n🛑 Shutting down...");
-    if (webhookSilenceCheck) clearInterval(webhookSilenceCheck);
-    if (diskAlertCheck) clearInterval(diskAlertCheck);
-    if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
-    if (quotaHistoryCheck) clearInterval(quotaHistoryCheck);
-    if (modelProbeCheck) clearInterval(modelProbeCheck);
-    // Clearing the interval only stops the next probe. Abort reaches the one
-    // running now - it kills the spawned tree synchronously - and awaiting it
-    // is what gives the prober's `finally` a turn to remove its temp dir before
-    // process.exit ends the loop. Without the await the tree still dies, but the
-    // 0-byte socket dir it left behind never gets cleaned up.
+  resources.acquire("model catalog probe", async () => {
     modelProbeAbort.abort();
     if (modelProbeInFlight) await modelProbeInFlight;
-    if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    mesh.shutdownAll(); // stops the root and any live workers (repository untouched)
-    errorNotifier?.close(); // cancel any pending coalesced failure summary
-    if (weSubscriber) {
-      try {
-        await weSubscriber.close();
-      } catch {
-        /* already closed */
-      }
-    }
-    if (chatSource) {
-      try {
-        await chatSource.close();
-      } catch {
-        /* already closed */
-      }
-    }
-    if (slackSource) {
-      try {
-        await slackSource.close();
-      } catch {
-        /* already closed */
-      }
-    }
-    try {
-      await webhookServer?.close();
-    } catch {
-      /* already closed */
-    }
-    if (dashboardServer) {
-      try {
-        await dashboardServer.close();
-      } catch {
-        /* already closed */
-      }
-    }
-    try {
-      await mcpHttp.close();
-    } catch {
-      /* already closed */
-    }
-    if (followerHub) {
-      try {
-        await followerHub.close();
-      } catch {
-        /* already closed */
-      }
-    }
-    if (gitBridgeServer) {
-      try {
-        if (typeof gitBridgeServer.closeAllConnections === "function") {
-          gitBridgeServer.closeAllConnections();
-        }
-        await new Promise<void>((resolve) => gitBridgeServer.close(() => resolve()));
-      } catch {
-        /* already closed */
-      }
-    }
-    // `closeDb()` below drops the repository container, but the listener it
-    // holds is a closure over this `runStart`'s `readyHeadSink`. Clearing the
-    // sink first stops a dead mesh being reachable through that closure, and
-    // clearing the sink rather than the listener avoids touching the database
-    // on a shutdown path that is about to close it.
-    readyHeadSink = undefined;
-    prerequisiteCancellationSink = undefined;
-    closeDb();
-    log.info("service_stopped", { reason });
-    process.exit(getShutdownExitCode(reason));
-  };
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  });
 
   // Webhook delivery silence needs sub-hour signal: a 10-minute check keeps the
   // default 45-minute threshold close to its intended alert window.
-  webhookSilenceCheck = setInterval(
+  everyInterval(
+    "webhook silence check",
     () => void webhookSilenceDetector?.check(),
     WEBHOOK_SILENCE_CHECK_INTERVAL_MS
   );
-  webhookSilenceCheck.unref?.();
 
   if (quotaThrottleEnabled) {
     // The coordinator tick interval keeps pacers informed on the configured cadence.
-    quotaThrottleCheck = setInterval(
+    everyInterval(
+      "quota throttle tick",
       () => {
         void tickQuotaThrottle().catch((err) => {
           console.warn(
@@ -4420,12 +4320,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
-    quotaThrottleCheck.unref?.();
   }
   if (quotaCoordinatorClient) {
     // History cache refresh runs on the same cadence but is not gated on
     // throttling: the dashboard reads history through the client either way.
-    quotaHistoryCheck = setInterval(
+    everyInterval(
+      "quota history refresh",
       () => {
         void refreshQuotaHistory().catch((err) => {
           log.warn("quota_history_interval_failed", {
@@ -4435,7 +4335,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
-    quotaHistoryCheck.unref?.();
   }
 
   const diskAlertConfig = config.observability?.diskAlert;
@@ -4487,11 +4386,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       opts?.e2e?.diskAlertDeps
     );
     diskAlert = activeDiskAlert;
-    diskAlertCheck = setInterval(
+    everyInterval(
+      "disk alert check",
       () => void activeDiskAlert.check(),
       diskAlertSettings.intervalSeconds * 1000
     );
-    diskAlertCheck.unref?.();
   } else {
     log.info("disk_alert_disabled", { detail: "observability.diskAlert.enabled is false" });
   }
@@ -4508,7 +4407,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         `[start] model catalog probe failed: ${err instanceof Error ? err.message : String(err)}`
       );
     });
-    modelProbeCheck = setInterval(
+    everyInterval(
+      "model catalog probe interval",
       () => {
         if (!running) return;
         modelProbeInFlight = refreshConfiguredProviderModelCatalogs({
@@ -4524,7 +4424,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       24 * 60 * 60 * 1000
     );
-    modelProbeCheck.unref?.();
   }
 
   // E2E: now that every edge is wired and shutdown exists, hand the driving
