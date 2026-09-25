@@ -79,8 +79,13 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
 export class FollowerHub {
   readonly leaderToken = randomBytes(16).toString("hex");
   private static readonly MAX_TRACKED_FOLLOWERS = 128;
+  private static readonly STALE_AFTER_MS = 45_000;
   private readonly log: Logger;
   private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
+  /** Followers for which the current lapsed-contact interval has been reported. */
+  private readonly staleFollowerIds = new Set<string>();
+  /** Generations that a confirmed replacement made permanently stale. */
+  private readonly supersededGenerations = new Map<string, Set<string>>();
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
   private onRegisterListeners: ((follower: RemoteInstance) => void)[] = [];
@@ -91,8 +96,19 @@ export class FollowerHub {
   private sweep = setInterval(() => this.sweepFollowers(), 5000);
   private sweepFollowers(): void {
     const now = Date.now();
+    // Contact age is advisory. It gates new dispatch but does not prove that a
+    // follower process or any in-flight provider run has ended.
     for (const follower of this.followers.values()) {
-      if (now - follower.seen > 45_000) this.drop(follower, "expired");
+      if (
+        now - follower.seen > FollowerHub.STALE_AFTER_MS &&
+        !this.staleFollowerIds.has(follower.id)
+      ) {
+        this.staleFollowerIds.add(follower.id);
+        this.log.warn("follower_contact_stale", {
+          followerId: follower.id,
+          lastSeen: new Date(follower.seen).toISOString(),
+        });
+      }
     }
     for (const [id, tracker] of this.dedupeTrackers) {
       if (!this.followers.has(id) && now - tracker.lastSeen > 3600_000) {
@@ -189,6 +205,7 @@ export class FollowerHub {
   ): FollowerUpdateStatus {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
+    follower.assertDispatchable();
     if (follower.isUpdateInProgress()) {
       throw new Error(`Follower ${followerId} already has an update in progress`);
     }
@@ -244,7 +261,19 @@ export class FollowerHub {
   createHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
+    follower.assertDispatchable();
     const host = follower.createHost(actorId);
+    host.once("exit", () => {
+      for (const [key, route] of this.routes)
+        if (route.actorId === actorId) this.routes.delete(key);
+    });
+    return host;
+  }
+  /** Reattach a persisted leader actor to the same follower process generation. */
+  rebindHost(followerId: string, actorId: string): ActorChannel {
+    const follower = this.followers.get(followerId);
+    if (!follower) throw new Error(`Follower ${followerId} is not connected`);
+    const host = follower.rebindHost(actorId);
     host.once("exit", () => {
       for (const [key, route] of this.routes)
         if (route.actorId === actorId) this.routes.delete(key);
@@ -298,24 +327,24 @@ export class FollowerHub {
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
-  private drop(
-    follower: RemoteInstance,
-    reason: "disconnected" | "expired" = "disconnected"
-  ): void {
+  private drop(follower: RemoteInstance): void {
     this.followers.delete(follower.id);
+    this.staleFollowerIds.delete(follower.id);
     follower.close();
-    if (reason === "expired") {
-      this.log.warn("follower_expired", {
-        followerId: follower.id,
-        lastSeen: new Date(follower.seen).toISOString(),
-      });
-    } else {
-      this.log.info("follower_disconnected", {
-        followerId: follower.id,
-        platform: follower.platform,
-        pid: follower.pid,
-      });
+    this.log.info("follower_disconnected", {
+      followerId: follower.id,
+      platform: follower.platform,
+      pid: follower.pid,
+    });
+  }
+
+  private supersedeGeneration(follower: RemoteInstance): void {
+    let generations = this.supersededGenerations.get(follower.id);
+    if (!generations) {
+      generations = new Set();
+      this.supersededGenerations.set(follower.id, generations);
     }
+    generations.add(follower.generation);
   }
 
   private getDedupeTracker(followerId: string): FollowerDedupeTracker {
@@ -419,13 +448,46 @@ export class FollowerHub {
         typeof body.id !== "string" ||
         !/^[a-zA-Z0-9_-]{1,64}$/.test(body.id) ||
         typeof body.platform !== "string" ||
-        typeof body.pid !== "number"
+        typeof body.pid !== "number" ||
+        typeof body.generation !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,128}$/.test(body.generation)
       ) {
         throw new Error("Invalid follower identity");
       }
-      if (this.followers.has(body.id)) {
-        reply(res, 409, { error: "Follower already connected" });
+      const existing = this.followers.get(body.id);
+      const superseded = this.supersededGenerations.get(body.id);
+      if (superseded?.has(body.generation)) {
+        // An older process must never reclaim this ID, even after its newer
+        // replacement has stopped; its session and any queued work are stale.
+        reply(res, 409, { error: "Follower generation was superseded" });
         return;
+      }
+      if (existing) {
+        if (existing.generation === body.generation) {
+          existing.renewSession();
+          this.staleFollowerIds.delete(existing.id);
+          this.log.info("follower_reconnected", {
+            followerId: existing.id,
+            generation: existing.generation,
+          });
+          for (const listener of this.onRegisterListeners) {
+            try {
+              listener(existing);
+            } catch (err) {
+              this.log.warn("follower_register_listener_error", { followerId: existing.id, err });
+            }
+          }
+          reply(res, 200, {
+            session: existing.session,
+            protocolVersion: INSTANCE_PROTOCOL_VERSION,
+            leaderToken: this.leaderToken,
+          });
+          return;
+        }
+        // The enrollment secret authenticates both requests; generation proves
+        // this is a new process and is the only transport event that ends old work.
+        this.supersedeGeneration(existing);
+        this.drop(existing);
       }
       const commitSha =
         typeof body.commitSha === "string" && isFullCommitSha(body.commitSha)
@@ -438,9 +500,12 @@ export class FollowerHub {
         body.pid,
         tracker,
         commitSha,
-        body.protocolVersion as number
+        body.protocolVersion as number,
+        body.generation,
+        FollowerHub.STALE_AFTER_MS
       );
       this.followers.set(follower.id, follower);
+      this.staleFollowerIds.delete(follower.id);
       this.log.info("follower_connected", {
         followerId: follower.id,
         platform: follower.platform,
@@ -467,8 +532,9 @@ export class FollowerHub {
       return;
     }
     follower.seen = Date.now();
+    this.staleFollowerIds.delete(follower.id);
     if (path === "/unregister") {
-      this.drop(follower, "disconnected");
+      this.drop(follower);
       reply(res, 200, {});
       return;
     }

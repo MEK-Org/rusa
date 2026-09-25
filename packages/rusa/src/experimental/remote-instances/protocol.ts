@@ -6,7 +6,7 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 4;
+export const INSTANCE_PROTOCOL_VERSION = 5;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
