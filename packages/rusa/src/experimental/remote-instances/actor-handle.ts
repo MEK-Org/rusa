@@ -248,13 +248,6 @@ export class ActorHandle implements MeshActor {
     this.send({ type: "stop" });
   }
 
-  /** Mark the current transport unavailable while preserving leader-owned run state. */
-  detachHost(): void {
-    if (this.terminated) return;
-    this.channel.removeAllListeners();
-    this.disconnect();
-  }
-
   /** A transport loss is recoverable: keep only what attachHost can still act on. */
   private disconnect(): void {
     if (this.closed) return;
