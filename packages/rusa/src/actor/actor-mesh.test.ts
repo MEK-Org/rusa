@@ -7613,19 +7613,21 @@ describe("ActorMesh", () => {
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
 
-      // Recipient liveness, the durable append, and the wake are one turn.
-      // Suspend anywhere between them and a retirement lands after a recipient
-      // was resolved as live: the row is still written (SqliteInboxRepository.append
+      // Recipient liveness and the durable append are one turn. Suspend
+      // between them and a retirement lands after a recipient was resolved as
+      // live: the row is still written (SqliteInboxRepository.append
       // validates only non-empty actor ids, and the inbox table has no actor
-      // foreign key), leaving durable unhandled work nobody alive can take,
-      // and the wake then fails. A microtask queued before the call is the
-      // tightest interleaving available — it runs at the first suspension
-      // point inside delivery, if the code has one at all. This now runs
+      // foreign key), leaving durable unhandled work nobody alive can take.
+      // The wake is not part of that turn: the after-commit seam issues it a
+      // microtask later (#632), so here it runs after the retirement and is
+      // refused, and this case asserts nothing about it. A microtask queued
+      // before the call is the tightest interleaving available — it runs at
+      // the first suspension point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
       // Under #540, an actor cannot retire while holding a live event subscription.
       // A directed target targets the worker without a subscription blocker on worker,
-      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // while exercising the exact same synchronous liveness-check -> append
       // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
@@ -8108,17 +8110,21 @@ describe("ActorMesh", () => {
         source: string;
         payload: { type: string; [key: string]: unknown };
       }> = [];
+      const appendListeners: Array<(items: readonly InboxEntry[]) => void> = [];
       const inboxStore = {
         append: (inputs: typeof appended) => {
           order.push("persist");
           appended.push(...inputs);
-          return inputs.map((input, index) => ({
+          const inserted = inputs.map((input, index) => ({
             ...input,
             id: `entry-${index}`,
             deliveredAt: new Date("2026-01-01T00:00:00Z"),
             seenAt: null,
             handledAt: null,
+            handledNote: null,
           }));
+          for (const listener of appendListeners) listener(inserted);
+          return inserted;
         },
         markSeen: () => {
           order.push("seen");
@@ -8137,9 +8143,12 @@ describe("ActorMesh", () => {
             (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
           ).length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
-        // Partial fake: it never notifies, so the only wake here is whatever the
-        // mesh path under test sends itself.
-        onItemsAppended: () => () => {},
+        // Event delivery no longer wakes its recipients itself (#632); the
+        // after-commit notification is the one wake, as in the durable store.
+        onItemsAppended: (listener: (items: readonly InboxEntry[]) => void) => {
+          appendListeners.push(listener);
+          return () => {};
+        },
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -8160,7 +8169,11 @@ describe("ActorMesh", () => {
         {
           actorId,
           source: "github:dummy-org/dummy-repo/issues/903",
-          payload: { type: "issue_comment.created", commentId: 4959289232 },
+          payload: {
+            type: "issue_comment.created",
+            commentId: 4959289232,
+            deliveryRole: "owner",
+          },
         },
       ]);
       expect(fake(actorId).calls).toHaveLength(1);
@@ -8917,8 +8930,17 @@ describe("ActorMesh", () => {
         await t.startRun(owner);
         await t.startRun(watcher);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
-        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
+
+        // Each copy carries the role it was routed under; the append seam, not
+        // the delivery call, turns that into preempt versus join (#632).
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([
+          [owner, "owner"],
+          [watcher, "subscriber"],
+        ]);
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
@@ -8961,13 +8983,47 @@ describe("ActorMesh", () => {
         await t.startRun(watcherA);
         await t.startRun(watcherB);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
 
+        expect(delivery.entries.map((entry) => entry.payload.deliveryRole)).toEqual([
+          "subscriber",
+          "subscriber",
+        ]);
         expect(t.signals.get(watcherA)?.aborted).toBe(false);
         expect(t.signals.get(watcherB)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([]);
         expect(t.unhandledResponsive(watcherA)).toHaveLength(1);
         expect(t.unhandledResponsive(watcherB)).toHaveLength(1);
+      });
+
+      it("coalesces one turn's mixed roles for an actor to the preempting wake, in either order", async () => {
+        // Fan-out destinations are deduplicated per event, so a mixed debt
+        // needs two appends before the drain: a subscriber copy plus any
+        // owner or unannotated row in the same turn (#632).
+        const t = setupTwoRunningActors();
+        const subscriberFirst = t.mesh.spawn({ charter: "subscriber first", parentId: "root" });
+        const ownerFirst = t.mesh.spawn({ charter: "owner first", parentId: "root" });
+        await t.startRun(subscriberFirst);
+        await t.startRun(ownerFirst);
+        const copy = (actorId: string, deliveryRole?: "owner" | "subscriber") =>
+          t.inboxStore.append([
+            {
+              actorId,
+              source: ISSUE,
+              payload: { ...payload("issues.opened"), priority: "responsive", deliveryRole },
+            },
+          ]);
+
+        copy(subscriberFirst, "subscriber");
+        copy(subscriberFirst, "owner");
+        copy(ownerFirst);
+        copy(ownerFirst, "subscriber");
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.signals.get(subscriberFirst)?.aborted).toBe(true);
+        expect(t.signals.get(ownerFirst)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([subscriberFirst, ownerFirst]);
       });
 
       it("still quick-starts an idle subscriber as responsive work", async () => {
@@ -8983,6 +9039,61 @@ describe("ActorMesh", () => {
         await vi.advanceTimersByTimeAsync(0);
 
         expect(t.runs.get(watcher)).toBe(1);
+        expect(t.preemptions()).toEqual([owner]);
+      });
+
+      it("persists a landed directive as the owner's copy and preempts its target", async () => {
+        // A directive makes its live target the sole owner and excludes
+        // subscribers, so it is the owner role rather than a third one (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        const target = t.mesh.spawn({ charter: "target", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(target);
+
+        const delivery = await t.mesh.deliverExternalEvent({
+          ...responsiveIssueEvent,
+          directedTarget: target,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([[target, "owner"]]);
+        expect(t.signals.get(target)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([target]);
+      });
+
+      it("routes by the role it computed, not one the raw event payload claims", async () => {
+        // The timer normalizer spreads `rawPayload`, so a `deliveryRole`
+        // inside it reaches the fan-out. Routing's answer must replace it in
+        // both directions before the seam reads it (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        for (const claimed of ["subscriber", "owner"] as const) {
+          await t.mesh.deliverExternalEvent({
+            ...responsiveIssueEvent,
+            rawPayload: { ...responsiveIssueEvent.rawPayload, deliveryRole: claimed },
+          });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+
+        const roles = (actorId: string) =>
+          t.unhandledResponsive(actorId).map((entry) => entry.payload.deliveryRole);
+        expect(roles(owner)).toEqual(["owner", "owner"]);
+        expect(roles(watcher)).toEqual(["subscriber", "subscriber"]);
+        // A claimed "subscriber" cannot turn the owner's wake into a join, and
+        // a claimed "owner" cannot make the subscriber's copy preempt.
+        expect(t.signals.get(owner)?.aborted).toBe(true);
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([owner]);
       });
 

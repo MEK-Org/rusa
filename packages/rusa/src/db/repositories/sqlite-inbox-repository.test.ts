@@ -131,6 +131,20 @@ describe("SqliteInboxRepository", () => {
     expect(store.countUnhandled("a")).toBe(0);
   });
 
+  it("accepts only the two delivery roles", () => {
+    // This repository is the only validateInboxPayload caller, so a validator
+    // that refused a valid role would otherwise surface only in production.
+    const role = (id: string, deliveryRole: string) => ({
+      id,
+      actorId: "a",
+      source: "chat",
+      payload: { type: "m", deliveryRole } as never,
+    });
+    expect(store.append([role("o", "owner"), role("s", "subscriber")])).toHaveLength(2);
+    expect(() => store.append([role("bad-role", "directed")])).toThrow(/payload\.deliveryRole/);
+    expect(store.read("a", "bad-role")).toBeNull();
+  });
+
   it("markHandled is owner-checked, all-or-nothing, and preserves the first timestamp", () => {
     store.append([
       { id: "a1", actorId: "a", source: "chat", payload: { type: "message.created" } },
