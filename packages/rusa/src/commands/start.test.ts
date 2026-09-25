@@ -7786,17 +7786,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     it("contains a failing disposer and still releases everything else", async () => {
+      writeConfig({ gitBridge: true, gitBridgePort: 9100 });
       const { mesh, shutdown } = await boot();
       shutdownFn = undefined;
-      vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
-        throw new Error("actor refused to stop");
-      });
+      const mcpClose = vi.spyOn(McpHttpServer.prototype, "close");
+      const gitBridge = gitHttpServerMock.servers[0];
+      if (!gitBridge) throw new Error("git bridge not started");
+      dbMock.closeDb.mockClear();
+      try {
+        vi.spyOn(mesh, "shutdownAll").mockImplementation(() => {
+          throw new Error("actor refused to stop");
+        });
 
-      await shutdown();
+        await shutdown();
 
-      expect(records("shutdown_disposer_failed")).toEqual([
-        expect.objectContaining({ resource: "actor mesh" }),
-      ]);
+        expect(records("shutdown_disposer_failed")).toEqual([
+          expect.objectContaining({ resource: "actor mesh" }),
+        ]);
+        // #389 requires attempting every later disposer even after a failure:
+        // the release must run past the mesh all the way to the database and
+        // the process still exits.
+        expect(mcpClose).toHaveBeenCalledOnce();
+        expect(gitBridge.close).toHaveBeenCalled();
+        expect(dbMock.closeDb).toHaveBeenCalledOnce();
+        expect(exitMock()).toHaveBeenCalledWith(0);
+      } finally {
+        mcpClose.mockRestore();
+      }
     });
 
     // Distinguishes post-handler boot failure from earlier pre-handler partial-boot tests.
@@ -7868,6 +7884,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
       await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(1));
       expect(dbMock.closeDb).toHaveBeenCalledOnce();
       expect(records("service_stopped")).toEqual([expect.objectContaining({ reason: "deploy" })]);
+    });
+
+    it("logs and stays up when the deploy shutdown aborts before commit", async () => {
+      const handles = await boot();
+      shutdownFn = undefined;
+      dbMock.closeDb.mockClear();
+      e2eInstanceManagerMock.stopForMeshShutdown.mockImplementationOnce(() => {
+        throw new Error("systemctl stop failed");
+      });
+
+      const updateDeps = handles.updateToolDepsFor?.("root");
+      expect(updateDeps).toBeDefined();
+      updateDeps?.deps.exit(0);
+
+      // The update orchestrator has already reported restarting by the time
+      // exit runs, so an abort here must be loud and must NOT exit: the
+      // service stays up (the mesh is drained) and a later signal retries.
+      await vi.waitFor(() => expect(records("shutdown_not_committed")).toHaveLength(1));
+      expect(records("shutdown_not_committed")[0]).toEqual(
+        expect.objectContaining({ reason: "deploy" })
+      );
+      expect(exitMock()).not.toHaveBeenCalled();
+      expect(dbMock.closeDb).not.toHaveBeenCalled();
+      expect(records("service_stopped")).toEqual([]);
     });
 
     it("closes the socket source immediately when slack startup fails", async () => {

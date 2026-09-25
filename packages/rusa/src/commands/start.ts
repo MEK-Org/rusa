@@ -1980,8 +1980,18 @@ async function composeStart(
         },
         // A successful self-update is a committed mesh shutdown; route through
         // shutdown("deploy") so all disposers are released in reverse order.
+        // If the pre-commit stop throws, shutdown never commits and the
+        // orchestrator has already reported restarting — log it (the detached
+        // rejection would otherwise be unhandled) and stay up so a later
+        // signal retries, exactly like the signal path.
         exit: (_code) => {
-          void shutdown("deploy");
+          shutdown("deploy").catch((err) =>
+            log.error("shutdown_not_committed", {
+              err,
+              reason: "deploy",
+              action: "self-update restart aborted before commit; the service is still running",
+            })
+          );
         },
         log: (m) => console.log(m),
       },
@@ -4252,37 +4262,6 @@ async function composeStart(
       })
     );
   };
-  // Installed before readiness is announced: until a listener exists, a
-  // signal takes its default action and kills the process unreleased. Handlers
-  // are acquired late so their disposer runs early in resources.close(),
-  // unconditionally unregistering them; if a disposer hangs or a second signal
-  // arrives during release, the default process action acts as an exit escape hatch.
-  process.on("SIGINT", onShutdownSignal);
-  process.on("SIGTERM", onShutdownSignal);
-  resources.acquire("shutdown signal handlers", () => {
-    process.off("SIGINT", onShutdownSignal);
-    process.off("SIGTERM", onShutdownSignal);
-  });
-
-  console.log("\n✓ Root actor live. Waiting for events...\n");
-
-  // Mechanical lifecycle ping : emitted by startup once the mesh is up.
-  // A lone "back online" with no preceding "updating" ping is the restart/crash signal.
-  if (sendToErrorChat) {
-    try {
-      postBackOnlinePing({ repoRoot: resolveRepoRoot(), sendToErrorChat });
-    } catch (err) {
-      console.warn(
-        `[start] back online ping failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-  }
-
-  // Boot survived: only now may an automatic leader-update trigger move followers.
-  // Arming here rather than at gateway bind is what keeps a leader that comes up far
-  // enough to open a socket and then dies from deploying followers onto the revision
-  // that killed it. Followers that connected earlier are reconciled by this call.
-  followerHub?.armReconciliation();
 
   // ── Lifecycle ──
   // Recurring maintenance jobs. Each interval is released by the scope that
@@ -4432,6 +4411,42 @@ async function composeStart(
       24 * 60 * 60 * 1000
     );
   }
+
+  // Signal handlers are acquired after every other resource and installed
+  // before readiness is announced. Being the LAST acquisition makes them the
+  // FIRST release: once shutdown commits, the scope unregisters them before
+  // any disposer runs, so the default signal action is back in force for the
+  // whole release and a second signal escapes a hung disposer (the awaited
+  // model probe above all). Until this line a signal takes its default action
+  // and kills the process unreleased — that pre-readiness contract is what
+  // the built-CLI smoke test pins.
+  process.on("SIGINT", onShutdownSignal);
+  process.on("SIGTERM", onShutdownSignal);
+  resources.acquire("shutdown signal handlers", () => {
+    process.off("SIGINT", onShutdownSignal);
+    process.off("SIGTERM", onShutdownSignal);
+  });
+
+  console.log("\n✓ Root actor live. Waiting for events...\n");
+
+  // Mechanical lifecycle ping : emitted by startup once the mesh is up.
+  // A lone "back online" with no preceding "updating" ping is the restart/crash signal.
+  if (sendToErrorChat) {
+    try {
+      postBackOnlinePing({ repoRoot: resolveRepoRoot(), sendToErrorChat });
+    } catch (err) {
+      console.warn(
+        `[start] back online ping failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // Boot survived: only now may an automatic leader-update trigger move followers.
+  // Arming after every acquisition and probe kickoff (rather than at gateway
+  // bind) is what keeps a leader that comes up far enough to open a socket and
+  // then dies from deploying followers onto the revision that killed it.
+  // Followers that connected earlier are reconciled by this call.
+  followerHub?.armReconciliation();
 
   // E2E: now that every edge is wired and shutdown exists, hand the driving
   // runner live handles so it can inject events and tear down deterministically.
