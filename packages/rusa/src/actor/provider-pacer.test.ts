@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConcurrencyLimiter } from "./concurrency-limiter.js";
-import { ProviderPacer, selectPoolLane, submitPoolGate } from "./provider-pacer.js";
+import {
+  ProviderPacer,
+  selectPoolLane,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 
 describe("ProviderPacer", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -767,5 +772,121 @@ describe("ProviderPacer", () => {
         responsive: false,
       });
     });
+  });
+});
+
+describe("UnifiedAdmissionQueue", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const laneFor = (config: string, intervalMs = 0) => ({
+    config,
+    lane: config,
+    pacer: new ProviderPacer(intervalMs, () => Date.now()),
+  });
+
+  it("lets an available lane synchronously claim the first compatible actor while retaining a blocked head", async () => {
+    const mesh = new ConcurrencyLimiter(2);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const delayed = laneFor("delayed", 60_000);
+    delayed.pacer.deferUntil(Date.now() + 1_000);
+    const available = laneFor("available");
+    const starts: string[] = [];
+
+    const first = queue.enqueue(
+      async (config) => {
+        starts.push(config);
+        return config;
+      },
+      [delayed],
+      { threadId: "first", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    const second = queue.enqueue(
+      async (config) => {
+        starts.push(config);
+        return config;
+      },
+      [available],
+      { threadId: "second", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(second.result).resolves.toBe("available");
+    expect(starts).toEqual(["available"]);
+    expect(queue.snapshot()).toEqual([expect.objectContaining({ threadId: "first", position: 0 })]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(first.result).resolves.toBe("delayed");
+    expect(starts).toEqual(["available", "delayed"]);
+  });
+
+  it("keeps unclaimed work reorderable and lets responsive work bypass the normal wait", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const delayed = laneFor("delayed", 60_000);
+    delayed.pacer.deferUntil(Date.now() + 60_000);
+    const started: string[] = [];
+    const run = (id: string) =>
+      queue.enqueue(
+        async () => {
+          started.push(id);
+          return id;
+        },
+        [delayed],
+        { threadId: id, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+    const one = run("one");
+    const two = run("two");
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["one", "two"]);
+    expect(queue.reorder("two", "one")).toBe(true);
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["two", "one"]);
+
+    one.promote();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(one.result).resolves.toBe("one");
+    expect(started).toEqual(["one"]);
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["two"]);
+    expect(two.cancel?.()).toBe(true);
+    await expect(two.result).rejects.toThrow(/cancelled before start/);
+  });
+
+  it("retains the exact candidate selected by a model-scoped lane", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    const queue = new UnifiedAdmissionQueue<{ provider: string; model: string }>();
+    const genericClaude = new ProviderPacer(0, () => Date.now());
+    const fableOnly = new ProviderPacer(0, () => Date.now());
+    const selected: string[] = [];
+
+    const fable = queue.enqueue(
+      async (candidate) => {
+        selected.push(`${candidate.provider}/${candidate.model}`);
+        return candidate.model;
+      },
+      [
+        {
+          config: { provider: "claude", model: "fable" },
+          // A model-scoped candidate has its own processor key. A generic
+          // Claude processor is therefore never allowed to claim it.
+          lane: "claude:fable",
+          pacer: fableOnly,
+        },
+      ],
+      { threadId: "fable", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+    queue.enqueue(
+      async (candidate) => candidate.model,
+      [
+        {
+          config: { provider: "claude", model: "generic" },
+          lane: "claude",
+          pacer: genericClaude,
+        },
+      ],
+      { threadId: "generic", enqueueNormal: (fn) => mesh.enqueue(fn) }
+    );
+
+    await expect(fable.result).resolves.toBe("fable");
+    expect(selected).toEqual(["claude/fable"]);
   });
 });

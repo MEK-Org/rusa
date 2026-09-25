@@ -622,3 +622,338 @@ export function submitPoolGate<C, T>(
     },
   };
 }
+
+/** A read-only entry in the leader-local, cross-lane admission queue. */
+export interface UnifiedAdmissionQueueSnapshot {
+  /** Owning actor; entries without an actor identity are intentionally omitted. */
+  threadId: string;
+  /** Zero-based position in the one global list, before lane compatibility filtering. */
+  position: number;
+  /**
+   * The current quote from this entry's best compatible lane, if one is
+   * available. This is a projection, never a reservation: an earlier item
+   * may claim that lane before this entry does.
+   */
+  estimatedStartAt: number | null;
+  /** Interval of the lane supplying `estimatedStartAt`, rounded for the wire. */
+  pacingIntervalMs: number;
+  responsive: boolean;
+}
+
+interface WaitingAdmission<C, T> {
+  fn: (config: C) => Promise<T>;
+  candidates: readonly PoolLaneCandidate<C>[];
+  opts: SubmitPoolGateOptions<C>;
+  responsive: boolean;
+  state: "waiting" | "claimed" | "settled";
+  inner?: RunStartHandle<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+  result: Promise<T>;
+}
+
+/**
+ * One leader-local waiting list shared by every provider lane.
+ *
+ * A lane is a processor rather than an owner of a private queue: whenever a
+ * lane can accept a normal start it synchronously scans this list and claims
+ * its first compatible actor. Claiming removes the item permanently and hands
+ * its exact declared candidate to the existing ProviderPacer/mesh-concurrency
+ * path. Therefore a restart needs no queue recovery — the durable inbox and
+ * RunManager dispatch reconciliation remain the source of truth — and the
+ * small after-claim-before-completion ambiguity is the same as any accepted
+ * in-memory run start.
+ */
+export class UnifiedAdmissionQueue<C> {
+  private readonly waiting: Array<WaitingAdmission<C, unknown>> = [];
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private draining = false;
+  private drainAgain = false;
+
+  constructor(private readonly now: () => number = () => Date.now()) {}
+
+  /**
+   * Append one actor's pending start, or place responsive work at the front.
+   * The returned handle can promote/cancel while the actor is still unclaimed;
+   * after a synchronous lane claim it delegates to the normal pacer handle.
+   */
+  enqueue<T>(
+    fn: (config: C) => Promise<T>,
+    candidates: readonly PoolLaneCandidate<C>[],
+    opts: SubmitPoolGateOptions<C>
+  ): RunStartHandle<T> {
+    if (candidates.length === 0) {
+      throw new Error("UnifiedAdmissionQueue requires at least one candidate");
+    }
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const result = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    const item: WaitingAdmission<C, T> = {
+      fn,
+      candidates,
+      opts,
+      responsive: opts.responsive === true,
+      state: "waiting",
+      resolve,
+      reject,
+      result,
+    };
+    this.insert(item as WaitingAdmission<C, unknown>);
+    this.drain();
+
+    return {
+      result,
+      get started() {
+        return item.inner?.started ?? false;
+      },
+      promote: () => this.promote(item),
+      cancel: () => this.cancel(item),
+    };
+  }
+
+  /** Side-effect-free global ordering for dashboard display and #570 controls. */
+  snapshot(): UnifiedAdmissionQueueSnapshot[] {
+    const now = this.now();
+    const snapshot: UnifiedAdmissionQueueSnapshot[] = [];
+    let position = 0;
+    for (const item of this.waiting) {
+      const candidate = selectPoolLane(this.healthy(item, item.responsive), now, {
+        responsive: item.responsive,
+      });
+      if (item.opts.threadId) {
+        snapshot.push({
+          threadId: item.opts.threadId,
+          position,
+          estimatedStartAt: candidate ? candidate.pacer.quote(now) : null,
+          pacingIntervalMs: candidate ? Math.round(candidate.pacer.interval) : 0,
+          responsive: item.responsive,
+        });
+      }
+      position++;
+    }
+    return snapshot;
+  }
+
+  /**
+   * Move an unclaimed actor before another unclaimed actor of the same
+   * priority. `beforeThreadId` omitted moves it to the end of its own priority
+   * partition. Claims and responsive priority are never rewritten.
+   */
+  reorder(threadId: string, beforeThreadId?: string): boolean {
+    const from = this.waiting.findIndex((item) => item.opts.threadId === threadId);
+    if (from < 0) return false;
+    const item = this.waiting[from];
+    if (!item || item.state !== "waiting") return false;
+    const priority = item.responsive;
+    this.waiting.splice(from, 1);
+
+    let target = -1;
+    if (beforeThreadId !== undefined) {
+      target = this.waiting.findIndex(
+        (candidate) =>
+          candidate.opts.threadId === beforeThreadId && candidate.responsive === priority
+      );
+      if (target < 0) {
+        this.waiting.splice(from, 0, item);
+        return false;
+      }
+    } else {
+      target = this.waiting.reduce(
+        (end, candidate, index) => (candidate.responsive === priority ? index + 1 : end),
+        0
+      );
+    }
+    this.waiting.splice(target, 0, item);
+    this.drain();
+    return true;
+  }
+
+  /** Re-quote live lane state after a quota/controller update. */
+  refresh(): void {
+    this.drain();
+  }
+
+  private insert(item: WaitingAdmission<C, unknown>): void {
+    if (!item.responsive) {
+      this.waiting.push(item);
+      return;
+    }
+    // Responsive arrivals keep their arrival order while remaining ahead of
+    // every normal entry. `promote` moves an existing actor to this same front.
+    const firstNormal = this.waiting.findIndex((candidate) => !candidate.responsive);
+    this.waiting.splice(firstNormal < 0 ? this.waiting.length : firstNormal, 0, item);
+  }
+
+  private promote<T>(item: WaitingAdmission<C, T>): void {
+    if (item.state === "claimed") {
+      item.inner?.promote();
+      return;
+    }
+    if (item.state !== "waiting" || item.responsive) return;
+    item.responsive = true;
+    const index = this.waiting.indexOf(item as WaitingAdmission<C, unknown>);
+    if (index >= 0) this.waiting.splice(index, 1);
+    this.waiting.unshift(item as WaitingAdmission<C, unknown>);
+    this.drain();
+  }
+
+  private cancel<T>(item: WaitingAdmission<C, T>): boolean {
+    if (item.state === "claimed") return item.inner?.cancel?.() ?? false;
+    if (item.state !== "waiting") return false;
+    this.settleWaiting(item, new RunStartCancelledError());
+    this.drain();
+    return true;
+  }
+
+  private drain(): void {
+    if (this.draining) {
+      this.drainAgain = true;
+      return;
+    }
+    this.draining = true;
+    try {
+      do {
+        this.drainAgain = false;
+        this.clearTimer();
+        this.claimResponsive();
+        this.claimNormal();
+        this.schedule();
+      } while (this.drainAgain);
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private claimResponsive(): void {
+    for (;;) {
+      const item = this.waiting.find((candidate) => candidate.responsive);
+      if (!item) return;
+      const selected = selectPoolLane(this.healthy(item, true), this.now(), { responsive: true });
+      if (!selected) {
+        this.settleWaiting(item, this.exhaustedError(item));
+        continue;
+      }
+      this.claim(item, selected);
+    }
+  }
+
+  private claimNormal(): void {
+    const processors = new Map<ProviderPacer, string>();
+    for (const item of this.waiting) {
+      if (item.responsive) continue;
+      for (const candidate of this.healthy(item, false)) {
+        processors.set(candidate.pacer, candidate.lane);
+      }
+    }
+    const now = this.now();
+    const available = [...processors.entries()]
+      .filter(([pacer]) => pacer.quote(now) <= now)
+      .sort(([a], [b]) => a.quote(now) - b.quote(now));
+    for (const [pacer, lane] of available) {
+      const item = this.waiting.find((candidate) => {
+        if (candidate.responsive) return false;
+        return this.healthy(candidate, false).some(
+          (entry) => entry.pacer === pacer && entry.lane === lane
+        );
+      });
+      if (!item) continue;
+      const selected = this.healthy(item, false).find(
+        (candidate) => candidate.pacer === pacer && candidate.lane === lane
+      );
+      if (selected) this.claim(item, selected);
+    }
+  }
+
+  private claim(item: WaitingAdmission<C, unknown>, selected: PoolLaneCandidate<C>): void {
+    const index = this.waiting.indexOf(item);
+    if (index < 0 || item.state !== "waiting") return;
+    this.waiting.splice(index, 1);
+    item.state = "claimed";
+    const selectedIndex = item.candidates.indexOf(selected);
+    const originalOnSelected = item.opts.onSelected;
+    const originalOnStarted = item.opts.onStarted;
+    const inner = submitPoolGate(item.fn, [selected], {
+      ...item.opts,
+      responsive: item.responsive,
+      onSelected: (selection) =>
+        originalOnSelected?.({
+          ...selection,
+          declaredIndex: selectedIndex,
+        }),
+      onStarted: () => {
+        originalOnStarted?.();
+        queueMicrotask(() => this.refresh());
+      },
+    });
+    item.inner = inner;
+    inner.result.then(
+      (value) => {
+        item.state = "settled";
+        item.resolve(value);
+      },
+      (error: unknown) => {
+        item.state = "settled";
+        item.reject(error);
+      }
+    );
+  }
+
+  private healthy(
+    item: WaitingAdmission<C, unknown>,
+    responsive: boolean
+  ): readonly PoolLaneCandidate<C>[] {
+    const live = item.opts.isHalted
+      ? item.candidates.filter((candidate) => !item.opts.isHalted?.(candidate.config))
+      : item.candidates;
+    // Match submitPoolGate's normal admission rule: a racing halt observation
+    // cannot manufacture a permanently unreservable pool.
+    const eligible = live.length > 0 ? live : item.candidates;
+    if (!responsive || !item.opts.isExhausted) return eligible;
+    return eligible.filter((candidate) => !item.opts.isExhausted?.(candidate.config));
+  }
+
+  private exhaustedError(item: WaitingAdmission<C, unknown>): Error {
+    return (
+      item.opts.onResponsivePoolExhausted?.(item.candidates.map((candidate) => candidate.config)) ??
+      new Error("model pool exhausted")
+    );
+  }
+
+  private settleWaiting<T>(item: WaitingAdmission<C, T>, error: Error): void {
+    const index = this.waiting.indexOf(item as WaitingAdmission<C, unknown>);
+    if (index >= 0) this.waiting.splice(index, 1);
+    item.state = "settled";
+    item.reject(error);
+  }
+
+  private schedule(): void {
+    if (this.waiting.length === 0) return;
+    const now = this.now();
+    let next: number | undefined;
+    for (const item of this.waiting) {
+      if (item.responsive) continue;
+      for (const candidate of this.healthy(item, false)) {
+        const quote = candidate.pacer.quote(now);
+        if (quote > now && (next === undefined || quote < next)) next = quote;
+      }
+    }
+    if (next === undefined) return;
+    this.timer = setTimeout(
+      () => {
+        this.timer = null;
+        this.drain();
+      },
+      Math.max(0, next - now)
+    );
+    this.timer.unref?.();
+  }
+
+  private clearTimer(): void {
+    if (this.timer === null) return;
+    clearTimeout(this.timer);
+    this.timer = null;
+  }
+}

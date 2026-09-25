@@ -4477,7 +4477,7 @@ export class ActorMesh {
     // opportunity; a live provider run has no pending reservation, so it keeps
     // its launched pool through its normal run boundary.
     const liveActor = this.runs.liveActor(id);
-    if (liveActor && this.requoteOrRetainQueuedRun(liveActor, validated)) {
+    if (liveActor && this.requeueQueuedRunForModelChange(liveActor, validated)) {
       return staged ? "staged" : "applied";
     }
 
@@ -4888,39 +4888,12 @@ export class ActorMesh {
   }
 
   /**
-   * Re-evaluate queued admissions pinned to a lane the quota coordinator has
-   * just reported exhausted, so each can re-pin to another pool entry or be
-   * held (#633). Matches on the recorded selection's `lane` — the canonical
-   * pacing key the coordinator reports — never the declared provider alias.
-   * A queued request with no recorded selection is pinned to nothing; its
-   * eventual quote already sees the deferred pacer.
-   *
-   * Stopgap: removed with the unified queueing model. Called only on a newly
-   * reported exhaustion — never on renewal, on a cadence, or any other trigger.
+   * Requeue a reservation after its actor's model pool was explicitly
+   * replaced. This is model-change recovery, not quota rebalancing: #672
+   * leaves unclaimed work in the shared admission list until a compatible lane
+   * claims it, so coordinator updates never cancel/re-pin active actors.
    */
-  reEvaluateExhaustedQueuedRuns(exhaustedLane: string): string[] {
-    const affected: string[] = [];
-    for (const [id, actor] of this.runs.liveEntries()) {
-      if (this.runs.selectionFor(id)?.lane !== exhaustedLane) continue;
-      if (this.requoteOrRetainQueuedRun(actor, this.launchModelConfig(id))) {
-        affected.push(id);
-      }
-    }
-    return affected;
-  }
-
-  /**
-   * Pass a queued reservation back through admission so provider selection
-   * can choose an eligible lane. When the pool has nowhere to land — every
-   * candidate halted, or the mesh shutting down — retain the work through the
-   * halt/resume path instead: `prepareRun` would drop the fresh re-admission,
-   * losing the opportunity. The question here is whether the pool has anywhere
-   * to go, so it checks the whole pool rather than the reserved lane. Normal
-   * halt processing clears a #633 reservation before this hook sees it; the
-   * all-halted branch is retained for the shared `setModelConfig` path.
-   * Returns whether a queued reservation was acted on.
-   */
-  private requoteOrRetainQueuedRun(
+  private requeueQueuedRunForModelChange(
     actor: MeshActor,
     modelConfig: readonly ProviderModelConfig[] | undefined
   ): boolean {

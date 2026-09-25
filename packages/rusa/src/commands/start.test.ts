@@ -1196,66 +1196,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         await close();
       }
     });
-
-    it("re-evaluates queued admissions only after a newly deferred coordinator exhaustion (#633)", async () => {
-      let claudeStatus = throttleStatus("claude");
-      const { mesh, close, pacerQuote, triggerQuotaThrottleTick } = await bootWithCoordinator(
-        () => ({ claude: claudeStatus }),
-        3600
-      );
-      try {
-        const reEvaluateSpy = vi
-          .spyOn(mesh, "reEvaluateExhaustedQueuedRuns")
-          .mockImplementation((lane) => {
-            // The production pacer has already consumed the coordinator's
-            // deadline, so a re-quote cannot reserve the exhausted lane.
-            expect(pacerQuote(lane)).toBeGreaterThan(Date.now());
-            return [];
-          });
-
-        // Initial unexhausted publication does not trigger re-evaluation.
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        // An incomplete or malformed expired publication cannot defer the
-        // pacer. Neither consumes the edge, so the later usable deadline does.
-        claudeStatus = throttleStatus("claude", { expired: true, exhaustedUntil: null });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "not-a-timestamp",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).not.toHaveBeenCalled();
-
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "2099-09-23T15:00:00.000Z",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-        expect(reEvaluateSpy).toHaveBeenCalledWith("claude");
-
-        // Revising a deadline while the lane remains deferred is not a new
-        // exhaustion edge, and neither is the subsequent renewal.
-        claudeStatus = throttleStatus("claude", {
-          expired: true,
-          exhaustedUntil: "2099-09-23T16:00:00.000Z",
-        });
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-
-        claudeStatus = throttleStatus("claude");
-        await triggerQuotaThrottleTick();
-        expect(reEvaluateSpy).toHaveBeenCalledTimes(1);
-      } finally {
-        await shutdownFn?.();
-        shutdownFn = undefined;
-        await close();
-      }
-    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
