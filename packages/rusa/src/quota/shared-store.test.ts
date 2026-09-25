@@ -1282,6 +1282,11 @@ describe("SharedQuotaStore PID integral term", () => {
       // Integrated dt must be bounded by 1800s, not 7200s
       expect(afterLongGap.integral).toBeCloseTo(afterLongGap.error * 1800, 4);
 
+      // A 10h outage adds at most one 1800s slot of area as well.
+      recordObservation(store, "kimi", "2030-01-01T12:00:00.000Z", 70, reset1);
+      const afterOutage = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
+      expect(afterOutage.integral).toBeCloseTo(afterLongGap.integral + afterOutage.error * 1800, 4);
+
       // Now simulate a window reset / refill: resetMoves or quotaRefilled
       const reset2 = "2030-01-15T00:00:00.000Z";
       recordObservation(store, "kimi", "2030-01-08T00:05:00.000Z", 98, reset2);

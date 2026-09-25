@@ -25,7 +25,7 @@ import {
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
-import type { QuotaFreshness } from "../quota/coordinator-protocol.js";
+import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
 import {
   hasSameQuotaWindowScope,
@@ -1150,21 +1150,15 @@ export class QuotaService {
     }
   }
 
-  private getTtlMs(provider: "claude" | "codex" | "agy" | "kimi"): number {
+  private getTtlMs(_provider: "claude" | "codex" | "agy" | "kimi"): number {
     if (this.deps.ttlMs !== undefined) {
       return this.deps.ttlMs;
     }
-    // #690: Routine provider readings target ~30 minutes across all providers
-    // (codex, claude, agy, kimi). Keep 30-minute probe cache floor so expensive
-    // interactive scrapes are not churned while QuotaCollectionLoop continues
-    // ticking fast (5m) for controller evaluation and manual observation ingestion.
-    switch (provider) {
-      case "claude":
-      case "agy":
-      case "codex":
-      case "kimi":
-        return 30 * 60 * 1000;
-    }
+    // #690: routine provider readings target ~30 minutes across all providers,
+    // so expensive interactive scrapes are not churned while QuotaCollectionLoop
+    // keeps ticking every 5m for controller evaluation and manual ingestion.
+    // Codex must not go lower until its placeholder handling lands.
+    return QUOTA_PROBE_TTL_MS;
   }
 
   /**

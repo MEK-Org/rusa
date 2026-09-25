@@ -92,12 +92,15 @@ export interface QuotaThrottleConfig {
   enabled?: boolean;
   /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
   maxIntervalSeconds?: number;
-  /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
+  /** Collection/controller tick in seconds. Default 300 (five minutes). Provider probes are cached for 30 minutes. */
   tickSeconds?: number;
-  /** Soft stale threshold in seconds for quota observations. Default 3600 (60 minutes) in manual mode or 3 * tickSeconds in scrape mode. */
-  staleSeconds?: number;
-  /** Hard stale threshold in seconds after which throttle widens to maxIntervalSeconds. Default 7200 (120 minutes) in manual mode or 3600 in scrape mode. */
-  hardStaleSeconds?: number;
+  /**
+   * Manual reading mode only: age in seconds past which the published interval
+   * widens to maxIntervalSeconds. Default 7200. Manual soft stale is
+   * min(3600, this). Scrape mode keeps soft = 30m probe TTL + 3 * tickSeconds
+   * and hard = 3600, and is not affected by this field.
+   */
+  manualHardStaleSeconds?: number;
 }
 
 export interface QuotaCoordinatorConfig {
@@ -105,10 +108,6 @@ export interface QuotaCoordinatorConfig {
   socketPath?: string;
   /** Relocated database path owned exclusively by the coordinator. */
   databasePath?: string;
-  /** Soft stale threshold in seconds for quota observations. Default 3600 (60 minutes) in manual mode or 3 * tickSeconds in scrape mode. */
-  staleSeconds?: number;
-  /** Hard stale threshold in seconds after which throttle widens to maxIntervalSeconds. Default 7200 (120 minutes) in manual mode or 3600 in scrape mode. */
-  hardStaleSeconds?: number;
   /**
    * Directory the daily `VACUUM INTO` backups are written to.
    * Defaults to a `backups/` directory beside the coordinator database, which

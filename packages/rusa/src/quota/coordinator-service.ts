@@ -14,13 +14,13 @@ import {
   COORDINATOR_PROTOCOL_MINOR,
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
-  DEFAULT_MANUAL_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
   isValidManualQuotaObservation,
   MANUAL_QUOTA_OBSERVATION_PATH,
   type ManualQuotaObservationResponse,
   manualQuotaObservationProblem,
+  manualSoftStaleAfterMs,
   type PublishedThrottleColdStatus,
   type PublishedThrottleLaneStatus,
   publishedThrottle,
@@ -89,7 +89,6 @@ export interface QuotaCoordinatorServiceOptions {
   maxIntervalSeconds?: number;
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
-  manualStaleAfterMs?: number;
   manualHardStaleAfterMs?: number;
   version?: string;
   now?: () => number;
@@ -120,12 +119,11 @@ export class QuotaCoordinatorService {
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.hardStaleAfterMs = options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
-    this.manualStaleAfterMs =
-      options.manualStaleAfterMs ?? options.staleAfterMs ?? DEFAULT_MANUAL_STALE_AFTER_MS;
+    // Manual thresholds never inherit the scrape ones: tuning one mode must not
+    // move the other's fail-safe (#690).
     this.manualHardStaleAfterMs =
-      options.manualHardStaleAfterMs ??
-      options.hardStaleAfterMs ??
-      DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+      options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+    this.manualStaleAfterMs = manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
   }
 
   private getServiceInfo(): QuotaCoordinatorServiceInfo {

@@ -7,9 +7,9 @@ import {
 import {
   DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
-  DEFAULT_MANUAL_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  manualSoftStaleAfterMs,
   publishedThrottle,
 } from "./coordinator-protocol.js";
 import type { SharedQuotaStore } from "./shared-store.js";
@@ -54,7 +54,6 @@ export interface QuotaCollectionLoopOptions {
    */
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
-  manualStaleAfterMs?: number;
   manualHardStaleAfterMs?: number;
   /** Metric sink; defaults to the discarding one. */
   metrics?: QuotaMetrics;
@@ -128,12 +127,11 @@ export class QuotaCollectionLoop {
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.hardStaleAfterMs = options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
-    this.manualStaleAfterMs =
-      options.manualStaleAfterMs ?? options.staleAfterMs ?? DEFAULT_MANUAL_STALE_AFTER_MS;
+    // Manual thresholds never inherit the scrape ones: tuning one mode must not
+    // move the other's fail-safe (#690).
     this.manualHardStaleAfterMs =
-      options.manualHardStaleAfterMs ??
-      options.hardStaleAfterMs ??
-      DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+      options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+    this.manualStaleAfterMs = manualSoftStaleAfterMs(this.manualHardStaleAfterMs);
     this.metrics = options.metrics ?? nullQuotaMetrics;
     this.setIntervalFn = options.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalFn =

@@ -141,7 +141,6 @@ export type ManualObservationResult =
 
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
-  maxIntegralStepSeconds?: number;
 }
 
 export interface QuotaControllerResetResult {
@@ -906,8 +905,9 @@ export class SharedQuotaStore {
       dtSeconds > 0 ? dtSeconds / (QUOTA_DERIVATIVE_TAU_SECONDS + dtSeconds) : 1;
     const previousDerivative = cycleChanged ? 0 : (previous?.controllerDerivative ?? 0);
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-    const maxIntegralStepSeconds = opts.maxIntegralStepSeconds ?? QUOTA_INTEGRAL_MAX_STEP_SECONDS;
-    const integralDtSeconds = cycleChanged ? 0 : Math.min(dtSeconds, maxIntegralStepSeconds);
+    const integralDtSeconds = cycleChanged
+      ? 0
+      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
     const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
     const candidateIntegral = previousIntegral + error * integralDtSeconds;
     const rawWithoutIntegral =

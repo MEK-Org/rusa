@@ -4,10 +4,27 @@ import { isProviderScopedWindow } from "./window-scope.js";
 
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
 export const COORDINATOR_PROTOCOL_MINOR = 1;
-export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
+/** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
+export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
+/**
+ * Scrape-mode soft stale: three missed ticks past the moment a probe refresh
+ * is due, so a healthy lane reading one full TTL old is still fresh.
+ */
+export function scrapeStaleAfterMs(tickSeconds: number): number {
+  return QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000;
+}
+export const DEFAULT_STALE_AFTER_MS = scrapeStaleAfterMs(300); // 45 min (30m TTL + 3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
-export const DEFAULT_MANUAL_STALE_AFTER_MS = 3_600_000; // 60 min (target for paced manual mode, #690)
-export const DEFAULT_MANUAL_HARD_STALE_AFTER_MS = 7_200_000; // 120 min (2 hours fail-safe threshold, #690)
+/**
+ * Manual mode sizes for reader plus submitter latency on paced lanes (#690):
+ * 15–40 min reader and 13–27 min submitter latency were observed in steady state.
+ */
+export const DEFAULT_MANUAL_STALE_AFTER_MS = 3_600_000; // 60 min
+export const DEFAULT_MANUAL_HARD_STALE_AFTER_MS = 7_200_000; // 120 min; `quota.throttle.manualHardStaleSeconds`
+/** Manual soft stale never exceeds its hard threshold, so the pair stays ordered. */
+export function manualSoftStaleAfterMs(manualHardStaleAfterMs: number): number {
+  return Math.min(DEFAULT_MANUAL_STALE_AFTER_MS, manualHardStaleAfterMs);
+}
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 /**

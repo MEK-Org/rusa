@@ -9,7 +9,9 @@ import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
   calculateFreshness,
+  DEFAULT_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
+  DEFAULT_STALE_AFTER_MS,
   MANUAL_QUOTA_OBSERVATION_PATH,
   ProtocolMismatchError,
   publishedThrottle,
@@ -1348,6 +1350,80 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       hardStale: false,
     });
     expect(collRes.json.providers.kimi.freshness.mode).toBe("scrape");
+  });
+
+  it("#690: manual thresholds never inherit scrape options, and scrape stays fresh for one probe TTL", async () => {
+    store.configureController({ maxIntervalSeconds: 3600 });
+    // The production command always passes the scrape thresholds.
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["kimi", "claude"],
+      staleAfterMs: DEFAULT_STALE_AFTER_MS,
+      hardStaleAfterMs: DEFAULT_HARD_STALE_AFTER_MS,
+    });
+    await service.start();
+
+    const nowMs = Date.now();
+    const recordSession = (provider: "kimi" | "claude", scrapedAt: string) => {
+      const snapshot = {
+        provider,
+        status: "available" as const,
+        scrapedAt,
+        limits: [
+          {
+            kind: "session" as const,
+            label: "Session",
+            percentLeft: 80,
+            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
+          },
+        ],
+      };
+      const id = store.recordRaw({ provider, scrapedAt, rawOutput: "raw" });
+      store.recordParsed(id, snapshot, snapshot);
+    };
+
+    // A scrape reading one full probe TTL old (plus a tick) is still fresh.
+    recordSession("kimi", new Date(nowMs - 35 * 60_000).toISOString());
+    const scrapeRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
+    expect(scrapeRes.json.freshness).toMatchObject({
+      mode: "scrape",
+      staleAfterMs: 45 * 60_000,
+      hardStaleAfterMs: 60 * 60_000,
+      stale: false,
+      hardStale: false,
+    });
+
+    await makeRequest(
+      socketPath,
+      QUOTA_READING_MODE_PATH,
+      "POST",
+      JSON.stringify({ provider: "claude", mode: "manual" })
+    );
+    recordSession("claude", new Date(nowMs - 50 * 60_000).toISOString());
+    const manualRes = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(manualRes.json.freshness).toMatchObject({
+      mode: "manual",
+      staleAfterMs: 3_600_000,
+      hardStaleAfterMs: 7_200_000,
+      stale: false,
+      hardStale: false,
+    });
+  });
+
+  it("#690: a manual hard-stale override below 60m pulls manual soft stale down with it", () => {
+    const tuned = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["kimi"],
+      manualHardStaleAfterMs: 30 * 60_000,
+    });
+    expect(tuned).toMatchObject({
+      manualStaleAfterMs: 30 * 60_000,
+      manualHardStaleAfterMs: 30 * 60_000,
+      staleAfterMs: DEFAULT_STALE_AFTER_MS,
+      hardStaleAfterMs: DEFAULT_HARD_STALE_AFTER_MS,
+    });
   });
 
   it("#690: /v1/throttle detects resetWaiting when window resetAt has passed without fresh reading", async () => {

@@ -1411,16 +1411,11 @@ async function composeStart(
       ? "rusa-staging"
       : "rusa";
   const quotaProviders = configuredQuotaThrottleProviders(config);
-  const explicitHardStaleSeconds =
-    config.quota?.coordinator?.hardStaleSeconds ?? config.quota?.throttle?.hardStaleSeconds;
-  const hardStaleAfterMs =
-    explicitHardStaleSeconds !== undefined ? explicitHardStaleSeconds * 1000 : undefined;
   const quotaCoordinatorClient = coordinatorSocketPath
     ? new QuotaCoordinatorClient({
         socketPath: coordinatorSocketPath,
         configuredProviders: quotaProviders,
         maxIntervalSeconds,
-        hardStaleAfterMs,
         source: serviceBasename,
         metrics: createQuotaMetrics(log),
         logger: {
