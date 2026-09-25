@@ -50,14 +50,20 @@ export class DashboardIdentityResolver {
         // Resolve only that durable key; a different email is the first-sign-in
         // conflict the claim error intentionally reports without exposing it.
         user = repo.findUserByExternalIdentity(identity);
-        if (!user || user.email !== email) throw this.conflict(error, email);
+        if (!user || user.email !== email) {
+          throw new DashboardIdentityClaimError(this.conflict(error, email));
+        }
       }
     }
     if (user.disabledAt) throw new Error("User disabled");
     if (user.email !== email) {
       // Returning users preserve the existing generic authentication failure
       // for an email collision; account-setup guidance is first-sign-in only.
-      user = repo.updateEmail(user.id, email);
+      try {
+        user = repo.updateEmail(user.id, email);
+      } catch (error) {
+        throw this.conflict(error, email);
+      }
     }
     return user;
   }
@@ -76,6 +82,6 @@ export class DashboardIdentityResolver {
       holderId: holder.id,
       holderBound: holder.identity !== undefined,
     });
-    return new DashboardIdentityClaimError(error);
+    return new Error("Verified email is already registered to another user", { cause: error });
   }
 }

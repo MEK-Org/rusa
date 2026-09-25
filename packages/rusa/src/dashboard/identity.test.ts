@@ -124,7 +124,10 @@ it("names the conflicting bound row without logging its email", () => {
   }
   expect(updateError).toBeInstanceOf(Error);
   expect(updateError).not.toBeInstanceOf(DashboardIdentityClaimError);
-  expect(warn).not.toHaveBeenCalled();
+  expect(warn).toHaveBeenCalledWith("dashboard_identity_email_conflict", {
+    holderId: pending.id,
+    holderBound: true,
+  });
   expect(repo.getUser(returning.id)?.email).toBe("other@example.com");
   // The address itself never reaches the record.
   expect(JSON.stringify(warn.mock.calls)).not.toContain("owner@example.com");
