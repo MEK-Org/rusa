@@ -5,6 +5,7 @@ import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../ac
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import {
@@ -32,6 +33,8 @@ export interface ActorHandleOptions {
   actorOptions?: ActorOptions;
   target?: string;
   logger?: Logger;
+  startupTimeoutMs?: number;
+  stateStaleTimeoutMs?: number;
 }
 
 /** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
@@ -56,6 +59,7 @@ export class ActorHandle implements MeshActor {
     }
   >();
   private startupTimer?: ReturnType<typeof setTimeout>;
+  private stateStaleTimer?: ReturnType<typeof setTimeout>;
   /** True between the leader admitting a run and that same run's terminal accounting. */
   private runOpen = false;
   /** Identity minted by the leader-side execution coordinator before admission. */
@@ -109,10 +113,12 @@ export class ActorHandle implements MeshActor {
     void this.ready.catch(() => {});
     clearTimeout(this.startupTimer);
     if (awaitStartup) {
-      this.startupTimer = setTimeout(
-        () => this.fail(new Error("Remote actor startup timed out")),
-        10_000
-      );
+      const startupTimeout = this.opts.startupTimeoutMs ?? 10_000;
+      this.startupTimer = setTimeout(() => {
+        const error = new Error("Remote actor startup timed out");
+        rejectReady(error);
+        this.fail(error);
+      }, startupTimeout);
     }
     channel.on("message", (raw) => {
       const message = raw as ActorEvent;
@@ -160,6 +166,24 @@ export class ActorHandle implements MeshActor {
     this.stateSettled = new Promise((resolve) => {
       this.settleState = resolve;
     });
+    clearTimeout(this.stateStaleTimer);
+    const staleTimeout = this.opts.stateStaleTimeoutMs ?? 10_000;
+    this.stateStaleTimer = setTimeout(() => {
+      if (!this.stateStale || this.closed) return;
+      this.log.warn("remote_state_stale_timeout", {
+        actorId: this.id,
+        target: this.opts.target ?? this.channel.nodeId,
+      });
+      this.stateStale = false;
+      this.state = "idle";
+      this.opts.context.onRuntimeStateChanged("idle");
+      if (this.pendingPreempt) {
+        this.pendingPreempt = false;
+        this.applyPreempt();
+      }
+      this.settleState?.();
+      void this.cancelRetainedAdmission();
+    }, staleTimeout);
     // A reconnect is transport recovery, not a fresh actor boot. Its delayed
     // state/ready report must not cancel a leader-retained admission after 10s.
     this.bindChannel(newChannel, false);
@@ -234,11 +258,17 @@ export class ActorHandle implements MeshActor {
     return { preempted: false };
   }
 
+  setModelConfig(modelConfig: ProviderModelConfig[]): void {
+    this.opts.bootstrap.modelConfig = [...modelConfig];
+  }
+
   close(): void {
     if (this.terminated) return;
     this.terminated = true;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.outstandingPreempt = undefined;
@@ -253,6 +283,8 @@ export class ActorHandle implements MeshActor {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.startupTimer);
+    clearTimeout(this.stateStaleTimer);
+    this.stateStaleTimer = undefined;
     // An unanswered preempt is re-decided against the follower's reattach state.
     this.pendingPreempt ||= this.outstandingPreempt !== undefined;
     this.outstandingPreempt = undefined;
@@ -368,11 +400,10 @@ export class ActorHandle implements MeshActor {
 
   private fail(error: Error): void {
     if (this.closed) return;
-    // On a live channel the leader is giving up on this follower actor (startup
-    // timeout, fatal, protocol error) and must tell it to stop. A dead channel is
-    // a transport loss that attachHost can still recover.
-    if (this.channel.connected) this.close();
-    else this.disconnect();
+    // Termination stays strictly reserved for a genuine actor close() (e.g. thread retirement).
+    // A connection error, startup timeout, or transport loss disconnects the handle so attachHost
+    // can still recover and rebind on reconnect.
+    this.disconnect();
     // A retained admission still owns its run: the claim that resumes it, or the
     // cancellation that drops it, decides that run's outcome instead.
     const retained = this.retainedAdmission !== undefined;
@@ -519,6 +550,8 @@ export class ActorHandle implements MeshActor {
         this.fail(new Error(message.error));
         break;
       case "state": {
+        clearTimeout(this.stateStaleTimer);
+        this.stateStaleTimer = undefined;
         const reattachReport = this.stateStale;
         this.state = message.state;
         this.yielded = message.yielded;
@@ -738,6 +771,11 @@ export class ActorHandle implements MeshActor {
                 const finished = new Promise<void>((resolve) => {
                   release = resolve;
                 });
+                const candidates = (
+                  this.opts.bootstrap.modelConfig?.length
+                    ? this.opts.bootstrap.modelConfig
+                    : request.candidates
+                ) as RawProviderModelConfig[];
                 const handle = ctx.gate(
                   async (selected) => {
                     // Provider pacing can delay this callback after the first
@@ -768,7 +806,7 @@ export class ActorHandle implements MeshActor {
                     });
                     await finished;
                   },
-                  request.candidates,
+                  candidates,
                   admission.responsive
                 );
                 this.gates.set(requestId, { handle, release, admission });

@@ -2,6 +2,7 @@ import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
+import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import {
   type ActorEvent,
@@ -72,6 +73,9 @@ export function createActorRuntime(
       }
       if (bootstrap.mcpServers) {
         mcpServers.splice(0, mcpServers.length, ...bootstrap.mcpServers);
+      }
+      if (bootstrap.modelConfig?.length) {
+        actor.setModelConfig(bootstrap.modelConfig as ProviderModelConfig[]);
       }
       if (bootstrap.sessionId) {
         sessionId = bootstrap.sessionId;
@@ -177,6 +181,9 @@ export function createActorRuntime(
             // Actor holds the array by reference, matching the in-process tool refresh path.
             mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
           }
+          if (snapshot.record.modelConfig?.length) {
+            actor?.setModelConfig(snapshot.record.modelConfig as ProviderModelConfig[]);
+          }
           // The leader's pacing gate owns selection; the follower runs what it reserved.
           return await fn(snapshot.selected ?? candidates[0]);
         } finally {
@@ -235,6 +242,9 @@ export function createActorRuntime(
       log: (chunk) => send({ type: "log", chunk }),
     });
     send({ type: "ready", pid: process.pid });
+    if (bootstrap.reconnect) {
+      send({ type: "state", state: "idle", yielded: false });
+    }
   }
 
   function stop(): void {

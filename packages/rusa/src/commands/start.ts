@@ -3020,8 +3020,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // durable inbox still holds the work and its priority, so an advisory
         // dispatch on either channel-recreating branch recovers it (#568).
         if (!existing) {
-          mesh.rehydrate(record);
-          mesh.dispatch(record.id);
+          try {
+            mesh.rehydrate(record);
+            mesh.dispatch(record.id);
+          } catch (err) {
+            log.warn("follower_reconnect_rehydrate_failed", {
+              actorId: record.id,
+              followerId: follower.id,
+              err,
+            });
+          }
         } else if (
           "attachHost" in existing &&
           typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"

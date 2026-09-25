@@ -8,13 +8,23 @@ import { createHarness, waitUntil } from "./harness.js";
 
 const instances: ReturnType<typeof createHarness>[] = [];
 const dirs: string[] = [];
-function setup(options: { delayMs?: number; failInit?: boolean; pacer?: ProviderPacer } = {}) {
+function setup(
+  options: {
+    delayMs?: number;
+    failInit?: boolean;
+    pacer?: ProviderPacer;
+    startupTimeoutMs?: number;
+    stateStaleTimeoutMs?: number;
+  } = {}
+) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
   dirs.push(cwd);
   const h = createHarness({
     cwd,
     delayMs: options.delayMs ?? 25,
     pacer: options.pacer,
+    startupTimeoutMs: options.startupTimeoutMs,
+    stateStaleTimeoutMs: options.stateStaleTimeoutMs,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -783,5 +793,187 @@ describe("monolithic follower instance", () => {
         },
       })
     ).not.toThrow();
+  });
+
+  // Issue #679 regressions
+  it("rebinds and dispatches pending durable work after lease flap following remote_run_end without remote_attach_after_close", async () => {
+    const h = setup();
+    const id = h.spawn("Charter A");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+    await waitUntil(() => h.events.some((e) => e.actorId === id && e.event.type === "result"));
+
+    // Add pending durable work in inbox
+    h.inboxStore.append([
+      { actorId: id, source: "test:durable-a", payload: { type: "test.work" } },
+    ]);
+
+    // Flap transport right after run end: transport loss or error lands on live channel
+    h.runtime(id).channel.emit("error", new Error("Transport lost"));
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Follower reconnects and reattaches
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    h.mesh.dispatch(id);
+
+    // Verify handle did not log remote_attach_after_close
+    expect(h.logs).not.toContainEqual(
+      expect.objectContaining({
+        event: "remote_attach_after_close",
+        fields: expect.objectContaining({ actorId: id }),
+      })
+    );
+
+    // Verify second run starts and completes for the pending durable work
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === id && e.event.type === "runStart").length >= 2
+    );
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === id && e.event.type === "result").length >= 2
+    );
+  });
+
+  it("times out of stateStale into a recoverable path when follower state report is missing or delayed after reconnect", async () => {
+    const h = setup({ stateStaleTimeoutMs: 50 });
+    const id = h.spawn("Charter B");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+    await waitUntil(() => h.events.some((e) => e.actorId === id && e.event.type === "result"));
+
+    // Follower drops
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Follower reconnects with a new process, but state report is suppressed/missing
+    const reconnect = h.reconnect();
+    const origReceive = reconnect.receive.bind(reconnect);
+    reconnect.receive = (event) => {
+      // Suppress state event to simulate missing/delayed report
+      if (
+        event.message &&
+        typeof event.message === "object" &&
+        "type" in event.message &&
+        event.message.type === "state"
+      ) {
+        return;
+      }
+      origReceive(event);
+    };
+
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    // Add pending durable work and dispatch
+    h.inboxStore.append([
+      { actorId: id, source: "test:durable-b", payload: { type: "test.work" } },
+    ]);
+    h.mesh.dispatch(id);
+
+    // Handle times out of stateStale into recoverable path, runs and completes
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === id && e.event.type === "runStart").length >= 2
+    );
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === id && e.event.type === "result").length >= 2
+    );
+  });
+
+  it("recovers an omitted actor handle without termination when boot re-registration omits it initially", async () => {
+    const h = setup({ startupTimeoutMs: 50 });
+    const first = h.spawn("First actor");
+    await expect(h.runtime(first).ready).resolves.toBe(process.pid);
+
+    // Suppress dispatch for the second actor to simulate follower omitting it at boot
+    const origDispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      if (envelope.actorId !== first) return; // omit second actor
+      origDispatch(envelope);
+    };
+
+    const second = h.spawn("Second actor (omitted at boot)");
+    // Second actor was omitted by follower during initial boot (never received ready),
+    // so its startupTimer expires and fires fail()
+    await expect(h.runtime(second).ready).rejects.toThrow("Remote actor startup timed out");
+
+    // Later registration completes for the omitted actor
+    h.follower.dispatch = origDispatch;
+    const reconnect = h.reconnect();
+    h.runtime(second).attachHost(reconnect.createHost(second));
+
+    // Handle should NOT log remote_attach_after_close
+    expect(h.logs).not.toContainEqual(
+      expect.objectContaining({
+        event: "remote_attach_after_close",
+        fields: expect.objectContaining({ actorId: second }),
+      })
+    );
+
+    // Now dispatch work to the recovered actor
+    h.inboxStore.append([
+      { actorId: second, source: "test:durable-c", payload: { type: "test.work" } },
+    ]);
+    h.mesh.dispatch(second);
+
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === second && e.event.type === "runStart").length >= 1
+    );
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === second && e.event.type === "result").length >= 1
+    );
+  });
+
+  it("applies a staged model pin on a running follower-hosted actor at next-run boundary without leader restart", async () => {
+    const h = setup();
+    const id = h.spawn("Charter D");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+    await waitUntil(() => h.events.some((e) => e.actorId === id && e.event.type === "result"));
+
+    // Pin model via mesh.setActorModel
+    h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-pinned-d" }], "root");
+
+    // Next run dispatched without leader restart or follower re-registration
+    h.inboxStore.append([
+      { actorId: id, source: "test:durable-d", payload: { type: "test.work" } },
+    ]);
+    h.mesh.dispatch(id);
+
+    await waitUntil(
+      () => h.events.filter((e) => e.actorId === id && e.event.type === "result").length === 2
+    );
+    const starts = h.events.filter((e) => e.actorId === id && e.event.type === "runStart");
+    expect(starts).toHaveLength(2);
+    const startEvent = starts[1]?.event;
+    if (startEvent && startEvent.type === "runStart") {
+      expect(startEvent.selected).toMatchObject({ model: "model-pinned-d" });
+    } else {
+      expect.fail("Expected second event to be runStart");
+    }
+  });
+
+  it("keeps genuine close() permanently terminated and never re-dispatches", async () => {
+    const h = setup();
+    const id = h.spawn("Charter Negative");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+    await waitUntil(() => h.events.some((e) => e.actorId === id && e.event.type === "result"));
+
+    // Genuine close() called
+    h.runtime(id).close();
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Reattach attempt must be refused with remote_attach_after_close
+    const reconnect = h.reconnect();
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({
+        event: "remote_attach_after_close",
+        fields: expect.objectContaining({ actorId: id }),
+      })
+    );
+
+    // Attempting to dispatch must drop wake and never start
+    h.inboxStore.append([{ actorId: id, source: "test:negative", payload: { type: "test.work" } }]);
+    h.mesh.dispatch(id);
+    expect(h.events.filter((e) => e.actorId === id && e.event.type === "runStart")).toHaveLength(1);
   });
 });
