@@ -623,6 +623,11 @@ export function submitPoolGate<C, T>(
   };
 }
 
+/** A lane can claim new work only with nothing queued or staged and no pacing delay left. */
+function isIdleLane(pacer: ProviderPacer, now: number): boolean {
+  return pacer.waiting === 0 && pacer.quote(now) <= now;
+}
+
 /** A read-only entry in the leader-local, cross-lane admission queue. */
 export interface UnifiedAdmissionQueueSnapshot {
   /** Owning actor; entries without an actor identity are intentionally omitted. */
@@ -647,6 +652,7 @@ interface WaitingAdmission<C, T> {
   responsive: boolean;
   state: "waiting" | "claimed" | "settled";
   inner?: RunStartHandle<T>;
+  claimedLane?: PoolLaneCandidate<C>;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
   result: Promise<T>;
@@ -666,6 +672,8 @@ interface WaitingAdmission<C, T> {
  */
 export class UnifiedAdmissionQueue<C> {
   private readonly waiting: Array<WaitingAdmission<C, unknown>> = [];
+  /** Claimed items until they settle; read only by `snapshot`. */
+  private readonly claimed = new Set<WaitingAdmission<C, unknown>>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private draining = false;
   private drainAgain = false;
@@ -714,11 +722,29 @@ export class UnifiedAdmissionQueue<C> {
     };
   }
 
-  /** Side-effect-free global ordering for dashboard display and #570 controls. */
+  /**
+   * Side-effect-free global ordering for dashboard display and #570 controls.
+   * Claimed actors that have not started yet (at most one per lane, waiting on
+   * mesh concurrency) come first with a `null` ETA, as the old per-lane staged
+   * head did; unclaimed actors follow in list order with a projected ETA.
+   */
   snapshot(): UnifiedAdmissionQueueSnapshot[] {
     const now = this.now();
     const snapshot: UnifiedAdmissionQueueSnapshot[] = [];
     let position = 0;
+    for (const item of this.claimed) {
+      if (item.inner?.started) continue;
+      if (item.opts.threadId) {
+        snapshot.push({
+          threadId: item.opts.threadId,
+          position,
+          estimatedStartAt: null,
+          pacingIntervalMs: Math.round(item.claimedLane?.pacer.interval ?? 0),
+          responsive: item.responsive,
+        });
+      }
+      position++;
+    }
     for (const item of this.waiting) {
       const candidate = selectPoolLane(this.healthy(item, item.responsive), now, {
         responsive: item.responsive,
@@ -840,30 +866,30 @@ export class UnifiedAdmissionQueue<C> {
     }
   }
 
+  /**
+   * Walk the list in order and give each normal item the best of its lanes
+   * that is idle now: nothing queued or staged in its pacer and no pacing
+   * delay left. Requiring an idle lane keeps at most one claimed-but-unstarted
+   * actor per lane, so work waiting on mesh concurrency stays in this list
+   * (reorderable, cancellable) rather than draining into per-lane FIFOs.
+   * `selectPoolLane` keeps the weekly-headroom tie-break among idle lanes.
+   *
+   * An item only ever claims one of its own declared candidates, so a lane
+   * never admits a model it does not gate: a model-scoped lane (e.g. Fable
+   * under #588) is a distinct candidate lane, not a provider-wide match.
+   */
   private claimNormal(): void {
-    const processors = new Map<ProviderPacer, string>();
-    for (const item of this.waiting) {
-      if (item.responsive) continue;
-      for (const candidate of this.healthy(item, false)) {
-        processors.set(candidate.pacer, candidate.lane);
-      }
-    }
     const now = this.now();
-    const available = [...processors.entries()]
-      .filter(([pacer]) => pacer.quote(now) <= now)
-      .sort(([a], [b]) => a.quote(now) - b.quote(now));
-    for (const [pacer, lane] of available) {
-      const item = this.waiting.find((candidate) => {
-        if (candidate.responsive) return false;
-        return this.healthy(candidate, false).some(
-          (entry) => entry.pacer === pacer && entry.lane === lane
-        );
-      });
-      if (!item) continue;
-      const selected = this.healthy(item, false).find(
-        (candidate) => candidate.pacer === pacer && candidate.lane === lane
+    const busy = new Set<ProviderPacer>();
+    for (const item of [...this.waiting]) {
+      if (item.responsive) continue;
+      const idle = this.healthy(item, false).filter(
+        (candidate) => !busy.has(candidate.pacer) && isIdleLane(candidate.pacer, now)
       );
-      if (selected) this.claim(item, selected);
+      const selected = selectPoolLane(idle, now);
+      if (!selected) continue;
+      busy.add(selected.pacer);
+      this.claim(item, selected);
     }
   }
 
@@ -872,6 +898,8 @@ export class UnifiedAdmissionQueue<C> {
     if (index < 0 || item.state !== "waiting") return;
     this.waiting.splice(index, 1);
     item.state = "claimed";
+    item.claimedLane = selected;
+    this.claimed.add(item);
     const selectedIndex = item.candidates.indexOf(selected);
     const originalOnSelected = item.opts.onSelected;
     const originalOnStarted = item.opts.onStarted;
@@ -889,13 +917,20 @@ export class UnifiedAdmissionQueue<C> {
       },
     });
     item.inner = inner;
+    // A claim that settles without starting (cancel, stale provider, mesh
+    // rejection) frees its lane just as a start does.
+    const release = () => {
+      item.state = "settled";
+      this.claimed.delete(item);
+      queueMicrotask(() => this.refresh());
+    };
     inner.result.then(
       (value) => {
-        item.state = "settled";
+        release();
         item.resolve(value);
       },
       (error: unknown) => {
-        item.state = "settled";
+        release();
         item.reject(error);
       }
     );
@@ -936,6 +971,9 @@ export class UnifiedAdmissionQueue<C> {
     for (const item of this.waiting) {
       if (item.responsive) continue;
       for (const candidate of this.healthy(item, false)) {
+        // A busy lane frees up through its claimed item's start or
+        // settlement, which refreshes; only a pacing delay needs a timer.
+        if (candidate.pacer.waiting > 0) continue;
         const quote = candidate.pacer.quote(now);
         if (quote > now && (next === undefined || quote < next)) next = quote;
       }

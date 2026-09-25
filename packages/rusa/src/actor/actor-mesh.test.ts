@@ -81,7 +81,12 @@ import {
   type ScheduledMessage,
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
-import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import {
+  type PoolLaneCandidate,
+  ProviderPacer,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -1003,6 +1008,54 @@ describe("ActorMesh", () => {
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
     expect(logs).toContain("dispatch(not-live) refused — no live actor");
+  });
+
+  it("rebuilds the unified admission list from unhandled inbox work after a leader restart (#672)", async () => {
+    // The durable inbox is the only record that survives a restart: rows
+    // committed before this mesh existed, with no scheduler state beside them.
+    const inboxStore = createMemoryInboxStore();
+    inboxStore.append([
+      { actorId: "t1", source: "mesh:root", payload: payload("mesh.message") },
+      { actorId: "t2", source: "mesh:root", payload: payload("mesh.message") },
+    ]);
+    const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
+    const lane = new ProviderPacer(0);
+    lane.deferUntil(Date.now() + 60_000);
+    const { mesh, registry, fake } = setup({
+      inboxStore,
+      providerGate: (fn, candidates, request) =>
+        queue.enqueue(
+          fn,
+          candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
+          {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+          }
+        ),
+    });
+    for (const id of ["t1", "t2"]) {
+      registry.upsert({
+        id,
+        charter: "resumed work",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    mesh.rehydrateAll();
+    mesh.reconcileInbox();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+
+    // One unclaimed opportunity per actor, in the one list, none started.
+    expect(queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
+    expect(fake("t1").calls).toHaveLength(0);
+    expect(fake("t2").calls).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake("t1").calls).toHaveLength(1);
+    expect(fake("t2").calls).toHaveLength(1);
+    expect(queue.snapshot()).toEqual([]);
   });
 
   it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
