@@ -1646,16 +1646,13 @@ export class ActorMesh {
     const headObligationIds = supportsObligationClosureReads(closure)
       ? [...new Set(focusedObligationIds)].filter((obligationId) => {
           const focused = closure.get(obligationId);
-          // A ready-head read that vanishes remains fail-closed as before. An
-          // explicit focus must also belong to this actor before it can arm a
-          // run; a foreign row is never this actor's closure commitment.
+          // A ready-head read that vanishes remains fail-closed as before. A
+          // readable focus must belong to this actor at selection before it can
+          // arm a run: an explicit id may name a foreign row, and a durable
+          // ready-head entry can outlive a reassignment made after delivery.
+          // A foreign row is never this actor's closure commitment.
           if (focused === null) return readyHeadObligationIds.includes(obligationId);
-          return (
-            focused.status === "ready" &&
-            (readyHeadObligationIds.includes(obligationId) ||
-              (focusedObligationId === obligationId &&
-                this.resolveThreadId(focused.ownerId) === actorId))
-          );
+          return focused.status === "ready" && this.resolveThreadId(focused.ownerId) === actorId;
         })
       : [];
     beforeCommit?.(entries);

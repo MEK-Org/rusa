@@ -11196,6 +11196,31 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
   });
 
+  it("does not arm a ready head reassigned to another actor before selection", () => {
+    const { mesh } = strictMesh();
+    const formerOwner = worker(mesh, "former owner");
+    const newOwner = worker(mesh, "new owner");
+    mesh.enrollActorInExperiment(formerOwner, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "moved-head", title: "Moved head", ownerId: formerOwner });
+    mesh.deliverReadyHeadAttention(formerOwner, { id: "moved-head", intent: "moved" }, null);
+    mesh.actorQueued(formerOwner, { responsive: false, mode: "ordinary" });
+    const movedEntry = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === formerOwner &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "moved-head"
+    );
+    if (!movedEntry) throw new Error("expected moved ready-head entry");
+
+    // The durable entry outlives the transfer; the row stays ready, but it is
+    // now the new owner's commitment, not the former owner's.
+    repo.reassign("moved-head", newOwner, "root");
+    expect(repo.get("moved-head")?.status).toBe("ready");
+    mesh.selectInboxEntries(formerOwner, [movedEntry.id]);
+    expect(mesh.runDisciplineNotice(formerOwner)).toBeUndefined();
+    expect(() => mesh.declareYield(formerOwner, "complete")).not.toThrow();
+  });
+
   it("captures experiment membership at selection, so a root unenrollment applies next run", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
@@ -11487,8 +11512,9 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.abandonInboxRun(source);
 
     // Attention was delivered while the source owned the head, but an ancestor
-    // moved it before the source selected. The source's own fresh checkpoint —
-    // written through the ancestor path here — is not a handoff it performed.
+    // moved it before the source selected. Selection arms only a head this
+    // actor owns (#673), so the stale entry is not the source's commitment and
+    // no transfer is attributed to its run.
     repo.create({ id: "moved", title: "Moved before selection", ownerId: source });
     repo.reassign("moved", recipient, "root");
     mesh.actorQueued(source, { responsive: false, mode: "ordinary" });
@@ -11500,8 +11526,8 @@ describe("strict obligation handling experiment (#382)", () => {
     );
     if (!stale) throw new Error("expected the pre-transfer attention");
     mesh.selectInboxEntries(source, [stale.id]);
-    repo.setCheckpoint("moved", "I never owned this during the run.", source);
-    expect(() => mesh.declareYield(source, "complete")).toThrow(/did not own it when selected/);
+    expect(mesh.runDisciplineNotice(source)).toBeUndefined();
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
   });
 
   it("records a head unreadable at selection and fails closed on a handoff of it", () => {
