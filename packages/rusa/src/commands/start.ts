@@ -632,8 +632,12 @@ export interface RunStartE2EHandles {
   /** Trigger the production host disk sensor immediately. */
   emitSystemDiskCheck: () => Promise<void>;
   /** Trigger the same graceful shutdown a SIGTERM would. */
-  shutdown: (reason?: "deploy" | null) => Promise<void>;
-  /** Factory for host-maintenance update tool deps, exposing the shutdown exit callback. */
+  shutdown: (reason?: "deploy" | null, exitCode?: number) => Promise<void>;
+  /**
+   * Factory for host-maintenance update tool deps, exposing the shutdown exit
+   * callback. E2E/test-only seam: production obtains these deps through
+   * host-maintenance wiring, not through the runner handles.
+   */
   updateToolDepsFor?: (selfId: string) => UpdateToolDeps;
 }
 
@@ -932,7 +936,7 @@ async function composeStart(
   resources: ResourceScope
 ): Promise<void> {
   const mcHome = resolveHome();
-  let shutdown: (reason?: "deploy" | null) => Promise<void>;
+  let shutdown: (reason?: "deploy" | null, exitCode?: number) => Promise<void>;
 
   // The service logger. `rusa start` is a service, so its diagnostics are JSON
   // records on stdout (journald's stream) rather than prose: a field says which
@@ -1980,12 +1984,14 @@ async function composeStart(
         },
         // A successful self-update is a committed mesh shutdown; route through
         // shutdown("deploy") so all disposers are released in reverse order.
-        // If the pre-commit stop throws, shutdown never commits and the
-        // orchestrator has already reported restarting — log it (the detached
-        // rejection would otherwise be unhandled) and stay up so a later
-        // signal retries, exactly like the signal path.
-        exit: (_code) => {
-          shutdown("deploy").catch((err) =>
+        // The updater's exit code wins (it asks for 0: a committed deploy is
+        // a clean unit stop, not a failed one). If the pre-commit stop
+        // throws, shutdown never commits and the orchestrator has already
+        // reported restarting — log it (the detached rejection would
+        // otherwise be unhandled) and stay up so a later signal retries,
+        // exactly like the signal path.
+        exit: (code) => {
+          shutdown("deploy", code).catch((err) =>
             log.error("shutdown_not_committed", {
               err,
               reason: "deploy",
@@ -4244,15 +4250,17 @@ async function composeStart(
   // commitment: if systemctl fails, the mesh stays up and a later signal
   // retries rather than orphaning the instance. Once it succeeds, shutdown is
   // committed and every acquired resource is released, newest first, with
-  // each failure contained and logged by the scope.
-  shutdown = async (reason: "deploy" | null = null) => {
+  // each failure contained and logged by the scope. A caller-supplied exit
+  // code wins over the reason default: the self-update orchestrator asks for
+  // exit(0) so a committed deploy is a clean unit stop, not a failed one.
+  shutdown = async (reason: "deploy" | null = null, exitCode?: number) => {
     if (!running) return;
     e2eInstance.stopForMeshShutdown();
     running = false;
     console.log("\n🛑 Shutting down...");
     await resources.close();
     log.info("service_stopped", { reason });
-    process.exit(getShutdownExitCode(reason));
+    process.exit(exitCode ?? getShutdownExitCode(reason));
   };
   const onShutdownSignal = () => {
     shutdown().catch((err) =>

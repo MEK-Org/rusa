@@ -7881,7 +7881,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       updateDeps?.deps.exit(0);
 
-      await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(1));
+      // The updater asks for exit(0): a committed deploy must be a clean unit
+      // stop, not the deploy default of 1 (failed unit under OnFailure).
+      await vi.waitFor(() => expect(exitMock()).toHaveBeenCalledWith(0));
       expect(dbMock.closeDb).toHaveBeenCalledOnce();
       expect(records("service_stopped")).toEqual([expect.objectContaining({ reason: "deploy" })]);
     });
