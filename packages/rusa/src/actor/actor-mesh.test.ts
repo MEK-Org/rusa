@@ -13,6 +13,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
+import type { Obligation } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import type { Logger } from "../observability/logger.js";
 import { FakeProvider } from "../providers/fake-provider.js";
@@ -46,6 +47,7 @@ import type {
   ActorFactoryContext,
   ActorMeshOptions,
   LiveObligationSummary,
+  MeshObligationPort,
   RetireCleanup,
   SpawnRequest,
 } from "./actor-mesh.js";
@@ -79,7 +81,12 @@ import {
   type ScheduledMessage,
   type ScheduledMessageScheduler,
 } from "./os-scheduler.js";
-import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
+import {
+  type PoolLaneCandidate,
+  ProviderPacer,
+  submitPoolGate,
+  UnifiedAdmissionQueue,
+} from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -1001,6 +1008,62 @@ describe("ActorMesh", () => {
     expect(fake("t1").calls).toHaveLength(1);
     expect(fake("t1").calls[0]?.prompt).toContain("Work from your inbox");
     expect(logs).toContain("dispatch(not-live) refused — no live actor");
+  });
+
+  it("rebuilds the unified admission list from unhandled inbox work after a leader restart (#672)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    inboxStore.append([
+      { actorId: "t1", source: "mesh:root", payload: payload("mesh.message") },
+      { actorId: "t2", source: "mesh:root", payload: payload("mesh.message") },
+    ]);
+    const actors = new InMemoryActorRepository();
+    for (const id of ["t1", "t2"]) {
+      actors.upsert({
+        id,
+        charter: "resumed work",
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      });
+    }
+    const leader = (lane: ProviderPacer) => {
+      const queue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
+      const harness = setup({
+        inboxStore,
+        actors,
+        providerGate: (fn, candidates, request) =>
+          queue.enqueue(
+            fn,
+            candidates.map((config) => ({ config, lane: config.provider, pacer: lane })),
+            {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+            }
+          ),
+      });
+      harness.mesh.rehydrateAll();
+      harness.mesh.reconcileInbox();
+      return { ...harness, queue };
+    };
+
+    // The first leader accepts both actors into its list, then dies before
+    // its lane opens: the list, and nothing else, is lost.
+    const closed = new ProviderPacer(0);
+    closed.deferUntil(Date.now() + 24 * 60 * 60_000);
+    const first = leader(closed);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(first.queue.snapshot().map((entry) => entry.threadId)).toEqual(["t1", "t2"]);
+    first.mesh.shutdownAll();
+
+    // A replacement leader has only the durable inbox to go on.
+    const second = leader(new ProviderPacer(0));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE);
+    expect(second.fake("t1").calls).toHaveLength(1);
+    expect(second.fake("t2").calls).toHaveLength(1);
+    expect(first.fake("t1").calls).toHaveLength(0);
+    expect(first.fake("t2").calls).toHaveLength(0);
+    expect(second.queue.snapshot()).toEqual([]);
   });
 
   it("wakes a recipient from the durable append alone, with no nudge from the appender", async () => {
@@ -1940,9 +2003,10 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("joins the active run when an actor makes its own obligation ready mid-run", async () => {
+  it("defers self-caused responsive ready attention to the run end (#632)", async () => {
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
+    let worker = "";
     let resolveFirst!: (result: Partial<RunResult>) => void;
     let firstSignal: AbortSignal | undefined;
     let runIndex = 0;
@@ -1954,6 +2018,201 @@ describe("ActorMesh", () => {
         });
       }
       return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    class ClassBackedObligations implements MeshObligationPort {
+      findLiveByExternalRef() {
+        return null;
+      }
+
+      get(id: string) {
+        return {
+          id,
+          ownerId: this.ownerId(),
+          status: "ready",
+          effectiveResponsive: true,
+        } as unknown as Obligation;
+      }
+
+      constructor(private readonly ownerId: () => string) {}
+    }
+    const obligations = new ClassBackedObligations(() => worker);
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      obligations,
+    });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    const appendSpy = vi.spyOn(inboxStore, "append");
+
+    // The running actor closed a prerequisite and made its own obligation
+    // ready. The delivery is deferred until run completion so it does not
+    // self-interrupt mid-run (#632).
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+    ).toBe(true);
+    expect(
+      mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-self-2", intent: "also self-caused" },
+        true
+      )
+    ).toBe(true);
+    await Promise.resolve(); // flush the durable-append drain after the current run
+    expect(firstSignal?.aborted).toBe(false);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(false);
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+    expect(appendSpy).toHaveBeenCalledTimes(1);
+    expect(appendSpy.mock.calls[0]?.[0]).toHaveLength(2);
+    expect(fake(worker).calls).toHaveLength(2);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+      )
+    ).toBe(true);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self-2"
+      )
+    ).toBe(true);
+  });
+
+  it("discards deferred responsive ready attention if obligation is no longer ready when run completes (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let worker = "";
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let runIndex = 0;
+    const provider = new FakeProvider(() => {
+      if (runIndex++ === 0) {
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "follow-up" };
+    });
+    let obligationStatus = "ready";
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: obligationStatus,
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      sharedProvider: provider,
+      obligations,
+    });
+    worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    // Actor makes an obligation ready mid-run:
+    expect(
+      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-closed", intent: "temp ready" }, true)
+    ).toBe(true);
+
+    // But before the run completes, the obligation is marked done (or subordinated):
+    obligationStatus = "done";
+
+    resolveFirst({ success: true, exitCode: 0, output: "first" });
+    await vi.advanceTimersByTimeAsync(0);
+    await tick();
+
+    // Since the obligation was done when the run flushed, no inbox entry was delivered and no follow-up was scheduled:
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(
+      inboxStore.entries.some(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-closed"
+      )
+    ).toBe(false);
+  });
+
+  it("reconciles self-caused responsive attention deferred by a process loss (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const actors = new InMemoryActorRepository();
+    let worker = "";
+    let runIndex = 0;
+    const provider = new FakeProvider(() => {
+      if (runIndex++ === 0) return new Promise<Partial<RunResult>>(() => {});
+      return { success: true, exitCode: 0, output: "restarted" };
+    });
+    const obligations: MeshObligationPort = {
+      findLiveByExternalRef: () => null,
+      get: (id: string) =>
+        ({
+          id,
+          ownerId: worker,
+          status: "ready",
+          effectiveResponsive: true,
+        }) as unknown as Obligation,
+    };
+    const first = setup({ actors, inboxStore, sharedProvider: provider, obligations });
+    worker = first.mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    first.mesh.dispatch(worker);
+    await first.tick();
+    expect(
+      first.mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-recovered", intent: "survives restart" },
+        true
+      )
+    ).toBe(true);
+    expect(inboxStore.entries.some((entry) => entry.source === "obligation:ob-recovered")).toBe(
+      false
+    );
+
+    // A restart loses the transient buffer, then rehydrates actors and derives
+    // the still-ready responsive fact from durable obligation state.
+    const restarted = setup({ actors, inboxStore });
+    restarted.mesh.rehydrateAll();
+    restarted.mesh.reconcileResponsiveReadyAttention({
+      listResponsiveReadyAttention: () => [
+        { id: "ob-recovered", ownerId: worker, intent: "survives restart" },
+      ],
+    });
+    await restarted.tick();
+
+    expect(
+      inboxStore.entries.filter(
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-recovered"
+      )
+    ).toHaveLength(1);
+  });
+
+  it("preempts active run when responsive ready attention is external (#632)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>(() => {});
+      }
+      return { success: true, exitCode: 0, output: "interrupted-follow-up" };
     });
     const { mesh, fake, tick } = setup({
       inboxStore,
@@ -1967,25 +2226,23 @@ describe("ActorMesh", () => {
     await tick();
     expect(fake(worker).calls).toHaveLength(1);
 
-    // The running actor closed a prerequisite and made its own obligation
-    // ready. The entry is durably responsive, so it is scheduled and admitted
-    // as responsive — but the actor will see it in its own worklist, so the
-    // run it is already doing is not thrown away.
+    // External caller (selfCausedMidRun = false) delivers responsive ready attention:
     expect(
-      mesh.deliverResponsiveReadyAttention(worker, { id: "ob-self", intent: "self-caused" }, true)
+      mesh.deliverResponsiveReadyAttention(
+        worker,
+        { id: "ob-ext", intent: "external responsive" },
+        false
+      )
     ).toBe(true);
-    await Promise.resolve(); // flush the durable-append drain after the join wake
-    expect(firstSignal?.aborted).toBe(false);
-    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
-    expect(fake(worker).calls).toHaveLength(1);
-
-    resolveFirst({ success: true, exitCode: 0, output: "first" });
     await vi.advanceTimersByTimeAsync(0);
     await tick();
-    expect(fake(worker).calls).toHaveLength(2);
+
+    // External responsive work immediately preempts the active run:
+    expect(firstSignal?.aborted).toBe(true);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(true);
     expect(
       inboxStore.entries.some(
-        (entry) => entry.actorId === worker && entry.source === "obligation:ob-self"
+        (entry) => entry.actorId === worker && entry.source === "obligation:ob-ext"
       )
     ).toBe(true);
   });
@@ -7356,19 +7613,21 @@ describe("ActorMesh", () => {
       const { mesh } = setup({ inboxStore });
       const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
 
-      // Recipient liveness, the durable append, and the wake are one turn.
-      // Suspend anywhere between them and a retirement lands after a recipient
-      // was resolved as live: the row is still written (SqliteInboxRepository.append
+      // Recipient liveness and the durable append are one turn. Suspend
+      // between them and a retirement lands after a recipient was resolved as
+      // live: the row is still written (SqliteInboxRepository.append
       // validates only non-empty actor ids, and the inbox table has no actor
-      // foreign key), leaving durable unhandled work nobody alive can take,
-      // and the wake then fails. A microtask queued before the call is the
-      // tightest interleaving available — it runs at the first suspension
-      // point inside delivery, if the code has one at all. This now runs
+      // foreign key), leaving durable unhandled work nobody alive can take.
+      // The wake is not part of that turn: the after-commit seam issues it a
+      // microtask later (#632), so here it runs after the retirement and is
+      // refused, and this case asserts nothing about it. A microtask queued
+      // before the call is the tightest interleaving available — it runs at
+      // the first suspension point inside delivery, if the code has one at all. This now runs
       // against the production entry point itself (#393), so an `await`
       // introduced anywhere under `deliverExternalEvent` fails here.
       // Under #540, an actor cannot retire while holding a live event subscription.
       // A directed target targets the worker without a subscription blocker on worker,
-      // while exercising the exact same synchronous liveness-check -> append -> wake
+      // while exercising the exact same synchronous liveness-check -> append
       // pipeline shared by all delivery routes under `deliverExternalEvent`.
       const retirement = Promise.resolve().then(() => mesh.retire(worker));
       const delivery = deliverCanonicalEvent(mesh, "github:dummy-org/dummy-repo", "repo event", {
@@ -7851,17 +8110,21 @@ describe("ActorMesh", () => {
         source: string;
         payload: { type: string; [key: string]: unknown };
       }> = [];
+      const appendListeners: Array<(items: readonly InboxEntry[]) => void> = [];
       const inboxStore = {
         append: (inputs: typeof appended) => {
           order.push("persist");
           appended.push(...inputs);
-          return inputs.map((input, index) => ({
+          const inserted = inputs.map((input, index) => ({
             ...input,
             id: `entry-${index}`,
             deliveredAt: new Date("2026-01-01T00:00:00Z"),
             seenAt: null,
             handledAt: null,
+            handledNote: null,
           }));
+          for (const listener of appendListeners) listener(inserted);
+          return inserted;
         },
         markSeen: () => {
           order.push("seen");
@@ -7880,9 +8143,12 @@ describe("ActorMesh", () => {
             (entry) => !options.responsiveOnly || entry.payload.priority === "responsive"
           ).length,
         list: () => ({ entries: [], unhandledCount: 0, nextCursor: null }),
-        // Partial fake: it never notifies, so the only wake here is whatever the
-        // mesh path under test sends itself.
-        onItemsAppended: () => () => {},
+        // Event delivery no longer wakes its recipients itself (#632); the
+        // after-commit notification is the one wake, as in the durable store.
+        onItemsAppended: (listener: (items: readonly InboxEntry[]) => void) => {
+          appendListeners.push(listener);
+          return () => {};
+        },
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -7903,7 +8169,11 @@ describe("ActorMesh", () => {
         {
           actorId,
           source: "github:dummy-org/dummy-repo/issues/903",
-          payload: { type: "issue_comment.created", commentId: 4959289232 },
+          payload: {
+            type: "issue_comment.created",
+            commentId: 4959289232,
+            deliveryRole: "owner",
+          },
         },
       ]);
       expect(fake(actorId).calls).toHaveLength(1);
@@ -8660,8 +8930,17 @@ describe("ActorMesh", () => {
         await t.startRun(owner);
         await t.startRun(watcher);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
-        await vi.advanceTimersByTimeAsync(0); // flush the durable-append drain after the join wake
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
+
+        // Each copy carries the role it was routed under; the append seam, not
+        // the delivery call, turns that into preempt versus join (#632).
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([
+          [owner, "owner"],
+          [watcher, "subscriber"],
+        ]);
 
         // The owner's run is replaced exactly once; the subscriber's is not.
         expect(t.signals.get(owner)?.aborted).toBe(true);
@@ -8704,13 +8983,47 @@ describe("ActorMesh", () => {
         await t.startRun(watcherA);
         await t.startRun(watcherB);
 
-        await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        const delivery = await t.mesh.deliverExternalEvent(responsiveIssueEvent);
+        await vi.advanceTimersByTimeAsync(0); // flush the after-commit append wake
 
+        expect(delivery.entries.map((entry) => entry.payload.deliveryRole)).toEqual([
+          "subscriber",
+          "subscriber",
+        ]);
         expect(t.signals.get(watcherA)?.aborted).toBe(false);
         expect(t.signals.get(watcherB)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([]);
         expect(t.unhandledResponsive(watcherA)).toHaveLength(1);
         expect(t.unhandledResponsive(watcherB)).toHaveLength(1);
+      });
+
+      it("coalesces one turn's mixed roles for an actor to the preempting wake, in either order", async () => {
+        // Fan-out destinations are deduplicated per event, so a mixed debt
+        // needs two appends before the drain: a subscriber copy plus any
+        // owner or unannotated row in the same turn (#632).
+        const t = setupTwoRunningActors();
+        const subscriberFirst = t.mesh.spawn({ charter: "subscriber first", parentId: "root" });
+        const ownerFirst = t.mesh.spawn({ charter: "owner first", parentId: "root" });
+        await t.startRun(subscriberFirst);
+        await t.startRun(ownerFirst);
+        const copy = (actorId: string, deliveryRole?: "owner" | "subscriber") =>
+          t.inboxStore.append([
+            {
+              actorId,
+              source: ISSUE,
+              payload: { ...payload("issues.opened"), priority: "responsive", deliveryRole },
+            },
+          ]);
+
+        copy(subscriberFirst, "subscriber");
+        copy(subscriberFirst, "owner");
+        copy(ownerFirst);
+        copy(ownerFirst, "subscriber");
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.signals.get(subscriberFirst)?.aborted).toBe(true);
+        expect(t.signals.get(ownerFirst)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([subscriberFirst, ownerFirst]);
       });
 
       it("still quick-starts an idle subscriber as responsive work", async () => {
@@ -8726,6 +9039,61 @@ describe("ActorMesh", () => {
         await vi.advanceTimersByTimeAsync(0);
 
         expect(t.runs.get(watcher)).toBe(1);
+        expect(t.preemptions()).toEqual([owner]);
+      });
+
+      it("persists a landed directive as the owner's copy and preempts its target", async () => {
+        // A directive makes its live target the sole owner and excludes
+        // subscribers, so it is the owner role rather than a third one (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        const target = t.mesh.spawn({ charter: "target", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(target);
+
+        const delivery = await t.mesh.deliverExternalEvent({
+          ...responsiveIssueEvent,
+          directedTarget: target,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(
+          delivery.entries.map((entry) => [entry.actorId, entry.payload.deliveryRole])
+        ).toEqual([[target, "owner"]]);
+        expect(t.signals.get(target)?.aborted).toBe(true);
+        expect(t.preemptions()).toEqual([target]);
+      });
+
+      it("routes by the role it computed, not one the raw event payload claims", async () => {
+        // The timer normalizer spreads `rawPayload`, so a `deliveryRole`
+        // inside it reaches the fan-out. Routing's answer must replace it in
+        // both directions before the seam reads it (#632).
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        for (const claimed of ["subscriber", "owner"] as const) {
+          await t.mesh.deliverExternalEvent({
+            ...responsiveIssueEvent,
+            rawPayload: { ...responsiveIssueEvent.rawPayload, deliveryRole: claimed },
+          });
+        }
+        await vi.advanceTimersByTimeAsync(0);
+
+        const roles = (actorId: string) =>
+          t.unhandledResponsive(actorId).map((entry) => entry.payload.deliveryRole);
+        expect(roles(owner)).toEqual(["owner", "owner"]);
+        expect(roles(watcher)).toEqual(["subscriber", "subscriber"]);
+        // A claimed "subscriber" cannot turn the owner's wake into a join, and
+        // a claimed "owner" cannot make the subscriber's copy preempt.
+        expect(t.signals.get(owner)?.aborted).toBe(true);
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
         expect(t.preemptions()).toEqual([owner]);
       });
 
@@ -11037,6 +11405,18 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.selectInboxEntries(actorId, [entry.id]);
   }
 
+  function selectDirectFocus(mesh: ActorMesh, actorId: string, obligationId: string): void {
+    mesh.sendMessage(actorId, "focus this obligation", "root");
+    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    const entry = inboxStore.entries
+      .filter(
+        (candidate) => candidate.actorId === actorId && candidate.payload.type === "mesh.message"
+      )
+      .at(-1);
+    if (!entry) throw new Error("expected direct-focus inbox entry");
+    mesh.selectInboxEntries(actorId, [entry.id], undefined, obligationId);
+  }
+
   function worker(mesh: ActorMesh, charter = "worker"): string {
     return mesh.spawn({
       charter,
@@ -11068,6 +11448,145 @@ describe("strict obligation handling experiment (#382)", () => {
         payload: expect.stringContaining('"obligationId":"strict-head"'),
       })
     );
+  });
+
+  it("arms strict handling from the focused obligation status at selection", () => {
+    const { mesh } = strictMesh();
+
+    const directReady = worker(mesh, "direct ready");
+    mesh.enrollActorInExperiment(directReady, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "direct-ready", title: "Direct ready", ownerId: directReady });
+    selectDirectFocus(mesh, directReady, "direct-ready");
+    expect(mesh.runDisciplineNotice(directReady)).toContain("direct-ready");
+    expect(() => mesh.declareYield(directReady, "complete")).toThrow(
+      /selected head obligation direct-ready/
+    );
+
+    const directWaiting = worker(mesh, "direct waiting");
+    mesh.enrollActorInExperiment(directWaiting, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "direct-waiting", title: "Direct waiting", ownerId: directWaiting });
+    repo.create({ id: "direct-blocker", title: "Direct blocker", ownerId: directWaiting });
+    repo.addPrerequisite("direct-waiting", "direct-blocker", "system:mesh");
+    selectDirectFocus(mesh, directWaiting, "direct-waiting");
+    expect(mesh.runDisciplineNotice(directWaiting)).toBeUndefined();
+    // The selection-time decision remains stable when the focused work becomes ready later.
+    repo.setTerminalStatus("direct-blocker", "done", null, null, "system:mesh");
+    expect(repo.get("direct-waiting")?.status).toBe("ready");
+    expect(() => mesh.declareYield(directWaiting, "complete")).not.toThrow();
+
+    const staleHead = worker(mesh, "stale ready-head");
+    mesh.enrollActorInExperiment(staleHead, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "stale-head", title: "Stale head", ownerId: staleHead });
+    mesh.deliverReadyHeadAttention(staleHead, { id: "stale-head", intent: "stale" }, null);
+    repo.create({
+      id: "already-waiting-child",
+      parentId: "stale-head",
+      title: "Already waiting child",
+      ownerId: staleHead,
+      creatorId: staleHead,
+    });
+    expect(repo.get("stale-head")?.status).toBe("waiting");
+    mesh.actorQueued(staleHead, { responsive: false, mode: "ordinary" });
+    const staleEntry = inboxStore.entries.find(
+      (candidate) =>
+        candidate.actorId === staleHead &&
+        candidate.payload.type === "obligation.ready_head" &&
+        candidate.payload.obligationId === "stale-head"
+    );
+    if (!staleEntry) throw new Error("expected stale ready-head inbox entry");
+    mesh.selectInboxEntries(staleHead, [staleEntry.id]);
+    expect(mesh.runDisciplineNotice(staleHead)).toBeUndefined();
+    expect(() => mesh.declareYield(staleHead, "complete")).not.toThrow();
+
+    const currentHead = worker(mesh, "current ready-head");
+    mesh.enrollActorInExperiment(currentHead, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "current-head", title: "Current head", ownerId: currentHead });
+    selectHead(mesh, currentHead, "current-head");
+    expect(mesh.runDisciplineNotice(currentHead)).toContain("current-head");
+    expect(() => mesh.declareYield(currentHead, "complete")).toThrow(
+      /selected head obligation current-head/
+    );
+
+    const control = worker(mesh, "unenrolled direct control");
+    repo.create({ id: "control-direct", title: "Control direct", ownerId: control });
+    selectDirectFocus(mesh, control, "control-direct");
+    expect(mesh.runDisciplineNotice(control)).toBeUndefined();
+    expect(() => mesh.declareYield(control, "complete")).not.toThrow();
+  });
+
+  it("unions selected ready heads with owned direct focus without arming foreign focus", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh, "union subject");
+    const other = worker(mesh, "other owner");
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "selected-head", title: "Selected head", ownerId: subject });
+    repo.create({ id: "owned-direct", title: "Owned direct", ownerId: subject });
+    repo.create({ id: "foreign-direct", title: "Foreign direct", ownerId: other });
+
+    // An explicit foreign focus cannot replace the selected head's closure
+    // requirement. It remains resolver context, not this actor's commitment.
+    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const headEntry = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === subject &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "selected-head"
+    );
+    if (!headEntry) throw new Error("expected selected ready-head entry");
+    mesh.selectInboxEntries(subject, [headEntry.id], undefined, "foreign-direct");
+    expect(mesh.runDisciplineNotice(subject)).toContain("selected-head");
+    expect(mesh.runDisciplineNotice(subject)).not.toContain("foreign-direct");
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation selected-head/
+    );
+    mesh.abandonInboxRun(subject);
+
+    // When both are owned and ready, each selection-time focus remains armed.
+    mesh.deliverReadyHeadAttention(subject, { id: "selected-head", intent: "head" }, null);
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const secondHeadEntry = inboxStore.entries
+      .filter(
+        (entry) =>
+          entry.actorId === subject &&
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === "selected-head" &&
+          !entry.handledAt
+      )
+      .at(-1);
+    if (!secondHeadEntry) throw new Error("expected second selected ready-head entry");
+    mesh.selectInboxEntries(subject, [secondHeadEntry.id], undefined, "owned-direct");
+    repo.setTerminalStatus("selected-head", "done", null, null, subject);
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation owned-direct/
+    );
+    repo.setTerminalStatus("owned-direct", "done", null, null, subject);
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+  });
+
+  it("does not arm a ready head reassigned to another actor before selection", () => {
+    const { mesh } = strictMesh();
+    const formerOwner = worker(mesh, "former owner");
+    const newOwner = worker(mesh, "new owner");
+    mesh.enrollActorInExperiment(formerOwner, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "moved-head", title: "Moved head", ownerId: formerOwner });
+    mesh.deliverReadyHeadAttention(formerOwner, { id: "moved-head", intent: "moved" }, null);
+    mesh.actorQueued(formerOwner, { responsive: false, mode: "ordinary" });
+    const movedEntry = inboxStore.entries.find(
+      (entry) =>
+        entry.actorId === formerOwner &&
+        entry.payload.type === "obligation.ready_head" &&
+        entry.payload.obligationId === "moved-head"
+    );
+    if (!movedEntry) throw new Error("expected moved ready-head entry");
+
+    // The durable entry outlives the transfer; the row stays ready, but it is
+    // now the new owner's commitment, not the former owner's.
+    repo.reassign("moved-head", newOwner, "root");
+    expect(repo.get("moved-head")?.status).toBe("ready");
+    mesh.selectInboxEntries(formerOwner, [movedEntry.id]);
+    expect(mesh.runDisciplineNotice(formerOwner)).toBeUndefined();
+    expect(() => mesh.declareYield(formerOwner, "complete")).not.toThrow();
   });
 
   it("captures experiment membership at selection, so a root unenrollment applies next run", () => {
@@ -11122,18 +11641,11 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "blocked")).not.toThrow();
   });
 
-  it("rejects pre-existing or other-authored children, but accepts a newly added unmet prerequisite", () => {
+  it("rejects an other-authored child after ready selection, but accepts a newly added unmet prerequisite", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
     mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
     repo.create({ id: "parent", title: "Parent", ownerId: subject });
-    repo.create({
-      id: "old-child",
-      parentId: "parent",
-      title: "Old child",
-      ownerId: subject,
-      creatorId: subject,
-    });
     selectHead(mesh, subject, "parent");
     repo.create({
       id: "other-child",
@@ -11368,8 +11880,9 @@ describe("strict obligation handling experiment (#382)", () => {
     mesh.abandonInboxRun(source);
 
     // Attention was delivered while the source owned the head, but an ancestor
-    // moved it before the source selected. The source's own fresh checkpoint —
-    // written through the ancestor path here — is not a handoff it performed.
+    // moved it before the source selected. Selection arms only a head this
+    // actor owns (#673), so the stale entry is not the source's commitment and
+    // no transfer is attributed to its run.
     repo.create({ id: "moved", title: "Moved before selection", ownerId: source });
     repo.reassign("moved", recipient, "root");
     mesh.actorQueued(source, { responsive: false, mode: "ordinary" });
@@ -11381,8 +11894,8 @@ describe("strict obligation handling experiment (#382)", () => {
     );
     if (!stale) throw new Error("expected the pre-transfer attention");
     mesh.selectInboxEntries(source, [stale.id]);
-    repo.setCheckpoint("moved", "I never owned this during the run.", source);
-    expect(() => mesh.declareYield(source, "complete")).toThrow(/did not own it when selected/);
+    expect(mesh.runDisciplineNotice(source)).toBeUndefined();
+    expect(() => mesh.declareYield(source, "complete")).not.toThrow();
   });
 
   it("records a head unreadable at selection and fails closed on a handoff of it", () => {

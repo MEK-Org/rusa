@@ -104,19 +104,31 @@ export interface DashboardDataDeps {
   /** Optional yield check for testing runState without full mesh instance. */
   isYielded?: (actorId: string) => boolean;
   /**
-   * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
-   * flattened across lanes. `position` is 0-based within its own provider
-   * lane (not globally comparable across lanes); `estimatedStartAt` is an
-   * ISO-8601 projection or `null` when it can't be honestly quoted yet;
-   * `pacingIntervalMs` is the lane's whole-millisecond start spacing — see
-   * `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   * Read-only snapshot of the leader's one admission list, across lanes.
+   * `position` is 0-based in that list; `estimatedStartAt` is an ISO-8601
+   * projection or `null` when it can't be honestly quoted yet;
+   * `pacingIntervalMs` is the projecting lane's whole-millisecond start
+   * spacing — see `UnifiedAdmissionQueue.snapshot` for the full contract.
    */
   providerQueueSnapshots?: () => Array<{
     threadId: string;
     position: number;
     estimatedStartAt: string | null;
     pacingIntervalMs: number;
+    claimed?: boolean;
+    compatibleLanes?: string[];
+    claimedLane?: string | null;
   }>;
+  /**
+   * Operator reorder of the unclaimed admission list (#570), applied only when
+   * `observedOrder` is still the live unclaimed order — see
+   * `UnifiedAdmissionQueue.reorderObserved`. Absent → the route 503s.
+   */
+  reorderAdmissionQueue?: (request: {
+    observedOrder: string[];
+    threadId: string;
+    beforeThreadId?: string;
+  }) => { status: "ok" | "stale" | "invalid"; order: string[] };
   /**
    * Current selected obligation for an actor's active run. This is a
    * projection of the durable inbox focus, not a second selection model; it
@@ -168,6 +180,7 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
+import { parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -321,16 +334,14 @@ interface ThreadDto {
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
   /**
-   * 0-based position within this actor's provider lane, or `null` when the
-   * actor isn't in a provider queue right now. Not comparable across
-   * different provider lanes — only meaningful relative to other actors on
-   * the same lane.
+   * 0-based position in the leader's one admission list, or `null` when the
+   * actor isn't waiting to start right now.
    */
   queuePosition?: number | null;
   /**
    * ISO-8601 estimate of when this actor's provider run will start, or
    * `null` when the estimate can't be honestly quoted yet (see
-   * `ProviderPacer.getQueueSnapshot`). Recomputed on every request from
+   * `UnifiedAdmissionQueue.snapshot`). Recomputed on every request from
    * live pacer state — never persisted, and shifts as pacing changes.
    */
   estimatedStartAt?: string | null;
@@ -340,6 +351,12 @@ interface ThreadDto {
    * lifetime as `estimatedStartAt`.
    */
   pacingIntervalMs?: number | null;
+  /** In the admission list holding a lane, waiting on mesh concurrency; never reorderable. */
+  admissionClaimed?: boolean;
+  /** Provider lanes this queued actor can start on; empty when not queued. */
+  compatibleLanes?: string[];
+  /** The lane a claimed admission holds, else `null`. */
+  claimedLane?: string | null;
 }
 
 /**
@@ -525,22 +542,65 @@ function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
 }
 
 /**
- * Inbox entries intentionally store lightweight pointers. The dashboard is the
- * presentation boundary, so resolve a mesh-message pointer, or a GitHub source
- * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
- * the event was about), here and never leak an opaque id or an unlinked
- * `github:` label into the UI payload.
+ * The `gchat:spaces/S/messages/M` reference a Google Chat inbox entry is
+ * about, or undefined when its payload names no message in its source space.
  *
- * Google Chat sources are deliberately left alone: a chat event's `source` is
- * the containing space (routing granularity), not the specific message, so
- * resolving it here would show the wrong entity. Every other payload keeps
- * its raw JSON, which is the honest rendering until that has a resolver.
+ * A chat event's `source` is the containing space (routing granularity), so
+ * resolving that would show the wrong entity; the message itself is the
+ * payload's `messageName`, which is Google's resource name and so already
+ * the reference path.
+ */
+function gchatInboxMessageReference(source: string, payload: InboxPayload): string | undefined {
+  if (payload.type !== "gchat.message" || typeof payload.messageName !== "string") {
+    return undefined;
+  }
+  try {
+    const reference = parseReference(`gchat:${payload.messageName}`);
+    const sourceReference = parseReference(source);
+    const [messageCollection, messageSpace, messageKind] = reference.segments;
+    const [sourceCollection, sourceSpace] = sourceReference.segments;
+    // This is the exact Google message resource form, not the cache's broader
+    // internal entity classifier. The source must be the message's containing
+    // space: an inbox payload cannot use this rendering path to name a message
+    // in a different space.
+    return reference.scheme === "gchat" &&
+      reference.segments.length === 4 &&
+      messageCollection === "spaces" &&
+      messageKind === "messages" &&
+      sourceReference.scheme === "gchat" &&
+      sourceReference.segments.length === 2 &&
+      sourceCollection === "spaces" &&
+      messageSpace === sourceSpace
+      ? reference.key
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Inbox entries intentionally store lightweight pointers. The dashboard is the
+ * presentation boundary, so resolve a mesh-message pointer, a GitHub source
+ * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
+ * the event was about), or the Google Chat message a chat event carries, here
+ * and never leak an opaque id or an unlinked label into the UI payload.
+ * Every other payload keeps its raw JSON, which is the honest rendering until
+ * that has a resolver.
  */
 async function resolveInboxPage(
   page: InboxPage,
   deps: DashboardDataDeps,
   chatScope: HumanChatScope
 ): Promise<ResolvedInboxPage> {
+  // Same cache/resolver an obligation's cited artifacts use, so an external
+  // inbox entry gets the identical rich preview and "open in new tab" link
+  // rather than a second rendering path.
+  const resolve = (ref: string) =>
+    deps.referenceCache
+      ? deps.referenceCache
+          .get(ref, deps)
+          .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
+      : resolveReferenceSync(ref, { meshChat: deps.meshChat });
   const entries: Array<ResolvedInboxEntry | null> = await Promise.all(
     page.entries.map(async (entry): Promise<ResolvedInboxEntry | null> => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
@@ -570,15 +630,6 @@ async function resolveInboxPage(
         };
       }
       if (entry.source.startsWith("github:")) {
-        // Same cache/resolver an obligation's cited artifacts use, so a
-        // GitHub-sourced inbox entry gets the identical rich preview and
-        // "open in new tab" link rather than a second rendering path.
-        const resolve = (ref: string) =>
-          deps.referenceCache
-            ? deps.referenceCache
-                .get(ref, deps)
-                .catch(() => resolveReferenceSync(ref, { meshChat: deps.meshChat }))
-            : resolveReferenceSync(ref, { meshChat: deps.meshChat });
         // A comment or review is resolved alongside the issue/PR it arrived
         // through, so the card can show what was said and what it was said on.
         const eventRef = githubInboxEventReference(entry.source, entry.payload);
@@ -588,6 +639,8 @@ async function resolveInboxPage(
         ]);
         return { ...entry, reference, ...(eventReference ? { eventReference } : {}) };
       }
+      const chatMessage = gchatInboxMessageReference(entry.source, entry.payload);
+      if (chatMessage) return { ...entry, reference: await resolve(chatMessage) };
       return entry;
     })
   );
@@ -766,6 +819,69 @@ export async function handleMeshApiRequest(
             sendJson(res, 201, { id });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/admission-queue/reorder — operator reorder of the unclaimed
+    // admission list (#570). The body carries the unclaimed order the operator
+    // saw; if the live list differs, nothing moves and 409 returns the current
+    // order. The order is leader-local memory and resets on leader restart.
+    if (pathname === "/api/mesh/admission-queue/reorder") {
+      const reorder = deps?.reorderAdmissionQueue;
+      if (!reorder) {
+        sendJson(res, 503, { error: "admission queue unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          const body =
+            typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : {};
+          const { threadId, beforeThreadId, observedOrder } = body;
+          if (
+            typeof threadId !== "string" ||
+            !(
+              beforeThreadId === undefined ||
+              beforeThreadId === null ||
+              typeof beforeThreadId === "string"
+            ) ||
+            !Array.isArray(observedOrder) ||
+            !observedOrder.every((id) => typeof id === "string")
+          ) {
+            sendJson(res, 400, {
+              error: "threadId, observedOrder (string[]) and optional beforeThreadId are required",
+            });
+            return;
+          }
+          const principal = requireOperatorPrincipal(req, res, deps);
+          if (!principal) return;
+          const result = reorder({
+            observedOrder,
+            threadId,
+            beforeThreadId: typeof beforeThreadId === "string" ? beforeThreadId : undefined,
+          });
+          if (result.status === "stale") {
+            sendJson(res, 409, { error: "admission queue changed", order: result.order });
+          } else if (result.status === "invalid") {
+            sendJson(res, 400, { error: "not an unclaimed queued actor", order: result.order });
+          } else {
+            deps?.logger?.info("admission_queue_reordered", {
+              principal,
+              threadId,
+              beforeThreadId: typeof beforeThreadId === "string" ? beforeThreadId : null,
+            });
+            sendJson(res, 200, { ok: true, order: result.order });
           }
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
@@ -1839,6 +1955,9 @@ export async function handleMeshApiRequest(
           queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
           estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
           pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
+          admissionClaimed: providerQueueSnapshots.get(r.id)?.claimed ?? false,
+          compatibleLanes: providerQueueSnapshots.get(r.id)?.compatibleLanes ?? [],
+          claimedLane: providerQueueSnapshots.get(r.id)?.claimedLane ?? null,
           selectedProvider: selection?.provider ?? null,
           selectedLane: selection?.lane ?? null,
           selectedModel: selection?.model ?? null,

@@ -2,8 +2,24 @@ export interface InboxPayload {
   type: string;
   /** Durable scheduling priority; absent means normal/background work. */
   priority?: "responsive";
+  /**
+   * Which relationship an event fan-out copy was delivered under, attributed
+   * by the producer when it appends the row (#632). A directed delivery lands
+   * its target as the sole owner, so it is "owner" rather than a third role.
+   * The after-commit wake reads this to decide whether a recipient's active
+   * run may be replaced ("owner") or only joined ("subscriber"); absent means
+   * ordinary work and keeps the ordinary dispatch.
+   *
+   * Persisted rather than re-resolved after commit because the ownership
+   * answer is a snapshot of routing at append time: a directive names a
+   * handle, and ownership or subscriptions can change before the wake reads
+   * the row, so routing again could give a different answer for the same copy.
+   */
+  deliveryRole?: InboxDeliveryRole;
   [key: string]: unknown;
 }
+
+export type InboxDeliveryRole = "owner" | "subscriber";
 
 export interface InboxEntry {
   id: string;
@@ -130,6 +146,10 @@ export function validateInboxPayload(payload: unknown): asserts payload is Inbox
   const priority = (payload as { priority?: unknown }).priority;
   if (priority !== undefined && priority !== "responsive") {
     throw new Error('inbox payload.priority must be "responsive" when present');
+  }
+  const deliveryRole = (payload as { deliveryRole?: unknown }).deliveryRole;
+  if (deliveryRole !== undefined && deliveryRole !== "owner" && deliveryRole !== "subscriber") {
+    throw new Error('inbox payload.deliveryRole must be "owner" or "subscriber" when present');
   }
 }
 

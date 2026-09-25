@@ -183,8 +183,11 @@ does not start a run. Omitting `target` keeps execution on the leader.
 
 ## What crosses the connection
 
-The follower authenticates with a secret, receives a registration session, and
-long-polls the leader for actor commands. It forwards actor events over HTTP.
+The follower authenticates with a secret, registers a process-lifetime generation
+and receives a renewable registration session, then long-polls the leader for
+actor commands. It forwards actor events over HTTP. A reconnect from the same
+generation rolls the session and reattaches its hosts; a different authenticated
+generation fences the old session and is the confirmed replacement boundary.
 Each actor runs the original `Actor` class inside the follower process, using
 locally installed provider adapters and credentials. The follower assigns each
 actor a local workspace without changing process-wide cwd or per-actor environment.
@@ -215,8 +218,8 @@ paths, and the routing table is in memory only.
    application-owned `context_config` JSON document. The reader accepts the previous strict
    v1 document and this build writes strict v2 documents; this is not a SQL migration and does
    not add a database JSON validator.
-2. **Client-side backoff reconnect**: If the leader restarts or transient network interruptions occur, the follower does not exit; it initiates an exponential backoff reconnect loop calling `/register`.
-3. **Re-attachment and capability re-issuance**: When the leader restarts and the follower re-enrolls, the leader re-attaches placed actors by ID and re-issues fresh bearer capability URLs. Unhandled inbox items trigger recovery wakes.
+2. **Client-side backoff reconnect**: If the leader restarts or transient network interruptions occur, the follower does not exit; it initiates an exponential backoff reconnect loop calling `/register`. The same running process retains its generation, so the leader rolls the session without closing its actor channels or retained admission ticket.
+3. **Re-attachment and capability re-issuance**: When the leader restarts and the follower re-enrolls, the leader re-attaches placed actors by ID and re-issues fresh bearer capability URLs. Unhandled inbox items trigger recovery wakes. A newly registered process generation fences and replaces any older channels for that enrollment identity.
 
 Before enabling placement, take the normal `mesh.db` backup for the deploy. Once a v2 document
 has been written, do not roll the database back to a pre-v2 binary: that binary strictly rejects
@@ -230,9 +233,9 @@ not require actor coordination or interrupt running actors prematurely.
 
 ### Compatibility and version fencing
 
-Follower nodes report their active git `commitSha` and `protocolVersion` upon
-initial enrollment via `POST /register`.
-- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 4). Mismatches fail closed with HTTP 409.
+Follower nodes report their active git `commitSha`, process generation, and
+`protocolVersion` upon enrollment via `POST /register`.
+- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 5). Mismatches fail closed with HTTP 409.
 - Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
 
 ### Build and deploy trigger semantics
@@ -253,8 +256,9 @@ Follower updates can be triggered via three paths:
    - **The replacement leader must survive its own boot before it moves anyone else.** Reconciliation is armed only once startup completes and the mesh is live, not when the follower gateway binds its socket. A leader that comes up far enough to open a port and then dies therefore dispatches nothing. This is the automated form of the operator-verification step that previously guarded the same risk: the leader demonstrating it can run the revision is what authorises propagating it. Followers that connect before arming are reconciled at arming, not dropped.
    - As enrolled followers reconnect and register via `POST /register`, the reconciler evaluates their reported `commitSha`:
      - If `follower.commitSha === trigger.targetSha`: recorded as `success`.
-     - If the follower lags `targetSha`, an update is dispatched via `updateFollower`. The attempt is recorded after dispatch; a dispatch that throws is recorded as a failure rather than a `pending` the follower could never leave.
+     - If the follower lags `targetSha`, an update is dispatched via `updateFollower`. The `pending` attempt is recorded before dispatch so the single-flight gate is durable across leader crashes from the moment the command is enqueued; a dispatch that throws is overwritten as a failure rather than leaving a `pending` state the follower could never leave.
      - **Fail-stop loop prevention**: If a follower previously reported a failure (`status: "failed"`) for the given `targetSha`, automatic reconciliation skips that follower to avoid endless build/restart loops. A newer target supersedes that suppression.
+   - **Automatic rollout is single-flight.** Once armed, the reconciler dispatches at most one automatic follower update at a time. Its durable `pending` attempt remains the gate across leader replacement; a replacement waits rather than guessing whether the former leader's follower is still draining or restarting. A failure, an `already_current` report, or a replacement registration on `targetSha` is terminal for that follower and releases the next eligible connected follower. This applies only to automatic reconciliation: the authenticated single-follower and update-all API paths remain operator-directed.
    - **An active trigger is not retired by the followers that happen to be connected.** The leader keeps no durable enrollment roster, so "every follower we can see is current" cannot establish that every enrolled follower is; completing on it would strand a follower that was offline during the leader update, which is the case the durable document exists to serve. The trigger instead stays active until the next leader update supersedes it, so a follower that reconnects hours later is still caught up. `GET /followers/reconciliation` reports whether a trigger is outstanding, whether all *connected* followers are current, and the per-follower attempt state.
 
 ### Follower-side update execution and safe rollback boundary
@@ -273,14 +277,25 @@ When a follower receives a `FollowerUpdateCommand`, it executes `executeFollower
 
 ## Limits
 
-Leader run accounting is exactly-once for admitted runs: a dropped connection fails
-exactly one durable run when it interrupts a run the leader had admitted, and
-books nothing when the follower was idle or never finished starting. The work
-that run was performing is not resumed or replayed, so effects the provider
-already committed are not exactly-once.
+Leader run accounting is exactly-once for admitted runs. A transport lapse is not
+a run outcome: an in-flight remote run remains pending and may report its late
+result after a same-generation reconnect. It ends only on that reported result,
+explicit cancellation, or a confirmed replacement process generation. Provider
+effects remain outside exactly-once guarantees.
 
-The leader expires unresponsive followers after 45 seconds. Provider process-tree
-cleanup after an abrupt crash still needs validation beyond this experiment.
+The gateway records authenticated last contact from the follower's long-poll and
+event requests and emits one `follower_contact_stale` warning when fresh contact
+first lapses. It refuses new actor placement and follower updates for that
+generation, but leaves existing actor channels and their queued commands intact
+for the next poll. Reattachment is not freshness-gated. It does not expire
+channels or fail runs on a 45-second timer. To recover, restore the
+follower's leader connectivity and let its same generation re-register and poll;
+to end a stranded run, use the normal actor cancellation or retirement control,
+whose stop command remains deliverable when contact returns. Any future expiry
+policy must be chosen from measured contact-gap data and documented as a separate
+operational decision.
+Provider process-tree cleanup after an abrupt crash still needs validation beyond
+this experiment.
 There is deliberately no per-actor Node crash isolation, matching the leader.
 Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
 

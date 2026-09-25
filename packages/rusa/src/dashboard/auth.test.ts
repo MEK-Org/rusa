@@ -12,6 +12,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { executeLegacyPrincipalMigration } from "../principals/legacy-migration.js";
 import { createDashboardRequestHandler, startDashboardServer } from "../webhook/server.js";
 import type { DashboardDataDeps } from "./api.js";
 import {
@@ -22,7 +23,7 @@ import {
   SESSION_MS,
   STREAM_IDLE_MS,
 } from "./auth.js";
-import { DashboardIdentityResolver } from "./identity.js";
+import { DASHBOARD_IDENTITY_CLAIM_ERROR, DashboardIdentityResolver } from "./identity.js";
 
 const config = {
   email: "owner@example.com",
@@ -557,6 +558,67 @@ describe.each(["legacy", "shared"])("%s dashboard authentication", (mode) => {
     expect(authorized.status).toBe(200);
     expect(firebase.verifyIdToken).toHaveBeenCalledWith("id-token", true);
     expect(firebase.verifySessionCookie).toHaveBeenCalledWith("cookie-1", true);
+  });
+
+  it("keeps repeated first sign-in requests bound to the migrated principal", async () => {
+    const migrated = executeLegacyPrincipalMigration(db, {
+      email: "owner@example.com",
+      apply: true,
+    });
+    const before = principals.getUser(migrated.principalId);
+
+    const [first, second] = await Promise.all([
+      post("/api/auth/session"),
+      post("/api/auth/session"),
+    ]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(principals.getUser(migrated.principalId)).toMatchObject({
+      id: migrated.principalId,
+      identity: { issuer: token.iss, subject: token.sub },
+    });
+    expect(before?.id).toBe(migrated.principalId);
+    expect(principals.listUsers()).toHaveLength(1);
+    expect(
+      principals.findUserByExternalIdentity({ issuer: token.iss, subject: token.sub })?.id
+    ).toBe(migrated.principalId);
+  });
+
+  it("does not bind a disabled or non-allowlisted provisioned principal", async () => {
+    const migrated = executeLegacyPrincipalMigration(db, {
+      email: "owner@example.com",
+      apply: true,
+    });
+    token = claim({ email: "other@example.com" });
+    expect((await post("/api/auth/session")).status).toBe(401);
+    expect(principals.getUser(migrated.principalId)?.identity).toBeUndefined();
+
+    token = claim();
+    principals.setDisabled(migrated.principalId, new Date(now).toISOString());
+    expect((await post("/api/auth/session")).status).toBe(401);
+    expect(principals.getUser(migrated.principalId)?.identity).toBeUndefined();
+  });
+
+  it("returns a safe actionable error when an admitted account cannot claim its provisioned principal", async () => {
+    const migrated = executeLegacyPrincipalMigration(db, {
+      email: "owner@example.com",
+      apply: true,
+    });
+    principals.bindExternalIdentity(
+      migrated.principalId,
+      { issuer: token.iss, subject: "other-google-user" },
+      new Date(now).toISOString()
+    );
+
+    const response = await post("/api/auth/session");
+    const body = await response.text();
+
+    expect(response.status).toBe(409);
+    expect(JSON.parse(body)).toEqual({ error: DASHBOARD_IDENTITY_CLAIM_ERROR });
+    expect(body).not.toContain("owner@example.com");
+    expect(firebase.createSessionCookie).not.toHaveBeenCalled();
+    expect(principals.getUser(migrated.principalId)?.identity?.subject).toBe("other-google-user");
   });
 
   it.each([

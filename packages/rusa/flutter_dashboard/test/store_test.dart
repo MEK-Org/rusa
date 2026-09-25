@@ -31,6 +31,107 @@ ActorRuntimeStateDelta _runtime(
 );
 
 void main() {
+  group('reorderQueuedActor (#570)', () {
+    Future<DashboardStore> bootedQueue(FakeApi api) => _booted(
+      api
+        ..threadsResult = [
+          makeThread('root'),
+          makeThread(
+            'a',
+            parent: 'root',
+            runState: RunState.queued,
+            queuePosition: 0,
+          ),
+          makeThread(
+            'b',
+            parent: 'root',
+            runState: RunState.queued,
+            queuePosition: 1,
+          ),
+        ],
+      FakeStream(),
+    );
+
+    test('sends the observed order and reports a move', () async {
+      final api = FakeApi();
+      final store = await bootedQueue(api);
+
+      final outcome = await store.reorderQueuedActor(
+        threadId: 'b',
+        beforeThreadId: 'a',
+        observedOrder: const ['a', 'b'],
+      );
+
+      expect(outcome, QueueReorderOutcome.moved);
+      expect(api.admissionReorderCalls.single.threadId, 'b');
+      expect(api.admissionReorderCalls.single.beforeThreadId, 'a');
+      expect(api.admissionReorderCalls.single.observedOrder, ['a', 'b']);
+      expect(store.error.value, isNull);
+      await store.dispose();
+    });
+
+    test('reports a 409 as stale without raising an error', () async {
+      final api = FakeApi()
+        ..admissionReorderError = DashboardApiException(
+          Uri.parse('http://localhost/api/mesh/admission-queue/reorder'),
+          409,
+          '{"error":"admission queue changed"}',
+        );
+      final store = await bootedQueue(api);
+
+      final outcome = await store.reorderQueuedActor(
+        threadId: 'b',
+        beforeThreadId: 'a',
+        observedOrder: const ['a', 'b'],
+      );
+
+      expect(outcome, QueueReorderOutcome.stale);
+      expect(store.error.value, isNull);
+      await store.dispose();
+    });
+
+    test('keeps a failed resync error after a 409', () async {
+      final api = FakeApi()
+        ..admissionReorderError = DashboardApiException(
+          Uri.parse('http://localhost/api/mesh/admission-queue/reorder'),
+          409,
+          '{"error":"admission queue changed"}',
+        );
+      final store = await bootedQueue(api);
+      api.threadsError = Exception('threads unavailable');
+
+      final outcome = await store.reorderQueuedActor(
+        threadId: 'b',
+        beforeThreadId: 'a',
+        observedOrder: const ['a', 'b'],
+      );
+
+      expect(outcome, QueueReorderOutcome.stale);
+      expect(store.error.value, contains('threads unavailable'));
+      await store.dispose();
+    });
+
+    test('surfaces any other refusal as an error', () async {
+      final api = FakeApi()
+        ..admissionReorderError = DashboardApiException(
+          Uri.parse('http://localhost/api/mesh/admission-queue/reorder'),
+          403,
+          '{"error":"forbidden"}',
+        );
+      final store = await bootedQueue(api);
+
+      final outcome = await store.reorderQueuedActor(
+        threadId: 'b',
+        beforeThreadId: 'a',
+        observedOrder: const ['a', 'b'],
+      );
+
+      expect(outcome, QueueReorderOutcome.failed);
+      expect(store.error.value, contains('403'));
+      await store.dispose();
+    });
+  });
+
   test('ThreadDto copyWith can clear staged model fields', () {
     final staged = makeThread(
       'a',

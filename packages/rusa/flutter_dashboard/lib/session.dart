@@ -8,6 +8,16 @@ import 'session_client.dart';
 
 const sessionIdleDuration = Duration(hours: 1);
 
+/// A server-confirmed account-linking conflict after Google has verified the
+/// person. The display text is deliberately generic: it guides the person to
+/// an administrator without exposing another account's email or identity.
+class DashboardAccountSetupError implements Exception {
+  const DashboardAccountSetupError();
+
+  static const message =
+      'This Google account is not linked to this dashboard. Ask the dashboard administrator to check the account setup.';
+}
+
 enum DashboardSessionStatus { local, signedOut, signedIn }
 
 abstract interface class SessionUser {
@@ -258,6 +268,7 @@ class FirebaseDashboardSession extends DashboardSession {
       );
       if (response.statusCode != 200) {
         await _auth.signOut();
+        if (response.statusCode == 409) throw const DashboardAccountSetupError();
         throw StateError('Sign in denied');
       }
       // A successful response only proves the server attempted to set the

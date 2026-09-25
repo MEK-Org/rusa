@@ -23,6 +23,7 @@ import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   EmptyInboxRepository,
+  type InboxAppendInput,
   type InboxEntry,
   type InboxPayload,
   type InboxRepository,
@@ -105,6 +106,8 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+type ResponsiveReadyAttention = { id: string; intent: string | null; readyCount?: number };
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -872,10 +875,10 @@ export class ActorMesh {
   private unsubscribeInboxAppends?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
   /**
-   * Recipients of durably committed inbox rows that nothing has woken yet.
-   * See {@link scheduleAppendedWork}.
+   * Recipients of durably committed inbox rows that nothing has woken yet, with
+   * the strongest wake their rows are owed. See {@link scheduleAppendedWork}.
    */
-  private readonly appendWakesOwed = new Set<string>();
+  private readonly appendWakesOwed = new Map<string, "preempt" | "join">();
   private readonly supportedVoices: readonly VoiceDefinition[];
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
@@ -925,6 +928,24 @@ export class ActorMesh {
       to: { id: string; intent: string | null; responsive?: boolean } | null;
       epoch: string;
     }
+  >();
+  /**
+   * Responsive-ready attention buffered while an actor is mid-run (#632).
+   *
+   * Generalizes the ready-head deferral principle: an actor must not be
+   * interrupted mid-run by downstream results of its own actions. Delivering
+   * per mutation would trigger eager preemption or require complex mid-run
+   * join disambiguation; instead, self-caused attention is deferred until
+   * the run finishes, deduplicated per obligation, and flushed into the inbox
+   * if the obligation is still ready and responsive. The buffer is deliberately
+   * transient: a process loss re-derives this durable obligation fact through
+   * boot {@link reconcileResponsiveReadyAttention}; a live run always flushes
+   * through the lifecycle's result or non-result terminal path before another
+   * run opens its window.
+   */
+  private readonly runResponsiveReadyAttention = new Map<
+    string,
+    Map<string, ResponsiveReadyAttention>
   >();
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
@@ -1365,9 +1386,10 @@ export class ActorMesh {
    *
    * Dispatch replaces an in-flight run when the durable work is responsive —
    * operator control, human messages, and `runNow` all mean "now". The one wake
-   * that may not is an event copy for a recipient other than the effective
-   * owner; that decision lives in {@link dispatchJoiningActiveRun}, so no
-   * caller of this method can turn preemption off.
+   * that may not is an event copy persisted with a `subscriber` delivery role;
+   * that decision lives in {@link scheduleAppendedWork} and
+   * {@link dispatchJoiningActiveRun}, so no caller of this method can turn
+   * preemption off.
    */
   dispatch(actorId: string): boolean {
     const resolved = this.resolveThreadId(actorId);
@@ -1475,8 +1497,11 @@ export class ActorMesh {
    * The dispatch that schedules without interrupting. Responsive work still
    * passes the voice hold and is admitted; what it does not do is replace a
    * run already in flight. Private and named so "responsive but not
-   * preempting" cannot leak into a control path. Its two callers are event
-   * fan-out's non-owner copy and self-caused mid-run ready attention.
+   * preempting" cannot leak into a control path — its one caller is the
+   * after-commit append seam, for rows an event fan-out persisted with a
+   * `subscriber` delivery role: only an event's effective owner may have its
+   * active run replaced. Self-caused mid-run ready attention is deferred to
+   * run end (#632).
    */
   private dispatchJoiningActiveRun(dest: string): boolean {
     const resolved = this.resolveThreadId(dest);
@@ -1496,15 +1521,22 @@ export class ActorMesh {
    * at boot.
    *
    * The debt is settled by whoever reaches the actor first, and this pays only
-   * what nobody else did. Every appending path in the mesh still wakes its own
-   * recipient in the same turn, some of them deliberately without preempting —
-   * an event copy delivered to a recipient that is not its effective owner is
-   * entitled to join the run in flight rather than replace it — and those
-   * wakes clear the debt, which is what stops a second dispatch from
+   * what nobody else did. Appending paths that still wake their own recipient
+   * in the same turn clear the debt, which is what stops a second dispatch from
    * cancelling and re-queueing the run the first one just admitted. What is
-   * left over is the case this exists for: work that became durable with no
-   * one attempting to schedule it, which now gets that attempt instead of
-   * waiting for the next boot.
+   * left over is work that became durable with no one attempting to schedule
+   * it: external event fan-out, responsive ready attention (including
+   * self-caused attention flushed after its producer's run), and anything
+   * else appended without a caller wake. That work gets one content-free
+   * attempt instead of waiting for the next boot.
+   *
+   * The attempt's strength comes from the rows themselves (#632). A row an
+   * event fan-out persisted with `deliveryRole: "subscriber"` is owed only a
+   * wake that joins a run in flight — a subscriber's copy is entitled to be
+   * admitted, never to abort a run that event does not belong to. Every other
+   * row, including an owner's copy and anything without a role, is owed the
+   * ordinary {@link dispatch}. A recipient's rows coalesce to the strongest
+   * wake owed, so one owner copy among subscriber copies still preempts.
    *
    * Deferring to a microtask is what gives the appending turn its chance, and
    * the store's contract asks a listener to stay cheap and hand off rather
@@ -1516,20 +1548,22 @@ export class ActorMesh {
       // Keyed the way the two dispatches key their deletes, so a row addressed
       // to "root" and a dispatch of the concrete root id are the same debt.
       const actorId = this.resolveThreadId(item.actorId);
-      if (this.appendWakesOwed.has(actorId)) continue;
-      this.appendWakesOwed.add(actorId);
-      owed = true;
+      const wake = item.payload.deliveryRole === "subscriber" ? "join" : "preempt";
+      const existing = this.appendWakesOwed.get(actorId);
+      if (existing === undefined) owed = true;
+      if (existing !== "preempt") this.appendWakesOwed.set(actorId, wake);
     }
     // The only writer above queues this drain whenever it adds a new debt; a
-    // drain snapshots and clears the whole set, so an already-owed id is safe
-    // to skip here.
+    // drain snapshots and clears the whole map, so an already-owed id only has
+    // its wake strengthened here.
     if (!owed) return;
     queueMicrotask(() => {
       const unpaid = [...this.appendWakesOwed];
       this.appendWakesOwed.clear();
-      for (const actorId of unpaid) {
+      for (const [actorId, wake] of unpaid) {
         try {
-          this.dispatch(actorId);
+          if (wake === "join") this.dispatchJoiningActiveRun(actorId);
+          else this.dispatch(actorId);
         } catch (err) {
           // An advisory wake is never allowed to become the appender's
           // problem, and boot reconciliation still covers what it missed.
@@ -1550,6 +1584,7 @@ export class ActorMesh {
     // head attention immediately, which is what every non-run producer wants.
     this.actorsInRun.add(actorId);
     this.runHeadNet.delete(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -1582,7 +1617,8 @@ export class ActorMesh {
   selectInboxEntries(
     actorId: string,
     entryIds: string[],
-    beforeCommit?: (entries: InboxEntry[]) => void
+    beforeCommit?: (entries: InboxEntry[]) => void,
+    focusedObligationId?: string
   ): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     const inboxStore = this.inboxStore;
@@ -1603,15 +1639,16 @@ export class ActorMesh {
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
-    // Note: STRICT_OBLIGATION_HANDLING_EXPERIMENT intentionally tracks only the
-    // actor's queue head (obligation.ready_head), asserting closure on that top
-    // commitment before clean yield. Behind-head responsive work
-    // (obligation.ready_responsive) alerts the actor of urgent work without
-    // asserting head-closure semantics on yield unless the actor selects it as head.
-    const headObligationIds = this.isEnrolledInExperiment(
+    // Snapshot the selected focus now. A direct focus and selected ready-head
+    // attention both contribute: supplying an explicit id must not let an
+    // actor bypass a ready head included in the same selection. Direct focus
+    // only arms its owning actor; the resolver may record another live row as
+    // context, but strict clean-yield closure is a commitment of its owner.
+    const strictEnrolled = this.isEnrolledInExperiment(
       actorId,
       STRICT_OBLIGATION_HANDLING_EXPERIMENT
-    )
+    );
+    const readyHeadObligationIds = strictEnrolled
       ? entries.flatMap((entry) =>
           entry.payload.type === "obligation.ready_head" &&
           typeof entry.payload.obligationId === "string"
@@ -1619,16 +1656,40 @@ export class ActorMesh {
             : []
         )
       : [];
+    const focusedObligationIds = strictEnrolled
+      ? [
+          ...(focusedObligationId !== undefined ? [focusedObligationId] : []),
+          ...readyHeadObligationIds,
+        ]
+      : [];
     // Fail closed, and fail here — before the selection commits, so nothing has
     // run yet and no clean yield can slip past unenforced. An enrolled actor in
     // a mesh without closure reads is a misconfiguration the root must fix by
     // wiring the port or unenrolling, not a run that silently opts out.
     const closure = this.obligations;
-    if (headObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
+    if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
         `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure reads (get, listDirectChildEdges, listPrerequisiteEdges) wired. Wire the closure port or unenroll the actor.`
       );
     }
+    // Membership and status are both selection-time facts. Keeping only ready
+    // focuses in the run state makes a later waiting -> ready transition stay
+    // unarmed, while a ready -> waiting transition retains the existing legal
+    // exit checks for the run that selected it. A transiently unreadable row
+    // remains fail-closed, as it did before status-aware selection: silently
+    // releasing a strict run on a failed closure read would be less safe.
+    const headObligationIds = supportsObligationClosureReads(closure)
+      ? [...new Set(focusedObligationIds)].filter((obligationId) => {
+          const focused = closure.get(obligationId);
+          // A ready-head read that vanishes remains fail-closed as before. A
+          // readable focus must belong to this actor at selection before it can
+          // arm a run: an explicit id may name a foreign row, and a durable
+          // ready-head entry can outlive a reassignment made after delivery.
+          // A foreign row is never this actor's closure commitment.
+          if (focused === null) return readyHeadObligationIds.includes(obligationId);
+          return focused.status === "ready" && this.resolveThreadId(focused.ownerId) === actorId;
+        })
+      : [];
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
     if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
@@ -1721,6 +1782,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
     // stays on the launched tuple and only picks up the new one now, for the
@@ -1739,6 +1801,7 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    this.flushRunResponsiveReadyAttention(actorId);
   }
 
   /**
@@ -1758,6 +1821,56 @@ export class ActorMesh {
     // at all — in the last case there is no obligation to point the actor at.
     if (!net || net.to === null || net.to.id === net.from) return;
     this.appendReadyHeadEntry(actorId, net.to, net.from, null, net.epoch);
+  }
+
+  /**
+   * Deliver deferred responsive-ready attention for an actor whose run has
+   * finished (#632). An actor creating self-assigned obligations mid-run
+   * buffers them so it cannot self-interrupt; once the run completes, this
+   * checks whether each obligation is still live, owned, and ready, and
+   * appends attention entries to the inbox for a follow-up run. The append
+   * listener is the sole scheduling seam: valid rows are committed together so
+   * one actor receives at most one advisory dispatch attempt.
+   */
+  private flushRunResponsiveReadyAttention(actorId: string): void {
+    const pending = this.runResponsiveReadyAttention.get(actorId);
+    this.runResponsiveReadyAttention.delete(actorId);
+    if (!pending || pending.size === 0 || !this.inboxStore) return;
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return;
+
+    // The production mesh always wires this read through the obligation
+    // repository. An isolated embedder without it cannot prove that a
+    // buffered item is still live and responsive, so it must not deliver a
+    // potentially stale responsive wake.
+    const obligationPort = this.obligations;
+    if (!obligationPort?.get) return;
+
+    const entries: InboxAppendInput[] = [];
+    for (const obligation of pending.values()) {
+      let live: Obligation | null;
+      try {
+        // Call through the port so class-backed implementations retain their
+        // receiver. A read failure fails this entry closed but must not abort
+        // the rest of finishInboxRun (notably staged model application).
+        live = obligationPort.get(obligation.id);
+      } catch (err) {
+        this.log(
+          `deferred responsive-ready read for ${obligation.id} failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
+      if (
+        !live ||
+        this.resolveThreadId(live.ownerId) !== actorId ||
+        live.status !== "ready" ||
+        !live.effectiveResponsive
+      ) {
+        continue;
+      }
+      entries.push(this.responsiveReadyAttentionEntry(actorId, obligation));
+    }
+    if (entries.length > 0) this.inboxStore.append(entries);
   }
 
   /**
@@ -1877,14 +1990,40 @@ export class ActorMesh {
    * `readyCount` makes every new episode a distinct entry; a replay of the
    * same committed episode is still a silent `ON CONFLICT DO NOTHING`.
    */
+  private responsiveReadyAttentionEntry(
+    actorId: string,
+    obligation: ResponsiveReadyAttention
+  ): InboxAppendInput {
+    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
+    return {
+      id: deduplicatedInboxEntryId(
+        `obligation-ready-responsive:${obligation.id}${episodeKey}`,
+        actorId
+      ),
+      actorId,
+      source: `obligation:${obligation.id}`,
+      payload: {
+        type: "obligation.ready_responsive",
+        obligationId: obligation.id,
+        intent: obligation.intent ?? undefined,
+        priority: "responsive",
+      } as unknown as InboxPayload,
+    };
+  }
+
   deliverResponsiveReadyAttention(
     ownerId: string,
-    obligation: { id: string; intent: string | null; readyCount?: number },
+    obligation: ResponsiveReadyAttention,
     /**
-     * The owner made its own obligation ready mid-run: it is already running
-     * and will see the obligation in its queue, so a normal follow-up nudge
-     * joins the run instead of preempting it. Any other cause is responsive
-     * and preempts — the v1 interrupt the inbox model admits.
+     * The owner made its own obligation ready mid-run: defer delivery until the
+     * end of the run (#632). Generalizes the ready-head deferral principle: an
+     * actor must not be interrupted mid-run by downstream results of its own
+     * actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+     * entries for any obligations that remain ready.
+     * Any other cause is external responsive work and preempts immediately.
+     * This path only covers the ready-responsive sink that carries its acting
+     * principal; self-scheduled messages and event fan-out have separate
+     * delivery semantics and remain outside this slice.
      */
     selfCausedMidRun = false
   ): boolean {
@@ -1892,31 +2031,28 @@ export class ActorMesh {
     const actorId = this.resolveThreadId(ownerId);
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
-    const episodeKey = obligation.readyCount !== undefined ? `:${obligation.readyCount}` : "";
-    const entryId = deduplicatedInboxEntryId(
-      `obligation-ready-responsive:${obligation.id}${episodeKey}`,
-      actorId
-    );
-    const entries = this.inboxStore.append([
-      {
-        id: entryId,
-        actorId,
-        source: `obligation:${obligation.id}`,
-        payload: {
-          type: "obligation.ready_responsive",
-          obligationId: obligation.id,
-          intent: obligation.intent ?? undefined,
-          priority: "responsive",
-        } as unknown as InboxPayload,
-      },
-    ]);
-    if (entries.length === 0) return false;
+
+    // Mid-run self-caused ready attention: defer delivery until the end of
+    // the run. Generalizes the ready-head deferral principle (#632):
+    // an actor should not be interrupted mid-run by downstream results of its
+    // own actions. When the run finishes, flushRunResponsiveReadyAttention delivers
+    // entries for any obligations that remain ready.
     if (selfCausedMidRun && this.actorsInRun.has(actorId)) {
-      this.dispatchJoiningActiveRun(actorId);
-    } else {
-      this.dispatch(actorId);
+      let pending = this.runResponsiveReadyAttention.get(actorId);
+      if (!pending) {
+        pending = new Map();
+        this.runResponsiveReadyAttention.set(actorId, pending);
+      }
+      pending.set(obligation.id, obligation);
+      return true;
     }
-    return true;
+
+    // The after-commit append seam owes this row its ordinary, preemptive
+    // wake (#632); an unannotated row is never a joining wake.
+    const entries = this.inboxStore.append([
+      this.responsiveReadyAttentionEntry(actorId, obligation),
+    ]);
+    return entries.length > 0;
   }
 
   /**
@@ -2995,8 +3131,8 @@ export class ActorMesh {
   /**
    * The one way an event enters the mesh. The host's three ingress paths —
    * GitHub, Chat, and timer — arrive with an explicit raw source shape;
-   * EventManager owns normalize → route → append, and Mesh owns the
-   * after-commit wake until #384 extracts that notification seam.
+   * EventManager owns normalize → route → append, and Mesh's after-commit
+   * append seam owns the wake.
    *
    * #393 collapsed the transitional `deliverEvent` into this method: routing,
    * source canonicalization, author suppression, durable append, and
@@ -3012,38 +3148,33 @@ export class ActorMesh {
    * way to reach a live actor, records its own durable row too.
    *
    * CRITICAL: the body runs to completion in one turn. No `await` may appear
-   * between recipient resolution and the wake — the manager's
+   * between recipient resolution and the durable append — the manager's
    * normalize/route/append is synchronous for exactly this reason, and this
    * method stays async only for its public contract. Yield anywhere in here
    * and an actor can retire after being resolved as live, leaving a durable
    * unhandled row with nobody alive to take it. `actor-mesh.test.ts` pins this
    * with a retirement queued as a microtask before the call.
+   *
+   * The wake is not issued here (#632). Each persisted copy carries the
+   * `deliveryRole` it was routed under, and the after-commit append seam
+   * ({@link scheduleAppendedWork}) gives an owner's copy the ordinary
+   * dispatch and a subscriber's copy a wake that joins rather than replaces
+   * its active run. A subscriber-only route therefore preempts nobody.
+   *
+   * What the one-turn rule guarantees is therefore resolution plus append,
+   * not the wake. The wake is advisory and arrives a microtask later, so a
+   * retirement already queued can land first; the run manager then refuses
+   * and logs that dispatch. The row is the same either way: it was appended
+   * while its recipient was live, exactly as when the wake was synchronous
+   * and the retirement followed it.
    */
   async deliverExternalEvent(raw: RawIntegrationEvent): Promise<DurableEventDelivery> {
     if (!this.eventManager) {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
-    const delivery = this.eventManager.handleExternalEvent(raw);
-    this.notifyPersistedInboxEntries(delivery);
     // Returned so a host-level alarm can tell an uncovered drop from a delivery
     // and fall back to its own channel rather than trusting mesh routing (#481).
-    return delivery;
-  }
-
-  /**
-   * Every persisted copy is just as durable and just as responsive for
-   * scheduling; which recipient's run may be replaced is decided by
-   * {@link dispatchJoiningActiveRun}. A subscriber-only route preempts nobody.
-   */
-  private notifyPersistedInboxEntries(delivery: DurableEventDelivery): void {
-    for (const entry of delivery.entries) {
-      const dest = entry.actorId;
-      const isOwner = delivery.ownerIds.includes(dest);
-      const dispatched = isOwner ? this.dispatch(dest) : this.dispatchJoiningActiveRun(dest);
-      if (!dispatched) {
-        throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
-      }
-    }
+    return this.eventManager.handleExternalEvent(raw);
   }
 
   /** A narrow live-actor read port for the host-assembled routing kernel. */
@@ -4352,13 +4483,7 @@ export class ActorMesh {
     // opportunity; a live provider run has no pending reservation, so it keeps
     // its launched pool through its normal run boundary.
     const liveActor = this.runs.liveActor(id);
-    // Do not turn a staged move onto an already-halted pool into a transient
-    // re-quote that `beforeRun` merely drops: retain the work through the
-    // existing halt/resume path instead. Partially healthy pools still
-    // re-quote normally, letting provider selection choose an eligible lane.
-    if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
-      if (liveActor?.cancelQueuedRun?.()) return staged ? "staged" : "applied";
-    } else if (liveActor?.rescheduleQueuedRun?.()) {
+    if (liveActor && this.requeueQueuedRunForModelChange(liveActor, validated)) {
       return staged ? "staged" : "applied";
     }
 
@@ -4615,6 +4740,7 @@ export class ActorMesh {
     this.unsubscribeInboxAppends?.();
     this.unsubscribeInboxAppends = undefined;
     this.appendWakesOwed.clear();
+    this.runResponsiveReadyAttention.clear();
     this.runs.closeAll();
   }
 
@@ -4765,6 +4891,22 @@ export class ActorMesh {
       }
     }
     return resumed;
+  }
+
+  /**
+   * Requeue a reservation after its actor's model pool was explicitly
+   * replaced. This is model-change recovery, not quota rebalancing: #672
+   * leaves unclaimed work in the shared admission list until a compatible lane
+   * claims it, so coordinator updates never cancel/re-pin active actors.
+   */
+  private requeueQueuedRunForModelChange(
+    actor: MeshActor,
+    modelConfig: readonly ProviderModelConfig[] | undefined
+  ): boolean {
+    if (this.allCandidatesHalted(modelConfig) || this.isShuttingDown()) {
+      return actor.cancelQueuedRun?.() === true;
+    }
+    return actor.rescheduleQueuedRun?.() === true;
   }
 
   private factoryContext(record: ActorRecord): ActorFactoryContext {

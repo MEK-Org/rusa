@@ -12,7 +12,11 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ActorOptions } from "../actor/actor.js";
+import {
+  type ActorOptions,
+  formatPoolExhaustedFailure,
+  type PoolSkippedEntry,
+} from "../actor/actor.js";
 import {
   type ActorFactoryContext,
   ActorMesh,
@@ -29,6 +33,7 @@ import {
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
+import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
@@ -93,7 +98,11 @@ import {
   resolvePortableContextCompactorModel,
 } from "../actor/portable-context-compactor.js";
 import type { PortableContextStore } from "../actor/portable-context-state.js";
-import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
+import {
+  type PoolLaneCandidate,
+  ProviderPacer,
+  UnifiedAdmissionQueue,
+} from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
@@ -604,6 +613,10 @@ export interface RunStartE2EHandles {
   mesh: ActorMesh;
   /** Read-only synchronization signal for the production coordinator client. */
   coordinatorAppliedInterval: (provider: string) => number | undefined;
+  /** Test-only read of the production pacer's next normal-start quote. */
+  coordinatorPacerQuote: (provider: string) => number;
+  /** Test-only deterministic tick for asserting exhaustion and renewal transitions without a real cadence. */
+  triggerQuotaThrottleTick?: () => Promise<void>;
   root: MeshActor;
   rootControl: RootControlService;
   externalRoot: ExternalRootDriver | null;
@@ -1530,6 +1543,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
   const providerPacers = new Map<string, ProviderPacer>();
+  // #672: this is intentionally process-local. Accepted work leaves the
+  // list exactly once, and boot/recovery reconstructs opportunities from the
+  // durable inbox through RunManager.dispatch rather than persisting a second
+  // scheduler claim model.
+  const admissionQueue = new UnifiedAdmissionQueue<RawProviderModelConfig>();
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
@@ -1551,11 +1569,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const weeklyQuotaFor = (providerName: string) =>
     weeklyAdmissionObservation(quotaCoordinatorClient?.getLastPublishedStatus(providerName));
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
+  // #655: only a coordinator-fresh publication can install an absolute
+  // exhaustion gate. Keep its published deadline through an unavailable read;
+  // the deadline itself releases the lane, without a second client freshness
+  // policy competing with the coordinator's governing-bucket verdict.
+  const coordinatorExhaustedUntilMs = new Map<QuotaThrottleProvider, number>();
+  const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
+    return (coordinatorExhaustedUntilMs.get(lane as QuotaThrottleProvider) ?? 0) > nowMs;
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
     persistedUpdatedAt?: string,
-    exhaustedUntil?: string | null
+    exhaustedUntil?: string | null,
+    coordinatorStale = false
   ): void => {
     try {
       const pacer = pacerFor(providerName);
@@ -1570,11 +1597,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           pacer.deferUntil(exhaustedUntilMs);
         }
       }
+      const exhaustedUntilMs = exhaustedUntil ? Date.parse(exhaustedUntil) : Number.NaN;
+      if (
+        tick.expired &&
+        !coordinatorStale &&
+        Number.isFinite(exhaustedUntilMs) &&
+        exhaustedUntilMs > Date.now()
+      ) {
+        coordinatorExhaustedUntilMs.set(providerName, exhaustedUntilMs);
+      } else {
+        coordinatorExhaustedUntilMs.delete(providerName);
+      }
       quotaThrottleStatuses.set(providerName, {
         ...tick,
         intervalSeconds: safeIntervalSeconds,
         updatedAt: persistedUpdatedAt ?? new Date().toISOString(),
       });
+      // A deferred or newly-open lane is a processor event, not a request to
+      // re-pin every actor. Re-scan the one unclaimed list against the live
+      // pacer quotes; claimed starts stay with their existing pacer/limiter
+      // handle and retain normal cancellation semantics.
+      admissionQueue.refresh();
       const errors = tick.buckets
         .map((bucket) => `${bucket.key}=${bucket.error.toFixed(1)}`)
         .join(",");
@@ -1596,6 +1639,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     status: PublishedThrottleProviderStatus
   ): void => {
     const pacer = pacerFor(providerName);
+    // Update the lane before asking the shared admission list to re-scan it.
     applyThrottleStatusToPacer(pacer, status);
     recordQuotaThrottleTick(
       providerName,
@@ -1613,7 +1657,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         })),
       },
       status.updatedAt,
-      status.exhaustedUntil
+      status.exhaustedUntil,
+      status.freshness.stale
     );
   };
   const tickQuotaThrottle = async (): Promise<void> => {
@@ -2330,23 +2375,37 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     secretsDir: secretsDirPath(mcHome),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
+      // #672: providers process one shared, in-memory list. The item keeps
+      // every exact declared candidate until a compatible lane synchronously
+      // claims one, then the established pacer/concurrency path owns it.
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = [];
+      for (const c of candidates) {
         const lane = providerThrottleKey(c.provider, config);
-        return {
+        lanes.push({
           config: c,
           lane,
           pacer: pacerFor(lane),
-          weeklyQuota: weeklyQuotaFor(lane),
-        };
-      });
-      // submitPoolGate owns selection for both priorities: normal work quotes
-      // healthy lanes and responsive work makes that same selection, then
-      // bypasses provider and mesh pacing after its lane is reserved.
-      return submitPoolGate((selected) => fn(selected), lanes, {
+          // Read at claim time, not enqueue time: an actor can wait past the
+          // reading it arrived with, and a stale one drops the tie-break.
+          get weeklyQuota() {
+            return weeklyQuotaFor(lane);
+          },
+        });
+      }
+      return admissionQueue.enqueue((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
         isHalted: (c) => isProviderHalted(c.provider, c.model),
+        isExhausted: (c) =>
+          laneReportedExhausted(providerThrottleKey(c.provider, config), Date.now()),
+        onResponsivePoolExhausted: () => {
+          const skipped: PoolSkippedEntry[] = candidates.map((entry) => ({
+            entry: { ...entry },
+            reason: isProviderHalted(entry.provider, entry.model) ? "halted" : "exhausted",
+          }));
+          return new PoolExhaustedError(formatPoolExhaustedFailure({ attempted: [], skipped }));
+        },
         onSelected: request.threadId
           ? (selection) => {
               const provider = selection.candidate.provider;
@@ -2537,14 +2596,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               const runId = runAccounting.activeRunId(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
               let focus: ResolvedInboxFocus | undefined;
-              const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
-                focus = inboxFocusResolver.select({
-                  runId,
-                  actorId: id,
-                  entries: selectedEntries,
-                  explicitObligationId: obligationId,
-                });
-              });
+              const entries = mesh.selectInboxEntries(
+                id,
+                entryIds,
+                (selectedEntries) => {
+                  focus = inboxFocusResolver.select({
+                    runId,
+                    actorId: id,
+                    entries: selectedEntries,
+                    explicitObligationId: obligationId,
+                  });
+                },
+                obligationId
+              );
               if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
               // Read after the selection commits: the same armed decision the
               // clean-yield check enforces is what states the rule here, so
@@ -2943,7 +3007,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
-
   if (followerHub) {
     followerHub.onRegister((follower) => {
       for (const record of actors.list()) {
@@ -2964,7 +3027,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
         ) {
           try {
-            const newHost = followerHub.createHost(follower.id, record.id);
+            const newHost = followerHub.rebindHost(follower.id, record.id);
             (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
             mesh.dispatch(record.id);
           } catch (err) {
@@ -3124,14 +3187,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const runId = runAccounting.activeRunId(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
         let focus: ResolvedInboxFocus | undefined;
-        const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
-          focus = inboxFocusResolver.select({
-            runId,
-            actorId: rootId,
-            entries: selectedEntries,
-            explicitObligationId: obligationId,
-          });
-        });
+        const entries = mesh.selectInboxEntries(
+          rootId,
+          entryIds,
+          (selectedEntries) => {
+            focus = inboxFocusResolver.select({
+              runId,
+              actorId: rootId,
+              entries: selectedEntries,
+              explicitObligationId: obligationId,
+            });
+          },
+          obligationId
+        );
         if (!focus) throw new Error(`run focus was not resolved for actor: ${rootId}`);
         return {
           entries,
@@ -3421,6 +3489,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
       const now = Date.now();
       const lane = providerThrottleKey(entry.provider, config);
+      // #655: name a coordinator-known-empty lane `exhausted` rather than the
+      // `pacing` its deferred pacer would report — the operator can then tell
+      // a known-zero lane from a transiently hot one.
+      if (laneReportedExhausted(lane, now)) {
+        return { eligible: false, reason: "exhausted" };
+      }
       if (pacerFor(lane).quote(now) > now) {
         return { eligible: false, reason: "pacing" };
       }
@@ -3520,14 +3594,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     refreshLiveActorMcp(rootId);
   }
   if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
+  // A lifted halt can reopen a lane that unclaimed work is waiting on, and
+  // replaying nothing would otherwise leave the admission list unscanned.
+  const resumeAfterHalt = (): string[] => {
+    const resumed = mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    admissionQueue.refresh();
+    return resumed;
+  };
   const scheduleHaltExpiry = (until?: string) => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     haltExpiryTimer = null;
     if (!until) return;
     const delay = Date.parse(until) - Date.now();
     if (delay <= 0) {
-      mesh.resumeCancelledRuns();
-      mesh.reconcileUnseenInbox();
+      resumeAfterHalt();
       return;
     }
     haltExpiryTimer = setTimeout(
@@ -3539,8 +3620,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           return;
         }
         if (state) return;
-        const resumed = mesh.resumeCancelledRuns();
-        mesh.reconcileUnseenInbox();
+        const resumed = resumeAfterHalt();
         console.warn(
           `[mesh] ▶ HALT expired${resumed.length ? ` — replayed ${resumed.length} queued run(s)` : ""}`
         );
@@ -3829,17 +3909,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           runningThreadIds: () => mesh.runningThreadIds(),
           queuedThreadIds: () => mesh.queuedThreadIds(),
           providerQueueSnapshots: () =>
-            [...providerPacers.values()].flatMap((pacer) =>
-              pacer.getQueueSnapshot().map((entry) => ({
-                threadId: entry.threadId,
-                position: entry.position,
-                estimatedStartAt:
-                  entry.estimatedStartAt === null
-                    ? null
-                    : new Date(entry.estimatedStartAt).toISOString(),
-                pacingIntervalMs: entry.pacingIntervalMs,
-              }))
-            ),
+            admissionQueue.snapshot().map((entry) => ({
+              threadId: entry.threadId,
+              position: entry.position,
+              estimatedStartAt:
+                entry.estimatedStartAt === null
+                  ? null
+                  : new Date(entry.estimatedStartAt).toISOString(),
+              pacingIntervalMs: entry.pacingIntervalMs,
+              claimed: entry.claimed,
+              compatibleLanes: entry.compatibleLanes,
+              claimedLane: entry.claimedLane,
+            })),
+          reorderAdmissionQueue: ({ observedOrder, threadId, beforeThreadId }) =>
+            admissionQueue.reorderObserved(observedOrder, threadId, beforeThreadId),
           // Current work is the durable inbox focus for this actor's active
           // run. It deliberately reads through the run ledger: a completed
           // focus is history, not the next queued run's selected work.
@@ -4078,8 +4161,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         haltSwitch.resume();
         if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
         haltExpiryTimer = null;
-        const resumed = mesh.resumeCancelledRuns();
-        mesh.reconcileUnseenInbox();
+        const resumed = resumeAfterHalt();
         console.warn(`[mesh] ▶ HALT cleared via chat by ${who}`);
         void cc
           .send(
@@ -4456,6 +4538,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     coordinatorAppliedInterval: (provider) =>
       quotaCoordinatorClient?.getLastAppliedInterval(provider),
+    coordinatorPacerQuote: (provider) => pacerFor(provider).quote(),
+    triggerQuotaThrottleTick: tickQuotaThrottle,
     root,
     rootControl,
     externalRoot,

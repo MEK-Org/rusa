@@ -23,6 +23,13 @@ import { loadConfig } from "../config/loader.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
 import { createLogger, type Logger } from "../observability/logger.js";
+import {
+  ANTIGRAVITY_PRIVATE_STATE_DIRS,
+  ANTIGRAVITY_PRIVATE_STATE_FILES,
+  antigravityActorStateDir,
+  antigravityStateDir,
+  ensureAntigravityPrivateState,
+} from "./antigravity-paths.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -806,17 +813,25 @@ function buildMeshActorBwrapArgs(o: {
   const pnpmStore = realpathIfExists(resolvePnpmStorePath());
   mkdirSync(pnpmStore, { recursive: true });
   const realActorDir = realpathIfExists(o.actorDir);
+  const actorParent = dirname(realActorDir);
+  const isWorkerActor = basename(actorParent) === "workers";
   const tempPaths: string[] = [];
   const commandPrefix: string[] = [];
+
+  // The sandbox replaces agy's conversation-bearing state below with
+  // actor-owned paths, so neither provider scratch nor conversation content can
+  // cross a worker boundary. `--bind` needs both sides to exist first.
+  if (o.authMode === "antigravity") ensureAntigravityPrivateState(realActorDir);
 
   const args: string[] = [
     "--unshare-all",
     "--share-net",
     "--die-with-parent",
     ...(o.isE2eRoot ? [] : ["--new-session"]),
-    // Read everything (incl. other actors' repos), with narrow tmpfs shadows for
-    // host-plane-only stores below; the real home stays visible so tools resolve
-    // ~/.gitconfig, ~/.ssh, ~/.config/gh without any remapping.
+    // Read the host root with narrow tmpfs shadows for host-plane-only stores.
+    // Real mesh workers also shadow their shared parent below, then re-bind only
+    // their own directory, so a sibling workspace is not addressable by either
+    // its provider-scratch or its durable host path.
     "--ro-bind",
     "/",
     "/",
@@ -831,6 +846,10 @@ function buildMeshActorBwrapArgs(o: {
     "--dir",
     "/tmp/cache",
   ];
+
+  if (isWorkerActor) {
+    args.push("--tmpfs", actorParent, "--dir", realActorDir);
+  }
 
   if (o.understandingMount) {
     args.push("--dir", "/tmp/understanding");
@@ -849,13 +868,7 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--ro-bind", toolchainLib, "/usr/local/lib");
   }
 
-  const actorParent = dirname(realActorDir);
-  const mcHome =
-    basename(actorParent) === "workers"
-      ? dirname(actorParent)
-      : o.isE2eRoot
-        ? actorParent
-        : undefined;
+  const mcHome = isWorkerActor ? dirname(actorParent) : o.isE2eRoot ? actorParent : undefined;
   if (mcHome) {
     const auditArtifactDir = hostJobAuditArtifactDir(mcHome);
     mkdirSync(auditArtifactDir, { recursive: true, mode: 0o700 });
@@ -867,7 +880,7 @@ function buildMeshActorBwrapArgs(o: {
   // guard is deliberately narrower than the `mcHome` one above so root (never
   // sandboxed in production) and the E2E root-agent sandboxed test double
   // both keep the host's real gh credential unconditionally.
-  if (mcHome && basename(actorParent) === "workers") {
+  if (mcHome && isWorkerActor) {
     ghWrapperDir = injectWorkerGithubCredential(args, mcHome);
     // Google user-OAuth token shadow : same real-workers-only guard as
     // the gh credential split. Root and the E2E root-agent double keep host
@@ -886,6 +899,19 @@ function buildMeshActorBwrapArgs(o: {
   // Write scope: the provider's auth/state dir(s), at their real paths.
   for (const dir of providerWritableStateDirs(o.authMode)) {
     addWritableBindIfExists(args, dir, dir);
+  }
+  if (o.authMode === "antigravity") {
+    // agy keeps scratch, transcripts, and conversation summaries beneath the
+    // writable provider state directory. Overlay each after that broad bind so
+    // the sandbox sees only this actor's copies; auth and config stay shared.
+    const hostState = antigravityStateDir();
+    const actorState = antigravityActorStateDir(realActorDir);
+    for (const path of [
+      ...ANTIGRAVITY_PRIVATE_STATE_DIRS,
+      ...ANTIGRAVITY_PRIVATE_STATE_FILES.map((file) => file.path),
+    ]) {
+      args.push("--bind", join(actorState, path), join(hostState, path));
+    }
   }
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin
@@ -1104,10 +1130,9 @@ function injectGitBridgeEnv(args: string[]): void {
 
 /**
  * Mesh entrypoint: an actor owns a single private directory and clones whatever
- * repos its charter needs inside it. Visibility is intentionally OPEN — an actor
- * may READ the whole host, including any other actor's repo (e.g. a reviewer
- * inspecting a coder's work). Isolation is write-scope, not read-scope: the actor
- * can only WRITE inside its own directory, the provider's state dir, the shared
+ * repos its charter needs inside it. Worker sandboxes shadow the shared worker
+ * parent and re-bind only their own directory, so a sibling worktree is not
+ * addressable. Write scope remains the actor directory, provider state, shared
  * pnpm CAS, and /tmp.
  *
  * Keeps the REAL home (read-only), so there's no synthetic HOME and no auth
