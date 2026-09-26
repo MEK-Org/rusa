@@ -536,12 +536,17 @@ export class QuotaCoordinatorClient {
   getHistory(provider: string, since?: string): Promise<readonly PublishedHistoryRecord[] | null> {
     const inFlight = this.historyReadsInFlight.get(provider);
     if (inFlight) return inFlight;
-    const read = this.requestHistory(provider, since).then((records) => {
-      this.historyReadsInFlight.delete(provider);
-      if (records === null) this.historyReadFailed.add(provider);
-      else this.historyReadFailed.delete(provider);
-      return records;
-    });
+    const read = this.requestHistory(provider, since)
+      .then((records) => {
+        if (records === null) this.historyReadFailed.add(provider);
+        else this.historyReadFailed.delete(provider);
+        return records;
+      })
+      .finally(() => {
+        // Cleared however the read settles, so a rejection cannot leave later
+        // reads joining a dead promise.
+        this.historyReadsInFlight.delete(provider);
+      });
     this.historyReadsInFlight.set(provider, read);
     return read;
   }

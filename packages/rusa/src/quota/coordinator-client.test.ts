@@ -1183,7 +1183,10 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       failing = false;
       const first = client.readThroughHistory("claude");
       const second = client.readThroughHistory("claude");
-      const refresh = client.getHistory("claude", new Date(0).toISOString());
+      const refresh = client.getHistory(
+        "claude",
+        new Date(Date.now() - HISTORY_WINDOW_MS).toISOString()
+      );
       await vi.waitFor(() => expect(release).toBeDefined());
       release?.();
       await Promise.all([first, second, refresh]);
@@ -1231,6 +1234,28 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       // codex's valid empty history is a successful read: not re-read per request.
       await client.readThroughHistory("codex");
       expect(requests.filter((p) => p === "codex")).toHaveLength(1);
+    });
+
+    it("clears a history read that rejects, so the next read starts afresh (#707)", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-reject-"));
+      const socketPath = join(root, "coordinator.sock");
+      const requests: string[] = [];
+      await listen(socketPath, (req, res) => {
+        requests.push(
+          new URL(req.url ?? "", "http://localhost").searchParams.get("provider") ?? ""
+        );
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ service: serviceInfo(), provider: "claude", records: [] }));
+      });
+      const client = new QuotaCoordinatorClient({ socketPath });
+      const request = vi.spyOn(http, "request").mockImplementationOnce(() => {
+        throw new Error("socket unavailable");
+      });
+
+      await expect(client.getHistory("claude")).rejects.toThrow("socket unavailable");
+      request.mockRestore();
+      expect(await client.getHistory("claude")).toEqual([]);
+      expect(requests).toEqual(["claude"]);
     });
   });
 
