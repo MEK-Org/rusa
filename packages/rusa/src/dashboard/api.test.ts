@@ -232,7 +232,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   describe("GET /api/mesh/recent-activity (#664)", () => {
-    it("coalesces handled work and folds only a terminal transition from the same selected run", async () => {
+    it("retains each handled entry and folds only a terminal transition from the same selected run", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       actors.upsert(rec(UUID_B, "root", "active"));
       obligations.create({ id: "linked", ownerId: UUID_A, title: "Linked work" });
@@ -282,6 +282,7 @@ describe("handleMeshApiRequest", () => {
               startedAt: "2020-01-01T00:00:00.000Z",
               endedAt: "2030-01-01T00:00:00.000Z",
               entryIds: ["linked-entry", "linked-entry-2"],
+              primaryObligationId: "linked",
             },
           ],
         },
@@ -290,12 +291,21 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(200);
       const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
 
-      expect(items).toHaveLength(2);
-      expect(items.find((item) => item.kind === "handled_inbox")).toMatchObject({
-        addressedNote: "Completed the linked work",
-        moreCount: 1,
-        linkedObligation: "Obligation done: Linked work",
-      });
+      expect(items).toHaveLength(3);
+      expect(items.filter((item) => item.kind === "handled_inbox")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "inbox_linked-entry",
+            addressedNote: "Completed the linked work",
+            linkedObligation: "Obligation done: Linked work",
+          }),
+          expect.objectContaining({
+            id: "inbox_linked-entry-2",
+            addressedNote: "Completed the linked work",
+            linkedObligation: "Obligation done: Linked work",
+          }),
+        ])
+      );
       expect(items.find((item) => item.kind === "terminal_obligation")).toMatchObject({
         summary: "Unmatched work",
         terminalStatus: "cancelled",
@@ -309,12 +319,99 @@ describe("handleMeshApiRequest", () => {
         "/api/mesh/recent-activity?limit=10"
       );
       const uncorrelated = JSON.parse(uncorrelatedRes.body).items as Array<Record<string, unknown>>;
-      expect(uncorrelated).toHaveLength(3);
+      expect(uncorrelated).toHaveLength(4);
       expect(
         uncorrelated.some(
           (item) => item.kind === "terminal_obligation" && item.summary === "Linked work"
         )
       ).toBe(true);
+    });
+
+    it("keeps a terminal change separate when handling happened after the selected run", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "late-linked", ownerId: UUID_A, title: "Late linked work" });
+      inbox.append([
+        {
+          id: "late-linked-entry",
+          actorId: UUID_A,
+          source: "obligation:late-linked",
+          payload: { type: "obligation.ready_head", obligationId: "late-linked" },
+        },
+      ]);
+      obligations.setTerminalStatus(
+        "late-linked",
+        "done",
+        "Finished during the run",
+        "mesh:messages/finished-during-run",
+        UUID_A
+      );
+      inbox.markHandled(
+        UUID_A,
+        ["late-linked-entry"],
+        new Date("2030-01-01T00:00:00.000Z"),
+        "Cleared later"
+      );
+
+      const withEarlierRun = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2029-01-01T00:00:00.000Z",
+              entryIds: ["late-linked-entry"],
+              primaryObligationId: "late-linked",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+
+      const { res } = await call(withEarlierRun, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      const lateHandled = items.find((item) => item.id === "inbox_late-linked-entry");
+      expect(lateHandled).toMatchObject({
+        id: "inbox_late-linked-entry",
+        addressedNote: "Cleared later",
+      });
+      expect(lateHandled).not.toHaveProperty("linkedObligation");
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal_obligation",
+            summary: "Late linked work",
+            terminalNote: "Finished during the run",
+          }),
+        ])
+      );
+    });
+
+    it("renders the terminal note and resolution recorded in history, not a later row rewrite", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "historic-linked", ownerId: UUID_A, title: "Historic linked work" });
+      obligations.setTerminalStatus(
+        "historic-linked",
+        "done",
+        "Original terminal note",
+        "mesh:messages/original-terminal",
+        UUID_A
+      );
+      // Model a bad later row rewrite without adding a second history event.
+      // Recent Activity must still report the immutable terminal transition.
+      db.prepare(`UPDATE obligations SET terminal_note = ?, resolution_ref = ? WHERE id = ?`).run(
+        "Rewritten current note",
+        "mesh:messages/rewritten-current",
+        "historic-linked"
+      );
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items.find((item) => item.summary === "Historic linked work")).toMatchObject({
+        terminalNote: "Original terminal note",
+        resolutionRef: "mesh:messages/original-terminal",
+      });
     });
   });
 

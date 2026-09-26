@@ -134,11 +134,18 @@ export interface InboxRepository {
     handledAt?: Date,
     handledNote?: string
   ): MarkHandledResult[];
+  /**
+   * SQL activity-feed projection. Each result names exactly one durable inbox
+   * entry; it deliberately does not infer an operator batch from matching
+   * timestamps or notes. Lightweight in-memory test stores may omit it.
+   */
   listRecentHandledGroups?(limit?: number): HandledInboxGroup[];
 }
 
 export interface HandledInboxGroup {
+  /** One durable handled entry, retained under this historical API name. */
   entry: InboxEntry;
+  /** Always zero: handled activity does not guess that rows share a batch. */
   moreCount: number;
 }
 
@@ -199,6 +206,9 @@ export class EmptyInboxRepository implements InboxRepository {
     _handledAt?: Date,
     _handledNote?: string
   ): MarkHandledResult[] {
+    return [];
+  }
+  listRecentHandledGroups(_limit = 50): HandledInboxGroup[] {
     return [];
   }
 }

@@ -7,8 +7,11 @@ import Database from "better-sqlite3";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
@@ -12500,9 +12503,12 @@ describe("accountRun token accounting (#443)", () => {
 
       (
         mesh as unknown as {
-          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
         }
-      ).countCompletedRunsForEntries = () => completed;
+      ).completedFocusEntryCounts = () => new Map([["item-1", completed]]);
 
       inboxStore.append([
         { id: "item-1", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
@@ -12550,9 +12556,12 @@ describe("accountRun token accounting (#443)", () => {
       // been recorded when finishInboxRun checks the durable count.
       (
         mesh as unknown as {
-          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
         }
-      ).countCompletedRunsForEntries = () => completed;
+      ).completedFocusEntryCounts = () => new Map([["resumed-item", completed]]);
       inboxStore.append([
         {
           id: "resumed-item",
@@ -12571,41 +12580,60 @@ describe("accountRun token accounting (#443)", () => {
       expect(fake(worker).calls).toHaveLength(1);
     });
 
-    it("does not let exhausted selected work consume a newly selected item's retry", async () => {
+    it("rejects a durably exhausted selection while accepting newly delivered work", () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, fake, tick } = setup({ inboxStore });
-      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
-      await tick();
+      const { mesh } = setup({ inboxStore });
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const runs = new ActorRunRepository(db);
+      const focus = new InboxFocusRepository(db, () => new Date("2026-01-01T00:00:00.000Z"));
+      const durableInbox = new SqliteInboxRepository(
+        db,
+        () => new Date("2026-01-01T00:00:00.000Z")
+      );
 
-      let completed = 0;
-      mesh.lifecycleFor(worker).add({
-        onEnd: (event) => {
-          if (event.terminal.kind === "result") completed++;
-        },
-      });
+      durableInbox.append([
+        { id: "old-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+        { id: "new-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      const recordSelection = (runId: string, entryId: string) => {
+        runs.start({
+          id: runId,
+          actorId: "root",
+          modelConfig: { version: 1, provider: "fake", model: "test" },
+        });
+        focus.recordSelection({
+          runId,
+          actorId: "root",
+          entryIds: [entryId],
+          primaryObligationId: null,
+          resolution: "explicit",
+        });
+        runs.complete(runId, { success: true, exitCode: 0, output: "returned unhandled" });
+      };
+      // Both durable run rows record an ordinary successful selection of the
+      // old entry. The next selection must require a meaningful change.
+      recordSelection("old-first", "old-item");
+      recordSelection("old-recovery", "old-item");
       (
         mesh as unknown as {
-          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
         }
-      ).countCompletedRunsForEntries = (_actorId, [entryId]) =>
-        entryId === "old-item" ? completed : Math.max(0, completed - 2);
+      ).completedFocusEntryCounts = (actorId, excludeRunId) =>
+        runs.completedFocusEntryCounts(actorId, excludeRunId);
 
       inboxStore.append([
-        { id: "old-item", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
+        { id: "old-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+        { id: "new-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
       ]);
-      await tick();
-      expect(fake(worker).calls).toHaveLength(2);
-      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
 
-      inboxStore.append([
-        { id: "new-item", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
-      ]);
-      await tick();
-
-      // The selected batch includes old-item, but new-item still gets its own
-      // first return plus one bounded recovery attempt.
-      expect(fake(worker).calls).toHaveLength(4);
-      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
+      expect(() => mesh.selectInboxEntries("root", ["old-item"])).toThrow(/needs attention/i);
+      expect(mesh.selectInboxEntries("root", ["new-item"])).toHaveLength(1);
+      expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
+      expect(mesh.hasOnlyExhaustedWork("root")).toBe(false);
     });
   });
 });

@@ -617,8 +617,15 @@ export interface ActorMeshOptions {
   onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
   /** Persist the active run's yield fact and return its durable run id. */
   recordRunYield?: (actorId: string, status: string, note?: string) => string | null;
-  /** Count completed runs for an actor that included any of the given inbox entry ids in focus. */
-  countCompletedRunsForEntries?: (actorId: string, entryIds: string[]) => number;
+  /**
+   * Durable successful-return counts keyed by selected inbox entry.  The
+   * optional exclusion makes retry eligibility independent of lifecycle
+   * listener ordering while the current run is being recorded.
+   */
+  completedFocusEntryCounts?: (
+    actorId: string,
+    excludeRunId?: string
+  ) => ReadonlyMap<string, number>;
   /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
@@ -957,12 +964,14 @@ export class ActorMesh {
    */
   private readonly retiring = new Set<string>();
   private readonly lifecycles = new Map<string, ActorLifecycle>();
-  private readonly exhaustedSelectedWork = new Map<string, Set<string>>();
-  private readonly countCompletedRunsForEntries?: (actorId: string, entryIds: string[]) => number;
+  private readonly completedFocusEntryCounts?: (
+    actorId: string,
+    excludeRunId?: string
+  ) => ReadonlyMap<string, number>;
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
-    this.countCompletedRunsForEntries = opts.countCompletedRunsForEntries;
+    this.completedFocusEntryCounts = opts.completedFocusEntryCounts;
     this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
@@ -1206,7 +1215,10 @@ export class ActorMesh {
           },
           onEnd: (event) => {
             if (event.terminal.kind === "result") {
-              this.finishInboxRun(event.actorId);
+              this.finishInboxRun(event.actorId, {
+                successful: event.terminal.result.success,
+                runId: event.runId,
+              });
               this.accountRun(event.actorId, event.terminal.result, event.runId);
             } else {
               this.abandonInboxRun(event.actorId);
@@ -1633,6 +1645,12 @@ export class ActorMesh {
     if (unique.length === 0 || unique.length > 100 || unique.length !== entryIds.length) {
       throw new Error("Select between 1 and 100 unique inbox entry ids");
     }
+    const exhausted = this.exhaustedInboxEntryIds(actorId, unique);
+    if (exhausted.size > 0) {
+      throw new Error(
+        `Selected inbox work needs attention after its bounded recovery: ${[...exhausted].join(", ")}`
+      );
+    }
     const entries = unique.map((id) => {
       const entry = inboxStore.read(actorId, id);
       if (!entry) throw new Error(`Inbox entry not found: ${id}`);
@@ -1783,7 +1801,7 @@ export class ActorMesh {
     return this.selectedInboxEntryIds.get(actorId) ?? [];
   }
 
-  finishInboxRun(actorId: string): void {
+  finishInboxRun(actorId: string, outcome: { successful?: boolean; runId?: string } = {}): void {
     actorId = this.resolveThreadId(actorId);
     const selectedIds = [...this.selectedInboxEntries(actorId)];
     this.selectedInboxEntryIds.delete(actorId);
@@ -1797,44 +1815,26 @@ export class ActorMesh {
     // {@link setActorModel}, so this call is then a no-op.
     this.applyPendingModel(actorId);
 
-    if (selectedIds.length > 0 && this.inboxStore && this.countCompletedRunsForEntries) {
+    // A real provider failure follows the ordinary failure route.  The one
+    // bounded retry is exclusively a recovery for selected work a provider
+    // successfully returned without handling.
+    if (
+      outcome.successful !== false &&
+      selectedIds.length > 0 &&
+      this.inboxStore &&
+      this.completedFocusEntryCounts
+    ) {
       const unhandledIds = selectedIds.filter((id) => {
         const entry = this.inboxStore?.read(actorId, id);
         return entry && !entry.handledAt;
       });
 
-      // Clear any previously exhausted entries that were handled in this run
-      const exhausted = this.exhaustedSelectedWork.get(actorId);
-      if (exhausted) {
-        for (const id of selectedIds) {
-          if (!unhandledIds.includes(id)) {
-            exhausted.delete(id);
-          }
-        }
-        if (exhausted.size === 0) {
-          this.exhaustedSelectedWork.delete(actorId);
-        }
-      }
-
       if (unhandledIds.length > 0) {
-        let hasRetryableUnhandled = false;
-        for (const id of unhandledIds) {
-          // This listener runs before the run-accounting listener completes
-          // the current row. Add this one local return to the durable count;
-          // never carry a process-local retry counter across a restart.
-          const completed = this.countCompletedRunsForEntries(actorId, [id]);
-          const current = completed + 1;
-          if (current >= 2) {
-            let actorExhausted = this.exhaustedSelectedWork.get(actorId);
-            if (!actorExhausted) {
-              actorExhausted = new Set<string>();
-              this.exhaustedSelectedWork.set(actorId, actorExhausted);
-            }
-            actorExhausted.add(id);
-          } else {
-            hasRetryableUnhandled = true;
-          }
-        }
+        // Count only prior successful returns.  Excluding this run means the
+        // calculation is unchanged if a later lifecycle listener has already
+        // persisted its terminal row.
+        const priorCounts = this.completedFocusEntryCounts(actorId, outcome.runId);
+        const hasRetryableUnhandled = unhandledIds.some((id) => (priorCounts.get(id) ?? 0) + 1 < 2);
 
         // An older exhausted entry must not consume a later entry's one
         // recovery attempt when a multi-item selection contains both.
@@ -1851,44 +1851,49 @@ export class ActorMesh {
 
   hasExhaustedSelectedWork(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
-    if (this.inboxStore && this.countCompletedRunsForEntries) {
-      const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 50 });
-      for (const entry of page.entries) {
-        if (this.countCompletedRunsForEntries(actorId, [entry.id]) >= 2) {
-          return true;
-        }
-      }
-    }
-    const exhausted = this.exhaustedSelectedWork.get(actorId);
-    if (!exhausted || exhausted.size === 0) return false;
-    if (this.inboxStore) {
-      for (const id of exhausted) {
-        const entry = this.inboxStore.read(actorId, id);
-        if (entry && !entry.handledAt) return true;
-      }
-      this.exhaustedSelectedWork.delete(actorId);
-      return false;
-    }
-    return true;
+    const entries = this.unhandledInboxEntries(actorId);
+    return (
+      this.exhaustedInboxEntryIds(
+        actorId,
+        entries.map((entry) => entry.id)
+      ).size > 0
+    );
   }
 
   hasOnlyExhaustedWork(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
-    if (!this.inboxStore) return false;
-    const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 100 });
-    if (page.entries.length === 0) return false;
-    const counter = this.countCompletedRunsForEntries;
-    if (counter) {
-      return page.entries.every((e) => counter(actorId, [e.id]) >= 2);
-    }
-    const exhausted = this.exhaustedSelectedWork.get(actorId);
-    if (!exhausted || exhausted.size === 0) return false;
-    return page.entries.every((e) => exhausted.has(e.id));
+    const entries = this.unhandledInboxEntries(actorId);
+    if (entries.length === 0) return false;
+    return (
+      this.exhaustedInboxEntryIds(
+        actorId,
+        entries.map((entry) => entry.id)
+      ).size === entries.length
+    );
   }
 
-  clearExhaustedWork(actorId: string): void {
-    actorId = this.resolveThreadId(actorId);
-    this.exhaustedSelectedWork.delete(actorId);
+  private unhandledInboxEntries(actorId: string): InboxEntry[] {
+    if (!this.inboxStore) return [];
+    const entries: InboxEntry[] = [];
+    const visitedCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 100, cursor });
+      entries.push(...page.entries);
+      cursor = page.nextCursor ?? undefined;
+      if (cursor && visitedCursors.has(cursor)) {
+        this.log(`inbox cursor repeated while reading unhandled work for ${actorId}`);
+        break;
+      }
+      if (cursor) visitedCursors.add(cursor);
+    } while (cursor);
+    return entries;
+  }
+
+  private exhaustedInboxEntryIds(actorId: string, entryIds: readonly string[]): Set<string> {
+    if (!this.completedFocusEntryCounts || entryIds.length === 0) return new Set();
+    const counts = this.completedFocusEntryCounts(actorId);
+    return new Set(entryIds.filter((id) => (counts.get(id) ?? 0) >= 2));
   }
 
   /**

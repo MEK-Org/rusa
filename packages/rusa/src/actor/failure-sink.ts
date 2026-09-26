@@ -167,7 +167,9 @@ export async function routeRunFailure(
   deps: FailureSinkDeps,
   actorId: string,
   result: RunResult,
-  providerLabel?: string
+  providerLabel?: string,
+  /** The durable run record, when the lifecycle owns one. */
+  runId?: string
 ): Promise<void> {
   if (result.success) return;
   if (isResponsivePreemption(result)) {
@@ -193,7 +195,7 @@ export async function routeRunFailure(
     leadLine = `provider selection ${providerLabel} failed.`;
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
-  routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result);
+  routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result, runId);
 }
 
 /** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
@@ -266,25 +268,14 @@ export function isHumanOperatorCancelled(
   return false;
 }
 
-export function routeContinuationCapped(
-  deps: FailureSinkDeps,
-  actorId: string,
-  continuationCount: number
-): void {
-  deps.log(
-    `yield-elicitation exhausted for ${actorId} after ${continuationCount} corrective run(s)`
-  );
-  const summary = `yield-elicitation exhausted after ${continuationCount} corrective run(s)`;
-  routeMechanicalFailureNotice(deps, actorId, "capped", summary);
-}
-
 function routeMechanicalFailureNotice(
   deps: FailureSinkDeps,
   actorId: string,
   label: "run failed" | "capped",
   summary: string,
   exitCode?: number,
-  result?: RunResult
+  result?: RunResult,
+  runId?: string
 ): void {
   const record = deps.actors.get(actorId);
 
@@ -303,7 +294,9 @@ function routeMechanicalFailureNotice(
 
   if (record?.parentId) {
     deps.sendToParent(record.parentId, `[${label}] ${summary}${extraMessage}`, actorId, {
-      runId: actorId,
+      // Older direct callers have no durable run record. Lifecycle callers
+      // pass the UUID so the parent can inspect the exact failed attempt.
+      runId: runId ?? actorId,
       actorId,
       exitCode,
     });

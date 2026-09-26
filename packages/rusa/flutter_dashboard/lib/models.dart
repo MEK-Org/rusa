@@ -537,6 +537,7 @@ class RecentActivityItem {
     required this.actorModel,
     this.sourceKind,
     this.sourceRef,
+    this.reference,
     this.summary,
     this.handledTime,
     this.addressedNote,
@@ -559,6 +560,7 @@ class RecentActivityItem {
   // Handled inbox fields
   final String? sourceKind;
   final String? sourceRef;
+  final ReferenceDto? reference;
   final String? summary;
   final String? handledTime;
   final String? addressedNote;
@@ -584,6 +586,9 @@ class RecentActivityItem {
         actorModel: j['actorModel'] as String? ?? '',
         sourceKind: j['sourceKind'] as String?,
         sourceRef: j['sourceRef'] as String?,
+        reference: j['reference'] is Map<String, dynamic>
+            ? ReferenceDto.fromJson(j['reference'] as Map<String, dynamic>)
+            : null,
         summary: j['summary'] as String?,
         handledTime: j['handledTime'] as String?,
         addressedNote: j['addressedNote'] as String?,

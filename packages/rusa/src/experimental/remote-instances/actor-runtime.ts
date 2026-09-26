@@ -251,8 +251,6 @@ export function createActorRuntime(
         },
       ]),
       onFirstChunk: () => send({ type: "firstChunk" }),
-      onContinue: (count) => send({ type: "continue", count }),
-      onContinuationCapped: (count) => send({ type: "capped", count }),
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;

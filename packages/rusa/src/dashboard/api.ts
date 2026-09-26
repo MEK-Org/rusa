@@ -2298,38 +2298,21 @@ export async function handleMeshApiRequest(
 
       const { handle, model } = actorDisplayInfo(group.entry.actorId);
 
-      let sourceKind = "UNKNOWN";
       const source = group.entry.source;
-      if (source.startsWith("github:")) {
-        sourceKind =
-          source.includes("/pull/") || source.includes("/pulls/")
-            ? "GITHUB PR"
-            : source.includes("/issues/") || source.includes("/issue/")
-              ? "GITHUB ISSUE"
-              : "GITHUB";
-      } else if (source.startsWith("mesh:")) {
-        sourceKind = "MESH CHAT";
-      } else if (source.startsWith("gchat:")) {
-        sourceKind = "GCHAT MESSAGE";
-      } else if (source.startsWith("slack:")) {
-        sourceKind = "SLACK MESSAGE";
-      } else if (source.startsWith("obligation:")) {
-        sourceKind = "OBLIGATION";
-      } else if (resolved.reference?.scheme) {
-        sourceKind = String(resolved.reference.scheme).toUpperCase();
-      }
-
+      const sourceKind = String(resolved.reference?.scheme ?? "inbox").toUpperCase();
+      const handledAt = group.entry.handledAt.toISOString();
+      const selectedRun = completedFocuses.find(
+        (run) =>
+          run.actorId === group.entry.actorId &&
+          run.entryIds.includes(group.entry.id) &&
+          handledAt >= run.startedAt &&
+          handledAt <= run.endedAt
+      );
+      const ob =
+        selectedRun?.primaryObligationId && deps.obligations
+          ? deps.obligations.get(selectedRun.primaryObligationId)
+          : null;
       let linkedObligation: string | null = null;
-      let obligationId: string | null = null;
-      if (typeof group.entry.payload?.obligationId === "string") {
-        obligationId = group.entry.payload.obligationId;
-      } else if (source.startsWith("obligation:")) {
-        obligationId = source.slice("obligation:".length);
-      }
-      let ob = obligationId && deps.obligations ? deps.obligations.get(obligationId) : null;
-      if (!ob && deps.obligations) {
-        ob = deps.obligations.findByExternalRef(source);
-      }
       if (ob) {
         linkedObligation = `Obligation: ${ob.title}`;
       }
@@ -2338,9 +2321,6 @@ export async function handleMeshApiRequest(
       // handled in one run and transition terminal in a later one. Fold only a
       // transition observed inside the completed run that selected this exact
       // entry, preserving later/unrelated terminal changes as their own cards.
-      const selectedRun = completedFocuses.find(
-        (run) => run.actorId === group.entry.actorId && run.entryIds.includes(group.entry.id)
-      );
       const matchedTerminal =
         ob && selectedRun
           ? terminalHistory.find(
@@ -2363,14 +2343,15 @@ export async function handleMeshApiRequest(
       handledItems.push({
         id: `inbox_${group.entry.id}`,
         kind: "handled_inbox",
-        time: group.entry.handledAt.toISOString(),
+        time: handledAt,
         actorId: group.entry.actorId,
         actorHandle: handle,
         actorModel: model,
         sourceKind,
         sourceRef: source,
+        ...(resolved.reference ? { reference: resolved.reference } : {}),
         summary,
-        handledTime: group.entry.handledAt.toISOString(),
+        handledTime: handledAt,
         addressedNote: group.entry.handledNote ?? "Handled without comment",
         ...(group.moreCount > 0 ? { moreCount: group.moreCount } : {}),
         ...(linkedObligation ? { linkedObligation } : {}),
@@ -2398,8 +2379,8 @@ export async function handleMeshApiRequest(
         summary: ob?.title ?? `Obligation ${h.obligationId}`,
         obligationId: h.obligationId,
         terminalStatus: status,
-        terminalNote: ob?.terminalNote ?? null,
-        resolutionRef: ob?.resolutionRef ?? null,
+        terminalNote: h.after.terminalNote ?? null,
+        resolutionRef: h.after.resolutionRef ?? null,
       });
     }
 

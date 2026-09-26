@@ -1815,31 +1815,6 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(1);
   });
 
-  it("does not synthesize capping or run failures when a run ends without yield (#664)", async () => {
-    const continued: number[] = [];
-    const capped = vi.fn();
-    const seen: RunResult[] = [];
-    const provider = new FakeProvider(); // never yields
-    const actor = makeActor(
-      {
-        onContinue: (n) => continued.push(n),
-        onContinuationCapped: capped,
-        onRunEnd: (result) => {
-          seen.push(result);
-        },
-      },
-      provider
-    );
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(1);
-    expect(continued).toEqual([]);
-    expect(capped).not.toHaveBeenCalled();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.success).toBe(true);
-  });
-
   it("does not queue responsive yield-elicitation runs when a run completes (#664)", async () => {
     const queuedEvents: { responsive: boolean; mode: string }[] = [];
     const provider = new FakeProvider();
@@ -1881,37 +1856,6 @@ describe("Actor", () => {
     await flush();
     expect(provider.calls).toHaveLength(1);
     expect(toParent).toHaveLength(0);
-  });
-
-  it("runs only once when maxContinuations is zero and does not yield (#664)", async () => {
-    const provider = new FakeProvider();
-    const actor = makeActor({ maxContinuations: 0 }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(1);
-  });
-
-  it("does not elicit yield after a failed run", async () => {
-    const provider = new FakeProvider(() => ({ success: false, output: "boom", exitCode: 1 }));
-    const onContinue = vi.fn();
-    const actor = makeActor({ maxContinuations: 5, onContinue }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(1);
-    expect(onContinue).not.toHaveBeenCalled();
-  });
-
-  it("does not elicit yield for a wake that beforeRun gated off", async () => {
-    const provider = new FakeProvider();
-    const onContinue = vi.fn();
-    const actor = makeActor({ maxContinuations: 5, beforeRun: () => false, onContinue }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(0); // gated off
-    expect(onContinue).not.toHaveBeenCalled();
   });
 
   it("exposes content-free lifecycle context only after beforeRun passes", async () => {

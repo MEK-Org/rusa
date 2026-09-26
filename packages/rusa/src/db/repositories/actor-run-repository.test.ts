@@ -114,6 +114,7 @@ describe("ActorRunRepository", () => {
         startedAt: "2026-08-30T00:00:01.000Z",
         endedAt: "2026-08-30T00:00:03.000Z",
         entryIds: ["entry-1", "entry-2"],
+        primaryObligationId: null,
       },
     ]);
   });

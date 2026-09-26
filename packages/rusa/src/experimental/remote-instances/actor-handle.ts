@@ -714,12 +714,6 @@ export class ActorHandle implements MeshActor {
         // An abandoned run is already terminal on the leader side; it has no
         // run end left to record.
         return this.endQueuedRun(message.abandon.reason, message.abandon.started);
-      case "continue":
-        hooks?.onContinue?.(message.count);
-        break;
-      case "capped":
-        hooks?.onContinuationCapped?.(message.count);
-        break;
       case "coalesced":
         hooks?.onCoalesceAborted?.(message.count, message.ageMs);
         break;

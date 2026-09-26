@@ -2429,7 +2429,8 @@ async function composeStart(
                 effort: lastSelected.effort,
               },
               result.model
-            )
+            ),
+            event.runId
           );
         }
       },
@@ -2515,18 +2516,8 @@ async function composeStart(
       getRepositories().actorRuns.recordYield(runId, status, note);
       return runId;
     },
-    countCompletedRunsForEntries: (actorId, entryIds) => {
-      if (entryIds.length === 0) return 0;
-      const placeholders = entryIds.map(() => "?").join(", ");
-      const row = getDb()
-        .prepare(
-          `SELECT COUNT(DISTINCT r.id) as count
-           FROM actor_runs r, json_each(r.focus_entry_ids_json)
-           WHERE r.actor_id = ? AND r.outcome = 'completed' AND json_each.value IN (${placeholders})`
-        )
-        .get(actorId, ...entryIds) as { count: number } | undefined;
-      return row?.count ?? 0;
-    },
+    completedFocusEntryCounts: (actorId, excludeRunId) =>
+      getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
     capabilityGrants,
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives

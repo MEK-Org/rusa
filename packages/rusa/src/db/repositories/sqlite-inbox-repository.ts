@@ -339,30 +339,15 @@ export class SqliteInboxRepository implements InboxRepository {
   listRecentHandledGroups(limit = 50): HandledInboxGroup[] {
     const rows = this.db
       .prepare(
-        `SELECT actor_id, handled_at, handled_note, COUNT(*) as group_count, MIN(id) as first_id
+        `SELECT id, actor_id, source, delivered_at, seen_at, handled_at, handled_note, payload_json
          FROM actor_inbox_entries
          WHERE handled_at IS NOT NULL
-         GROUP BY actor_id, handled_at, handled_note
-         ORDER BY handled_at DESC
+         ORDER BY handled_at DESC, id DESC
          LIMIT ?`
       )
-      .all(limit) as Array<{
-      actor_id: string;
-      handled_at: string;
-      handled_note: string | null;
-      group_count: number;
-      first_id: string;
-    }>;
-
-    return rows
-      .map((r) => {
-        const entry = this.read(r.actor_id, r.first_id);
-        if (!entry) return null;
-        return {
-          entry,
-          moreCount: r.group_count - 1,
-        };
-      })
-      .filter((g): g is HandledInboxGroup => g !== null);
+      .all(limit) as InboxRow[];
+    // A matching timestamp/note is not a durable batch identifier. Keep every
+    // row visible rather than collapsing unrelated operator actions.
+    return rows.map((row) => ({ entry: toEntry(row), moreCount: 0 }));
   }
 }

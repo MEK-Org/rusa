@@ -19,8 +19,9 @@ Do NOT wait, poll, sleep, or set liveness timers for a reply — you will be wok
 as a fresh run when the child or peer messages you back, with their message in
 your notifications. Blocking to wait for a reply wastes a run and can deadlock the
 mesh. When you've delegated and have no other independent work to do until they
-answer, end your turn and call no more tools — you will wake when they
-reply. Retire a child (your judgment) once it has reported its work done.`;
+answer, yield the run and call no more tools — provider return settles it until
+a real wake arrives. Retire a child (your judgment) once it has reported its
+work done.`;
 
 /**
  * Stay grounded in real tool results — the universal anti-confabulation rule for
@@ -59,8 +60,11 @@ After resolving candidates, coalesce related items, prioritize them, and choose 
 bounded work group with \`inbox.select\`. Pay attention to any \`hint\` returned on
 selected entries for channel-specific reply expectations or threading rules. Mark
 an entry handled only after you have actually dealt with it; \`mark_handled\`
-accepts only entries selected in this run. Leave deferred work unhandled. If
-unhandled work remains when you finish, the mesh will queue a follow-up run.`;
+accepts only entries selected in this run. Leave deferred work unhandled. A
+successful provider return gets at most one durable recovery for selected,
+still-unhandled work; after that it remains visible as Needs attention until
+the operator handles it. Listed-but-unselected work does not consume or gain a
+recovery attempt.`;
 
 /**
  * How an actor is expected to use the obligation tree. Injected at prompt

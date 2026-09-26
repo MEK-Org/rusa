@@ -98,7 +98,6 @@ class _OverviewTabState extends State<OverviewTab> {
   @override
   void initState() {
     super.initState();
-    widget.store.refreshYieldEvents();
     widget.store.refreshQuotaHistory();
     _humanQueueFuture = _loadHumanQueue();
     // The dashboard config — and with it the durable user principal — is
@@ -1224,47 +1223,45 @@ class _OverviewTabState extends State<OverviewTab> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      ReferenceKindChip(item.sourceKind ?? 'INBOX'),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: MeshColors.textPrimary,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      if (item.moreCount != null && item.moreCount! > 0) ...[
+                  if (item.reference != null)
+                    ReferencePreview(
+                      reference: item.reference!,
+                      kindLabel: item.sourceKind,
+                      summary: item.summary,
+                      showBody: false,
+                      margin: EdgeInsets.zero,
+                    )
+                  else
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ReferenceKindChip(item.sourceKind ?? 'INBOX'),
                         const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: MeshColors.bgSecondary,
-                            borderRadius: BorderRadius.circular(4),
-                            border: Border.all(color: MeshColors.border),
-                          ),
+                        Expanded(
                           child: Text(
-                            '(+ ${item.moreCount} more)',
-                            style: kMonoStyle.copyWith(
-                              color: MeshColors.accent,
-                              fontSize: 10,
+                            '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: MeshColors.textPrimary,
+                              fontSize: 12,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
                         ),
                       ],
-                    ],
-                  ),
+                    ),
+                  if (item.moreCount != null && item.moreCount! > 0) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      '(+ ${item.moreCount} more with this source)',
+                      style: kMonoStyle.copyWith(
+                        color: MeshColors.accent,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   Container(
                     width: double.infinity,

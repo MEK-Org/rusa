@@ -38,6 +38,7 @@ export interface CompletedActorRunFocus {
   startedAt: string;
   endedAt: string;
   entryIds: string[];
+  primaryObligationId: string | null;
 }
 
 interface ActorRunRow {
@@ -267,6 +268,30 @@ export class ActorRunRepository {
   }
 
   /**
+   * Count successful completed runs by selected inbox entry for one actor.
+   * The grouped read is the durable retry budget: callers may exclude the
+   * terminal row they are currently processing so lifecycle listener ordering
+   * cannot affect whether one recovery remains.
+   */
+  completedFocusEntryCounts(actorId: string, excludeRunId?: string): ReadonlyMap<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT json_each.value AS entry_id, COUNT(DISTINCT r.id) AS run_count
+         FROM actor_runs r, json_each(r.focus_entry_ids_json)
+         WHERE r.actor_id = ?
+           AND r.outcome = 'completed'
+           AND r.success = 1
+           AND (? IS NULL OR r.id != ?)
+         GROUP BY json_each.value`
+      )
+      .all(actorId, excludeRunId ?? null, excludeRunId ?? null) as Array<{
+      entry_id: string;
+      run_count: number;
+    }>;
+    return new Map(rows.map((row) => [row.entry_id, row.run_count]));
+  }
+
+  /**
    * Completed runs that retained a selected-inbox snapshot, newest first.
    * Invalid historical focus JSON is ignored so a dashboard read can still
    * render its independent activity rows.
@@ -275,7 +300,7 @@ export class ActorRunRepository {
     assertLimit(limit);
     const rows = this.db
       .prepare(
-        `SELECT actor_id, started_at, ended_at, focus_entry_ids_json
+        `SELECT actor_id, started_at, ended_at, focus_entry_ids_json, focus_primary_obligation_id
          FROM actor_runs
          WHERE outcome = 'completed'
            AND ended_at IS NOT NULL
@@ -288,6 +313,7 @@ export class ActorRunRepository {
       started_at: string;
       ended_at: string;
       focus_entry_ids_json: string;
+      focus_primary_obligation_id: string | null;
     }>;
 
     return rows.flatMap((row) => {
@@ -302,6 +328,7 @@ export class ActorRunRepository {
             startedAt: row.started_at,
             endedAt: row.ended_at,
             entryIds,
+            primaryObligationId: row.focus_primary_obligation_id,
           },
         ];
       } catch {

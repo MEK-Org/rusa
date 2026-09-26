@@ -144,12 +144,6 @@ export interface ActorOptions {
   yieldGraceMs?: number;
   /** Max age of coalesced voice events before the run becomes unkillable (default 8000). */
   voiceCoalesceMaxAgeMs?: number;
-  /** Deprecated compatibility knob, ignored after run-return settlement (#664). */
-  maxContinuations?: number;
-  /** Deprecated compatibility callback, no longer invoked after #664. */
-  onContinue?: (n: number) => void;
-  /** Deprecated compatibility callback, no longer invoked after #664. */
-  onContinuationCapped?: (n: number) => void;
   /**
    * Provider pacing plus normal-run mesh scheduling. Responsive runs may bypass
    * both queues; the returned handle can promote a queued normal run.
