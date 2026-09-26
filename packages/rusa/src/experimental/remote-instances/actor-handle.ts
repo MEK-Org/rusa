@@ -63,12 +63,12 @@ export class ActorHandle implements MeshActor {
   exited!: Promise<void>;
   private readonly log: Logger;
   private runStartTime?: number;
-  /** Wall-clock start of the open run, the watermark a running interrupt sets. */
+  /** When the leader received the open run's `runStart`. */
   private runStartedAt?: Date;
   /**
-   * When the leader handed the open admission to the follower. It precedes the
-   * follower's start, so it stands in for {@link runStartedAt} while `runStart`
-   * is still in flight without suppressing work delivered after the real start.
+   * When the leader handed the open admission, and with it the prompt snapshot,
+   * to the follower: the watermark a running interrupt sets. Nothing delivered
+   * after it reached that run's prompt.
    */
   private admittedAt?: Date;
   /**
@@ -285,15 +285,10 @@ export class ActorHandle implements MeshActor {
   }
 
   requestRun(nudge?: RunNudge): void {
-    this.sendWake({ type: "wake", nudge }, nudge);
-  }
-
-  /** Wakes wait for the reattach state report, so a pending preempt decision goes first. */
-  private sendWake(command: LeaderCommand, nudge?: RunNudge): void {
     void this.ready
       .then(() => this.stateSettled)
       .then(() => {
-        if (this.closed || !this.send(command)) this.reportDroppedWake(nudge);
+        if (this.closed || !this.send({ type: "wake", nudge })) this.reportDroppedWake(nudge);
       })
       .catch(() => this.reportDroppedWake(nudge));
   }
@@ -318,8 +313,11 @@ export class ActorHandle implements MeshActor {
     if (unstarted.length > 0) {
       let cancelled = false;
       for (const gate of unstarted) {
+        // Only a gate this call cancelled answers as cancelled; one that had
+        // already settled keeps its real rejection.
+        if (!gate.handle.cancel?.()) continue;
         gate.cancelled = true;
-        if (gate.handle.cancel?.()) cancelled = true;
+        cancelled = true;
       }
       if (!cancelled) return false;
       // The gate's rejection replies on a later microtask, so this command lands
@@ -352,6 +350,14 @@ export class ActorHandle implements MeshActor {
   resumeCancelledRun(): boolean {
     if (!this.cancelledQueuedRun) return false;
     this.cancelledQueuedRun = false;
+    if (this.pendingQueuedCancel) {
+      // The cancellation has not reached the follower: its admission request
+      // is still in flight. Withdraw the refusal so that request proceeds as
+      // the replay; a resume command now would leave it parked on arrival.
+      this.pendingQueuedCancel = false;
+      this.cancelledQueuedNudge = undefined;
+      return true;
+    }
     this.resumeCancelledPending = true;
     this.deliverResumeCancelled();
     return true;
@@ -400,9 +406,10 @@ export class ActorHandle implements MeshActor {
     const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
     if (this.isRunning || admitted) {
       if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
-      // Admitted but `runStart` not yet here: the admission time is earlier
-      // than the real start, so later work is still redispatched, never hidden.
-      const runStartTime = this.runStartedAt ?? this.admittedAt ?? now;
+      // The follower's prompt is the admission reply's snapshot, built just
+      // after admittedAt, so that instant bounds what the run saw. runStartedAt
+      // is the later receipt of `runStart` and would hide work delivered between.
+      const runStartTime = this.admittedAt ?? this.runStartedAt ?? now;
       this.interruptedWatermark = runStartTime;
       this.interruptedRunId = this.startedRunId ?? this.queuedRunId;
       return { interrupted: true, runStartTime, wasQueued: false };

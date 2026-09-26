@@ -1373,6 +1373,35 @@ describe("monolithic follower instance", () => {
       expect(h.failures).toEqual([]);
     });
 
+    it("withdraws a halt cancellation the follower has not seen when unhalted first", async () => {
+      let halted = false;
+      let cancelled: string[] | undefined;
+      let resumed: string[] | undefined;
+      const h: ReturnType<typeof setup> = setup({
+        isHalted: () => halted,
+        onEvent: (actorId, event) => {
+          // Halt and unhalt between the queued report and the admission request.
+          if (event.type === "queued" && !cancelled) {
+            halted = true;
+            cancelled = h.mesh.cancelHaltedQueuedRuns();
+            halted = false;
+            resumed = h.mesh.resumeCancelledRuns();
+            expect([cancelled, resumed]).toEqual([[actorId], [actorId]]);
+          }
+        },
+      });
+      const id = h.spawn("Halted and unhalted before its admission request arrives");
+      await waitUntil(() =>
+        h.events.some(
+          (e) => e.actorId === id && e.event.type === "result" && e.event.result.success
+        )
+      );
+      expect(started(h, id)).toHaveLength(1);
+      expect(abandoned(h, id)).toEqual([]);
+      expect(h.mesh.resumeCancelledRuns()).toEqual([]);
+      expect(h.failures).toEqual([]);
+    });
+
     it("refuses an admitted start that the interrupt reaches before the provider launches", async () => {
       const h = setup({ delayMs: 300 });
       const id = h.spawn("Interrupted between admission and launch");
@@ -1427,6 +1456,36 @@ describe("monolithic follower instance", () => {
       expect(started(h, id)).toHaveLength(1);
       // ...while newer work does, and that run clears the watermark.
       h.dispatchNormal(id);
+      await waitUntil(() => started(h, id).length === 2);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+    });
+
+    it("redispatches work delivered after admission when runStart has already arrived", async () => {
+      const h = setup({ delayMs: 2_000 });
+      const id = h.spawn("Run long");
+      const runtime = h.runtime(id);
+      const send = runtime.channel.send.bind(runtime.channel);
+      let delivered = false;
+      runtime.channel.send = ((message: LeaderCommand, callback: (error: Error | null) => void) => {
+        const sent = send(message, callback);
+        // The admission reply's snapshot is the run's prompt; this work misses it.
+        if (
+          !delivered &&
+          message.type === "reply" &&
+          message.value &&
+          typeof message.value === "object" &&
+          "selected" in message.value
+        ) {
+          delivered = true;
+          const until = Date.now() + 5;
+          while (Date.now() < until) {}
+          h.dispatchNormal(id, "test:after-admission");
+        }
+        return sent;
+      }) as typeof runtime.channel.send;
+
+      await waitUntil(() => started(h, id).length === 1);
+      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
       await waitUntil(() => started(h, id).length === 2);
       expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
     });
