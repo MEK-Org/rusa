@@ -7802,19 +7802,21 @@ describe("ActorMesh", () => {
       expect(fake(parent).calls).toHaveLength(0);
     });
 
-    it("refuses cross-branch delegation without changing the current owner", () => {
-      const { mesh } = setup();
+    it("refuses cross-branch delegation without releasing an exact current owner", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({ events: (event: MeshEventInput) => events.push(event) });
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
       const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.subscribeEventSource(pr, parent, "root");
       const before = mesh.listSubscriptions();
 
       expect(() => mesh.delegateEventSource(pr, sibling, parent)).toThrow(
         /strict descendant of the current effective owner/
       );
       expect(mesh.listSubscriptions()).toEqual(before);
+      expect(events.filter((event) => event.kind === "event_source_unsubscribed")).toEqual([]);
     });
 
     it("refuses delegation to a non-descendant without changing the current owner", () => {
