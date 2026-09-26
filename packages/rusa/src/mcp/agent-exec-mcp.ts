@@ -639,7 +639,7 @@ export function createAgentExecMcpServer(
         "refusal names each one, and nothing is retired until you have reassigned or finished " +
         "those obligations, cancelled (cancel_scheduled_message) or re-sent those messages, " +
         "and disposed of those event subscriptions — an ownership is delegated onward by its " +
-        "holder (delegate_event_source, its parent included) or reclaimed by the owner above it " +
+        "holder to a descendant (delegate_event_source) or reclaimed by the covering owner " +
         "(reclaim_event_source); a direct subscription is dropped by its holder " +
         "(unsubscribe_event_source) or by you as its ancestor (unsubscribe_event_source with " +
         "thread_id set to the holder).",
@@ -677,9 +677,9 @@ export function createAgentExecMcpServer(
     {
       title: "Delegate event source to an actor",
       description:
-        "Delegate an event source you currently own to any actor you hold a handle to. Effective ownership is resolved with live obligation claims taking precedence over stored subscriptions, which fall back to most-specific-live-subscriber-wins with parent bubbling.",
+        "Delegate an event source you currently own to one of your descendants. Effective ownership is resolved with live obligation claims taking precedence over stored subscriptions, which fall back to most-specific-live-subscriber-wins with parent bubbling. Delegating to yourself retains the existing strict-subresource rule.",
       inputSchema: {
-        child_thread_id: z.string().describe("The actor thread id to receive events."),
+        child_thread_id: z.string().describe("The descendant actor thread id to receive events."),
         ...eventResourceInputSchema,
       },
     },

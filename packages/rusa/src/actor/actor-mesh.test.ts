@@ -7802,40 +7802,34 @@ describe("ActorMesh", () => {
       expect(fake(parent).calls).toHaveLength(0);
     });
 
-    it("lets an effective owner delegate to a sibling", () => {
+    it("refuses cross-branch delegation without changing the current owner", () => {
       const { mesh } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
       const pr = "github:dummy-org/dummy-repo/pulls/616";
 
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      const before = mesh.listSubscriptions();
 
-      expect(() => mesh.delegateEventSource(pr, sibling, parent)).not.toThrow();
-      expect(
-        mesh
-          .listSubscriptions()
-          .find(
-            (s) => s.actorId === sibling && s.resource === "github:dummy-org/dummy-repo/pulls/616"
-          )?.subscribedBy
-      ).toBe(parent);
+      expect(() => mesh.delegateEventSource(pr, sibling, parent)).toThrow(
+        /strict descendant of the current effective owner/
+      );
+      expect(mesh.listSubscriptions()).toEqual(before);
     });
 
-    it("lets an effective owner delegate to its parent", () => {
+    it("refuses delegation to a non-descendant without changing the current owner", () => {
       const { mesh } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
       const pr = "github:dummy-org/dummy-repo/pulls/616";
 
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", child, "root");
+      const before = mesh.listSubscriptions();
 
-      expect(() => mesh.delegateEventSource(pr, parent, child)).not.toThrow();
-      expect(
-        mesh
-          .listSubscriptions()
-          .find(
-            (s) => s.actorId === parent && s.resource === "github:dummy-org/dummy-repo/pulls/616"
-          )?.subscribedBy
-      ).toBe(child);
+      expect(() => mesh.delegateEventSource(pr, parent, child)).toThrow(
+        /strict descendant of the current effective owner/
+      );
+      expect(mesh.listSubscriptions()).toEqual(before);
     });
 
     it("rejects reaching into a slice delegated away", () => {
@@ -9250,6 +9244,7 @@ describe("ActorMesh", () => {
       // away or take it back.
       const { mesh } = setup();
       const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const ownerChild = mesh.spawn({ charter: "owner child", parentId: owner });
       const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
       const outsider = mesh.spawn({ charter: "outsider", parentId: "root" });
 
@@ -9261,7 +9256,7 @@ describe("ActorMesh", () => {
       );
       expect(() => mesh.reclaimEventSource(ISSUE, watcher)).toThrow();
       // And the owner is unaffected by the subscription sitting alongside it.
-      expect(() => mesh.delegateEventSource(ISSUE, outsider, owner)).not.toThrow();
+      expect(() => mesh.delegateEventSource(ISSUE, ownerChild, owner)).not.toThrow();
     });
 
     it("records an audit event for each add and removal", () => {
@@ -11024,8 +11019,8 @@ describe("ActorMesh", () => {
         expect(blocked.message).toContain("1 live event subscription(s) owned in its subtree");
         expect(blocked.message).toContain(`${resource} [ownership] held by ${worker}`);
         expect(blocked.message).toContain(
-          "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
-            "or the owner above it reclaims it (reclaim_event_source)"
+          "[ownership]: the holder delegates it onward to a descendant (delegate_event_source) " +
+            "or the covering owner reclaims it (reclaim_event_source)"
         );
         expect(blocked.message).toContain(
           "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +

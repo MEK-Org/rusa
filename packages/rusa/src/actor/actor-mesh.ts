@@ -425,8 +425,8 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
     // exit the retirer can take without the holder's cooperation — a wedged
     // holder must not make its subtree unretirable. Ownership is only ever
     // reached by delegation (root owns the configured roots; nothing else mints
-    // it), so it leaves the same way: the holder delegates it onward — its
-    // parent included — or the owner above it reclaims it. A direct
+    // it), so it leaves the same way: the holder delegates it to a descendant,
+    // or the covering owner reclaims it. A direct
     // subscription is dropped by its holder, or by any ancestor naming the
     // holder (the same authority that retires it). `unsubscribe_event_source`
     // is deliberately not an ownership release: ownership with no receiver
@@ -434,8 +434,8 @@ function describeRetirementBlockers(target: string, blockers: RetirementBlockers
     // implicit fallback #540 refuses to add.
     lines.push(
       `${blockers.subscriptions.length} live event subscription(s) owned in its subtree — ` +
-        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
-        "or the owner above it reclaims it (reclaim_event_source); " +
+        "[ownership]: the holder delegates it onward to a descendant (delegate_event_source) " +
+        "or the covering owner reclaims it (reclaim_event_source); " +
         "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
         "unsubscribes it for them (unsubscribe_event_source with thread_id set to the holder):"
     );
@@ -2963,6 +2963,12 @@ export class ActorMesh {
     if (this.effectiveOwnerOf(resource) !== delegatedBy) {
       throw new Error(
         `cannot delegate ${resourceKey(resource)}: caller is not the current effective owner`
+      );
+    }
+
+    if (childThreadId !== delegatedBy && !this.isAncestorOf(delegatedBy, childThreadId)) {
+      throw new Error(
+        `cannot delegate ${resourceKey(resource)}: target must be a strict descendant of the current effective owner`
       );
     }
 

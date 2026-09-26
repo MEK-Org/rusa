@@ -1445,8 +1445,8 @@ describe("agent-execution MCP server", () => {
       expect(message).toContain("github:test-org/test-repo/issues/10 [ownership]");
       expect(message).toContain("github:test-org/test-repo [subscription]");
       expect(message).toContain(
-        "[ownership]: the holder delegates it onward (delegate_event_source, its parent included) " +
-          "or the owner above it reclaims it (reclaim_event_source)"
+        "[ownership]: the holder delegates it onward to a descendant (delegate_event_source) " +
+          "or the covering owner reclaims it (reclaim_event_source)"
       );
       expect(message).toContain(
         "[subscription]: the holder unsubscribes (unsubscribe_event_source), or an ancestor " +
@@ -1482,11 +1482,10 @@ describe("agent-execution MCP server", () => {
       expect(registry.get(worker)?.status).toBe("retired");
     });
 
-    // The holder-side disposition the refusal names: an [ownership] blocker
-    // clears when the holder delegates it back to its parent through the same
-    // tool that handed it down. No new tool and no ownership release without a
-    // receiver — the source is owned by someone live at every step.
-    it("retire_thread succeeds after the holder delegates its ownership back to its parent (#540)", async () => {
+    // The covering owner-side disposition the refusal names: an [ownership]
+    // blocker clears when the parent reclaims it. No ownership release without
+    // a receiver — the source is owned by someone live at every step.
+    it("retire_thread succeeds after the covering owner reclaims its delegated ownership (#540)", async () => {
       const { mesh, registry } = setup({ configuredEventSources: ["github:test-org/test-repo"] });
       const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       const worker = mesh.spawn({
@@ -1522,11 +1521,11 @@ describe("agent-execution MCP server", () => {
       expect(stillBlocked.isError).toBe(true);
       expect(String(dataOf(stillBlocked))).toContain("1 live event subscription(s)");
 
-      const handedBack = (await workerClient.callTool({
-        name: "delegate_event_source",
-        arguments: { child_thread_id: "root", source: "github:test-org/test-repo/pulls/11" },
+      const reclaimed = (await client.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "github:test-org/test-repo/pulls/11" },
       })) as CallToolResult;
-      expect(handedBack.isError).toBeFalsy();
+      expect(reclaimed.isError).toBeFalsy();
       expect(
         mesh
           .listSubscriptions()
