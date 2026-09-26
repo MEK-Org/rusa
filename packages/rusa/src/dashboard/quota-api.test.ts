@@ -940,6 +940,36 @@ describe("GET /api/quota and GET /api/quota/history", () => {
     expect(r.json()).toEqual(buildQuotaHistorySnapshot(deps));
   });
 
+  it("reads each configured provider through before serving GET /api/quota/history (#707)", async () => {
+    const nowMs = Date.parse("2026-09-26T16:00:00.000Z");
+    const cache = new Map<string, QuotaHistorySource[]>();
+    const readThrough: string[] = [];
+    const deps: QuotaApiDeps = {
+      getQuota: async () => {
+        throw new Error("history route must not read quota");
+      },
+      providers: ["claude", "codex"],
+      now: () => nowMs,
+      listHistory: (provider) => cache.get(provider) ?? [],
+      readThroughHistory: async (provider) => {
+        readThrough.push(provider);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        if (provider === "claude") {
+          cache.set(provider, [
+            historyPoint({ observedAt: "2026-09-26T15:00:00.000Z", percentLeft: 64 }),
+          ]);
+        }
+      },
+    };
+    const r = fakeRes();
+    await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota/history"), deps);
+
+    expect(r.status()).toBe(200);
+    expect(readThrough).toEqual(["claude", "codex"]);
+    const body = r.json() as { history: { provider: string; points: unknown[] }[] };
+    expect(body.history.map((s) => [s.provider, s.points.length])).toEqual([["claude", 1]]);
+  });
+
   it("falls through (returns false) for a non-matching path", async () => {
     const { deps } = fakeDeps({ claude: claudeState, codex: codexState, agy: agyState });
     const r = fakeRes();

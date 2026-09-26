@@ -4044,6 +4044,11 @@ async function composeStart(
           listHistory: quotaCoordinatorClient
             ? (provider, sinceIso) => quotaCoordinatorClient.getCachedHistory(provider, sinceIso)
             : undefined,
+          // A provider the boot warmup or last refresh failed to read is read on
+          // the history request instead of waiting for the next tick (#707).
+          readThroughHistory: quotaCoordinatorClient
+            ? (provider) => quotaCoordinatorClient.readThroughHistory(provider)
+            : undefined,
         },
         // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
         // for the reports tab. The standalone `dashboard` command wires this

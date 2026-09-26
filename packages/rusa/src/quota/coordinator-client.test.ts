@@ -1140,6 +1140,98 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       // Deterministic cleanup: release gate and stop server cleanly without hanging
       releaseResponse?.();
     });
+
+    it("reads through a provider whose last history read failed, one read at a time, and keeps last-good (#707)", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-read-through-"));
+      const socketPath = join(root, "coordinator.sock");
+      const record: PublishedHistoryRecord = {
+        scope: "provider",
+        kind: "weekly",
+        label: "Claude weekly",
+        observedAt: "2026-09-26T12:00:00.000Z",
+        percentLeft: 70,
+        resetAtIso: null,
+        controllerError: null,
+        intervalSeconds: 300,
+      };
+      let failing = true;
+      const requests: string[] = [];
+      let release: (() => void) | undefined;
+      await listen(socketPath, async (req, res) => {
+        const provider = new URL(req.url ?? "", "http://localhost").searchParams.get("provider");
+        requests.push(provider ?? "");
+        if (failing) {
+          res.statusCode = 500;
+          res.end();
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ service: serviceInfo(), provider, records: [record] }));
+      });
+      const client = new QuotaCoordinatorClient({ socketPath });
+
+      // A provider never read is read through.
+      await client.readThroughHistory("claude");
+      expect(requests).toEqual(["claude"]);
+      expect(client.getCachedHistory("claude")).toEqual([]);
+
+      // Its last read failed: read through again. Concurrent callers (a
+      // dashboard request and the periodic refresh) share one coordinator read.
+      failing = false;
+      const first = client.readThroughHistory("claude");
+      const second = client.readThroughHistory("claude");
+      const refresh = client.getHistory("claude", new Date(0).toISOString());
+      await vi.waitFor(() => expect(release).toBeDefined());
+      release?.();
+      await Promise.all([first, second, refresh]);
+      expect(requests).toEqual(["claude", "claude"]);
+      expect(await refresh).toEqual([record]);
+      expect(client.getCachedHistory("claude")).toEqual([record]);
+
+      // A successful read is served from cache without another request.
+      await client.readThroughHistory("claude");
+      expect(requests).toHaveLength(2);
+
+      // A later failed refresh keeps the last-good history, and the next
+      // read-through retries it once.
+      failing = true;
+      expect(await client.getHistory("claude")).toBeNull();
+      expect(client.getCachedHistory("claude")).toEqual([record]);
+      await client.readThroughHistory("claude");
+      expect(requests).toHaveLength(4);
+      expect(client.getCachedHistory("claude")).toEqual([record]);
+    });
+
+    it("bounds a read-through against a hung coordinator by the request timeout without affecting other providers (#707)", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-read-through-hung-"));
+      const socketPath = join(root, "coordinator.sock");
+      const requests: string[] = [];
+      await listen(socketPath, (req, res) => {
+        const provider = new URL(req.url ?? "", "http://localhost").searchParams.get("provider");
+        requests.push(provider ?? "");
+        if (provider === "claude") return; // never answers
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ service: serviceInfo(), provider, records: [] }));
+      });
+      const client = new QuotaCoordinatorClient({ socketPath, requestTimeoutMs: 50 });
+
+      const startedAt = Date.now();
+      await Promise.all([
+        client.readThroughHistory("claude"),
+        client.readThroughHistory("claude"),
+        client.readThroughHistory("codex"),
+      ]);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(requests.sort()).toEqual(["claude", "codex"]);
+      expect(client.getCachedHistory("claude")).toEqual([]);
+
+      // codex's valid empty history is a successful read: not re-read per request.
+      await client.readThroughHistory("codex");
+      expect(requests.filter((p) => p === "codex")).toHaveLength(1);
+    });
   });
 
   describe("Production tick reconciliation: warm → outage/cold → hard-stale", () => {

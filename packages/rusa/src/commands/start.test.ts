@@ -8,7 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -31,6 +31,7 @@ import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
+import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
@@ -727,6 +728,124 @@ describe("runStart webhook event routing (Phase 4)", () => {
       startDashboardServerSpy.mockRestore();
       getHistorySpy.mockRestore();
       getQuotaSpy.mockRestore();
+    }
+  });
+
+  it("serves non-empty dashboard history on the first request after a failed boot warmup, without a refresh tick (#707)", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const observedAt = new Date(Date.now() - 60_000).toISOString();
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test",
+      serverTime: observedAt,
+    };
+    const historyRequests: string[] = [];
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname !== "/v1/history") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+        return;
+      }
+      historyRequests.push(url.searchParams.get("provider") ?? "");
+      // The boot warmup's read fails; the coordinator answers every later read.
+      if (historyRequests.length === 1) {
+        res.statusCode = 503;
+        res.end(JSON.stringify({ service, error: { code: "unavailable" } }));
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          service,
+          provider: "agy",
+          since: new Date(Date.now() - HISTORY_WINDOW_MS).toISOString(),
+          records: [
+            {
+              scope: "provider",
+              kind: "weekly",
+              label: "Weekly",
+              observedAt,
+              percentLeft: 64,
+              resetAtIso: null,
+              controllerError: null,
+              intervalSeconds: null,
+            },
+          ],
+        })
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: { coordinator: { socketPath } },
+      }),
+      "utf8"
+    );
+
+    try {
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      // The dashboard bound after the boot warmup settled, and that read failed.
+      expect(historyRequests).toEqual(["agy"]);
+      const quotaApi = startDashboardServerSpy.mock.calls[0][0].quotaApi;
+      if (!quotaApi) throw new Error("quotaApi not wired");
+      expect(quotaApi.listHistory?.("agy", new Date(0).toISOString())).toEqual([]);
+
+      let status = 0;
+      let body = "";
+      const res = {
+        writeHead(code: number) {
+          status = code;
+          return res;
+        },
+        end(payload?: string) {
+          body = payload ?? "";
+        },
+      } as unknown as ServerResponse;
+      await handleQuotaApiRequest(
+        { method: "GET" } as IncomingMessage,
+        res,
+        new URL("http://dash/api/quota/history"),
+        quotaApi
+      );
+
+      expect(status).toBe(200);
+      const history = (JSON.parse(body) as QuotaHistoryDto).history;
+      expect(history.map((series) => [series.provider, series.points.length])).toEqual([
+        ["agy", 1],
+      ]);
+      expect(history[0].points[0]).toMatchObject({ observedAt, remainingPercent: 64 });
+      // One read on the request itself: no periodic refresh tick has run.
+      expect(historyRequests).toEqual(["agy", "agy"]);
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
     }
   });
 
