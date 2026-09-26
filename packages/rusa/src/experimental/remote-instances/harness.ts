@@ -1,6 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { ActorMesh } from "../../actor/actor-mesh.js";
+import { InMemoryCapabilityGrantStore } from "../../actor/capability-grants.js";
+import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
@@ -31,6 +33,7 @@ export function createHarness(options: {
   cwd: string;
   delayMs?: number;
   providerFactory?: ProviderFactory;
+  maxConcurrent?: number;
   /**
    * Leader-side provider pacing. Supplied only by tests about a run that waits
    * to be admitted; without it the mesh keeps its unpaced default gate.
@@ -100,6 +103,7 @@ export function createHarness(options: {
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  const capabilityGrants = new InMemoryCapabilityGrantStore();
   const pacer = options.pacer;
   // Dispatch reads work and priority back out of durable inbox state, so these
   // tests need a real store rather than a stub: the production SQLite one over
@@ -115,8 +119,10 @@ export function createHarness(options: {
     inboxStore,
     eventSourceOwners,
     eventSourceSubscriptions,
-    maxConcurrent: 1,
+    maxConcurrent: options.maxConcurrent ?? 1,
     isHalted: options.isHalted,
+    capabilityGrants,
+    grantableCapabilities: new Set([COMPUTER_USE_CAPABILITY]),
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     ...(pacer
@@ -237,7 +243,9 @@ export function createHarness(options: {
     meshEvents,
     logs,
     failures,
+    capabilityGrants,
     follower,
+    home: options.cwd,
     get remote() {
       return remote;
     },

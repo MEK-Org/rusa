@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
+  Actor,
   type ActorOptions,
   formatPoolExhaustedFailure,
   type PoolSkippedEntry,
@@ -34,6 +35,7 @@ import {
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
+import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -1003,6 +1005,14 @@ async function composeStart(
   else if (config.jevApiKeyFile) {
     log.warn("jev_classifier_unavailable", { reason: "credential_unavailable" });
   }
+  // This process owns one local desktop. Followers construct their own lock
+  // inside their process, so no coordinator-wide lock serializes separate hosts.
+  const computerUseLock = new ComputerUseLock((err) => {
+    log.warn("preempted_computer_use_re_request_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
+  resources.acquire("computer-use lock", () => computerUseLock.close());
   resources.reportFailuresTo(({ resource, error }) =>
     log.error("shutdown_disposer_failed", { resource, err: error })
   );
@@ -2720,6 +2730,7 @@ async function composeStart(
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
+      COMPUTER_USE_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3079,6 +3090,7 @@ async function composeStart(
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
+        let localActor: Actor | undefined;
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -3146,7 +3158,23 @@ async function composeStart(
           // quota exhaustion is not something it self-heals out of — it's a
           // signal to the worker's parent, who judges what happens next (see
           // the exhaustion-classified onRun failure notice below).
-          gate: ctx.gate,
+          gate: (fn, candidates, responsive) => {
+            // A remote target executes inside its follower and obtains that
+            // follower's lock. Never make two independent instances contend
+            // through the leader process.
+            if (ctx.executionTarget === undefined) {
+              return computerUseLock.gateAfterProvider(
+                id,
+                responsive,
+                (start) => ctx.gate(start, candidates, responsive),
+                fn,
+                () => mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY),
+                () => localActor?.preemptForResponsive(),
+                () => localActor?.requestRun()
+              );
+            }
+            return ctx.gate(fn, candidates, responsive);
+          },
           beforeRun: ctx.beforeRun,
           admitRun: ctx.admitRun,
           lifecycle: ctx.lifecycle,
@@ -3185,6 +3213,7 @@ async function composeStart(
           actorOptions,
           driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
         });
+        if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -3554,7 +3583,16 @@ async function composeStart(
     },
     admitRun: ({ responsive }): boolean =>
       responsive || !(voiceService?.hasActiveSession(rootId) ?? false),
-    gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+    gate: (fn, candidates, responsive) =>
+      computerUseLock.gateAfterProvider(
+        rootId,
+        responsive,
+        (start) => mesh.gateRun(start, candidates, responsive, rootId),
+        fn,
+        () => mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY),
+        () => root.preemptForResponsive?.(),
+        () => root.requestRun?.()
+      ),
     onQueuedRunCancelled: () => mesh.clearSelection(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     onProviderAttempt: (attempt) => {

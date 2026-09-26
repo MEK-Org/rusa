@@ -1,5 +1,6 @@
 import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
+import type { ComputerUseLock } from "../../actor/computer-use-lock.js";
 import {
   RunStartCancelledError,
   type RunStartHandle,
@@ -26,7 +27,8 @@ type AdmitRequest = Extract<Request, { op: "admit" }>;
 export function createActorRuntime(
   createProvider: ProviderFactory,
   send: (message: ActorEvent) => void,
-  onClosed: () => void
+  onClosed: () => void,
+  computerUseLock?: ComputerUseLock
 ) {
   let actor: Actor | undefined;
   let sequence = 0;
@@ -159,7 +161,10 @@ export function createActorRuntime(
       beforeRun: async ({ mode }) => {
         pendingRunMode = mode;
         try {
-          const reply = await request<{ allowed: boolean; sessionId?: string }>({
+          const reply = await request<{
+            allowed: boolean;
+            sessionId?: string;
+          }>({
             op: "beforeRun",
             mode,
           }).result;
@@ -176,84 +181,104 @@ export function createActorRuntime(
           throw err;
         }
       },
-      gate: <T>(
-        fn: (selected: RawProviderModelConfig) => Promise<T>,
-        candidates: readonly RawProviderModelConfig[],
-        responsive: boolean
-      ): RunStartHandle<T> => {
-        activeGates++;
-        // A new admission is a new opportunity; an older interrupt is not about it.
-        interruptedAdmission = false;
-        const admitRequest: AdmitRequest = {
-          op: "admit",
-          candidates: [...candidates],
-          responsive,
-          mode: pendingRunMode,
-        };
-        const admission = request<RunSnapshot | { deferred: true }>(admitRequest);
-        pendingAdmission = { id: admission.id, request: admitRequest };
-        const result = (async () => {
-          try {
-            let admitted: RunSnapshot | { deferred: true };
+      gate: (fn, candidates, responsive) => {
+        let providerStarted = false;
+        // This must be set by the leader's selected-provider reply, not by
+        // beforeRun: a durable grant can change while provider pacing waits.
+        let computerUseAtAdmission = false;
+        const leaderGate = <T>(
+          start: (selected: RawProviderModelConfig) => Promise<T>
+        ): RunStartHandle<T> => {
+          activeGates++;
+          // A new admission is a new opportunity; an older interrupt is not about it.
+          interruptedAdmission = false;
+          const admitRequest: AdmitRequest = {
+            op: "admit",
+            candidates: [...candidates],
+            responsive,
+            mode: pendingRunMode,
+          };
+          const admission = request<RunSnapshot | { deferred: true }>(admitRequest);
+          pendingAdmission = { id: admission.id, request: admitRequest };
+          const result = (async () => {
             try {
-              admitted = await admission.result;
-            } catch (err) {
-              if (
-                err instanceof Error &&
-                err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
-              ) {
-                // The leader cancelled a stale reservation after changing this
-                // Actor's pool. Actor's retry loop re-runs the same opportunity
-                // against the pool set by the preceding modelConfig command.
-                throw new RunStartStaleProviderError();
+              let admitted: RunSnapshot | { deferred: true };
+              try {
+                admitted = await admission.result;
+              } catch (err) {
+                if (
+                  err instanceof Error &&
+                  err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
+                ) {
+                  // The leader cancelled a stale reservation after changing this
+                  // Actor's pool. Actor's retry loop re-runs the same opportunity
+                  // against the pool set by the preceding modelConfig command.
+                  throw new RunStartStaleProviderError();
+                }
+                if (
+                  err instanceof Error &&
+                  (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
+                    err.message.includes(COORDINATOR_ADMISSION_CANCELLED_ERROR) ||
+                    err.message.includes("Coordinator disconnected"))
+                ) {
+                  throw new RunStartCancelledError();
+                }
+                throw err;
               }
-              if (
-                err instanceof Error &&
-                (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
-                  err.message.includes(COORDINATOR_ADMISSION_CANCELLED_ERROR) ||
-                  err.message.includes("Coordinator disconnected"))
-              ) {
+              if ("deferred" in admitted) throw new RunStartCancelledError();
+              snapshot = admitted;
+              computerUseAtAdmission = admitted.computerUse === true;
+              if (stopping) throw new Error("Actor stopped before admission");
+              // The leader's admission decision, not wake ordering, sets the run's priority.
+              if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
+              sessionId = snapshot.record.sessionId;
+              if (snapshot.mcpServers) {
+                // Actor holds the array by reference, matching the in-process tool refresh path.
+                mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
+              }
+              if (interruptedAdmission) {
+                interruptedAdmission = false;
                 throw new RunStartCancelledError();
               }
-              throw err;
+              // The leader's pacing gate owns selection; the follower runs what it reserved.
+              providerStarted = true;
+              return await start(snapshot.selected ?? candidates[0]);
+            } finally {
+              if (pendingAdmission?.id === admission.id) pendingAdmission = undefined;
+              send({ type: "release", requestId: admission.id });
+              activeGates--;
+              finishClose();
             }
-            if ("deferred" in admitted) throw new RunStartCancelledError();
-            snapshot = admitted;
-            if (stopping) throw new Error("Actor stopped before admission");
-            // The leader's admission decision, not wake ordering, sets the run's priority.
-            if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
-            sessionId = snapshot.record.sessionId;
-            if (snapshot.mcpServers) {
-              // Actor holds the array by reference, matching the in-process tool refresh path.
-              mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
-            }
-            if (interruptedAdmission) {
-              interruptedAdmission = false;
-              throw new RunStartCancelledError();
-            }
-            // The leader's pacing gate owns selection; the follower runs what it reserved.
-            return await fn(snapshot.selected ?? candidates[0]);
-          } finally {
-            if (pendingAdmission?.id === admission.id) pendingAdmission = undefined;
-            send({ type: "release", requestId: admission.id });
-            activeGates--;
-            finishClose();
-          }
-        })();
-        return {
-          result,
-          started: false,
-          promote: () => {},
-          // Settle the start here rather than waiting for the leader's error
-          // reply, so Actor.cancelQueuedRun keeps this opportunity for resume.
-          cancel: () => {
-            const call = leaderCancelling ? pending.get(admission.id) : undefined;
-            if (!call) return false;
-            pending.delete(admission.id);
-            call.reject(new RunStartCancelledError());
-            return true;
-          },
+          })();
+          return {
+            result,
+            get started() {
+              return providerStarted;
+            },
+            promote: () => {},
+            // Settle the start here rather than waiting for the leader's error
+            // reply, so Actor.cancelQueuedRun keeps this opportunity for resume.
+            cancel: () => {
+              if (providerStarted) return false;
+              const call = leaderCancelling ? pending.get(admission.id) : undefined;
+              if (!call) return false;
+              pending.delete(admission.id);
+              call.reject(new RunStartCancelledError());
+              return true;
+            },
+          };
         };
+        return computerUseLock
+          ? computerUseLock.gateAfterProvider(
+              bootstrap.id,
+              responsive,
+              leaderGate,
+              fn,
+              () => computerUseAtAdmission,
+              () => actor?.preemptForResponsive(),
+              () => actor?.requestRun()
+            )
+          : leaderGate(fn);
       },
       lifecycle: createActorLifecycle([
         {

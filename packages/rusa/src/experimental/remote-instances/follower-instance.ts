@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { ComputerUseLock } from "../../actor/computer-use-lock.js";
 import { createActorRuntime } from "./actor-runtime.js";
 import { createProvider } from "./configured-provider.js";
 import type { FollowerActorCommand, FollowerEvent } from "./follower-hub.js";
@@ -11,13 +12,16 @@ export class FollowerInstance {
   private actors = new Map<string, ReturnType<typeof createActorRuntime>>();
   private stopped = false;
   private draining = false;
+  private readonly computerUseLock = new ComputerUseLock();
 
   constructor(
     private readonly home: string,
     private readonly sandbox: boolean,
     private readonly emit: (event: FollowerEvent) => void,
     private readonly providerFactory: ProviderFactory = createProvider
-  ) {}
+  ) {
+    mkdirSync(home, { recursive: true });
+  }
 
   get actorIds(): string[] {
     return [...this.actors.keys()];
@@ -51,7 +55,8 @@ export class FollowerInstance {
             actorId,
             message: { type: "exit", code: 0, signal: null },
           });
-        }
+        },
+        this.computerUseLock
       );
       this.actors.set(actorId, actor);
     }
@@ -81,6 +86,7 @@ export class FollowerInstance {
   close(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.computerUseLock.close();
     for (const actor of [...this.actors.values()]) actor.close();
   }
 }
