@@ -122,8 +122,9 @@ export interface EventSourceOwnerStore {
   activeForResource(resource: EventResource): EventSourceOwnership[];
   /**
    * The opaque, versioned config blob on an active exact event source. `undefined`
-   * means no exact active source exists; `null` means it exists without config.
-   * Config shape belongs to the consumer that owns its version, not this store.
+   * means no durable exact active source exists (a config-implied root row is
+   * not durable); `null` means it exists without config. Config shape belongs
+   * to the consumer that owns its version, not this store.
    */
   getConfig(resource: EventResource): string | null | undefined;
   /** Replace the config blob on an active exact event source. */
@@ -465,12 +466,14 @@ export class UnionEventSourceOwnerStore implements EventSourceOwnerStore {
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
 
+  /**
+   * Only the mutating side holds configurable rows. A config-implied row is
+   * re-derived every boot and never persisted, so it has no config to read or
+   * write; materializing one would let a later boot's reconciliation tombstone
+   * it and suppress the operator's source if it were configured again.
+   */
   getConfig(resource: EventResource): string | null | undefined {
-    const key = resourceKey(resource);
-    if (this.mutatingStore.activeForResource(key).length > 0) {
-      return this.mutatingStore.getConfig(key);
-    }
-    return this.baseStore.getConfig(key);
+    return this.mutatingStore.getConfig(resourceKey(resource));
   }
 
   setConfig(resource: EventResource, config: string | null): void {

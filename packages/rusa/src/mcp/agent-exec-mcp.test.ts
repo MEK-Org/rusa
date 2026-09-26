@@ -28,9 +28,11 @@ import {
   PARENT_GRANTABLE_CAPABILITIES,
 } from "../actor/capability-grants.js";
 import {
+  type EventSourceOwnerStore,
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
   parentOf,
+  reconcileEventSources,
 } from "../actor/event-subscriptions.js";
 import {
   type ExperimentEnrollmentStore,
@@ -126,6 +128,8 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     configuredEventSources?: readonly string[];
+    /** Defaults to an empty in-memory store; pass the boot union to test it. */
+    eventSourceOwners?: EventSourceOwnerStore;
     handleForId?: (id: string) => string;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -157,7 +161,7 @@ function setup(
     payload?: string;
   }[] = [];
   let seq = 0;
-  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
   let mesh!: ActorMesh;
   const eventSourceResolver = new HierarchicalEventSourceResolver({
@@ -2178,6 +2182,49 @@ describe("agent-execution MCP server", () => {
   });
 
   describe("Event source delegation tools (non-root, ISSUE_NUM §2)", () => {
+    it("omits and refuses config on a config-implied root source over the boot union (#695)", async () => {
+      const persistent = new InMemoryEventSourceOwnerStore();
+      const boot = reconcileEventSources(
+        persistent,
+        ["gchat:spaces"],
+        "root",
+        () => "2026-01-01T00:00:00Z"
+      );
+      const { mesh } = setup({
+        eventSourceOwners: boot.store,
+        configuredEventSources: ["gchat:spaces"],
+      });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const call = async (name: string, args: Record<string, unknown>) =>
+        (await rootClient.callTool({ name, arguments: args })) as CallToolResult;
+
+      // The root owns the configured source, but only through the boot-derived
+      // row: it is not listed as configurable and a write says why.
+      expect(dataOf(await call("list_event_sources", {}))).toEqual([]);
+      const res = await call("set_event_source_config", {
+        source: "gchat:spaces",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(/implied by configured event sources.*self-delegate/i);
+      expect(persistent.list()).toEqual([]);
+      expect(boot.store.activeForResource("gchat:spaces")).toEqual([
+        expect.objectContaining({ actorId: "root" }),
+      ]);
+
+      // Self-delegating an exact space creates the durable, configurable row.
+      await call("delegate_event_source", { child_thread_id: "root", source: "gchat:spaces/team" });
+      const set = await call("set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(set.isError).toBeFalsy();
+      expect(dataOf(await call("list_event_sources", {}))).toEqual([
+        { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+      ]);
+      expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
+    });
+
     it("lists and configures only the caller's owned event sources (#692)", async () => {
       const { mesh, events } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));

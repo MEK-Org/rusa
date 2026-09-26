@@ -727,7 +727,7 @@ export function createAgentExecMcpServer(
     {
       title: "List your event sources",
       description:
-        "List your active exact event-source ownership rows and their stored configuration objects. A null config means that row has no explicit configuration; live obligation routing claims are not configuration rows.",
+        "List your active exact event-source ownership rows and their stored configuration objects. Every listed row accepts set_event_source_config. A null config means that row has no explicit configuration; live obligation routing claims and sources implied by the operator's configured event sources are not configuration rows.",
       inputSchema: {},
     },
     async () => {

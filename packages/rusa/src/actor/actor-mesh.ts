@@ -3160,7 +3160,9 @@ export class ActorMesh {
   /**
    * List the caller's active exact event-source ownership rows together with
    * their stored configuration. This is intentionally a durable-row view,
-   * rather than the actor-admin audit view exposed by `list_subscriptions`.
+   * rather than the actor-admin audit view exposed by `list_subscriptions`:
+   * every listed row accepts `setEventSourceConfig`, so config-implied root
+   * sources, which have no durable row, are omitted (#695 review).
    * A live obligation can temporarily govern delivery for the same resource,
    * but does not disclose or rewrite the row's opaque configuration.
    */
@@ -3169,10 +3171,12 @@ export class ActorMesh {
     return this.eventSourceOwners
       .list()
       .filter((source) => source.actorId === ownerId && !source.unsubscribedAt)
-      .map((source) => ({
-        resource: source.resource,
-        config: readEventSourceConfig(this.eventSourceOwners.getConfig(source.resource)),
-      }));
+      .flatMap((source) => {
+        const config = this.eventSourceOwners.getConfig(source.resource);
+        return config === undefined
+          ? []
+          : [{ resource: source.resource, config: readEventSourceConfig(config) }];
+      });
   }
 
   /**
@@ -3193,6 +3197,11 @@ export class ActorMesh {
     if (exactOwner?.actorId !== ownerId) {
       throw new Error(
         `cannot configure ${canonicalResource}: caller needs an active exact source; self-delegate it or receive an exact delegation first`
+      );
+    }
+    if (this.eventSourceOwners.getConfig(canonicalResource) === undefined) {
+      throw new Error(
+        `cannot configure ${canonicalResource}: it is implied by configured event sources and has no durable row; self-delegate a descendant source to configure it`
       );
     }
     this.eventSourceOwners.setConfig(

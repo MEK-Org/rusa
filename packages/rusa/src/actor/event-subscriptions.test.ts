@@ -371,7 +371,7 @@ describe("reconcileEventSources", () => {
     // an exact persistent boundary. A generic config write must fail cleanly
     // here instead of materializing a row and changing routing semantics.
     expect(result.store.activeForResource(chat).map((row) => row.actorId)).toEqual([rootId]);
-    expect(result.store.getConfig(chat)).toBeNull();
+    expect(result.store.getConfig(chat)).toBeUndefined();
     expect(() => result.store.setConfig(chat, '{"version":1,"chatWakeMode":"all"}')).toThrow(
       /no active event-source owner/
     );
