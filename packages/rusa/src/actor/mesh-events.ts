@@ -182,6 +182,10 @@ export type MeshEventKind =
   // (#692). `actorId` = the owner who wrote it, `detail` = the space resource,
   // `payload` = { mode }, with `null` for a clear back to the default.
   | "chat_wake_mode_set"
+  // The effective owner of an event source replaced or cleared its generic
+  // configuration. `actorId` = the owner, `detail` = the source, and payload
+  // only says whether a config exists — arbitrary config is never logged.
+  | "event_source_config_set"
   | "stamp_invalid"
   // Host-plane `host-jobs` capability : a grantable systemd-run --user
   // runner for long host-side experiments. `actorId` = the submitting/owning

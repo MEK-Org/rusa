@@ -17,7 +17,6 @@ import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
-import type { ChatWakeModeView } from "../chat/wake-mode.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
@@ -720,28 +719,20 @@ export function createAgentExecMcpServer(
     }
   );
 
-  // ── Chat wake mode (#692) ── How a Google Chat space wakes its owner. The
-  // authority is the same effective ownership that governs delegating the
-  // space, enforced in the mesh, so these tools add no permission of their own.
-  const chatSpaceInputSchema = {
-    space: z.string().describe("The Google Chat space, as gchat:spaces/<id> or spaces/<id>."),
-  };
-  const describeWakeMode = (view: ChatWakeModeView): string =>
-    view.mode === null
-      ? `${view.resource}: default (every message in a DM or two-person space, mentions elsewhere)`
-      : `${view.resource}: ${view.mode}`;
-
+  // ── Event-source configuration (#692) ── Each consumer owns the versioned
+  // keys it understands. Configuration has the same effective-owner authority
+  // as delegation, enforced in the mesh; these tools grant no new permission.
   server.registerTool(
-    "get_chat_wake_mode",
+    "list_event_sources",
     {
-      title: "Read a chat space's wake mode",
+      title: "List your event sources",
       description:
-        "Read whether a Google Chat space you currently own wakes you on mentions only, on all messages, or by the default (every message in a DM or two-person space, mentions in larger spaces).",
-      inputSchema: chatSpaceInputSchema,
+        "List your active exact event sources and each source's stored configuration object. A null config means that source has no explicit configuration.",
+      inputSchema: {},
     },
-    async ({ space }) => {
+    async () => {
       try {
-        return toolOk(describeWakeMode(mesh.getChatWakeMode(space, selfId)));
+        return toolOk(mesh.listEventSources(selfId));
       } catch (err) {
         return toolError(err);
       }
@@ -749,20 +740,26 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
-    "set_chat_wake_mode",
+    "set_event_source_config",
     {
-      title: "Set a chat space's wake mode",
+      title: "Set an event source's configuration",
       description:
-        "Choose how a Google Chat space you currently own wakes you: `mentions` (only messages that @mention Rusa), `all` (every message), or `default` (every message in a DM or two-person space, mentions in larger spaces). A non-default per-space setting makes that space an explicit ownership boundary; `default` clears its setting but retains that boundary. A broad-source delegation or reclaim does not move that space — use exact-source delegation or reclaim. Each change applies from the next arriving message.",
+        "Replace the configuration object on an event source you currently own, or pass null to clear it. A non-null config materializes that exact source as an ownership boundary; later broad delegation or reclaim does not move it, so use exact-source delegation or reclaim when needed. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
       inputSchema: {
-        ...chatSpaceInputSchema,
-        mode: z.enum(["mentions", "all", "default"]).describe("The wake mode for this space."),
+        ...eventResourceInputSchema,
+        config: z
+          .record(z.string(), z.unknown())
+          .nullable()
+          .describe("The complete versioned configuration object, or null to clear it."),
       },
     },
-    async ({ space, mode }) => {
+    async ({ source, kind, org, repo, number, ref, space, config }) => {
       try {
-        const view = mesh.setChatWakeMode(space, mode === "default" ? null : mode, selfId);
-        return toolOk(describeWakeMode(view));
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "configuration"
+        );
+        return toolOk(mesh.setEventSourceConfig(resource, config, selfId));
       } catch (err) {
         return toolError(err);
       }

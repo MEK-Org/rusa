@@ -337,6 +337,31 @@ export interface RetirementBlockers {
 export type EffectiveRouteDiagnostic = EventSourceOwnershipDiagnostic;
 
 /**
+ * The public shape of one currently-owned event source. Config is deliberately
+ * an object rather than a feature-specific schema: each event-source consumer
+ * owns the version and keys it understands.
+ */
+export interface EventSourceConfigView {
+  resource: EventResource;
+  config: Record<string, unknown> | null;
+}
+
+function readEventSourceConfig(raw: string | null | undefined): Record<string, unknown> | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("configuration is not an object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `cannot read event-source configuration: ${error instanceof Error ? error.message : "invalid JSON"}`
+    );
+  }
+}
+
+/**
  * Retirement refused because the subtree still holds work someone has to decide
  * about. Carries the blockers structurally as well as in the message, so a
  * caller that wants to act on them doesn't have to parse prose back out.
@@ -3126,6 +3151,64 @@ export class ActorMesh {
     const at = this.now();
     this.unsubscribeEventSource(resource, current.actorId, at);
     this.subscribeEventSource(resource, reclaimedBy, reclaimedBy);
+  }
+
+  /**
+   * List the caller's active exact event sources together with their stored
+   * configuration. This is intentionally an owner view, rather than the
+   * actor-admin audit view exposed by `list_subscriptions`.
+   */
+  listEventSources(callerId: string): EventSourceConfigView[] {
+    const ownerId = this.resolveThreadId(callerId);
+    return this.eventSourceOwners
+      .list()
+      .filter((source) => source.actorId === ownerId && !source.unsubscribedAt)
+      .map((source) => ({
+        resource: source.resource,
+        config: readEventSourceConfig(this.eventSourceOwners.getConfig(source.resource)),
+      }));
+  }
+
+  /**
+   * Replace the opaque configuration object on an event source the caller
+   * currently owns. A non-null config materializes the exact source so config
+   * is carried with an explicit ownership boundary; clearing does not remove a
+   * previously materialized source.
+   */
+  setEventSourceConfig(
+    resource: EventResource,
+    config: Record<string, unknown> | null,
+    callerId: string
+  ): EventSourceConfigView {
+    const ownerId = this.resolveThreadId(callerId);
+    const canonicalResource = resourceKey(resource);
+    if (this.effectiveOwnerOf(canonicalResource) !== ownerId) {
+      throw new Error(
+        `cannot configure ${canonicalResource}: caller is not its current effective owner`
+      );
+    }
+
+    const exactOwner = this.eventSourceOwners.activeForResource(canonicalResource)[0];
+    if (config !== null && exactOwner?.actorId !== ownerId) {
+      // Configuration belongs to the exact source, not an inherited parent
+      // source. Using the ordinary subscribe path makes that boundary durable
+      // and records the existing ownership audit event.
+      this.subscribeEventSource(canonicalResource, ownerId, ownerId);
+    }
+    if (config !== null || exactOwner?.actorId === ownerId) {
+      this.eventSourceOwners.setConfig(
+        canonicalResource,
+        config === null ? null : JSON.stringify(config)
+      );
+      // Never put arbitrary operator configuration into the event payload.
+      this.recordEvent({
+        kind: "event_source_config_set",
+        actorId: ownerId,
+        detail: canonicalResource,
+        payload: JSON.stringify({ configured: config !== null }),
+      });
+    }
+    return { resource: canonicalResource, config };
   }
 
   /**

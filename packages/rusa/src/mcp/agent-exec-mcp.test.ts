@@ -669,7 +669,7 @@ describe("agent-execution MCP server", () => {
         "cancel_scheduled_message",
         "delegate_event_source",
         "enroll_actor_experiment",
-        "get_chat_wake_mode",
+        "list_event_sources",
         "grant_capability",
         "introduce",
         "list_actor_experiments",
@@ -686,7 +686,7 @@ describe("agent-execution MCP server", () => {
         "send_message",
         "set_thread_charter",
         "set_actor_model",
-        "set_chat_wake_mode",
+        "set_event_source_config",
         "set_thread_title",
         "spawn_thread",
         "subscribe_event_source",
@@ -943,7 +943,7 @@ describe("agent-execution MCP server", () => {
       [
         "cancel_scheduled_message",
         "delegate_event_source",
-        "get_chat_wake_mode",
+        "list_event_sources",
         "grant_capability",
         "introduce",
         "list_followers",
@@ -954,7 +954,7 @@ describe("agent-execution MCP server", () => {
         "revoke_capability",
         "send_message",
         "set_actor_model",
-        "set_chat_wake_mode",
+        "set_event_source_config",
         "spawn_thread",
         "subscribe_event_source",
         "transfer_voice_session",
@@ -2178,7 +2178,7 @@ describe("agent-execution MCP server", () => {
   });
 
   describe("Event source delegation tools (non-root, ISSUE_NUM §2)", () => {
-    it("lets only a chat space's effective owner read and set its wake mode (#692)", async () => {
+    it("lists and configures only the caller's owned event sources (#692)", async () => {
       const { mesh, events } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
@@ -2193,13 +2193,38 @@ describe("agent-execution MCP server", () => {
       const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
         (await client.callTool({ name, arguments: args })) as CallToolResult;
 
-      // The mode belongs to the space, not to its then-current owner: a later
-      // owner inherits the space's behavior and may change it.
-      let res = await call(rootClient, "set_chat_wake_mode", {
-        space: "gchat:spaces/team",
-        mode: "all",
+      // The config is a generic object attached to the exact source. Chat wake
+      // mode is its first consumer, and the list is the owner's read surface.
+      let res = await call(rootClient, "list_event_sources", {});
+      expect(dataOf(res)).toEqual([{ resource: "gchat:spaces", config: null }]);
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces",
+        config: { routing: { priority: "normal" } },
+      });
+      expect(dataOf(res)).toEqual({
+        resource: "gchat:spaces",
+        config: { routing: { priority: "normal" } },
+      });
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual([
+        { resource: "gchat:spaces", config: { routing: { priority: "normal" } } },
+      ]);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_config_set",
+          actorId: "root",
+          detail: "gchat:spaces",
+          payload: JSON.stringify({ configured: true }),
+        })
+      );
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
       });
       expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toEqual({
+        resource: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
       expect(events).toContainEqual(
         expect.objectContaining({
           kind: "event_source_subscribed",
@@ -2213,40 +2238,38 @@ describe("agent-execution MCP server", () => {
         arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
       });
 
-      res = await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" });
-      expect(res.isError).toBeFalsy();
-      expect(dataOf(res)).toBe("gchat:spaces/team: all");
-
-      res = await call(ownerClient, "set_chat_wake_mode", {
-        space: "spaces/team",
-        mode: "mentions",
+      res = await call(ownerClient, "list_event_sources", {});
+      expect(dataOf(res)).toEqual([
+        { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+      ]);
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "mentions" },
       });
       expect(res.isError).toBeFalsy();
-      expect(dataOf(res)).toBe("gchat:spaces/team: mentions");
       expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
       // Another of root's spaces is untouched, and the owner has no say over it.
       expect(mesh.chatWakeModeFor("spaces/other")).toBeUndefined();
-      res = await call(ownerClient, "set_chat_wake_mode", { space: "spaces/other", mode: "all" });
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/other",
+        config: { version: 1, chatWakeMode: "all" },
+      });
       expect(res.isError).toBe(true);
       expect(dataOf(res)).toMatch(/not its current effective owner/);
 
       // Having delegated the space away, root is no longer its owner either.
-      res = await call(rootClient, "set_chat_wake_mode", {
-        space: "gchat:spaces/team",
-        mode: "mentions",
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "mentions" },
       });
       expect(res.isError).toBe(true);
       expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
 
-      // A space is the unit: the whole chat tree and a single thread are refused.
-      res = await call(rootClient, "set_chat_wake_mode", { space: "gchat:spaces", mode: "all" });
-      expect(res.isError).toBe(true);
-
-      res = await call(ownerClient, "set_chat_wake_mode", {
-        space: "spaces/team",
-        mode: "default",
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: null,
       });
-      expect(dataOf(res)).toContain("gchat:spaces/team: default");
+      expect(dataOf(res)).toEqual({ resource: "gchat:spaces/team", config: null });
       expect(mesh.chatWakeModeFor("spaces/team")).toBeUndefined();
       // An unparseable or non-space resource returns undefined without throwing (#695).
       expect(mesh.chatWakeModeFor("malformed space name")).toBeUndefined();
@@ -2258,17 +2281,22 @@ describe("agent-execution MCP server", () => {
         name: "reclaim_event_source",
         arguments: { source: "gchat:spaces/team" },
       });
-      await call(rootClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" });
+      await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: { child_thread_id: "t1", source: "gchat:spaces" },
       });
-      expect(dataOf(await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
-        "gchat:spaces/team: all"
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
       );
-      expect(
-        (await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" })).isError
-      ).toBe(true);
+      expect(dataOf(await call(ownerClient, "list_event_sources", {}))).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ resource: "gchat:spaces/team" })])
+      );
     });
 
     it("requires exact reclaim for a child-created chat wake boundary (#692)", async () => {
@@ -2291,8 +2319,16 @@ describe("agent-execution MCP server", () => {
         arguments: { child_thread_id: "t1", source: "gchat:spaces" },
       });
       expect(
-        dataOf(await call(ownerClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" }))
-      ).toBe("gchat:spaces/team: all");
+        dataOf(
+          await call(ownerClient, "set_event_source_config", {
+            source: "gchat:spaces/team",
+            config: { version: 1, chatWakeMode: "all" },
+          })
+        )
+      ).toEqual({
+        resource: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
 
       // Reclaiming the broad source leaves the child's newly materialized exact
       // boundary in place. The parent must reclaim that exact source before the
@@ -2302,11 +2338,13 @@ describe("agent-execution MCP server", () => {
         arguments: { source: "gchat:spaces" },
       })) as CallToolResult;
       expect(broadReclaim.isError).toBeFalsy();
-      expect((await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" })).isError).toBe(
-        true
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ resource: "gchat:spaces/team" })])
       );
-      expect(dataOf(await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
-        "gchat:spaces/team: all"
+      expect(dataOf(await call(ownerClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
       );
 
       const exactReclaim = (await rootClient.callTool({
@@ -2314,8 +2352,10 @@ describe("agent-execution MCP server", () => {
         arguments: { source: "gchat:spaces/team" },
       })) as CallToolResult;
       expect(exactReclaim.isError).toBeFalsy();
-      expect(dataOf(await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
-        "gchat:spaces/team: all"
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
       );
     });
 
