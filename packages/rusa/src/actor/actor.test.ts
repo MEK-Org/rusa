@@ -22,7 +22,7 @@ import {
   RunStartCancelledError,
   type RunStartHandle,
 } from "./concurrency-limiter.js";
-import { routeContinuationCapped, routeRunFailure } from "./failure-sink.js";
+import { routeRunFailure } from "./failure-sink.js";
 
 /** Let the timer-less corrective-run microtasks drain. */
 const flush = async () => {
@@ -1806,113 +1806,32 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(0); // threw before the provider was invoked
   });
 
-  it("runs one corrective yield-only prompt when a run ends without yield", async () => {
-    let actor!: Actor;
-    const provider = new FakeProvider((opts) => {
-      if (opts.prompt.includes("Yield required")) actor.declareYield();
-      return {};
-    });
-    actor = makeActor({}, provider);
+  it("settles cleanly without a corrective yield prompt when a run ends without yield (#664)", async () => {
+    const provider = new FakeProvider();
+    const actor = makeActor({}, provider);
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
     await flush();
-    expect(provider.calls).toHaveLength(2);
-    expect(provider.calls[1]?.prompt).toContain("End this run correctly now by calling yield_run");
-    expect(provider.calls[1]?.prompt).not.toContain("take your next step");
-    expect(provider.calls[1]?.prompt).not.toContain("take it now");
+    expect(provider.calls).toHaveLength(1);
   });
 
-  it("fails a run that still does not yield after the corrective prompt", async () => {
-    const continued: number[] = [];
-    const capped = vi.fn();
-    const seen: RunResult[] = [];
-    const provider = new FakeProvider(); // never yields
-    const actor = makeActor(
-      {
-        onContinue: (n) => continued.push(n),
-        onContinuationCapped: capped,
-        onRunEnd: (result) => {
-          seen.push(result);
-        },
-      },
-      provider
-    );
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(2);
-    expect(continued).toEqual([1]);
-    expect(capped).toHaveBeenCalledWith(1);
-    expect(seen).toHaveLength(2);
-    expect(seen[0]?.success).toBe(true);
-    expect(seen[1]?.success).toBe(false);
-    expect(seen[1]?.output).toContain("corrective yield-elicitation run");
-  });
-
-  it("marks corrective yield-elicitation runs with responsive priority", async () => {
+  it("does not queue responsive yield-elicitation runs when a run completes (#664)", async () => {
     const queuedEvents: { responsive: boolean; mode: string }[] = [];
-    const gatedPriorities: boolean[] = [];
-    const startPriorities: boolean[] = [];
-    const provider = new FakeProvider(); // never yields
-    const actor = makeActor(
-      {
-        onQueued: (event) => queuedEvents.push(event),
-        gate: (fn, candidates, responsive) => {
-          gatedPriorities.push(responsive);
-          return fn(candidates[0]);
-        },
-        onRunStart: (responsive) => {
-          startPriorities.push(responsive);
-        },
-      },
-      provider
-    );
-    actor.requestRun(); // normal priority
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(2);
-    expect(queuedEvents).toEqual([
-      { responsive: false, mode: "ordinary" },
-      { responsive: true, mode: "yield-elicitation" },
-    ]);
-    expect(gatedPriorities).toEqual([false, true]);
-    expect(startPriorities).toEqual([false, true]);
-  });
-
-  it("notifies the parent exactly once when the corrective prompt still does not yield", async () => {
-    const toParent: string[] = [];
-    const capEvents: number[] = [];
     const provider = new FakeProvider();
     const actor = makeActor(
       {
-        onContinuationCapped: (n) => capEvents.push(n),
-        onRunEnd: (result) => {
-          if (!result.success) {
-            routeRunFailure(
-              {
-                actors: { get: () => ({ id: "a1", parentId: "root" }) as ActorRecord },
-                sendToParent: (_toId, body) => toParent.push(body),
-                postToErrorChat: null,
-                rootId: "root",
-                log: () => {},
-              },
-              "a1",
-              result
-            );
-          }
-        },
+        onQueued: (event) => queuedEvents.push(event),
       },
       provider
     );
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
     await flush();
-    expect(capEvents).toEqual([1]);
-    expect(toParent).toHaveLength(1);
-    expect(toParent[0]).toContain("[run failed]");
+    expect(provider.calls).toHaveLength(1);
+    expect(queuedEvents).toEqual([{ responsive: false, mode: "ordinary" }]);
   });
 
-  it("does not duplicate notifications when cap is hit under production-like hooks", async () => {
+  it("does not notify parent of failure when a run ends without yield (#664)", async () => {
     const toParent: string[] = [];
     const provider = new FakeProvider();
     const deps = {
@@ -1924,9 +1843,6 @@ describe("Actor", () => {
     };
     const actor = makeActor(
       {
-        onContinuationCapped: (n) => {
-          routeContinuationCapped(deps, "a1", n);
-        },
         onRunEnd: async (result) => {
           if (!result.success && !result.capped) {
             await routeRunFailure(deps, "a1", result);
@@ -1938,130 +1854,8 @@ describe("Actor", () => {
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
     await flush();
-    expect(toParent).toHaveLength(1);
-    expect(toParent[0]).toContain("[capped]");
-    expect(toParent[0]).not.toContain("[run failed]");
-  });
-
-  it("still fails a corrective no-yield run when an external wake arrives mid-run", async () => {
-    const toParent: string[] = [];
-    const seen: RunResult[] = [];
-    const capEvents: number[] = [];
-    let correctiveResolve!: (res: RunResult) => void;
-    let correctiveStarted = false;
-    let actor!: Actor;
-    const correctiveRun = new Promise<RunResult>((resolve) => {
-      correctiveResolve = resolve;
-    });
-    const provider = new FakeProvider((opts) => {
-      if (opts.prompt.includes("Yield required")) {
-        correctiveStarted = true;
-        return correctiveRun;
-      }
-      if (!opts.prompt.includes("Yield required") && correctiveStarted) {
-        actor.declareYield();
-      }
-      return {};
-    });
-    actor = makeActor(
-      {
-        onContinuationCapped: (n) => capEvents.push(n),
-        onRunEnd: (result) => {
-          seen.push(result);
-          if (!result.success) {
-            routeRunFailure(
-              {
-                actors: { get: () => ({ id: "a1", parentId: "root" }) as ActorRecord },
-                sendToParent: (_toId, body) => toParent.push(body),
-                postToErrorChat: null,
-                rootId: "root",
-                log: () => {},
-              },
-              "a1",
-              result
-            );
-          }
-        },
-      },
-      provider
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(correctiveStarted).toBe(true);
-    expect(provider.calls).toHaveLength(2);
-
-    actor.requestRun();
-    correctiveResolve({
-      success: true,
-      output: "still no yield",
-      exitCode: 0,
-    });
-    await flush();
-
-    expect(capEvents).toEqual([1]);
-    expect(seen[1]?.success).toBe(false);
-    expect(seen[1]?.output).toContain("corrective yield-elicitation run");
-    expect(toParent).toHaveLength(1);
-    expect(toParent[0]).toContain("[run failed]");
-
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls[2]?.prompt).toBe("PROMPT: inbox work");
-    expect(seen[2]?.success).toBe(true);
-    expect(toParent).toHaveLength(1);
-  });
-
-  it("applies the one-corrective-run rule even when maxContinuations is zero", async () => {
-    const provider = new FakeProvider(); // never yields
-    const actor = makeActor({ maxContinuations: 0 }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(2);
-  });
-
-  it("does not elicit yield after a failed run", async () => {
-    const provider = new FakeProvider(() => ({ success: false, output: "boom", exitCode: 1 }));
-    const onContinue = vi.fn();
-    const actor = makeActor({ maxContinuations: 5, onContinue }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
     expect(provider.calls).toHaveLength(1);
-    expect(onContinue).not.toHaveBeenCalled();
-  });
-
-  it("resumes yield elicitation once a run succeeds again after a failure", async () => {
-    let failNext = true;
-    const provider = new FakeProvider(() => {
-      if (failNext) {
-        failNext = false;
-        return { success: false, output: "boom", exitCode: 1 };
-      }
-      return {}; // success; FakeProvider never yields → gets a corrective prompt
-    });
-    const actor = makeActor({ maxContinuations: 2 }, provider);
-    actor.requestRun(); // fails → no continuation
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(1);
-    actor.requestRun(); // succeeds → gets the one corrective prompt
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(3); // 1 failed + 2 runs for the successful no-yield wake
-  });
-
-  it("does not elicit yield for a wake that beforeRun gated off", async () => {
-    const provider = new FakeProvider();
-    const onContinue = vi.fn();
-    const actor = makeActor({ maxContinuations: 5, beforeRun: () => false, onContinue }, provider);
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-    await flush();
-    expect(provider.calls).toHaveLength(0); // gated off
-    expect(onContinue).not.toHaveBeenCalled();
+    expect(toParent).toHaveLength(0);
   });
 
   it("exposes content-free lifecycle context only after beforeRun passes", async () => {

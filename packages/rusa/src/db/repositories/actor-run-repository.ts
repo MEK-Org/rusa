@@ -28,6 +28,19 @@ export interface ActorRun {
   abandonReason: string | null;
 }
 
+/**
+ * A completed run's durable selection interval. This is a narrow read model
+ * for joining an activity row to the work that selected it; it must not make
+ * completed focus appear as current selected work.
+ */
+export interface CompletedActorRunFocus {
+  actorId: string;
+  startedAt: string;
+  endedAt: string;
+  entryIds: string[];
+  primaryObligationId: string | null;
+}
+
 interface ActorRunRow {
   id: string;
   actor_id: string;
@@ -252,6 +265,76 @@ export class ActorRunRepository {
       )
       .all(actorId, limit) as ActorRunRow[];
     return rows.map(toActorRun);
+  }
+
+  /**
+   * Count successful completed runs by selected inbox entry for one actor.
+   * The grouped read is the durable retry budget: callers may exclude the
+   * terminal row they are currently processing so lifecycle listener ordering
+   * cannot affect whether one recovery remains.
+   */
+  completedFocusEntryCounts(actorId: string, excludeRunId?: string): ReadonlyMap<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT json_each.value AS entry_id, COUNT(DISTINCT r.id) AS run_count
+         FROM actor_runs r, json_each(r.focus_entry_ids_json)
+         WHERE r.actor_id = ?
+           AND r.outcome = 'completed'
+           AND r.success = 1
+           AND (? IS NULL OR r.id != ?)
+         GROUP BY json_each.value`
+      )
+      .all(actorId, excludeRunId ?? null, excludeRunId ?? null) as Array<{
+      entry_id: string;
+      run_count: number;
+    }>;
+    return new Map(rows.map((row) => [row.entry_id, row.run_count]));
+  }
+
+  /**
+   * Completed runs that retained a selected-inbox snapshot, newest first.
+   * Invalid historical focus JSON is ignored so a dashboard read can still
+   * render its independent activity rows.
+   */
+  listRecentCompletedFocuses(limit: number): CompletedActorRunFocus[] {
+    assertLimit(limit);
+    const rows = this.db
+      .prepare(
+        `SELECT actor_id, started_at, ended_at, focus_entry_ids_json, focus_primary_obligation_id
+         FROM actor_runs
+         WHERE outcome = 'completed'
+           AND ended_at IS NOT NULL
+           AND focus_entry_ids_json IS NOT NULL
+         ORDER BY ended_at DESC, id DESC
+         LIMIT ?`
+      )
+      .all(limit) as Array<{
+      actor_id: string;
+      started_at: string;
+      ended_at: string;
+      focus_entry_ids_json: string;
+      focus_primary_obligation_id: string | null;
+    }>;
+
+    return rows.flatMap((row) => {
+      try {
+        const entryIds = JSON.parse(row.focus_entry_ids_json);
+        if (!Array.isArray(entryIds) || !entryIds.every((id) => typeof id === "string")) {
+          return [];
+        }
+        return [
+          {
+            actorId: row.actor_id,
+            startedAt: row.started_at,
+            endedAt: row.ended_at,
+            entryIds,
+            primaryObligationId: row.focus_primary_obligation_id,
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
   }
 
   /**

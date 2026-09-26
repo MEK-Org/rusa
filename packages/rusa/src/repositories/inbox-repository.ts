@@ -134,6 +134,12 @@ export interface InboxRepository {
     handledAt?: Date,
     handledNote?: string
   ): MarkHandledResult[];
+  /**
+   * Activity-feed projection of individual durable handled rows, newest first.
+   * A handled timestamp or note is not a durable batch identity, so callers
+   * receive each item separately rather than a guessed coalesced group.
+   */
+  listRecentHandledEntries(limit?: number): InboxEntry[];
 }
 
 export function validateInboxPayload(payload: unknown): asserts payload is InboxPayload {
@@ -193,6 +199,9 @@ export class EmptyInboxRepository implements InboxRepository {
     _handledAt?: Date,
     _handledNote?: string
   ): MarkHandledResult[] {
+    return [];
+  }
+  listRecentHandledEntries(_limit = 50): InboxEntry[] {
     return [];
   }
 }

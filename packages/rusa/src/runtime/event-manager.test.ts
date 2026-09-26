@@ -95,6 +95,17 @@ class FakeInboxStore implements InboxRepository {
     return [];
   }
 
+  listRecentHandledEntries(limit = 50): InboxEntry[] {
+    return this.entries
+      .filter((entry) => entry.handledAt !== null)
+      .sort(
+        (left, right) =>
+          (right.handledAt?.getTime() ?? 0) - (left.handledAt?.getTime() ?? 0) ||
+          right.id.localeCompare(left.id)
+      )
+      .slice(0, limit);
+  }
+
   markSeen(): InboxEntry[] {
     return [];
   }

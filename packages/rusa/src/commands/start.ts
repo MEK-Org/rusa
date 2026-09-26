@@ -54,7 +54,6 @@ import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
   type FailureSinkDeps,
   formatProviderLabel,
-  routeContinuationCapped,
   routeRunFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
@@ -523,9 +522,6 @@ export async function deliverHostAlarm(opts: {
   opts.sendToErrorChat(opts.message);
   return "errorChat";
 }
-
-/** Legacy cap value retained for event detail; Actor now allows one corrective yield run. */
-const WORKER_MAX_CONTINUATIONS = 20;
 
 export function getShutdownExitCode(reason: "deploy" | null): number {
   return reason === "deploy" ? 1 : 0;
@@ -2433,7 +2429,8 @@ async function composeStart(
                 effort: lastSelected.effort,
               },
               result.model
-            )
+            ),
+            event.runId
           );
         }
       },
@@ -2519,6 +2516,8 @@ async function composeStart(
       getRepositories().actorRuns.recordYield(runId, status, note);
       return runId;
     },
+    completedFocusEntryCounts: (actorId, excludeRunId) =>
+      getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
     capabilityGrants,
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
@@ -3051,23 +3050,6 @@ async function composeStart(
           admitRun: ctx.admitRun,
           lifecycle: ctx.lifecycle,
           onQueuedRunCancelled: ctx.onQueuedRunCancelled,
-          // Compatibility only: Actor enforces one corrective yield prompt
-          // regardless of this legacy cap value.
-          maxContinuations: WORKER_MAX_CONTINUATIONS,
-          onContinue: (n) =>
-            mesh.recordEvent({
-              kind: "run_continued",
-              actorId: id,
-              detail: `yield-elicitation ${n}/1`,
-            }),
-          onContinuationCapped: (n) => {
-            mesh.recordEvent({
-              kind: "continuation_capped",
-              actorId: id,
-              detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
-            });
-            routeContinuationCapped(failureSink, id, n);
-          },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onProviderAttempt: (attempt) => {
             activeRunSelections.set(id, {
@@ -3460,9 +3442,8 @@ async function composeStart(
     },
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
-    beforeRun: ({ mode }): boolean => {
+    beforeRun: (): boolean => {
       if (!mesh.prepareRun(rootId)) return false;
-      if (mode === "yield-elicitation") return true;
       const watermark = root.getInterruptedWatermark?.();
       if (watermark) {
         const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
@@ -3470,24 +3451,10 @@ async function composeStart(
       }
       return inboxStore.countUnhandled(rootId) > 0;
     },
-    admitRun: ({ responsive, mode }): boolean =>
-      responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
+    admitRun: ({ responsive }): boolean =>
+      responsive || !(voiceService?.hasActiveSession(rootId) ?? false),
     gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
     onQueuedRunCancelled: () => mesh.clearSelection(rootId),
-    onContinue: (n) =>
-      mesh.recordEvent({
-        kind: "run_continued",
-        actorId: rootId,
-        detail: `yield-elicitation ${n}/1`,
-      }),
-    onContinuationCapped: (n) => {
-      mesh.recordEvent({
-        kind: "continuation_capped",
-        actorId: rootId,
-        detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
-      });
-      routeContinuationCapped(failureSink, rootId, n);
-    },
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     onProviderAttempt: (attempt) => {
       activeRunSelections.set(rootId, {
@@ -3849,6 +3816,8 @@ async function composeStart(
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          actorRuns: getRepositories().actorRuns,
+          inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
             logger: log.child({ component: "reference-cache" }),
