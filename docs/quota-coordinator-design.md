@@ -260,8 +260,12 @@ under v1:
   established `ProviderPacer` and mesh-concurrency path own that accepted
   start. At most one claimed-but-unstarted actor waits per lane; the rest
   stay unclaimed in the list. An actor only ever claims one of its own
-  declared candidates, so a model-scoped lane (Fable under #588) is a
-  distinct candidate lane that a provider-wide lane cannot claim through.
+  declared candidates. A model with its own published quota windows (Fable
+  under #588) paces on a model pacer linked to its provider pacer: it is
+  available only when both clocks allow a start, each start is charged to
+  both, and the linked lanes hold at most one claim between them. Other
+  models of the provider stay on the provider pacer and never see the
+  model's windows.
   Responsive work never waits in the list: it claims a healthy lane at once
   and bypasses pacing. A claim is consumed, never released or transferred, so
   a lane deferred after claiming keeps its one unstarted actor until the

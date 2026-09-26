@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
-import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import type { ProviderQuotaSnapshot, QuotaLimit, QuotaWindowKind } from "../mcp/quota-mcp.js";
 import {
   nullQuotaMetrics,
   QUOTA_SERVICE_METRICS,
@@ -176,10 +176,25 @@ export interface PersistedQuotaProviderStatus {
   exhaustedUntil: string | null;
   updatedAt: string;
   buckets: PersistedQuotaBucketStatus[];
+  /**
+   * One independently reasoned lane per model scope the provider reports
+   * (#588). Omitted when there are none, so a provider-only status is
+   * unchanged. A candidate model is governed by the provider lane together
+   * with every entry whose `models` contains it.
+   */
+  modelLanes?: PersistedQuotaModelLaneStatus[];
+}
+
+/** A model-scoped lane: the provider status shape plus the models it applies to. */
+export interface PersistedQuotaModelLaneStatus
+  extends Omit<PersistedQuotaProviderStatus, "modelLanes"> {
+  models: string[];
 }
 
 export interface QuotaHistoryRecord {
-  scope: "provider";
+  scope: "provider" | "model";
+  /** Canonical model IDs of a model-scoped row; omitted for provider rows. */
+  models?: string[];
   kind: string;
   label: string;
   observedAt: string;
@@ -192,12 +207,14 @@ export interface QuotaHistoryRecord {
 }
 
 interface StoredObservation extends CanonicalQuotaObservation {
+  modelScope: string;
   slot: number;
   processed: number;
 }
 
 interface ReasonedObservation {
   provider: string;
+  modelScope: string;
   kind: string;
   label: string;
   resetAtIso: string | null;
@@ -252,6 +269,79 @@ function canonicalJson(value: unknown): string {
 /** Stable request identity; no caller-controlled serialization ambiguities. */
 export function manualObservationFingerprint(snapshot: ProviderQuotaSnapshot): string {
   return createHash("sha256").update(canonicalJson(snapshot)).digest("hex");
+}
+
+/** `model_scope` of a provider-wide observation: the column default. */
+export const PROVIDER_SCOPE_KEY = "";
+
+/**
+ * Versioned `model_scope` blob of a model-scoped observation. The models are
+ * the catalog-validated canonical IDs, sorted so one allocation has exactly
+ * one durable identity whatever order the catalog or parser listed them in.
+ */
+interface ModelScopeBlob {
+  version: 1;
+  models: string[];
+}
+
+export function modelScopeKey(models: readonly string[]): string {
+  const blob: ModelScopeBlob = { version: 1, models: [...new Set(models)].sort() };
+  return canonicalJson(blob);
+}
+
+/**
+ * Decode a stored `model_scope`: `[]` for the provider-wide key, the model IDs
+ * for a well-formed version-1 blob, and `null` for anything else. The column
+ * carries no SQLite validator, so every reader treats `null` as unusable
+ * evidence rather than widening it to provider scope.
+ */
+export function parseModelScopeKey(key: string): string[] | null {
+  if (key === PROVIDER_SCOPE_KEY) return [];
+  try {
+    const blob = JSON.parse(key) as Partial<ModelScopeBlob> | null;
+    if (
+      blob?.version !== 1 ||
+      !Array.isArray(blob.models) ||
+      blob.models.length === 0 ||
+      !blob.models.every((model) => typeof model === "string" && model.length > 0) ||
+      modelScopeKey(blob.models) !== key
+    ) {
+      return null;
+    }
+    return blob.models;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The durable scope of one parsed window, or `null` when it must be rejected.
+ * Provider-scoped windows map to {@link PROVIDER_SCOPE_KEY}. A model-scoped
+ * window is accepted only from a catalog-validated source, only in the
+ * explicit `{ provider, models }` form, and only for this provider; the bare
+ * legacy `"model"` scope names no models and so cannot identify a lane.
+ */
+function observationScopeKey(
+  limit: Pick<QuotaLimit, "scope">,
+  provider: string,
+  acceptModelScope: boolean
+): string | null {
+  if (isProviderScopedWindow(limit)) return PROVIDER_SCOPE_KEY;
+  if (!acceptModelScope || typeof limit.scope !== "object" || limit.scope === null) return null;
+  const { provider: scopedProvider, models } = limit.scope;
+  if (
+    typeof scopedProvider !== "string" ||
+    scopedProvider.trim().toLocaleLowerCase("en-US") !== provider ||
+    !Array.isArray(models) ||
+    !models.every((model) => typeof model === "string" && model.trim().length > 0)
+  ) {
+    return null;
+  }
+  return modelScopeKey(models.map((model) => model.trim()));
+}
+
+function bucketKey(provider: string, models: readonly string[], kind: string): string {
+  return models.length === 0 ? `${provider}:${kind}` : `${provider}[${models.join(",")}]:${kind}`;
 }
 
 /**
@@ -399,6 +489,7 @@ export class SharedQuotaStore {
     const migrate = this.db.transaction(() => {
       const rawVersion = this.db.pragma("user_version", { simple: true });
       const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
+      this.addModelScopeInTransaction();
       this.db.exec(`
       CREATE TABLE IF NOT EXISTS quota_scrapes (
         id TEXT PRIMARY KEY,
@@ -415,6 +506,7 @@ export class SharedQuotaStore {
 
       CREATE TABLE IF NOT EXISTS quota_observations (
         provider TEXT NOT NULL,
+        model_scope TEXT NOT NULL DEFAULT '',
         kind TEXT NOT NULL,
         observed_slot INTEGER NOT NULL,
         label TEXT NOT NULL,
@@ -428,16 +520,16 @@ export class SharedQuotaStore {
         controller_integral REAL,
         uncapped_interval_seconds REAL,
         interval_seconds REAL,
-        PRIMARY KEY(provider, kind, observed_slot)
+        PRIMARY KEY(provider, model_scope, kind, observed_slot)
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
         ON quota_observations(provider, observed_at);
       CREATE INDEX IF NOT EXISTS idx_quota_observations_observed_at
         ON quota_observations(observed_at);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_kind_time
-        ON quota_observations(provider, kind, observed_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_quota_observations_reasoned
-        ON quota_observations(provider, kind, observed_at DESC)
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_kind_time
+        ON quota_observations(provider, model_scope, kind, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_scope_reasoned
+        ON quota_observations(provider, model_scope, kind, observed_at DESC)
         WHERE interval_seconds IS NOT NULL;
       CREATE TABLE IF NOT EXISTS quota_provider_reading_modes (
         provider TEXT PRIMARY KEY,
@@ -461,6 +553,55 @@ export class SharedQuotaStore {
       }
     });
     migrate.immediate();
+  }
+
+  /**
+   * Schema version 3 (#588): move `model_scope` into the observation key. A
+   * primary key cannot be altered in place, so a pre-v3 table is rebuilt with
+   * every row copied as provider-wide (`''`) — before v3 the store rejected
+   * every model-scoped window, so that is exactly what each row was. The old
+   * table's `(provider, kind)` indexes go with it and the schema block below
+   * recreates the scope-aware ones. A database already carrying the column,
+   * or with no observation table yet, is left alone.
+   */
+  private addModelScopeInTransaction(): void {
+    const columns = (
+      this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+    ).map((column) => column.name);
+    if (columns.length === 0 || columns.includes("model_scope")) return;
+    if (!columns.includes("controller_integral")) {
+      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+    }
+    this.db.exec(`
+      CREATE TABLE quota_observations_v3 (
+        provider TEXT NOT NULL,
+        model_scope TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL,
+        observed_slot INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        percent_left REAL NOT NULL,
+        reset_at_iso TEXT,
+        window_ms INTEGER NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0,
+        controller_error REAL,
+        controller_derivative REAL,
+        controller_integral REAL,
+        uncapped_interval_seconds REAL,
+        interval_seconds REAL,
+        PRIMARY KEY(provider, model_scope, kind, observed_slot)
+      );
+      INSERT INTO quota_observations_v3
+        (provider, model_scope, kind, observed_slot, label, observed_at, percent_left,
+         reset_at_iso, window_ms, processed, controller_error, controller_derivative,
+         controller_integral, uncapped_interval_seconds, interval_seconds)
+      SELECT provider, '', kind, observed_slot, label, observed_at, percent_left,
+             reset_at_iso, window_ms, processed, controller_error, controller_derivative,
+             controller_integral, uncapped_interval_seconds, interval_seconds
+      FROM quota_observations ORDER BY rowid;
+      DROP TABLE quota_observations;
+      ALTER TABLE quota_observations_v3 RENAME TO quota_observations;
+    `);
   }
 
   /**
@@ -510,7 +651,8 @@ export class SharedQuotaStore {
              WHERE o.interval_seconds IS NOT NULL
                AND NOT EXISTS (
                  SELECT 1 FROM quota_observations newer
-                 WHERE newer.provider = o.provider AND newer.kind = o.kind
+                 WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+                   AND newer.kind = o.kind
                    AND newer.interval_seconds IS NOT NULL
                    AND (newer.observed_at > o.observed_at OR
                         (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
@@ -560,7 +702,11 @@ export class SharedQuotaStore {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
         .run(serializeParsedState(inferredState), id);
-      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
+      // The scrape path's model scopes already passed the catalog-aware trust
+      // boundary in the parser (`resolveWindowModels`).
+      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider, {
+        acceptModelScope: true,
+      });
     })();
     this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
       provider: scrape?.provider ?? inferredParsed.provider,
@@ -667,9 +813,9 @@ export class SharedQuotaStore {
         const occupied = this.db
           .prepare(
             `SELECT 1 FROM quota_observations
-             WHERE provider = ? AND kind = ? AND observed_slot = ?`
+             WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
           )
-          .get(provider, candidate.kind, candidate.slot);
+          .get(provider, PROVIDER_SCOPE_KEY, candidate.kind, candidate.slot);
         if (occupied) return { result: "stale_observation" };
       }
 
@@ -682,7 +828,9 @@ export class SharedQuotaStore {
         idempotencyKey: input.idempotencyKey,
         generation: input.generation,
       };
-      this.insertObservations(state, observedAt, provider);
+      // A manual body is not catalog-validated, so its model-scoped rows stay
+      // snapshot-only evidence and never become a pacing lane.
+      this.insertObservations(state, observedAt, provider, { acceptModelScope: false });
       this.db
         .prepare(
           `INSERT INTO quota_scrapes (id, provider, scraped_at, raw_output, parsed_state)
@@ -770,23 +918,32 @@ export class SharedQuotaStore {
                 observed_at AS observedAt, percent_left AS percentLeft,
                 reset_at_iso AS resetAtIso, window_ms AS windowMs
          FROM quota_observations
-         WHERE provider = ? AND observed_at >= ?
+         WHERE provider = ? AND model_scope = '' AND observed_at >= ?
          ORDER BY observed_at ASC, rowid ASC`
       )
       .all(provider, sinceIso) as CanonicalQuotaObservation[];
   }
 
   listHistorySince(provider: string, sinceIso: string): QuotaHistoryRecord[] {
-    return this.db
+    const rows = this.db
       .prepare(
-        `SELECT 'provider' AS scope, kind, label, observed_at AS observedAt,
+        `SELECT model_scope AS modelScope, kind, label, observed_at AS observedAt,
                 percent_left AS percentLeft, reset_at_iso AS resetAtIso,
                 controller_error AS controllerError, interval_seconds AS intervalSeconds
          FROM quota_observations
          WHERE provider = ? AND observed_at >= ?
          ORDER BY observed_at ASC, rowid ASC`
       )
-      .all(provider, sinceIso) as QuotaHistoryRecord[];
+      .all(provider, sinceIso) as Array<
+      Omit<QuotaHistoryRecord, "scope" | "models"> & { modelScope: string }
+    >;
+    return rows.flatMap(({ modelScope, ...row }): QuotaHistoryRecord[] => {
+      const models = parseModelScopeKey(modelScope);
+      if (models === null) return [];
+      return models.length === 0
+        ? [{ scope: "provider" as const, ...row }]
+        : [{ scope: "model" as const, models, ...row }];
+    });
   }
 
   getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {
@@ -808,7 +965,7 @@ export class SharedQuotaStore {
     const run = this.db.transaction(() => {
       const observations = this.db
         .prepare(
-          `SELECT provider, kind, label,
+          `SELECT provider, model_scope AS modelScope, kind, label,
                   observed_at AS observedAt, observed_slot AS slot,
                   percent_left AS percentLeft, reset_at_iso AS resetAtIso,
                   window_ms AS windowMs, processed
@@ -848,10 +1005,10 @@ export class SharedQuotaStore {
                 observed_at AS observedAt, reset_at_iso AS resetAtIso,
                 percent_left AS percentLeft
          FROM quota_observations
-         WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND interval_seconds IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
       )
-      .get(observation.provider, observation.kind) as
+      .get(observation.provider, observation.modelScope, observation.kind) as
       | {
           intervalSeconds: number;
           controllerError: number;
@@ -945,7 +1102,7 @@ export class SharedQuotaStore {
         `UPDATE quota_observations
          SET processed = 1, controller_error = ?, controller_derivative = ?,
              controller_integral = ?, uncapped_interval_seconds = ?, interval_seconds = ?
-         WHERE provider = ? AND kind = ? AND observed_slot = ?`
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
       )
       .run(
         error,
@@ -954,6 +1111,7 @@ export class SharedQuotaStore {
         uncappedInterval,
         interval,
         observation.provider,
+        observation.modelScope,
         observation.kind,
         observation.slot
       );
@@ -962,13 +1120,15 @@ export class SharedQuotaStore {
     });
   }
 
-  private markProcessed(observation: Pick<StoredObservation, "provider" | "kind" | "slot">): void {
+  private markProcessed(
+    observation: Pick<StoredObservation, "provider" | "modelScope" | "kind" | "slot">
+  ): void {
     this.db
       .prepare(
         `UPDATE quota_observations SET processed = 1
-         WHERE provider = ? AND kind = ? AND observed_slot = ?`
+         WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
       )
-      .run(observation.provider, observation.kind, observation.slot);
+      .run(observation.provider, observation.modelScope, observation.kind, observation.slot);
   }
 
   /**
@@ -1049,7 +1209,9 @@ export class SharedQuotaStore {
    * uncapped period across that provider's kinds. Resetting a single kind
    * would leave another kind's stale decision governing the lane, so the
    * reset would not be one. Provider-wide is the unit that matches the
-   * actuator.
+   * actuator. That includes the provider's model-scoped lanes (#588): a
+   * model candidate is paced by the provider lane and its model lanes
+   * together, so a surviving model decision would outlive the reset.
    *
    * ## What it deliberately does not touch
    *
@@ -1085,21 +1247,30 @@ export class SharedQuotaStore {
     return run.immediate();
   }
 
-  /** Resolve the temporary exhaustion gate without persisting it as a period. */
-  getExhaustedUntil(provider: string, nowMs = Date.now()): string | null {
+  /**
+   * Resolve the temporary exhaustion gate without persisting it as a period.
+   * `modelScope` selects one lane; the default is the provider-wide lane, so
+   * a model allocation at zero never gates the provider's other models.
+   */
+  getExhaustedUntil(
+    provider: string,
+    nowMs = Date.now(),
+    modelScope: string = PROVIDER_SCOPE_KEY
+  ): string | null {
     const rows = this.db
       .prepare(
         `SELECT o.percent_left, o.reset_at_iso
          FROM quota_observations o
-         WHERE o.provider = ?
+         WHERE o.provider = ? AND o.model_scope = ?
            AND NOT EXISTS (
              SELECT 1 FROM quota_observations newer
-             WHERE newer.provider = o.provider AND newer.kind = o.kind
+             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+               AND newer.kind = o.kind
                AND (newer.observed_at > o.observed_at OR
                     (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
            )`
       )
-      .all(provider) as Array<{ percent_left: number; reset_at_iso: string | null }>;
+      .all(provider, modelScope) as Array<{ percent_left: number; reset_at_iso: string | null }>;
     let latestResetMs = Number.NEGATIVE_INFINITY;
     for (const row of rows) {
       if (row.percent_left > 0 || !row.reset_at_iso) continue;
@@ -1110,10 +1281,41 @@ export class SharedQuotaStore {
     return Number.isFinite(latestResetMs) ? new Date(latestResetMs).toISOString() : null;
   }
 
+  /**
+   * The provider-wide lane's persisted status, with one `modelLanes` entry per
+   * model scope that has reasoned evidence (#588). Each lane is elected from
+   * its own rows only: a model-scoped reading never enters the provider
+   * lane's governing election, and the provider's rows never enter a model
+   * lane's. Combining them for a concrete candidate is the client's job.
+   */
   getProviderThrottle(provider: string): PersistedQuotaProviderStatus | null {
+    const status = this.scopeThrottle(provider, PROVIDER_SCOPE_KEY);
+    if (!status) return null;
+    const scopes = this.db
+      .prepare(
+        `SELECT DISTINCT model_scope AS modelScope FROM quota_observations
+         WHERE provider = ? AND model_scope <> '' AND interval_seconds IS NOT NULL
+         ORDER BY model_scope`
+      )
+      .all(provider) as Array<{ modelScope: string }>;
+    const modelLanes: PersistedQuotaModelLaneStatus[] = [];
+    for (const { modelScope } of scopes) {
+      const models = parseModelScopeKey(modelScope);
+      if (!models || models.length === 0) continue;
+      const lane = this.scopeThrottle(provider, modelScope, models);
+      if (lane) modelLanes.push({ ...lane, models });
+    }
+    return modelLanes.length > 0 ? { ...status, modelLanes } : status;
+  }
+
+  private scopeThrottle(
+    provider: string,
+    modelScope: string,
+    models: readonly string[] = []
+  ): Omit<PersistedQuotaProviderStatus, "modelLanes"> | null {
     const reasoned = this.db
       .prepare(
-        `SELECT provider, kind, label, reset_at_iso AS resetAtIso,
+        `SELECT provider, model_scope AS modelScope, kind, label, reset_at_iso AS resetAtIso,
                 interval_seconds AS intervalSeconds,
                 uncapped_interval_seconds AS uncappedIntervalSeconds,
                 controller_error AS controllerError,
@@ -1121,30 +1323,32 @@ export class SharedQuotaStore {
                 controller_integral AS controllerIntegral,
                 percent_left AS percentLeft, observed_at AS observedAt
          FROM quota_observations o
-         WHERE provider = ? AND interval_seconds IS NOT NULL
+         WHERE provider = ? AND model_scope = ? AND interval_seconds IS NOT NULL
            AND NOT EXISTS (
              SELECT 1 FROM quota_observations newer
-             WHERE newer.provider = o.provider AND newer.kind = o.kind
+             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+               AND newer.kind = o.kind
                AND newer.interval_seconds IS NOT NULL
                AND (newer.observed_at > o.observed_at OR
                     (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
            )`
       )
-      .all(provider) as ReasonedObservation[];
+      .all(provider, modelScope) as ReasonedObservation[];
     const current = this.db
       .prepare(
         `SELECT kind, label, reset_at_iso AS resetAtIso,
                 percent_left AS percentLeft, observed_at AS observedAt
          FROM quota_observations o
-         WHERE provider = ?
+         WHERE provider = ? AND model_scope = ?
            AND NOT EXISTS (
              SELECT 1 FROM quota_observations newer
-             WHERE newer.provider = o.provider AND newer.kind = o.kind
+             WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+               AND newer.kind = o.kind
                AND (newer.observed_at > o.observed_at OR
                     (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
            )`
       )
-      .all(provider) as Array<{
+      .all(provider, modelScope) as Array<{
       kind: string;
       label: string;
       resetAtIso: string | null;
@@ -1176,14 +1380,18 @@ export class SharedQuotaStore {
     // direction (§5.7) and lasts until the controller reasons the newest rows or
     // the next scrape lands.
     const eligibleReasoned = currentScrapeReasoned.length > 0 ? currentScrapeReasoned : reasoned;
-    eligibleReasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
+    // Ties break on kind so one set of rows always elects the same bucket.
+    eligibleReasoned.sort(
+      (a, b) =>
+        b.uncappedIntervalSeconds - a.uncappedIntervalSeconds || a.kind.localeCompare(b.kind)
+    );
     const governing = eligibleReasoned[0];
-    const exhaustedUntil = this.getExhaustedUntil(provider);
+    const exhaustedUntil = this.getExhaustedUntil(provider, Date.now(), modelScope);
     return {
       provider,
       intervalSeconds: governing?.intervalSeconds ?? 0,
       uncappedIntervalSeconds: governing?.uncappedIntervalSeconds ?? 0,
-      governingBucketKey: governing ? `${provider}:${governing.kind}` : null,
+      governingBucketKey: governing ? bucketKey(provider, models, governing.kind) : null,
       capped:
         governing !== undefined && governing.uncappedIntervalSeconds > governing.intervalSeconds,
       expired: exhaustedUntil !== null,
@@ -1193,7 +1401,7 @@ export class SharedQuotaStore {
         const latest = currentByKind.get(row.kind) ?? row;
         const observedMs = Date.parse(latest.observedAt);
         return {
-          key: `${provider}:${row.kind}`,
+          key: bucketKey(provider, models, row.kind),
           percentLeft: latest.percentLeft,
           timeRemainingPct:
             latest.resetAtIso && Number.isFinite(observedMs)
@@ -1217,8 +1425,9 @@ export class SharedQuotaStore {
 
   private insertObservations(
     state: ProviderQuotaSnapshot,
-    storedObservedAt?: string,
-    storedProvider?: string
+    storedObservedAt: string | undefined,
+    storedProvider: string | undefined,
+    opts: { acceptModelScope: boolean }
   ): void {
     const observedAt = state.scrapedAt ?? storedObservedAt;
     const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
@@ -1227,13 +1436,15 @@ export class SharedQuotaStore {
     const observed = (result: QuotaObservationResult): void => {
       this.metrics.counter(QUOTA_SERVICE_METRICS.observationsTotal, { provider, result });
     };
-    const seenKinds = new Set<string>();
+    const seenLanes = new Set<string>();
     for (const limit of state.limits ?? []) {
-      // A window this store will not reason about — model-scoped, or a percent
-      // outside 0..100 — is counted as rejected rather than dropped silently,
-      // because a parser regression shows up here as reads that produce
-      // observations no controller ever sees.
-      if (!isProviderScopedWindow(limit) || !Number.isFinite(limit.percentLeft)) {
+      // A window this store will not reason about — a model scope from an
+      // unvalidated source or naming no models, or a percent outside 0..100 —
+      // is counted as rejected rather than dropped silently, because a parser
+      // regression shows up here as reads that produce observations no
+      // controller ever sees.
+      const modelScope = observationScopeKey(limit, provider, opts.acceptModelScope);
+      if (modelScope === null || !Number.isFinite(limit.percentLeft)) {
         observed("rejected");
         continue;
       }
@@ -1242,13 +1453,15 @@ export class SharedQuotaStore {
         continue;
       }
       const kind = normalizeKind(limit.kind);
-      if (seenKinds.has(kind)) {
+      const lane = `${modelScope}\u0000${kind}`;
+      if (seenLanes.has(lane)) {
         observed("superseded");
         continue;
       }
-      seenKinds.add(kind);
+      seenLanes.add(lane);
       const candidate: StoredObservation = {
         provider,
+        modelScope,
         kind,
         label: limit.label,
         observedAt,
@@ -1260,14 +1473,14 @@ export class SharedQuotaStore {
       };
       const existing = this.db
         .prepare(
-          `SELECT provider, kind, label,
+          `SELECT provider, model_scope AS modelScope, kind, label,
                   observed_at AS observedAt, observed_slot AS slot,
                   percent_left AS percentLeft, reset_at_iso AS resetAtIso,
                   window_ms AS windowMs, processed
            FROM quota_observations
-           WHERE provider = ? AND kind = ? AND observed_slot = ?`
+           WHERE provider = ? AND model_scope = ? AND kind = ? AND observed_slot = ?`
         )
-        .get(provider, kind, candidate.slot) as StoredObservation | undefined;
+        .get(provider, modelScope, kind, candidate.slot) as StoredObservation | undefined;
       if (existing?.processed === 1) {
         observed("superseded");
         continue;
@@ -1284,10 +1497,10 @@ export class SharedQuotaStore {
       this.db
         .prepare(
           `INSERT INTO quota_observations
-            (provider, kind, observed_slot, label, observed_at,
+            (provider, model_scope, kind, observed_slot, label, observed_at,
              percent_left, reset_at_iso, window_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(provider, kind, observed_slot) DO UPDATE SET
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(provider, model_scope, kind, observed_slot) DO UPDATE SET
              label = excluded.label,
              observed_at = excluded.observed_at,
              percent_left = excluded.percent_left,
@@ -1296,6 +1509,7 @@ export class SharedQuotaStore {
         )
         .run(
           provider,
+          modelScope,
           kind,
           candidate.slot,
           candidate.label,

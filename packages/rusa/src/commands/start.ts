@@ -264,6 +264,8 @@ import {
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   HISTORY_WINDOW_MS,
+  type ModelLanePacing,
+  modelLanePacing,
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
@@ -1661,6 +1663,78 @@ async function composeStart(
   const laneReportedExhausted = (lane: string, nowMs: number): boolean => {
     return (coordinatorExhaustedUntilMs.get(lane as QuotaThrottleProvider) ?? 0) > nowMs;
   };
+  // #588: a model with its own published quota windows (e.g. Fable) paces on
+  // a model pacer linked to its provider pacer, so each start honours both the
+  // provider-wide and the model's windows while other models of the provider
+  // stay on the provider pacer alone. Keyed by provider lane and model ID; a
+  // model pacer is created on the first publication naming the model and is
+  // then kept, falling back to no extra spacing if its windows disappear.
+  const modelPacers = new Map<string, { lane: string; model: string; pacer: ProviderPacer }>();
+  const modelExhaustedUntilMs = new Map<string, number>();
+  const modelPacerKey = (lane: string, model: string) => `${lane}\u0000${model}`;
+  const applyModelLanePacing = (
+    key: string,
+    pacer: ProviderPacer,
+    pacing: ModelLanePacing | undefined
+  ): void => {
+    pacer.setInterval((pacing?.intervalSeconds ?? 0) * 1000);
+    const deferUntilMs = pacing?.deferUntil ? Date.parse(pacing.deferUntil) : Number.NaN;
+    if (Number.isFinite(deferUntilMs)) pacer.deferUntil(deferUntilMs);
+    const exhaustedUntilMs = pacing?.exhaustedUntil
+      ? Date.parse(pacing.exhaustedUntil)
+      : Number.NaN;
+    if (Number.isFinite(exhaustedUntilMs) && exhaustedUntilMs > Date.now()) {
+      modelExhaustedUntilMs.set(key, exhaustedUntilMs);
+    } else {
+      modelExhaustedUntilMs.delete(key);
+    }
+  };
+  /** The pacer that gates `model` on `lane`: its model pacer, else the provider pacer. */
+  const candidatePacerFor = (lane: string, model: string | undefined): ProviderPacer => {
+    if (!quotaThrottleEnabled || !model) return pacerFor(lane);
+    const key = modelPacerKey(lane, model);
+    const existing = modelPacers.get(key);
+    if (existing) return existing.pacer;
+    const pacing = modelLanePacing(quotaCoordinatorClient?.getLastPublishedStatus(lane), model);
+    if (!pacing) return pacerFor(lane);
+    const pacer = new ProviderPacer(0, undefined, pacerFor(lane));
+    modelPacers.set(key, { lane, model, pacer });
+    applyModelLanePacing(key, pacer, pacing);
+    return pacer;
+  };
+  const candidateReportedExhausted = (
+    lane: string,
+    model: string | undefined,
+    nowMs: number
+  ): boolean => {
+    if (laneReportedExhausted(lane, nowMs)) return true;
+    if (model === undefined) return false;
+    // Materializes the model pacer, and with it the exhaustion reading, the
+    // first time a publication names this model.
+    candidatePacerFor(lane, model);
+    return (modelExhaustedUntilMs.get(modelPacerKey(lane, model)) ?? 0) > nowMs;
+  };
+  const applyModelLaneStatuses = (lane: string, status: PublishedThrottleProviderStatus): void => {
+    for (const [key, entry] of modelPacers) {
+      if (entry.lane !== lane) continue;
+      try {
+        const pacing = modelLanePacing(status, entry.model);
+        applyModelLanePacing(key, entry.pacer, pacing);
+        log.info("quota_model_lane_throttle", {
+          provider: lane,
+          model: entry.model,
+          intervalSeconds: pacing?.intervalSeconds ?? 0,
+          exhaustedUntil: pacing?.exhaustedUntil ?? null,
+        });
+      } catch (err) {
+        log.warn("quota_model_lane_throttle_failed", {
+          provider: lane,
+          model: entry.model,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
     tick: QuotaThrottleTick,
@@ -1723,8 +1797,9 @@ async function composeStart(
     status: PublishedThrottleProviderStatus
   ): void => {
     const pacer = pacerFor(providerName);
-    // Update the lane before asking the shared admission list to re-scan it.
+    // Update the lanes before asking the shared admission list to re-scan them.
     applyThrottleStatusToPacer(pacer, status);
+    applyModelLaneStatuses(providerName, status);
     recordQuotaThrottleTick(
       providerName,
       {
@@ -2669,7 +2744,11 @@ async function composeStart(
         lanes.push({
           config: c,
           lane,
-          pacer: pacerFor(lane),
+          // Read at claim time too: a model's own windows can first be
+          // published while its actor waits (#588).
+          get pacer() {
+            return candidatePacerFor(lane, c.model);
+          },
           // Read at claim time, not enqueue time: an actor can wait past the
           // reading it arrived with, and a stale one drops the tie-break.
           get weeklyQuota() {
@@ -2683,7 +2762,7 @@ async function composeStart(
         enqueueNormal: request.enqueueNormal,
         isHalted: (c) => isProviderHalted(c.provider, c.model),
         isExhausted: (c) =>
-          laneReportedExhausted(providerThrottleKey(c.provider, config), Date.now()),
+          candidateReportedExhausted(providerThrottleKey(c.provider, config), c.model, Date.now()),
         onResponsivePoolExhausted: () => {
           const skipped: PoolSkippedEntry[] = candidates.map((entry) => ({
             entry: { ...entry },
@@ -3475,10 +3554,10 @@ async function composeStart(
       // #655: name a coordinator-known-empty lane `exhausted` rather than the
       // `pacing` its deferred pacer would report — the operator can then tell
       // a known-zero lane from a transiently hot one.
-      if (laneReportedExhausted(lane, now)) {
+      if (candidateReportedExhausted(lane, entry.model, now)) {
         return { eligible: false, reason: "exhausted" };
       }
-      if (pacerFor(lane).quote(now) > now) {
+      if (candidatePacerFor(lane, entry.model).quote(now) > now) {
         return { eligible: false, reason: "pacing" };
       }
       return { eligible: true };
