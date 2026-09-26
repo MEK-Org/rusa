@@ -1266,7 +1266,7 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   });
 
-  it("does not slow a routine 30m step below its 5m reference response (#690)", () => {
+  it("does not slow a routine 30m step below its six-5m reference response (#690)", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-elapsed-actuator-"));
     roots.push(root);
     const fiveMinute = new SharedQuotaStore(join(root, "five-minute.db"));
@@ -1303,10 +1303,11 @@ describe("SharedQuotaStore PID integral term", () => {
       recordError(thirtyMinute, "claude", 30, 20);
       const fiveMinuteStep = reasonedRows(fiveMinute, "claude").at(-1) as ReasonedRow;
       const thirtyMinuteStep = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-      // One 30m observation is close to the six 5m reference updates over the
-      // same wall-clock period, and no longer constrained to the prior two-step
-      // (1800s) slew cap.
-      expect(thirtyMinuteStep.interval).toBeGreaterThan(fiveMinuteStep.interval * 0.9);
+      // One 30m observation must not be slower than the six 5m reference
+      // updates over the same wall-clock period, and is no longer constrained
+      // to the prior two-step (1800s) slew cap. This deterministic fixture has
+      // no sampling jitter or rounding allowance to absorb.
+      expect(thirtyMinuteStep.interval).toBeGreaterThanOrEqual(fiveMinuteStep.interval);
       expect(thirtyMinuteStep.interval).toBeLessThan(fiveMinuteStep.interval * 1.2);
       expect(thirtyMinuteStep.interval).toBeGreaterThan(2 * QUOTA_MAX_SLEW_SECONDS);
     } finally {
