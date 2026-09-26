@@ -274,6 +274,7 @@ When a follower receives a `FollowerUpdateCommand`, it executes `executeFollower
 
 - **Codex computer use**: Downstream of the 2026-09-06 live follower validation test on macOS against an E2E leader, where Codex's native computer-use MCP (screen/accessibility state, mouse, keyboard) drove Notes.app end-to-end without macOS permission prompts. Rusa does not provide a custom desktop automation harness or macOS sandboxing; execution relies on the provider's native host capabilities.
 - **Claude computer use**: Strictly excluded and out of scope for #301 per the 2026-09-06 operator scope ruling. Headless Claude Code sessions lack a computer-use tool in this environment; no PTY harness or desktop automation tooling is provided or attempted.
+- **Actor scheduling**: Grant the `computer-use` capability to each actor that may control a desktop. The grant or revocation takes effect at that actor's next provider admission, including a run already waiting in provider pacing. Each execution process holds an in-memory computer-use lock: one capable run may hold it at a time, while ordinary capable work waits with its inbox work intact. A responsive capable wake requests interruption of a normal holder and begins only after that holder stops; a responsive holder finishes, and later responsive requests remain FIFO behind it. The lock coordinates only runs in its own process: it deliberately does not use PID files or coordinate across follower replacement processes. It is acquired after provider admission, so an admitted capable run retains that provider admission while it waits for the lock. On shutdown, queued runs are cancelled and the active holder is interrupted. No configuration setting is required.
 
 ## Limits
 
@@ -295,8 +296,7 @@ whose stop command remains deliverable when contact returns. Any future expiry
 policy must be chosen from measured contact-gap data and documented as a separate
 operational decision.
 Provider process-tree cleanup after an abrupt crash still needs validation beyond
-this experiment.
-There is deliberately no per-actor Node crash isolation, matching the leader.
+this experiment. There is deliberately no per-actor Node crash isolation, matching the leader.
 Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
 
 Local files stay on the follower. Media/file transfer, leader-local repository

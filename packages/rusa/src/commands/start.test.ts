@@ -16,7 +16,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { Actor } from "../actor/actor.js";
+import { Actor, type ActorOptions } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import { ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
@@ -2162,6 +2162,69 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(actorOptions.mcpServers.some((server) => server.name === "understanding-write")).toBe(
       true
     );
+  });
+
+  it("serializes locally hosted computer-use workers through the start gate without holding an unrelated worker", async () => {
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const liveMesh = mesh;
+    const spawnWorker = (charter: string) =>
+      liveMesh.spawn({
+        charter,
+        parentId: "root",
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+    const first = spawnWorker("local computer holder");
+    const second = spawnWorker("local computer waiter");
+    const unrelated = spawnWorker("local unrelated worker");
+    liveMesh.grantCapability(first, "computer-use", "root");
+    liveMesh.grantCapability(second, "computer-use", "root");
+
+    type GateOptions = Pick<ActorOptions, "gate" | "modelConfig">;
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    // Drive the gate each live Actor was composed with, as its run would.
+    const gateRun = (id: string): Promise<void> => {
+      const actor = liveMesh.get(id);
+      if (!actor) throw new Error(`worker missing: ${id}`);
+      const { gate, modelConfig } = (actor as unknown as { opts: GateOptions }).opts;
+      if (!gate || !modelConfig) throw new Error(`worker gate missing: ${id}`);
+      const handle = gate(
+        () =>
+          new Promise<void>((release) => {
+            started.push(id);
+            releases.set(id, release);
+          }),
+        modelConfig,
+        false
+      );
+      return "result" in handle ? handle.result : handle;
+    };
+
+    const firstRun = gateRun(first);
+    const secondRun = gateRun(second);
+    const unrelatedRun = gateRun(unrelated);
+    await vi.waitFor(() => expect(started).toEqual(expect.arrayContaining([first, unrelated])));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(started).not.toContain(second);
+
+    releases.get(first)?.();
+    await firstRun;
+    await vi.waitFor(() => expect(started).toContain(second));
+    releases.get(second)?.();
+    releases.get(unrelated)?.();
+    await Promise.all([secondRun, unrelatedRun]);
   });
 
   it("mounts the actor-bound obligations MCP for root and rehydrated workers", async () => {

@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
@@ -19,6 +21,7 @@ function setup(
     providerFactory?: ProviderFactory;
     isHalted?: (provider?: string, model?: string) => boolean;
     onEvent?: (actorId: string, event: ActorEvent) => void;
+    maxConcurrent?: number;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -31,6 +34,7 @@ function setup(
     stateStaleTimeoutMs: options.stateStaleTimeoutMs,
     isHalted: options.isHalted,
     onEvent: options.onEvent,
+    maxConcurrent: options.maxConcurrent,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -40,12 +44,247 @@ function setup(
   instances.push(h);
   return h;
 }
+
+function grantComputerUse(h: ReturnType<typeof createHarness>, actorId: string): void {
+  h.capabilityGrants.grant({
+    actorId,
+    capability: COMPUTER_USE_CAPABILITY,
+    grantedBy: "root",
+    grantedAt: "2026-09-25T00:00:00Z",
+  });
+}
+
 afterEach(async () => {
   for (const h of instances.splice(0)) await h.close();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+const capabilityBoundaryProvider: ProviderFactory = (bridge, _options, selected) => ({
+  name: "instance-fixture",
+  providerName: "instance-fixture",
+  model: selected?.model,
+  async run(run) {
+    const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
+    await delay(prompt.charter === "short provider blocker" ? 80 : 700, undefined, {
+      signal: run.signal,
+    });
+    await bridge.sendMessage(prompt.parentId, prompt.charter);
+    bridge.yieldRun("complete", "capability boundary fixture complete");
+    return {
+      success: true,
+      output: prompt.charter,
+      exitCode: 0,
+      sessionId: run.session?.id,
+      model: selected?.model,
+    };
+  },
+});
+
 describe("monolithic follower instance", () => {
+  it("serializes three computer-capable actors without holding unrelated actors", async () => {
+    // Provider admission happens before the per-instance lock. Give all four
+    // runs capacity here so the unrelated control proves the lock — rather
+    // than global provider capacity — is what keeps the other capable actors
+    // queued.
+    let activeComputerRuns = 0;
+    let maxActiveComputerRuns = 0;
+    const h = setup({
+      maxConcurrent: 4,
+      providerFactory: (bridge, _options, selected) => ({
+        name: "instance-fixture",
+        providerName: "instance-fixture",
+        model: selected?.model,
+        async run(run) {
+          const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
+          const controlsComputer = prompt.charter !== "Read-only work";
+          if (controlsComputer) {
+            activeComputerRuns++;
+            maxActiveComputerRuns = Math.max(maxActiveComputerRuns, activeComputerRuns);
+          }
+          try {
+            await delay(400, undefined, { signal: run.signal });
+            await bridge.sendMessage(prompt.parentId, prompt.charter);
+            bridge.yieldRun("complete", "computer use fixture complete");
+            return {
+              success: true,
+              output: prompt.charter,
+              exitCode: 0,
+              sessionId: run.session?.id,
+              model: selected?.model,
+            };
+          } finally {
+            if (controlsComputer) activeComputerRuns--;
+          }
+        },
+      }),
+    });
+    const long = h.spawn("Long computer run");
+    grantComputerUse(h, long);
+    await waitUntil(() => h.runtime(long).isRunning);
+    const short = h.spawn("Short computer run");
+    grantComputerUse(h, short);
+    const third = h.spawn("Third computer run");
+    grantComputerUse(h, third);
+    const unrelated = h.spawn("Read-only work");
+
+    await waitUntil(() => h.runtime(unrelated).isRunning);
+    expect(h.runtime(short).isRunning).toBe(false);
+    expect(h.runtime(third).isRunning).toBe(false);
+    await waitUntil(() => h.events.filter((event) => event.event.type === "result").length === 4);
+    // The leader can book a terminal result asynchronously after a follower's
+    // provider has returned. Count the actual provider runs rather than use
+    // that cross-process bookkeeping order as a proxy for computer control.
+    expect(maxActiveComputerRuns).toBe(1);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("reads a newly granted computer-use capability at provider admission", async () => {
+    const h = setup({
+      delayMs: 0,
+      maxConcurrent: 2,
+      providerFactory: capabilityBoundaryProvider,
+    });
+    const holder = h.spawn("long computer holder");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const blocker = h.spawn("short provider blocker");
+    await waitUntil(() => h.runtime(blocker).isRunning);
+    const target = h.spawn("late capability target");
+    await waitUntil(() => h.runtime(target).isQueued);
+
+    h.capabilityGrants.grant({
+      actorId: target,
+      capability: COMPUTER_USE_CAPABILITY,
+      grantedBy: "root",
+      grantedAt: "2026-09-26T00:00:00Z",
+    });
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === blocker && event.event.type === "result")
+    );
+    // The target is now provider-admitted but must wait for the current
+    // computer holder: the grant happened after beforeRun, while it paced.
+    expect(
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    ).toBe(false);
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === holder && event.event.type === "result")
+    );
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    );
+
+    const resultIndex = h.events.findIndex(
+      (event) => event.actorId === holder && event.event.type === "result"
+    );
+    const startIndex = h.events.findIndex(
+      (event) => event.actorId === target && event.event.type === "runStart"
+    );
+    expect(startIndex).toBeGreaterThan(resultIndex);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("does not retain a revoked computer-use capability through provider pacing", async () => {
+    const h = setup({
+      delayMs: 0,
+      maxConcurrent: 2,
+      providerFactory: capabilityBoundaryProvider,
+    });
+    const holder = h.spawn("long computer holder");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const blocker = h.spawn("short provider blocker");
+    await waitUntil(() => h.runtime(blocker).isRunning);
+    const target = h.spawn("revoked capability target");
+    grantComputerUse(h, target);
+    await waitUntil(() => h.runtime(target).isQueued);
+
+    h.capabilityGrants.revoke(target, COMPUTER_USE_CAPABILITY, "2026-09-26T00:00:00Z");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    );
+
+    const holderResult = h.events.findIndex(
+      (event) => event.actorId === holder && event.event.type === "result"
+    );
+    const targetStart = h.events.findIndex(
+      (event) => event.actorId === target && event.event.type === "runStart"
+    );
+    expect(holderResult).toBe(-1);
+    expect(targetStart).toBeGreaterThanOrEqual(0);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("lets separate follower instances control their own computers concurrently", async () => {
+    const left = setup({ delayMs: 500, maxConcurrent: 3 });
+    const right = setup({ delayMs: 500, maxConcurrent: 3 });
+    const leftActor = left.spawn("Left computer run");
+    grantComputerUse(left, leftActor);
+    const rightActor = right.spawn("Right computer run");
+    grantComputerUse(right, rightActor);
+
+    await waitUntil(() => left.runtime(leftActor).isRunning && right.runtime(rightActor).isRunning);
+    expect(left.failures).toEqual([]);
+    expect(right.failures).toEqual([]);
+  });
+
+  it("stops a normal computer holder before granting its responsive waiter", async () => {
+    const h = setup({ delayMs: 1500, maxConcurrent: 3 });
+    const holder = h.spawn("Long computer run");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const responsive = h.spawn("Urgent computer run");
+    grantComputerUse(h, responsive);
+    await waitUntil(() => h.runtime(responsive).isQueued);
+
+    h.dispatchResponsive(responsive);
+    await waitUntil(() => !h.runtime(holder).isRunning);
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === responsive && event.event.type === "runStart")
+    );
+    const initialStarts = h.events
+      .filter((event) => event.event.type === "runStart")
+      .map((event) => event.actorId);
+    expect(initialStarts.indexOf(responsive)).toBeGreaterThan(initialStarts.indexOf(holder));
+
+    // After the responsive waiter finishes, the preempted holder must automatically
+    // re-run without a new delivery and complete its durable work.
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === responsive && event.event.type === "result")
+    );
+    await waitUntil(
+      () =>
+        h.events.some(
+          (event) =>
+            event.actorId === holder && event.event.type === "result" && event.event.result.success
+        ),
+      15_000
+    );
+    const allStarts = h.events
+      .filter((event) => event.event.type === "runStart")
+      .map((event) => event.actorId);
+    expect(allStarts).toEqual([holder, responsive, holder]);
+    expect(h.messages.filter((msg) => msg.fromId === holder)).toHaveLength(1);
+    expect(h.messages.filter((msg) => msg.fromId === responsive)).toHaveLength(1);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("cancels queued computer work when the follower disconnects", async () => {
+    const h = setup({ delayMs: 1000, maxConcurrent: 3 });
+    const holder = h.spawn("Long computer run");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const queued = h.spawn("Queued computer run");
+    grantComputerUse(h, queued);
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    h.follower.close();
+    h.remote.close();
+    await Promise.all([h.runtime(holder).exited, h.runtime(queued).exited]);
+    expect(
+      h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
+    ).toBe(false);
+  });
+
   it("closes admission before waiting for active actors to quiesce", async () => {
     const follower = new FollowerInstance("/tmp/rusa-follower-drain", false, () => {});
     follower.beginDrain();
@@ -59,6 +298,7 @@ describe("monolithic follower instance", () => {
 
     expect(follower.actorIds).toEqual([]);
     await expect(follower.waitForQuiescence(20)).resolves.toMatchObject({ quiesced: true });
+    follower.close();
   });
 
   it("hosts multiple Actors in one PID and retires one without stopping its sibling", async () => {

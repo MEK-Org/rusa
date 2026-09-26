@@ -41,6 +41,8 @@ export interface RunSnapshot {
   prompt: string;
   promptBuild?: PromptBuild;
   mcpServers?: McpServerSpec[];
+  /** Capability state read by the leader at this run's provider admission. */
+  computerUse?: boolean;
   /** The candidate the leader's pacing gate reserved for this run. */
   selected?: RawProviderModelConfig;
   /**

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
+import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import { type ActorRunMode, mergeNudges, type RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
@@ -1059,6 +1060,11 @@ export class ActorHandle implements MeshActor {
                       requestId,
                       value: {
                         ...this.opts.snapshot(),
+                        // A follower can wait in provider pacing after its
+                        // beforeRun request. Read the durable grant at the
+                        // selected-provider boundary instead of carrying that
+                        // earlier snapshot into the instance lock.
+                        computerUse: ctx.mesh.hasActiveCapability(this.id, COMPUTER_USE_CAPABILITY),
                         selected,
                         responsive: admission.responsive,
                       },
