@@ -28,6 +28,23 @@ Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
     _providerSeriesColors[provider] ??
     _fallbackSeriesColors[fallbackIndex % _fallbackSeriesColors.length];
 
+Color _quotaChartColorForSeries(
+  QuotaHistorySeriesDto series,
+  int fallbackIndex,
+) {
+  if (series.scope != 'model') {
+    return _quotaChartColorForProvider(series.provider, fallbackIndex);
+  }
+  // Model history must be visually distinct from its provider-wide series.
+  // Hash canonical IDs rather than the display label, which is presentation.
+  final identity = series.modelIds.join('\u0000');
+  final hash = identity.codeUnits.fold<int>(
+    0,
+    (value, codeUnit) => value * 31 + codeUnit,
+  );
+  return _fallbackSeriesColors[hash.abs() % _fallbackSeriesColors.length];
+}
+
 String _providerTitle(String provider) => switch (provider) {
   'claude' => 'Claude',
   'codex' => 'Codex',
@@ -222,7 +239,7 @@ class _ChartSection extends StatelessWidget {
             for (var i = 0; i < series.length; i++)
               _LegendItem(
                 series: series[i],
-                color: _quotaChartColorForProvider(series[i].provider, i),
+                color: _quotaChartColorForSeries(series[i], i),
               ),
           ],
         ),
@@ -252,7 +269,9 @@ class _LegendItem extends StatelessWidget {
         ),
         const SizedBox(width: 6),
         Text(
-          _providerTitle(series.provider),
+          series.scope == 'model'
+              ? '${_providerTitle(series.provider)} · ${series.label}'
+              : _providerTitle(series.provider),
           style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
         ),
       ],

@@ -175,6 +175,69 @@ void main() {
   });
 
   testWidgets(
+    'renders a Fable weekly series separately from provider-wide Claude',
+    (tester) async {
+      tester.view.physicalSize = const Size(900, 1200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      const fableHistory = QuotaHistoryDto(
+        generatedAt: '2026-07-26T20:00:00.000Z',
+        historySince: '2026-07-23T20:00:00.000Z',
+        history: [
+          QuotaHistorySeriesDto(
+            provider: 'claude',
+            windowId: 'weekly',
+            label: 'Weekly',
+            points: [
+              QuotaHistoryPointDto(
+                observedAt: '2026-07-26T19:00:00.000Z',
+                remainingPercent: 70,
+                intervalSeconds: 30,
+              ),
+            ],
+          ),
+          QuotaHistorySeriesDto(
+            provider: 'claude',
+            windowId: 'weekly',
+            scope: 'model',
+            modelIds: ['claude-fable'],
+            label: 'Fable',
+            points: [
+              QuotaHistoryPointDto(
+                observedAt: '2026-07-26T19:00:00.000Z',
+                remainingPercent: 40,
+                intervalSeconds: 120,
+              ),
+            ],
+          ),
+        ],
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildMeshTheme(),
+          home: const Scaffold(
+            body: SizedBox(
+              width: 900,
+              child: QuotaHistoryChart(history: fableHistory),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Claude'), findsNWidgets(2));
+      expect(find.text('Claude · Fable'), findsNWidgets(2));
+      final errorPaint = tester.widget<CustomPaint>(
+        find.byKey(const Key('quota-pace-error-chart')),
+      );
+      expect(
+        (errorPaint.painter! as QuotaPaceErrorChartPainter).series,
+        hasLength(2),
+      );
+    },
+  );
+
+  testWidgets(
     'labels a stale cached chart with verbatim timestamps and never now',
     (tester) async {
       tester.view.physicalSize = const Size(900, 1200);

@@ -647,7 +647,7 @@ describe("dashboard quota snapshot", () => {
     expect(claude?.windows.every((w) => w.scrapedAt === null)).toBe(true);
   });
 
-  it("history ignores non-provider buckets, short windows, and observations outside the range", () => {
+  it("history keeps independently identified model buckets, while ignoring short windows and observations outside the range", () => {
     const series = buildQuotaHistory(
       "codex",
       [
@@ -657,6 +657,8 @@ describe("dashboard quota snapshot", () => {
         }),
         historyPoint({
           scope: "model",
+          models: ["codex-fable"],
+          label: "Fable",
           observedAt: "2026-07-25T21:00:00.000Z",
           percentLeft: 55,
         }),
@@ -674,7 +676,44 @@ describe("dashboard quota snapshot", () => {
       "2026-07-26T20:00:00.000Z"
     );
 
-    expect(series).toEqual([]);
+    expect(series).toMatchObject([
+      {
+        provider: "codex",
+        windowId: "weekly",
+        scope: "model",
+        modelIds: ["codex-fable"],
+        label: "Fable",
+        points: [{ remainingPercent: 55 }],
+      },
+    ]);
+  });
+
+  it("keeps provider and Fable weekly histories as separate explicit lanes", () => {
+    const series = buildQuotaHistory(
+      "claude",
+      [
+        historyPoint({ observedAt: "2026-07-25T21:00:00.000Z", percentLeft: 70 }),
+        historyPoint({
+          scope: "model",
+          models: ["claude-fable"],
+          label: "Fable",
+          observedAt: "2026-07-25T21:00:00.000Z",
+          percentLeft: 40,
+        }),
+      ],
+      "2026-07-25T20:00:00.000Z",
+      "2026-07-26T20:00:00.000Z"
+    );
+
+    expect(series).toMatchObject([
+      { scope: "provider", modelIds: [], points: [{ remainingPercent: 70 }] },
+      {
+        scope: "model",
+        modelIds: ["claude-fable"],
+        label: "Fable",
+        points: [{ remainingPercent: 40 }],
+      },
+    ]);
   });
 
   it("uses the persisted controller error and interval instead of recomputing either", () => {
@@ -763,6 +802,8 @@ describe("dashboard quota history snapshot", () => {
       {
         provider: "claude",
         windowId: "weekly",
+        scope: "provider",
+        modelIds: [],
         label: "Weekly",
         points: [
           {
@@ -809,6 +850,8 @@ describe("dashboard quota history snapshot", () => {
       {
         provider: "codex",
         windowId: "weekly",
+        scope: "provider",
+        modelIds: [],
         label: "Weekly limit",
         points: [
           {
@@ -854,6 +897,8 @@ describe("dashboard quota history snapshot", () => {
       {
         provider: "codex",
         windowId: "weekly",
+        scope: "provider",
+        modelIds: [],
         label: "Weekly (all models)",
         points: [
           {

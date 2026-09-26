@@ -3,7 +3,9 @@ import type { PersistedQuotaBucketStatus, PersistedQuotaProviderStatus } from ".
 import { isProviderScopedWindow } from "./window-scope.js";
 
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
-export const COORDINATOR_PROTOCOL_MINOR = 1;
+// Minor 2 adds model identities to model-scoped history rows. Older readers
+// retain their provider-only behavior because the extension is additive.
+export const COORDINATOR_PROTOCOL_MINOR = 2;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
@@ -75,6 +77,11 @@ export interface PublishedThrottleCollectionResponse {
 
 export interface PublishedHistoryRecord {
   scope: "provider" | "model";
+  /**
+   * Canonical configured model IDs for a model-scoped row. Provider-scoped
+   * rows omit this, so clients never have to infer scope from a display label.
+   */
+  models?: string[];
   kind: string;
   label: string;
   observedAt: string;
@@ -94,8 +101,16 @@ export interface PublishedHistoryResponse {
 export function isValidHistoryRecord(record: unknown): record is PublishedHistoryRecord {
   if (typeof record !== "object" || record === null) return false;
   const r = record as Record<string, unknown>;
+  const models = r.models;
+  const hasValidModelIdentity =
+    r.scope === "provider"
+      ? models === undefined
+      : Array.isArray(models) &&
+        models.length > 0 &&
+        models.every((model) => typeof model === "string" && model.length > 0);
   return (
     (r.scope === "provider" || r.scope === "model") &&
+    hasValidModelIdentity &&
     typeof r.kind === "string" &&
     typeof r.label === "string" &&
     typeof r.observedAt === "string" &&
