@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -40,6 +41,22 @@ Future<void> pumpInbox(WidgetTester tester, DashboardStore store) async {
     ),
   );
   await tester.pumpAndSettle();
+}
+
+class _ActorSwitchingApi extends FakeApi {
+  final actorBInboxGate = Completer<Map<String, dynamic>>();
+
+  @override
+  Future<Map<String, dynamic>> fetchInbox(
+    String actorId, {
+    String status = 'all',
+    int limit = 20,
+  }) {
+    if (actorId == 'actor-b' && status == 'unhandled') {
+      return actorBInboxGate.future;
+    }
+    return super.fetchInbox(actorId, status: status, limit: limit);
+  }
 }
 
 void main() {
@@ -106,6 +123,48 @@ void main() {
         quotaCache: FakeQuotaCache(),
         treePreferencesCache: FakeTreePreferencesCache(),
       );
+    });
+
+    testWidgets('hides the previous actor inbox while the next one loads',
+        (tester) async {
+      final switchingApi = _ActorSwitchingApi()
+        ..inboxResultsByStatus['unhandled'] = {
+          'entries': [entry('actor-a-entry')],
+        }
+        ..inboxResultsByStatus['handled'] = {'entries': []};
+      final switchingStore = DashboardStore(
+        api: switchingApi,
+        stream: FakeStream(),
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: InboxTab(actorId: 'actor-a', store: switchingStore)),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Body of actor-a-entry'), findsOneWidget);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: InboxTab(actorId: 'actor-b', store: switchingStore)),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('Body of actor-a-entry'), findsNothing);
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+      switchingApi.actorBInboxGate.complete({'entries': [entry('actor-b-entry')]});
+      await tester.pumpAndSettle();
+      expect(find.text('Body of actor-b-entry'), findsOneWidget);
     });
 
     testWidgets('dismisses an outstanding entry with a typed reason', (tester) async {
