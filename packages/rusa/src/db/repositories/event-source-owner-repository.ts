@@ -80,15 +80,7 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
         .prepare(
           `INSERT INTO event_source_owners
              (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at, config)
-           VALUES (?, ?, ?, ?, ?, (
-             SELECT config FROM event_source_owners
-             WHERE resource = ?
-             ORDER BY
-               CASE WHEN unsubscribed_at IS NULL THEN 0 ELSE 1 END,
-               unsubscribed_at DESC,
-               subscribed_at DESC
-             LIMIT 1
-           ))
+           VALUES (?, ?, ?, ?, ?, NULL)
            ON CONFLICT(resource, actor_id) DO UPDATE SET
              subscribed_by = excluded.subscribed_by,
              subscribed_at = excluded.subscribed_at,
@@ -100,8 +92,7 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
           subscription.actorId,
           subscription.subscribedBy,
           subscription.subscribedAt,
-          subscription.unsubscribedAt ?? null,
-          resource
+          subscription.unsubscribedAt ?? null
         );
     })();
   }

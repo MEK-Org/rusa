@@ -4,7 +4,6 @@ import {
   chatSpaceResource,
   chatWakeModeFromConfig,
   tryChatSpaceResource,
-  withChatWakeMode,
 } from "./wake-mode.js";
 
 describe("chat wake mode (#692)", () => {
@@ -47,32 +46,18 @@ describe("chat wake mode (#692)", () => {
     expect(tryChatSpaceResource("")).toBeUndefined();
   });
 
-  it("reads and changes only its key in a versioned event-source config blob", () => {
+  it("reads its key from a versioned event-source config blob", () => {
     const raw = '{"version":1,"otherFeature":{"enabled":true},"chatWakeMode":"mentions"}';
     expect(chatWakeModeFromConfig(raw)).toBe("mentions");
-    const all = withChatWakeMode(raw, "all");
-    expect(all).toEqual(expect.any(String));
-    expect(JSON.parse(all ?? "")).toEqual({
-      version: 1,
-      otherFeature: { enabled: true },
-      chatWakeMode: "all",
-    });
-    const cleared = withChatWakeMode(raw, null);
-    expect(cleared).toEqual(expect.any(String));
-    expect(JSON.parse(cleared ?? "")).toEqual({
-      version: 1,
-      otherFeature: { enabled: true },
-    });
   });
 
-  it("fails closed for malformed or unknown-version config and refuses to overwrite it", () => {
+  it("fails closed for malformed or unknown-version config", () => {
     for (const raw of [
       "not JSON",
       '{"version":2,"chatWakeMode":"all"}',
       '{"version":1,"chatWakeMode":"bad"}',
     ]) {
       expect(chatWakeModeFromConfig(raw)).toBeUndefined();
-      expect(() => withChatWakeMode(raw, "all")).toThrow(/malformed or unknown/);
     }
   });
 });

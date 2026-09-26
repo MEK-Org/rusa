@@ -1,11 +1,8 @@
 import { randomUUID } from "node:crypto";
 import {
   type ChatWakeMode,
-  type ChatWakeModeView,
-  chatSpaceResource,
   chatWakeModeFromConfig,
   tryChatSpaceResource,
-  withChatWakeMode,
 } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
@@ -3110,11 +3107,16 @@ export class ActorMesh {
     // ownership claim it is handing off, release it first (mirroring
     // reclaimEventSource) so the store's one-active-subscriber invariant
     // admits the child.
+    const config = this.eventSourceOwners.getConfig(resource);
     if (this.activeSubscriptionHeldBy(delegatedBy, resource)) {
       this.unsubscribeEventSource(resource, delegatedBy, this.now());
     }
 
     this.subscribeEventSource(resource, childThreadId, delegatedBy);
+    // Config is meaningful only on this exact live handoff. The store does not
+    // infer a value from tombstones, so an unrelated later subscription starts
+    // unconfigured.
+    if (config !== undefined) this.eventSourceOwners.setConfig(resource, config);
   }
 
   /**
@@ -3148,9 +3150,11 @@ export class ActorMesh {
       );
     }
 
+    const config = this.eventSourceOwners.getConfig(resource);
     const at = this.now();
     this.unsubscribeEventSource(resource, current.actorId, at);
     this.subscribeEventSource(resource, reclaimedBy, reclaimedBy);
+    if (config !== undefined) this.eventSourceOwners.setConfig(resource, config);
   }
 
   /**
@@ -3171,9 +3175,9 @@ export class ActorMesh {
 
   /**
    * Replace the opaque configuration object on an event source the caller
-   * currently owns. A non-null config materializes the exact source so config
-   * is carried with an explicit ownership boundary; clearing does not remove a
-   * previously materialized source.
+   * currently owns through an active exact source. Configuring a source never
+   * changes routing or retirement blockers: self-delegate it or receive an
+   * exact delegation first. Clearing also requires that same explicit boundary.
    */
   setEventSourceConfig(
     resource: EventResource,
@@ -3189,25 +3193,22 @@ export class ActorMesh {
     }
 
     const exactOwner = this.eventSourceOwners.activeForResource(canonicalResource)[0];
-    if (config !== null && exactOwner?.actorId !== ownerId) {
-      // Configuration belongs to the exact source, not an inherited parent
-      // source. Using the ordinary subscribe path makes that boundary durable
-      // and records the existing ownership audit event.
-      this.subscribeEventSource(canonicalResource, ownerId, ownerId);
-    }
-    if (config !== null || exactOwner?.actorId === ownerId) {
-      this.eventSourceOwners.setConfig(
-        canonicalResource,
-        config === null ? null : JSON.stringify(config)
+    if (exactOwner?.actorId !== ownerId) {
+      throw new Error(
+        `cannot configure ${canonicalResource}: caller needs an active exact source; self-delegate it or receive an exact delegation first`
       );
-      // Never put arbitrary operator configuration into the event payload.
-      this.recordEvent({
-        kind: "event_source_config_set",
-        actorId: ownerId,
-        detail: canonicalResource,
-        payload: JSON.stringify({ configured: config !== null }),
-      });
     }
+    this.eventSourceOwners.setConfig(
+      canonicalResource,
+      config === null ? null : JSON.stringify(config)
+    );
+    // Never put arbitrary operator configuration into the event payload.
+    this.recordEvent({
+      kind: "event_source_config_set",
+      actorId: ownerId,
+      detail: canonicalResource,
+      payload: JSON.stringify({ configured: config !== null }),
+    });
     return { resource: canonicalResource, config };
   }
 
@@ -3225,77 +3226,6 @@ export class ActorMesh {
     const resource = tryChatSpaceResource(space);
     if (!resource) return undefined;
     return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
-  }
-
-  /**
-   * Read a Google Chat space's wake mode as its current effective owner (#692).
-   * `mode: null` means no mode is stored and the built-in default applies.
-   */
-  getChatWakeMode(space: EventResource, callerId: string): ChatWakeModeView {
-    const resource = this.requireChatSpaceOwner(space, callerId, "read");
-    return {
-      resource,
-      mode: chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource)) ?? null,
-    };
-  }
-
-  /**
-   * Set (or, with `null`, clear back to the default) a Google Chat space's wake
-   * mode. Authority is the same effective ownership that governs delegating the
-   * space, so an actor can only change how a space it owns wakes it (#692).
-   * Records an audit event.
-   */
-  setChatWakeMode(
-    space: EventResource,
-    mode: ChatWakeMode | null,
-    callerId: string
-  ): ChatWakeModeView {
-    const resource = this.requireChatSpaceOwner(space, callerId, "change");
-    const setBy = this.resolveThreadId(callerId);
-    if (mode === null) {
-      const config = this.eventSourceOwners.getConfig(resource);
-      if (config !== undefined) {
-        this.eventSourceOwners.setConfig(resource, withChatWakeMode(config, null));
-      }
-    } else {
-      // A per-space setting needs an exact source row. Materializing one makes
-      // the space an explicit ownership boundary, rather than silently storing
-      // a child setting on its ancestor. That boundary is deliberate: later
-      // delegation/reclaim carries this source's config with it. The ordinary
-      // subscription path also records the corresponding audit event. Clearing
-      // a mode retains an already-materialized boundary; changing ownership is
-      // an explicit delegate/reclaim action, not a side effect of configuration.
-      if (
-        !this.eventSourceOwners.activeForResource(resource).some((row) => row.actorId === setBy)
-      ) {
-        this.subscribeEventSource(resource, setBy, setBy);
-      }
-      this.eventSourceOwners.setConfig(
-        resource,
-        withChatWakeMode(this.eventSourceOwners.getConfig(resource) ?? null, mode)
-      );
-    }
-    this.recordEvent({
-      kind: "chat_wake_mode_set",
-      actorId: setBy,
-      detail: resource,
-      payload: JSON.stringify({ mode }),
-    });
-    return { resource, mode };
-  }
-
-  private requireChatSpaceOwner(
-    space: EventResource,
-    callerId: string,
-    action: "read" | "change"
-  ): string {
-    const resource = chatSpaceResource(space);
-    if (this.effectiveOwnerOf(resource) !== this.resolveThreadId(callerId)) {
-      throw new Error(
-        `cannot ${action} the wake mode of ${resource}: caller is not its current effective owner`
-      );
-    }
-    return resource;
   }
 
   /**

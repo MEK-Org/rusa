@@ -355,7 +355,7 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
     subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
   ): void {
     const resource = resourceKey(subscription.resource);
-    this.write({ ...subscription, resource, unsubscribedAt: undefined }, this.configFor(resource));
+    this.write({ ...subscription, resource, unsubscribedAt: undefined }, null);
   }
 
   /** Hydrate one already-durable row without reactivating a tombstone. */
@@ -378,21 +378,6 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
       throw new Error(activeOwnerConflictMessage(resource, holder.actorId, subscription.actorId));
     }
     this.subs.set(`${resource}:${subscription.actorId}`, { ...normalized, config });
-  }
-
-  private configFor(resource: EventResource): string | null {
-    const rows = [...this.subs.values()].filter((row) => row.resource === resourceKey(resource));
-    const active = rows.find((row) => !row.unsubscribedAt);
-    if (active) return active.config;
-    return (
-      rows
-        .filter((row) => row.unsubscribedAt)
-        .sort(
-          (a, b) =>
-            (b.unsubscribedAt ?? "").localeCompare(a.unsubscribedAt ?? "") ||
-            b.subscribedAt.localeCompare(a.subscribedAt)
-        )[0]?.config ?? null
-    );
   }
 
   unsubscribe(resource: EventResource, actorId: string, at: string): void {

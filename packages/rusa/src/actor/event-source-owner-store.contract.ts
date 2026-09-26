@@ -105,7 +105,7 @@ export function testEventSourceOwnerStoreContract(
       expect(store.activeForResource("github_repo:dummy-org/dummy-repo")).toEqual([]);
     });
 
-    it("keeps opaque config with the exact source across an ownership handoff", () => {
+    it("does not revive opaque config from a tombstoned source", () => {
       const store = makeStore();
       expect(store.getConfig(REPO)).toBeUndefined();
       store.subscribe(sub({ actorId: ACTOR_A }));
@@ -113,7 +113,7 @@ export function testEventSourceOwnerStoreContract(
       store.setConfig(REPO, '{"version":1,"chatWakeMode":"all"}');
       store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
       store.subscribe(sub({ actorId: ACTOR_B, subscribedAt: "2026-06-28T00:01:00Z" }));
-      expect(store.getConfig(REPO)).toBe('{"version":1,"chatWakeMode":"all"}');
+      expect(store.getConfig(REPO)).toBeNull();
     });
 
     it("refuses config writes without an active exact source", () => {

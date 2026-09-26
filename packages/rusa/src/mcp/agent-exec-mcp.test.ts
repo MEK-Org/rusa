@@ -2220,6 +2220,28 @@ describe("agent-execution MCP server", () => {
         source: "gchat:spaces/team",
         config: { version: 1, chatWakeMode: "all" },
       });
+      // An inherited parent source is not materialized by a config write: that
+      // would silently alter routing and retirement blockers. The owner must
+      // first make its exact source explicit through the ordinary tool.
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(
+        /active exact source.*self-delegate.*receive an exact delegation/i
+      );
+      expect(events).not.toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_subscribed",
+          actorId: "root",
+          detail: "gchat:spaces/team",
+        })
+      );
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "root", source: "gchat:spaces/team" },
+      });
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
       expect(res.isError).toBeFalsy();
       expect(dataOf(res)).toEqual({
         resource: "gchat:spaces/team",
@@ -2317,6 +2339,10 @@ describe("agent-execution MCP server", () => {
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: { child_thread_id: "t1", source: "gchat:spaces" },
+      });
+      await ownerClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
       });
       expect(
         dataOf(

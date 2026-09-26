@@ -12,14 +12,7 @@ import type { ChatMessage } from "./types.js";
  * mentions. The default is derived per message rather than written down, so
  * spaces that existed before the setting did keep exactly the behavior they had.
  */
-export const CHAT_WAKE_MODES = ["mentions", "all"] as const;
-export type ChatWakeMode = (typeof CHAT_WAKE_MODES)[number];
-
-/** What an owner reads back: `mode: null` means no mode is stored and the default applies. */
-export interface ChatWakeModeView {
-  resource: string;
-  mode: ChatWakeMode | null;
-}
+export type ChatWakeMode = "mentions" | "all";
 
 /**
  * The canonical `gchat:spaces/<id>` resource for one Google Chat space, from
@@ -95,23 +88,6 @@ function parseEventSourceConfigV1(raw: string | null): EventSourceConfigV1 | und
 /** Read this feature's value from the event source's versioned generic config blob. */
 export function chatWakeModeFromConfig(raw: string | null | undefined): ChatWakeMode | undefined {
   return raw === undefined ? undefined : parseEventSourceConfigV1(raw)?.chatWakeMode;
-}
-
-/**
- * Return the next generic event-source config after changing only this feature.
- * Unknown v1 keys survive; malformed or future-version blobs are refused rather
- * than overwritten by an older writer.
- */
-export function withChatWakeMode(raw: string | null, mode: ChatWakeMode | null): string | null {
-  const config =
-    raw === null ? ({ version: 1 } satisfies EventSourceConfigV1) : parseEventSourceConfigV1(raw);
-  if (!config) {
-    throw new Error("cannot change chat wake mode in malformed or unknown event-source config");
-  }
-  const next: EventSourceConfigV1 = { ...config };
-  if (mode === null) delete next.chatWakeMode;
-  else next.chatWakeMode = mode;
-  return Object.keys(next).length === 1 ? null : JSON.stringify(next);
 }
 
 /** The mode a space behaves as when none is stored, from what the message says about its space. */

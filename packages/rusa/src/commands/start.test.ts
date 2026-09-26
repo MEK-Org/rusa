@@ -3530,7 +3530,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries[0]?.seenAt).not.toBeNull();
   });
 
-  it("wakes each Google Chat space by its owner's wake mode, defaulting by space size (#692)", async () => {
+  it("uses generic event-source config for Google Chat wake mode, defaulting by space size (#692)", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     writeFileSync(
@@ -3593,31 +3593,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await emit("spaces/team", "t1");
     await emit("spaces/team", "t2", { mention: true });
     expect(delivered()).toEqual(["spaces/dm/messages/d1", "spaces/team/messages/t2"]);
-    expect(liveMesh.getChatWakeMode("gchat:spaces/team", "root")).toEqual({
-      resource: "gchat:spaces/team",
-      mode: null,
-    });
 
-    // Only the space's effective owner may change or read its mode.
-    const child = liveMesh.spawn({
-      charter: "not the chat owner",
-      parentId: "root",
-      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
-    });
-    expect(() => liveMesh.setChatWakeMode("gchat:spaces/team", "all", child)).toThrow(
-      /not its current effective owner/
+    // The generic configuration requires the exact subscription boundary; the
+    // ownership and MCP authority cases are covered at the MCP seam.
+    liveMesh.subscribeEventSource("gchat:spaces/team", "root", "root");
+    liveMesh.subscribeEventSource("gchat:spaces/dm", "root", "root");
+    liveMesh.setEventSourceConfig("gchat:spaces/team", { version: 1, chatWakeMode: "all" }, "root");
+    liveMesh.setEventSourceConfig(
+      "gchat:spaces/dm",
+      { version: 1, chatWakeMode: "mentions" },
+      "root"
     );
-    expect(() => liveMesh.getChatWakeMode("gchat:spaces/team", child)).toThrow(
-      /not its current effective owner/
-    );
-
-    // The owner flips each space independently; the next arriving message obeys.
-    liveMesh.setChatWakeMode("gchat:spaces/team", "all", "root");
-    liveMesh.setChatWakeMode("spaces/dm", "mentions", "root");
     expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
-    expect(liveMesh.getChatWakeMode("gchat:spaces/dm", "root")).toMatchObject({
-      mode: "mentions",
-    });
 
     await emit("spaces/team", "t3");
     await emit("spaces/dm", "d2", { dm: true });
@@ -3633,8 +3620,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       "spaces/team/messages/t3",
     ]);
 
-    // Clearing restores the default for that space alone.
-    liveMesh.setChatWakeMode("gchat:spaces/team", null, "root");
+    // Clearing generic config restores the default for that space alone.
+    liveMesh.setEventSourceConfig("gchat:spaces/team", null, "root");
     await emit("spaces/team", "t4");
     await emit("spaces/dm", "d4", { dm: true });
     expect(delivered()).not.toContain("spaces/team/messages/t4");
