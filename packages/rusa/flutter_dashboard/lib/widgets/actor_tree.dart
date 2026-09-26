@@ -657,7 +657,8 @@ class _ActorRowState extends State<_ActorRow> {
                   ),
                   if (showModel ||
                       showEffort ||
-                      thread.commitmentKind != null) ...[
+                      thread.commitmentKind != null ||
+                      thread.needsAttention) ...[
                     const SizedBox(height: 4),
                     Row(
                       children: [
@@ -693,6 +694,41 @@ class _ActorRowState extends State<_ActorRow> {
                           _WorkStateBadge(
                             kind: thread.commitmentKind!,
                             compact: true,
+                          ),
+                        ],
+                        if (thread.needsAttention) ...[
+                          if (showModel ||
+                              showEffort ||
+                              thread.commitmentKind != null)
+                            const SizedBox(width: 6),
+                          Tooltip(
+                            message: thread.needsAttentionReason ??
+                                'Selected work exhausted retries without being handled',
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: MeshColors.statusHalted.withValues(
+                                  alpha: 0.14,
+                                ),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: MeshColors.statusHalted.withValues(
+                                    alpha: 0.65,
+                                  ),
+                                ),
+                              ),
+                              child: Text(
+                                'NEEDS ATTENTION',
+                                style: kMonoStyle.copyWith(
+                                  color: MeshColors.statusHalted,
+                                  fontSize: 9.5,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
                           ),
                         ],
                       ],

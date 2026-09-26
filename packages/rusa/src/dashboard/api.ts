@@ -4,6 +4,7 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -14,6 +15,8 @@ import {
   readAvatar,
   uploadAvatar,
 } from "../avatar/avatars.js";
+import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
@@ -71,6 +74,10 @@ export interface DashboardDataDeps {
    * the operator clearing an entry the actor should not have to answer (#66).
    */
   inbox?: InboxRepository;
+  /** Completed selection intervals used only to correlate same-run activity rows. */
+  actorRuns?: ActorRunRepository;
+  /** Durable per-entry obligation associations for activity correlation. */
+  inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
@@ -181,6 +188,7 @@ import type { FollowerInfo } from "../experimental/remote-instances/follower-hub
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
 import { gchatInboxMessageReference } from "../references/inbox-reference.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -357,6 +365,9 @@ interface ThreadDto {
   compatibleLanes?: string[];
   /** The lane a claimed admission holds, else `null`. */
   claimedLane?: string | null;
+  /** Whether selected inbox work has exhausted bounded retries and requires attention. */
+  needsAttention?: boolean;
+  needsAttentionReason?: string | null;
 }
 
 /**
@@ -1930,6 +1941,13 @@ export async function handleMeshApiRequest(
           voiceConfig: r.voiceConfig ?? null,
           ...(selectedInboxItem ? { selectedInboxItem } : {}),
           ...(moreInboxItemsCount !== undefined ? { moreInboxItemsCount } : {}),
+          ...(typeof deps.mesh?.hasExhaustedSelectedWork === "function" &&
+          deps.mesh.hasExhaustedSelectedWork(r.id)
+            ? {
+                needsAttention: true,
+                needsAttentionReason: "Selected work exhausted retries without being handled",
+              }
+            : {}),
         };
       })
     );
@@ -2209,6 +2227,183 @@ export async function handleMeshApiRequest(
       blocksHasMore: blocks.hasMore,
       artifacts,
       externalReference,
+    });
+    return true;
+  }
+
+  // GET /api/mesh/recent-activity?limit= — newest-first activity items: handled inbox cards + terminal obligation changes
+  if (pathname === "/api/mesh/recent-activity") {
+    const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+    const limit = Number.isNaN(rawLimit) || rawLimit <= 0 ? 50 : Math.min(rawLimit, 100);
+    const chatScope = viewerScope();
+    const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
+
+    const actorDisplayInfo = (actorId: string) => {
+      const actor = actors.get(actorId);
+      const handle = actor?.isRoot ? rootHandle : generateHandle(actorId);
+      const model = actor?.modelConfig?.[0]
+        ? `${actor.modelConfig[0].model}${actor.modelConfig[0].effort ? `, ${actor.modelConfig[0].effort}` : ""}`
+        : "default";
+      return { handle, model };
+    };
+
+    const handledEntries = deps.inbox?.listRecentHandledEntries(limit) ?? [];
+    const terminalHistory = deps.obligations?.listTerminalHistory?.(limit) ?? [];
+
+    const matchedTerminalHistoryIds = new Set<number>();
+    const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
+    const handledItems: Array<Record<string, unknown>> = [];
+
+    for (const entry of handledEntries) {
+      if (!entry.handledAt) continue;
+      const page = await resolveInboxPage(
+        { entries: [entry], unhandledCount: 1, nextCursor: null },
+        deps,
+        chatScope
+      );
+      const resolved = page.entries[0];
+      if (!resolved) continue;
+
+      const { handle, model } = actorDisplayInfo(entry.actorId);
+
+      const source = entry.source;
+      let sourceKind = "UNKNOWN";
+      if (source.startsWith("github:")) {
+        let collection: string | undefined;
+        try {
+          collection = asGitHubIssue(parseReference(source))?.collection;
+        } catch {
+          // Non-canonical GitHub source: fall through to the generic kind.
+        }
+        sourceKind =
+          collection === "pulls"
+            ? "GITHUB PR"
+            : collection === "issues"
+              ? "GITHUB ISSUE"
+              : "GITHUB";
+      } else if (source.startsWith("mesh:")) {
+        sourceKind = "MESH CHAT";
+      } else if (source.startsWith("gchat:")) {
+        sourceKind = "GCHAT MESSAGE";
+      } else if (source.startsWith("slack:")) {
+        sourceKind = "SLACK MESSAGE";
+      } else if (source.startsWith("obligation:")) {
+        sourceKind = "OBLIGATION";
+      } else if (resolved.reference?.scheme) {
+        sourceKind = String(resolved.reference.scheme).toUpperCase();
+      }
+
+      const handledAt = entry.handledAt.toISOString();
+      const selectedRun = completedFocuses.find(
+        (run) =>
+          run.actorId === entry.actorId &&
+          run.entryIds.includes(entry.id) &&
+          handledAt >= run.startedAt &&
+          handledAt <= run.endedAt
+      );
+
+      // Selection records one run-level primary focus, but a run may select
+      // unrelated inbox entries. Link and fold an activity card only through
+      // this entry's own durable association or exact source reference.
+      // Same per-entry refs selection resolves, minus its live-only filter:
+      // folding needs the terminal obligation too.
+      const refs = inboxEntryObligationRefs(
+        deps.inboxFocus ?? { listEntryObligationIds: () => [] },
+        entry.actorId,
+        entry
+      );
+      const entryObligationIds = new Set(refs.associatedIds);
+      if (refs.payloadObligationId) entryObligationIds.add(refs.payloadObligationId);
+      if (source.startsWith("obligation:")) {
+        entryObligationIds.add(source.slice("obligation:".length));
+      }
+      const externallyLinked = refs.githubWorkRef
+        ? (deps.obligations?.findByExternalRef(refs.githubWorkRef) ?? null)
+        : null;
+      if (externallyLinked) entryObligationIds.add(externallyLinked.id);
+      const entryObligations = deps.obligations
+        ? [...entryObligationIds]
+            .map((obligationId) => deps.obligations?.get(obligationId) ?? null)
+            .filter((obligation): obligation is Obligation => obligation !== null)
+        : [];
+      let linkedObligation: string | null =
+        selectedRun && entryObligations[0] ? `Obligation: ${entryObligations[0].title}` : null;
+
+      // A source link alone is not enough: a recurring obligation can be
+      // handled in one run and transition terminal in a later one. Fold only a
+      // transition observed inside the completed run that selected this exact
+      // entry, preserving later/unrelated terminal changes as their own cards.
+      const matchedTerminal = selectedRun
+        ? terminalHistory.find(
+            (history) =>
+              entryObligationIds.has(history.obligationId) &&
+              history.actingPrincipal === entry.actorId &&
+              history.timestamp >= selectedRun.startedAt &&
+              history.timestamp <= selectedRun.endedAt
+          )
+        : undefined;
+      if (matchedTerminal) {
+        matchedTerminalHistoryIds.add(matchedTerminal.id);
+        const terminalObligation = deps.obligations?.get(matchedTerminal.obligationId);
+        if (terminalObligation) {
+          linkedObligation = `Obligation ${matchedTerminal.after.status}: ${terminalObligation.title}`;
+        }
+      }
+
+      const summary =
+        resolved.reference?.title ??
+        (typeof entry.payload?.type === "string" ? entry.payload.type : source);
+
+      handledItems.push({
+        id: `inbox_${entry.id}`,
+        kind: "handled_inbox",
+        time: handledAt,
+        actorId: entry.actorId,
+        actorHandle: handle,
+        actorModel: model,
+        sourceKind,
+        sourceRef: source,
+        ...(resolved.reference ? { reference: resolved.reference } : {}),
+        summary,
+        handledTime: handledAt,
+        addressedNote: entry.handledNote ?? "Handled without comment",
+        ...(linkedObligation ? { linkedObligation } : {}),
+      });
+    }
+
+    const obligationItems: Array<Record<string, unknown>> = [];
+    for (const h of terminalHistory) {
+      if (matchedTerminalHistoryIds.has(h.id)) {
+        continue;
+      }
+      const ob = deps.obligations ? deps.obligations.get(h.obligationId) : null;
+      const status = (h.after.status ?? ob?.status ?? "done") as "done" | "cancelled";
+      const { handle, model } = actorDisplayInfo(h.actingPrincipal ?? ob?.ownerId ?? "root");
+
+      obligationItems.push({
+        id: `obligation_history_${h.id}`,
+        kind: "terminal_obligation",
+        time: h.timestamp,
+        actorId: h.actingPrincipal ?? ob?.ownerId ?? "root",
+        actorHandle: handle,
+        actorModel: model,
+        sourceKind: "OBLIGATION",
+        sourceRef: ob?.externalRef?.key ?? `obligation:${h.obligationId}`,
+        summary: ob?.title ?? `Obligation ${h.obligationId}`,
+        obligationId: h.obligationId,
+        terminalStatus: status,
+        terminalNote: h.after.terminalNote ?? null,
+        resolutionRef: h.after.resolutionRef ?? null,
+      });
+    }
+
+    const merged = [...handledItems, ...obligationItems];
+    merged.sort(
+      (a, b) => new Date(b.time as string).getTime() - new Date(a.time as string).getTime()
+    );
+
+    sendJson(res, 200, {
+      items: merged.slice(0, limit),
     });
     return true;
   }

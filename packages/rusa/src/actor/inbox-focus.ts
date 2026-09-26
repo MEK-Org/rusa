@@ -69,6 +69,49 @@ function live(obligation: Obligation | null): obligation is Obligation {
   return obligation !== null && !isTerminalObligationStatus(obligation.status);
 }
 
+const OBLIGATION_PAYLOAD_TYPES = new Set([
+  "obligation.ready_head",
+  "obligation.ready_responsive",
+  "obligation.prerequisite_cancelled",
+]);
+
+/** The canonical key of a GitHub issue or PR source, or null for anything else. */
+export function githubWorkRef(source: string): string | null {
+  try {
+    const parsed = parseReference(source);
+    return asGitHubIssue(parsed) ? parsed.key : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every way one inbox entry names the obligation it advances, before any
+ * status policy. Selection keeps only live obligations; the activity feed also
+ * needs terminal ones to fold a closing transition, so callers filter.
+ */
+export interface InboxEntryObligationRefs {
+  associatedIds: string[];
+  payloadObligationId: string | null;
+  githubWorkRef: string | null;
+}
+
+export function inboxEntryObligationRefs(
+  focus: Pick<InboxFocusRepository, "listEntryObligationIds">,
+  actorId: string,
+  entry: InboxEntry
+): InboxEntryObligationRefs {
+  const payloadId = entry.payload.obligationId;
+  return {
+    associatedIds: focus.listEntryObligationIds(actorId, entry.id),
+    payloadObligationId:
+      OBLIGATION_PAYLOAD_TYPES.has(String(entry.payload.type)) && typeof payloadId === "string"
+        ? payloadId
+        : null,
+    githubWorkRef: githubWorkRef(entry.source),
+  };
+}
+
 /** Resolve and durably record the obligation one inbox selection advances. */
 export class InboxFocusResolver {
   constructor(
@@ -89,23 +132,17 @@ export class InboxFocusResolver {
 
     for (const entry of input.entries) {
       const ids = new Set<string>();
-      for (const id of this.focus.listEntryObligationIds(input.actorId, entry.id)) {
+      const refs = inboxEntryObligationRefs(this.focus, input.actorId, entry);
+      for (const id of refs.associatedIds) {
         if (live(this.obligations.get(id))) ids.add(id);
       }
-      if (
-        entry.payload.type === "obligation.ready_head" ||
-        entry.payload.type === "obligation.ready_responsive" ||
-        entry.payload.type === "obligation.prerequisite_cancelled"
-      ) {
-        const id = entry.payload.obligationId;
-        if (typeof id === "string" && live(this.obligations.get(id))) {
-          ids.add(id);
-          obligationBackedEntries.add(entry.id);
-        }
+      const payloadId = refs.payloadObligationId;
+      if (payloadId !== null && live(this.obligations.get(payloadId))) {
+        ids.add(payloadId);
+        obligationBackedEntries.add(entry.id);
       }
-      const githubRef = this.githubWorkRef(entry.source);
-      if (githubRef) {
-        const linked = this.obligations.findLiveObligationByExternalRef(githubRef);
+      if (refs.githubWorkRef) {
+        const linked = this.obligations.findLiveObligationByExternalRef(refs.githubWorkRef);
         if (linked) ids.add(linked.id);
         obligationBackedEntries.add(entry.id);
       }
@@ -193,15 +230,6 @@ export class InboxFocusResolver {
   }
 
   /** Exact issue/PR reference emitted by the shared GitHub inbox grammar. */
-  private githubWorkRef(source: string): string | null {
-    try {
-      const parsed = parseReference(source);
-      return asGitHubIssue(parsed) ? parsed.key : null;
-    } catch {
-      return null;
-    }
-  }
-
   private isAncestorOrSelf(ancestorId: string, descendantId: string): boolean {
     let current = this.obligations.get(descendantId);
     const seen = new Set<string>();
