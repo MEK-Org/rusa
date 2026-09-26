@@ -2,9 +2,11 @@ import type Database from "better-sqlite3";
 
 /**
  * Coordinator-owned SQLite schema. Version 2 adds the durable per-provider
- * reading-mode fence and manual-observation idempotency receipts.
+ * reading-mode fence and manual-observation idempotency receipts. Version 3
+ * adds `quota_observations.model_scope` to the observation and controller
+ * identity (#588), so a model-scoped window keeps its own PID history.
  */
-export const QUOTA_SCHEMA_VERSION = 2;
+export const QUOTA_SCHEMA_VERSION = 3;
 
 export class SchemaVersionRefusalError extends Error {
   constructor(

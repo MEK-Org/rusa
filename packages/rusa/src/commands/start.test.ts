@@ -1213,6 +1213,82 @@ describe("runStart webhook event routing (Phase 4)", () => {
         await close();
       }
     });
+
+    describe("model-scoped quota lanes (#588)", () => {
+      const fableEntry = { provider: "claude", model: "claude-fable-5-1", effort: "high" };
+      const withFableLane = (
+        provider: ReturnType<typeof throttleStatus>,
+        lane: { intervalSeconds?: number; percentLeft?: number; expired?: boolean }
+      ) => ({
+        ...provider,
+        modelLanes: [
+          {
+            ...throttleStatus("claude", lane),
+            governingBucketKey: "claude[claude-fable-5-1]:weekly",
+            models: ["claude-fable-5-1"],
+          },
+        ],
+      });
+
+      it("paces Fable on its own window while Sonnet keeps the provider lane", async () => {
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: withFableLane(throttleStatus("claude"), { intervalSeconds: 3600 }),
+        }));
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          await expect(mesh.gateRun(ran, [fableEntry], false).result).resolves.toBe(
+            "claude-fable-5-1"
+          );
+
+          // Fable's own hour-long pace holds the next Fable start...
+          const fableGate = mesh.gateRun(ran, [fableEntry], false);
+          fableGate.result.catch(() => {});
+          // ...while Sonnet, outside the Fable window, starts on the provider lane.
+          await expect(mesh.gateRun(ran, [claudeEntry], false).result).resolves.toBe(
+            "claude-sonnet-5"
+          );
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(fableGate.started).toBe(false);
+          fableGate.cancel?.();
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
+      it("skips only Fable when the coordinator reports its own window exhausted", async () => {
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: withFableLane(throttleStatus("claude", { percentLeft: 90 }), {
+            percentLeft: 0,
+            expired: true,
+          }),
+          codex: throttleStatus("codex", { percentLeft: 50 }),
+        }));
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          // The Fable model lane is known-empty: its responsive work moves on.
+          await expect(mesh.gateRun(ran, [fableEntry, codexEntry], true).result).resolves.toBe(
+            "gpt-5.6"
+          );
+          // Sonnet shares the provider but not the Fable window.
+          await expect(mesh.gateRun(ran, [claudeEntry], true).result).resolves.toBe(
+            "claude-sonnet-5"
+          );
+          const failure = await mesh.gateRun(ran, [fableEntry], true).result.then(
+            () => undefined,
+            (error: unknown) => error
+          );
+          expect(failure).toBeInstanceOf(PoolExhaustedError);
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {

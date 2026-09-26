@@ -1414,6 +1414,8 @@ class QuotaHistorySeriesDto {
     required this.windowId,
     required this.label,
     required this.points,
+    this.scope = 'provider',
+    this.modelIds = const [],
   });
 
   final String provider;
@@ -1421,11 +1423,21 @@ class QuotaHistorySeriesDto {
   final String label;
   final List<QuotaHistoryPointDto> points;
 
+  /// Explicit scope from the coordinator; no display-label parsing is needed.
+  final String scope;
+
+  /// Canonical configured model IDs for a model-scoped history series.
+  final List<String> modelIds;
+
   factory QuotaHistorySeriesDto.fromJson(Map<String, dynamic> j) =>
       QuotaHistorySeriesDto(
         provider: j['provider'] as String? ?? '',
         windowId: j['windowId'] as String? ?? '',
         label: j['label'] as String? ?? '',
+        scope: j['scope'] as String? ?? 'provider',
+        modelIds: (j['modelIds'] as List<dynamic>? ?? const [])
+            .whereType<String>()
+            .toList(),
         points: (j['points'] as List<dynamic>? ?? const [])
             .map(
               (e) => QuotaHistoryPointDto.fromJson(e as Map<String, dynamic>),
