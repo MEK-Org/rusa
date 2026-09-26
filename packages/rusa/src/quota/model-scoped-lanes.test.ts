@@ -287,7 +287,19 @@ describe("model-scoped quota lanes: store (#588)", () => {
           (provider, kind, observed_slot, label, observed_at, percent_left, reset_at_iso,
            window_ms, processed, controller_error, controller_derivative, controller_integral,
            uncapped_interval_seconds, interval_seconds)
-         VALUES ('claude', 'weekly', 1, 'Weekly', '2030-01-01T00:00:00.000Z', 50, ?,
+         VALUES ('claude', 'weekly', 2, 'Weekly', '2030-01-01T00:00:00.000Z', 50, ?,
+                 604800000, 1, 3, 0.5, 120, 40, 40)`
+      )
+      .run(RESET);
+    // Equal timestamps use rowid as the deterministic latest-reading tie
+    // break. The migration must preserve that order as it rebuilds the table.
+    legacy
+      .prepare(
+        `INSERT INTO quota_observations
+          (provider, kind, observed_slot, label, observed_at, percent_left, reset_at_iso,
+           window_ms, processed, controller_error, controller_derivative, controller_integral,
+           uncapped_interval_seconds, interval_seconds)
+         VALUES ('claude', 'weekly', 1, 'Weekly', '2030-01-01T00:00:00.000Z', 0, ?,
                  604800000, 1, 3, 0.5, 120, 40, 40)`
       )
       .run(RESET);
@@ -300,11 +312,15 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(
         store.db
           .prepare(
-            `SELECT model_scope AS modelScope, controller_integral AS integral,
-                    interval_seconds AS interval FROM quota_observations`
+            `SELECT model_scope AS modelScope, percent_left AS percentLeft,
+                    controller_integral AS integral, interval_seconds AS interval
+             FROM quota_observations ORDER BY rowid`
           )
           .all()
-      ).toEqual([{ modelScope: "", integral: 120, interval: 40 }]);
+      ).toEqual([
+        { modelScope: "", percentLeft: 50, integral: 120, interval: 40 },
+        { modelScope: "", percentLeft: 0, integral: 120, interval: 40 },
+      ]);
       const indices = (
         store.db
           .prepare(
@@ -314,7 +330,11 @@ describe("model-scoped quota lanes: store (#588)", () => {
       ).map((row) => row.name);
       expect(indices).toContain("idx_quota_observations_scope_kind_time");
       expect(indices).not.toContain("idx_quota_observations_provider_kind_time");
-      expect(store.getProviderThrottle("claude")).toMatchObject({ intervalSeconds: 40 });
+      expect(store.getProviderThrottle("claude")).toMatchObject({
+        intervalSeconds: 40,
+        expired: true,
+        exhaustedUntil: RESET,
+      });
       expect(store.getProviderThrottle("claude")?.modelLanes).toBeUndefined();
     } finally {
       store.close();
