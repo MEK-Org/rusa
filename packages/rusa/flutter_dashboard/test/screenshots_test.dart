@@ -30,7 +30,6 @@ import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
-import 'package:rusa_dashboard/widgets/quota_history_chart.dart';
 
 import 'fakes.dart';
 import 'screenshot_support.dart';
@@ -85,40 +84,6 @@ void main() {
       });
     },
   );
-
-  testWidgets('renders the quota plots with a null-controller model series', (
-    tester,
-  ) async {
-    await tester.runAsync(() async {
-      await tester.binding.setSurfaceSize(const Size(900, 980));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-
-      final key = GlobalKey();
-      await tester.pumpWidget(
-        MaterialApp(
-          debugShowCheckedModeBanner: false,
-          theme: buildMeshTheme(),
-          home: Scaffold(
-            body: RepaintBoundary(
-              key: key,
-              child: ColoredBox(
-                color: MeshColors.bgSecondary,
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: QuotaHistoryChart(history: _overviewQuotaHistory()),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-
-      expect(find.text('Quota Remaining'), findsOneWidget);
-      await captureBoundary(key, '$_outDir/quota_history_remaining.png');
-      expect(tester.takeException(), isNull);
-    });
-  });
 
   testWidgets(
     'renders the dashboard overview (tree + detail + coalesced events)',

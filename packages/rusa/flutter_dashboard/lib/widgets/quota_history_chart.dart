@@ -883,11 +883,12 @@ class QuotaRemainingChartPainter extends CustomPainter {
   final DateTime start;
   final DateTime end;
 
-  /// The longest silence still drawn as one line. The API keeps at most one
-  /// reading per ~30 minutes of the 14-day range, so a longer silence is a
-  /// missing reading rather than thinning. Two hours (about three empty
-  /// buckets) is a judgment call, not fitted to the recording cadence, which
-  /// is minutes; any value comfortably above 30 minutes is safe.
+  /// The longest silence still drawn as one line. The API keeps the newest
+  /// reading in each 30-minute bucket of the 14-day range, so readings kept
+  /// from adjacent buckets can sit almost 60 minutes apart with nothing
+  /// missing; this must stay comfortably above 60 minutes. Two hours breaks
+  /// the line only after at least three empty buckets in a row. It is a
+  /// judgment call, not fitted to the recording cadence, which is minutes.
   static const maxJoinGap = Duration(hours: 2);
 
   static const _left = 42.0;
