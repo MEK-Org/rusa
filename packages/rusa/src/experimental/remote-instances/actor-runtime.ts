@@ -47,6 +47,13 @@ export function createActorRuntime(
    * uncancellable start, as before.
    */
   let leaderCancelling = false;
+  /**
+   * The leader forwards an interrupt once it has admitted the start, so the
+   * command can land while that admission's reply is still unwinding toward
+   * the provider launch. The Actor then sees a queued start it cannot cancel;
+   * this refuses the start instead of letting the interrupted run launch.
+   */
+  let interruptedAdmission = false;
   const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0) {
@@ -175,6 +182,8 @@ export function createActorRuntime(
         responsive: boolean
       ): RunStartHandle<T> => {
         activeGates++;
+        // A new admission is a new opportunity; an older interrupt is not about it.
+        interruptedAdmission = false;
         const admitRequest: AdmitRequest = {
           op: "admit",
           candidates: [...candidates],
@@ -217,6 +226,10 @@ export function createActorRuntime(
             if (snapshot.mcpServers) {
               // Actor holds the array by reference, matching the in-process tool refresh path.
               mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
+            }
+            if (interruptedAdmission) {
+              interruptedAdmission = false;
+              throw new RunStartCancelledError();
             }
             // The leader's pacing gate owns selection; the follower runs what it reserved.
             return await fn(snapshot.selected ?? candidates[0]);
@@ -335,7 +348,7 @@ export function createActorRuntime(
         break;
       }
       case "interrupt":
-        actor?.interrupt(message.by);
+        if (actor?.interrupt(message.by).wasQueued && pendingAdmission) interruptedAdmission = true;
         break;
       case "cancelQueued":
         leaderCancelling = true;
