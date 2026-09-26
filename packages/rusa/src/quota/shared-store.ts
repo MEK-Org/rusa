@@ -61,7 +61,7 @@ export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
  * on-cadence observation receive the same smoothing, slew, and integral credit
  * as its six five-minute reference steps.
  */
-export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = 30 * 60; // 1800s (30 minutes)
+export const QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 30 * 60; // 1800s (30 minutes)
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 /** The observation interval the original actuator constants were tuned for. */
 export const QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS = SLOT_MS / 1000;
@@ -75,7 +75,7 @@ function elapsedActuatorResponse(
 ): { smoothing: number; slew: number } {
   const elapsedSeconds =
     hasPrevious && dtSeconds > 0
-      ? Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS)
+      ? Math.min(dtSeconds, QUOTA_MAX_CREDITED_ELAPSED_SECONDS)
       : QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS;
   return {
     smoothing:
@@ -926,7 +926,7 @@ export class SharedQuotaStore {
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
     const integralDtSeconds = cycleChanged
       ? 0
-      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
+      : Math.min(dtSeconds, QUOTA_MAX_CREDITED_ELAPSED_SECONDS);
     const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
     const candidateIntegral = previousIntegral + error * integralDtSeconds;
     const rawWithoutIntegral =
@@ -1048,8 +1048,8 @@ export class SharedQuotaStore {
    * "no decision" available without a schema change, and the published status
    * shows it as such (`governingBucketKey: null`, no buckets). The variant's
    * first step is also not quite a cold start — the gap since the zeroed row
-   * feeds the integral (`error × min(dt, QUOTA_INTEGRAL_MAX_STEP_SECONDS)`,
-   * at most half of the proportional term (`(QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS) × QUOTA_INTEGRAL_MAX_STEP_SECONDS = 120/3600 × 1800 = 60 s/pt`)) and its retained
+   * feeds the integral (`error × min(dt, QUOTA_MAX_CREDITED_ELAPSED_SECONDS)`,
+   * at most half of the proportional term (`(QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS) × QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 120/3600 × 1800 = 60 s/pt`)) and its retained
    * `controller_error` feeds the raw derivative — but that is bounded and
    * would not on its own have disqualified it.
    *

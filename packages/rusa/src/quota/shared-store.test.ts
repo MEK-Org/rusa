@@ -12,11 +12,12 @@ import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
-  QUOTA_INTEGRAL_MAX_STEP_SECONDS,
   QUOTA_INTEGRAL_TIME_SECONDS,
   QUOTA_KD_SECONDS_SQUARED_PER_POINT,
   QUOTA_KI_SECONDS_PER_POINT_SECOND,
   QUOTA_KP_SECONDS_PER_POINT,
+  QUOTA_MAX_CREDITED_ELAPSED_SECONDS,
+  QUOTA_MAX_SLEW_SECONDS,
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
   QUOTA_SCHEMA_VERSION,
@@ -996,7 +997,7 @@ describe("SharedQuotaStore PID integral term", () => {
       const rows = reasonedRows(store, "claude");
       expect(rows).toHaveLength(13);
       expect(QUOTA_INTEGRAL_TIME_SECONDS).toBe(2 * QUOTA_DERIVATIVE_TAU_SECONDS);
-      expect(QUOTA_INTEGRAL_MAX_STEP_SECONDS).toBe(30 * 60);
+      expect(QUOTA_MAX_CREDITED_ELAPSED_SECONDS).toBe(30 * 60);
 
       // A cold start has no elapsed time to integrate over, so the first
       // decision is the pure proportional one a PD controller would have made.
@@ -1192,7 +1193,7 @@ describe("SharedQuotaStore PID integral term", () => {
       recordObservation(store, "claude", "2030-02-01T00:00:00.000Z", 40, reset);
 
       const gapped = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      expect(gapped.integral).toBeCloseTo(gapped.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
+      expect(gapped.integral).toBeCloseTo(gapped.error * QUOTA_MAX_CREDITED_ELAPSED_SECONDS, 6);
       expect(gapped.integral).toBeLessThan(gapped.error * 24 * 60 * 60);
     } finally {
       store.close();
@@ -1302,10 +1303,12 @@ describe("SharedQuotaStore PID integral term", () => {
       recordError(thirtyMinute, "claude", 30, 20);
       const fiveMinuteStep = reasonedRows(fiveMinute, "claude").at(-1) as ReasonedRow;
       const thirtyMinuteStep = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-      // A 30m observation earns six reference slews when needed, instead of
-      // being artificially limited to the former two-step cap.
-      expect(thirtyMinuteStep.interval).toBeGreaterThanOrEqual(fiveMinuteStep.interval);
-      expect(thirtyMinuteStep.interval).toBeLessThanOrEqual(6 * 900);
+      // One 30m observation is close to the six 5m reference updates over the
+      // same wall-clock period, and no longer constrained to the prior two-step
+      // (1800s) slew cap.
+      expect(thirtyMinuteStep.interval).toBeGreaterThan(fiveMinuteStep.interval * 0.9);
+      expect(thirtyMinuteStep.interval).toBeLessThan(fiveMinuteStep.interval * 1.2);
+      expect(thirtyMinuteStep.interval).toBeGreaterThan(2 * QUOTA_MAX_SLEW_SECONDS);
     } finally {
       fiveMinute.close();
       thirtyMinute.close();
@@ -1473,7 +1476,7 @@ describe("SharedQuotaStore PID integral term", () => {
         "2030-01-08T00:00:00.000Z"
       );
       const next = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      expect(next.integral).toBeCloseTo(next.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
+      expect(next.integral).toBeCloseTo(next.error * QUOTA_MAX_CREDITED_ELAPSED_SECONDS, 6);
     } finally {
       store.close();
     }
