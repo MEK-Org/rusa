@@ -549,7 +549,6 @@ class RecentActivityItem {
   });
 
   final String id;
-
   /// 'handled_inbox' | 'terminal_obligation'
   final String kind;
   final String time;
@@ -1394,8 +1393,10 @@ class QuotaHistoryPointDto {
 
   final String observedAt;
 
-  /// Quota left in the window, as recorded. Null when the reading carries
-  /// none, which the chart leaves undrawn rather than showing as 0%.
+  /// Quota left in the window, as recorded. The server's DTO always sends a
+  /// number (`QuotaHistoryPointDto.remainingPercent` in quota-api.ts), so null
+  /// only comes from a malformed payload; the chart leaves it undrawn where the
+  /// old `?? 0` parse drew it as 0% (#706).
   final double? remainingPercent;
   final double? error;
   final String? resetAtIso;

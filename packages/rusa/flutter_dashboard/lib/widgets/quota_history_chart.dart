@@ -54,31 +54,27 @@ Color _quotaChartColorForSeries(
   return _fallbackSeriesColors[hash.abs() % _fallbackSeriesColors.length];
 }
 
-/// How far back the dashboard asks for quota history when the API does not say:
-/// the server's `HISTORY_WINDOW_MS` (#706).
-const kQuotaHistoryDays = 14;
+/// Reported reset instants that move by more than this belong to a new quota
+/// window rather than parse jitter. Every plot here breaks on this one rule.
+const _windowResetShift = Duration(hours: 1);
 
 /// The range a history snapshot covers, from the API's own bounds, so every
-/// label names the range that was actually returned. Without a snapshot it is
-/// the default range ending now. [phrase] reads "prior 14 days" for a
-/// whole-day range and "prior 36 hours" otherwise; [title] is its heading form.
+/// label names the range that was actually returned. The API's range is a
+/// whole number of days (`HISTORY_WINDOW_MS`); [phrase] reads "prior 14 days"
+/// and [title] is its heading form.
 ({DateTime start, DateTime end, String phrase, String title})
-quotaHistoryRangeOf(QuotaHistoryDto? history) {
+quotaHistoryRangeOf(QuotaHistoryDto history) {
   final end =
-      DateTime.tryParse(history?.generatedAt ?? '')?.toUtc() ??
+      DateTime.tryParse(history.generatedAt)?.toUtc() ??
       DateTime.now().toUtc();
-  final start =
-      DateTime.tryParse(history?.historySince ?? '')?.toUtc() ??
-      end.subtract(const Duration(days: kQuotaHistoryDays));
-  final hours = end.difference(start).inHours;
-  final (count, unit) = hours >= 24 && hours % 24 == 0
-      ? (hours ~/ 24, 'days')
-      : (hours, 'hours');
+  // An unreadable bound draws an empty range rather than a guessed one.
+  final start = DateTime.tryParse(history.historySince)?.toUtc() ?? end;
+  final days = (end.difference(start).inMinutes / (24 * 60)).round();
   return (
     start: start,
     end: end,
-    phrase: 'prior $count $unit',
-    title: 'Prior $count ${unit[0].toUpperCase()}${unit.substring(1)}',
+    phrase: 'prior $days days',
+    title: 'Prior $days Days',
   );
 }
 
@@ -497,7 +493,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
         bool isReset = false;
         if (lastResetAt != null && resetAt != null) {
           final resetDiff = resetAt.difference(lastResetAt).abs();
-          if (resetDiff > const Duration(hours: 1) ||
+          if (resetDiff > _windowResetShift ||
               (lastObservedAt != null && observedAt.isAfter(lastResetAt))) {
             isReset = true;
           }
@@ -766,7 +762,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
         bool isReset = false;
         if (lastResetAt != null && resetAt != null) {
           final resetDiff = resetAt.difference(lastResetAt).abs();
-          if (resetDiff > const Duration(hours: 1) ||
+          if (resetDiff > _windowResetShift ||
               (lastObservedAt != null && observedAt.isAfter(lastResetAt))) {
             isReset = true;
           }
@@ -889,7 +885,9 @@ class QuotaRemainingChartPainter extends CustomPainter {
 
   /// The longest silence still drawn as one line. The API keeps at most one
   /// reading per ~30 minutes of the 14-day range, so a longer silence is a
-  /// missing reading rather than thinning.
+  /// missing reading rather than thinning. Two hours (about three empty
+  /// buckets) is a judgment call, not fitted to the recording cadence, which
+  /// is minutes; any value comfortably above 30 minutes is safe.
   static const maxJoinGap = Duration(hours: 2);
 
   static const _left = 42.0;
@@ -938,7 +936,7 @@ class QuotaRemainingChartPainter extends CustomPainter {
       var isReset = false;
       if (lastResetAt != null && resetAt != null) {
         isReset =
-            resetAt.difference(lastResetAt).abs() > const Duration(hours: 1) ||
+            resetAt.difference(lastResetAt).abs() > _windowResetShift ||
             observedAt.isAfter(lastResetAt);
       }
       if (isReset) {

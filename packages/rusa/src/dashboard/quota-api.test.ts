@@ -767,11 +767,10 @@ describe("dashboard quota snapshot", () => {
       resetAtIso: null,
     });
   });
-  it("bounds a dense series to one real reading per time bucket, keeping each window's last reading before a reset", () => {
+  it("bounds a dense series to one real reading per time bucket and leaves an outage empty", () => {
     const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
     const untilMs = sinceMs + HISTORY_WINDOW_MS;
-    const firstReset = "2026-09-19T00:00:00.000Z";
-    const secondReset = "2026-09-26T00:00:00.000Z";
+    const reset = "2026-09-19T00:00:00.000Z";
     const fiveMinutes = 5 * 60 * 1000;
     const rows: QuotaHistorySource[] = [];
     for (let t = sinceMs; t <= untilMs; t += fiveMinutes) {
@@ -782,7 +781,7 @@ describe("dashboard quota snapshot", () => {
       ) {
         continue;
       }
-      const beforeReset = t < Date.parse(firstReset);
+      const beforeReset = t < Date.parse(reset);
       rows.push(
         historyPoint({
           scope: "model",
@@ -790,7 +789,7 @@ describe("dashboard quota snapshot", () => {
           label: "Fable",
           observedAt: new Date(t).toISOString(),
           percentLeft: Math.round((beforeReset ? 40 : 90) - ((t - sinceMs) % 1000) / 100),
-          resetAtIso: beforeReset ? firstReset : secondReset,
+          resetAtIso: beforeReset ? reset : "2026-09-26T00:00:00.000Z",
         })
       );
     }
@@ -813,10 +812,7 @@ describe("dashboard quota snapshot", () => {
       expect(point.error).toBeNull();
       expect(point.intervalSeconds).toBeNull();
     }
-    // The newest reading and the last reading before the reset both survive.
     expect(series.points.at(-1)?.observedAt).toBe(rows.at(-1)?.observedAt);
-    const lastBeforeReset = rows.filter((row) => row.resetAtIso === firstReset).at(-1);
-    expect(series.points.map((point) => point.observedAt)).toContain(lastBeforeReset?.observedAt);
     // Nothing is invented inside the outage.
     expect(
       series.points.filter(
@@ -825,6 +821,26 @@ describe("dashboard quota snapshot", () => {
           point.observedAt < "2026-09-17T00:00:00.000Z"
       )
     ).toEqual([]);
+  });
+
+  it("holds the bound for a fully covered range with a reading exactly at its end", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const rows: QuotaHistorySource[] = [];
+    for (let t = sinceMs; t <= untilMs; t += 5 * 60 * 1000) {
+      rows.push(historyPoint({ observedAt: new Date(t).toISOString(), percentLeft: 50 }));
+    }
+    expect(rows.at(-1)?.observedAt).toBe(new Date(untilMs).toISOString());
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    expect(series.points).toHaveLength(MAX_HISTORY_POINTS_PER_SERIES);
+    expect(series.points.at(-1)?.observedAt).toBe(new Date(untilMs).toISOString());
   });
 
   it("leaves a series at or under the bound untouched", () => {

@@ -293,29 +293,16 @@ export { HISTORY_WINDOW_MS };
 /**
  * Most points one history series may carry to the dashboard. Five-minute
  * readings over the 14-day range would be ~4,000 per series; 672 is one per
- * half hour, which is finer than the chart can draw and keeps the response and
- * the paint loop small (#706).
+ * half hour. This is a reading of #706's "bounded" ask, not a measured
+ * response or paint budget: half-hourly is finer than the chart can draw.
  */
 export const MAX_HISTORY_POINTS_PER_SERIES = 672;
 
 /**
- * A reported reset instant that moves by more than this is a new quota window
- * rather than parse jitter — the same threshold the dashboard chart breaks on.
- */
-const WINDOW_RESET_SHIFT_MS = 60 * 60 * 1000;
-
-function startsNewWindow(previous: QuotaHistorySource, next: QuotaHistorySource): boolean {
-  if (previous.resetAtIso === null || next.resetAtIso === null) return false;
-  const shiftMs = Math.abs(Date.parse(next.resetAtIso) - Date.parse(previous.resetAtIso));
-  return Number.isFinite(shiftMs) && shiftMs > WINDOW_RESET_SHIFT_MS;
-}
-
-/**
  * Thin a time-ordered series to at most `MAX_HISTORY_POINTS_PER_SERIES` real
- * readings. Each time bucket keeps its newest reading, plus the last reading
- * of a window that reset inside the bucket, so the low point before a reset
- * survives. Readings are chosen, never averaged or filled, so an unobserved
- * stretch stays empty and every controller field is the stored one.
+ * readings: the newest reading in each equal time bucket of the range.
+ * Readings are chosen, never averaged or filled, so an unobserved stretch
+ * stays empty and every controller field is the stored one.
  */
 function boundHistoryPoints(
   points: readonly QuotaHistorySource[],
@@ -323,30 +310,16 @@ function boundHistoryPoints(
   untilMs: number
 ): readonly QuotaHistorySource[] {
   if (points.length <= MAX_HISTORY_POINTS_PER_SERIES) return points;
-  let resets = 0;
-  for (let i = 1; i < points.length; i++) {
-    if (startsNewWindow(points[i - 1], points[i])) resets++;
-  }
-  // Reserve room for the pre-reset readings so the bound is hard.
-  const bucketCount =
-    MAX_HISTORY_POINTS_PER_SERIES - Math.min(resets, MAX_HISTORY_POINTS_PER_SERIES / 2);
-  const bucketMs = Math.max(1, (untilMs - sinceMs) / bucketCount);
+  const lastBucket = MAX_HISTORY_POINTS_PER_SERIES - 1;
+  const bucketMs = Math.max(1, (untilMs - sinceMs) / MAX_HISTORY_POINTS_PER_SERIES);
+  // The range is inclusive of `untilMs`; a reading exactly there joins the
+  // last bucket rather than opening one past the bound.
   const bucketOf = (point: QuotaHistorySource): number =>
-    Math.floor((Date.parse(point.observedAt) - sinceMs) / bucketMs);
-  const kept: QuotaHistorySource[] = [];
-  let preReset: QuotaHistorySource | null = null;
-  for (let i = 0; i < points.length; i++) {
-    const point = points[i];
+    Math.min(lastBucket, Math.floor((Date.parse(point.observedAt) - sinceMs) / bucketMs));
+  return points.filter((point, i) => {
     const next = points[i + 1];
-    if (next !== undefined && bucketOf(next) === bucketOf(point)) {
-      if (startsNewWindow(point, next)) preReset = point;
-      continue;
-    }
-    if (preReset !== null) kept.push(preReset);
-    kept.push(point);
-    preReset = null;
-  }
-  return kept;
+    return next === undefined || bucketOf(next) !== bucketOf(point);
+  });
 }
 
 /**
