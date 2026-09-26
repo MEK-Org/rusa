@@ -64,8 +64,48 @@ export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
  */
 export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = 30 * 60; // 1800s (30 minutes)
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
+/** The observation interval the original actuator constants were tuned for. */
+export const QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS = SLOT_MS / 1000;
+/**
+ * Never let a delayed observation advance the actuator by more than one normal
+ * probe interval. This is deliberately independent from its true age, which is
+ * retained in the observation and publication paths.
+ */
+export const QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS = 30 * 60;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
+/** Maximum slew over one five-minute reference observation. */
 export const QUOTA_MAX_SLEW_SECONDS = 900;
+/**
+ * A sparse observation earns elapsed-time slew, but never more than two
+ * reference steps at once. This bounds a delayed/noisy read to 30 minutes of
+ * interval movement while avoiding the six-fold slowdown at the 30m cadence.
+ */
+export const QUOTA_MAX_SCALED_SLEW_SECONDS = 2 * QUOTA_MAX_SLEW_SECONDS;
+
+function boundedActuatorElapsedSeconds(dtSeconds: number, hasPrevious: boolean): number {
+  if (!hasPrevious || !Number.isFinite(dtSeconds) || dtSeconds <= 0) {
+    return QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS;
+  }
+  return Math.min(dtSeconds, QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS);
+}
+
+/**
+ * Translate the five-minute smoothing constant into an elapsed-time factor.
+ * Six 5m updates and one 30m update therefore retain the same exponential
+ * response, subject to the separate slew guard below.
+ */
+export function actuatorSmoothingForElapsedSeconds(elapsedSeconds: number): number {
+  const bounded = Math.min(Math.max(elapsedSeconds, 0), QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS);
+  return 1 - (1 - QUOTA_ACTUATOR_SMOOTHING) ** (bounded / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS);
+}
+
+export function actuatorSlewForElapsedSeconds(elapsedSeconds: number): number {
+  const bounded = Math.min(Math.max(elapsedSeconds, 0), QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS);
+  return Math.min(
+    QUOTA_MAX_SCALED_SLEW_SECONDS,
+    QUOTA_MAX_SLEW_SECONDS * (bounded / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS)
+  );
+}
 /**
  * A rise in remaining quota above this many points is read as a refill rather
  * than a measurement. Inside one window `percentLeft` only falls — consumption
@@ -933,14 +973,18 @@ export class SharedQuotaStore {
     // A rollover resets the controller memory, not the actuator. This resumes
     // from the last reasoned period rather than treating the exhaustion wait as one.
     const previousInterval = previous?.intervalSeconds ?? 0;
-    const smoothed =
-      previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval);
+    // Ingestion produces one durable observation per actual scrape/manual POST;
+    // cache reads and collection ticks only see the already-persisted state, so
+    // `dtSeconds` here is observation age rather than request cadence. Scale
+    // smoothing and slew by that elapsed time, then cap a delayed/noisy reading
+    // to a bounded 30m actuator step.
+    const actuatorElapsedSeconds = boundedActuatorElapsedSeconds(dtSeconds, previous != null);
+    const smoothing = actuatorSmoothingForElapsedSeconds(actuatorElapsedSeconds);
+    const slew = actuatorSlewForElapsedSeconds(actuatorElapsedSeconds);
+    const smoothed = previousInterval + smoothing * (uncappedCandidate - previousInterval);
     const uncappedInterval = Math.max(
       0,
-      Math.min(
-        previousInterval + QUOTA_MAX_SLEW_SECONDS,
-        Math.max(previousInterval - QUOTA_MAX_SLEW_SECONDS, smoothed)
-      )
+      Math.min(previousInterval + slew, Math.max(previousInterval - slew, smoothed))
     );
     const interval = Math.min(opts.maxIntervalSeconds, uncappedInterval);
 
