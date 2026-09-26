@@ -1704,12 +1704,21 @@ async function composeStart(
     candidatePacerFor(lane, model);
     return (modelExhaustedUntilMs.get(modelPacerKey(lane, model)) ?? 0) > nowMs;
   };
+  // Model pacers whose windows the coordinator no longer publishes, so a
+  // retirement is logged once rather than only as a zero interval per apply.
+  const retiredModelPacers = new Set<string>();
   const applyModelLaneStatuses = (lane: string, status: PublishedThrottleProviderStatus): void => {
     for (const [key, entry] of modelPacers) {
       if (entry.lane !== lane) continue;
       try {
         const pacing = modelLanePacing(status, entry.model);
         applyModelLanePacing(key, entry.pacer, pacing);
+        if (pacing) {
+          retiredModelPacers.delete(key);
+        } else if (!retiredModelPacers.has(key)) {
+          retiredModelPacers.add(key);
+          log.info("quota_model_lane_retired", { provider: lane, model: entry.model });
+        }
         log.info("quota_model_lane_throttle", {
           provider: lane,
           model: entry.model,
