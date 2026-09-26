@@ -3095,9 +3095,11 @@ export class ActorMesh {
   /**
    * Reclaim an exact delegated event source, pointing it back at the caller when
    * the caller would be the effective owner after that exact delegation is removed,
-   * or when the caller is an actor-tree ancestor of its current holder. The latter
-   * is the parent-side escape hatch for a delegated root source: removing its only
-   * exact row leaves no source-level owner to establish the former condition.
+   * or when no owner of an underlying source remains and the caller is the actor
+   * that delegated the current row. The latter is the delegator's escape hatch for
+   * a delegated root source: removing its only exact row leaves no source-level
+   * owner to establish the former condition. It grants nothing to other ancestors
+   * and never bypasses an actor that still owns an underlying source (#695 review).
    */
   reclaimEventSource(resource: EventResource, reclaimedBy: string): void {
     reclaimedBy = this.resolveThreadId(reclaimedBy);
@@ -3110,12 +3112,14 @@ export class ActorMesh {
       throw new Error(`cannot reclaim ${resourceKey(resource)}: no active subscription`);
     }
 
-    const ownsUnderlyingSource =
-      this.effectiveOwnerOf(resource, { ignoreExactResource: resource }) === reclaimedBy;
-    const isHolderAncestor = this.isAncestorOf(reclaimedBy, current.actorId);
-    if (!ownsUnderlyingSource && !isHolderAncestor) {
+    const underlyingOwner = this.effectiveOwnerOf(resource, { ignoreExactResource: resource });
+    const delegatedRootSource =
+      underlyingOwner === undefined &&
+      current.subscribedBy === reclaimedBy &&
+      current.subscribedBy !== current.actorId;
+    if (underlyingOwner !== reclaimedBy && !delegatedRootSource) {
       throw new Error(
-        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim or an ancestor of its current holder`
+        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim or the delegator of an unowned root source`
       );
     }
 

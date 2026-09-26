@@ -703,7 +703,7 @@ export function createAgentExecMcpServer(
     {
       title: "Reclaim delegated event source",
       description:
-        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed, or when you are the current holder's actor-tree ancestor. Live obligation claims take precedence over stored subscriptions.",
+        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed, or when you delegated it and no owner of an underlying source remains (a delegated root source). Live obligation claims take precedence over stored subscriptions.",
       inputSchema: eventResourceInputSchema,
     },
     async ({ source, kind, org, repo, number, ref, space }) => {
