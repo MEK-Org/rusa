@@ -45,6 +45,7 @@ import { actorExperiments } from "./0047_actor_experiments.js";
 import { portableContextSnapshots } from "./0048_portable_context_snapshots.js";
 import { obligationResponsive } from "./0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "./0050_drop_obligation_ready_heads.js";
+import { eventSourceConfig } from "./0051_event_source_config.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -102,4 +103,5 @@ export const migrations: Migration[] = [
   portableContextSnapshots,
   obligationResponsive,
   dropObligationReadyHeads,
+  eventSourceConfig,
 ];

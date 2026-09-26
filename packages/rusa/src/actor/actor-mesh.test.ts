@@ -7996,6 +7996,53 @@ describe("ActorMesh", () => {
       expect(() => mesh.reclaimEventSource(pr, sibling)).toThrow(/effective owner after reclaim/);
     });
 
+    it("refuses an ancestor bypassing the owner of the underlying source (#695 review)", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
+      const child = mesh.spawn({ charter: "pr worker", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      expect(() => mesh.reclaimEventSource(pr, "root")).toThrow(/effective owner after reclaim/);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === pr && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([child]);
+    });
+
+    it("lets only the delegator reclaim a delegated root source (#695 review)", () => {
+      const { mesh } = setup();
+      const delegator = mesh.spawn({ charter: "space steward", parentId: "root" });
+      const branch = mesh.spawn({ charter: "other branch", parentId: "root" });
+      const holder = mesh.spawn({ charter: "space worker", parentId: branch });
+      const spaces = "gchat:spaces";
+
+      mesh.subscribeEventSource(spaces, delegator, "root");
+      mesh.delegateEventSource(spaces, holder, delegator);
+
+      // No underlying source owner remains; the holder's own ancestors gain nothing.
+      expect(() => mesh.reclaimEventSource(spaces, branch)).toThrow(/delegator of an unowned/);
+      expect(() => mesh.reclaimEventSource(spaces, "root")).toThrow(/delegator of an unowned/);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === spaces && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([holder]);
+
+      mesh.reclaimEventSource(spaces, delegator);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === spaces && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([delegator]);
+    });
+
     it("an actor may self-delegate a strict descendant of a parent it effectively owns", () => {
       const { mesh } = setup();
       const actor = mesh.spawn({ charter: "repo steward", parentId: "root" });

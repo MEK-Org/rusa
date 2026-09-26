@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  type ChatWakeMode,
+  chatWakeModeFromConfig,
+  tryChatSpaceResource,
+} from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
@@ -327,6 +332,31 @@ export interface RetirementBlockers {
  * ladder constructs the value.
  */
 export type EffectiveRouteDiagnostic = EventSourceOwnershipDiagnostic;
+
+/**
+ * The public shape of one currently-owned event source. Config is deliberately
+ * an object rather than a feature-specific schema: each event-source consumer
+ * owns the version and keys it understands.
+ */
+export interface EventSourceConfigView {
+  resource: EventResource;
+  config: Record<string, unknown> | null;
+}
+
+function readEventSourceConfig(raw: string | null | undefined): Record<string, unknown> | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("configuration is not an object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `cannot read event-source configuration: ${error instanceof Error ? error.message : "invalid JSON"}`
+    );
+  }
+}
 
 /**
  * Retirement refused because the subtree still holds work someone has to decide
@@ -3077,16 +3107,26 @@ export class ActorMesh {
     // ownership claim it is handing off, release it first (mirroring
     // reclaimEventSource) so the store's one-active-subscriber invariant
     // admits the child.
+    const config = this.eventSourceOwners.getConfig(resource);
     if (this.activeSubscriptionHeldBy(delegatedBy, resource)) {
       this.unsubscribeEventSource(resource, delegatedBy, this.now());
     }
 
     this.subscribeEventSource(resource, childThreadId, delegatedBy);
+    // Config is meaningful only on this exact live handoff. The store does not
+    // infer a value from tombstones, so an unrelated later subscription starts
+    // unconfigured.
+    if (config !== undefined) this.eventSourceOwners.setConfig(resource, config);
   }
 
   /**
    * Reclaim an exact delegated event source, pointing it back at the caller when
-   * the caller would be the effective owner after that exact delegation is removed.
+   * the caller would be the effective owner after that exact delegation is removed,
+   * or when no owner of an underlying source remains and the caller is the actor
+   * that delegated the current row. The latter is the delegator's escape hatch for
+   * a delegated root source: removing its only exact row leaves no source-level
+   * owner to establish the former condition. It grants nothing to other ancestors
+   * and never bypasses an actor that still owns an underlying source (#695 review).
    */
   reclaimEventSource(resource: EventResource, reclaimedBy: string): void {
     reclaimedBy = this.resolveThreadId(reclaimedBy);
@@ -3099,15 +3139,99 @@ export class ActorMesh {
       throw new Error(`cannot reclaim ${resourceKey(resource)}: no active subscription`);
     }
 
-    if (this.effectiveOwnerOf(resource, { ignoreExactResource: resource }) !== reclaimedBy) {
+    const underlyingOwner = this.effectiveOwnerOf(resource, { ignoreExactResource: resource });
+    const delegatedRootSource =
+      underlyingOwner === undefined &&
+      current.subscribedBy === reclaimedBy &&
+      current.subscribedBy !== current.actorId;
+    if (underlyingOwner !== reclaimedBy && !delegatedRootSource) {
       throw new Error(
-        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim`
+        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim or the delegator of an unowned root source`
       );
     }
 
+    const config = this.eventSourceOwners.getConfig(resource);
     const at = this.now();
     this.unsubscribeEventSource(resource, current.actorId, at);
     this.subscribeEventSource(resource, reclaimedBy, reclaimedBy);
+    if (config !== undefined) this.eventSourceOwners.setConfig(resource, config);
+  }
+
+  /**
+   * List the caller's active exact event-source ownership rows together with
+   * their stored configuration. This is intentionally a durable-row view,
+   * rather than the actor-admin audit view exposed by `list_subscriptions`:
+   * every listed row accepts `setEventSourceConfig`, so config-implied root
+   * sources, which have no durable row, are omitted (#695 review).
+   * A live obligation can temporarily govern delivery for the same resource,
+   * but does not disclose or rewrite the row's opaque configuration.
+   */
+  listEventSources(callerId: string): EventSourceConfigView[] {
+    const ownerId = this.resolveThreadId(callerId);
+    return this.eventSourceOwners
+      .list()
+      .filter((source) => source.actorId === ownerId && !source.unsubscribedAt)
+      .flatMap((source) => {
+        const config = this.eventSourceOwners.getConfig(source.resource);
+        return config === undefined
+          ? []
+          : [{ resource: source.resource, config: readEventSourceConfig(config) }];
+      });
+  }
+
+  /**
+   * Replace the opaque configuration object on an event source whose active
+   * exact ownership row belongs to the caller. Configuring a source never
+   * changes routing or retirement blockers: self-delegate it or receive an
+   * exact delegation first. A live obligation can temporarily govern delivery,
+   * but cannot read, clear, or change that durable row's configuration.
+   */
+  setEventSourceConfig(
+    resource: EventResource,
+    config: Record<string, unknown> | null,
+    callerId: string
+  ): EventSourceConfigView {
+    const ownerId = this.resolveThreadId(callerId);
+    const canonicalResource = resourceKey(resource);
+    const exactOwner = this.eventSourceOwners.activeForResource(canonicalResource)[0];
+    if (exactOwner?.actorId !== ownerId) {
+      throw new Error(
+        `cannot configure ${canonicalResource}: caller needs an active exact source; self-delegate it or receive an exact delegation first`
+      );
+    }
+    if (this.eventSourceOwners.getConfig(canonicalResource) === undefined) {
+      throw new Error(
+        `cannot configure ${canonicalResource}: it is implied by configured event sources and has no durable row; self-delegate a descendant source to configure it`
+      );
+    }
+    this.eventSourceOwners.setConfig(
+      canonicalResource,
+      config === null ? null : JSON.stringify(config)
+    );
+    // Never put arbitrary operator configuration into the event payload.
+    this.recordEvent({
+      kind: "event_source_config_set",
+      actorId: ownerId,
+      detail: canonicalResource,
+      payload: JSON.stringify({ configured: config !== null }),
+    });
+    return { resource: canonicalResource, config };
+  }
+
+  /**
+   * The stored wake mode of a Google Chat space, or `undefined` when the space
+   * follows the built-in default (#692). Read by chat ingestion for every
+   * arriving message, so a change governs the next message; the host is the
+   * caller, so no ownership check applies here.
+   *
+   * An unexpected or unparseable inbound space name cannot have a stored mode;
+   * it falls back safely to `undefined` so ingestion keeps the built-in default
+   * without throwing before the emergency halt brake (#695 review).
+   */
+  chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
+    const resource = tryChatSpaceResource(space);
+    if (!resource) return undefined;
+    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
   }
 
   /**

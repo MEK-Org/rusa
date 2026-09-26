@@ -120,6 +120,15 @@ export interface EventSourceOwnerStore {
   list(): EventSourceOwnership[];
   /** The subscriptions currently active for a resource (≤1 by the invariant). */
   activeForResource(resource: EventResource): EventSourceOwnership[];
+  /**
+   * The opaque, versioned config blob on an active exact event source. `undefined`
+   * means no durable exact active source exists (a config-implied root row is
+   * not durable); `null` means it exists without config. Config shape belongs
+   * to the consumer that owns its version, not this store.
+   */
+  getConfig(resource: EventResource): string | null | undefined;
+  /** Replace the config blob on an active exact event source. */
+  setConfig(resource: EventResource, config: string | null): void;
 }
 
 export interface EventSourceOwnershipAuditEvent {
@@ -341,16 +350,22 @@ export function isStrictSubResourceOf(x: EventResource, y: EventResource): boole
 
 /** In-memory subscription store — for tests and the e2e runner. */
 export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
-  private readonly subs = new Map<string, EventSourceOwnership>();
+  private readonly subs = new Map<string, EventSourceOwnership & { config: string | null }>();
 
   subscribe(
     subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
   ): void {
-    this.restore({ ...subscription, unsubscribedAt: undefined });
+    const resource = resourceKey(subscription.resource);
+    this.write({ ...subscription, resource, unsubscribedAt: undefined }, null);
   }
 
   /** Hydrate one already-durable row without reactivating a tombstone. */
   restore(subscription: EventSourceOwnership): void {
+    const resource = resourceKey(subscription.resource);
+    this.write({ ...subscription, resource }, null);
+  }
+
+  private write(subscription: EventSourceOwnership, config: string | null): void {
     const resource = resourceKey(subscription.resource);
     const normalized: EventSourceOwnership = {
       ...subscription,
@@ -363,7 +378,7 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
     if (holder && !normalized.unsubscribedAt) {
       throw new Error(activeOwnerConflictMessage(resource, holder.actorId, subscription.actorId));
     }
-    this.subs.set(`${resource}:${subscription.actorId}`, normalized);
+    this.subs.set(`${resource}:${subscription.actorId}`, { ...normalized, config });
   }
 
   unsubscribe(resource: EventResource, actorId: string, at: string): void {
@@ -374,12 +389,32 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
   }
 
   list(): EventSourceOwnership[] {
-    return [...this.subs.values()].map((s) => ({ ...s }));
+    return [...this.subs.values()].map(({ config: _config, ...s }) => ({ ...s }));
   }
 
   activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
+  }
+
+  private activeEntry(
+    resource: EventResource
+  ): [string, EventSourceOwnership & { config: string | null }] | undefined {
+    const normalized = resourceKey(resource);
+    return [...this.subs.entries()].find(
+      ([, row]) => row.resource === normalized && !row.unsubscribedAt
+    );
+  }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    return this.activeEntry(resource)?.[1].config;
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    const active = this.activeEntry(resource);
+    if (!active)
+      throw new Error(`cannot configure ${resourceKey(resource)}: no active event-source owner`);
+    this.subs.set(active[0], { ...active[1], config });
   }
 }
 
@@ -429,6 +464,20 @@ export class UnionEventSourceOwnerStore implements EventSourceOwnerStore {
   activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
+  }
+
+  /**
+   * Only the mutating side holds configurable rows. A config-implied row is
+   * re-derived every boot and never persisted, so it has no config to read or
+   * write; materializing one would let a later boot's reconciliation tombstone
+   * it and suppress the operator's source if it were configured again.
+   */
+  getConfig(resource: EventResource): string | null | undefined {
+    return this.mutatingStore.getConfig(resourceKey(resource));
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    this.mutatingStore.setConfig(resourceKey(resource), config);
   }
 }
 

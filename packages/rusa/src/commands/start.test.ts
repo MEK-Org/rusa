@@ -3593,6 +3593,134 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries[0]?.seenAt).not.toBeNull();
   });
 
+  it("uses generic event-source config for Google Chat wake mode, defaulting by space size (#692)", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const liveMesh = mesh;
+
+    const emit = (space: string, name: string, opts: { dm?: boolean; mention?: boolean } = {}) =>
+      chatSource.emit({
+        name: `${space}/messages/${name}`,
+        spaceName: space,
+        spaceType: opts.dm ? "DIRECT_MESSAGE" : "SPACE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text: "ordinary update",
+        mentionsSelf: opts.mention ?? false,
+        isDirectMessage: opts.dm ?? false,
+      });
+    const delivered = () =>
+      getRepositories()
+        .inbox.list("root", { status: "all", limit: 100 })
+        .entries.map((entry) => (entry.payload as { messageName?: string }).messageName)
+        .sort();
+
+    // Unset: a DM wakes on every message, a larger space only on a mention.
+    await emit("spaces/dm", "d1", { dm: true });
+    await emit("spaces/team", "t1");
+    await emit("spaces/team", "t2", { mention: true });
+    expect(delivered()).toEqual(["spaces/dm/messages/d1", "spaces/team/messages/t2"]);
+
+    // The generic configuration requires the exact subscription boundary; the
+    // ownership and MCP authority cases are covered at the MCP seam.
+    liveMesh.subscribeEventSource("gchat:spaces/team", "root", "root");
+    liveMesh.subscribeEventSource("gchat:spaces/dm", "root", "root");
+    liveMesh.setEventSourceConfig("gchat:spaces/team", { version: 1, chatWakeMode: "all" }, "root");
+    liveMesh.setEventSourceConfig(
+      "gchat:spaces/dm",
+      { version: 1, chatWakeMode: "mentions" },
+      "root"
+    );
+    expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
+
+    await emit("spaces/team", "t3");
+    await emit("spaces/dm", "d2", { dm: true });
+    await emit("spaces/dm", "d3", { dm: true, mention: true });
+    await emit("spaces/other", "o1");
+    // A redelivered message is not duplicated, and a message dropped before the
+    // change is not resurrected by it.
+    await emit("spaces/team", "t3");
+    expect(delivered()).toEqual([
+      "spaces/dm/messages/d1",
+      "spaces/dm/messages/d3",
+      "spaces/team/messages/t2",
+      "spaces/team/messages/t3",
+    ]);
+
+    // Clearing generic config restores the default for that space alone.
+    liveMesh.setEventSourceConfig("gchat:spaces/team", null, "root");
+    await emit("spaces/team", "t4");
+    await emit("spaces/dm", "d4", { dm: true });
+    expect(delivered()).not.toContain("spaces/team/messages/t4");
+    expect(delivered()).not.toContain("spaces/dm/messages/d4");
+
+    // An unexpected inbound space name (e.g. thread-qualified, which chatSpaceResource
+    // rejects as not naming a single space) safely falls back to default mode
+    // without throwing, so it reaches inbox delivery and emergency halt (#695).
+    await emit("spaces/team/threads/t1", "u1", { mention: true });
+    expect(delivered()).toContain("spaces/team/threads/t1/messages/u1");
+
+    // Emergency halt brake functions even when the inbound space name is unparseable for wake mode
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/halt1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/halt",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/resume1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/resume",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Resumed");
+  });
+
   it("handles scoped/timed halt commands mechanically and requires resume before replacement", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();

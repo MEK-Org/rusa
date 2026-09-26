@@ -106,6 +106,7 @@ describe("Database Migration System", () => {
       "0048_portable_context_snapshots",
       "0049_obligation_responsive",
       "0050_drop_obligation_ready_heads",
+      "0051_event_source_config",
     ]);
 
     const tableNames = (

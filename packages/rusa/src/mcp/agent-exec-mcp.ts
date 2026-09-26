@@ -702,7 +702,7 @@ export function createAgentExecMcpServer(
     {
       title: "Reclaim delegated event source",
       description:
-        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed. Live obligation claims take precedence over stored subscriptions.",
+        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed, or when you delegated it and no owner of an underlying source remains (a delegated root source). Live obligation claims take precedence over stored subscriptions.",
       inputSchema: eventResourceInputSchema,
     },
     async ({ source, kind, org, repo, number, ref, space }) => {
@@ -713,6 +713,53 @@ export function createAgentExecMcpServer(
         );
         mesh.reclaimEventSource(resource, selfId);
         return toolOk(`reclaimed ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  // ── Event-source configuration (#692) ── Each consumer owns the versioned
+  // keys it understands on its active exact ownership rows. A routing claim
+  // never exposes or mutates another row's opaque configuration.
+  server.registerTool(
+    "list_event_sources",
+    {
+      title: "List your event sources",
+      description:
+        "List your active exact event-source ownership rows and their stored configuration objects. Every listed row accepts set_event_source_config. A null config means that row has no explicit configuration; live obligation routing claims and sources implied by the operator's configured event sources are not configuration rows.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return toolOk(mesh.listEventSources(selfId));
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_event_source_config",
+    {
+      title: "Set an event source's configuration",
+      description:
+        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
+      inputSchema: {
+        ...eventResourceInputSchema,
+        config: z
+          .record(z.string(), z.unknown())
+          .nullable()
+          .describe("The complete versioned configuration object, or null to clear it."),
+      },
+    },
+    async ({ source, kind, org, repo, number, ref, space, config }) => {
+      try {
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "configuration"
+        );
+        return toolOk(mesh.setEventSourceConfig(resource, config, selfId));
       } catch (err) {
         return toolError(err);
       }

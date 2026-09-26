@@ -363,6 +363,21 @@ describe("reconcileEventSources", () => {
     });
   });
 
+  it("keeps configured root sources as non-configurable implied rows", () => {
+    const persistent = new InMemoryEventSourceOwnerStore();
+    const result = reconcileEventSources(persistent, [chat], rootId, () => "2026-07-02T00:00:00Z");
+
+    // The active row is derived from the operator's broad source config, not
+    // an exact persistent boundary. A generic config write must fail cleanly
+    // here instead of materializing a row and changing routing semantics.
+    expect(result.store.activeForResource(chat).map((row) => row.actorId)).toEqual([rootId]);
+    expect(result.store.getConfig(chat)).toBeUndefined();
+    expect(() => result.store.setConfig(chat, '{"version":1,"chatWakeMode":"all"}')).toThrow(
+      /no active event-source owner/
+    );
+    expect(persistent.list()).toEqual([]);
+  });
+
   it("seeds and reconciles the system family as a config-owned root source", () => {
     const store = new InMemoryEventSourceOwnerStore();
     const now = () => "2026-07-02T00:00:00Z";
