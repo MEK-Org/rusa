@@ -241,6 +241,10 @@ export class QuotaCoordinatorClient {
   private lastSuccessfulReadMs: Map<string, number> = new Map();
   private lastPublishedStatuses: Map<string, PublishedThrottleProviderStatus> = new Map();
   private historyCache: Map<string, readonly PublishedHistoryRecord[]> = new Map();
+  private historyReadsInFlight: Map<string, Promise<readonly PublishedHistoryRecord[] | null>> =
+    new Map();
+  /** Providers whose most recent history read failed; their cache may be absent or last-good. */
+  private historyReadFailed: Set<string> = new Set();
   private serviceConnected = false;
   private nextReadAllowedAtMs = 0;
   private reconnectBackoffMs = RECONNECT_BACKOFF_MIN_MS;
@@ -508,12 +512,46 @@ export class QuotaCoordinatorClient {
   }
 
   /**
+   * Dashboard read-through (#707): when a provider has never had a successful
+   * history read, or its most recent read failed, read it now so the caller
+   * serves what the coordinator has rather than waiting for the next periodic
+   * refresh. Otherwise resolves immediately. Bounded by the request timeout, and
+   * joins a read already in flight for the provider rather than starting another.
+   */
+  async readThroughHistory(provider: string): Promise<void> {
+    if (this.historyCache.has(provider) && !this.historyReadFailed.has(provider)) return;
+    await this.getHistory(provider);
+  }
+
+  /**
    * Fetch published history for a provider from the coordinator service via GET /v1/history.
    * Treats history failures as null without replacing the existing cache entry on transport,
    * timeout, HTTP non-200, JSON parse, protocolMajor mismatch, identity mismatch, or invalid shape.
    * [] is reserved for a valid empty response.
+   *
+   * At most one read per provider is in flight: a call made while one is
+   * pending joins it, whatever its `since` (callers all read the same
+   * `HISTORY_WINDOW_MS` window).
    */
-  async getHistory(
+  getHistory(provider: string, since?: string): Promise<readonly PublishedHistoryRecord[] | null> {
+    const inFlight = this.historyReadsInFlight.get(provider);
+    if (inFlight) return inFlight;
+    const read = this.requestHistory(provider, since)
+      .then((records) => {
+        if (records === null) this.historyReadFailed.add(provider);
+        else this.historyReadFailed.delete(provider);
+        return records;
+      })
+      .finally(() => {
+        // Cleared however the read settles, so a rejection cannot leave later
+        // reads joining a dead promise.
+        this.historyReadsInFlight.delete(provider);
+      });
+    this.historyReadsInFlight.set(provider, read);
+    return read;
+  }
+
+  private requestHistory(
     provider: string,
     since?: string
   ): Promise<readonly PublishedHistoryRecord[] | null> {
