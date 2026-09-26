@@ -38,6 +38,8 @@ export function createHarness(options: {
   pacer?: ProviderPacer;
   startupTimeoutMs?: number;
   stateStaleTimeoutMs?: number;
+  /** Provider halt state, for tests about halted-queue cancellation and replay. */
+  isHalted?: (provider?: string, model?: string) => boolean;
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -112,6 +114,7 @@ export function createHarness(options: {
     eventSourceOwners,
     eventSourceSubscriptions,
     maxConcurrent: 1,
+    isHalted: options.isHalted,
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     ...(pacer

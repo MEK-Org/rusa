@@ -3,7 +3,7 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
-import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
+import { type ActorRunMode, mergeNudges, type RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
@@ -11,6 +11,7 @@ import type { ActorChannel } from "./actor-channel.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_ADMISSION_CANCELLED_ERROR,
   COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
   type LeaderCommand,
@@ -62,6 +63,16 @@ export class ActorHandle implements MeshActor {
   exited!: Promise<void>;
   private readonly log: Logger;
   private runStartTime?: number;
+  /** Wall-clock start of the open run, the watermark a running interrupt sets. */
+  private runStartedAt?: Date;
+  /**
+   * Inbox items delivered at or before this time do not justify another run.
+   * The leader answers the follower's beforeRun, so it owns the watermark.
+   */
+  private interruptedWatermark: Date | null = null;
+  /** A queued start was cancelled; {@link resumeCancelledRun} replays it. */
+  private cancelledQueuedRun = false;
+  private cancelledQueuedNudge: RunNudge | undefined;
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
@@ -77,6 +88,8 @@ export class ActorHandle implements MeshActor {
       modelConfigGeneration: number;
       /** The pool changed after this reservation quoted; retry it under the new pool. */
       modelConfigStale: boolean;
+      /** An operator interrupt or provider halt cancelled this reservation. */
+      cancelled: boolean;
     }
   >();
   private startupTimer?: ReturnType<typeof setTimeout>;
@@ -255,13 +268,94 @@ export class ActorHandle implements MeshActor {
   }
 
   requestRun(nudge?: RunNudge): void {
+    this.sendWake({ type: "wake", nudge }, nudge);
+  }
+
+  /** Wakes wait for the reattach state report, so a pending preempt decision goes first. */
+  private sendWake(command: LeaderCommand, nudge?: RunNudge): void {
     void this.ready
       .then(() => this.stateSettled)
       .then(() => {
-        if (this.closed || !this.send({ type: "wake", nudge })) this.reportDroppedWake(nudge);
+        if (this.closed || !this.send(command)) this.reportDroppedWake(nudge);
       })
       .catch(() => this.reportDroppedWake(nudge));
   }
+
+  /**
+   * Cancel an admission the leader reserved and the follower has not started,
+   * giving back its place in provider pacing and concurrency. The follower's
+   * Actor books the run `start-cancelled` and keeps the opportunity, as a local
+   * queued-start cancellation does, until {@link resumeCancelledRun}.
+   */
+  cancelQueuedRun(): boolean {
+    if (this.terminated) return false;
+    const unstarted = [...this.gates.values()].filter((gate) => !gate.handle.started);
+    if (unstarted.length === 0) return false;
+    let cancelled = false;
+    for (const gate of unstarted) {
+      gate.cancelled = true;
+      if (gate.handle.cancel?.()) cancelled = true;
+    }
+    if (!cancelled) return false;
+    // The gate's rejection replies on a later microtask, so this command lands
+    // first and the follower settles its start as cancelled, not failed.
+    this.send({ type: "cancelQueued" });
+    const responsive = unstarted.some((gate) => gate.admission.responsive);
+    this.cancelledQueuedNudge = mergeNudges(this.cancelledQueuedNudge ?? null, {
+      ...(responsive ? { priority: "responsive" } : {}),
+      mode: this.queuedMode ?? "ordinary",
+    });
+    this.cancelledQueuedRun = true;
+    this.opts.context.onQueuedRunCancelled?.();
+    return true;
+  }
+
+  /** Replay the scheduling opportunity retained by {@link cancelQueuedRun}. */
+  resumeCancelledRun(): boolean {
+    if (!this.cancelledQueuedRun) return false;
+    const nudge = this.cancelledQueuedNudge ?? {};
+    this.cancelledQueuedRun = false;
+    this.cancelledQueuedNudge = undefined;
+    this.sendWake({ type: "resumeCancelled", nudge }, nudge);
+    return true;
+  }
+
+  /**
+   * Operator interrupt. A queued start is cancelled here, where its admission
+   * lives; a started run is aborted by the follower, which owns the provider.
+   * The follower's answer is asynchronous, so a run that finishes before the
+   * command lands simply completes.
+   */
+  interrupt(by = "human:operator"): {
+    interrupted: boolean;
+    runStartTime?: Date;
+    wasQueued?: boolean;
+  } {
+    const now = new Date();
+    const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
+    if (this.isRunning || admitted) {
+      if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
+      const runStartTime = this.runStartedAt ?? now;
+      this.interruptedWatermark = runStartTime;
+      return { interrupted: true, runStartTime, wasQueued: false };
+    }
+    if (!this.cancelQueuedRun()) return { interrupted: false };
+    this.interruptedWatermark = now;
+    if (this.state === "queued") {
+      this.state = "idle";
+      this.opts.context.onRuntimeStateChanged("idle");
+    }
+    return { interrupted: true, runStartTime: now, wasQueued: true };
+  }
+
+  getInterruptedWatermark(): Date | null {
+    return this.interruptedWatermark;
+  }
+
+  clearInterruptWatermark(): void {
+    this.interruptedWatermark = null;
+  }
+
   declareYield(status?: string, note?: string): void {
     // Fence parent-hosted tools immediately when the mesh accepts yield_run.
     this.yielded = true;
@@ -503,6 +597,7 @@ export class ActorHandle implements MeshActor {
         ? Math.round(performance.now() - this.runStartTime)
         : undefined;
     this.runStartTime = undefined;
+    this.runStartedAt = undefined;
     this.log.info("remote_run_end", {
       actorId: this.id,
       target: this.opts.target ?? this.channel.nodeId,
@@ -687,6 +782,11 @@ export class ActorHandle implements MeshActor {
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
+        this.runStartedAt = new Date();
+        // A run that starts after the interrupt has moved past it, as locally.
+        if (this.interruptedWatermark && this.runStartedAt > this.interruptedWatermark) {
+          this.interruptedWatermark = null;
+        }
         this.queuedRunId = message.runId ?? this.queuedRunId ?? randomUUID();
         this.startedRunId = this.queuedRunId;
         // Mark the terminal claim before awaiting observers. The first
@@ -880,6 +980,7 @@ export class ActorHandle implements MeshActor {
                   admission,
                   modelConfigGeneration,
                   modelConfigStale: false,
+                  cancelled: false,
                 });
                 void handle.result.catch((error: Error) => {
                   const gate = this.gates.get(requestId);
@@ -892,7 +993,11 @@ export class ActorHandle implements MeshActor {
                     });
                     return;
                   }
-                  this.send({ type: "reply", requestId, error: error.message });
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    error: gate?.cancelled ? COORDINATOR_ADMISSION_CANCELLED_ERROR : error.message,
+                  });
                   // A retained ticket that loses its place (the leader gave up, or
                   // pacing released it into a dead channel) ends the run it held:
                   // nothing else is left to report that run's outcome.

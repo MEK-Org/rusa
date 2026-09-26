@@ -6,12 +6,14 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 6;
+export const INSTANCE_PROTOCOL_VERSION = 7;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
 /** The leader replaced a queued actor's pool; re-run the same admission against it. */
 export const COORDINATOR_MODEL_CONFIG_CHANGED_ERROR = "Coordinator model configuration changed";
+/** An operator interrupt or a provider halt cancelled the queued admission before it started. */
+export const COORDINATOR_ADMISSION_CANCELLED_ERROR = "Coordinator cancelled the queued admission";
 export interface Bootstrap {
   id: string;
   cwd: string;
@@ -86,6 +88,16 @@ export type LeaderCommand =
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }
+  /** Operator interrupt of the run the follower is executing. */
+  | { type: "interrupt"; by: string }
+  /**
+   * The leader is cancelling this actor's unstarted admission. Sent before the
+   * admission's error reply, so the follower's Actor keeps the opportunity for
+   * `resumeCancelled` exactly as a local queued-start cancellation does.
+   */
+  | { type: "cancelQueued" }
+  /** Replay a cancelled queued opportunity; `nudge` covers a follower that kept none. */
+  | { type: "resumeCancelled"; nudge: RunNudge }
   | { type: "yield"; status?: string; note?: string }
   | { type: "unkillable" }
   | { type: "stop" }
