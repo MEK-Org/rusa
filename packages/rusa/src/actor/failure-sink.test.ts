@@ -76,11 +76,13 @@ describe("routeRunFailure", () => {
     expect(toChat).toHaveLength(0);
   });
 
-  it("preserves the lifecycle's durable run id in a child failure notice", async () => {
+  it("identifies a failed launched provider run without mislabeling selection", async () => {
     const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
 
-    await routeRunFailure(deps, "w1", FAIL, undefined, "run-04d139ba");
+    await routeRunFailure(deps, "w1", FAIL, "kimi/kimi-for-coding @ high", "run-04d139ba");
 
+    expect(toParent[0]?.body).toContain("provider run kimi/kimi-for-coding @ high failed.");
+    expect(toParent[0]?.body).not.toContain("provider selection");
     expect(toParent[0]?.forensics).toEqual({
       runId: "run-04d139ba",
       actorId: "w1",
@@ -183,7 +185,7 @@ describe("routeRunFailure", () => {
       expect(body).toContain("boom");
     });
 
-    it("attributes a native rejection when classify reports not exhausted", async () => {
+    it("labels a non-exhausted provider run failure", async () => {
       const { deps, toParent } = makeDeps(
         { w1: { id: "w1", parentId: "root" } },
         { classify: async () => ({ exhausted: false }) }
@@ -192,7 +194,7 @@ describe("routeRunFailure", () => {
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
       expect(body).toBe(
-        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+        "[run failed] provider run claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
       );
     });
 
@@ -211,18 +213,18 @@ describe("routeRunFailure", () => {
       await routeRunFailure(deps, "w1", networkFail, "antigravity");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toContain("[run failed] provider selection antigravity failed.");
+      expect(body).toContain("[run failed] provider run antigravity failed.");
       expect(body).toContain("(exit 1)");
       expect(body).toContain("connect ETIMEDOUT");
     });
 
-    it("attributes a native rejection when no classifier is configured", async () => {
+    it("labels a provider run failure when no classifier is configured", async () => {
       const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
       await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
       expect(body).toBe(
-        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+        "[run failed] provider run claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
       );
     });
   });

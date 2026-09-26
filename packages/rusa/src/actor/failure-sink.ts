@@ -160,8 +160,8 @@ function findDirtyOrAheadRepoPath(workerDir: string): string | null {
  * another provider/tier, or re-scope) — so an exhaustion classification leads
  * the notice with a named condition, ahead of the usual exit-code/tail
  * summary. `providerLabel` (typically `<provider>/<model> @ <effort>`, via
- * {@link formatProviderLabel}) attributes both exhaustion and native selection
- * rejection to the exact requested provider selection.
+ * {@link formatProviderLabel}) identifies the provider/model that produced the
+ * failed run; it does not claim that selection itself failed.
  */
 export async function routeRunFailure(
   deps: FailureSinkDeps,
@@ -192,7 +192,7 @@ export async function routeRunFailure(
   }
 
   if (!leadLine && providerLabel) {
-    leadLine = `provider selection ${providerLabel} failed.`;
+    leadLine = `provider run ${providerLabel} failed.`;
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
   routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result, runId);
