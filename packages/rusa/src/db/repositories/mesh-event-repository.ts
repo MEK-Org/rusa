@@ -155,11 +155,10 @@ export class MeshEventRepository {
    * expensive one. `mesh_events` on the live mesh is 70 MB of leaf pages plus
    * 120 MB of overflow pages, and the overflow is almost entirely run
    * transcripts on `run_end` — 138 MB that {@link list} materialises into JS
-   * strings on every call and that the commitment ledger, its only whole-history
-   * reader, never looks at. Measured on that database through the actor list's
-   * cache miss, which is the ledger's one hot caller: 1748 ms and +511 MB RSS
-   * with {@link list}, 763 ms and +77 MB with this read, for a byte-identical
-   * response.
+   * strings on every call and that a kind-filtered reader such as the startup
+   * event-subscription audit never looks at. Measured on that database for a
+   * whole-history fold: 1748 ms and +511 MB RSS with {@link list}, 763 ms and
+   * +77 MB with this read, for a byte-identical response.
    *
    * Body resolution is unchanged — `body` and the `mesh_chat` join are selected
    * together for `bodyKinds` and resolved by {@link toMeshEvent}, so a

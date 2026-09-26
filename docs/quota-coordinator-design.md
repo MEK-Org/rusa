@@ -1125,13 +1125,14 @@ things this pins, and the first two are corrections review earned:
   boundary to special-case.
 - **The widening takes the wider of the two, rather than assigning.** Every
   bucket's `interval_seconds` is already clamped at record time by
-  `Math.min(maxIntervalSeconds, uncappedInterval)` (`shared-store.ts:934-41`), so in
+  `Math.min(maxIntervalSeconds, uncappedInterval)` (the controller step,
+  `SharedQuotaStore.advanceObservation`), so in
   the steady case `stored(p).intervalSeconds ≤ maxIntervalSeconds` and the `max`
   is simply `maxIntervalSeconds`. It earns its keep only after a config edit
   lowers `maxIntervalSeconds` beneath a value already recorded — a real
   possibility, since that setting is operator-editable and rows outlive edits
-  (`shared-store.ts:1113-89` serves retained reasoned rows until newer ones
-  arrive). A
+  (`SharedQuotaStore.getProviderThrottle` serves retained reasoned rows until
+  newer ones arrive). A
   plain assignment would then make a hard-stale provider publish *faster* than
   its own stored interval, which is precisely what "the degradation is always
   toward slower, never faster" forbids.
