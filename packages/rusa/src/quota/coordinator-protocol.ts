@@ -13,25 +13,16 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 export const COORDINATOR_PROTOCOL_MINOR = 2;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
+export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 /**
  * Scrape-mode soft stale: three missed ticks past the moment a probe refresh
- * is due, so a healthy lane reading one full TTL old is still fresh.
+ * is due, so a healthy lane reading one full TTL old is still fresh. Clamped
+ * to the scrape hard stale so the pair stays ordered for long ticks.
  */
 export function scrapeStaleAfterMs(tickSeconds: number): number {
-  if (
-    !Number.isFinite(tickSeconds) ||
-    !Number.isInteger(tickSeconds) ||
-    tickSeconds <= 0 ||
-    tickSeconds >= 600
-  ) {
-    throw new RangeError(
-      `tickSeconds (${tickSeconds}) must be a positive integer less than 600 to preserve scrape hard-stale timing`
-    );
-  }
-  return QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000;
+  return Math.min(QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000, DEFAULT_HARD_STALE_AFTER_MS);
 }
 export const DEFAULT_STALE_AFTER_MS = scrapeStaleAfterMs(300); // 45 min (30m TTL + 3 x 300s)
-export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 /**
  * Manual mode sizes for reader plus submitter latency on paced lanes (#690):
  * 15–40 min reader and 13–27 min submitter latency were observed in steady state.

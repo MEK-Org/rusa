@@ -498,7 +498,7 @@ providers:
     cliCommand: claude
 quota:
   throttle:
-    tickSeconds: 300
+    tickSeconds: 900
     manualHardStaleSeconds: 5400
   coordinator:
     socketPath: ${join(home, "coordinator.sock")}
@@ -518,10 +518,11 @@ quota:
       "test-abort-freshness"
     );
 
-    // Scrape soft stale is anchored to the 30m probe TTL, and the manual
-    // override reaches the service without the scrape value shadowing it.
+    // A long tick still loads: scrape soft stale (30m + 3 ticks) clamps to the
+    // 60m scrape hard stale, and the manual override reaches the service
+    // without the scrape value shadowing it.
     expect(captured).toMatchObject({
-      staleAfterMs: 45 * 60_000,
+      staleAfterMs: 60 * 60_000,
       manualHardStaleAfterMs: 5_400_000,
     });
     expect(captured?.hardStaleAfterMs).toBeUndefined();

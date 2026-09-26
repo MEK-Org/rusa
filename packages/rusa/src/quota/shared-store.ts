@@ -1110,9 +1110,10 @@ export class SharedQuotaStore {
     const previousInterval = previous?.intervalSeconds ?? 0;
     // Ingestion produces one durable observation per actual scrape/manual POST;
     // cache reads and collection ticks only see the already-persisted state, so
-    // `dtSeconds` here is observation age rather than request cadence. Credit
-    // at most one trusted 30-minute slot, consistently for smoothing, slew,
-    // and integration; cached reads cannot create another response.
+    // `dtSeconds` here is the elapsed time between persisted observations, not
+    // request cadence. Credit at most one trusted 30-minute slot, consistently
+    // for smoothing, slew, and integration; cached reads cannot create another
+    // response.
     const { smoothing, slew } = elapsedActuatorResponse(dtSeconds, previous != null);
     const smoothed = previousInterval + smoothing * (uncappedCandidate - previousInterval);
     const uncappedInterval = Math.max(

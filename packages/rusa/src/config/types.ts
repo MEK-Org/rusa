@@ -92,13 +92,13 @@ export interface QuotaThrottleConfig {
   enabled?: boolean;
   /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
   maxIntervalSeconds?: number;
-  /** Collection/controller tick in seconds. Default 300 (five minutes). Provider probes are cached for 30 minutes; must be less than 600 to preserve scrape hard-stale timing. */
+  /** Collection/controller tick in seconds. Default 300 (five minutes). Provider probes are cached for 30 minutes; scrape soft stale is min(30m + 3 ticks, 60m). */
   tickSeconds?: number;
   /**
    * Manual reading mode only: age in seconds past which the published interval
    * widens to maxIntervalSeconds. Default 7200. Manual soft stale is
-   * min(3600, this). Scrape mode keeps soft = 30m probe TTL + 3 * tickSeconds
-   * and hard = 3600, and is not affected by this field.
+   * min(3600, this). Scrape mode keeps soft = min(30m probe TTL + 3 * tickSeconds,
+   * 3600) and hard = 3600, and is not affected by this field.
    */
   manualHardStaleSeconds?: number;
 }

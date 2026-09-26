@@ -90,12 +90,9 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
     quotaThrottle.tickSeconds !== undefined &&
     (!Number.isFinite(quotaThrottle.tickSeconds) ||
       !Number.isInteger(quotaThrottle.tickSeconds) ||
-      quotaThrottle.tickSeconds <= 0 ||
-      quotaThrottle.tickSeconds >= 600)
+      quotaThrottle.tickSeconds <= 0)
   ) {
-    throw new Error(
-      "config.yaml: quota.throttle.tickSeconds must be a positive integer less than 600"
-    );
+    throw new Error("config.yaml: quota.throttle.tickSeconds must be a positive integer");
   }
   if (
     quotaThrottle.manualHardStaleSeconds !== undefined &&

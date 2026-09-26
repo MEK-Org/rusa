@@ -169,9 +169,9 @@ quota.throttle:
 
   enabled                  Optional boolean. Enables persisted closed-loop launch pacing.
   maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
-  tickSeconds              Optional positive integer collection/controller tick; defaults to 300. Must
-                           be less than 600. Provider probes are cached for 30 minutes; scrape-mode
-                           soft stale is 30m + 3 ticks.
+  tickSeconds              Optional positive integer collection/controller tick; defaults to 300.
+                           Provider probes are cached for 30 minutes; scrape-mode soft stale is
+                           min(30m + 3 ticks, 60m).
   manualHardStaleSeconds   Optional positive integer for manual reading mode only; defaults to 7200. Past it
                            the published interval widens to maxIntervalSeconds. Manual soft stale is
                            min(3600, this). Scrape-mode thresholds are unaffected.

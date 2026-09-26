@@ -1315,16 +1315,18 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   });
 
-  it("bounds a delayed observation to one trusted 30m response slot (#690)", () => {
+  it("moves a late observation no further than an on-cadence 30m one (#690)", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-delayed-actuator-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const onCadence = new SharedQuotaStore(join(root, "on-cadence.db"));
+    const delayed = new SharedQuotaStore(join(root, "delayed.db"));
     try {
-      store.configureController({ maxIntervalSeconds: 36000 });
+      onCadence.configureController({ maxIntervalSeconds: 36000 });
+      delayed.configureController({ maxIntervalSeconds: 36000 });
       const startMs = Date.parse("2030-01-01T00:00:00.000Z");
       const reset = "2030-01-08T00:00:00.000Z";
       const weeklyMs = 7 * 24 * 60 * 60 * 1000;
-      const recordError = (offsetMinutes: number, error: number) => {
+      const recordError = (store: SharedQuotaStore, offsetMinutes: number, error: number) => {
         const observedMs = startMs + offsetMinutes * 60 * 1000;
         recordObservation(
           store,
@@ -1335,15 +1337,27 @@ describe("SharedQuotaStore PID integral term", () => {
         );
       };
 
-      recordError(0, 0);
-      recordError(30, 20);
-      const routine = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      recordError(5 * 60, 20);
-      const delayed = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      for (const store of [onCadence, delayed]) {
+        recordError(store, 0, 0);
+        recordError(store, 30, 20);
+      }
+      const before = reasonedRows(delayed, "claude").at(-1) as ReasonedRow;
+      recordError(onCadence, 60, 20);
+      recordError(delayed, 5 * 60, 20);
+      const next = reasonedRows(onCadence, "claude").at(-1) as ReasonedRow;
+      const late = reasonedRows(delayed, "claude").at(-1) as ReasonedRow;
 
-      expect(delayed.interval - routine.interval).toBeLessThanOrEqual(6 * 900);
+      // The 5h-late reading is credited as one 30m slot, so it moves the
+      // interval as far as the on-cadence reading does; only the derivative
+      // filter, which decays over the real gap, separates them (~0.2%). Without
+      // the 1800s credit cap, the late step is ~21% larger.
+      const lateStep = late.interval - before.interval;
+      const onCadenceStep = next.interval - before.interval;
+      expect(lateStep).toBeGreaterThan(0);
+      expect(Math.abs(lateStep - onCadenceStep)).toBeLessThan(0.01 * onCadenceStep);
     } finally {
-      store.close();
+      onCadence.close();
+      delayed.close();
     }
   });
 
@@ -1374,43 +1388,6 @@ describe("SharedQuotaStore PID integral term", () => {
       const noisy = reasonedRows(store, "claude").at(-1) as ReasonedRow;
 
       expect(Math.abs(noisy.interval - beforeNoise.interval)).toBeLessThanOrEqual(900);
-    } finally {
-      store.close();
-    }
-  });
-
-  it("bounds long gaps to 30m step and resets anti-windup on window reset / refill (#690)", () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-antiwindup-"));
-    roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"));
-    try {
-      store.configureController({ maxIntervalSeconds: 36000 });
-      const reset1 = "2030-01-08T00:00:00.000Z";
-
-      // Initial observation at t=0
-      recordObservation(store, "kimi", "2030-01-01T00:00:00.000Z", 90, reset1);
-      // Long gap of 2 hours (7200s): must be clamped to 1800s (30m)
-      recordObservation(store, "kimi", "2030-01-01T02:00:00.000Z", 80, reset1);
-
-      const afterLongGap = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
-      // Integrated dt must be bounded by 1800s, not 7200s
-      expect(afterLongGap.integral).toBeCloseTo(afterLongGap.error * 1800, 4);
-
-      // A 10h outage adds at most one 1800s slot of area as well.
-      recordObservation(store, "kimi", "2030-01-01T12:00:00.000Z", 70, reset1);
-      const afterOutage = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
-      expect(afterOutage.integral).toBeCloseTo(afterLongGap.integral + afterOutage.error * 1800, 4);
-
-      // Now simulate a window reset / refill: resetMoves or quotaRefilled
-      const reset2 = "2030-01-15T00:00:00.000Z";
-      recordObservation(store, "kimi", "2030-01-08T00:05:00.000Z", 98, reset2);
-
-      const afterReset = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
-      // Cycle changed zeroes integralDtSeconds and previousIntegral
-      expect(afterReset.integral).toBe(0);
-      // Resetting state does not bypass the one trusted 30-minute response
-      // bound when it computes the next applied interval.
-      expect(Math.abs(afterReset.interval - afterOutage.interval)).toBeLessThanOrEqual(6 * 900);
     } finally {
       store.close();
     }

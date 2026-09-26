@@ -1228,135 +1228,10 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(published.intervalSeconds).toBe(3600);
   });
 
-  it("#690: /v1/throttle exposes freshness mode, thresholds, and resetWaiting", async () => {
+  it("#690: /v1/throttle serves each lane's own freshness mode and thresholds", async () => {
     store.configureController({ maxIntervalSeconds: 3600 });
-    service = new QuotaCoordinatorService({
-      socketPath,
-      store,
-      configuredProviders: ["kimi", "claude"],
-    });
-    await service.start();
-
-    // Default scrape mode for kimi
-    const nowMs = Date.now();
-    const idKimi = store.recordRaw({
-      provider: "kimi",
-      scrapedAt: new Date(nowMs - 10_000).toISOString(),
-      rawOutput: "raw",
-    });
-    store.recordParsed(
-      idKimi,
-      {
-        provider: "kimi",
-        status: "available",
-        scrapedAt: new Date(nowMs - 10_000).toISOString(),
-        limits: [
-          {
-            kind: "session",
-            label: "5h",
-            percentLeft: 90,
-            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
-          },
-        ],
-      },
-      {
-        provider: "kimi",
-        status: "available",
-        scrapedAt: new Date(nowMs - 10_000).toISOString(),
-        limits: [
-          {
-            kind: "session",
-            label: "5h",
-            percentLeft: 90,
-            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
-          },
-        ],
-      }
-    );
-
-    const scrapeRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
-    expect(scrapeRes.status).toBe(200);
-    expect(scrapeRes.json.freshness).toMatchObject({
-      mode: "scrape",
-      stale: false,
-      hardStale: false,
-      resetWaiting: false,
-    });
-    expect(scrapeRes.json.freshness.staleAfterMs).toBeGreaterThan(0);
-    expect(scrapeRes.json.freshness.hardStaleAfterMs).toBeGreaterThanOrEqual(
-      scrapeRes.json.freshness.staleAfterMs
-    );
-
-    // Switch claude to manual mode and record an observation
-    const switchRes = await makeRequest(
-      socketPath,
-      QUOTA_READING_MODE_PATH,
-      "POST",
-      JSON.stringify({ provider: "claude", mode: "manual" })
-    );
-    expect(switchRes.status).toBe(200);
-
-    const manualObservedAt = new Date(nowMs - 70 * 60 * 1000).toISOString(); // 70m ago (> 60m soft, < 120m hard)
-    const idClaude = store.recordRaw({
-      provider: "claude",
-      scrapedAt: manualObservedAt,
-      rawOutput: "manual",
-    });
-    store.recordParsed(
-      idClaude,
-      {
-        provider: "claude",
-        status: "available",
-        scrapedAt: manualObservedAt,
-        limits: [
-          {
-            kind: "session",
-            label: "Session",
-            percentLeft: 80,
-            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
-          },
-        ],
-      },
-      {
-        provider: "claude",
-        status: "available",
-        scrapedAt: manualObservedAt,
-        limits: [
-          {
-            kind: "session",
-            label: "Session",
-            percentLeft: 80,
-            resetAtIso: new Date(nowMs + 3600_000).toISOString(),
-          },
-        ],
-      }
-    );
-
-    const manualRes = await makeRequest(socketPath, "/v1/throttle?provider=claude");
-    expect(manualRes.status).toBe(200);
-    expect(manualRes.json.freshness).toMatchObject({
-      mode: "manual",
-      staleAfterMs: 3_600_000, // 60m default
-      hardStaleAfterMs: 7_200_000, // 120m default
-      stale: true, // 70m > 60m
-      hardStale: false, // 70m < 120m
-      resetWaiting: false,
-    });
-
-    // Collection route carries the same freshness fields
-    const collRes = await makeRequest(socketPath, "/v1/throttle");
-    expect(collRes.status).toBe(200);
-    expect(collRes.json.providers.claude.freshness).toMatchObject({
-      mode: "manual",
-      stale: true,
-      hardStale: false,
-    });
-    expect(collRes.json.providers.kimi.freshness.mode).toBe("scrape");
-  });
-
-  it("#690: manual thresholds never inherit scrape options, and scrape stays fresh for one probe TTL", async () => {
-    store.configureController({ maxIntervalSeconds: 3600 });
-    // The production command always passes the scrape thresholds.
+    // The production command always passes the scrape thresholds; manual
+    // lanes must not inherit them.
     service = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -1388,47 +1263,46 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     // A scrape reading one full probe TTL old (plus a tick) is still fresh.
     recordSession("kimi", new Date(nowMs - 35 * 60_000).toISOString());
     const scrapeRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
+    expect(scrapeRes.status).toBe(200);
     expect(scrapeRes.json.freshness).toMatchObject({
       mode: "scrape",
       staleAfterMs: 45 * 60_000,
       hardStaleAfterMs: 60 * 60_000,
       stale: false,
       hardStale: false,
+      resetWaiting: false,
     });
 
-    await makeRequest(
+    const switchRes = await makeRequest(
       socketPath,
       QUOTA_READING_MODE_PATH,
       "POST",
       JSON.stringify({ provider: "claude", mode: "manual" })
     );
-    recordSession("claude", new Date(nowMs - 50 * 60_000).toISOString());
+    expect(switchRes.status).toBe(200);
+    // 70m old: past the 60m manual soft stale, inside the 120m hard stale.
+    // Under the scrape thresholds the service was given, it would be hard stale.
+    recordSession("claude", new Date(nowMs - 70 * 60_000).toISOString());
     const manualRes = await makeRequest(socketPath, "/v1/throttle?provider=claude");
+    expect(manualRes.status).toBe(200);
     expect(manualRes.json.freshness).toMatchObject({
       mode: "manual",
       staleAfterMs: 3_600_000,
       hardStaleAfterMs: 7_200_000,
-      stale: false,
+      stale: true,
+      hardStale: false,
+      resetWaiting: false,
+    });
+
+    // The collection route carries the same per-lane freshness.
+    const collRes = await makeRequest(socketPath, "/v1/throttle");
+    expect(collRes.status).toBe(200);
+    expect(collRes.json.providers.claude.freshness).toMatchObject({
+      mode: "manual",
+      stale: true,
       hardStale: false,
     });
-  });
-
-  it("#690: a manual hard-stale override below 60m pulls manual soft stale down with it", () => {
-    expect(freshnessThresholds("manual", { manualHardStaleAfterMs: 30 * 60_000 })).toEqual({
-      staleAfterMs: 30 * 60_000,
-      hardStaleAfterMs: 30 * 60_000,
-    });
-    const tuned = new QuotaCoordinatorService({
-      socketPath,
-      store,
-      configuredProviders: ["kimi"],
-      manualHardStaleAfterMs: 30 * 60_000,
-    });
-    expect(tuned).toMatchObject({
-      manualHardStaleAfterMs: 30 * 60_000,
-      staleAfterMs: DEFAULT_STALE_AFTER_MS,
-      hardStaleAfterMs: DEFAULT_HARD_STALE_AFTER_MS,
-    });
+    expect(collRes.json.providers.kimi.freshness).toMatchObject({ mode: "scrape", stale: false });
   });
 
   it("#690: /v1/throttle detects resetWaiting when window resetAt has passed without fresh reading", async () => {
@@ -1469,42 +1343,38 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.freshness.resetWaiting).toBe(true);
   });
 
-  it("#690: scrapeStaleAfterMs rejects tickSeconds >= 600 or invalid", () => {
-    expect(() => scrapeStaleAfterMs(600)).toThrow(RangeError);
-    expect(() => scrapeStaleAfterMs(1800)).toThrow(RangeError);
-    expect(() => scrapeStaleAfterMs(0)).toThrow(RangeError);
-    expect(() => scrapeStaleAfterMs(-1)).toThrow(RangeError);
-    expect(() => scrapeStaleAfterMs(1.5)).toThrow(RangeError);
-    expect(scrapeStaleAfterMs(300)).toBe(45 * 60 * 1000);
-  });
-
   it("#690: freshnessThresholds isolates manual and scrape modes", () => {
-    const manualDefault = freshnessThresholds("manual");
-    expect(manualDefault).toEqual({
-      staleAfterMs: 60 * 60 * 1000,
-      hardStaleAfterMs: 120 * 60 * 1000,
+    expect(freshnessThresholds("scrape")).toEqual({
+      staleAfterMs: 45 * 60_000,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    expect(freshnessThresholds("manual")).toEqual({
+      staleAfterMs: 60 * 60_000,
+      hardStaleAfterMs: 120 * 60_000,
     });
 
-    const scrapeDefault = freshnessThresholds("scrape");
-    expect(scrapeDefault).toEqual({
-      staleAfterMs: 45 * 60 * 1000,
-      hardStaleAfterMs: 60 * 60 * 1000,
+    // Manual mode ignores scrape options entirely.
+    expect(
+      freshnessThresholds("manual", {
+        scrapeStaleAfterMs: 5 * 60_000,
+        scrapeHardStaleAfterMs: 10 * 60_000,
+      })
+    ).toEqual({ staleAfterMs: 60 * 60_000, hardStaleAfterMs: 120 * 60_000 });
+
+    // A manual hard stale below 60m pulls manual soft stale down with it.
+    expect(freshnessThresholds("manual", { manualHardStaleAfterMs: 30 * 60_000 })).toEqual({
+      staleAfterMs: 30 * 60_000,
+      hardStaleAfterMs: 30 * 60_000,
     });
 
-    // Manual hard-stale below 60m clamps soft stale
-    const tunedManual = freshnessThresholds("manual", { manualHardStaleAfterMs: 30 * 60 * 1000 });
-    expect(tunedManual).toEqual({
-      staleAfterMs: 30 * 60 * 1000,
-      hardStaleAfterMs: 30 * 60 * 1000,
-    });
-
-    // Scrape hard stale remains 60m and is not raised
-    const scrapeWithLongTick = freshnessThresholds("scrape", {
-      scrapeStaleAfterMs: scrapeStaleAfterMs(500),
-    });
-    expect(scrapeWithLongTick).toEqual({
-      staleAfterMs: 30 * 60 * 1000 + 3 * 500 * 1000, // 55m
-      hardStaleAfterMs: 60 * 60 * 1000,
-    });
+    // Scrape soft stale is the probe TTL plus three ticks, clamped to the 60m
+    // scrape hard stale so long ticks keep the pair ordered.
+    expect(scrapeStaleAfterMs(300)).toBe(45 * 60_000);
+    expect(scrapeStaleAfterMs(500)).toBe(55 * 60_000);
+    expect(scrapeStaleAfterMs(600)).toBe(60 * 60_000);
+    expect(scrapeStaleAfterMs(1800)).toBe(60 * 60_000);
+    expect(freshnessThresholds("scrape", { scrapeStaleAfterMs: scrapeStaleAfterMs(1800) })).toEqual(
+      { staleAfterMs: 60 * 60_000, hardStaleAfterMs: 60 * 60_000 }
+    );
   });
 });
