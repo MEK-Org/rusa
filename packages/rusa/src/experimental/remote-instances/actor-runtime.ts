@@ -2,6 +2,7 @@ import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import {
   RunStartCancelledError,
+  type RunStartHandle,
   RunStartStaleProviderError,
 } from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
@@ -10,6 +11,7 @@ import type { CodingProvider, McpServerSpec } from "../../providers/types.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_ADMISSION_CANCELLED_ERROR,
   COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_ERROR,
   type LeaderCommand,
@@ -38,6 +40,20 @@ export function createActorRuntime(
   let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
   /** The admission request in flight, which a reconnecting leader can resume. */
   let pendingAdmission: { id: number; request: AdmitRequest } | undefined;
+  /**
+   * True only while a leader cancel command runs. The admission is the
+   * leader's resource, so only the leader can make its pending start
+   * cancellable; the Actor's own preempt and close paths still see an
+   * uncancellable start, as before.
+   */
+  let leaderCancelling = false;
+  /**
+   * The leader forwards an interrupt once it has admitted the start, so the
+   * command can land while that admission's reply is still unwinding toward
+   * the provider launch. The Actor then sees a queued start it cannot cancel;
+   * this refuses the start instead of letting the interrupted run launch.
+   */
+  let interruptedAdmission = false;
   const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0) {
@@ -160,8 +176,14 @@ export function createActorRuntime(
           throw err;
         }
       },
-      gate: async (fn, candidates, responsive) => {
+      gate: <T>(
+        fn: (selected: RawProviderModelConfig) => Promise<T>,
+        candidates: readonly RawProviderModelConfig[],
+        responsive: boolean
+      ): RunStartHandle<T> => {
         activeGates++;
+        // A new admission is a new opportunity; an older interrupt is not about it.
+        interruptedAdmission = false;
         const admitRequest: AdmitRequest = {
           op: "admit",
           candidates: [...candidates],
@@ -170,47 +192,68 @@ export function createActorRuntime(
         };
         const admission = request<RunSnapshot | { deferred: true }>(admitRequest);
         pendingAdmission = { id: admission.id, request: admitRequest };
-        try {
-          let admitted: RunSnapshot | { deferred: true };
+        const result = (async () => {
           try {
-            admitted = await admission.result;
-          } catch (err) {
-            if (
-              err instanceof Error &&
-              err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
-            ) {
-              // The leader cancelled a stale reservation after changing this
-              // Actor's pool. Actor's retry loop re-runs the same opportunity
-              // against the pool set by the preceding modelConfig command.
-              throw new RunStartStaleProviderError();
+            let admitted: RunSnapshot | { deferred: true };
+            try {
+              admitted = await admission.result;
+            } catch (err) {
+              if (
+                err instanceof Error &&
+                err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
+              ) {
+                // The leader cancelled a stale reservation after changing this
+                // Actor's pool. Actor's retry loop re-runs the same opportunity
+                // against the pool set by the preceding modelConfig command.
+                throw new RunStartStaleProviderError();
+              }
+              if (
+                err instanceof Error &&
+                (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
+                  err.message.includes(COORDINATOR_ADMISSION_CANCELLED_ERROR) ||
+                  err.message.includes("Coordinator disconnected"))
+              ) {
+                throw new RunStartCancelledError();
+              }
+              throw err;
             }
-            if (
-              err instanceof Error &&
-              (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
-                err.message.includes("Coordinator disconnected"))
-            ) {
+            if ("deferred" in admitted) throw new RunStartCancelledError();
+            snapshot = admitted;
+            if (stopping) throw new Error("Actor stopped before admission");
+            // The leader's admission decision, not wake ordering, sets the run's priority.
+            if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
+            sessionId = snapshot.record.sessionId;
+            if (snapshot.mcpServers) {
+              // Actor holds the array by reference, matching the in-process tool refresh path.
+              mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
+            }
+            if (interruptedAdmission) {
+              interruptedAdmission = false;
               throw new RunStartCancelledError();
             }
-            throw err;
+            // The leader's pacing gate owns selection; the follower runs what it reserved.
+            return await fn(snapshot.selected ?? candidates[0]);
+          } finally {
+            if (pendingAdmission?.id === admission.id) pendingAdmission = undefined;
+            send({ type: "release", requestId: admission.id });
+            activeGates--;
+            finishClose();
           }
-          if ("deferred" in admitted) throw new RunStartCancelledError();
-          snapshot = admitted;
-          if (stopping) throw new Error("Actor stopped before admission");
-          // The leader's admission decision, not wake ordering, sets the run's priority.
-          if (admitted.responsive && !responsive) actor?.promoteQueuedRun();
-          sessionId = snapshot.record.sessionId;
-          if (snapshot.mcpServers) {
-            // Actor holds the array by reference, matching the in-process tool refresh path.
-            mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
-          }
-          // The leader's pacing gate owns selection; the follower runs what it reserved.
-          return await fn(snapshot.selected ?? candidates[0]);
-        } finally {
-          if (pendingAdmission?.id === admission.id) pendingAdmission = undefined;
-          send({ type: "release", requestId: admission.id });
-          activeGates--;
-          finishClose();
-        }
+        })();
+        return {
+          result,
+          started: false,
+          promote: () => {},
+          // Settle the start here rather than waiting for the leader's error
+          // reply, so Actor.cancelQueuedRun keeps this opportunity for resume.
+          cancel: () => {
+            const call = leaderCancelling ? pending.get(admission.id) : undefined;
+            if (!call) return false;
+            pending.delete(admission.id);
+            call.reject(new RunStartCancelledError());
+            return true;
+          },
+        };
       },
       lifecycle: createActorLifecycle([
         {
@@ -304,6 +347,22 @@ export function createActorRuntime(
         send({ type: "preempted", requestId: message.requestId, ...result });
         break;
       }
+      case "interrupt":
+        if (actor?.interrupt(message.by).wasQueued && pendingAdmission) interruptedAdmission = true;
+        break;
+      case "cancelQueued":
+        leaderCancelling = true;
+        try {
+          actor?.cancelQueuedRun();
+        } finally {
+          leaderCancelling = false;
+        }
+        break;
+      case "resumeCancelled":
+        // A start the leader cancelled before this Actor could retain it (a
+        // lease flap, for one) still owes the actor its scheduling opportunity.
+        if (!stopping && actor && !actor.resumeCancelledRun()) actor.requestRun(message.nudge);
+        break;
       case "yield":
         actor?.declareYield(message.status, message.note);
         break;

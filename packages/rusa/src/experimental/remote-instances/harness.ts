@@ -38,6 +38,10 @@ export function createHarness(options: {
   pacer?: ProviderPacer;
   startupTimeoutMs?: number;
   stateStaleTimeoutMs?: number;
+  /** Provider halt state, for tests about halted-queue cancellation and replay. */
+  isHalted?: (provider?: string, model?: string) => boolean;
+  /** Leader-side observer, called as each follower event is received, for race-window tests. */
+  onEvent?: (actorId: string, event: ActorEvent) => void;
 }) {
   const actors = new InMemoryActorRepository();
   const runtimes = new Map<string, ActorHandle>();
@@ -112,6 +116,7 @@ export function createHarness(options: {
     eventSourceOwners,
     eventSourceSubscriptions,
     maxConcurrent: 1,
+    isHalted: options.isHalted,
     events: (event) => meshEvents.push(event),
     idgen: () => `instance-worker-${++sequence}`,
     ...(pacer
@@ -183,6 +188,7 @@ export function createHarness(options: {
         saveSession: (sessionId) => actors.patch(context.record.id, { sessionId }),
         onEvent: (event) => {
           events.push({ actorId: context.record.id, event });
+          options.onEvent?.(context.record.id, event);
           if (event.type === "result" && event.result.success) cursor = admittedCursor;
         },
         onFailure: (error) => {

@@ -3,7 +3,7 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
-import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
+import { type ActorRunMode, mergeNudges, type RunNudge } from "../../actor/trigger-runner.js";
 import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
@@ -11,6 +11,7 @@ import type { ActorChannel } from "./actor-channel.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_ADMISSION_CANCELLED_ERROR,
   COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR,
   type LeaderCommand,
@@ -62,6 +63,31 @@ export class ActorHandle implements MeshActor {
   exited!: Promise<void>;
   private readonly log: Logger;
   private runStartTime?: number;
+  /** When the leader received the open run's `runStart`. */
+  private runStartedAt?: Date;
+  /**
+   * When the leader handed the open admission, and with it the prompt snapshot,
+   * to the follower: the watermark a running interrupt sets. Nothing delivered
+   * after it reached that run's prompt.
+   */
+  private admittedAt?: Date;
+  /**
+   * Inbox items delivered at or before this time do not justify another run.
+   * The leader answers the follower's beforeRun, so it owns the watermark.
+   */
+  private interruptedWatermark: Date | null = null;
+  /** The run that watermark interrupted; its own late `runStart` must not clear it. */
+  private interruptedRunId: string | undefined;
+  /** A queued start was cancelled; {@link resumeCancelledRun} replays it. */
+  private cancelledQueuedRun = false;
+  private cancelledQueuedNudge: RunNudge | undefined;
+  /** {@link resumeCancelledRun} was asked for and the follower has not been sent it yet. */
+  private resumeCancelledPending = false;
+  /**
+   * Cancellation asked for between the follower's queued report and its
+   * admission request; that request is refused as cancelled when it arrives.
+   */
+  private pendingQueuedCancel = false;
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
@@ -77,6 +103,8 @@ export class ActorHandle implements MeshActor {
       modelConfigGeneration: number;
       /** The pool changed after this reservation quoted; retry it under the new pool. */
       modelConfigStale: boolean;
+      /** An operator interrupt or provider halt cancelled this reservation. */
+      cancelled: boolean;
     }
   >();
   private startupTimer?: ReturnType<typeof setTimeout>;
@@ -242,6 +270,8 @@ export class ActorHandle implements MeshActor {
         ...(this.retainedAdmission ? { resumeAdmission: true } : {}),
       },
     });
+    // An unhalt during the gap asked for a replay this channel can now carry.
+    if (this.resumeCancelledPending) this.deliverResumeCancelled();
   }
 
   get isRunning(): boolean {
@@ -262,6 +292,145 @@ export class ActorHandle implements MeshActor {
       })
       .catch(() => this.reportDroppedWake(nudge));
   }
+
+  /**
+   * Cancel an admission the leader reserved and the follower has not started,
+   * giving back its place in provider pacing and concurrency. The follower's
+   * Actor books the run `start-cancelled` and keeps the opportunity, as a local
+   * queued-start cancellation does, until {@link resumeCancelledRun}.
+   */
+  cancelQueuedRun(): boolean {
+    if (this.terminated) return false;
+    if (this.resumeCancelledPending) {
+      // Halted again before the replay reached the follower: keep the
+      // opportunity parked for the next resume instead of launching it.
+      this.resumeCancelledPending = false;
+      this.cancelledQueuedRun = true;
+      return true;
+    }
+    const unstarted = [...this.gates.values()].filter((gate) => !gate.handle.started);
+    let responsive: boolean;
+    if (unstarted.length > 0) {
+      let cancelled = false;
+      for (const gate of unstarted) {
+        // Only a gate this call cancelled answers as cancelled; one that had
+        // already settled keeps its real rejection.
+        if (!gate.handle.cancel?.()) continue;
+        gate.cancelled = true;
+        cancelled = true;
+      }
+      if (!cancelled) return false;
+      // The gate's rejection replies on a later microtask, so this command lands
+      // first and the follower settles its start as cancelled, not failed.
+      this.send({ type: "cancelQueued" });
+      responsive = unstarted.some((gate) => gate.admission.responsive);
+    } else if (this.state === "queued" && !this.runOpen && !this.closed && this.gates.size === 0) {
+      // The follower reported queued and its admission request has not taken
+      // a gate yet. It follows the report on the same channel, so refuse it
+      // on arrival (see rejectCancelledAdmission) as a local queued start would be.
+      this.pendingQueuedCancel = true;
+      responsive = this.pendingQueuedPromotion;
+    } else {
+      return false;
+    }
+    this.cancelledQueuedNudge = mergeNudges(this.cancelledQueuedNudge ?? null, {
+      ...(responsive ? { priority: "responsive" } : {}),
+      mode: this.queuedMode ?? "ordinary",
+    });
+    this.cancelledQueuedRun = true;
+    this.opts.context.onQueuedRunCancelled?.();
+    return true;
+  }
+
+  /**
+   * Replay the scheduling opportunity retained by {@link cancelQueuedRun}. The
+   * request stays pending until a connected follower is sent it, so an unhalt
+   * during a transport gap replays after reattach.
+   */
+  resumeCancelledRun(): boolean {
+    if (!this.cancelledQueuedRun) return false;
+    this.cancelledQueuedRun = false;
+    if (this.pendingQueuedCancel) {
+      // The cancellation has not reached the follower: its admission request
+      // is still in flight. Withdraw the refusal so that request proceeds as
+      // the replay; a resume command now would leave it parked on arrival.
+      this.pendingQueuedCancel = false;
+      this.cancelledQueuedNudge = undefined;
+      return true;
+    }
+    this.resumeCancelledPending = true;
+    this.deliverResumeCancelled();
+    return true;
+  }
+
+  /** Send a pending replay in wake order; a closed channel leaves it for attachHost. */
+  private deliverResumeCancelled(): void {
+    void this.ready
+      .then(() => this.stateSettled)
+      .then(() => {
+        if (!this.resumeCancelledPending || this.closed) return;
+        const nudge = this.cancelledQueuedNudge ?? {};
+        if (!this.send({ type: "resumeCancelled", nudge })) return;
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedNudge = undefined;
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * Refuse an admission request whose queued start was cancelled before it
+   * arrived. The follower's pending start is already registered, so
+   * `cancelQueued` settles it and retains the opportunity, as for a gate.
+   */
+  private rejectCancelledAdmission(requestId: number): boolean {
+    if (!this.pendingQueuedCancel) return false;
+    this.pendingQueuedCancel = false;
+    this.pendingQueuedPromotion = false;
+    this.send({ type: "cancelQueued" });
+    this.send({ type: "reply", requestId, error: COORDINATOR_ADMISSION_CANCELLED_ERROR });
+    return true;
+  }
+
+  /**
+   * Operator interrupt. A queued start is cancelled here, where its admission
+   * lives; a started run is aborted by the follower, which owns the provider.
+   * The follower's answer is asynchronous, so a run that finishes before the
+   * command lands simply completes.
+   */
+  interrupt(by = "human:operator"): {
+    interrupted: boolean;
+    runStartTime?: Date;
+    wasQueued?: boolean;
+  } {
+    const now = new Date();
+    const admitted = [...this.gates.values()].some((gate) => gate.handle.started);
+    if (this.isRunning || admitted) {
+      if (this.closed || !this.send({ type: "interrupt", by })) return { interrupted: false };
+      // The follower's prompt is the admission reply's snapshot, built just
+      // after admittedAt, so that instant bounds what the run saw. runStartedAt
+      // is the later receipt of `runStart` and would hide work delivered between.
+      const runStartTime = this.admittedAt ?? this.runStartedAt ?? now;
+      this.interruptedWatermark = runStartTime;
+      this.interruptedRunId = this.startedRunId ?? this.queuedRunId;
+      return { interrupted: true, runStartTime, wasQueued: false };
+    }
+    if (!this.cancelQueuedRun()) return { interrupted: false };
+    this.interruptedWatermark = now;
+    if (this.state === "queued") {
+      this.state = "idle";
+      this.opts.context.onRuntimeStateChanged("idle");
+    }
+    return { interrupted: true, runStartTime: now, wasQueued: true };
+  }
+
+  getInterruptedWatermark(): Date | null {
+    return this.interruptedWatermark;
+  }
+
+  clearInterruptWatermark(): void {
+    this.interruptedWatermark = null;
+  }
+
   declareYield(status?: string, note?: string): void {
     // Fence parent-hosted tools immediately when the mesh accepts yield_run.
     this.yielded = true;
@@ -318,6 +487,8 @@ export class ActorHandle implements MeshActor {
     this.stateStaleTimer = undefined;
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
+    this.pendingQueuedCancel = false;
+    this.resumeCancelledPending = false;
     this.outstandingPreempt = undefined;
     void this.cancelRetainedAdmission();
     // Keep running slots occupied until the remote actor releases them or exits.
@@ -358,6 +529,8 @@ export class ActorHandle implements MeshActor {
     // left to apply to once that request is gone; a retained ticket keeps it
     // live, and the deferred preempt re-promotes it after reattach.
     if (!this.retainedAdmission) this.pendingQueuedPromotion = false;
+    // The follower re-derives its queued run on reattach; that is a fresh request.
+    this.pendingQueuedCancel = false;
   }
 
   private releaseGates(): void {
@@ -503,6 +676,8 @@ export class ActorHandle implements MeshActor {
         ? Math.round(performance.now() - this.runStartTime)
         : undefined;
     this.runStartTime = undefined;
+    this.runStartedAt = undefined;
+    this.admittedAt = undefined;
     this.log.info("remote_run_end", {
       actorId: this.id,
       target: this.opts.target ?? this.channel.nodeId,
@@ -524,6 +699,7 @@ export class ActorHandle implements MeshActor {
     const runId = started ? this.startedRunId : this.queuedRunId;
     if (!runId) return;
     this.runOpen = false;
+    this.admittedAt = undefined;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
     return this.opts.context.lifecycle.emit("onEnd", {
@@ -618,7 +794,10 @@ export class ActorHandle implements MeshActor {
         this.yielded = message.yielded;
         this.stateStale = false;
         this.stateUnconfirmed = false;
-        if (message.state !== "queued") this.pendingQueuedPromotion = false;
+        if (message.state !== "queued") {
+          this.pendingQueuedPromotion = false;
+          this.pendingQueuedCancel = false;
+        }
         if (this.pendingPreempt) {
           this.pendingPreempt = false;
           this.applyPreempt();
@@ -687,7 +866,18 @@ export class ActorHandle implements MeshActor {
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
+        this.runStartedAt = new Date();
         this.queuedRunId = message.runId ?? this.queuedRunId ?? randomUUID();
+        // A later run has moved past the interrupt, as locally. The interrupted
+        // run's own start can arrive after the interrupt and is not one.
+        if (
+          this.interruptedWatermark &&
+          this.runStartedAt > this.interruptedWatermark &&
+          this.queuedRunId !== this.interruptedRunId
+        ) {
+          this.interruptedWatermark = null;
+          this.interruptedRunId = undefined;
+        }
         this.startedRunId = this.queuedRunId;
         // Mark the terminal claim before awaiting observers. The first
         // lifecycle listener starts synchronously, so accounting is open; a
@@ -802,6 +992,7 @@ export class ActorHandle implements MeshActor {
               return (async () => {
                 // Any other admission says the retained run is not coming back.
                 await this.cancelRetainedAdmission();
+                if (this.rejectCancelledAdmission(requestId)) return;
                 // A responsive item that landed between the follower's queued
                 // report and this request is admitted at the priority it asked
                 // for, not the one the follower knew about when it asked.
@@ -823,6 +1014,8 @@ export class ActorHandle implements MeshActor {
                   this.send({ type: "reply", requestId, value: { deferred: true } });
                   return;
                 }
+                // Cancelled while the host-authority preflight was pending.
+                if (this.rejectCancelledAdmission(requestId)) return;
                 let release!: () => void;
                 const finished = new Promise<void>((resolve) => {
                   release = resolve;
@@ -858,6 +1051,7 @@ export class ActorHandle implements MeshActor {
                       });
                       return;
                     }
+                    this.admittedAt = new Date();
                     // Selection is decided here and carried to the follower, so the
                     // remote run uses the candidate the leader actually reserved.
                     this.send({
@@ -880,6 +1074,7 @@ export class ActorHandle implements MeshActor {
                   admission,
                   modelConfigGeneration,
                   modelConfigStale: false,
+                  cancelled: false,
                 });
                 void handle.result.catch((error: Error) => {
                   const gate = this.gates.get(requestId);
@@ -892,7 +1087,11 @@ export class ActorHandle implements MeshActor {
                     });
                     return;
                   }
-                  this.send({ type: "reply", requestId, error: error.message });
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    error: gate?.cancelled ? COORDINATOR_ADMISSION_CANCELLED_ERROR : error.message,
+                  });
                   // A retained ticket that loses its place (the leader gave up, or
                   // pacing released it into a dead channel) ends the run it held:
                   // nothing else is left to report that run's outcome.
