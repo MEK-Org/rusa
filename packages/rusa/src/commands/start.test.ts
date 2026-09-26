@@ -3614,7 +3614,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // The owner flips each space independently; the next arriving message obeys.
     liveMesh.setChatWakeMode("gchat:spaces/team", "all", "root");
     liveMesh.setChatWakeMode("spaces/dm", "mentions", "root");
-    expect(getRepositories().chatWakeModes.get("gchat:spaces/team")?.mode).toBe("all");
+    expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
     expect(liveMesh.getChatWakeMode("gchat:spaces/dm", "root")).toMatchObject({
       mode: "mentions",
     });

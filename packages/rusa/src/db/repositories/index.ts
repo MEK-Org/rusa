@@ -7,7 +7,6 @@ import type { ActorRepository } from "../../repositories/actor-repository.js";
 import type { InboxRepository } from "../../repositories/inbox-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
-import { DbChatWakeModeStore } from "./chat-wake-mode-repository.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
 import { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";
@@ -43,7 +42,6 @@ export class Repositories {
   readonly actorRuns: ActorRunRepository;
   readonly actors: ActorRepository;
   readonly capabilityGrants: CapabilityGrantStore;
-  readonly chatWakeModes: DbChatWakeModeStore;
   readonly eventSourceOwners: DbEventSourceOwnerStore;
   readonly experimentEnrollments: ExperimentEnrollmentStore;
   readonly eventSourceSubscriptions: DbEventSourceSubscriptionStore;
@@ -79,7 +77,6 @@ export class Repositories {
     this.modelClasses = new ModelClassRepository(db);
     this.actors = new SqliteActorRepository(db, this.principals, this.modelClasses);
     this.capabilityGrants = new DbCapabilityGrantStore(db);
-    this.chatWakeModes = new DbChatWakeModeStore(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
     this.experimentEnrollments = new DbExperimentEnrollmentStore(db);
     this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
@@ -133,7 +130,6 @@ export type {
   PortableLedgerSourceKind,
 } from "./actor-run-repository.js";
 export { ActorRunRepository } from "./actor-run-repository.js";
-export { DbChatWakeModeStore } from "./chat-wake-mode-repository.js";
 export { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 export { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
 export { DbExperimentEnrollmentStore } from "./experiment-enrollment-repository.js";

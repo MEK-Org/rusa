@@ -15,12 +15,6 @@ import type { ChatMessage } from "./types.js";
 export const CHAT_WAKE_MODES = ["mentions", "all"] as const;
 export type ChatWakeMode = (typeof CHAT_WAKE_MODES)[number];
 
-/** One stored per-space choice, keyed by the canonical `gchat:spaces/<id>` resource. */
-export interface ChatWakeModeSetting {
-  resource: string;
-  mode: ChatWakeMode;
-}
-
 /** What an owner reads back: `mode: null` means no mode is stored and the default applies. */
 export interface ChatWakeModeView {
   resource: string;
@@ -71,33 +65,53 @@ export function tryChatSpaceResource(space: string): string | undefined {
   }
 }
 
-/**
- * Durable per-space wake modes. SQLite in production
- * (`DbChatWakeModeStore`), in-memory for tests. Authority lives in the mesh,
- * never in the store: the store records whatever the mesh already accepted.
- */
-export interface ChatWakeModeStore {
-  get(resource: string): ChatWakeModeSetting | undefined;
-  set(setting: ChatWakeModeSetting): void;
-  /** Remove the stored mode so the space falls back to the built-in default. */
-  clear(resource: string): void;
+type EventSourceConfigV1 = Record<string, unknown> & {
+  version: 1;
+  chatWakeMode?: ChatWakeMode;
+};
+
+function parseEventSourceConfigV1(raw: string | null): EventSourceConfigV1 | undefined {
+  if (raw === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as { version?: unknown }).version !== 1
+    ) {
+      return undefined;
+    }
+    const chatWakeMode = (parsed as { chatWakeMode?: unknown }).chatWakeMode;
+    if (chatWakeMode !== undefined && chatWakeMode !== "mentions" && chatWakeMode !== "all") {
+      return undefined;
+    }
+    return parsed as EventSourceConfigV1;
+  } catch {
+    return undefined;
+  }
 }
 
-export class InMemoryChatWakeModeStore implements ChatWakeModeStore {
-  private readonly settings = new Map<string, ChatWakeModeSetting>();
+/** Read this feature's value from the event source's versioned generic config blob. */
+export function chatWakeModeFromConfig(raw: string | null | undefined): ChatWakeMode | undefined {
+  return raw === undefined ? undefined : parseEventSourceConfigV1(raw)?.chatWakeMode;
+}
 
-  get(resource: string): ChatWakeModeSetting | undefined {
-    const setting = this.settings.get(resource);
-    return setting ? { ...setting } : undefined;
+/**
+ * Return the next generic event-source config after changing only this feature.
+ * Unknown v1 keys survive; malformed or future-version blobs are refused rather
+ * than overwritten by an older writer.
+ */
+export function withChatWakeMode(raw: string | null, mode: ChatWakeMode | null): string | null {
+  const config =
+    raw === null ? ({ version: 1 } satisfies EventSourceConfigV1) : parseEventSourceConfigV1(raw);
+  if (!config) {
+    throw new Error("cannot change chat wake mode in malformed or unknown event-source config");
   }
-
-  set(setting: ChatWakeModeSetting): void {
-    this.settings.set(setting.resource, { ...setting });
-  }
-
-  clear(resource: string): void {
-    this.settings.delete(resource);
-  }
+  const next: EventSourceConfigV1 = { ...config };
+  if (mode === null) delete next.chatWakeMode;
+  else next.chatWakeMode = mode;
+  return Object.keys(next).length === 1 ? null : JSON.stringify(next);
 }
 
 /** The mode a space behaves as when none is stored, from what the message says about its space. */

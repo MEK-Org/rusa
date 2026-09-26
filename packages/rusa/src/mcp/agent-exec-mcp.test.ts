@@ -2179,7 +2179,7 @@ describe("agent-execution MCP server", () => {
 
   describe("Event source delegation tools (non-root, ISSUE_NUM §2)", () => {
     it("lets only a chat space's effective owner read and set its wake mode (#692)", async () => {
-      const { mesh } = setup();
+      const { mesh, events } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
         name: "spawn_thread",
@@ -2200,6 +2200,14 @@ describe("agent-execution MCP server", () => {
         mode: "all",
       });
       expect(res.isError).toBeFalsy();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_subscribed",
+          actorId: "root",
+          detail: "gchat:spaces/team",
+        })
+      );
+
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
@@ -2243,6 +2251,24 @@ describe("agent-execution MCP server", () => {
       // An unparseable or non-space resource returns undefined without throwing (#695).
       expect(mesh.chatWakeModeFor("malformed space name")).toBeUndefined();
       expect(mesh.chatWakeModeFor("gchat:spaces")).toBeUndefined();
+
+      // A configured space is deliberately an exact ownership boundary. Moving
+      // the broad Chat source does not silently move this source's config.
+      await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces/team" },
+      });
+      await call(rootClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" });
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces" },
+      });
+      expect(dataOf(await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
+        "gchat:spaces/team: all"
+      );
+      expect(
+        (await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" })).isError
+      ).toBe(true);
     });
 
     it("lets a subscribed parent delegate to a child and reclaim the topic", async () => {

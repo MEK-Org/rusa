@@ -2627,8 +2627,6 @@ async function composeStart(
     experimentEnrollments: getRepositories().experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
-    // Per-space Google Chat wake modes (#692), read by chat ingestion below.
-    chatWakeModes: getRepositories().chatWakeModes,
     // One seam: the manager carries the kernel built above, so mesh authority
     // and event delivery cannot diverge.
     eventManager,

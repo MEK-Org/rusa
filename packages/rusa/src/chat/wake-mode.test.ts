@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   chatMessageWakes,
   chatSpaceResource,
-  InMemoryChatWakeModeStore,
+  chatWakeModeFromConfig,
   tryChatSpaceResource,
+  withChatWakeMode,
 } from "./wake-mode.js";
 
 describe("chat wake mode (#692)", () => {
@@ -46,13 +47,32 @@ describe("chat wake mode (#692)", () => {
     expect(tryChatSpaceResource("")).toBeUndefined();
   });
 
-  it("stores and clears per space in memory", () => {
-    const store = new InMemoryChatWakeModeStore();
-    const setting = { resource: "gchat:spaces/A", mode: "all" as const };
-    store.set(setting);
-    expect(store.get("gchat:spaces/A")).toEqual(setting);
-    expect(store.get("gchat:spaces/B")).toBeUndefined();
-    store.clear("gchat:spaces/A");
-    expect(store.get("gchat:spaces/A")).toBeUndefined();
+  it("reads and changes only its key in a versioned event-source config blob", () => {
+    const raw = '{"version":1,"otherFeature":{"enabled":true},"chatWakeMode":"mentions"}';
+    expect(chatWakeModeFromConfig(raw)).toBe("mentions");
+    const all = withChatWakeMode(raw, "all");
+    expect(all).toEqual(expect.any(String));
+    expect(JSON.parse(all ?? "")).toEqual({
+      version: 1,
+      otherFeature: { enabled: true },
+      chatWakeMode: "all",
+    });
+    const cleared = withChatWakeMode(raw, null);
+    expect(cleared).toEqual(expect.any(String));
+    expect(JSON.parse(cleared ?? "")).toEqual({
+      version: 1,
+      otherFeature: { enabled: true },
+    });
+  });
+
+  it("fails closed for malformed or unknown-version config and refuses to overwrite it", () => {
+    for (const raw of [
+      "not JSON",
+      '{"version":2,"chatWakeMode":"all"}',
+      '{"version":1,"chatWakeMode":"bad"}',
+    ]) {
+      expect(chatWakeModeFromConfig(raw)).toBeUndefined();
+      expect(() => withChatWakeMode(raw, "all")).toThrow(/malformed or unknown/);
+    }
   });
 });

@@ -120,6 +120,14 @@ export interface EventSourceOwnerStore {
   list(): EventSourceOwnership[];
   /** The subscriptions currently active for a resource (≤1 by the invariant). */
   activeForResource(resource: EventResource): EventSourceOwnership[];
+  /**
+   * The opaque, versioned config blob on an active exact event source. `undefined`
+   * means no exact active source exists; `null` means it exists without config.
+   * Config shape belongs to the consumer that owns its version, not this store.
+   */
+  getConfig(resource: EventResource): string | null | undefined;
+  /** Replace the config blob on an active exact event source. */
+  setConfig(resource: EventResource, config: string | null): void;
 }
 
 export interface EventSourceOwnershipAuditEvent {
@@ -341,16 +349,22 @@ export function isStrictSubResourceOf(x: EventResource, y: EventResource): boole
 
 /** In-memory subscription store — for tests and the e2e runner. */
 export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
-  private readonly subs = new Map<string, EventSourceOwnership>();
+  private readonly subs = new Map<string, EventSourceOwnership & { config: string | null }>();
 
   subscribe(
     subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
   ): void {
-    this.restore({ ...subscription, unsubscribedAt: undefined });
+    const resource = resourceKey(subscription.resource);
+    this.write({ ...subscription, resource, unsubscribedAt: undefined }, this.configFor(resource));
   }
 
   /** Hydrate one already-durable row without reactivating a tombstone. */
   restore(subscription: EventSourceOwnership): void {
+    const resource = resourceKey(subscription.resource);
+    this.write({ ...subscription, resource }, null);
+  }
+
+  private write(subscription: EventSourceOwnership, config: string | null): void {
     const resource = resourceKey(subscription.resource);
     const normalized: EventSourceOwnership = {
       ...subscription,
@@ -363,7 +377,22 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
     if (holder && !normalized.unsubscribedAt) {
       throw new Error(activeOwnerConflictMessage(resource, holder.actorId, subscription.actorId));
     }
-    this.subs.set(`${resource}:${subscription.actorId}`, normalized);
+    this.subs.set(`${resource}:${subscription.actorId}`, { ...normalized, config });
+  }
+
+  private configFor(resource: EventResource): string | null {
+    const rows = [...this.subs.values()].filter((row) => row.resource === resourceKey(resource));
+    const active = rows.find((row) => !row.unsubscribedAt);
+    if (active) return active.config;
+    return (
+      rows
+        .filter((row) => row.unsubscribedAt)
+        .sort(
+          (a, b) =>
+            (b.unsubscribedAt ?? "").localeCompare(a.unsubscribedAt ?? "") ||
+            b.subscribedAt.localeCompare(a.subscribedAt)
+        )[0]?.config ?? null
+    );
   }
 
   unsubscribe(resource: EventResource, actorId: string, at: string): void {
@@ -374,12 +403,35 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
   }
 
   list(): EventSourceOwnership[] {
-    return [...this.subs.values()].map((s) => ({ ...s }));
+    return [...this.subs.values()].map(({ config: _config, ...s }) => ({ ...s }));
   }
 
   activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
+  }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    const active = this.subs.get(
+      [...this.subs.keys()].find((key) => {
+        const row = this.subs.get(key);
+        return row?.resource === resourceKey(resource) && !row.unsubscribedAt;
+      }) ?? ""
+    );
+    return active?.config;
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    const key = [...this.subs.keys()].find((candidate) => {
+      const row = this.subs.get(candidate);
+      return row?.resource === resourceKey(resource) && !row.unsubscribedAt;
+    });
+    if (!key)
+      throw new Error(`cannot configure ${resourceKey(resource)}: no active event-source owner`);
+    const active = this.subs.get(key);
+    if (!active)
+      throw new Error(`cannot configure ${resourceKey(resource)}: no active event-source owner`);
+    this.subs.set(key, { ...active, config });
   }
 }
 
@@ -429,6 +481,26 @@ export class UnionEventSourceOwnerStore implements EventSourceOwnerStore {
   activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
+  }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    const key = resourceKey(resource);
+    if (this.mutatingStore.activeForResource(key).length > 0) {
+      return this.mutatingStore.getConfig(key);
+    }
+    return this.baseStore.getConfig(key);
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    const key = resourceKey(resource);
+    if (this.mutatingStore.activeForResource(key).length > 0) {
+      this.mutatingStore.setConfig(key, config);
+      return;
+    }
+    const active = this.activeForResource(key)[0];
+    if (!active) throw new Error(`cannot configure ${key}: no active event-source owner`);
+    this.mutatingStore.subscribe(active);
+    this.mutatingStore.setConfig(key, config);
   }
 }
 

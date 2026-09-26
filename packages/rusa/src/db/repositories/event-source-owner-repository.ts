@@ -133,4 +133,25 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
         .all(resourceKey(resource)) as SubscriptionRow[]
     ).map(fromRow);
   }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT config FROM event_source_owners WHERE resource = ? AND unsubscribed_at IS NULL"
+      )
+      .get(resourceKey(resource)) as { config: string | null } | undefined;
+    return row?.config;
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    const key = resourceKey(resource);
+    const result = this.db
+      .prepare(
+        "UPDATE event_source_owners SET config = ? WHERE resource = ? AND unsubscribed_at IS NULL"
+      )
+      .run(config, key);
+    if (result.changes !== 1) {
+      throw new Error(`cannot configure ${key}: no active event-source owner`);
+    }
+  }
 }

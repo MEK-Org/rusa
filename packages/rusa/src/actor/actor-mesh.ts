@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
   type ChatWakeMode,
-  type ChatWakeModeStore,
   type ChatWakeModeView,
   chatSpaceResource,
-  InMemoryChatWakeModeStore,
+  chatWakeModeFromConfig,
   tryChatSpaceResource,
+  withChatWakeMode,
 } from "../chat/wake-mode.js";
 import { assertSecretContainment, secretsDirPath } from "../config/secrets.js";
 import { getDb } from "../db/index.js";
@@ -702,13 +702,6 @@ export interface ActorMeshOptions {
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
-   * Durable per-space Google Chat wake modes (#692). Defaults to an in-memory
-   * store; the wiring supplies the SQLite-backed one. Only a space's current
-   * effective owner may read or change its mode — enforced here, never in the
-   * store.
-   */
-  chatWakeModes?: ChatWakeModeStore;
-  /**
    * The single external-event seam: the host-assembled EventManager, which
    * carries the one routing kernel as {@link EventManager.routing}. Mesh reads
    * its authority ladder from that manager rather than accepting a resolver
@@ -891,7 +884,6 @@ export class ActorMesh {
   private readonly experiments: ExperimentEnrollmentStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
-  private readonly chatWakeModes: ChatWakeModeStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
   /** Captured at selection so root enrollment changes never alter an active run. */
@@ -999,7 +991,6 @@ export class ActorMesh {
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
-    this.chatWakeModes = opts.chatWakeModes ?? new InMemoryChatWakeModeStore();
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
@@ -3140,7 +3131,7 @@ export class ActorMesh {
   chatWakeModeFor(space: EventResource): ChatWakeMode | undefined {
     const resource = tryChatSpaceResource(space);
     if (!resource) return undefined;
-    return this.chatWakeModes.get(resource)?.mode;
+    return chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource));
   }
 
   /**
@@ -3149,8 +3140,10 @@ export class ActorMesh {
    */
   getChatWakeMode(space: EventResource, callerId: string): ChatWakeModeView {
     const resource = this.requireChatSpaceOwner(space, callerId, "read");
-    const setting = this.chatWakeModes.get(resource);
-    return { resource, mode: setting?.mode ?? null };
+    return {
+      resource,
+      mode: chatWakeModeFromConfig(this.eventSourceOwners.getConfig(resource)) ?? null,
+    };
   }
 
   /**
@@ -3167,24 +3160,27 @@ export class ActorMesh {
     const resource = this.requireChatSpaceOwner(space, callerId, "change");
     const setBy = this.resolveThreadId(callerId);
     if (mode === null) {
-      this.chatWakeModes.clear(resource);
+      const config = this.eventSourceOwners.getConfig(resource);
+      if (config !== undefined) {
+        this.eventSourceOwners.setConfig(resource, withChatWakeMode(config, null));
+      }
     } else {
-      // A configured wake mode is durable event-source state. If authority
-      // reached this space through an ancestor, materialize this exact source
-      // under the same effective owner before writing config. That turns a
-      // future delegation/reclaim of the space into a normal owner-row handoff,
-      // which carries the configuration without changing its behavior.
+      // A per-space setting needs an exact source row. Materializing one makes
+      // the space an explicit ownership boundary, rather than silently storing
+      // a child setting on its ancestor. That boundary is deliberate: later
+      // delegation/reclaim carries this source's config with it. The ordinary
+      // subscription path also records the corresponding audit event. Clearing
+      // a mode retains an already-materialized boundary; changing ownership is
+      // an explicit delegate/reclaim action, not a side effect of configuration.
       if (
         !this.eventSourceOwners.activeForResource(resource).some((row) => row.actorId === setBy)
       ) {
-        this.eventSourceOwners.subscribe({
-          resource,
-          actorId: setBy,
-          subscribedBy: setBy,
-          subscribedAt: this.now(),
-        });
+        this.subscribeEventSource(resource, setBy, setBy);
       }
-      this.chatWakeModes.set({ resource, mode });
+      this.eventSourceOwners.setConfig(
+        resource,
+        withChatWakeMode(this.eventSourceOwners.getConfig(resource) ?? null, mode)
+      );
     }
     this.recordEvent({
       kind: "chat_wake_mode_set",
