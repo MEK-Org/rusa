@@ -194,10 +194,6 @@ import {
   SLACK_WRITE_MCP_NAME,
 } from "../mcp/slack-mcp.js";
 import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
-import {
-  createStuckLoopDetectorMcpServer,
-  STUCK_LOOP_DETECTOR_MCP_NAME,
-} from "../mcp/stuck-loop-detector-mcp.js";
 import { createTrackerMcpServer, TRACKER_MCP_NAME } from "../mcp/tracker-mcp.js";
 import {
   createUnderstandingReadServer,
@@ -1457,12 +1453,6 @@ async function composeStart(
         resolveUnderstandingRootNodeId(config),
         understandingStrings.loadStrings
       ),
-    [STUCK_LOOP_DETECTOR_MCP_NAME]: () =>
-      createStuckLoopDetectorMcpServer({
-        actors,
-        meshEvents: getRepositories().meshEvents,
-        rootHandle,
-      }),
     // Route agent get_quota through the coordinator client when configured (§12 item 4, #356)
     [QUOTA_MCP_NAME]: () =>
       createQuotaMcpServer(
@@ -2267,7 +2257,6 @@ async function composeStart(
     void mcpHttp.removeServer(`${actorId}:${REPO_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${TRACKER_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${UNDERSTANDING_READ_MCP_NAME}`);
-    void mcpHttp.removeServer(`${actorId}:${STUCK_LOOP_DETECTOR_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
@@ -3018,16 +3007,6 @@ async function composeStart(
             { isFenced }
           )
         );
-        const stuckLoopUrl = mcpHttp.addServer(`${id}:${STUCK_LOOP_DETECTOR_MCP_NAME}`, () =>
-          createStuckLoopDetectorMcpServer(
-            {
-              actors,
-              meshEvents: getRepositories().meshEvents,
-              rootHandle,
-            },
-            { isFenced }
-          )
-        );
         const quotaUrl = mcpHttp.addServer(`${id}:${QUOTA_MCP_NAME}`, () =>
           createQuotaMcpServer(
             { config, workersDir, coordinatorClient: quotaCoordinatorClient },
@@ -3040,7 +3019,6 @@ async function composeStart(
           { name: TRACKER_MCP_NAME, url: trackerUrl },
           { name: REPO_MCP_NAME, url: repoUrl },
           { name: UNDERSTANDING_READ_MCP_NAME, url: understandingUrl },
-          { name: STUCK_LOOP_DETECTOR_MCP_NAME, url: stuckLoopUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
         ];
         if (chatClient) {

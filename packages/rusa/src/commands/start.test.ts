@@ -7455,7 +7455,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(rootServers.map((server) => server.name)).toEqual([
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "tracker",
         "repo",
@@ -7471,7 +7470,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "tracker",
         "repo",
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "mesh",
         "inbox",
@@ -7494,7 +7492,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(mcpServersOf(root).map((server) => server.name)).toEqual([
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "chat-read",
         "tracker",
@@ -7512,7 +7509,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "tracker",
         "repo",
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "chat-read",
         "mesh",
@@ -7536,7 +7532,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         tracker: { tool: "list_open_issues", args: { repo: "dummy-org/dummy-repo" } },
         repo: { tool: "merge_pull_request", args: { repo: "dummy-org/dummy-repo", prNumber: 1 } },
         understanding: { tool: "overview", args: {} },
-        "stuck-loop-detector": { tool: "list_open_commitments", args: {} },
         quota: { tool: "list_models", args: {} },
         mesh: { tool: "list_threads", args: {} },
         inbox: { tool: "list", args: {} },
@@ -7572,7 +7567,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         tracker: true,
         repo: true,
         understanding: true,
-        "stuck-loop-detector": true,
         quota: true,
         mesh: true,
         inbox: true,
@@ -7582,7 +7576,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       expect(await fencedByServer(mcpServersOf(root), ["repo", "pnpm-install"])).toEqual({
         understanding: false,
-        "stuck-loop-detector": false,
         quota: false,
         tracker: false,
         mesh: true,
