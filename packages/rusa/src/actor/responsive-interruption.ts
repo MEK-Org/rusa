@@ -3,11 +3,10 @@
  * decision — "given this information, should we interrupt?" — and nothing
  * else; it is not a general provider abstraction.
  *
- * The request carries durable inbox identifiers and nothing else. A client
- * that needs the text behind an id resolves it itself, which is where the
- * data-access and retention boundary lives. No client ships in this slice and
- * no production wiring constructs one: what lands here is the classifier and
- * its seam, tested against synthetic fixtures.
+ * The request carries durable inbox identifiers. The live client resolves the
+ * corresponding source text on the host, immediately before its opt-in HTTP
+ * request; that boundary is deliberately outside this scheduler policy. The
+ * decision and its durable audit remain identifiers only.
  *
  * ## Why an open question rather than a taxonomy
  *
@@ -27,10 +26,32 @@
 
 /** A live client sees ids; resolving them to text is its own concern. */
 export interface JevDecisionClient {
-  decide(request: JevDecisionRequest): Promise<JevDecisionResponse>;
+  /**
+   * `signal` is the policy deadline's cancellation path. A client must pass it
+   * to its transport so an abandoned shadow observation does not continue
+   * sending content after the scheduler has stopped waiting for it.
+   */
+  decide(
+    request: JevDecisionRequest,
+    options?: { signal?: AbortSignal }
+  ): Promise<JevDecisionResponse>;
+}
+
+/**
+ * Thrown by a client that could not read the arriving item's text. Recorded as
+ * `input_unavailable` so the audit separates "nothing to decide on" from a
+ * failed call.
+ */
+export class JevInputUnavailableError extends Error {
+  constructor() {
+    super("JEV decision input text is unavailable");
+    this.name = "JevInputUnavailableError";
+  }
 }
 
 export interface JevDecisionRequest {
+  /** Host-local lookup key. It is not copied into the durable decision audit. */
+  actorId: string;
   /** The open-ended decision put to the model, verbatim. */
   question: string;
   input: {
@@ -125,6 +146,8 @@ export function shadowReactionTarget(
 }
 
 export interface ResponsiveInterruptionInput {
+  /** Host-local lookup key for a live client; not copied into the audit. */
+  actorId: string;
   incomingEntryId: string;
   /** The primary candidate set. Whenever it is non-empty it is the only set. */
   selectedEntryIds: readonly string[];
@@ -137,7 +160,7 @@ interface DecisionBase {
   candidateSource: ResponsiveInterruptionCandidateSource;
   threshold: number;
   /** IDs only: message bodies and other operational content never enter the audit. */
-  input: ResponsiveInterruptionInput;
+  input: Omit<ResponsiveInterruptionInput, "actorId">;
 }
 
 /**
@@ -148,6 +171,7 @@ interface DecisionBase {
 export type ResponsiveInterruptionQueueReason =
   | "unavailable"
   | "client_error"
+  | "input_unavailable"
   | "timeout"
   | "no_candidates"
   | "invalid_verdict"
@@ -176,11 +200,13 @@ export type ResponsiveInterruptionDecision =
     });
 
 /**
- * How long a decision may take before the policy stops waiting on it.
- * Uncalibrated placeholder: no live client exists yet to measure. The number,
- * and whether an abandoned request should be cancelled through an
- * `AbortSignal` on the request rather than merely no longer awaited, belong to
- * the live-client slice.
+ * How long a decision may take before the policy stops waiting on it. The
+ * budget covers the live client's source reads as well as its HTTP request.
+ * Expiry aborts the request through the `AbortSignal` passed to `decide`; the
+ * source clients take no signal, so the client stops waiting on a read in
+ * progress rather than cancelling it, and sends nothing after expiry.
+ * Uncalibrated placeholder: shadow mode delays nothing, and `timeout` is
+ * recorded as its own reason, so the shadow data is what calibrates it.
  */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
@@ -238,16 +264,16 @@ export class ShadowResponsiveInterruptionClassifier {
 
     let response: JevDecisionResponse;
     try {
-      response = await this.withDeadline(
-        this.client.decide({
-          question: RESPONSIVE_INTERRUPTION_QUESTION,
-          input: { incomingEntryId: input.incomingEntryId, candidateEntryIds, candidateSource },
-        })
-      );
+      response = await this.withDeadline(this.client, {
+        actorId: input.actorId,
+        question: RESPONSIVE_INTERRUPTION_QUESTION,
+        input: { incomingEntryId: input.incomingEntryId, candidateEntryIds, candidateSource },
+      });
     } catch (err) {
       // The error text is the other route by which operational content could
       // reach the audit, so only the fact of failure is recorded.
-      return queue(err === DEADLINE_EXCEEDED ? "timeout" : "client_error");
+      if (err === DEADLINE_EXCEEDED) return queue("timeout");
+      return queue(err instanceof JevInputUnavailableError ? "input_unavailable" : "client_error");
     }
 
     if (!isConfidence(response?.confidence)) return queue("invalid_confidence");
@@ -277,13 +303,20 @@ export class ShadowResponsiveInterruptionClassifier {
    * resolves would leak a pending observation per arrival; in a later
    * authoritative mode it would stall the arrival itself.
    */
-  private async withDeadline(pending: Promise<JevDecisionResponse>): Promise<JevDecisionResponse> {
+  private async withDeadline(
+    client: JevDecisionClient,
+    request: JevDecisionRequest
+  ): Promise<JevDecisionResponse> {
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        pending,
+        client.decide(request, { signal: controller.signal }),
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(DEADLINE_EXCEEDED), this.timeoutMs);
+          timer = setTimeout(() => {
+            controller.abort(DEADLINE_EXCEEDED);
+            reject(DEADLINE_EXCEEDED);
+          }, this.timeoutMs);
         }),
       ]);
     } finally {

@@ -73,6 +73,8 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import type { InboxChatContextSources } from "../actor/inbox-chat-context.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
+import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
+import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
   type MeshEventSink,
   type RunAbandonedPayload,
@@ -104,6 +106,7 @@ import {
   UnifiedAdmissionQueue,
 } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
+import { ShadowResponsiveInterruptionClassifier } from "../actor/responsive-interruption.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import {
@@ -136,6 +139,7 @@ import {
   WorkspaceEventsSubscriber,
 } from "../chat/workspace-events.js";
 import { type ConfigProfile, loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
+import { readJevApiKeyFile } from "../config/jev.js";
 import { secretsDirPath } from "../config/secrets.js";
 import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import type { DashboardAuth } from "../dashboard/auth.js";
@@ -992,6 +996,15 @@ async function composeStart(
     secrets: readSecrets,
     context: { component: "start" },
   });
+  // This file name is configuration, not a credential. Read the value only on
+  // the host plane and register it with the log scrubber before any client can
+  // use it. A bad/missing file intentionally leaves the opt-in observer
+  // unavailable instead of failing the daemon or changing its scheduler.
+  const jevApiKey = readJevApiKeyFile(config.jevApiKeyFile, mcHome);
+  if (jevApiKey) knownSecrets.add(jevApiKey);
+  else if (config.jevApiKeyFile) {
+    log.warn("jev_classifier_unavailable", { reason: "credential_unavailable" });
+  }
   resources.reportFailuresTo(({ resource, error }) =>
     log.error("shutdown_disposer_failed", { resource, err: error })
   );
@@ -1479,6 +1492,29 @@ async function composeStart(
     ...(slackClient ? { slackClient } : {}),
     meshChat: getRepositories().meshChat,
   });
+  const responsiveInterruption =
+    config.jevApiKeyFile === undefined
+      ? undefined
+      : new ShadowResponsiveInterruptionClassifier({
+          // Uncalibrated placeholder until shadow data exists. It only decides
+          // which recorded prediction (and chat reaction) a confident-enough
+          // interrupt gets; shadow mode never changes scheduling.
+          threshold: 0.8,
+          ...(jevApiKey
+            ? {
+                client: new HttpJevDecisionClient(
+                  jevApiKey,
+                  createJevInboxTextResolver({
+                    inbox: inboxStore,
+                    ...(chatClient ? { chatClient } : {}),
+                    ...(slackClient ? { slackClient } : {}),
+                    meshChat: getRepositories().meshChat,
+                    issueClient,
+                  })
+                ),
+              }
+            : {}),
+        });
 
   const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
@@ -2596,6 +2632,13 @@ async function composeStart(
       }),
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
+    responsiveInterruption,
+    ...(responsiveInterruption && chatClient
+      ? {
+          reactToChatMessage: (messageName: string, emoji: string) =>
+            chatClient.react(messageName, emoji),
+        }
+      : {}),
     // Grantable = every registered MCP-server capability PLUS the generic
     // `secret` base (#542), under which ROOT grants any contained
     // `secret:<filename>`; which of those a non-root parent may delegate is

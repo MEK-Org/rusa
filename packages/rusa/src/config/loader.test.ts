@@ -136,6 +136,24 @@ describe("loadConfig geminiApiKey (optional)", () => {
   });
 });
 
+describe("loadConfig jevApiKeyFile (optional)", () => {
+  it("keeps the JEV shadow observer off when the config key is absent", () => {
+    expect(loadConfig(writeConfig()).jevApiKeyFile).toBeUndefined();
+  });
+
+  it("trims a configured host-plane credential filename", () => {
+    expect(loadConfig(writeConfig({ jevApiKeyFile: "  synthetic-jev-key  " })).jevApiKeyFile).toBe(
+      "synthetic-jev-key"
+    );
+  });
+
+  it("rejects a blank credential filename", () => {
+    expect(() => loadConfig(writeConfig({ jevApiKeyFile: "   " }))).toThrow(
+      /jevApiKeyFile must be a non-empty secret filename/
+    );
+  });
+});
+
 describe("loadConfig rootActor.context", () => {
   it("normalizes a valid portable ledger context", () => {
     const config = loadConfig(

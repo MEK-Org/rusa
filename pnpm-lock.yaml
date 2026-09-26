@@ -44,6 +44,9 @@ importers:
       '@thkp-eng/goals-types':
         specifier: workspace:*
         version: link:../../third_party/glass_goals_devkit/packages/goals-types
+      '@typesafe-ai/sdk':
+        specifier: 0.6.0
+        version: 0.6.0
       better-sqlite3:
         specifier: ^12.6.2
         version: 12.6.2
@@ -948,6 +951,10 @@ packages:
 
   '@types/tough-cookie@4.0.5':
     resolution: {integrity: sha512-/Ad8+nIOV7Rl++6f1BdKxFSMgmoqEoYbHRpPcx3JEfv8VRsQe9Z4mCXeJBzxs7mbHY/XOZZuXlRNfhpVPbs6ZA==}
+
+  '@typesafe-ai/sdk@0.6.0':
+    resolution: {integrity: sha512-IddX+Q0XM+VagOUZFeP7wZjaO4SHMdvnh2zEBdrZZnXedWI3BNK1lKhMx3ayrkFWvVLbVcUHJy6AVZlY+e6Jaw==}
+    engines: {node: '>=20'}
 
   '@vitest/expect@3.2.7':
     resolution: {integrity: sha512-E8eBXaKibuvH2pSZErOjdVb5vF4PbKYcrnluBTYxEk1l/VhhwZg1kZQsdtjq+CsF5CFydf2Rdkz7jDHKSisi3w==}
@@ -3434,6 +3441,8 @@ snapshots:
 
   '@types/tough-cookie@4.0.5':
     optional: true
+
+  '@typesafe-ai/sdk@0.6.0': {}
 
   '@vitest/expect@3.2.7':
     dependencies:
