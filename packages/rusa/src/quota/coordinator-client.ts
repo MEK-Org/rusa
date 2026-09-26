@@ -290,7 +290,7 @@ export class QuotaCoordinatorClient {
       return maxInterval;
     }
 
-    // §5.7 Rule 2: Past hardStaleAfterMs since its last successful read, the client widens to maxIntervalSeconds on its own
+    // §5.7 Rule 2: Past hardStaleAfterMs since its last successful read, the client widens to maxIntervalSeconds on its own.
     const nowMs = this.nowMs();
     const hardStaleAfterMs = this.options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
     if (nowMs - lastRead > hardStaleAfterMs) {

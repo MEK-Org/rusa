@@ -851,6 +851,7 @@ class _ProviderQuotaRing extends StatelessWidget {
     final asOf = _asOfLine(
       weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt,
       now: now,
+      freshness: provider.throttle?.freshness,
     );
     final tooltip = [
       _providerLabel(provider.provider),
@@ -952,7 +953,7 @@ String quotaWindowTooltip(
     final resetStr = reset != null
         ? DateFormat('EEE h:mm a').format(reset.toLocal())
         : window.resetAtIso!;
-    return '$label: window reset at $resetStr; no fresh read since';
+    return '$label: window reset at $resetStr; no fresh read since (awaiting fresh read, estimated ~100% remaining)';
   }
   final pos = _schedulePosition(window, now);
   if (pos == null) {
@@ -1014,7 +1015,11 @@ String? _resetLine(QuotaWindowDto window) {
 /// to match reset timestamps. Carries relative age when [now] is provided so
 /// stale readings are visibly distinct. Null when the state behind this window
 /// never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(String? scrapedAtIso, {DateTime? now}) {
+String? _asOfLine(
+  String? scrapedAtIso, {
+  DateTime? now,
+  QuotaFreshnessDto? freshness,
+}) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;
@@ -1030,6 +1035,13 @@ String? _asOfLine(String? scrapedAtIso, {DateTime? now}) {
       parts.add('(${age.inMinutes}m ago)');
     }
   }
+  if (freshness != null) {
+    if (freshness.hardStale) {
+      parts.add('[overdue: hard-stale]');
+    } else if (freshness.stale) {
+      parts.add('[overdue: stale]');
+    }
+  }
   return parts.join(' ');
 }
 
@@ -1040,6 +1052,22 @@ String quotaThrottleTooltip(QuotaThrottleDto throttle) {
     'Normal launch pacing: one start every '
         '${_formatInterval(throttle.intervalSeconds)}',
   ];
+  if (throttle.freshness != null) {
+    final f = throttle.freshness!;
+    final modeLabel = f.mode == 'manual' ? 'manual' : 'scrape';
+    if (f.resetWaiting) {
+      lines.add('Freshness ($modeLabel): window reset; awaiting fresh reading (estimated)');
+      if (f.hardStale) {
+        lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
+      }
+    } else if (f.hardStale) {
+      lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
+    } else if (f.stale) {
+      lines.add('Freshness ($modeLabel): overdue (stale reading)');
+    } else {
+      lines.add('Freshness ($modeLabel): fresh');
+    }
+  }
   if (throttle.expired) {
     lines.add(
       'previous quota window expired; returning to the configured interval',

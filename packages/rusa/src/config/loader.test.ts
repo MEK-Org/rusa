@@ -818,6 +818,8 @@ describe("loadConfig quota throttle", () => {
     [{ enabled: "yes" }, /enabled must be a boolean/],
     [{ maxIntervalSeconds: 0 }, /maxIntervalSeconds/],
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
+    [{ manualHardStaleSeconds: 0 }, /manualHardStaleSeconds must be a positive integer/],
+    [{ manualHardStaleSeconds: 90.5 }, /manualHardStaleSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {
     expect(() => loadConfig(writeConfig({ quota: { throttle: quotaThrottle } }))).toThrow(message);
   });

@@ -1656,7 +1656,7 @@ void main() {
         );
         expect(
           quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-          'Session: window reset at Wed 11:28 PM; no fresh read since',
+          'Session: window reset at Wed 11:28 PM; no fresh read since (awaiting fresh read, estimated ~100% remaining)',
         );
       },
     );
@@ -1750,6 +1750,77 @@ void main() {
         'hottest bucket claude:weekly: 20.0 points over pace',
       );
     });
+
+    test('explains manual freshness mode and reset-waiting status (#690)', () {
+      expect(
+        quotaThrottleTooltip(
+          const QuotaThrottleDto(
+            intervalSeconds: 300,
+            expired: false,
+            updatedAt: '2026-09-25T13:42:29.000Z',
+            buckets: [],
+            freshness: QuotaFreshnessDto(
+              mode: 'manual',
+              stale: true,
+              hardStale: false,
+              resetWaiting: true,
+            ),
+          ),
+        ),
+        'Normal launch pacing: one start every 5.0m\n'
+        'Freshness (manual): window reset; awaiting fresh reading (estimated)',
+      );
+    });
+
+    test('explains manual freshness mode and hard-stale overdue status (#690)', () {
+      expect(
+        quotaThrottleTooltip(
+          const QuotaThrottleDto(
+            intervalSeconds: 36000,
+            expired: false,
+            capped: true,
+            updatedAt: '2026-09-25T13:42:29.000Z',
+            buckets: [],
+            freshness: QuotaFreshnessDto(
+              mode: 'manual',
+              stale: true,
+              hardStale: true,
+              resetWaiting: false,
+            ),
+          ),
+        ),
+        'Normal launch pacing: one start every 10.0h\n'
+        'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
+        'limited to the configured maximum interval',
+      );
+    });
+
+    test(
+      'explains both reset-waiting and hard-stale overdue status when both are active (#690)',
+      () {
+        expect(
+          quotaThrottleTooltip(
+            const QuotaThrottleDto(
+              intervalSeconds: 36000,
+              expired: false,
+              capped: true,
+              updatedAt: '2026-09-25T13:42:29.000Z',
+              buckets: [],
+              freshness: QuotaFreshnessDto(
+                mode: 'manual',
+                stale: true,
+                hardStale: true,
+                resetWaiting: true,
+              ),
+            ),
+          ),
+          'Normal launch pacing: one start every 10.0h\n'
+          'Freshness (manual): window reset; awaiting fresh reading (estimated)\n'
+          'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
+          'limited to the configured maximum interval',
+        );
+      },
+    );
 
     test(
       'renders only pacing line when not expired and no buckets driving pace',

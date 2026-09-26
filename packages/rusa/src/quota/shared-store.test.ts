@@ -12,11 +12,12 @@ import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
-  QUOTA_INTEGRAL_MAX_STEP_SECONDS,
   QUOTA_INTEGRAL_TIME_SECONDS,
   QUOTA_KD_SECONDS_SQUARED_PER_POINT,
   QUOTA_KI_SECONDS_PER_POINT_SECOND,
   QUOTA_KP_SECONDS_PER_POINT,
+  QUOTA_MAX_CREDITED_ELAPSED_SECONDS,
+  QUOTA_MAX_SLEW_SECONDS,
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
   QUOTA_SCHEMA_VERSION,
@@ -995,7 +996,7 @@ describe("SharedQuotaStore PID integral term", () => {
       const rows = reasonedRows(store, "claude");
       expect(rows).toHaveLength(13);
       expect(QUOTA_INTEGRAL_TIME_SECONDS).toBe(2 * QUOTA_DERIVATIVE_TAU_SECONDS);
-      expect(QUOTA_INTEGRAL_MAX_STEP_SECONDS).toBe(5 * 60);
+      expect(QUOTA_MAX_CREDITED_ELAPSED_SECONDS).toBe(30 * 60);
 
       // A cold start has no elapsed time to integrate over, so the first
       // decision is the pure proportional one a PD controller would have made.
@@ -1191,8 +1192,202 @@ describe("SharedQuotaStore PID integral term", () => {
       recordObservation(store, "claude", "2030-02-01T00:00:00.000Z", 40, reset);
 
       const gapped = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      expect(gapped.integral).toBeCloseTo(gapped.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
+      expect(gapped.integral).toBeCloseTo(gapped.error * QUOTA_MAX_CREDITED_ELAPSED_SECONDS, 6);
       expect(gapped.integral).toBeLessThan(gapped.error * 24 * 60 * 60);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("accumulates the same integral area for six 5m observations vs one 30m observation under stable error (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-step-compare-"));
+    roots.push(root);
+    const store5m = new SharedQuotaStore(join(root, "store5m.db"));
+    const store30m = new SharedQuotaStore(join(root, "store30m.db"));
+    try {
+      store5m.configureController({ maxIntervalSeconds: 36000 });
+      store30m.configureController({ maxIntervalSeconds: 36000 });
+
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const standingError = 10;
+
+      // In store5m, record 7 observations (t=0, 5m, 10m, 15m, 20m, 25m, 30m) with constant error
+      for (let i = 0; i <= 6; i++) {
+        const obsMs = startMs + i * 5 * 60 * 1000;
+        const timeRemainingPct = ((Date.parse(reset) - obsMs) / weeklyMs) * 100;
+        recordObservation(
+          store5m,
+          "claude",
+          new Date(obsMs).toISOString(),
+          timeRemainingPct - standingError,
+          reset
+        );
+      }
+
+      // In store30m, record 2 observations (t=0 and t=30m) with the same constant error
+      const t0 = startMs;
+      const t30 = startMs + 30 * 60 * 1000;
+      const timeRemainingPct0 = ((Date.parse(reset) - t0) / weeklyMs) * 100;
+      const timeRemainingPct30 = ((Date.parse(reset) - t30) / weeklyMs) * 100;
+      recordObservation(
+        store30m,
+        "claude",
+        new Date(t0).toISOString(),
+        timeRemainingPct0 - standingError,
+        reset
+      );
+      recordObservation(
+        store30m,
+        "claude",
+        new Date(t30).toISOString(),
+        timeRemainingPct30 - standingError,
+        reset
+      );
+
+      const rows5m = reasonedRows(store5m, "claude");
+      const rows30m = reasonedRows(store30m, "claude");
+
+      expect(rows5m).toHaveLength(7);
+      expect(rows30m).toHaveLength(2);
+
+      const final5m = rows5m.at(-1) as ReasonedRow;
+      const final30m = rows30m.at(-1) as ReasonedRow;
+
+      // Both should have integrated standingError * 1800s
+      expect(final5m.integral).toBeCloseTo(standingError * 1800, 4);
+      expect(final30m.integral).toBeCloseTo(standingError * 1800, 4);
+      expect(final30m.integral).toBeCloseTo(final5m.integral, 4);
+    } finally {
+      store5m.close();
+      store30m.close();
+    }
+  });
+
+  it("does not slow a routine 30m step below its six-5m reference response (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-elapsed-actuator-"));
+    roots.push(root);
+    const fiveMinute = new SharedQuotaStore(join(root, "five-minute.db"));
+    const thirtyMinute = new SharedQuotaStore(join(root, "thirty-minute.db"));
+    try {
+      fiveMinute.configureController({ maxIntervalSeconds: 36000 });
+      thirtyMinute.configureController({ maxIntervalSeconds: 36000 });
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const recordError = (
+        store: SharedQuotaStore,
+        provider: string,
+        offsetMinutes: number,
+        error: number,
+        resetAtIso = reset
+      ) => {
+        const observedMs = startMs + offsetMinutes * 60 * 1000;
+        const timeRemainingPct = ((Date.parse(resetAtIso) - observedMs) / weeklyMs) * 100;
+        recordObservation(
+          store,
+          provider,
+          new Date(observedMs).toISOString(),
+          timeRemainingPct - error,
+          resetAtIso
+        );
+      };
+
+      // The same step lands once at 30m or six times at 5m. The sparse lane
+      // receives elapsed-time smoothing/slew rather than one old 5m step.
+      recordError(fiveMinute, "claude", 0, 0);
+      recordError(thirtyMinute, "claude", 0, 0);
+      for (let minute = 5; minute <= 30; minute += 5) recordError(fiveMinute, "claude", minute, 20);
+      recordError(thirtyMinute, "claude", 30, 20);
+      const fiveMinuteStep = reasonedRows(fiveMinute, "claude").at(-1) as ReasonedRow;
+      const thirtyMinuteStep = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
+      // One 30m observation must not be slower than the six 5m reference
+      // updates over the same wall-clock period, and is no longer constrained
+      // to the prior two-step (1800s) slew cap. This deterministic fixture has
+      // no sampling jitter or rounding allowance to absorb.
+      expect(thirtyMinuteStep.interval).toBeGreaterThanOrEqual(fiveMinuteStep.interval);
+      expect(thirtyMinuteStep.interval).toBeLessThan(fiveMinuteStep.interval * 1.2);
+      expect(thirtyMinuteStep.interval).toBeGreaterThan(2 * QUOTA_MAX_SLEW_SECONDS);
+    } finally {
+      fiveMinute.close();
+      thirtyMinute.close();
+    }
+  });
+
+  it("moves a late observation no further than an on-cadence 30m one (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-delayed-actuator-"));
+    roots.push(root);
+    const onCadence = new SharedQuotaStore(join(root, "on-cadence.db"));
+    const delayed = new SharedQuotaStore(join(root, "delayed.db"));
+    try {
+      onCadence.configureController({ maxIntervalSeconds: 36000 });
+      delayed.configureController({ maxIntervalSeconds: 36000 });
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const recordError = (store: SharedQuotaStore, offsetMinutes: number, error: number) => {
+        const observedMs = startMs + offsetMinutes * 60 * 1000;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          ((Date.parse(reset) - observedMs) / weeklyMs) * 100 - error,
+          reset
+        );
+      };
+
+      for (const store of [onCadence, delayed]) {
+        recordError(store, 0, 0);
+        recordError(store, 30, 20);
+      }
+      const before = reasonedRows(delayed, "claude").at(-1) as ReasonedRow;
+      recordError(onCadence, 60, 20);
+      recordError(delayed, 5 * 60, 20);
+      const next = reasonedRows(onCadence, "claude").at(-1) as ReasonedRow;
+      const late = reasonedRows(delayed, "claude").at(-1) as ReasonedRow;
+
+      // The 5h-late reading is credited as one 30m slot, so it moves the
+      // interval as far as the on-cadence reading does; only the derivative
+      // filter, which decays over the real gap, separates them (~0.2%). Without
+      // the 1800s credit cap, the late step is ~21% larger.
+      const lateStep = late.interval - before.interval;
+      const onCadenceStep = next.interval - before.interval;
+      expect(lateStep).toBeGreaterThan(0);
+      expect(Math.abs(lateStep - onCadenceStep)).toBeLessThan(0.01 * onCadenceStep);
+    } finally {
+      onCadence.close();
+      delayed.close();
+    }
+  });
+
+  it("limits a noisy five-minute follow-up to one reference slew (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-noisy-actuator-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const recordError = (offsetMinutes: number, error: number) => {
+        const observedMs = startMs + offsetMinutes * 60 * 1000;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          ((Date.parse(reset) - observedMs) / weeklyMs) * 100 - error,
+          reset
+        );
+      };
+
+      recordError(0, 0);
+      recordError(30, 20);
+      const beforeNoise = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      recordError(35, 19);
+      const noisy = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+
+      expect(Math.abs(noisy.interval - beforeNoise.interval)).toBeLessThanOrEqual(900);
     } finally {
       store.close();
     }
@@ -1258,7 +1453,7 @@ describe("SharedQuotaStore PID integral term", () => {
         "2030-01-08T00:00:00.000Z"
       );
       const next = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      expect(next.integral).toBeCloseTo(next.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
+      expect(next.integral).toBeCloseTo(next.error * QUOTA_MAX_CREDITED_ELAPSED_SECONDS, 6);
     } finally {
       store.close();
     }

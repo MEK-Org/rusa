@@ -48,20 +48,42 @@ export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;
 /**
  * Integral time: how long a standing error must persist before the integral
  * term contributes as much period as the proportional term already does. One
- * hour is deliberately conservative for this five-minute observation loop and
- * is twice the existing derivative filter's time constant.
+ * hour is deliberately conservative for routine observation loops (from
+ * 5-minute ticks to 30-minute probe cadences) and is twice the existing
+ * derivative filter's time constant.
  */
 export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;
 export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
   QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS;
 /**
- * Largest observation gap integrated as a single step. Never infer more area
- * than one normal five-minute observation slot from an unobserved gap.
+ * Largest elapsed interval the controller credits from one observation. This
+ * is one normal 30-minute probe slot: it bounds stale input while letting one
+ * on-cadence observation receive the same smoothing, slew, and integral credit
+ * as its six five-minute reference steps.
  */
-export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
+export const QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 30 * 60; // 1800s (30 minutes)
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
+/** The observation interval the original actuator constants were tuned for. */
+export const QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS = SLOT_MS / 1000;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
+/** Maximum slew over one five-minute reference observation. */
 export const QUOTA_MAX_SLEW_SECONDS = 900;
+
+function elapsedActuatorResponse(
+  dtSeconds: number,
+  hasPrevious: boolean
+): { smoothing: number; slew: number } {
+  const elapsedSeconds =
+    hasPrevious && dtSeconds > 0
+      ? Math.min(dtSeconds, QUOTA_MAX_CREDITED_ELAPSED_SECONDS)
+      : QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS;
+  return {
+    smoothing:
+      1 -
+      (1 - QUOTA_ACTUATOR_SMOOTHING) ** (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS),
+    slew: QUOTA_MAX_SLEW_SECONDS * (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS),
+  };
+}
 /**
  * A rise in remaining quota above this many points is read as a refill rather
  * than a measurement. Inside one window `percentLeft` only falls — consumption
@@ -1061,7 +1083,7 @@ export class SharedQuotaStore {
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
     const integralDtSeconds = cycleChanged
       ? 0
-      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
+      : Math.min(dtSeconds, QUOTA_MAX_CREDITED_ELAPSED_SECONDS);
     const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
     const candidateIntegral = previousIntegral + error * integralDtSeconds;
     const rawWithoutIntegral =
@@ -1086,14 +1108,17 @@ export class SharedQuotaStore {
     // A rollover resets the controller memory, not the actuator. This resumes
     // from the last reasoned period rather than treating the exhaustion wait as one.
     const previousInterval = previous?.intervalSeconds ?? 0;
-    const smoothed =
-      previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval);
+    // Ingestion produces one durable observation per actual scrape/manual POST;
+    // cache reads and collection ticks only see the already-persisted state, so
+    // `dtSeconds` here is the elapsed time between persisted observations, not
+    // request cadence. Credit at most one trusted 30-minute slot, consistently
+    // for smoothing, slew, and integration; cached reads cannot create another
+    // response.
+    const { smoothing, slew } = elapsedActuatorResponse(dtSeconds, previous != null);
+    const smoothed = previousInterval + smoothing * (uncappedCandidate - previousInterval);
     const uncappedInterval = Math.max(
       0,
-      Math.min(
-        previousInterval + QUOTA_MAX_SLEW_SECONDS,
-        Math.max(previousInterval - QUOTA_MAX_SLEW_SECONDS, smoothed)
-      )
+      Math.min(previousInterval + slew, Math.max(previousInterval - slew, smoothed))
     );
     const interval = Math.min(opts.maxIntervalSeconds, uncappedInterval);
 
@@ -1184,8 +1209,8 @@ export class SharedQuotaStore {
    * "no decision" available without a schema change, and the published status
    * shows it as such (`governingBucketKey: null`, no buckets). The variant's
    * first step is also not quite a cold start — the gap since the zeroed row
-   * feeds the integral (`error × min(dt, QUOTA_INTEGRAL_MAX_STEP_SECONDS)`,
-   * at most a twelfth of the proportional term) and its retained
+   * feeds the integral (`error × min(dt, QUOTA_MAX_CREDITED_ELAPSED_SECONDS)`,
+   * at most half of the proportional term (`(QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS) × QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 120/3600 × 1800 = 60 s/pt`)) and its retained
    * `controller_error` feeds the raw derivative — but that is bounded and
    * would not on its own have disqualified it.
    *

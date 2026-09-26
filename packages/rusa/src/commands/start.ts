@@ -1814,6 +1814,7 @@ async function composeStart(
           error: bucket.error,
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
+        freshness: status.freshness,
       },
       status.updatedAt,
       status.exhaustedUntil,

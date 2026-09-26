@@ -11,8 +11,54 @@ export const COORDINATOR_PROTOCOL_MAJOR = 1;
 // throttle lanes (#588). Both are additive: an older reader ignores them and
 // keeps its provider-only behavior.
 export const COORDINATOR_PROTOCOL_MINOR = 2;
-export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
+/** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
+export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
+/**
+ * Scrape-mode soft stale: three missed ticks past the moment a probe refresh
+ * is due, so a healthy lane reading one full TTL old is still fresh. Clamped
+ * to the scrape hard stale so the pair stays ordered for long ticks.
+ */
+export function scrapeStaleAfterMs(tickSeconds: number): number {
+  return Math.min(QUOTA_PROBE_TTL_MS + 3 * tickSeconds * 1000, DEFAULT_HARD_STALE_AFTER_MS);
+}
+export const DEFAULT_STALE_AFTER_MS = scrapeStaleAfterMs(300); // 45 min (30m TTL + 3 x 300s)
+/**
+ * Manual mode sizes for reader plus submitter latency on paced lanes (#690):
+ * 15–40 min reader and 13–27 min submitter latency were observed in steady state.
+ */
+export const DEFAULT_MANUAL_STALE_AFTER_MS = 3_600_000; // 60 min
+export const DEFAULT_MANUAL_HARD_STALE_AFTER_MS = 7_200_000; // 120 min; `quota.throttle.manualHardStaleSeconds`
+/** Manual soft stale never exceeds its hard threshold, so the pair stays ordered. */
+export function manualSoftStaleAfterMs(manualHardStaleAfterMs: number): number {
+  return Math.min(DEFAULT_MANUAL_STALE_AFTER_MS, manualHardStaleAfterMs);
+}
+
+export interface FreshnessThresholdsConfig {
+  scrapeStaleAfterMs?: number;
+  scrapeHardStaleAfterMs?: number;
+  manualHardStaleAfterMs?: number;
+}
+
+/**
+ * Single helper for deriving resolved soft and hard freshness thresholds (#690).
+ * In manual mode, thresholds are isolated: soft stale is min(60m, manualHard)
+ * so the pair stays ordered. Manual mode never inherits scrape options.
+ * In scrape mode, soft stale defaults to 45m (30m TTL + 3*300s) and hard to 60m.
+ */
+export function freshnessThresholds(
+  mode: "manual" | "scrape" | undefined,
+  config?: FreshnessThresholdsConfig
+): { staleAfterMs: number; hardStaleAfterMs: number } {
+  if (mode === "manual") {
+    const hardStaleAfterMs = config?.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
+    const staleAfterMs = manualSoftStaleAfterMs(hardStaleAfterMs);
+    return { staleAfterMs, hardStaleAfterMs };
+  }
+  const staleAfterMs = config?.scrapeStaleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const hardStaleAfterMs = config?.scrapeHardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  return { staleAfterMs, hardStaleAfterMs };
+}
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
 export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 /**
@@ -37,6 +83,10 @@ export interface QuotaFreshness {
   buckets: Record<string, number>;
   stale: boolean;
   hardStale: boolean;
+  mode?: "manual" | "scrape";
+  staleAfterMs?: number;
+  hardStaleAfterMs?: number;
+  resetWaiting?: boolean;
 }
 
 export interface PublishedThrottleProviderStatus {
@@ -233,6 +283,7 @@ export interface PublishedThrottleOptions {
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
   nowMs?: number;
+  mode?: "manual" | "scrape";
 }
 
 export class ProtocolMismatchError extends Error {
@@ -251,11 +302,13 @@ export class ProtocolMismatchError extends Error {
 
 export function calculateFreshness(
   stored: PersistedQuotaProviderStatus,
-  options?: { staleAfterMs?: number; hardStaleAfterMs?: number; nowMs?: number }
+  options?: PublishedThrottleOptions
 ): QuotaFreshness {
   const nowMs = options?.nowMs ?? Date.now();
-  const staleAfterMs = options?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
-  const hardStaleAfterMs = options?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  const mode = options?.mode;
+  const defaultThresholds = freshnessThresholds(mode);
+  const staleAfterMs = options?.staleAfterMs ?? defaultThresholds.staleAfterMs;
+  const hardStaleAfterMs = options?.hardStaleAfterMs ?? defaultThresholds.hardStaleAfterMs;
 
   const buckets: Record<string, number> = {};
   const currentAges: number[] = [];
@@ -296,11 +349,34 @@ export function calculateFreshness(
   const stale = ageMs > staleAfterMs;
   const hardStale = ageMs > hardStaleAfterMs;
 
+  // Window reset-wait distinction (#690): if any window has passed its reset
+  // instant (resetAtIso <= nowMs), but the observation was taken before that reset,
+  // the coordinator is waiting for a fresh post-reset observation. This must never
+  // be conflated with an observed zero or fresh usage reading.
+  const resetWaiting =
+    stored.buckets && stored.buckets.length > 0
+      ? stored.buckets.some((b) => {
+          if (!b.resetAtIso) return false;
+          const resetMs = Date.parse(b.resetAtIso);
+          const observedMs = Date.parse(b.observedAt);
+          return (
+            Number.isFinite(resetMs) &&
+            resetMs <= nowMs &&
+            Number.isFinite(observedMs) &&
+            observedMs < resetMs
+          );
+        })
+      : false;
+
   return {
     ageMs,
     buckets,
     stale,
     hardStale,
+    mode,
+    staleAfterMs,
+    hardStaleAfterMs,
+    resetWaiting,
   };
 }
 
@@ -309,7 +385,8 @@ export function publishedThrottle(
   options?: PublishedThrottleOptions
 ): PublishedThrottleProviderStatus {
   const published = publishedLane(stored, options);
-  const hardStaleAfterMs = options?.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+  const hardStaleAfterMs =
+    options?.hardStaleAfterMs ?? freshnessThresholds(options?.mode).hardStaleAfterMs;
   const providerUpdatedMs = Date.parse(stored.updatedAt);
   // A model lane is retired, not hard-staled, once the provider has kept
   // reporting for longer than the hard-stale horizon without it: the window

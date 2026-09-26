@@ -6,16 +6,17 @@
 // study can compare candidate weights. Nothing here runs in production.
 
 export const MAX_INTERVAL_SECONDS = 36_000;
-export const INTEGRAL_MAX_STEP_SECONDS = 300;
+export const MAX_CREDITED_ELAPSED_SECONDS = 1_800;
 export const DERIVATIVE_TAU_SECONDS = 1_800;
+export const ACTUATOR_REFERENCE_STEP_SECONDS = 300;
 export const ACTUATOR_SMOOTHING = 0.25;
 export const MAX_SLEW_SECONDS = 900;
 export const REFILL_EPSILON_POINTS = 2;
 
-// This is the public staging revision whose controller source was read while
+// This is the public revision whose controller source was read while
 // preparing this study. The scripts also run the marker check below against the
 // checkout's source, so a changed equation or constant fails regeneration.
-export const PRODUCTION_CONTROLLER_REVISION = "04a8b99228a5d6baa2992d3d0776fa75b060021a";
+export const PRODUCTION_CONTROLLER_REVISION = "f08dfb04a80ed6e7e6755d08251d35b63649d3e8";
 
 export const BASELINE = {
   id: "current",
@@ -67,15 +68,19 @@ export function assertProductionParity(source) {
     "export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;",
     "export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;",
     "export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;",
+    "export const QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 30 * 60;",
+    "export const QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS = SLOT_MS / 1000;",
     "export const QUOTA_ACTUATOR_SMOOTHING = 0.25;",
     "export const QUOTA_MAX_SLEW_SECONDS = 900;",
     "export const QUOTA_REFILL_EPSILON_POINTS = 2;",
     "const cycleChanged = resetMoved || quotaRefilled;",
-    "Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS)",
+    "Math.min(dtSeconds, QUOTA_MAX_CREDITED_ELAPSED_SECONDS)",
     "Math.min(candidateIntegral, Math.max(previousIntegral, upperBound))",
     "Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound))",
-    "previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval)",
-    "previousInterval + QUOTA_MAX_SLEW_SECONDS",
+    "(1 - QUOTA_ACTUATOR_SMOOTHING) ** (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS)",
+    "QUOTA_MAX_SLEW_SECONDS * (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS)",
+    "previousInterval + smoothing * (uncappedCandidate - previousInterval)",
+    "Math.min(previousInterval + slew, Math.max(previousInterval - slew, smoothed))",
   ];
   const missing = required.filter((fragment) => !source.includes(fragment));
   if (missing.length > 0) {
@@ -85,8 +90,45 @@ export function assertProductionParity(source) {
   }
 }
 
+/**
+ * Elapsed-time actuator response from shared-store.ts: one 300 s reference
+ * step keeps the tuned 0.25 smoothing and 900 s slew, longer observation gaps
+ * compound them, and credit stops at one 30-minute slot. A zero `dtSeconds`
+ * marks a lane's first observation, which uses the reference step.
+ */
+export function elapsedActuatorResponse(dtSeconds) {
+  const elapsedSeconds =
+    dtSeconds > 0
+      ? Math.min(dtSeconds, MAX_CREDITED_ELAPSED_SECONDS)
+      : ACTUATOR_REFERENCE_STEP_SECONDS;
+  const steps = elapsedSeconds / ACTUATOR_REFERENCE_STEP_SECONDS;
+  return {
+    smoothing: 1 - (1 - ACTUATOR_SMOOTHING) ** steps,
+    slew: MAX_SLEW_SECONDS * steps,
+  };
+}
+
+/** The production actuator described above. */
+export const ELAPSED_ACTUATOR = {
+  id: "elapsed",
+  maxIntegralStepSeconds: MAX_CREDITED_ELAPSED_SECONDS,
+  response: elapsedActuatorResponse,
+};
+
+/**
+ * The pre-#690 actuator: a 300 s integral step cap and fixed per-observation
+ * smoothing and slew regardless of elapsed time. Kept only so the #291
+ * historical trace, which production recorded under this rule, can still
+ * validate the shared PID core.
+ */
+export const LEGACY_FIXED_STEP_ACTUATOR = {
+  id: "legacy-fixed-step",
+  maxIntegralStepSeconds: ACTUATOR_REFERENCE_STEP_SECONDS,
+  response: () => ({ smoothing: ACTUATOR_SMOOTHING, slew: MAX_SLEW_SECONDS }),
+};
+
 /** Exact fixed-weight update from shared-store.ts, parameterized only for study. */
-export function advance(previous, input, candidate) {
+export function advance(previous, input, candidate, actuator = ELAPSED_ACTUATOR) {
   const { kp, ki, kd } = parameters(candidate);
   const dtSeconds = Math.max(0, input.dtSeconds);
   const cycleChanged = input.cycleChanged ?? false;
@@ -95,7 +137,7 @@ export function advance(previous, input, candidate) {
   const rawDerivative =
     !cycleChanged && dtSeconds > 0 ? (input.error - previous.error) / dtSeconds : 0;
   const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-  const integralDtSeconds = cycleChanged ? 0 : Math.min(dtSeconds, INTEGRAL_MAX_STEP_SECONDS);
+  const integralDtSeconds = cycleChanged ? 0 : Math.min(dtSeconds, actuator.maxIntegralStepSeconds);
   const previousIntegral = cycleChanged ? 0 : previous.integral;
   const candidateIntegral = previousIntegral + input.error * integralDtSeconds;
   const rawWithoutIntegral = kp * input.error + kd * derivative;
@@ -110,13 +152,11 @@ export function advance(previous, input, candidate) {
     integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
   }
   const target = Math.max(0, rawInterval(integral));
-  const smoothed = previous.interval + ACTUATOR_SMOOTHING * (target - previous.interval);
+  const { smoothing, slew } = actuator.response(dtSeconds);
+  const smoothed = previous.interval + smoothing * (target - previous.interval);
   const uncappedInterval = Math.max(
     0,
-    Math.min(
-      previous.interval + MAX_SLEW_SECONDS,
-      Math.max(previous.interval - MAX_SLEW_SECONDS, smoothed)
-    )
+    Math.min(previous.interval + slew, Math.max(previous.interval - slew, smoothed))
   );
   return {
     error: input.error,
