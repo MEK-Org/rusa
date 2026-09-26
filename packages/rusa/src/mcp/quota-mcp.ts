@@ -1054,7 +1054,10 @@ export class QuotaService {
   private readonly deps: QuotaMcpDeps;
   private readonly configuredProviders: Set<string>;
   private readonly cache = new Map<string, { state: ProviderQuotaSnapshot; timestamp: number }>();
-  private readonly inFlightProbes = new Map<string, Promise<ProviderQuotaSnapshot>>();
+  private readonly inFlightProbes = new Map<
+    string,
+    { promise: Promise<ProviderQuotaSnapshot>; startedAt: number }
+  >();
 
   constructor(deps: QuotaMcpDeps) {
     this.deps = deps;
@@ -1193,20 +1196,25 @@ export class QuotaService {
     let didProbe = false;
     if (!inFlight) {
       didProbe = true;
-      inFlight = this.executeProbe(provider).finally(() => {
-        this.inFlightProbes.delete(provider);
-      });
+      inFlight = {
+        startedAt: now,
+        promise: this.executeProbe(provider).finally(() => {
+          this.inFlightProbes.delete(provider);
+        }),
+      };
       this.inFlightProbes.set(provider, inFlight);
     }
 
     let state: ProviderQuotaSnapshot;
     try {
-      state = await inFlight;
+      state = await inFlight.promise;
     } catch (error) {
       return { didProbe, error };
     }
     if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
-      this.cache.set(provider, { state, timestamp: (this.deps.now ?? Date.now)() });
+      // Schedule the next probe from this probe's start, not its completion:
+      // a slow CLI must not silently add a collection tick to the 30m cadence.
+      this.cache.set(provider, { state, timestamp: inFlight.startedAt });
     }
     return { state, didProbe };
   }

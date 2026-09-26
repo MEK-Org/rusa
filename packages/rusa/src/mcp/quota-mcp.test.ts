@@ -2306,6 +2306,35 @@ describe("quota MCP server", () => {
       }
     });
 
+    it("starts the probe TTL before a slow probe resolves, so the 5m collector does not add a tick", async () => {
+      let nowMs = Date.parse("2026-07-14T09:15:00.000Z");
+      vi.mocked(mockClaudeProvider.run).mockImplementationOnce(async () => {
+        nowMs += 5 * 60 * 1000;
+        return {
+          success: true,
+          output:
+            "using your subscription to power...\nCurrent session: 10% used · resets Jul 5, 10:50am (UTC)",
+          exitCode: 0,
+        };
+      });
+      const service = new QuotaService({
+        config: mockConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: mockResolveProvider,
+        now: () => nowMs,
+      });
+
+      await service.getQuota("claude");
+      expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+
+      // The completed observation is five minutes old, but its TTL began at
+      // probe start. At the next 30m boundary the collector must refresh now,
+      // not wait for a seventh five-minute tick.
+      nowMs = Date.parse("2026-07-14T09:45:00.000Z");
+      await service.getQuota("claude");
+      expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
+    });
+
     describe("getQuotaCached (non-blocking request path, issue #10)", () => {
       it("returns unsupported for an unconfigured provider without probing", () => {
         const scrapeCodexStatus = vi.fn().mockResolvedValue("raw codex status");

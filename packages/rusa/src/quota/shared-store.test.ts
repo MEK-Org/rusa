@@ -10,10 +10,6 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
 import {
-  actuatorSlewForElapsedSeconds,
-  actuatorSmoothingForElapsedSeconds,
-  QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS,
-  QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS,
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_MAX_STEP_SECONDS,
@@ -21,7 +17,6 @@ import {
   QUOTA_KD_SECONDS_SQUARED_PER_POINT,
   QUOTA_KI_SECONDS_PER_POINT_SECOND,
   QUOTA_KP_SECONDS_PER_POINT,
-  QUOTA_MAX_SCALED_SLEW_SECONDS,
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
   QUOTA_SCHEMA_VERSION,
@@ -1264,24 +1259,13 @@ describe("SharedQuotaStore PID integral term", () => {
       expect(final5m.integral).toBeCloseTo(standingError * 1800, 4);
       expect(final30m.integral).toBeCloseTo(standingError * 1800, 4);
       expect(final30m.integral).toBeCloseTo(final5m.integral, 4);
-      // The elapsed-time smoothing keeps a sparse 30m lane close to the 5m
-      // lane's wall-clock response instead of applying only one 25% step.
-      expect(final30m.interval).toBeGreaterThan(final5m.interval * 0.9);
-      expect(final30m.interval).toBeLessThan(final5m.interval * 1.2);
-      expect(actuatorSmoothingForElapsedSeconds(QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS)).toBe(
-        QUOTA_ACTUATOR_SMOOTHING
-      );
-      expect(actuatorSmoothingForElapsedSeconds(QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS)).toBeCloseTo(
-        1 - (1 - QUOTA_ACTUATOR_SMOOTHING) ** 6,
-        12
-      );
     } finally {
       store5m.close();
       store30m.close();
     }
   });
 
-  it("scales actual-observation actuator steps while bounding delayed, noisy, and reset readings (#690)", () => {
+  it("does not slow a routine 30m step below its 5m reference response (#690)", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-elapsed-actuator-"));
     roots.push(root);
     const fiveMinute = new SharedQuotaStore(join(root, "five-minute.db"));
@@ -1318,47 +1302,77 @@ describe("SharedQuotaStore PID integral term", () => {
       recordError(thirtyMinute, "claude", 30, 20);
       const fiveMinuteStep = reasonedRows(fiveMinute, "claude").at(-1) as ReasonedRow;
       const thirtyMinuteStep = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-      expect(actuatorSlewForElapsedSeconds(QUOTA_ACTUATOR_MAX_ELAPSED_SECONDS)).toBe(
-        QUOTA_MAX_SCALED_SLEW_SECONDS
-      );
-      expect(actuatorSlewForElapsedSeconds(10 * 60 * 60)).toBe(QUOTA_MAX_SCALED_SLEW_SECONDS);
-      expect(thirtyMinuteStep.interval).toBe(QUOTA_MAX_SCALED_SLEW_SECONDS);
-      expect(thirtyMinuteStep.interval).toBeGreaterThan(fiveMinuteStep.interval * 0.6);
-      expect(thirtyMinuteStep.interval).toBeLessThan(fiveMinuteStep.interval * 0.8);
-
-      // A 5m collection tick or cached probe read has no new durable
-      // observation to reason from, so it cannot add controller area or move
-      // the applied interval.
-      const beforeRepeatedTicks = reasonedRows(thirtyMinute, "claude");
-      for (let i = 0; i < 6; i += 1) {
-        thirtyMinute.advancePendingController({ maxIntervalSeconds: 36000 });
-      }
-      expect(reasonedRows(thirtyMinute, "claude")).toEqual(beforeRepeatedTicks);
-
-      // A delayed sample has real observation age, but can move the actuator
-      // by no more than the sparse-step cap. A one-point noisy follow-up gets
-      // the ordinary 5m cap, not a fabricated long elapsed interval.
-      recordError(thirtyMinute, "claude", 5 * 60, 20);
-      const delayed = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-      recordError(thirtyMinute, "claude", 5 * 60 + 5, 19);
-      const noisy = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-
-      // A rollover clears controller memory but still bounds the command from
-      // the last applied interval; it must not turn a reset into a huge jump.
-      const nextReset = "2030-01-15T00:00:00.000Z";
-      recordError(thirtyMinute, "claude", 7 * 24 * 60 + 5, 0, nextReset);
-      const resetRow = reasonedRows(thirtyMinute, "claude").at(-1) as ReasonedRow;
-
-      expect(delayed.interval - thirtyMinuteStep.interval).toBe(QUOTA_MAX_SCALED_SLEW_SECONDS);
-      expect(Math.abs(noisy.interval - delayed.interval)).toBeLessThanOrEqual(900);
-      expect(resetRow.integral).toBe(0);
-      expect(resetRow.derivative).toBe(0);
-      expect(Math.abs(resetRow.interval - noisy.interval)).toBeLessThanOrEqual(
-        QUOTA_MAX_SCALED_SLEW_SECONDS
-      );
+      // A 30m observation earns six reference slews when needed, instead of
+      // being artificially limited to the former two-step cap.
+      expect(thirtyMinuteStep.interval).toBeGreaterThanOrEqual(fiveMinuteStep.interval);
+      expect(thirtyMinuteStep.interval).toBeLessThanOrEqual(6 * 900);
     } finally {
       fiveMinute.close();
       thirtyMinute.close();
+    }
+  });
+
+  it("bounds a delayed observation to one trusted 30m response slot (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-delayed-actuator-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const recordError = (offsetMinutes: number, error: number) => {
+        const observedMs = startMs + offsetMinutes * 60 * 1000;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          ((Date.parse(reset) - observedMs) / weeklyMs) * 100 - error,
+          reset
+        );
+      };
+
+      recordError(0, 0);
+      recordError(30, 20);
+      const routine = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      recordError(5 * 60, 20);
+      const delayed = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+
+      expect(delayed.interval - routine.interval).toBeLessThanOrEqual(6 * 900);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("limits a noisy five-minute follow-up to one reference slew (#690)", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-noisy-actuator-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const startMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const reset = "2030-01-08T00:00:00.000Z";
+      const weeklyMs = 7 * 24 * 60 * 60 * 1000;
+      const recordError = (offsetMinutes: number, error: number) => {
+        const observedMs = startMs + offsetMinutes * 60 * 1000;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          ((Date.parse(reset) - observedMs) / weeklyMs) * 100 - error,
+          reset
+        );
+      };
+
+      recordError(0, 0);
+      recordError(30, 20);
+      const beforeNoise = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      recordError(35, 19);
+      const noisy = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+
+      expect(Math.abs(noisy.interval - beforeNoise.interval)).toBeLessThanOrEqual(900);
+    } finally {
+      store.close();
     }
   });
 
@@ -1391,6 +1405,9 @@ describe("SharedQuotaStore PID integral term", () => {
       const afterReset = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
       // Cycle changed zeroes integralDtSeconds and previousIntegral
       expect(afterReset.integral).toBe(0);
+      // Resetting state does not bypass the one trusted 30-minute response
+      // bound when it computes the next applied interval.
+      expect(Math.abs(afterReset.interval - afterOutage.interval)).toBeLessThanOrEqual(6 * 900);
     } finally {
       store.close();
     }
