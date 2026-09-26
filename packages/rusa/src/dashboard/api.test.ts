@@ -464,10 +464,17 @@ describe("handleMeshApiRequest", () => {
           source: "github:MEK-Org/rusa/pulls/696",
           payload: { type: "pull_request_review.submitted" },
         },
+        {
+          // A repository named "pulls" must not make an issue look like a PR.
+          id: "pulls-repo-issue-entry",
+          actorId: UUID_A,
+          source: "github:o/pulls/issues/3",
+          payload: { type: "issue_comment.created" },
+        },
       ]);
       inbox.markHandled(
         UUID_A,
-        ["issue-entry", "pr-entry"],
+        ["issue-entry", "pr-entry", "pulls-repo-issue-entry"],
         new Date("2026-09-26T03:15:00.000Z"),
         "Addressed"
       );
@@ -479,6 +486,10 @@ describe("handleMeshApiRequest", () => {
         expect.arrayContaining([
           expect.objectContaining({ id: "inbox_issue-entry", sourceKind: "GITHUB ISSUE" }),
           expect.objectContaining({ id: "inbox_pr-entry", sourceKind: "GITHUB PR" }),
+          expect.objectContaining({
+            id: "inbox_pulls-repo-issue-entry",
+            sourceKind: "GITHUB ISSUE",
+          }),
         ])
       );
     });

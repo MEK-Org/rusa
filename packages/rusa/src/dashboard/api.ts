@@ -4,6 +4,7 @@ import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
+import { inboxEntryObligationRefs } from "../actor/inbox-focus.js";
 import type { RootControlPrincipal, RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
@@ -186,7 +187,7 @@ export interface DashboardDataDeps {
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { FollowerUpdateStatus } from "../experimental/remote-instances/protocol.js";
 import { githubInboxEventReference } from "../github/inbox-notification.js";
-import { parseReference } from "../references/reference.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 export type { FollowerInfo, FollowerUpdateStatus };
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -2304,10 +2305,16 @@ export async function handleMeshApiRequest(
       const source = entry.source;
       let sourceKind = "UNKNOWN";
       if (source.startsWith("github:")) {
+        let collection: string | undefined;
+        try {
+          collection = asGitHubIssue(parseReference(source))?.collection;
+        } catch {
+          // Non-canonical GitHub source: fall through to the generic kind.
+        }
         sourceKind =
-          source.includes("/pull/") || source.includes("/pulls/")
+          collection === "pulls"
             ? "GITHUB PR"
-            : source.includes("/issues/") || source.includes("/issue/")
+            : collection === "issues"
               ? "GITHUB ISSUE"
               : "GITHUB";
       } else if (source.startsWith("mesh:")) {
@@ -2334,16 +2341,21 @@ export async function handleMeshApiRequest(
       // Selection records one run-level primary focus, but a run may select
       // unrelated inbox entries. Link and fold an activity card only through
       // this entry's own durable association or exact source reference.
-      const entryObligationIds = new Set(
-        deps.inboxFocus?.listEntryObligationIds(entry.actorId, entry.id) ?? []
+      // Same per-entry refs selection resolves, minus its live-only filter:
+      // folding needs the terminal obligation too.
+      const refs = inboxEntryObligationRefs(
+        deps.inboxFocus ?? { listEntryObligationIds: () => [] },
+        entry.actorId,
+        entry
       );
-      if (typeof entry.payload.obligationId === "string") {
-        entryObligationIds.add(entry.payload.obligationId);
-      }
+      const entryObligationIds = new Set(refs.associatedIds);
+      if (refs.payloadObligationId) entryObligationIds.add(refs.payloadObligationId);
       if (source.startsWith("obligation:")) {
         entryObligationIds.add(source.slice("obligation:".length));
       }
-      const externallyLinked = deps.obligations?.findByExternalRef(source) ?? null;
+      const externallyLinked = refs.githubWorkRef
+        ? (deps.obligations?.findByExternalRef(refs.githubWorkRef) ?? null)
+        : null;
       if (externallyLinked) entryObligationIds.add(externallyLinked.id);
       const entryObligations = deps.obligations
         ? [...entryObligationIds]
