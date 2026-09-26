@@ -3158,9 +3158,11 @@ export class ActorMesh {
   }
 
   /**
-   * List the caller's active exact event sources together with their stored
-   * configuration. This is intentionally an owner view, rather than the
-   * actor-admin audit view exposed by `list_subscriptions`.
+   * List the caller's active exact event-source ownership rows together with
+   * their stored configuration. This is intentionally a durable-row view,
+   * rather than the actor-admin audit view exposed by `list_subscriptions`.
+   * A live obligation can temporarily govern delivery for the same resource,
+   * but does not disclose or rewrite the row's opaque configuration.
    */
   listEventSources(callerId: string): EventSourceConfigView[] {
     const ownerId = this.resolveThreadId(callerId);
@@ -3174,10 +3176,11 @@ export class ActorMesh {
   }
 
   /**
-   * Replace the opaque configuration object on an event source the caller
-   * currently owns through an active exact source. Configuring a source never
+   * Replace the opaque configuration object on an event source whose active
+   * exact ownership row belongs to the caller. Configuring a source never
    * changes routing or retirement blockers: self-delegate it or receive an
-   * exact delegation first. Clearing also requires that same explicit boundary.
+   * exact delegation first. A live obligation can temporarily govern delivery,
+   * but cannot read, clear, or change that durable row's configuration.
    */
   setEventSourceConfig(
     resource: EventResource,
@@ -3186,12 +3189,6 @@ export class ActorMesh {
   ): EventSourceConfigView {
     const ownerId = this.resolveThreadId(callerId);
     const canonicalResource = resourceKey(resource);
-    if (this.effectiveOwnerOf(canonicalResource) !== ownerId) {
-      throw new Error(
-        `cannot configure ${canonicalResource}: caller is not its current effective owner`
-      );
-    }
-
     const exactOwner = this.eventSourceOwners.activeForResource(canonicalResource)[0];
     if (exactOwner?.actorId !== ownerId) {
       throw new Error(

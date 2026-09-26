@@ -2277,7 +2277,7 @@ describe("agent-execution MCP server", () => {
         config: { version: 1, chatWakeMode: "all" },
       });
       expect(res.isError).toBe(true);
-      expect(dataOf(res)).toMatch(/not its current effective owner/);
+      expect(dataOf(res)).toMatch(/needs an active exact source/);
 
       // Having delegated the space away, root is no longer its owner either.
       res = await call(rootClient, "set_event_source_config", {
@@ -2319,6 +2319,69 @@ describe("agent-execution MCP server", () => {
       expect(dataOf(await call(ownerClient, "list_event_sources", {}))).not.toEqual(
         expect.arrayContaining([expect.objectContaining({ resource: "gchat:spaces/team" })])
       );
+    });
+
+    it("keeps opaque source configuration with its exact row during a live obligation claim (#692)", async () => {
+      const issue = "github:MEK-Org/rusa/issues/692";
+      const liveObligations: Record<string, string | null> = {};
+      const { mesh } = setup({
+        obligations: {
+          findLiveByExternalRef: (ref) => {
+            const ownerId = liveObligations[ref];
+            return ownerId ? { ownerId } : null;
+          },
+        },
+      });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "live obligation owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const claimClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      mesh.subscribeEventSource(issue, "root", "root");
+      expect(
+        dataOf(
+          await call(rootClient, "set_event_source_config", {
+            source: issue,
+            config: { version: 1, label: "durable-row" },
+          })
+        )
+      ).toEqual({ resource: issue, config: { version: 1, label: "durable-row" } });
+
+      // The live obligation controls delivery, not the stored subscription row
+      // or its opaque configuration.
+      liveObligations[issue] = "t1";
+      expect(dataOf(await call(claimClient, "list_event_sources", {}))).toEqual([]);
+      const deniedClear = await call(claimClient, "set_event_source_config", {
+        source: issue,
+        config: null,
+      });
+      expect(deniedClear.isError).toBe(true);
+      expect(dataOf(deniedClear)).toMatch(/needs an active exact source/);
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual([
+        { resource: issue, config: { version: 1, label: "durable-row" } },
+      ]);
+
+      // The exact owner may update its durable config without disturbing the
+      // live claim that is currently routing delivery.
+      expect(
+        dataOf(
+          await call(rootClient, "set_event_source_config", {
+            source: issue,
+            config: { version: 1, label: "retained-row" },
+          })
+        )
+      ).toEqual({ resource: issue, config: { version: 1, label: "retained-row" } });
+      expect(mesh.resolveEffectiveRoute(issue)).toMatchObject({
+        governingSource: "obligation",
+        principal: "t1",
+      });
     });
 
     it("requires exact reclaim for a child-created chat wake boundary (#692)", async () => {

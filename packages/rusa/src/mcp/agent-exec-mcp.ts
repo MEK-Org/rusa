@@ -720,14 +720,14 @@ export function createAgentExecMcpServer(
   );
 
   // ── Event-source configuration (#692) ── Each consumer owns the versioned
-  // keys it understands. Configuration has the same effective-owner authority
-  // as delegation, enforced in the mesh; these tools grant no new permission.
+  // keys it understands on its active exact ownership rows. A routing claim
+  // never exposes or mutates another row's opaque configuration.
   server.registerTool(
     "list_event_sources",
     {
       title: "List your event sources",
       description:
-        "List your active exact event sources and each source's stored configuration object. A null config means that source has no explicit configuration.",
+        "List your active exact event-source ownership rows and their stored configuration objects. A null config means that row has no explicit configuration; live obligation routing claims are not configuration rows.",
       inputSchema: {},
     },
     async () => {
@@ -744,7 +744,7 @@ export function createAgentExecMcpServer(
     {
       title: "Set an event source's configuration",
       description:
-        "Replace the configuration object on an event source you currently own, or pass null to clear it. A non-null config materializes that exact source as an ownership boundary; later broad delegation or reclaim does not move it, so use exact-source delegation or reclaim when needed. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
+        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
       inputSchema: {
         ...eventResourceInputSchema,
         config: z
