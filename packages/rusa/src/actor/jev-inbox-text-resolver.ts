@@ -13,47 +13,29 @@ import type { JevResolvedInboxEntry, ResolveJevInboxEntry } from "./jev-decision
  * what a decision actually needs.
  */
 export const JEV_MAX_ENTRY_TEXT_CHARS = 4_000;
-/**
- * How long a resolved entry is reused. One arrival batch evaluates each
- * incoming entry against the same candidate set; this keeps that to one source
- * read per entry instead of one per arrival. In memory only.
- */
-const MEMO_TTL_MS = 30_000;
-const MEMO_MAX_ENTRIES = 256;
-
 export interface JevInboxTextResolverDeps
   extends Pick<ReferenceResolverDeps, "meshChat" | "chatClient" | "slackClient" | "issueClient"> {
   inbox: Pick<InboxRepository, "read">;
-  now?: () => number;
 }
 
 /**
  * Resolve an inbox row at the host edge just before the opt-in JEV request,
- * through the same reference path the dashboard uses to show inbox entries.
- * Source text is neither added to `inbox_items` nor returned to the
- * scheduler/audit layer. An entry whose text cannot be read resolves with
- * `text: null` rather than throwing, so one unreadable candidate does not void
- * the whole decision; the client decides what a missing incoming text means.
+ * through the same `resolveReference` path the dashboard uses to show inbox
+ * entries, but not its reference cache: that cache persists entity bodies in
+ * mesh.db, and this path keeps source text in memory only. Source text is
+ * neither added to `inbox_items` nor returned to the scheduler/audit layer.
+ * An entry whose text cannot be read resolves with `text: null` rather than
+ * throwing, so one unreadable candidate does not void the whole decision; the
+ * client decides what a missing incoming text means.
+ *
+ * The source clients take no `AbortSignal`, so an expired deadline stops the
+ * caller waiting on a read rather than cancelling it. No request is sent after
+ * expiry either way.
  */
 export function createJevInboxTextResolver(deps: JevInboxTextResolverDeps): ResolveJevInboxEntry {
-  const now = deps.now ?? Date.now;
-  const memo = new Map<string, { expiresAt: number; value: Promise<JevResolvedInboxEntry> }>();
   return async (actorId, entryId, signal) => {
     signal?.throwIfAborted();
-    const key = `${actorId}\u0000${entryId}`;
-    const at = now();
-    let hit = memo.get(key);
-    if (!hit || hit.expiresAt <= at) {
-      for (const [k, v] of memo) if (v.expiresAt <= at) memo.delete(k);
-      while (memo.size >= MEMO_MAX_ENTRIES) {
-        const oldest = memo.keys().next().value;
-        if (oldest === undefined) break;
-        memo.delete(oldest);
-      }
-      hit = { expiresAt: at + MEMO_TTL_MS, value: resolveEntry(actorId, entryId, deps) };
-      memo.set(key, hit);
-    }
-    const resolved = await hit.value;
+    const resolved = await resolveEntry(actorId, entryId, deps);
     signal?.throwIfAborted();
     return resolved;
   };

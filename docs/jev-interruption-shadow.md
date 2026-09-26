@@ -22,27 +22,39 @@ masked in every sandbox, so this file, like any host secret, reaches a worker
 only if root explicitly grants `secret:<filename>` (#542); nothing in the
 classifier needs such a grant.
 
-With this explicit opt-in, the client resolves the text of the arriving item and
-its current candidates immediately before calling TypeSafe, through the same
-reference resolver the dashboard uses for inbox entries. Obligation attention
-and mechanical notes contribute their inline intent or note. It does not add
-that text to the durable inbox or shadow audit; resolved text is reused in
-memory for up to 30 seconds so one arrival batch reads each source once.
+With this explicit opt-in, the client resolves the text of the arriving item
+immediately before calling TypeSafe, and then, only if that text is readable,
+the text of its current candidates. It reads through the same reference
+resolver the dashboard uses for inbox entries, but not the dashboard's
+reference cache, which persists bodies in `mesh.db`. Obligation attention and
+mechanical notes contribute their inline intent or note. The text is held in
+memory for that one decision; it is not added to the durable inbox, the shadow
+audit, or any cache.
+
+**What is sent.** Every inbox item kind the actor holds can be sent, including
+mesh messages: a person's own conversation with the actor, which the dashboard
+hides from other viewers. Google Chat, Slack and GitHub items, obligation
+attention and mechanical notes are sent too. Enabling the setting sends all of
+these to TypeSafe for the actors that receive responsive items.
 
 Each decision is bounded: at most 20 candidates are read and sent (the number
 left out is sent as `omittedCandidates`), and each entry's text is cut at 4,000
 characters. Both numbers, the 0.8 interrupt threshold, and the 5-second
-decision deadline (which covers source reads and the request) are uncalibrated
-placeholders that the shadow data is meant to calibrate.
+decision deadline are uncalibrated placeholders that the shadow data is meant
+to calibrate. The deadline covers source reads and the request: expiry cancels
+the request, but a source read in progress runs to completion unobserved,
+because the source clients take no cancellation signal. Nothing is sent after
+expiry.
 
-The client follows the [TypeSafe System One API](https://docs.typesafe.ai/api):
-it posts `https://api.typesafe.ai/v1/systemone` with a Bearer credential, model
-`jev-latest`, the resolved incoming and candidate entries (id, inbox source,
-payload type, text) as `state`, and one
-`choice` question named `interruption`. The choices are `interrupt` and
-`queue`; it accepts only a `choice` answer whose probabilities for those two
-form a distribution (each in [0, 1], summing to 1 within rounding) and a
-numeric confidence.
+The client uses the official `@typesafe-ai/sdk`, pinned to an exact version,
+and follows the [TypeSafe System One API](https://docs.typesafe.ai/api). It
+posts `https://api.typesafe.ai/v1/systemone` with a Bearer credential. The API
+root is set explicitly, so a `TYPESAFE_BASE_URL` in the daemon's environment
+cannot redirect the credential. The request carries model `jev-latest`, the
+resolved incoming and candidate entries (id, inbox source, payload type, text)
+as `state`, and one `choice` question named `interruption`. The choices are
+`interrupt` and `queue`; it accepts an answer only if it selects one of those
+and carries a numeric confidence.
 
 The shadow audit retains stable inbox IDs, candidate source, verdict/confidence,
 and baseline scheduler behavior; it does not retain message bodies, TypeSafe

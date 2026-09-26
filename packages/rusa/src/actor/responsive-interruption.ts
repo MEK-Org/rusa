@@ -201,8 +201,10 @@ export type ResponsiveInterruptionDecision =
 
 /**
  * How long a decision may take before the policy stops waiting on it. The
- * budget covers the live client's source reads as well as its HTTP request,
- * and expiry aborts both through the `AbortSignal` passed to `decide`.
+ * budget covers the live client's source reads as well as its HTTP request.
+ * Expiry aborts the request through the `AbortSignal` passed to `decide`; the
+ * source clients take no signal, so the client stops waiting on a read in
+ * progress rather than cancelling it, and sends nothing after expiry.
  * Uncalibrated placeholder: shadow mode delays nothing, and `timeout` is
  * recorded as its own reason, so the shadow data is what calibrates it.
  */

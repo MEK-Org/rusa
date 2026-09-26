@@ -45,7 +45,7 @@ importers:
         specifier: workspace:*
         version: link:../../third_party/glass_goals_devkit/packages/goals-types
       '@typesafe-ai/sdk':
-        specifier: ^0.6.0
+        specifier: 0.6.0
         version: 0.6.0
       better-sqlite3:
         specifier: ^12.6.2

@@ -143,15 +143,12 @@ describe("createJevInboxTextResolver", () => {
     expect(resolved.truncated).toBe(true);
   });
 
-  it("reads each source once across one arrival batch, then refreshes", async () => {
-    let now = 0;
-    const source = { ...deps(), now: () => now };
+  it("reads the source on every call, so a failed read is not reused", async () => {
+    const source = deps();
+    source.chatClient.getMessage.mockRejectedValueOnce(new Error("transient"));
     const resolve = createJevInboxTextResolver(source);
-    await Promise.all([resolve("actor", "entry"), resolve("actor", "entry")]);
-    await resolve("actor", "entry");
-    expect(source.chatClient.getMessage).toHaveBeenCalledTimes(1);
-    now = 60_000;
-    await resolve("actor", "entry");
+    await expect(resolve("actor", "entry")).resolves.toMatchObject({ text: null });
+    await expect(resolve("actor", "entry")).resolves.toMatchObject({ text: "real chat text" });
     expect(source.chatClient.getMessage).toHaveBeenCalledTimes(2);
   });
 });

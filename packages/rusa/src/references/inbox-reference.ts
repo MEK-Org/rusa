@@ -45,8 +45,10 @@ export function gchatInboxMessageReference(
 /**
  * The reference holding the text an inbox entry is about, or undefined when the
  * entry names none. Inbox rows store pointers rather than bodies, so this is
- * the one mapping from a row to something {@link resolveReference} can read:
- * a mesh message id, the exact GitHub comment or review (or, for other GitHub
+ * the JEV client's mapping from a row to something {@link resolveReference}
+ * can read. (The dashboard's inbox page keeps its own mapping, which also
+ * resolves the event and falls back to the issue/PR where this names nothing;
+ * only the Chat case is shared.) It names a mesh message id, the exact GitHub comment or review (or, for other GitHub
  * events, the issue/PR itself), the Chat message in its source space, or a Slack message.
  */
 export function inboxEntryReference(

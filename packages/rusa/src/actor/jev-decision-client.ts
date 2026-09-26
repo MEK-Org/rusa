@@ -1,13 +1,4 @@
-import {
-  APIError,
-  type ChoiceCriteria,
-  type ChoiceQuestion,
-  choice,
-  type EntryType,
-  type Fetch,
-  type SystemOneResult,
-  TypeSafeClient,
-} from "@typesafe-ai/sdk";
+import { APIError, choice, type Fetch, type JsonValue, TypeSafeClient } from "@typesafe-ai/sdk";
 import {
   type JevDecisionClient,
   type JevDecisionRequest,
@@ -15,8 +6,12 @@ import {
   JevInputUnavailableError,
 } from "./responsive-interruption.js";
 
-/** The documented TypeSafe System One endpoint used for this narrow shadow policy. */
-export const JEV_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone";
+/**
+ * The TypeSafe API root. It matches the SDK default but is passed explicitly:
+ * left unset, the SDK would take `TYPESAFE_BASE_URL` from the daemon's
+ * environment and send the bearer credential and inbox text wherever it names.
+ */
+const JEV_BASE_URL = "https://api.typesafe.ai";
 /** An alias rather than a pinned release lets the operator's TypeSafe account select its current model. */
 export const JEV_DEFAULT_MODEL = "jev-latest";
 /**
@@ -27,7 +22,15 @@ export const JEV_DEFAULT_MODEL = "jev-latest";
  */
 export const JEV_MAX_CANDIDATES = 20;
 
-export interface JevResolvedInboxEntry {
+/** The two outcomes offered to the model, which are also the verdicts accepted back. */
+const INTERRUPTION_CRITERIA = {
+  interrupt:
+    "The arriving item bears on the listed work clearly enough that continuing would waste or spoil it.",
+  queue: "The arriving item can safely wait in the queue.",
+};
+
+/** A type alias rather than an interface, so it is assignable to the SDK's JSON state. */
+export type JevResolvedInboxEntry = {
   id: string;
   source: string;
   /** Inbox payload type, so a candidate without readable text still says what it is. */
@@ -35,7 +38,7 @@ export interface JevResolvedInboxEntry {
   /** Source text (bounded), or null when the source could not be read. Never persisted. */
   text: string | null;
   truncated?: true;
-}
+};
 
 /** Host-owned resolution boundary; neither the scheduler nor its audit stores text. */
 export type ResolveJevInboxEntry = (
@@ -44,51 +47,11 @@ export type ResolveJevInboxEntry = (
   signal?: AbortSignal
 ) => Promise<JevResolvedInboxEntry>;
 
-export interface JevFetchInit {
-  method: string;
-  headers: Record<string, string>;
-  body: string;
-  signal?: AbortSignal;
-}
-
-export type JevFetch = (
-  input: string,
-  init: JevFetchInit
-) => Promise<Response | { ok: boolean; status: number; json(): Promise<unknown> }>;
-
-function adaptFetch(fetchImpl: JevFetch): Fetch {
-  return async (input: string, init?: RequestInit): Promise<Response> => {
-    const rawHeaders = init?.headers ?? {};
-    const headers: Record<string, string> =
-      rawHeaders instanceof Headers
-        ? Object.fromEntries(rawHeaders.entries())
-        : (rawHeaders as Record<string, string>);
-    const res = await fetchImpl(input, {
-      method: init?.method ?? "POST",
-      headers,
-      body: typeof init?.body === "string" ? init.body : JSON.stringify(init?.body ?? {}),
-      signal: init?.signal ?? undefined,
-    });
-    if (res instanceof Response) return res;
-    if (
-      typeof (res as Response).clone === "function" &&
-      typeof (res as Response).text === "function"
-    ) {
-      return res as Response;
-    }
-    const data = await res.json();
-    return new Response(JSON.stringify(data), {
-      status: res.status,
-      headers: { "Content-Type": "application/json" },
-    });
-  };
-}
-
 /**
- * TypeSafe transport behind the existing JEV seam leveraging the official
- * `@typesafe-ai/sdk` client. It configures single-send (`maxRetries: 0`) and
- * disables SDK logging to ensure no prompt content or retry leaks occur, while
- * the shadow scheduler fails safely to queue.
+ * TypeSafe transport behind the existing JEV seam, using the official
+ * `@typesafe-ai/sdk` client. It sends once (`maxRetries: 0`), because a retry
+ * would resend real inbox content, and turns SDK logging off so prompt bodies
+ * never reach logs. Every failure throws, and the shadow scheduler queues.
  */
 export class HttpJevDecisionClient implements JevDecisionClient {
   private readonly client: TypeSafeClient;
@@ -96,19 +59,15 @@ export class HttpJevDecisionClient implements JevDecisionClient {
   constructor(
     apiKey: string,
     private readonly resolveEntry: ResolveJevInboxEntry,
-    fetchImpl: JevFetch = globalThis.fetch as unknown as JevFetch,
-    client?: TypeSafeClient
+    fetch?: Fetch
   ) {
-    this.client =
-      client ??
-      new TypeSafeClient({
-        apiKey,
-        baseURL: new URL(JEV_SYSTEM_ONE_URL).origin,
-        fetch: adaptFetch(fetchImpl),
-        retry: { maxRetries: 0 },
-        logLevel: "off",
-        dangerouslyAllowBrowser: true,
-      });
+    this.client = new TypeSafeClient({
+      apiKey,
+      baseURL: JEV_BASE_URL,
+      retry: { maxRetries: 0 },
+      logLevel: "off",
+      ...(fetch ? { fetch } : {}),
+    });
   }
 
   async decide(
@@ -117,76 +76,49 @@ export class HttpJevDecisionClient implements JevDecisionClient {
   ): Promise<JevDecisionResponse> {
     const { actorId } = request;
     const { incomingEntryId, candidateEntryIds, candidateSource } = request.input;
-    const sent = candidateEntryIds.slice(0, JEV_MAX_CANDIDATES);
-    const [incoming, ...candidates] = await Promise.all(
-      [incomingEntryId, ...sent].map((entryId) =>
-        this.resolveEntry(actorId, entryId, options.signal)
-      )
-    );
     // Without the arriving item's text there is nothing to decide. That is an
-    // input gap, not a transport failure, and the audit keeps them apart.
-    if (!incoming || incoming.text === null) throw new JevInputUnavailableError();
+    // input gap, not a transport failure, and the audit keeps them apart. It is
+    // settled before any candidate is read.
+    const incoming = await this.resolveEntry(actorId, incomingEntryId, options.signal);
+    if (incoming.text === null) throw new JevInputUnavailableError();
+    const sent = candidateEntryIds.slice(0, JEV_MAX_CANDIDATES);
+    const candidates = await Promise.all(
+      sent.map((entryId) => this.resolveEntry(actorId, entryId, options.signal))
+    );
     const omittedCandidates = candidateEntryIds.length - sent.length;
+    const state: JsonValue = {
+      incoming,
+      candidates,
+      candidateSource,
+      ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
+    };
 
-    let result: SystemOneResult<{ interruption: ChoiceQuestion<ChoiceCriteria> }>;
+    let answer: { choice: unknown; confidence: unknown } | undefined;
     try {
-      result = await this.client.systemOne(
+      const result = await this.client.systemOne(
         {
           model: JEV_DEFAULT_MODEL,
-          state: {
-            incoming,
-            candidates,
-            candidateSource,
-            ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
-          } as unknown as EntryType,
-          questions: {
-            interruption: choice(request.question, {
-              interrupt:
-                "The arriving item bears on the listed work clearly enough that continuing would waste or spoil it.",
-              queue: "The arriving item can safely wait in the queue.",
-            }),
-          },
+          state,
+          questions: { interruption: choice(request.question, INTERRUPTION_CRITERIA) },
         },
         { signal: options.signal }
       );
+      answer = result.answers?.interruption;
     } catch (err) {
       if (err instanceof APIError) {
         throw new Error(`JEV decision service returned HTTP ${err.status}`);
       }
       throw err;
     }
-
-    const answer = (
-      result as {
-        answers?: Record<
-          string,
-          { type?: unknown; choice?: unknown; probabilities?: unknown; confidence?: unknown }
-        >;
-      }
-    ).answers?.interruption;
+    // The SDK types the answer but does not validate the wire, so the two
+    // fields the policy uses are checked here.
     if (
-      !answer ||
-      answer.type !== "choice" ||
-      typeof answer.choice !== "string" ||
-      !hasChoiceProbabilities(answer.probabilities) ||
+      typeof answer?.choice !== "string" ||
+      !Object.hasOwn(INTERRUPTION_CRITERIA, answer.choice) ||
       typeof answer.confidence !== "number"
     ) {
       throw new Error("JEV decision service returned an invalid interruption answer");
     }
     return { verdict: answer.choice, confidence: answer.confidence };
   }
-}
-
-/**
- * The documented Choice answer is a distribution over the criteria. One that is
- * not (a value outside [0, 1], or a total off 1 by more than rounding) says the
- * answer is malformed, so it is not trusted to carry a verdict.
- */
-function hasChoiceProbabilities(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const { interrupt, queue } = value as Record<string, unknown>;
-  const isProbability = (p: unknown): p is number => typeof p === "number" && p >= 0 && p <= 1;
-  return (
-    isProbability(interrupt) && isProbability(queue) && Math.abs(interrupt + queue - 1) <= 0.01
-  );
 }
