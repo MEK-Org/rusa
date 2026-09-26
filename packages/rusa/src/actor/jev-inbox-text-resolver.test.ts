@@ -51,10 +51,10 @@ describe("createJevInboxTextResolver", () => {
       source: "gchat:spaces/S",
       type: "gchat.message",
       text: "real chat text",
-      // The message carries no sender or createTime, so there is no sender and
-      // the time falls back to when the row arrived.
+      // The message carries no sender or createTime, so those source facts are
+      // explicitly unknown; row delivery time must not masquerade as send time.
       sender: null,
-      timestamp: "2026-09-26T17:00:07.000Z",
+      timestamp: null,
     });
     expect(source.inbox.read).toHaveBeenCalledWith("actor", "entry");
     expect(source.chatClient.getMessage).toHaveBeenCalledWith("spaces/S/messages/M");
@@ -71,7 +71,7 @@ describe("createJevInboxTextResolver", () => {
 
     await expect(createJevInboxTextResolver(source)("actor", "entry")).resolves.toMatchObject({
       text: "lands*",
-      sender: "Operator",
+      sender: "users/1",
       timestamp: "2026-09-26T17:00:06.000Z",
     });
   });

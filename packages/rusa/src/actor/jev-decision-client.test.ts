@@ -237,7 +237,8 @@ describe("INTERRUPTION_CRITERIA", () => {
  * HTTP transport are faked.
  */
 describe("JEV interruption regressions (#710)", () => {
-  const SENDER = "Operator";
+  const DISPLAY_NAME = "Operator";
+  const STABLE_SENDER = "users/1";
 
   async function decidePair(pair: {
     earlier: string;
@@ -269,7 +270,7 @@ describe("JEV interruption regressions (#710)", () => {
       chatClient: {
         getMessage: async (name: string) => ({
           name,
-          sender: { name: "users/1", displayName: SENDER },
+          sender: { name: "users/1", displayName: DISPLAY_NAME },
           ...messages[name],
         }),
         getSpace: vi.fn(),
@@ -310,14 +311,14 @@ describe("JEV interruption regressions (#710)", () => {
       incoming: {
         id: "later",
         text: "On second thought let's not test it",
-        sender: SENDER,
+        sender: STABLE_SENDER,
         timestamp: "2026-09-26T17:00:06.000Z",
       },
       candidates: [
         {
           id: "earlier",
           text: "This is a test of the jev stuff",
-          sender: SENDER,
+          sender: STABLE_SENDER,
           timestamp: "2026-09-26T17:00:00.000Z",
           candidateSource: "selected",
         },
@@ -332,7 +333,7 @@ describe("JEV interruption regressions (#710)", () => {
     });
     // The audit stays ids-only: no text, sender or source time reaches it.
     const audit = JSON.stringify(decision);
-    for (const leaked of ["second thought", "jev stuff", SENDER, "17:00:0"]) {
+    for (const leaked of ["second thought", "jev stuff", DISPLAY_NAME, STABLE_SENDER, "17:00:0"]) {
       expect(audit).not.toContain(leaked);
     }
   });
@@ -350,14 +351,14 @@ describe("JEV interruption regressions (#710)", () => {
       incoming: {
         id: "later",
         text: "lands*",
-        sender: SENDER,
+        sender: STABLE_SENDER,
         timestamp: "2026-09-26T17:00:06.000Z",
       },
       candidates: [
         {
           id: "earlier",
           text: "Keep shadow mode on for now, and disable the jev integration until that fails.",
-          sender: SENDER,
+          sender: STABLE_SENDER,
           timestamp: "2026-09-26T17:00:00.000Z",
           candidateSource: "pending",
         },
@@ -366,7 +367,7 @@ describe("JEV interruption regressions (#710)", () => {
     });
     expect(decision).toMatchObject({ outcome: "interrupt", verdict: "interrupt" });
     const audit = JSON.stringify(decision);
-    for (const leaked of ["lands*", "jev integration", SENDER, "17:00:0"]) {
+    for (const leaked of ["lands*", "jev integration", DISPLAY_NAME, STABLE_SENDER, "17:00:0"]) {
       expect(audit).not.toContain(leaked);
     }
   });
