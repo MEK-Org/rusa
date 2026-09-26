@@ -39,6 +39,13 @@ interface PacerRequest<T> {
  * A FIFO, start-to-start provider governor. Normal runs wait for the adaptive
  * interval and then for mesh concurrency; responsive runs bypass both queues.
  * The next interval starts only when the provider invocation actually starts.
+ *
+ * A pacer may be linked to a provider-wide pacer (#588): it then paces one
+ * model's own quota windows on top of the provider's. It is available only
+ * when both clocks allow a start, each of its starts is charged to the
+ * provider clock as well, and the two lanes hold at most one pending request
+ * between them, so a model start can neither skip the provider-wide interval
+ * nor stage beside a provider-lane start.
  */
 export class ProviderPacer {
   private intervalMs: number;
@@ -47,13 +54,17 @@ export class ProviderPacer {
   private readonly queue: Array<PacerRequest<unknown>> = [];
   private staged: PacerRequest<unknown> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly dependents = new Set<ProviderPacer>();
 
   constructor(
     intervalMs = 0,
-    private readonly now: () => number = () => Date.now()
+    private readonly now: () => number = () => Date.now(),
+    /** The provider-wide pacer this model pacer also answers to, if any. */
+    readonly linked?: ProviderPacer
   ) {
     this.assertInterval(intervalMs);
     this.intervalMs = intervalMs;
+    linked?.dependents.add(this);
   }
 
   get interval(): number {
@@ -62,6 +73,24 @@ export class ProviderPacer {
 
   get waiting(): number {
     return this.queue.length + (this.staged ? 1 : 0);
+  }
+
+  /**
+   * Whether this lane, its linked provider lane, or another model lane linked
+   * to the same provider holds a queued or staged request. Such a lane shares
+   * the one provider start clock, so it cannot accept new work until that
+   * request starts or settles.
+   */
+  get busy(): boolean {
+    const root = this.linked ?? this;
+    if (root.waiting > 0) return true;
+    for (const dependent of root.dependents) if (dependent.waiting > 0) return true;
+    return false;
+  }
+
+  /** The earliest start this lane's own clock and its linked provider clock both allow. */
+  private get availableAt(): number {
+    return Math.max(this.nextAvailableAt, this.linked?.nextAvailableAt ?? 0);
   }
 
   /**
@@ -110,7 +139,7 @@ export class ProviderPacer {
     }> = [];
     const pacingIntervalMs = Math.round(this.intervalMs);
     let position = 0;
-    let eta: number | null = this.staged ? null : this.nextAvailableAt;
+    let eta: number | null = this.staged ? null : this.availableAt;
 
     if (this.staged) {
       if (this.staged.opts.threadId) {
@@ -147,14 +176,14 @@ export class ProviderPacer {
    * compare candidates before committing to one via {@link submit}.
    */
   quote(now: number = this.now()): number {
-    return Math.max(now, this.nextAvailableAt) + this.waiting * this.intervalMs;
+    return Math.max(now, this.availableAt) + this.waiting * this.intervalMs;
   }
 
   get queueHead(): { threadId: string; availableAt: number } | null {
     if (this.staged) return null;
     const request = this.queue[0];
     if (!request?.opts.threadId) return null;
-    return { threadId: request.opts.threadId, availableAt: this.nextAvailableAt };
+    return { threadId: request.opts.threadId, availableAt: this.availableAt };
   }
 
   setInterval(intervalMs: number): void {
@@ -164,6 +193,7 @@ export class ProviderPacer {
       this.nextAvailableAt = this.lastStartedAt + intervalMs;
     }
     this.schedule();
+    for (const dependent of this.dependents) dependent.schedule();
   }
 
   /**
@@ -176,6 +206,7 @@ export class ProviderPacer {
     }
     this.nextAvailableAt = Math.max(this.nextAvailableAt, availableAtMs);
     this.schedule();
+    for (const dependent of this.dependents) dependent.schedule();
   }
 
   submit<T>(fn: () => Promise<T>, opts: ProviderPacerSubmitOptions): RunStartHandle<T> {
@@ -247,7 +278,7 @@ export class ProviderPacer {
       this.timer = null;
     }
     if (this.staged || this.queue.length === 0) return;
-    const waitMs = Math.max(0, this.nextAvailableAt - this.now());
+    const waitMs = Math.max(0, this.availableAt - this.now());
     if (waitMs === 0) {
       this.stageNext();
       return;
@@ -283,7 +314,7 @@ export class ProviderPacer {
 
       // The adaptive interval may have increased while this ticket waited in
       // the mesh queue. Revalidate at selection time rather than starting early.
-      if (!request.responsive && this.now() < this.nextAvailableAt) {
+      if (!request.responsive && this.now() < this.availableAt) {
         request.state = "provider-queued";
         this.queue.unshift(request);
         this.schedule();
@@ -312,6 +343,7 @@ export class ProviderPacer {
     const startedAt = this.now();
     this.lastStartedAt = startedAt;
     this.nextAvailableAt = startedAt + this.intervalMs;
+    this.linked?.charge(startedAt);
     request.opts.onStarted?.();
     this.schedule();
     try {
@@ -321,6 +353,17 @@ export class ProviderPacer {
     } finally {
       request.state = "settled";
     }
+  }
+
+  /**
+   * Record a linked model lane's start on this provider clock. An earlier
+   * deferral (e.g. an exhaustion deadline) is kept rather than shortened.
+   */
+  private charge(startedAt: number): void {
+    this.lastStartedAt = startedAt;
+    this.nextAvailableAt = Math.max(this.nextAvailableAt, startedAt + this.intervalMs);
+    this.schedule();
+    for (const dependent of this.dependents) dependent.schedule();
   }
 
   private assertInterval(intervalMs: number): void {
@@ -628,9 +671,12 @@ function lanesOf<C>(item: { candidates: readonly PoolLaneCandidate<C>[] }): stri
   return [...new Set(item.candidates.map((candidate) => candidate.lane))];
 }
 
-/** A lane can claim new work only with nothing queued or staged and no pacing delay left. */
+/**
+ * A lane can claim new work only with nothing queued or staged on it or on a
+ * lane sharing its provider clock, and no pacing delay left.
+ */
 function isIdleLane(pacer: ProviderPacer, now: number): boolean {
-  return pacer.waiting === 0 && pacer.quote(now) <= now;
+  return !pacer.busy && pacer.quote(now) <= now;
 }
 
 /** A read-only entry in the leader-local, cross-lane admission queue. */
@@ -772,7 +818,7 @@ export class UnifiedAdmissionQueue<C> {
     // honest time until that claim starts, so it offers none.
     const next = new Map<ProviderPacer, number | null>();
     const projected = (pacer: ProviderPacer): number | null => {
-      if (!next.has(pacer)) next.set(pacer, pacer.waiting > 0 ? null : pacer.quote(now));
+      if (!next.has(pacer)) next.set(pacer, pacer.busy ? null : pacer.quote(now));
       return next.get(pacer) ?? null;
     };
     for (const item of this.waiting) {
@@ -901,19 +947,23 @@ export class UnifiedAdmissionQueue<C> {
    * actor.
    *
    * An item only ever claims one of its own declared candidates, so a lane
-   * never admits a model it does not gate: a model-scoped lane (e.g. Fable
-   * under #588) is a distinct candidate lane, not a provider-wide match.
+   * never admits a model it does not gate: a model-scoped pacer (e.g. Fable
+   * under #588) paces only candidates that declare that model, and shares its
+   * provider's clock through the link rather than standing in for it.
    */
   private claimNormal(): void {
     const now = this.now();
+    // Keyed by provider clock: a model lane and its provider lane share one,
+    // so a pass claims at most one of them.
     const busy = new Set<ProviderPacer>();
+    const clockOf = (pacer: ProviderPacer) => pacer.linked ?? pacer;
     for (const item of [...this.waiting]) {
       const idle = this.healthy(item, false).filter(
-        (candidate) => !busy.has(candidate.pacer) && isIdleLane(candidate.pacer, now)
+        (candidate) => !busy.has(clockOf(candidate.pacer)) && isIdleLane(candidate.pacer, now)
       );
       const selected = selectPoolLane(idle, now);
       if (!selected) continue;
-      busy.add(selected.pacer);
+      busy.add(clockOf(selected.pacer));
       this.claim(item, selected);
     }
   }
@@ -1006,7 +1056,7 @@ export class UnifiedAdmissionQueue<C> {
       for (const candidate of this.healthy(item, false)) {
         // A busy lane frees up through its claimed item's start or
         // settlement, which refreshes; only a pacing delay needs a timer.
-        if (candidate.pacer.waiting > 0) continue;
+        if (candidate.pacer.busy) continue;
         const quote = candidate.pacer.quote(now);
         if (quote > now && (next === undefined || quote < next)) next = quote;
       }

@@ -1239,3 +1239,108 @@ describe("UnifiedAdmissionQueue", () => {
     await expect(handle.result).resolves.toBe("second");
   });
 });
+
+describe("linked model pacers (#588)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const clock = () => Date.now();
+  const lanes = (providerMs: number, fableMs: number) => {
+    const provider = new ProviderPacer(providerMs, clock);
+    const fable = new ProviderPacer(fableMs, clock, provider);
+    return {
+      provider,
+      fable,
+      sonnetCandidate: { config: "claude-sonnet-5", lane: "claude", pacer: provider },
+      fableCandidate: { config: "claude-fable-5-1", lane: "claude", pacer: fable },
+    };
+  };
+
+  it("paces a Fable start by the stricter of its own and the provider clock", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const enqueueNormal = <T>(fn: () => Promise<T>) => mesh.enqueue(fn);
+    const base = Date.now();
+
+    // Fable's own window is the stricter one.
+    const strict = lanes(10_000, 60_000);
+    await strict.fable.submit(async () => "fable", { enqueueNormal }).result;
+    expect(strict.fable.quote(base)).toBe(base + 60_000);
+    // Its start is charged to the provider clock too, so Sonnet waits for
+    // the provider interval but not for Fable's window.
+    expect(strict.provider.quote(base)).toBe(base + 10_000);
+
+    // The provider window is the stricter one.
+    const loose = lanes(10_000, 5_000);
+    await loose.fable.submit(async () => "fable", { enqueueNormal }).result;
+    expect(loose.fable.quote(base)).toBe(base + 10_000);
+    // A provider-lane start also delays Fable.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await loose.provider.submit(async () => "sonnet", { enqueueNormal }).result;
+    expect(loose.fable.quote(Date.now())).toBe(base + 20_000);
+
+    // Fable exhaustion never touches Sonnet; provider exhaustion stops both.
+    const gated = lanes(0, 0);
+    gated.fable.deferUntil(base + 3_600_000);
+    expect(gated.provider.quote(Date.now())).toBe(Date.now());
+    gated.fable.deferUntil(0);
+    gated.provider.deferUntil(base + 7_200_000);
+    expect(gated.fable.quote(Date.now())).toBe(base + 7_200_000);
+  });
+
+  it("follows the live stricter clock after a reset or a retired window", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const enqueueNormal = <T>(fn: () => Promise<T>) => mesh.enqueue(fn);
+    const base = Date.now();
+    const { provider, fable } = lanes(10_000, 60_000);
+    await fable.submit(async () => "fable", { enqueueNormal }).result;
+
+    // An operator reset of the provider controller leaves Fable's window governing.
+    provider.setInterval(0);
+    expect(fable.quote(base)).toBe(base + 60_000);
+    // The Fable window disappears (published interval 0): the provider governs.
+    fable.setInterval(0);
+    provider.setInterval(10_000);
+    expect(fable.quote(base)).toBe(base + 10_000);
+    // A hard-stale provider widening to the ceiling holds Fable too.
+    provider.setInterval(3_600_000);
+    expect(fable.quote(base)).toBe(base + 3_600_000);
+  });
+
+  it("claims at most one of a provider's lanes at a time and starts each on the shared clock", async () => {
+    const mesh = new ConcurrencyLimiter(4);
+    const queue = new UnifiedAdmissionQueue<string>();
+    const { provider, fable, sonnetCandidate, fableCandidate } = lanes(10_000, 30_000);
+    const base = Date.now();
+    const started: Array<[string, number]> = [];
+    const run = (id: string, candidate: typeof sonnetCandidate) =>
+      queue.enqueue(
+        async (config) => {
+          started.push([config, Date.now() - base]);
+          return id;
+        },
+        [candidate],
+        { threadId: id, enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+    run("fable-1", fableCandidate);
+    run("sonnet-1", sonnetCandidate);
+    run("fable-2", fableCandidate);
+    // The Fable claim makes the provider lane busy: Sonnet waits for the
+    // provider clock rather than staging beside it.
+    expect(fable.busy).toBe(true);
+    expect(provider.busy).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual([["claude-fable-5-1", 0]]);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(started).toEqual([
+      ["claude-fable-5-1", 0],
+      ["claude-sonnet-5", 10_000],
+    ]);
+    // Fable's own window, not the provider's, holds the second Fable start.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(started).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(started.at(-1)).toEqual(["claude-fable-5-1", 30_000]);
+  });
+});
