@@ -3169,6 +3169,21 @@ export class ActorMesh {
     if (mode === null) {
       this.chatWakeModes.clear(resource);
     } else {
+      // A configured wake mode is durable event-source state. If authority
+      // reached this space through an ancestor, materialize this exact source
+      // under the same effective owner before writing config. That turns a
+      // future delegation/reclaim of the space into a normal owner-row handoff,
+      // which carries the configuration without changing its behavior.
+      if (
+        !this.eventSourceOwners.activeForResource(resource).some((row) => row.actorId === setBy)
+      ) {
+        this.eventSourceOwners.subscribe({
+          resource,
+          actorId: setBy,
+          subscribedBy: setBy,
+          subscribedAt: this.now(),
+        });
+      }
       this.chatWakeModes.set({ resource, mode });
     }
     this.recordEvent({

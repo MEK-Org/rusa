@@ -13,6 +13,7 @@ type SubscriptionRow = {
   subscribed_by: string;
   subscribed_at: string;
   unsubscribed_at: string | null;
+  config: string | null;
 };
 
 function fromRow(row: SubscriptionRow): EventSourceOwnership {
@@ -25,7 +26,7 @@ function fromRow(row: SubscriptionRow): EventSourceOwnership {
   };
 }
 
-const SELECT_COLUMNS = "resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at";
+const SELECT_COLUMNS = "resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at, config";
 
 /**
  * SQLite implementation of {@link EventSourceOwnerStore} — every call reads
@@ -78,19 +79,29 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
       this.db
         .prepare(
           `INSERT INTO event_source_owners
-             (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at)
-           VALUES (?, ?, ?, ?, ?)
+             (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at, config)
+           VALUES (?, ?, ?, ?, ?, (
+             SELECT config FROM event_source_owners
+             WHERE resource = ?
+             ORDER BY
+               CASE WHEN unsubscribed_at IS NULL THEN 0 ELSE 1 END,
+               unsubscribed_at DESC,
+               subscribed_at DESC
+             LIMIT 1
+           ))
            ON CONFLICT(resource, actor_id) DO UPDATE SET
              subscribed_by = excluded.subscribed_by,
              subscribed_at = excluded.subscribed_at,
-             unsubscribed_at = excluded.unsubscribed_at`
+             unsubscribed_at = excluded.unsubscribed_at,
+             config = excluded.config`
         )
         .run(
           resource,
           subscription.actorId,
           subscription.subscribedBy,
           subscription.subscribedAt,
-          subscription.unsubscribedAt ?? null
+          subscription.unsubscribedAt ?? null,
+          resource
         );
     })();
   }
