@@ -47,10 +47,21 @@ async function resolveEntry(
   deps: JevInboxTextResolverDeps
 ): Promise<JevResolvedInboxEntry> {
   const entry = deps.inbox.read(actorId, entryId);
-  if (!entry) return { id: entryId, source: "", type: "", text: null };
+  if (!entry) {
+    return { id: entryId, source: "", type: "", text: null, sender: null, timestamp: null };
+  }
   const ref = inboxEntryReference(entry);
-  const text = (ref ? referenceText(await resolveReference(ref, deps)) : null) ?? inlineText(entry);
-  return { id: entry.id, source: entry.source, type: entry.payload.type, ...bounded(text) };
+  const resolved = ref ? await resolveReference(ref, deps) : null;
+  const text = (resolved ? referenceText(resolved) : null) ?? inlineText(entry);
+  return {
+    id: entry.id,
+    source: entry.source,
+    type: entry.payload.type,
+    ...bounded(text),
+    sender: resolved?.author || inlineSender(entry),
+    // The source's own time when it has one; otherwise when the row arrived.
+    timestamp: resolved?.timestamp || entry.deliveredAt.toISOString(),
+  };
 }
 
 function referenceText(resolved: ResolvedReferenceWithEntity): string | null {
@@ -74,6 +85,12 @@ function inlineText(entry: InboxEntry): string | null {
     if (typeof value === "string" && value.trim()) return value;
   }
   return null;
+}
+
+/** Mesh-generated rows name their sending actor inline, when they have one. */
+function inlineSender(entry: InboxEntry): string | null {
+  const fromId = entry.payload.fromId;
+  return typeof fromId === "string" && fromId ? fromId : null;
 }
 
 function bounded(text: string | null): { text: string | null; truncated?: true } {

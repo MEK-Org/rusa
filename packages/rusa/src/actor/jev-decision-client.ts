@@ -22,11 +22,13 @@ export const JEV_DEFAULT_MODEL = "jev-latest";
  */
 export const JEV_MAX_CANDIDATES = 20;
 
-/** The two outcomes offered to the model, which are also the verdicts accepted back. */
-const INTERRUPTION_CRITERIA = {
-  interrupt:
-    "The arriving item bears on the listed work clearly enough that continuing would waste or spoil it.",
-  queue: "The arriving item can safely wait in the queue.",
+/**
+ * The two outcomes offered to the model, which are also the verdicts accepted
+ * back. Exported so a test can pin the wording the operator approved (#710).
+ */
+export const INTERRUPTION_CRITERIA = {
+  interrupt: "the arriving item relates to the current work, or its relationship is uncertain.",
+  queue: "the arriving item is clearly unrelated to the current work.",
 };
 
 /** A type alias rather than an interface, so it is assignable to the SDK's JSON state. */
@@ -38,6 +40,13 @@ export type JevResolvedInboxEntry = {
   /** Source text (bounded), or null when the source could not be read. Never persisted. */
   text: string | null;
   truncated?: true;
+  /**
+   * Who sent it and when (ISO-8601), or null when unknown, so the model can
+   * see that two messages came from the same person seconds apart. Never
+   * persisted.
+   */
+  sender: string | null;
+  timestamp: string | null;
 };
 
 /** Host-owned resolution boundary; neither the scheduler nor its audit stores text. */
@@ -82,8 +91,13 @@ export class HttpJevDecisionClient implements JevDecisionClient {
     const incoming = await this.resolveEntry(actorId, incomingEntryId, options.signal);
     if (incoming.text === null) throw new JevInputUnavailableError();
     const sent = candidateEntryIds.slice(0, JEV_MAX_CANDIDATES);
+    // Each candidate says which set it came from, so the model can tell
+    // current work (selected) from unread context (pending).
     const candidates = await Promise.all(
-      sent.map((entryId) => this.resolveEntry(actorId, entryId, options.signal))
+      sent.map(async (entryId) => ({
+        ...(await this.resolveEntry(actorId, entryId, options.signal)),
+        candidateSource,
+      }))
     );
     const omittedCandidates = candidateEntryIds.length - sent.length;
     const state: JsonValue = {

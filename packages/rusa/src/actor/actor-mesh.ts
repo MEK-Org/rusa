@@ -1477,12 +1477,12 @@ export class ActorMesh {
    */
   private postShadowReaction(
     payload: Readonly<Record<string, unknown>>,
-    outcome: ResponsiveInterruptionVerdict,
+    verdict: ResponsiveInterruptionVerdict,
     incomingEntryId: string
   ): void {
     const react = this.reactToChatMessage;
     if (!react) return;
-    const target = shadowReactionTarget(payload, outcome);
+    const target = shadowReactionTarget(payload, verdict);
     if (!target) return;
     // A reaction is an observation aid, never a delivery guarantee. Failures
     // are logged rather than retried; the audit event already holds the
