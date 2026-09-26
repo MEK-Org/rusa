@@ -128,7 +128,10 @@ export interface QuotaHistoryDto {
   generatedAt: string;
   /** Inclusive lower bound for the quota history returned with this snapshot. */
   historySince: string;
-  /** Durable real-scrape readings from the prior 3 days, grouped by quota pool. */
+  /**
+   * Durable real-scrape readings from the prior `HISTORY_WINDOW_MS` (14 days),
+   * grouped by quota pool, each series bounded to `MAX_HISTORY_POINTS_PER_SERIES`.
+   */
   history: QuotaHistorySeriesDto[];
 }
 
@@ -288,6 +291,65 @@ function toProviderDto(
 export { HISTORY_WINDOW_MS };
 
 /**
+ * Most points one history series may carry to the dashboard. Five-minute
+ * readings over the 14-day range would be ~4,000 per series; 672 is one per
+ * half hour, which is finer than the chart can draw and keeps the response and
+ * the paint loop small (#706).
+ */
+export const MAX_HISTORY_POINTS_PER_SERIES = 672;
+
+/**
+ * A reported reset instant that moves by more than this is a new quota window
+ * rather than parse jitter — the same threshold the dashboard chart breaks on.
+ */
+const WINDOW_RESET_SHIFT_MS = 60 * 60 * 1000;
+
+function startsNewWindow(previous: QuotaHistorySource, next: QuotaHistorySource): boolean {
+  if (previous.resetAtIso === null || next.resetAtIso === null) return false;
+  const shiftMs = Math.abs(Date.parse(next.resetAtIso) - Date.parse(previous.resetAtIso));
+  return Number.isFinite(shiftMs) && shiftMs > WINDOW_RESET_SHIFT_MS;
+}
+
+/**
+ * Thin a time-ordered series to at most `MAX_HISTORY_POINTS_PER_SERIES` real
+ * readings. Each time bucket keeps its newest reading, plus the last reading
+ * of a window that reset inside the bucket, so the low point before a reset
+ * survives. Readings are chosen, never averaged or filled, so an unobserved
+ * stretch stays empty and every controller field is the stored one.
+ */
+function boundHistoryPoints(
+  points: readonly QuotaHistorySource[],
+  sinceMs: number,
+  untilMs: number
+): readonly QuotaHistorySource[] {
+  if (points.length <= MAX_HISTORY_POINTS_PER_SERIES) return points;
+  let resets = 0;
+  for (let i = 1; i < points.length; i++) {
+    if (startsNewWindow(points[i - 1], points[i])) resets++;
+  }
+  // Reserve room for the pre-reset readings so the bound is hard.
+  const bucketCount =
+    MAX_HISTORY_POINTS_PER_SERIES - Math.min(resets, MAX_HISTORY_POINTS_PER_SERIES / 2);
+  const bucketMs = Math.max(1, (untilMs - sinceMs) / bucketCount);
+  const bucketOf = (point: QuotaHistorySource): number =>
+    Math.floor((Date.parse(point.observedAt) - sinceMs) / bucketMs);
+  const kept: QuotaHistorySource[] = [];
+  let preReset: QuotaHistorySource | null = null;
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i];
+    const next = points[i + 1];
+    if (next !== undefined && bucketOf(next) === bucketOf(point)) {
+      if (startsNewWindow(point, next)) preReset = point;
+      continue;
+    }
+    if (preReset !== null) kept.push(preReset);
+    kept.push(point);
+    preReset = null;
+  }
+  return kept;
+}
+
+/**
  * A provider's windows are its provider-scoped ones only, decided by the same
  * `isProviderScopedWindow` rule observation ingestion applies (issue #249). The
  * filter lives here, ahead of the per-provider mappers, so every provider gets
@@ -345,7 +407,8 @@ export function buildQuotaHistory(
     if (group) group.push(point);
     else groups.set(key, [point]);
   }
-  return [...groups.values()].map((points) => {
+  return [...groups.values()].map((group) => {
+    const points = boundHistoryPoints(group, sinceMs, untilMs);
     const latest = points.at(-1);
     const scope = latest?.scope ?? "provider";
     return {

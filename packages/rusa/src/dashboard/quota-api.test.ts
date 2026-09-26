@@ -7,7 +7,9 @@ import {
   buildQuotaHistory,
   buildQuotaHistorySnapshot,
   buildQuotaSnapshot,
+  HISTORY_WINDOW_MS,
   handleQuotaApiRequest,
+  MAX_HISTORY_POINTS_PER_SERIES,
   type QuotaApiDeps,
   type QuotaHistorySource,
   type QuotaSnapshotDto,
@@ -765,10 +767,142 @@ describe("dashboard quota snapshot", () => {
       resetAtIso: null,
     });
   });
+  it("bounds a dense series to one real reading per time bucket, keeping each window's last reading before a reset", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const firstReset = "2026-09-19T00:00:00.000Z";
+    const secondReset = "2026-09-26T00:00:00.000Z";
+    const fiveMinutes = 5 * 60 * 1000;
+    const rows: QuotaHistorySource[] = [];
+    for (let t = sinceMs; t <= untilMs; t += fiveMinutes) {
+      // A two-day outage with no readings at all must stay a gap.
+      if (
+        t >= Date.parse("2026-09-15T00:00:00.000Z") &&
+        t < Date.parse("2026-09-17T00:00:00.000Z")
+      ) {
+        continue;
+      }
+      const beforeReset = t < Date.parse(firstReset);
+      rows.push(
+        historyPoint({
+          scope: "model",
+          models: ["claude-fable"],
+          label: "Fable",
+          observedAt: new Date(t).toISOString(),
+          percentLeft: Math.round((beforeReset ? 40 : 90) - ((t - sinceMs) % 1000) / 100),
+          resetAtIso: beforeReset ? firstReset : secondReset,
+        })
+      );
+    }
+    expect(rows.length).toBeGreaterThan(MAX_HISTORY_POINTS_PER_SERIES);
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    expect(series.points.length).toBeLessThanOrEqual(MAX_HISTORY_POINTS_PER_SERIES);
+    // Every point is a real reading, never an average or a filled value.
+    const byObservedAt = new Map(rows.map((row) => [row.observedAt, row]));
+    for (const point of series.points) {
+      const source = byObservedAt.get(point.observedAt);
+      expect(source).toBeDefined();
+      expect(point.remainingPercent).toBe(source?.percentLeft);
+      expect(point.error).toBeNull();
+      expect(point.intervalSeconds).toBeNull();
+    }
+    // The newest reading and the last reading before the reset both survive.
+    expect(series.points.at(-1)?.observedAt).toBe(rows.at(-1)?.observedAt);
+    const lastBeforeReset = rows.filter((row) => row.resetAtIso === firstReset).at(-1);
+    expect(series.points.map((point) => point.observedAt)).toContain(lastBeforeReset?.observedAt);
+    // Nothing is invented inside the outage.
+    expect(
+      series.points.filter(
+        (point) =>
+          point.observedAt >= "2026-09-15T00:00:00.000Z" &&
+          point.observedAt < "2026-09-17T00:00:00.000Z"
+      )
+    ).toEqual([]);
+  });
+
+  it("leaves a series at or under the bound untouched", () => {
+    const rows = Array.from({ length: 12 }, (_, i) =>
+      historyPoint({
+        observedAt: new Date(Date.parse("2026-09-20T00:00:00.000Z") + i * 60_000).toISOString(),
+        percentLeft: 50 - i,
+      })
+    );
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      "2026-09-12T00:00:00.000Z",
+      "2026-09-26T00:00:00.000Z"
+    );
+    expect(series.points.map((point) => point.remainingPercent)).toEqual(
+      rows.map((row) => row.percentLeft)
+    );
+  });
 });
 
 describe("dashboard quota history snapshot", () => {
-  it("returns prior-3-day durable readings as quota remaining, not quota used", () => {
+  it("reaches back past Sep 14 on Sep 26 and carries model readings that have no controller decision", () => {
+    expect(HISTORY_WINDOW_MS).toBe(14 * 24 * 60 * 60 * 1000);
+    const now = Date.parse("2026-09-26T15:00:00.000Z");
+    const historySnapshot = buildQuotaHistorySnapshot({
+      getQuota: async () => claudeState,
+      providers: ["claude"],
+      now: () => now,
+      listHistory: () => [
+        historyPoint({
+          scope: "model",
+          models: ["claude-fable"],
+          label: "Fable",
+          observedAt: "2026-09-14T00:05:00.000Z",
+          percentLeft: 97,
+          resetAtIso: "2026-09-19T00:00:00.000Z",
+        }),
+        historyPoint({
+          scope: "model",
+          models: ["claude-fable"],
+          label: "Fable",
+          observedAt: "2026-09-26T14:55:00.000Z",
+          percentLeft: 61,
+          resetAtIso: "2026-09-26T23:00:00.000Z",
+        }),
+      ],
+    });
+
+    expect(historySnapshot.historySince).toBe("2026-09-12T15:00:00.000Z");
+    expect(historySnapshot.history).toEqual([
+      {
+        provider: "claude",
+        windowId: "weekly",
+        scope: "model",
+        modelIds: ["claude-fable"],
+        label: "Fable",
+        points: [
+          {
+            observedAt: "2026-09-14T00:05:00.000Z",
+            remainingPercent: 97,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: "2026-09-19T00:00:00.000Z",
+          },
+          {
+            observedAt: "2026-09-26T14:55:00.000Z",
+            remainingPercent: 61,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: "2026-09-26T23:00:00.000Z",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("returns prior-14-day durable readings as quota remaining, not quota used", () => {
     const now = Date.parse("2026-07-26T20:00:00.000Z");
     const calls: Array<{ provider: string; sinceIso: string }> = [];
     const historySnapshot = buildQuotaHistorySnapshot({
@@ -793,11 +927,11 @@ describe("dashboard quota history snapshot", () => {
     expect(calls).toEqual([
       {
         provider: "claude",
-        sinceIso: "2026-07-23T20:00:00.000Z",
+        sinceIso: "2026-07-12T20:00:00.000Z",
       },
     ]);
     expect(historySnapshot.generatedAt).toBe("2026-07-26T20:00:00.000Z");
-    expect(historySnapshot.historySince).toBe("2026-07-23T20:00:00.000Z");
+    expect(historySnapshot.historySince).toBe("2026-07-12T20:00:00.000Z");
     expect(historySnapshot.history).toEqual([
       {
         provider: "claude",

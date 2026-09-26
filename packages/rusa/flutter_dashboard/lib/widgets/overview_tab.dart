@@ -205,7 +205,7 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Quota pacing over the prior 3 days, backed by durable provider scrapes.
+  /// Quota pacing over the history range, backed by durable provider scrapes.
   Widget _buildQuotaPoolsCard() {
     return StreamBuilder<List<Object?>>(
       stream: Rx.combineLatest2<QuotaHistoryDto?, bool, List<Object?>>(
@@ -229,13 +229,16 @@ class _OverviewTabState extends State<OverviewTab> {
               _sectionHeader(
                 Icons.show_chart,
                 MeshColors.accent,
-                'Quota Pacing — Prior 3 Days',
+                'Quota Pacing — ${quotaHistoryRangeOf(history).title}',
               ),
               const SizedBox(height: 4),
-              const Text(
+              Text(
                 'How each provider has been pacing through its weekly quota '
-                'over the last three days.',
-                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                'over the ${quotaHistoryRangeOf(history).phrase}.',
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 11,
+                ),
               ),
               const SizedBox(height: 14),
               if (history == null)

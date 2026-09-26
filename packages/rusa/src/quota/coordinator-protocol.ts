@@ -14,7 +14,12 @@ export const COORDINATOR_PROTOCOL_MINOR = 2;
 export const DEFAULT_STALE_AFTER_MS = 900_000; // 15 min (3 x 300s)
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
 export const DEFAULT_MAX_INTERVAL_SECONDS = 3600;
-export const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
+/**
+ * How far back the dashboard's quota history reaches. Fourteen days covers two
+ * full weekly windows, so a model's history survives a reset (#706); rows are
+ * retained for 30 days (`QUOTA_OBSERVATION_RETENTION_MS`).
+ */
+export const HISTORY_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 /**
  * Operator write routes (#573). They are ordinary `/v1/` paths: design §5.2,
  * Criterion 7 states the allowed method per path rather than declaring the
