@@ -39,8 +39,8 @@ node research/quota-closed-loop-study.mjs --check
 and the candidate list that both studies import, so the two cannot drift apart.
 `research/lib/closed-loop.mjs` holds the plant model used only by the closed-loop
 study. The scripts also assert the mirrored controller constants and update-rule
-markers against the checkout's production source; the recorded staging revision is
-`04a8b99228a5d6baa2992d3d0776fa75b060021a`.
+markers against the checkout's production source; the recorded source revision is
+`f08dfb04a80ed6e7e6755d08251d35b63649d3e8` (the #690 elapsed-time actuator).
 
 ## Fixed-input artifacts
 
@@ -70,9 +70,9 @@ The closed-loop simulation audits eight modeler-selected coverage categories. Pu
 this list.
 
 1. **Applied throttling (Source-backed mechanism):** One `ProviderPacer` lane stages one external request behind the interval clock, then waits for `ConcurrencyLimiter` selection. The staged request remains in that queue until selection-time revalidation; interval lengthening rebases pending pacing on `lastStartedAt`.
-2. **Observation cadence (Source-backed slot width; modeled timing):** The baseline uses the store's 300 s `SLOT_MS` width. Exact 300 s simulation steps avoid the earlier 600 s model's `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300` integration clipping; live jitter and skipped slots are uncalibrated.
+2. **Observation cadence (Source-backed slot width; modeled timing):** The baseline uses the store's 300 s `SLOT_MS` width. 300 s is also the actuator's reference step: production scales smoothing and slew by elapsed observation time and credits at most `QUOTA_MAX_CREDITED_ELAPSED_SECONDS = 1800` per observation (integral, smoothing, and slew alike), so 600 s steps are no longer clipped to 300 s as they were under the earlier `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300` rule; live jitter and skipped slots are uncalibrated.
 3. **Execution duration and concurrency (Modeled duration; source-backed default capacity):** 240 s is a modeled duration baseline. Four concurrent normal slots match the mesh configuration default; 30/240/600 s and 1/4 slots are sensitivity cases.
-4. **Quota reset behavior (Source-backed mechanism):** The model mirrors `shared-store.ts` cycle rollover at 7 days, 100% refill, integral/derivative zeroing, and post-reset slew/smoothing.
+4. **Quota reset behavior (Source-backed mechanism):** The model mirrors `shared-store.ts` cycle rollover at 7 days, 100% refill, integral/derivative zeroing, and post-reset elapsed-scaled slew/smoothing.
 5. **Responsive and external demand (Source-backed gating; modeled split):** Responsive runs bypass pacing and mesh concurrency while updating the interval clock. Demand split is an explicit assumption.
 6. **Quota usage (Modeled normalization + sensitivity):** Fixed 0.050 points per run and the derived 2,000-run weekly budget are normalized model inputs, not observed usage. The deterministic 1.8×/0.6×/0.6× sensitivity is attached to generated arrivals so every candidate receives the same exogenous cost trace; it is not a real token-cost distribution.
 7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson draws (no public arrival telemetry).
