@@ -2271,6 +2271,54 @@ describe("agent-execution MCP server", () => {
       ).toBe(true);
     });
 
+    it("requires exact reclaim for a child-created chat wake boundary (#692)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "space owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      mesh.subscribeEventSource("gchat:spaces", "root", "root");
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces" },
+      });
+      expect(
+        dataOf(await call(ownerClient, "set_chat_wake_mode", { space: "spaces/team", mode: "all" }))
+      ).toBe("gchat:spaces/team: all");
+
+      // Reclaiming the broad source leaves the child's newly materialized exact
+      // boundary in place. The parent must reclaim that exact source before the
+      // child can be retired or the parent can change its mode.
+      const broadReclaim = (await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces" },
+      })) as CallToolResult;
+      expect(broadReclaim.isError).toBeFalsy();
+      expect((await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" })).isError).toBe(
+        true
+      );
+      expect(dataOf(await call(ownerClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
+        "gchat:spaces/team: all"
+      );
+
+      const exactReclaim = (await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces/team" },
+      })) as CallToolResult;
+      expect(exactReclaim.isError).toBeFalsy();
+      expect(dataOf(await call(rootClient, "get_chat_wake_mode", { space: "spaces/team" }))).toBe(
+        "gchat:spaces/team: all"
+      );
+    });
+
     it("lets a subscribed parent delegate to a child and reclaim the topic", async () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));

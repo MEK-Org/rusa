@@ -3094,7 +3094,10 @@ export class ActorMesh {
 
   /**
    * Reclaim an exact delegated event source, pointing it back at the caller when
-   * the caller would be the effective owner after that exact delegation is removed.
+   * the caller would be the effective owner after that exact delegation is removed,
+   * or when the caller is an actor-tree ancestor of its current holder. The latter
+   * is the parent-side escape hatch for a delegated root source: removing its only
+   * exact row leaves no source-level owner to establish the former condition.
    */
   reclaimEventSource(resource: EventResource, reclaimedBy: string): void {
     reclaimedBy = this.resolveThreadId(reclaimedBy);
@@ -3107,9 +3110,12 @@ export class ActorMesh {
       throw new Error(`cannot reclaim ${resourceKey(resource)}: no active subscription`);
     }
 
-    if (this.effectiveOwnerOf(resource, { ignoreExactResource: resource }) !== reclaimedBy) {
+    const ownsUnderlyingSource =
+      this.effectiveOwnerOf(resource, { ignoreExactResource: resource }) === reclaimedBy;
+    const isHolderAncestor = this.isAncestorOf(reclaimedBy, current.actorId);
+    if (!ownsUnderlyingSource && !isHolderAncestor) {
       throw new Error(
-        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim`
+        `cannot reclaim ${resourceKey(resource)}: caller is not the effective owner after reclaim or an ancestor of its current holder`
       );
     }
 

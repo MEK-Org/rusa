@@ -411,27 +411,24 @@ export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
 
-  getConfig(resource: EventResource): string | null | undefined {
-    const active = this.subs.get(
-      [...this.subs.keys()].find((key) => {
-        const row = this.subs.get(key);
-        return row?.resource === resourceKey(resource) && !row.unsubscribedAt;
-      }) ?? ""
+  private activeEntry(
+    resource: EventResource
+  ): [string, EventSourceOwnership & { config: string | null }] | undefined {
+    const normalized = resourceKey(resource);
+    return [...this.subs.entries()].find(
+      ([, row]) => row.resource === normalized && !row.unsubscribedAt
     );
-    return active?.config;
+  }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    return this.activeEntry(resource)?.[1].config;
   }
 
   setConfig(resource: EventResource, config: string | null): void {
-    const key = [...this.subs.keys()].find((candidate) => {
-      const row = this.subs.get(candidate);
-      return row?.resource === resourceKey(resource) && !row.unsubscribedAt;
-    });
-    if (!key)
-      throw new Error(`cannot configure ${resourceKey(resource)}: no active event-source owner`);
-    const active = this.subs.get(key);
+    const active = this.activeEntry(resource);
     if (!active)
       throw new Error(`cannot configure ${resourceKey(resource)}: no active event-source owner`);
-    this.subs.set(key, { ...active, config });
+    this.subs.set(active[0], { ...active[1], config });
   }
 }
 
@@ -492,15 +489,7 @@ export class UnionEventSourceOwnerStore implements EventSourceOwnerStore {
   }
 
   setConfig(resource: EventResource, config: string | null): void {
-    const key = resourceKey(resource);
-    if (this.mutatingStore.activeForResource(key).length > 0) {
-      this.mutatingStore.setConfig(key, config);
-      return;
-    }
-    const active = this.activeForResource(key)[0];
-    if (!active) throw new Error(`cannot configure ${key}: no active event-source owner`);
-    this.mutatingStore.subscribe(active);
-    this.mutatingStore.setConfig(key, config);
+    this.mutatingStore.setConfig(resourceKey(resource), config);
   }
 }
 

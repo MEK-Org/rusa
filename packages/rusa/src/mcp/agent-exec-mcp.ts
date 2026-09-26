@@ -703,7 +703,7 @@ export function createAgentExecMcpServer(
     {
       title: "Reclaim delegated event source",
       description:
-        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed. Live obligation claims take precedence over stored subscriptions.",
+        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed, or when you are the current holder's actor-tree ancestor. Live obligation claims take precedence over stored subscriptions.",
       inputSchema: eventResourceInputSchema,
     },
     async ({ source, kind, org, repo, number, ref, space }) => {
@@ -753,7 +753,7 @@ export function createAgentExecMcpServer(
     {
       title: "Set a chat space's wake mode",
       description:
-        "Choose how a Google Chat space you currently own wakes you: `mentions` (only messages that @mention Rusa), `all` (every message), or `default` (every message in a DM or two-person space, mentions in larger spaces). A non-default per-space setting makes that space an explicit ownership boundary; `default` clears its setting but retains that boundary, which can be moved with event-source delegation or reclaim. Each change applies from the next arriving message.",
+        "Choose how a Google Chat space you currently own wakes you: `mentions` (only messages that @mention Rusa), `all` (every message), or `default` (every message in a DM or two-person space, mentions in larger spaces). A non-default per-space setting makes that space an explicit ownership boundary; `default` clears its setting but retains that boundary. A broad-source delegation or reclaim does not move that space — use exact-source delegation or reclaim. Each change applies from the next arriving message.",
       inputSchema: {
         ...chatSpaceInputSchema,
         mode: z.enum(["mentions", "all", "default"]).describe("The wake mode for this space."),
