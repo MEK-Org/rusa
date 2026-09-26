@@ -40,7 +40,7 @@ void main() {
 
         final wideQueue = tester.getRect(find.text('My Queue'));
         final wideQuota = tester.getRect(
-          find.text('Quota Pacing — Prior 3 Days'),
+          find.textContaining('Quota Pacing'),
         );
         expect(wideQueue.left, lessThan(wideQuota.left));
         expect(wideQueue.bottom, greaterThan(wideQuota.top));
@@ -52,7 +52,7 @@ void main() {
 
         final narrowQueue = tester.getRect(find.text('My Queue'));
         final narrowQuota = tester.getRect(
-          find.text('Quota Pacing — Prior 3 Days'),
+          find.textContaining('Quota Pacing'),
         );
         expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
         expect(narrowQueue.top, lessThan(narrowQuota.top));
@@ -68,7 +68,7 @@ void main() {
 
         final justBelowQueue = tester.getRect(find.text('My Queue'));
         final justBelowQuota = tester.getRect(
-          find.text('Quota Pacing — Prior 3 Days'),
+          find.textContaining('Quota Pacing'),
         );
         expect(justBelowQueue.left, closeTo(justBelowQuota.left, 1));
         expect(justBelowQueue.top, lessThan(justBelowQuota.top));
@@ -81,7 +81,7 @@ void main() {
 
         final atBoundaryQueue = tester.getRect(find.text('My Queue'));
         final atBoundaryQuota = tester.getRect(
-          find.text('Quota Pacing — Prior 3 Days'),
+          find.textContaining('Quota Pacing'),
         );
         expect(atBoundaryQueue.left, lessThan(atBoundaryQuota.left));
         expect(atBoundaryQueue.bottom, greaterThan(atBoundaryQuota.top));

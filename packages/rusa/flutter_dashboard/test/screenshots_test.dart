@@ -416,11 +416,11 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
   ],
 );
 
-QuotaHistoryDto _overviewQuotaHistory() => const QuotaHistoryDto(
+QuotaHistoryDto _overviewQuotaHistory() => QuotaHistoryDto(
   generatedAt: '2026-06-26T09:00:00Z',
-  historySince: '2026-06-23T09:00:00Z',
+  historySince: '2026-06-12T09:00:00Z',
   history: [
-    QuotaHistorySeriesDto(
+    const QuotaHistorySeriesDto(
       provider: 'codex',
       windowId: 'weekly',
       label: 'Weekly',
@@ -442,8 +442,50 @@ QuotaHistoryDto _overviewQuotaHistory() => const QuotaHistoryDto(
         ),
       ],
     ),
+    // Model history with no controller decision (#706): it draws only on the
+    // remaining plot, across a reset and a day with no readings.
+    QuotaHistorySeriesDto(
+      provider: 'claude',
+      windowId: 'weekly',
+      scope: 'model',
+      modelIds: const ['claude-fable'],
+      label: 'Fable',
+      points: _fableHistoryPoints(),
+    ),
   ],
 );
+
+/// Half-hourly Fable readings from Jun 13, as the API sends them after
+/// thinning: weekly drawdown, a reset on Jun 19 and Jun 26, and no readings
+/// through Jun 21.
+List<QuotaHistoryPointDto> _fableHistoryPoints() {
+  final points = <QuotaHistoryPointDto>[];
+  final resets = [
+    DateTime.utc(2026, 6, 19),
+    DateTime.utc(2026, 6, 26),
+    DateTime.utc(2026, 7, 3),
+  ];
+  for (
+    var at = DateTime.utc(2026, 6, 13);
+    !at.isAfter(DateTime.utc(2026, 6, 26, 9));
+    at = at.add(const Duration(minutes: 30))
+  ) {
+    if (at.isAfter(DateTime.utc(2026, 6, 21)) &&
+        at.isBefore(DateTime.utc(2026, 6, 22))) {
+      continue;
+    }
+    final resetAt = resets.firstWhere((reset) => reset.isAfter(at));
+    final left = resetAt.difference(at).inMinutes / (7 * 24 * 60);
+    points.add(
+      QuotaHistoryPointDto(
+        observedAt: at.toIso8601String(),
+        remainingPercent: (100 * left * 0.9 + 8).clamp(0, 100).toDouble(),
+        resetAtIso: resetAt.toIso8601String(),
+      ),
+    );
+  }
+  return points;
+}
 
 List<String> _seedIds() => const [
   'root',

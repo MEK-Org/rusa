@@ -33,8 +33,8 @@ export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  * Observation retention window (30 days).
  *
  * Chosen deliberately:
- * 1. Overview tab history chart queries only 3 days (`HISTORY_WINDOW_MS`), and cold-start fallback
- *    queries only 24h. 30 days provides a generous 10x safety buffer that covers full monthly provider
+ * 1. Overview tab history chart queries 14 days (`HISTORY_WINDOW_MS`), and cold-start fallback
+ *    queries only 24h. 30 days provides a safety buffer beyond that range that covers full monthly provider
  *    billing/quota reset cycles while strictly bounding table growth to ~50k-100k rows across all
  *    providers and slot intervals.
  * 2. Matches `QUOTA_RAW_RETENTION_MS` so raw telemetry and reasoned observation lifecycles stay in lockstep.

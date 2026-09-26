@@ -851,7 +851,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
   });
 
   describe("Dashboard history bridge", () => {
-    it("fetches /v1/history bounded by 3-day window and caches records for synchronous getCachedHistory reads", async () => {
+    it("fetches /v1/history bounded by the history window and caches records for synchronous getCachedHistory reads", async () => {
       root = mkdtempSync(join(tmpdir(), "quota-client-history-"));
       const socketPath = join(root, "coordinator.sock");
       let requestedUrl = "";
@@ -909,7 +909,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(records).not.toBeNull();
       expect(records).toHaveLength(2);
 
-      // Verify bounded by 3 days window in default query
+      // Verify bounded by HISTORY_WINDOW_MS in the default query
       const expectedSince = new Date(nowMs - HISTORY_WINDOW_MS).toISOString();
       expect(requestedUrl).toContain(encodeURIComponent(expectedSince));
 

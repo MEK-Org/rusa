@@ -1439,7 +1439,12 @@ class QuotaHistoryPointDto {
   });
 
   final String observedAt;
-  final double remainingPercent;
+
+  /// Quota left in the window, as recorded. The server's DTO always sends a
+  /// number (`QuotaHistoryPointDto.remainingPercent` in quota-api.ts), so null
+  /// only comes from a malformed payload; the chart leaves it undrawn where the
+  /// old `?? 0` parse drew it as 0% (#706).
+  final double? remainingPercent;
   final double? error;
   final String? resetAtIso;
   final double? intervalSeconds;
@@ -1447,14 +1452,14 @@ class QuotaHistoryPointDto {
   factory QuotaHistoryPointDto.fromJson(Map<String, dynamic> j) =>
       QuotaHistoryPointDto(
         observedAt: j['observedAt'] as String? ?? '',
-        remainingPercent: (j['remainingPercent'] as num?)?.toDouble() ?? 0,
+        remainingPercent: (j['remainingPercent'] as num?)?.toDouble(),
         error: (j['error'] as num?)?.toDouble(),
         resetAtIso: j['resetAtIso'] as String?,
         intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble(),
       );
 }
 
-/// The prior-3-day readings for one provider quota pool.
+/// The readings for one quota pool over the API's history range (#706).
 class QuotaHistorySeriesDto {
   const QuotaHistorySeriesDto({
     required this.provider,
