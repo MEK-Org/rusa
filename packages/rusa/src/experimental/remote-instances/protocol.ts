@@ -6,19 +6,17 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 5;
+export const INSTANCE_PROTOCOL_VERSION = 6;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
+/** The leader replaced a queued actor's pool; re-run the same admission against it. */
+export const COORDINATOR_MODEL_CONFIG_CHANGED_ERROR = "Coordinator model configuration changed";
 export interface Bootstrap {
   id: string;
   cwd: string;
   sessionId?: string;
-  /**
-   * The actor's declared candidate pool. Remote placement carries a single
-   * candidate today: the follower builds one provider from `providerOptions`,
-   * so a longer pool has nothing to resolve a second candidate with.
-   */
+  /** The actor's declared candidate pool. */
   modelConfig?: RawProviderModelConfig[];
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
@@ -58,8 +56,10 @@ export interface ProviderBridge {
 
 export type ProviderFactory = (
   bridge: ProviderBridge,
-  options: Record<string, unknown>
-) => CodingProvider | Promise<CodingProvider>;
+  options: Record<string, unknown>,
+  /** The leader-admitted tuple that this adapter must execute. */
+  selected?: RawProviderModelConfig
+) => CodingProvider;
 
 export type Request =
   | { op: "beforeRun"; mode: ActorRunMode }
@@ -81,6 +81,8 @@ export type Request =
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
+  /** Replace the follower Actor's next-run pool without resetting its runtime. */
+  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[] }
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }
@@ -115,8 +117,6 @@ export type ActorEvent =
     }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
-  | { type: "continue"; count: number }
-  | { type: "capped"; count: number }
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
   | { type: "fatal"; error: string };

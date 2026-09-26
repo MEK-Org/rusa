@@ -74,7 +74,7 @@ interface ObligationArtifactRow {
   attached_at: string;
 }
 
-/** The five lifecycle columns carried in an obligation-history sparse delta. */
+/** The lifecycle and terminal-attribution columns carried in a history delta. */
 interface TrackedObligationRow {
   id: string;
   owner_id: string;
@@ -82,6 +82,8 @@ interface TrackedObligationRow {
   priority: number | null;
   status: ObligationStatus;
   external_ref: string | null;
+  terminal_note: string | null;
+  resolution_ref: string | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -92,11 +94,15 @@ interface ObligationDeltaRow {
   before_priority: number | null;
   before_status: ObligationStatus;
   before_external_ref: string | null;
+  before_terminal_note: string | null;
+  before_resolution_ref: string | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
   after_status: ObligationStatus;
   after_external_ref: string | null;
+  after_terminal_note: string | null;
+  after_resolution_ref: string | null;
 }
 
 export interface CreateObligationInput {
@@ -476,11 +482,15 @@ export class ObligationRepository {
         before_priority     REAL,
         before_status       TEXT NOT NULL,
         before_external_ref TEXT,
+        before_terminal_note TEXT,
+        before_resolution_ref TEXT,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
         after_status        TEXT NOT NULL,
-        after_external_ref  TEXT
+        after_external_ref  TEXT,
+        after_terminal_note TEXT,
+        after_resolution_ref TEXT
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -490,15 +500,21 @@ export class ObligationRepository {
         OR old.priority IS NOT new.priority
         OR old.status IS NOT new.status
         OR old.external_ref IS NOT new.external_ref
+        OR old.terminal_note IS NOT new.terminal_note
+        OR old.resolution_ref IS NOT new.resolution_ref
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-          after_owner_id, after_parent_id, after_priority, after_status, after_external_ref
+          before_terminal_note, before_resolution_ref,
+          after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
+          after_terminal_note, after_resolution_ref
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
-          new.owner_id, new.parent_id, new.priority, new.status, new.external_ref
+          old.terminal_note, old.resolution_ref,
+          new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
+          new.terminal_note, new.resolution_ref
         );
       END;
     `);
@@ -1244,7 +1260,9 @@ export class ObligationRepository {
       .prepare(
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-                after_owner_id, after_parent_id, after_priority, after_status, after_external_ref
+                before_terminal_note, before_resolution_ref,
+                after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
+                after_terminal_note, after_resolution_ref
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1261,6 +1279,8 @@ export class ObligationRepository {
         priority: delta.after_priority,
         status: delta.after_status,
         external_ref: delta.after_external_ref,
+        terminal_note: delta.after_terminal_note,
+        resolution_ref: delta.after_resolution_ref,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1275,6 +1295,8 @@ export class ObligationRepository {
           priority: delta.before_priority,
           status: delta.before_status,
           external_ref: delta.before_external_ref,
+          terminal_note: delta.before_terminal_note,
+          resolution_ref: delta.before_resolution_ref,
         },
         after,
       });
@@ -1291,13 +1313,17 @@ export class ObligationRepository {
       const priorityChanged = b.priority !== a.priority;
       const statusChanged = b.status !== a.status;
       const externalRefChanged = b.external_ref !== a.external_ref;
+      const terminalNoteChanged = b.terminal_note !== a.terminal_note;
+      const resolutionRefChanged = b.resolution_ref !== a.resolution_ref;
 
       if (
         !ownerChanged &&
         !parentChanged &&
         !priorityChanged &&
         !statusChanged &&
-        !externalRefChanged
+        !externalRefChanged &&
+        !terminalNoteChanged &&
+        !resolutionRefChanged
       ) {
         continue;
       }
@@ -1324,6 +1350,14 @@ export class ObligationRepository {
       if (externalRefChanged) {
         beforeState.externalRef = b.external_ref;
         afterState.externalRef = a.external_ref;
+      }
+      if (terminalNoteChanged) {
+        beforeState.terminalNote = b.terminal_note;
+        afterState.terminalNote = a.terminal_note;
+      }
+      if (resolutionRefChanged) {
+        beforeState.resolutionRef = b.resolution_ref;
+        afterState.resolutionRef = a.resolution_ref;
       }
 
       // Map the primary modified field to its semantic mutation kind.
@@ -2400,6 +2434,18 @@ export class ObligationRepository {
     return row ? { id: row.id, ownerId: row.owner_id } : null;
   }
 
+  /** Look up an obligation by its external reference, regardless of terminal status. */
+  findByExternalRef(ref: string): Obligation | null {
+    const row = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+         WHERE obligation.external_ref = ? COLLATE NOCASE
+         LIMIT 1`
+      )
+      .get(ref) as ObligationRow | undefined;
+    return row ? toObligation(row) : null;
+  }
+
   /** Every artifact cited by an obligation, oldest first. */
   listCompletionsPage(
     id: string,
@@ -2474,6 +2520,23 @@ export class ObligationRepository {
     // so this is where a row proves it is the entry the caller is typed to get.
     // Fail-closed for the whole call, like every other reader here: one row
     // that cannot be read makes the trail throw rather than silently shorten.
+    return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * Terminal obligation status transitions (done / cancelled) across all obligations,
+   * newest-first by monotonic id.
+   */
+  listTerminalHistory(limit = 50): ObligationHistoryEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload
+         FROM obligation_history
+         WHERE json_extract(payload, '$.after.status') IN ('done', 'cancelled')
+         ORDER BY id DESC
+         LIMIT ?`
+      )
+      .all(limit);
     return rows.map(parseHistoryRow);
   }
 

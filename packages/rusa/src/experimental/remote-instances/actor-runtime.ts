@@ -1,11 +1,16 @@
 import { Actor } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
-import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  RunStartStaleProviderError,
+} from "../../actor/concurrency-limiter.js";
 import type { ActorRunMode } from "../../actor/trigger-runner.js";
-import type { McpServerSpec } from "../../providers/types.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../../providers/model-config.js";
+import type { CodingProvider, McpServerSpec } from "../../providers/types.js";
 import {
   type ActorEvent,
   type Bootstrap,
+  COORDINATOR_MODEL_CONFIG_CHANGED_ERROR,
   COORDINATOR_RECONNECTED_ERROR,
   type LeaderCommand,
   type ProviderFactory,
@@ -73,6 +78,9 @@ export function createActorRuntime(
       if (bootstrap.mcpServers) {
         mcpServers.splice(0, mcpServers.length, ...bootstrap.mcpServers);
       }
+      if (bootstrap.modelConfig?.length) {
+        actor.setModelConfig(bootstrap.modelConfig as ProviderModelConfig[]);
+      }
       if (bootstrap.sessionId) {
         sessionId = bootstrap.sessionId;
       }
@@ -91,29 +99,38 @@ export function createActorRuntime(
     }
     let snapshot: RunSnapshot;
     sessionId = bootstrap.sessionId;
-    const provider = await createProvider(
-      {
-        sendMessage: (to, body) => request({ op: "sendMessage", to, body }).result,
-        yieldRun: (status, note) => {
-          if (!actor) throw new Error("Actor is not initialized");
-          actor.declareYield(status, note);
-        },
+    const bridge = {
+      sendMessage: (to: string, body: string) => request({ op: "sendMessage", to, body }).result,
+      yieldRun: (status?: string, note?: string) => {
+        if (!actor) throw new Error("Actor is not initialized");
+        actor.declareYield(status, note);
       },
-      bootstrap.providerOptions ?? {}
-    );
-    if (stopping) return;
+    };
+    const providerOptions = bootstrap.providerOptions ?? {};
     mcpServers.splice(0, mcpServers.length, ...(bootstrap.mcpServers ?? []));
-    // One provider per remote actor: the bootstrap names the single declared
-    // candidate, so selection resolves back to it whatever the leader reserved.
     const modelConfig = bootstrap.modelConfig?.length
       ? [...bootstrap.modelConfig]
-      : [{ provider: provider.providerName ?? provider.name }];
+      : [{ provider: String(providerOptions.name ?? "unknown") }];
+    const providers = new Map<string, CodingProvider>();
+    const resolveProvider = (selected: RawProviderModelConfig): CodingProvider => {
+      const key = JSON.stringify(selected);
+      let provider = providers.get(key);
+      if (!provider) {
+        provider = createProvider(bridge, providerOptions, selected);
+        providers.set(key, provider);
+      }
+      return provider;
+    };
+    // Construct the bootstrap tuple before ready so a bad follower provider
+    // still rejects startup. Later runs resolve their own admitted tuple.
+    resolveProvider(modelConfig[0]);
+    if (stopping) return;
     actor = new Actor({
       ...bootstrap.actorOptions,
       id: bootstrap.id,
       cwd: bootstrap.cwd,
       modelConfig,
-      resolveProvider: () => provider,
+      resolveProvider,
       mcpServers,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
       loadSessionId: () => sessionId,
@@ -158,6 +175,15 @@ export function createActorRuntime(
           try {
             admitted = await admission.result;
           } catch (err) {
+            if (
+              err instanceof Error &&
+              err.message.includes(COORDINATOR_MODEL_CONFIG_CHANGED_ERROR)
+            ) {
+              // The leader cancelled a stale reservation after changing this
+              // Actor's pool. Actor's retry loop re-runs the same opportunity
+              // against the pool set by the preceding modelConfig command.
+              throw new RunStartStaleProviderError();
+            }
             if (
               err instanceof Error &&
               (err.message.includes(COORDINATOR_RECONNECTED_ERROR) ||
@@ -225,8 +251,6 @@ export function createActorRuntime(
         },
       ]),
       onFirstChunk: () => send({ type: "firstChunk" }),
-      onContinue: (count) => send({ type: "continue", count }),
-      onContinuationCapped: (count) => send({ type: "capped", count }),
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;
@@ -235,6 +259,9 @@ export function createActorRuntime(
       log: (chunk) => send({ type: "log", chunk }),
     });
     send({ type: "ready", pid: process.pid });
+    if (bootstrap.reconnect) {
+      send({ type: "state", state: "idle", yielded: false });
+    }
   }
 
   function stop(): void {
@@ -255,6 +282,9 @@ export function createActorRuntime(
           send({ type: "fatal", error: String(error) });
           stop();
         });
+        break;
+      case "modelConfig":
+        actor?.setModelConfig(message.modelConfig as ProviderModelConfig[]);
         break;
       case "reply": {
         const call = pending.get(message.requestId);

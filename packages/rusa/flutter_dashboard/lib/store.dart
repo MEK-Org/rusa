@@ -128,12 +128,6 @@ const int _kEventsPageSize = 50;
 // in-memory window currently holds.
 const int _kFeedRetentionCap = _kEventsPageSize * 10;
 
-// Overview's yield window has always been a REST-seeded newest-50/seven-day
-// contract (see `refreshYieldEvents`); the live `run_yielded` prepend must
-// keep honoring the same "newest 50" half of that contract instead of
-// growing without bound for the life of the tab.
-const int _kYieldPageSize = 50;
-
 /// Retired actors whose most recent mesh event is older than this are hidden
 /// from the dashboard tree even when "Show retired" is enabled .
 ///
@@ -341,7 +335,8 @@ class DashboardStore {
   var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
-  final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
+  final _recentActivity =
+      BehaviorSubject<List<RecentActivityItem>>.seeded(const []);
 
   /// Model and effort of each active run, keyed by actor id. Seeded from the
   /// actor's newest `run_start` event and replaced by live ones; an actor's
@@ -394,7 +389,6 @@ class DashboardStore {
   final _seenEventIds = <String>{};
   final _seenConversationMessageIds = <String>{};
   final _seenOperatorChatMessageIds = <String>{};
-  final _seenYieldEventIds = <String>{};
 
   Timer? _topologyDebounce;
   Timer? _quotaPoll;
@@ -426,7 +420,8 @@ class DashboardStore {
   ValueStream<List<LiveLine>> get live => _live.stream;
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
   ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
-  ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
+  ValueStream<List<RecentActivityItem>> get recentActivity =>
+      _recentActivity.stream;
   ValueStream<Map<String, RunModelSelection>> get runSelections =>
       _runSelections.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
@@ -519,6 +514,7 @@ class DashboardStore {
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
+    unawaited(refreshRecentActivity());
     unawaited(refreshQuota());
     // Background SWR revalidation (ISSUE_NUM ask 4) — the ring/tooltip keep
     // showing the last-known reading immediately; this just periodically
@@ -595,26 +591,12 @@ class DashboardStore {
     await _requestRuntimeSync();
   }
 
-  Future<void> refreshYieldEvents() async {
+  Future<void> refreshRecentActivity() async {
     try {
-      final window = DateTime.now()
-          .subtract(const Duration(days: 7))
-          .toUtc()
-          .toIso8601String();
-      final page = await _api.fetchEvents(
-        since: window,
-        kinds: const ['run_yielded'],
-        limit: _kYieldPageSize,
-        order: 'desc',
-      );
-      final list = List<MeshEvent>.of(_yieldEvents.value);
-      for (final e in page.events) {
-        if (_seenYieldEventIds.add(e.id)) list.add(e);
+      final items = await _api.fetchRecentActivity(limit: 50);
+      if (!_recentActivity.isClosed) {
+        _recentActivity.add(items);
       }
-      list.sort((a, b) => b.ts.compareTo(a.ts));
-      _yieldEvents.add(
-        _capRetained(list, _kYieldPageSize, _seenYieldEventIds, (e) => e.id),
-      );
     } catch (_) {}
   }
 
@@ -1391,18 +1373,8 @@ class DashboardStore {
         _runSelections.add({..._runSelections.value, e.actorId!: selection});
       }
     }
-    if (e.kind == 'run_yielded') {
-      if (_seenYieldEventIds.add(e.id)) {
-        final cur = _yieldEvents.value;
-        _yieldEvents.add(
-          _capRetained(
-            [e, ...cur],
-            _kYieldPageSize,
-            _seenYieldEventIds,
-            (x) => x.id,
-          ),
-        );
-      }
+    if (e.kind == 'run_end' || e.kind == 'obligation_status_changed') {
+      unawaited(refreshRecentActivity());
     }
 
     if (e.kind == 'obligation_checkpoint_set' &&
@@ -1914,7 +1886,7 @@ class DashboardStore {
       _live.close(),
       _quota.close(),
       _quotaHistory.close(),
-      _yieldEvents.close(),
+      _recentActivity.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
       _actorsStale.close(),

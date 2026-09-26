@@ -432,6 +432,7 @@ type DesiredOverlayEntry = {
 export class SqliteActorRepository implements ActorRepository {
   private readonly db: Database.Database;
   private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
+  private parentStmt?: Database.Statement;
 
   constructor(
     db: Database.Database,
@@ -445,6 +446,13 @@ export class SqliteActorRepository implements ActorRepository {
     private readonly modelClasses: ModelClassStore = new ModelClassRepository(db)
   ) {
     this.db = db;
+  }
+
+  private getParentStmt(): Database.Statement {
+    if (!this.parentStmt) {
+      this.parentStmt = this.db.prepare("SELECT parent_id FROM actors WHERE id = ?");
+    }
+    return this.parentStmt;
   }
 
   upsert(record: ActorRecord): void {
@@ -523,6 +531,11 @@ export class SqliteActorRepository implements ActorRepository {
 
     // Process memory must advance only after the durable transaction commits.
     this.storeDesiredOverlay(record);
+  }
+
+  parentOf(id: string): string | null | undefined {
+    const row = this.getParentStmt().get(id) as { parent_id: string | null } | undefined;
+    return row ? row.parent_id : undefined;
   }
 
   get(id: string): ActorRecord | undefined {

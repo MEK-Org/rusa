@@ -45,6 +45,8 @@ ThreadDto makeThread(
   String? selectedProvider,
   String? selectedModel,
   String? selectedEffort,
+  bool needsAttention = false,
+  String? needsAttentionReason,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -82,6 +84,8 @@ ThreadDto makeThread(
   selectedProvider: selectedProvider,
   selectedModel: selectedModel,
   selectedEffort: selectedEffort,
+  needsAttention: needsAttention,
+  needsAttentionReason: needsAttentionReason,
 );
 
 InboxEntryDto makeInboxEntry(
@@ -254,6 +258,15 @@ class FakeApi extends DashboardApi {
       runtimeCursor: runtimeCursor,
       supportedVoices: supportedVoices,
     );
+  }
+
+  List<RecentActivityItem> recentActivityResult = [];
+  int recentActivityCallCount = 0;
+
+  @override
+  Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
+    recentActivityCallCount++;
+    return recentActivityResult;
   }
 
   final actorVoiceUpdates = <({String actorId, VoiceConfigDto? voiceConfig})>[];

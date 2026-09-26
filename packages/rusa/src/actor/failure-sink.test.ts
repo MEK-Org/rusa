@@ -10,7 +10,6 @@ import {
   type FailureSinkDeps,
   formatProviderLabel,
   isHumanOperatorCancelled,
-  routeContinuationCapped,
   routeRunFailure,
 } from "./failure-sink.js";
 
@@ -75,6 +74,20 @@ describe("routeRunFailure", () => {
     expect(toParent[0]?.body).toContain("run failed");
     expect(toParent[0]?.forensics).toEqual({ runId: "w1", actorId: "w1", exitCode: 1 });
     expect(toChat).toHaveLength(0);
+  });
+
+  it("identifies a failed launched provider run without mislabeling selection", async () => {
+    const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
+
+    await routeRunFailure(deps, "w1", FAIL, "kimi/kimi-for-coding @ high", "run-04d139ba");
+
+    expect(toParent[0]?.body).toContain("provider run kimi/kimi-for-coding @ high failed.");
+    expect(toParent[0]?.body).not.toContain("provider selection");
+    expect(toParent[0]?.forensics).toEqual({
+      runId: "run-04d139ba",
+      actorId: "w1",
+      exitCode: 1,
+    });
   });
 
   it("does not send failure notice when result.success is true", async () => {
@@ -172,7 +185,7 @@ describe("routeRunFailure", () => {
       expect(body).toContain("boom");
     });
 
-    it("attributes a native rejection when classify reports not exhausted", async () => {
+    it("labels a non-exhausted provider run failure", async () => {
       const { deps, toParent } = makeDeps(
         { w1: { id: "w1", parentId: "root" } },
         { classify: async () => ({ exhausted: false }) }
@@ -181,7 +194,7 @@ describe("routeRunFailure", () => {
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
       expect(body).toBe(
-        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+        "[run failed] provider run claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
       );
     });
 
@@ -200,43 +213,20 @@ describe("routeRunFailure", () => {
       await routeRunFailure(deps, "w1", networkFail, "antigravity");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toContain("[run failed] provider selection antigravity failed.");
+      expect(body).toContain("[run failed] provider run antigravity failed.");
       expect(body).toContain("(exit 1)");
       expect(body).toContain("connect ETIMEDOUT");
     });
 
-    it("attributes a native rejection when no classifier is configured", async () => {
+    it("labels a provider run failure when no classifier is configured", async () => {
       const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
       await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
       expect(body).toBe(
-        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+        "[run failed] provider run claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
       );
     });
-  });
-
-  it("sends continuation caps to the parent as a mechanical capped notice", () => {
-    const { deps, toParent, toChat, logs } = makeDeps({ w1: { id: "w1", parentId: "root" } });
-    routeContinuationCapped(deps, "w1", 20);
-    expect(toParent).toHaveLength(1);
-    expect(toParent[0]?.toId).toBe("root");
-    expect(toParent[0]?.fromId).toBe("w1");
-    expect(toParent[0]?.body).toBe(
-      "[capped] yield-elicitation exhausted after 20 corrective run(s)"
-    );
-    expect(toParent[0]?.forensics).toEqual({ runId: "w1", actorId: "w1", exitCode: undefined });
-    expect(toChat).toHaveLength(0);
-    expect(logs[0]).toContain("yield-elicitation exhausted for w1");
-  });
-
-  it("sends root continuation caps to the error chat", () => {
-    const { deps, toChat, logs } = makeDeps({ root: { id: "root", parentId: null } });
-    routeContinuationCapped(deps, "root", 20);
-    expect(toChat).toHaveLength(1);
-    expect(toChat[0]).toContain("System Root's root capped");
-    expect(toChat[0]).toContain("yield-elicitation exhausted after 20 corrective run(s)");
-    expect(logs[0]).toContain("yield-elicitation exhausted for root");
   });
 
   describe("watchdog unpushed work detection (Rung 2)", () => {

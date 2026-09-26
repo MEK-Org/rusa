@@ -46,6 +46,30 @@ describe("SqliteInboxRepository", () => {
     store = new SqliteInboxRepository(db, () => new Date("2026-07-13T12:00:00.000Z"));
   });
 
+  it("lists handled activity per durable entry instead of inferring a timestamp batch", () => {
+    store.append([
+      {
+        id: "handled-a",
+        actorId: "actor-a",
+        source: "mesh:one",
+        payload: { type: "mesh.message" },
+      },
+      {
+        id: "handled-b",
+        actorId: "actor-a",
+        source: "mesh:two",
+        payload: { type: "mesh.message" },
+      },
+    ]);
+    const sameMoment = new Date("2026-07-13T12:05:00.000Z");
+    store.markHandled("actor-a", ["handled-a", "handled-b"], sameMoment, "done");
+
+    expect(store.listRecentHandledEntries()).toMatchObject([
+      { id: "handled-b", source: "mesh:two", handledNote: "done" },
+      { id: "handled-a", source: "mesh:one", handledNote: "done" },
+    ]);
+  });
+
   it("appends atomically and lists actor-bound entries newest first with opaque pagination", () => {
     store.append([
       {

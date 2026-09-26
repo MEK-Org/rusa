@@ -38,6 +38,18 @@ class DashboardApi {
     return ThreadsSnapshot.fromJson(await _getJson(_u('/api/mesh/threads')));
   }
 
+  /// `GET /api/mesh/recent-activity` → newest-first activity items (#664).
+  Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
+    final json = await _getJson(
+      _u('/api/mesh/recent-activity', {'limit': limit.toString()}),
+    );
+    final raw = json['items'] as List<dynamic>? ?? const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(RecentActivityItem.fromJson)
+        .toList();
+  }
+
   /// `GET /api/mesh/threads/charter` → one actor's full charter.
   ///
   /// The thread list carries only a clipped preview, since it is the same field
