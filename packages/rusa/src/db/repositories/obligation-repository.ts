@@ -2400,6 +2400,18 @@ export class ObligationRepository {
     return row ? { id: row.id, ownerId: row.owner_id } : null;
   }
 
+  /** Look up an obligation by its external reference, regardless of terminal status. */
+  findByExternalRef(ref: string): Obligation | null {
+    const row = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+         WHERE obligation.external_ref = ? COLLATE NOCASE
+         LIMIT 1`
+      )
+      .get(ref) as ObligationRow | undefined;
+    return row ? toObligation(row) : null;
+  }
+
   /** Every artifact cited by an obligation, oldest first. */
   listCompletionsPage(
     id: string,
@@ -2474,6 +2486,23 @@ export class ObligationRepository {
     // so this is where a row proves it is the entry the caller is typed to get.
     // Fail-closed for the whole call, like every other reader here: one row
     // that cannot be read makes the trail throw rather than silently shorten.
+    return rows.map(parseHistoryRow);
+  }
+
+  /**
+   * Terminal obligation status transitions (done / cancelled) across all obligations,
+   * newest-first by monotonic id.
+   */
+  listTerminalHistory(limit = 50): ObligationHistoryEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload
+         FROM obligation_history
+         WHERE json_extract(payload, '$.after.status') IN ('done', 'cancelled')
+         ORDER BY id DESC
+         LIMIT ?`
+      )
+      .all(limit);
     return rows.map(parseHistoryRow);
   }
 

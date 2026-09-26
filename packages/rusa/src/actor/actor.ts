@@ -43,7 +43,6 @@ export const WATCHDOG_STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export const WATCHDOG_CEILING_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 export const DEFAULT_YIELD_GRACE_MS = 10 * 1000; // 10 seconds
 export const RESPONSIVE_PREEMPTION_SOURCE = "responsive-notification";
-const YIELD_ELICITATION_MAX = 1;
 
 /**
  * What {@link ActorOptions.buildPrompt} returns: the assembled prompt, plus —
@@ -145,15 +144,11 @@ export interface ActorOptions {
   yieldGraceMs?: number;
   /** Max age of coalesced voice events before the run becomes unkillable (default 8000). */
   voiceCoalesceMaxAgeMs?: number;
-  /**
-   * Deprecated compatibility knob. Actors now get exactly one corrective run
-   * when they finish without calling {@link declareYield}; if they still do not
-   * yield, the run is classified failed.
-   */
+  /** Deprecated compatibility knob, ignored after run-return settlement (#664). */
   maxContinuations?: number;
-  /** Observability: a corrective yield-elicitation run was scheduled (`n` = 1). */
+  /** Deprecated compatibility callback, no longer invoked after #664. */
   onContinue?: (n: number) => void;
-  /** Observability: the corrective yield-elicitation budget was exhausted. */
+  /** Deprecated compatibility callback, no longer invoked after #664. */
   onContinuationCapped?: (n: number) => void;
   /**
    * Provider pacing plus normal-run mesh scheduling. Responsive runs may bypass
@@ -292,8 +287,6 @@ export class Actor {
   private coalesceAbortController?: AbortController;
   /** Handle for this actor's provider run while it is waiting to start. */
   private pendingStart?: RunStartHandle<RunResult>;
-  /** Consecutive corrective yield-elicitation runs since the last external wake or yield. */
-  private continuations = 0;
   /** Set within a run when the actor calls its yield tool; read after the run. */
   private yielded = false;
   /** Status ('complete' | 'blocked') set when the actor calls its yield tool. */
@@ -301,8 +294,6 @@ export class Actor {
   private yieldNote?: string;
   /** True when the last wake was gated off by {@link ActorOptions.beforeRun} (nothing ran). */
   private lastRunSkipped = false;
-  /** True when the last run ended in a failure result (non-zero / threw). */
-  private lastRunFailed = false;
   /** True only while the provider run and its post-run hook are active. */
   private executing = false;
   /** True while the run is waiting in provider pacing or the mesh concurrency queue. */
@@ -370,9 +361,6 @@ export class Actor {
   /** Wake this actor with content-free scheduling metadata. */
   requestRun(nudge: RunNudge = {}): void {
     if (this.closed) return;
-    if (nudge.mode !== "yield-elicitation") {
-      this.continuations = 0;
-    }
     if (isResponsiveNudge(nudge)) {
       this.pendingStart?.promote();
     }
@@ -417,33 +405,12 @@ export class Actor {
   }
 
   /**
-   * The {@link TriggerRunner.onIdle} policy: decide whether to run the one
-   * corrective yield-elicitation prompt after a successful run that did not
-   * call yield_run.
+   * The {@link TriggerRunner.onIdle} policy: under #664, a provider CLI run
+   * settles when the local or remote CLI returns without requiring a routine
+   * yield_run call or corrective yield-elicitation run.
    */
   private continueOrIdle(): RunNudge | null {
-    // The wake was gated off (beforeRun returned false) — treat it as a dropped
-    // trigger, not a run that fell short, so we don't spin re-checking the same
-    // closed gate.
-    if (this.lastRunSkipped) {
-      this.continuations = 0;
-      return null;
-    }
-    if (this.yielded) {
-      this.continuations = 0;
-      return null;
-    }
-    // A failed run never gets a corrective yield prompt. On failure we
-    // mechanically stop and let the failure forward up to the parent (the onRun
-    // → failure-sink path), which applies judgment about what to do next.
-    if (this.lastRunFailed) {
-      this.continuations = 0;
-      return null;
-    }
-    if (this.continuations >= YIELD_ELICITATION_MAX) return null;
-    this.continuations += 1;
-    this.opts.onContinue?.(this.continuations);
-    return { mode: "yield-elicitation", priority: "responsive" };
+    return null;
   }
 
   get isBusy(): boolean {
@@ -521,9 +488,6 @@ export class Actor {
     const nudge = this.cancelledQueuedNudge ?? {};
     this.cancelledQueuedRun = false;
     this.cancelledQueuedNudge = undefined;
-    if (nudge.mode !== "yield-elicitation") {
-      this.continuations = 0;
-    }
     // Bypass Actor.requestRun's queued fast-path: a halt can lift while the
     // cancelled gate is still unwinding, and TriggerRunner will coalesce this
     // retained opportunity into that exact one replay.
@@ -744,7 +708,6 @@ export class Actor {
 
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
   private async executeTurn(nudge: RunNudge): Promise<void> {
-    const isCorrectiveRun = nudge.mode === "yield-elicitation";
     let responsive = isResponsiveNudge(nudge);
     const sessionId = this.opts.loadSessionId();
     // The provider treats the actor's cwd as its private directory and shadows
@@ -878,14 +841,7 @@ export class Actor {
       ) {
         this.interruptedWatermark = null;
       }
-      built = isCorrectiveRun
-        ? {
-            prompt:
-              "Yield required: your previous run ended without calling yield_run. " +
-              "End this run correctly now by calling yield_run with status complete or blocked. " +
-              "Do not do additional work in this corrective run.",
-          }
-        : this.opts.buildPrompt();
+      built = this.opts.buildPrompt();
       const runId = this.currentRunId;
       if (!runId) throw new Error(`actor ${this.id} started without a lifecycle run id`);
       // Inside the gate: the provider is starting. The hook fires here rather than
@@ -1048,22 +1004,6 @@ export class Actor {
       }
     }
 
-    if (result.success && !this.yielded && isCorrectiveRun) {
-      this.opts.onContinuationCapped?.(YIELD_ELICITATION_MAX);
-      const reason =
-        "Run failed: actor ended the corrective yield-elicitation run without calling yield_run.";
-      result = {
-        ...result,
-        success: false,
-        exitCode: result.exitCode === 0 ? 1 : result.exitCode,
-        output: result.output ? `${reason}\n\n${result.output}` : reason,
-        capped: true,
-      };
-    }
-    // Read by continueOrIdle: a failed run stops yield elicitation and delegates
-    // up rather than retrying. Set before onRun so the post-run hook (failure
-    // forwarding) and the continuation decision see a consistent outcome.
-    this.lastRunFailed = !result.success;
     // Set BEFORE the await, not after: from here this run has reported its
     // outcome. If the hook itself throws partway, the run must not ALSO be
     // reported abandoned — one opportunity, one terminal signal.

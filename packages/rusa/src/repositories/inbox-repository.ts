@@ -134,6 +134,12 @@ export interface InboxRepository {
     handledAt?: Date,
     handledNote?: string
   ): MarkHandledResult[];
+  listRecentHandledGroups?(limit?: number): HandledInboxGroup[];
+}
+
+export interface HandledInboxGroup {
+  entry: InboxEntry;
+  moreCount: number;
 }
 
 export function validateInboxPayload(payload: unknown): asserts payload is InboxPayload {

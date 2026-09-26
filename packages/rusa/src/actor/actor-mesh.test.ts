@@ -12477,4 +12477,135 @@ describe("accountRun token accounting (#443)", () => {
       output: 5,
     });
   });
+
+  describe("bounded inbox retry and exhaustion (#664)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("dispatches one retry for unhandled selected work and stops on exhaustion", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({
+        inboxStore,
+      });
+
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 0;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+
+      (
+        mesh as unknown as {
+          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+        }
+      ).countCompletedRunsForEntries = () => completed;
+
+      inboxStore.append([
+        { id: "item-1", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
+
+      await tick();
+      // It ran initial run + 1 retry = 2 calls
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // On second completion, retry budget is exhausted
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
+
+      // Further tick does not dispatch a third run
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // reconcileInbox skips the exhausted actor
+      mesh.reconcileInbox();
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // When the entry is marked handled, exhaustion clears
+      inboxStore.markHandled(worker, ["item-1"]);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(false);
+    });
+
+    it("uses durable prior completions after restart instead of granting a third attempt", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 1;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+
+      // A prior process completed the first selection without handling it.
+      // This mesh receives the resumed run, whose own terminal row has not yet
+      // been recorded when finishInboxRun checks the durable count.
+      (
+        mesh as unknown as {
+          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+        }
+      ).countCompletedRunsForEntries = () => completed;
+      inboxStore.append([
+        {
+          id: "resumed-item",
+          actorId: worker,
+          source: "mesh:root",
+          payload: payload("mesh.message"),
+        },
+      ]);
+
+      await tick();
+      expect(fake(worker).calls).toHaveLength(1);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+
+      mesh.reconcileInbox();
+      await tick();
+      expect(fake(worker).calls).toHaveLength(1);
+    });
+
+    it("does not let exhausted selected work consume a newly selected item's retry", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 0;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+      (
+        mesh as unknown as {
+          countCompletedRunsForEntries: (actorId: string, entryIds: string[]) => number;
+        }
+      ).countCompletedRunsForEntries = (_actorId, [entryId]) =>
+        entryId === "old-item" ? completed : Math.max(0, completed - 2);
+
+      inboxStore.append([
+        { id: "old-item", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+
+      inboxStore.append([
+        { id: "new-item", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      await tick();
+
+      // The selected batch includes old-item, but new-item still gets its own
+      // first return plus one bounded recovery attempt.
+      expect(fake(worker).calls).toHaveLength(4);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
+    });
+  });
 });

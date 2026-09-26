@@ -73,6 +73,51 @@ describe("ActorRunRepository", () => {
     });
   });
 
+  it("lists only completed runs with valid durable inbox focus for activity correlation", () => {
+    const selected = runs.start({
+      id: "selected-run",
+      actorId: "actor-a",
+      startedAt: "2026-08-30T00:00:01.000Z",
+      modelConfig: launch("codex", "gpt-5.5", "high"),
+    });
+    db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`).run(
+      JSON.stringify(["entry-1", "entry-2"]),
+      selected
+    );
+    runs.complete(selected, {
+      endedAt: "2026-08-30T00:00:03.000Z",
+      success: true,
+      exitCode: 0,
+      output: "done",
+    });
+
+    const invalid = runs.start({
+      id: "invalid-focus-run",
+      actorId: "actor-b",
+      startedAt: "2026-08-30T00:00:04.000Z",
+      modelConfig: launch("codex", "gpt-5.5"),
+    });
+    db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`).run(
+      JSON.stringify({ not: "an array" }),
+      invalid
+    );
+    runs.complete(invalid, {
+      endedAt: "2026-08-30T00:00:05.000Z",
+      success: true,
+      exitCode: 0,
+      output: "done",
+    });
+
+    expect(runs.listRecentCompletedFocuses(10)).toEqual([
+      {
+        actorId: "actor-a",
+        startedAt: "2026-08-30T00:00:01.000Z",
+        endedAt: "2026-08-30T00:00:03.000Z",
+        entryIds: ["entry-1", "entry-2"],
+      },
+    ]);
+  });
+
   it("retains the launch model and effort on an interrupted (abandoned) run", () => {
     const id = runs.start({
       id: "run-interrupted",

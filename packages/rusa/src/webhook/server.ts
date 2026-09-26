@@ -31,6 +31,7 @@ import {
   handleUnderstandingStringsRequest,
   type UnderstandingOpsDeps,
 } from "../dashboard/understanding-ops-api.js";
+import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -133,6 +134,8 @@ export interface DashboardMeshRefs {
   obligations?: ObligationRepository;
   /** Durable actor inbox, exposed read-only through the dashboard data API. */
   inbox?: InboxRepository;
+  /** Completed selection intervals used to correlate same-run activity rows. */
+  actorRuns?: ActorRunRepository;
   emitter: MeshEventEmitter;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
@@ -594,6 +597,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
+          actorRuns: options.mesh.actorRuns,
           sseHub,
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,

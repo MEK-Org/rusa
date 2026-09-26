@@ -28,6 +28,18 @@ export interface ActorRun {
   abandonReason: string | null;
 }
 
+/**
+ * A completed run's durable selection interval. This is a narrow read model
+ * for joining an activity row to the work that selected it; it must not make
+ * completed focus appear as current selected work.
+ */
+export interface CompletedActorRunFocus {
+  actorId: string;
+  startedAt: string;
+  endedAt: string;
+  entryIds: string[];
+}
+
 interface ActorRunRow {
   id: string;
   actor_id: string;
@@ -252,6 +264,50 @@ export class ActorRunRepository {
       )
       .all(actorId, limit) as ActorRunRow[];
     return rows.map(toActorRun);
+  }
+
+  /**
+   * Completed runs that retained a selected-inbox snapshot, newest first.
+   * Invalid historical focus JSON is ignored so a dashboard read can still
+   * render its independent activity rows.
+   */
+  listRecentCompletedFocuses(limit: number): CompletedActorRunFocus[] {
+    assertLimit(limit);
+    const rows = this.db
+      .prepare(
+        `SELECT actor_id, started_at, ended_at, focus_entry_ids_json
+         FROM actor_runs
+         WHERE outcome = 'completed'
+           AND ended_at IS NOT NULL
+           AND focus_entry_ids_json IS NOT NULL
+         ORDER BY ended_at DESC, id DESC
+         LIMIT ?`
+      )
+      .all(limit) as Array<{
+      actor_id: string;
+      started_at: string;
+      ended_at: string;
+      focus_entry_ids_json: string;
+    }>;
+
+    return rows.flatMap((row) => {
+      try {
+        const entryIds = JSON.parse(row.focus_entry_ids_json);
+        if (!Array.isArray(entryIds) || !entryIds.every((id) => typeof id === "string")) {
+          return [];
+        }
+        return [
+          {
+            actorId: row.actor_id,
+            startedAt: row.started_at,
+            endedAt: row.ended_at,
+            entryIds,
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
   }
 
   /**

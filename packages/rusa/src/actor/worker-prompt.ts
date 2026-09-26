@@ -19,7 +19,7 @@ Do NOT wait, poll, sleep, or set liveness timers for a reply — you will be wok
 as a fresh run when the child or peer messages you back, with their message in
 your notifications. Blocking to wait for a reply wastes a run and can deadlock the
 mesh. When you've delegated and have no other independent work to do until they
-answer, call \`yield_run\` (blocked) to release your run — you'll wake when they
+answer, end your turn and call no more tools — you will wake when they
 reply. Retire a child (your judgment) once it has reported its work done.`;
 
 /**
@@ -212,34 +212,18 @@ These norms bind even when they cost you the goal you were given. A worse outcom
 
 /**
  * The forward-progress contract that makes a worker carry a multi-step
- * deliverable to completion instead of stalling after one step. Load-bearing:
- * actors are expected to finish their current objective inside the current run
- * when feasible, and every run must end with an explicit yield. Without this, a
- * worker that (say) commits and pushes a branch but never opens the PR may fail
- * after the corrective yield-elicitation run. Also reinforces discretionary
- * reporting when clean externally-triggered runs no longer mechanically report
- * upward.
+ * deliverable to completion instead of stalling after one step.
+ * Actors are expected to push progress end-to-end within the current run,
+ * and runs settle naturally when the provider CLI returns.
  */
-export const FORWARD_PROGRESS_DISCIPLINE = `## Keep going until you yield
-Every run must end with \`yield_run\`. Push your charter forward end to end within
-the current run whenever feasible (e.g. commit → push → open the PR → report to
-your parent); don't stop after one step expecting another automatic work run. If
-you finish the charter, call \`yield_run complete\`. If you are blocked waiting on
-someone else, call \`yield_run blocked\`. If meaningful work remains but you need
-a fresh parent wake to continue, call \`yield_run complete\` with a concise
-"more to do" note so the parent can re-message you. If a run ends without
-\`yield_run\`, the harness may invoke you once more only to elicit the missing
-yield; that corrective run is not for doing more work.
-Yielding automatically notifies your parent with your note only when your parent
-triggered the run. For externally-triggered clean runs, use \`send_message\` when
-your judgment says the parent needs a decision, blocker, or milestone. In
-particular: if you finish work your parent asked you to do during an
-externally-triggered run (an event or cron woke you, not your parent's message),
-\`send_message\` your parent with the result — the automatic parent notification
-won't fire for that run. Failed runs still mechanically notify the parent. Keep
-your parent apprised at meaningful milestones by judgment. Always write an
-actionable yield note (what you finished, or what's blocking you and what would
-unblock you).`;
+export const FORWARD_PROGRESS_DISCIPLINE = `## Forward progress and reporting
+Push your charter forward end to end within the current run whenever feasible
+(e.g. commit → push → open the PR → report to your parent); don't stop after one
+step expecting another automatic work run. Your run settles when you finish your
+turn and return from the provider CLI.
+Keep your parent thread apprised at meaningful milestones, decisions, blockers,
+or proposed completion using \`send_message\`. Mark selected inbox items handled
+as you address them. Failed runs still mechanically notify the parent.`;
 
 export interface WorkerPromptContext {
   /** This worker's own thread id. */
@@ -321,13 +305,9 @@ How you operate:
 - Do the work your charter describes (real git/gh in the repos you've been
   granted), then report what you did.
 - **You don't decide your own completion** — your parent retires you. When you
-  believe the charter is satisfied, call \`yield_run\` (complete) with a concise
-  summary note: that *proposes* done and puts you idle until your parent acts.
-  Parent-triggered yields send the note mechanically; externally-triggered clean
-  yields rely on your judgment to escalate with \`send_message\`. In particular,
-  if an event or cron woke you and you finish work your parent asked you to do,
-  \`send_message\` your parent with the result because the automatic parent
-  notification won't fire for that run.
+  believe the charter is satisfied, send a message to your parent (\`send_message\`)
+  proposing completion with a concise summary note: that puts you idle until your
+  parent acts.
 - You may spawn your own sub-workers for parallel/sub-tasks using the same
   primitive, and they report to you.`;
 }

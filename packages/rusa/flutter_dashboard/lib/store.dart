@@ -342,6 +342,8 @@ class DashboardStore {
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
+  final _recentActivity =
+      BehaviorSubject<List<RecentActivityItem>>.seeded(const []);
 
   /// Model and effort of each active run, keyed by actor id. Seeded from the
   /// actor's newest `run_start` event and replaced by live ones; an actor's
@@ -427,6 +429,8 @@ class DashboardStore {
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
   ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
+  ValueStream<List<RecentActivityItem>> get recentActivity =>
+      _recentActivity.stream;
   ValueStream<Map<String, RunModelSelection>> get runSelections =>
       _runSelections.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
@@ -519,6 +523,7 @@ class DashboardStore {
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
+    unawaited(refreshRecentActivity());
     unawaited(refreshQuota());
     // Background SWR revalidation (ISSUE_NUM ask 4) — the ring/tooltip keep
     // showing the last-known reading immediately; this just periodically
@@ -615,6 +620,15 @@ class DashboardStore {
       _yieldEvents.add(
         _capRetained(list, _kYieldPageSize, _seenYieldEventIds, (e) => e.id),
       );
+    } catch (_) {}
+  }
+
+  Future<void> refreshRecentActivity() async {
+    try {
+      final items = await _api.fetchRecentActivity(limit: 50);
+      if (!_recentActivity.isClosed) {
+        _recentActivity.add(items);
+      }
     } catch (_) {}
   }
 
@@ -1405,6 +1419,12 @@ class DashboardStore {
       }
     }
 
+    if (e.kind == 'run_end' ||
+        e.kind == 'run_yielded' ||
+        e.kind == 'obligation_status_changed') {
+      unawaited(refreshRecentActivity());
+    }
+
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
       invalidateObligationsCache();
@@ -1915,6 +1935,7 @@ class DashboardStore {
       _quota.close(),
       _quotaHistory.close(),
       _yieldEvents.close(),
+      _recentActivity.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
       _actorsStale.close(),

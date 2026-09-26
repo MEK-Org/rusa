@@ -90,74 +90,80 @@ void main() {
     },
   );
 
-  testWidgets('yield rows do not overflow at mobile (~390px) width ', (
+  testWidgets('Recent Activity renders handled cards with addressed note', (
     tester,
   ) async {
     await tester.runAsync(() async {
       const actor = '11111111-1111-4111-8111-111111111111';
       final api = FakeApi()
         ..threadsResult = [makeThread(actor)]
-        ..eventPages = [
-          EventPage(
-            events: [
-              makeEvent(
-                'e1',
-                'run_yielded',
-                actor: actor,
-                detail: 'complete',
-                body:
-                    'A long yield summary note that would overflow a '
-                    'fixed-width timestamp + avatar + pill row on a '
-                    'narrow mobile viewport if it were not stacked.',
-              ),
-            ],
-            nextCursor: null,
+        ..recentActivityResult = [
+          const RecentActivityItem(
+            id: 'inbox_1',
+            kind: 'handled_inbox',
+            time: '2026-09-23T14:21:37.000Z',
+            actorId: actor,
+            actorHandle: 'kestrel-coder',
+            actorModel: 'claude-opus-4-6, high',
+            sourceKind: 'GITHUB ISSUE',
+            sourceRef: 'github:MEK-Org/rusa/issues/664',
+            summary: 'UI proposal feedback on #664',
+            handledTime: '2026-09-23T14:21:37.000Z',
+            addressedNote: 'Packaged design proposal into PR #665',
+            moreCount: 1,
+            linkedObligation:
+                'Obligation: Render work-outcome dashboard mock-up',
           ),
         ];
       final store = DashboardStore(api: api, stream: FakeStream());
       await store.init();
 
-      await tester.binding.setSurfaceSize(const Size(390, 844));
+      await tester.binding.setSurfaceSize(const Size(1500, 1400));
       addTearDown(() => tester.binding.setSurfaceSize(null));
 
       await tester.pumpWidget(_app(store));
-      // Let the widget's initState refreshYieldEvents() fetch resolve.
       await tester.pump();
       await tester.pump();
 
       expect(tester.takeException(), isNull);
-      expect(find.textContaining('A long yield summary note'), findsOneWidget);
-      expect(find.text('$actor-handle'), findsOneWidget);
+      expect(find.text('Recent Activity'), findsOneWidget);
+      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(
+        find.textContaining('Packaged design proposal into PR #665'),
+        findsOneWidget,
+      );
+      expect(find.text('(+ 1 more)'), findsOneWidget);
+      expect(
+        find.text('Obligation: Render work-outcome dashboard mock-up'),
+        findsOneWidget,
+      );
 
       await store.dispose();
     });
   });
 
-  testWidgets('yield rows name the actor, never a raw id', (tester) async {
+  testWidgets('Recent Activity renders terminal obligation transitions', (
+    tester,
+  ) async {
     await tester.runAsync(() async {
-      const known = '11111111-1111-4111-8111-111111111111';
-      const gone = '22222222-2222-4222-8222-222222222222';
+      const actor = '11111111-1111-4111-8111-111111111111';
       final api = FakeApi()
-        ..threadsResult = [makeThread(known)]
-        ..eventPages = [
-          EventPage(
-            events: [
-              makeEvent(
-                'e1',
-                'run_yielded',
-                actor: known,
-                detail: 'complete',
-                body: 'Known note',
-              ),
-              makeEvent(
-                'e2',
-                'run_yielded',
-                actor: gone,
-                detail: 'blocked',
-                body: 'Gone note',
-              ),
-            ],
-            nextCursor: null,
+        ..threadsResult = [makeThread(actor)]
+        ..recentActivityResult = [
+          const RecentActivityItem(
+            id: 'ob_1',
+            kind: 'terminal_obligation',
+            time: '2026-09-23T14:21:37.000Z',
+            actorId: actor,
+            actorHandle: 'kestrel-coder',
+            actorModel: 'claude-opus-4-6, high',
+            sourceKind: 'OBLIGATION',
+            sourceRef: 'github:MEK-Org/rusa/issues/664',
+            summary: 'Render work-outcome dashboard mock-up',
+            obligationId: '0e655f00-0000-4000-8000-000000000001',
+            terminalStatus: 'done',
+            terminalNote: 'Landed mock-up and tests',
+            resolutionRef: 'github:MEK-Org/rusa/pulls/665',
           ),
         ];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -169,10 +175,16 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      expect(find.text('$known-handle'), findsOneWidget);
-      expect(find.text('Unknown actor'), findsOneWidget);
-      expect(find.text(gone), findsNothing);
       expect(tester.takeException(), isNull);
+      expect(find.text('Recent Activity'), findsOneWidget);
+      expect(find.text('kestrel-coder'), findsOneWidget);
+      expect(find.text('DONE'), findsOneWidget);
+      expect(find.textContaining('Landed mock-up and tests'), findsOneWidget);
+      expect(
+        find.text('Resolution: github:MEK-Org/rusa/pulls/665'),
+        findsOneWidget,
+      );
+
       await store.dispose();
     });
   });

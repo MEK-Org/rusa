@@ -231,6 +231,116 @@ describe("handleMeshApiRequest", () => {
     };
   });
 
+  describe("GET /api/mesh/recent-activity (#664)", () => {
+    it("coalesces handled work and folds only a terminal transition from the same selected run", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      actors.upsert(rec(UUID_B, "root", "active"));
+      obligations.create({ id: "linked", ownerId: UUID_A, title: "Linked work" });
+      obligations.create({ id: "unmatched", ownerId: UUID_B, title: "Unmatched work" });
+
+      inbox.append([
+        {
+          id: "linked-entry",
+          actorId: UUID_A,
+          source: "obligation:linked",
+          payload: { type: "obligation.ready_head", obligationId: "linked" },
+        },
+        {
+          id: "linked-entry-2",
+          actorId: UUID_A,
+          source: "obligation:linked",
+          payload: { type: "obligation.ready_head", obligationId: "linked" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["linked-entry", "linked-entry-2"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Completed the linked work"
+      );
+      obligations.setTerminalStatus(
+        "linked",
+        "done",
+        "Linked resolution",
+        "mesh:messages/linked-resolution",
+        UUID_A
+      );
+      obligations.setTerminalStatus(
+        "unmatched",
+        "cancelled",
+        "Unmatched resolution",
+        "mesh:messages/unmatched-resolution",
+        UUID_B
+      );
+
+      const sameRunDeps = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2030-01-01T00:00:00.000Z",
+              entryIds: ["linked-entry", "linked-entry-2"],
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+      const { res } = await call(sameRunDeps, "GET", "/api/mesh/recent-activity?limit=10");
+      expect(res.statusCode).toBe(200);
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items).toHaveLength(2);
+      expect(items.find((item) => item.kind === "handled_inbox")).toMatchObject({
+        addressedNote: "Completed the linked work",
+        moreCount: 1,
+        linkedObligation: "Obligation done: Linked work",
+      });
+      expect(items.find((item) => item.kind === "terminal_obligation")).toMatchObject({
+        summary: "Unmatched work",
+        terminalStatus: "cancelled",
+        terminalNote: "Unmatched resolution",
+        resolutionRef: "mesh:messages/unmatched-resolution",
+      });
+
+      const { res: uncorrelatedRes } = await call(
+        deps,
+        "GET",
+        "/api/mesh/recent-activity?limit=10"
+      );
+      const uncorrelated = JSON.parse(uncorrelatedRes.body).items as Array<Record<string, unknown>>;
+      expect(uncorrelated).toHaveLength(3);
+      expect(
+        uncorrelated.some(
+          (item) => item.kind === "terminal_obligation" && item.summary === "Linked work"
+        )
+      ).toBe(true);
+    });
+  });
+
+  it("GET /api/mesh/threads surfaces exhausted selected work as needs attention (#664)", async () => {
+    actors.upsert(rec(UUID_A, "root", "active"));
+    const { res } = await call(
+      {
+        ...deps,
+        mesh: {
+          hasExhaustedSelectedWork: (actorId: string) => actorId === UUID_A,
+        } as unknown as ActorMesh,
+      },
+      "GET",
+      "/api/mesh/threads"
+    );
+
+    expect(res.statusCode).toBe(200);
+    const thread = (JSON.parse(res.body).threads as Array<Record<string, unknown>>).find(
+      (item) => item.id === UUID_A
+    );
+    expect(thread).toMatchObject({
+      needsAttention: true,
+      needsAttentionReason: "Selected work exhausted retries without being handled",
+    });
+  });
+
   describe("auth-disabled local mode attribution (#460)", () => {
     const mutations = (): Array<[string, string, string | undefined]> => [
       ["POST", "/api/mesh/actors", JSON.stringify({ charter: "c", provider: "agy", model: "m" })],

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
+  type HandledInboxGroup,
   type InboxActorWork,
   type InboxAppendInput,
   type InboxEntry,
@@ -333,5 +334,35 @@ export class SqliteInboxRepository implements InboxRepository {
       )
       .all() as InboxActorWork[];
     return rows.map((row) => ({ actorId: row.actorId, priority: row.priority }));
+  }
+
+  listRecentHandledGroups(limit = 50): HandledInboxGroup[] {
+    const rows = this.db
+      .prepare(
+        `SELECT actor_id, handled_at, handled_note, COUNT(*) as group_count, MIN(id) as first_id
+         FROM actor_inbox_entries
+         WHERE handled_at IS NOT NULL
+         GROUP BY actor_id, handled_at, handled_note
+         ORDER BY handled_at DESC
+         LIMIT ?`
+      )
+      .all(limit) as Array<{
+      actor_id: string;
+      handled_at: string;
+      handled_note: string | null;
+      group_count: number;
+      first_id: string;
+    }>;
+
+    return rows
+      .map((r) => {
+        const entry = this.read(r.actor_id, r.first_id);
+        if (!entry) return null;
+        return {
+          entry,
+          moreCount: r.group_count - 1,
+        };
+      })
+      .filter((g): g is HandledInboxGroup => g !== null);
   }
 }
