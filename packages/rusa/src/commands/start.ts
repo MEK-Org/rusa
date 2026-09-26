@@ -3817,6 +3817,7 @@ async function composeStart(
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
           actorRuns: getRepositories().actorRuns,
+          inboxFocus: getRepositories().inboxFocus,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
             logger: log.child({ component: "reference-cache" }),

@@ -387,6 +387,102 @@ describe("handleMeshApiRequest", () => {
       );
     });
 
+    it("does not fold a run primary obligation into an unrelated handled entry", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "primary", ownerId: UUID_A, title: "Primary work" });
+      inbox.append([
+        {
+          id: "primary-entry",
+          actorId: UUID_A,
+          source: "obligation:primary",
+          payload: { type: "obligation.ready_head", obligationId: "primary" },
+        },
+        {
+          id: "unrelated-entry",
+          actorId: UUID_A,
+          source: "mesh:other",
+          payload: { type: "mesh.message" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["unrelated-entry"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed the unrelated message"
+      );
+      obligations.setTerminalStatus(
+        "primary",
+        "done",
+        "Primary resolution",
+        "mesh:messages/primary-resolution",
+        UUID_A
+      );
+
+      const sameRunDeps = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2030-01-01T00:00:00.000Z",
+              entryIds: ["primary-entry", "unrelated-entry"],
+              primaryObligationId: "primary",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+      const { res } = await call(sameRunDeps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items.find((item) => item.id === "inbox_unrelated-entry")).not.toHaveProperty(
+        "linkedObligation"
+      );
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal_obligation",
+            summary: "Primary work",
+            terminalNote: "Primary resolution",
+          }),
+        ])
+      );
+    });
+
+    it("keeps GitHub PR and issue source kinds distinct in handled activity", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      inbox.append([
+        {
+          id: "issue-entry",
+          actorId: UUID_A,
+          source: "github:MEK-Org/rusa/issues/664",
+          payload: { type: "issue_comment.created" },
+        },
+        {
+          id: "pr-entry",
+          actorId: UUID_A,
+          source: "github:MEK-Org/rusa/pulls/696",
+          payload: { type: "pull_request_review.submitted" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["issue-entry", "pr-entry"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed"
+      );
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "inbox_issue-entry", sourceKind: "GITHUB ISSUE" }),
+          expect.objectContaining({ id: "inbox_pr-entry", sourceKind: "GITHUB PR" }),
+        ])
+      );
+    });
+
     it("renders the terminal note and resolution recorded in history, not a later row rewrite", async () => {
       actors.upsert(rec(UUID_A, "root", "active"));
       obligations.create({ id: "historic-linked", ownerId: UUID_A, title: "Historic linked work" });

@@ -135,18 +135,11 @@ export interface InboxRepository {
     handledNote?: string
   ): MarkHandledResult[];
   /**
-   * SQL activity-feed projection. Each result names exactly one durable inbox
-   * entry; it deliberately does not infer an operator batch from matching
-   * timestamps or notes. Lightweight in-memory test stores may omit it.
+   * Activity-feed projection of individual durable handled rows, newest first.
+   * A handled timestamp or note is not a durable batch identity, so callers
+   * receive each item separately rather than a guessed coalesced group.
    */
-  listRecentHandledGroups?(limit?: number): HandledInboxGroup[];
-}
-
-export interface HandledInboxGroup {
-  /** One durable handled entry, retained under this historical API name. */
-  entry: InboxEntry;
-  /** Always zero: handled activity does not guess that rows share a batch. */
-  moreCount: number;
+  listRecentHandledEntries(limit?: number): InboxEntry[];
 }
 
 export function validateInboxPayload(payload: unknown): asserts payload is InboxPayload {
@@ -208,7 +201,7 @@ export class EmptyInboxRepository implements InboxRepository {
   ): MarkHandledResult[] {
     return [];
   }
-  listRecentHandledGroups(_limit = 50): HandledInboxGroup[] {
+  listRecentHandledEntries(_limit = 50): InboxEntry[] {
     return [];
   }
 }

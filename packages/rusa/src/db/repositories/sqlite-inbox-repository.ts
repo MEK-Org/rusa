@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
-  type HandledInboxGroup,
   type InboxActorWork,
   type InboxAppendInput,
   type InboxEntry,
@@ -336,7 +335,7 @@ export class SqliteInboxRepository implements InboxRepository {
     return rows.map((row) => ({ actorId: row.actorId, priority: row.priority }));
   }
 
-  listRecentHandledGroups(limit = 50): HandledInboxGroup[] {
+  listRecentHandledEntries(limit = 50): InboxEntry[] {
     const rows = this.db
       .prepare(
         `SELECT id, actor_id, source, delivered_at, seen_at, handled_at, handled_note, payload_json
@@ -348,6 +347,6 @@ export class SqliteInboxRepository implements InboxRepository {
       .all(limit) as InboxRow[];
     // A matching timestamp/note is not a durable batch identifier. Keep every
     // row visible rather than collapsing unrelated operator actions.
-    return rows.map((row) => ({ entry: toEntry(row), moreCount: 0 }));
+    return rows.map(toEntry);
   }
 }

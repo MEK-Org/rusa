@@ -64,9 +64,9 @@ describe("SqliteInboxRepository", () => {
     const sameMoment = new Date("2026-07-13T12:05:00.000Z");
     store.markHandled("actor-a", ["handled-a", "handled-b"], sameMoment, "done");
 
-    expect(store.listRecentHandledGroups()).toMatchObject([
-      { entry: { id: "handled-b", source: "mesh:two", handledNote: "done" }, moreCount: 0 },
-      { entry: { id: "handled-a", source: "mesh:one", handledNote: "done" }, moreCount: 0 },
+    expect(store.listRecentHandledEntries()).toMatchObject([
+      { id: "handled-b", source: "mesh:two", handledNote: "done" },
+      { id: "handled-a", source: "mesh:one", handledNote: "done" },
     ]);
   });
 

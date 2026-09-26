@@ -1251,17 +1251,6 @@ class _OverviewTabState extends State<OverviewTab> {
                         ),
                       ],
                     ),
-                  if (item.moreCount != null && item.moreCount! > 0) ...[
-                    const SizedBox(height: 6),
-                    Text(
-                      '(+ ${item.moreCount} more with this source)',
-                      style: kMonoStyle.copyWith(
-                        color: MeshColors.accent,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
                   const SizedBox(height: 8),
                   Container(
                     width: double.infinity,

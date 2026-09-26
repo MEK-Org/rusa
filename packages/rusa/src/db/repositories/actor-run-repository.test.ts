@@ -119,6 +119,27 @@ describe("ActorRunRepository", () => {
     ]);
   });
 
+  it("counts only successful focus rows and can exclude the current completed run", () => {
+    const completeWithFocus = (id: string, success: boolean) => {
+      runs.start({
+        id,
+        actorId: "actor-a",
+        modelConfig: launch("codex", "gpt-5.5"),
+      });
+      db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`).run(
+        JSON.stringify(["entry-1"]),
+        id
+      );
+      runs.complete(id, { success, exitCode: success ? 0 : 1, output: id });
+    };
+
+    completeWithFocus("included-success", true);
+    completeWithFocus("failed", false);
+    completeWithFocus("excluded-success", true);
+
+    expect(runs.completedFocusEntryCounts("actor-a", "excluded-success").get("entry-1")).toBe(1);
+  });
+
   it("retains the launch model and effort on an interrupted (abandoned) run", () => {
     const id = runs.start({
       id: "run-interrupted",

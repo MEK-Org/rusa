@@ -541,7 +541,6 @@ class RecentActivityItem {
     this.summary,
     this.handledTime,
     this.addressedNote,
-    this.moreCount,
     this.linkedObligation,
     this.obligationId,
     this.terminalStatus,
@@ -564,7 +563,6 @@ class RecentActivityItem {
   final String? summary;
   final String? handledTime;
   final String? addressedNote;
-  final int? moreCount;
   final String? linkedObligation;
 
   // Terminal obligation fields
@@ -592,7 +590,6 @@ class RecentActivityItem {
         summary: j['summary'] as String?,
         handledTime: j['handledTime'] as String?,
         addressedNote: j['addressedNote'] as String?,
-        moreCount: j['moreCount'] as int?,
         linkedObligation: j['linkedObligation'] as String?,
         obligationId: j['obligationId'] as String?,
         terminalStatus: j['terminalStatus'] as String?,

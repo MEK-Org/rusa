@@ -219,6 +219,15 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
     actorsWithUnhandled: () => pendingActors((entry) => entry.handledAt === null),
     actorsWithUnseen: () =>
       pendingActors((entry) => entry.handledAt === null && entry.seenAt === null),
+    listRecentHandledEntries: (limit = 50) =>
+      entries
+        .filter((entry) => entry.handledAt !== null)
+        .sort(
+          (left, right) =>
+            (right.handledAt?.getTime() ?? 0) - (left.handledAt?.getTime() ?? 0) ||
+            right.id.localeCompare(left.id)
+        )
+        .slice(0, limit),
     markSeen: (actorId, seenAt = new Date("2026-01-01T00:00:00Z")) => {
       const unseen = entries.filter(
         (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null
@@ -12484,6 +12493,34 @@ describe("accountRun token accounting (#443)", () => {
   describe("bounded inbox retry and exhaustion (#664)", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
+
+    it("does not recover selected work after a failed provider return", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const provider = new FakeProvider(() => ({
+        success: false,
+        exitCode: 1,
+        output: "provider failed",
+      }));
+      const { mesh, tick } = setup({ inboxStore, sharedProvider: provider });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      inboxStore.append([
+        {
+          id: "failed-item",
+          actorId: worker,
+          source: "mesh:root",
+          payload: payload("mesh.message"),
+        },
+      ]);
+      await tick();
+
+      expect(provider.calls).toHaveLength(1);
+      // A second debounce would expose an automatic recovery if the
+      // successful-return gate were removed.
+      await tick();
+      expect(provider.calls).toHaveLength(1);
+    });
 
     it("dispatches one retry for unhandled selected work and stops on exhaustion", async () => {
       const inboxStore = createMemoryInboxStore();

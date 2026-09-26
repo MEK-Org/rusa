@@ -110,7 +110,6 @@ void main() {
             summary: 'UI proposal feedback on #664',
             handledTime: '2026-09-23T14:21:37.000Z',
             addressedNote: 'Packaged design proposal into PR #665',
-            moreCount: 1,
             linkedObligation:
                 'Obligation: Render work-outcome dashboard mock-up',
           ),
@@ -132,7 +131,6 @@ void main() {
         find.textContaining('Packaged design proposal into PR #665'),
         findsOneWidget,
       );
-      expect(find.text('(+ 1 more with this source)'), findsOneWidget);
       expect(
         find.text('Obligation: Render work-outcome dashboard mock-up'),
         findsOneWidget,

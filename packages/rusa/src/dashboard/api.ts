@@ -15,6 +15,7 @@ import {
   uploadAvatar,
 } from "../avatar/avatars.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import type { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
@@ -74,6 +75,8 @@ export interface DashboardDataDeps {
   inbox?: InboxRepository;
   /** Completed selection intervals used only to correlate same-run activity rows. */
   actorRuns?: ActorRunRepository;
+  /** Durable per-entry obligation associations for activity correlation. */
+  inboxFocus?: InboxFocusRepository;
   sseHub: SseHub;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
@@ -2279,72 +2282,107 @@ export async function handleMeshApiRequest(
       return { handle, model };
     };
 
-    const handledGroups = deps.inbox?.listRecentHandledGroups?.(limit) ?? [];
+    const handledEntries = deps.inbox?.listRecentHandledEntries(limit) ?? [];
     const terminalHistory = deps.obligations?.listTerminalHistory?.(limit) ?? [];
 
     const matchedTerminalHistoryIds = new Set<number>();
     const completedFocuses = deps.actorRuns?.listRecentCompletedFocuses(limit * 2) ?? [];
     const handledItems: Array<Record<string, unknown>> = [];
 
-    for (const group of handledGroups) {
-      if (!group.entry.handledAt) continue;
+    for (const entry of handledEntries) {
+      if (!entry.handledAt) continue;
       const page = await resolveInboxPage(
-        { entries: [group.entry], unhandledCount: 1, nextCursor: null },
+        { entries: [entry], unhandledCount: 1, nextCursor: null },
         deps,
         chatScope
       );
       const resolved = page.entries[0];
       if (!resolved) continue;
 
-      const { handle, model } = actorDisplayInfo(group.entry.actorId);
+      const { handle, model } = actorDisplayInfo(entry.actorId);
 
-      const source = group.entry.source;
-      const sourceKind = String(resolved.reference?.scheme ?? "inbox").toUpperCase();
-      const handledAt = group.entry.handledAt.toISOString();
+      const source = entry.source;
+      let sourceKind = "UNKNOWN";
+      if (source.startsWith("github:")) {
+        sourceKind =
+          source.includes("/pull/") || source.includes("/pulls/")
+            ? "GITHUB PR"
+            : source.includes("/issues/") || source.includes("/issue/")
+              ? "GITHUB ISSUE"
+              : "GITHUB";
+      } else if (source.startsWith("mesh:")) {
+        sourceKind = "MESH CHAT";
+      } else if (source.startsWith("gchat:")) {
+        sourceKind = "GCHAT MESSAGE";
+      } else if (source.startsWith("slack:")) {
+        sourceKind = "SLACK MESSAGE";
+      } else if (source.startsWith("obligation:")) {
+        sourceKind = "OBLIGATION";
+      } else if (resolved.reference?.scheme) {
+        sourceKind = String(resolved.reference.scheme).toUpperCase();
+      }
+
+      const handledAt = entry.handledAt.toISOString();
       const selectedRun = completedFocuses.find(
         (run) =>
-          run.actorId === group.entry.actorId &&
-          run.entryIds.includes(group.entry.id) &&
+          run.actorId === entry.actorId &&
+          run.entryIds.includes(entry.id) &&
           handledAt >= run.startedAt &&
           handledAt <= run.endedAt
       );
-      const ob =
-        selectedRun?.primaryObligationId && deps.obligations
-          ? deps.obligations.get(selectedRun.primaryObligationId)
-          : null;
-      let linkedObligation: string | null = null;
-      if (ob) {
-        linkedObligation = `Obligation: ${ob.title}`;
+
+      // Selection records one run-level primary focus, but a run may select
+      // unrelated inbox entries. Link and fold an activity card only through
+      // this entry's own durable association or exact source reference.
+      const entryObligationIds = new Set(
+        deps.inboxFocus?.listEntryObligationIds(entry.actorId, entry.id) ?? []
+      );
+      if (typeof entry.payload.obligationId === "string") {
+        entryObligationIds.add(entry.payload.obligationId);
       }
+      if (source.startsWith("obligation:")) {
+        entryObligationIds.add(source.slice("obligation:".length));
+      }
+      const externallyLinked = deps.obligations?.findByExternalRef(source) ?? null;
+      if (externallyLinked) entryObligationIds.add(externallyLinked.id);
+      const entryObligations = deps.obligations
+        ? [...entryObligationIds]
+            .map((obligationId) => deps.obligations?.get(obligationId) ?? null)
+            .filter((obligation): obligation is Obligation => obligation !== null)
+        : [];
+      let linkedObligation: string | null =
+        selectedRun && entryObligations[0] ? `Obligation: ${entryObligations[0].title}` : null;
 
       // A source link alone is not enough: a recurring obligation can be
       // handled in one run and transition terminal in a later one. Fold only a
       // transition observed inside the completed run that selected this exact
       // entry, preserving later/unrelated terminal changes as their own cards.
-      const matchedTerminal =
-        ob && selectedRun
-          ? terminalHistory.find(
-              (history) =>
-                history.obligationId === ob.id &&
-                history.actingPrincipal === group.entry.actorId &&
-                history.timestamp >= selectedRun.startedAt &&
-                history.timestamp <= selectedRun.endedAt
-            )
-          : undefined;
-      if (matchedTerminal && ob) {
+      const matchedTerminal = selectedRun
+        ? terminalHistory.find(
+            (history) =>
+              entryObligationIds.has(history.obligationId) &&
+              history.actingPrincipal === entry.actorId &&
+              history.timestamp >= selectedRun.startedAt &&
+              history.timestamp <= selectedRun.endedAt
+          )
+        : undefined;
+      if (matchedTerminal) {
         matchedTerminalHistoryIds.add(matchedTerminal.id);
-        linkedObligation = `Obligation ${matchedTerminal.after.status}: ${ob.title}`;
+        const terminalObligation = deps.obligations?.get(matchedTerminal.obligationId);
+        if (terminalObligation) {
+          linkedObligation = `Obligation ${matchedTerminal.after.status}: ${terminalObligation.title}`;
+        }
       }
 
       const summary =
         resolved.reference?.title ??
-        (typeof group.entry.payload?.type === "string" ? group.entry.payload.type : source);
+        (typeof entry.payload?.type === "string" ? entry.payload.type : source);
 
       handledItems.push({
-        id: `inbox_${group.entry.id}`,
+        id: `inbox_${entry.id}`,
         kind: "handled_inbox",
         time: handledAt,
-        actorId: group.entry.actorId,
+        actorId: entry.actorId,
         actorHandle: handle,
         actorModel: model,
         sourceKind,
@@ -2352,8 +2390,7 @@ export async function handleMeshApiRequest(
         ...(resolved.reference ? { reference: resolved.reference } : {}),
         summary,
         handledTime: handledAt,
-        addressedNote: group.entry.handledNote ?? "Handled without comment",
-        ...(group.moreCount > 0 ? { moreCount: group.moreCount } : {}),
+        addressedNote: entry.handledNote ?? "Handled without comment",
         ...(linkedObligation ? { linkedObligation } : {}),
       });
     }
