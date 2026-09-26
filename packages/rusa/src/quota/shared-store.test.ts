@@ -700,8 +700,8 @@ describe("SharedQuotaStore retention and indexing", () => {
           .all() as Array<{ name: string }>
       ).map((row) => row.name);
 
-      expect(indices).toContain("idx_quota_observations_provider_kind_time");
-      expect(indices).toContain("idx_quota_observations_reasoned");
+      expect(indices).toContain("idx_quota_observations_scope_kind_time");
+      expect(indices).toContain("idx_quota_observations_scope_reasoned");
       expect(indices).toContain("idx_quota_observations_observed_at");
       expect(indices).toContain("idx_shared_quota_scrapes_time");
 
@@ -736,13 +736,13 @@ describe("SharedQuotaStore retention and indexing", () => {
           `EXPLAIN QUERY PLAN
            SELECT interval_seconds, controller_error, controller_derivative, observed_at, reset_at_iso
            FROM quota_observations
-           WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
+           WHERE provider = ? AND model_scope = ? AND kind = ? AND interval_seconds IS NOT NULL
            ORDER BY observed_at DESC LIMIT 1`
         )
-        .all("claude", "weekly") as Array<{ detail: string }>;
+        .all("claude", "", "weekly") as Array<{ detail: string }>;
 
       expect(
-        previousPlan.some((step) => step.detail.includes("idx_quota_observations_reasoned"))
+        previousPlan.some((step) => step.detail.includes("idx_quota_observations_scope_reasoned"))
       ).toBe(true);
 
       // Query plan for current observations in getProviderThrottle
@@ -751,20 +751,19 @@ describe("SharedQuotaStore retention and indexing", () => {
           `EXPLAIN QUERY PLAN
            SELECT kind, label, reset_at_iso, percent_left, observed_at
            FROM quota_observations o
-           WHERE provider = ?
+           WHERE provider = ? AND model_scope = ?
              AND NOT EXISTS (
                SELECT 1 FROM quota_observations newer
-               WHERE newer.provider = o.provider AND newer.kind = o.kind
+               WHERE newer.provider = o.provider AND newer.model_scope = o.model_scope
+                 AND newer.kind = o.kind
                  AND (newer.observed_at > o.observed_at OR
                       (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
              )`
         )
-        .all("claude") as Array<{ detail: string }>;
+        .all("claude", "") as Array<{ detail: string }>;
 
       expect(
-        currentPlan.some((step) =>
-          step.detail.includes("idx_quota_observations_provider_kind_time")
-        )
+        currentPlan.some((step) => step.detail.includes("idx_quota_observations_scope_kind_time"))
       ).toBe(true);
     } finally {
       store.close();

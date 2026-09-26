@@ -231,6 +231,320 @@ describe("handleMeshApiRequest", () => {
     };
   });
 
+  describe("GET /api/mesh/recent-activity (#664)", () => {
+    it("retains each handled entry and folds only a terminal transition from the same selected run", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      actors.upsert(rec(UUID_B, "root", "active"));
+      obligations.create({ id: "linked", ownerId: UUID_A, title: "Linked work" });
+      obligations.create({ id: "unmatched", ownerId: UUID_B, title: "Unmatched work" });
+
+      inbox.append([
+        {
+          id: "linked-entry",
+          actorId: UUID_A,
+          source: "obligation:linked",
+          payload: { type: "obligation.ready_head", obligationId: "linked" },
+        },
+        {
+          id: "linked-entry-2",
+          actorId: UUID_A,
+          source: "obligation:linked",
+          payload: { type: "obligation.ready_head", obligationId: "linked" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["linked-entry", "linked-entry-2"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Completed the linked work"
+      );
+      obligations.setTerminalStatus(
+        "linked",
+        "done",
+        "Linked resolution",
+        "mesh:messages/linked-resolution",
+        UUID_A
+      );
+      obligations.setTerminalStatus(
+        "unmatched",
+        "cancelled",
+        "Unmatched resolution",
+        "mesh:messages/unmatched-resolution",
+        UUID_B
+      );
+
+      const sameRunDeps = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2030-01-01T00:00:00.000Z",
+              entryIds: ["linked-entry", "linked-entry-2"],
+              primaryObligationId: "linked",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+      const { res } = await call(sameRunDeps, "GET", "/api/mesh/recent-activity?limit=10");
+      expect(res.statusCode).toBe(200);
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items).toHaveLength(3);
+      expect(items.filter((item) => item.kind === "handled_inbox")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "inbox_linked-entry",
+            addressedNote: "Completed the linked work",
+            linkedObligation: "Obligation done: Linked work",
+          }),
+          expect.objectContaining({
+            id: "inbox_linked-entry-2",
+            addressedNote: "Completed the linked work",
+            linkedObligation: "Obligation done: Linked work",
+          }),
+        ])
+      );
+      expect(items.find((item) => item.kind === "terminal_obligation")).toMatchObject({
+        summary: "Unmatched work",
+        terminalStatus: "cancelled",
+        terminalNote: "Unmatched resolution",
+        resolutionRef: "mesh:messages/unmatched-resolution",
+      });
+
+      const { res: uncorrelatedRes } = await call(
+        deps,
+        "GET",
+        "/api/mesh/recent-activity?limit=10"
+      );
+      const uncorrelated = JSON.parse(uncorrelatedRes.body).items as Array<Record<string, unknown>>;
+      expect(uncorrelated).toHaveLength(4);
+      expect(
+        uncorrelated.some(
+          (item) => item.kind === "terminal_obligation" && item.summary === "Linked work"
+        )
+      ).toBe(true);
+    });
+
+    it("keeps a terminal change separate when handling happened after the selected run", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "late-linked", ownerId: UUID_A, title: "Late linked work" });
+      inbox.append([
+        {
+          id: "late-linked-entry",
+          actorId: UUID_A,
+          source: "obligation:late-linked",
+          payload: { type: "obligation.ready_head", obligationId: "late-linked" },
+        },
+      ]);
+      obligations.setTerminalStatus(
+        "late-linked",
+        "done",
+        "Finished during the run",
+        "mesh:messages/finished-during-run",
+        UUID_A
+      );
+      inbox.markHandled(
+        UUID_A,
+        ["late-linked-entry"],
+        new Date("2030-01-01T00:00:00.000Z"),
+        "Cleared later"
+      );
+
+      const withEarlierRun = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2029-01-01T00:00:00.000Z",
+              entryIds: ["late-linked-entry"],
+              primaryObligationId: "late-linked",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+
+      const { res } = await call(withEarlierRun, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      const lateHandled = items.find((item) => item.id === "inbox_late-linked-entry");
+      expect(lateHandled).toMatchObject({
+        id: "inbox_late-linked-entry",
+        addressedNote: "Cleared later",
+      });
+      expect(lateHandled).not.toHaveProperty("linkedObligation");
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal_obligation",
+            summary: "Late linked work",
+            terminalNote: "Finished during the run",
+          }),
+        ])
+      );
+    });
+
+    it("does not fold a run primary obligation into an unrelated handled entry", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "primary", ownerId: UUID_A, title: "Primary work" });
+      inbox.append([
+        {
+          id: "primary-entry",
+          actorId: UUID_A,
+          source: "obligation:primary",
+          payload: { type: "obligation.ready_head", obligationId: "primary" },
+        },
+        {
+          id: "unrelated-entry",
+          actorId: UUID_A,
+          source: "mesh:other",
+          payload: { type: "mesh.message" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["unrelated-entry"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed the unrelated message"
+      );
+      obligations.setTerminalStatus(
+        "primary",
+        "done",
+        "Primary resolution",
+        "mesh:messages/primary-resolution",
+        UUID_A
+      );
+
+      const sameRunDeps = {
+        ...deps,
+        actorRuns: {
+          listRecentCompletedFocuses: () => [
+            {
+              actorId: UUID_A,
+              startedAt: "2020-01-01T00:00:00.000Z",
+              endedAt: "2030-01-01T00:00:00.000Z",
+              entryIds: ["primary-entry", "unrelated-entry"],
+              primaryObligationId: "primary",
+            },
+          ],
+        },
+      } as unknown as DashboardDataDeps;
+      const { res } = await call(sameRunDeps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items.find((item) => item.id === "inbox_unrelated-entry")).not.toHaveProperty(
+        "linkedObligation"
+      );
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal_obligation",
+            summary: "Primary work",
+            terminalNote: "Primary resolution",
+          }),
+        ])
+      );
+    });
+
+    it("keeps GitHub PR and issue source kinds distinct in handled activity", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      inbox.append([
+        {
+          id: "issue-entry",
+          actorId: UUID_A,
+          source: "github:MEK-Org/rusa/issues/664",
+          payload: { type: "issue_comment.created" },
+        },
+        {
+          id: "pr-entry",
+          actorId: UUID_A,
+          source: "github:MEK-Org/rusa/pulls/696",
+          payload: { type: "pull_request_review.submitted" },
+        },
+        {
+          // A repository named "pulls" must not make an issue look like a PR.
+          id: "pulls-repo-issue-entry",
+          actorId: UUID_A,
+          source: "github:o/pulls/issues/3",
+          payload: { type: "issue_comment.created" },
+        },
+      ]);
+      inbox.markHandled(
+        UUID_A,
+        ["issue-entry", "pr-entry", "pulls-repo-issue-entry"],
+        new Date("2026-09-26T03:15:00.000Z"),
+        "Addressed"
+      );
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "inbox_issue-entry", sourceKind: "GITHUB ISSUE" }),
+          expect.objectContaining({ id: "inbox_pr-entry", sourceKind: "GITHUB PR" }),
+          expect.objectContaining({
+            id: "inbox_pulls-repo-issue-entry",
+            sourceKind: "GITHUB ISSUE",
+          }),
+        ])
+      );
+    });
+
+    it("renders the terminal note and resolution recorded in history, not a later row rewrite", async () => {
+      actors.upsert(rec(UUID_A, "root", "active"));
+      obligations.create({ id: "historic-linked", ownerId: UUID_A, title: "Historic linked work" });
+      obligations.setTerminalStatus(
+        "historic-linked",
+        "done",
+        "Original terminal note",
+        "mesh:messages/original-terminal",
+        UUID_A
+      );
+      // Model a bad later row rewrite without adding a second history event.
+      // Recent Activity must still report the immutable terminal transition.
+      db.prepare(`UPDATE obligations SET terminal_note = ?, resolution_ref = ? WHERE id = ?`).run(
+        "Rewritten current note",
+        "mesh:messages/rewritten-current",
+        "historic-linked"
+      );
+
+      const { res } = await call(deps, "GET", "/api/mesh/recent-activity?limit=10");
+      const items = JSON.parse(res.body).items as Array<Record<string, unknown>>;
+
+      expect(items.find((item) => item.summary === "Historic linked work")).toMatchObject({
+        terminalNote: "Original terminal note",
+        resolutionRef: "mesh:messages/original-terminal",
+      });
+    });
+  });
+
+  it("GET /api/mesh/threads surfaces exhausted selected work as needs attention (#664)", async () => {
+    actors.upsert(rec(UUID_A, "root", "active"));
+    const { res } = await call(
+      {
+        ...deps,
+        mesh: {
+          hasExhaustedSelectedWork: (actorId: string) => actorId === UUID_A,
+        } as unknown as ActorMesh,
+      },
+      "GET",
+      "/api/mesh/threads"
+    );
+
+    expect(res.statusCode).toBe(200);
+    const thread = (JSON.parse(res.body).threads as Array<Record<string, unknown>>).find(
+      (item) => item.id === UUID_A
+    );
+    expect(thread).toMatchObject({
+      needsAttention: true,
+      needsAttentionReason: "Selected work exhausted retries without being handled",
+    });
+  });
+
   describe("auth-disabled local mode attribution (#460)", () => {
     const mutations = (): Array<[string, string, string | undefined]> => [
       ["POST", "/api/mesh/actors", JSON.stringify({ charter: "c", provider: "agy", model: "m" })],

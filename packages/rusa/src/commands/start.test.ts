@@ -1213,6 +1213,82 @@ describe("runStart webhook event routing (Phase 4)", () => {
         await close();
       }
     });
+
+    describe("model-scoped quota lanes (#588)", () => {
+      const fableEntry = { provider: "claude", model: "claude-fable-5-1", effort: "high" };
+      const withFableLane = (
+        provider: ReturnType<typeof throttleStatus>,
+        lane: { intervalSeconds?: number; percentLeft?: number; expired?: boolean }
+      ) => ({
+        ...provider,
+        modelLanes: [
+          {
+            ...throttleStatus("claude", lane),
+            governingBucketKey: "claude[claude-fable-5-1]:weekly",
+            models: ["claude-fable-5-1"],
+          },
+        ],
+      });
+
+      it("paces Fable on its own window while Sonnet keeps the provider lane", async () => {
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: withFableLane(throttleStatus("claude"), { intervalSeconds: 3600 }),
+        }));
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          await expect(mesh.gateRun(ran, [fableEntry], false).result).resolves.toBe(
+            "claude-fable-5-1"
+          );
+
+          // Fable's own hour-long pace holds the next Fable start...
+          const fableGate = mesh.gateRun(ran, [fableEntry], false);
+          fableGate.result.catch(() => {});
+          // ...while Sonnet, outside the Fable window, starts on the provider lane.
+          await expect(mesh.gateRun(ran, [claudeEntry], false).result).resolves.toBe(
+            "claude-sonnet-5"
+          );
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          expect(fableGate.started).toBe(false);
+          fableGate.cancel?.();
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
+      it("skips only Fable when the coordinator reports its own window exhausted", async () => {
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: withFableLane(throttleStatus("claude", { percentLeft: 90 }), {
+            percentLeft: 0,
+            expired: true,
+          }),
+          codex: throttleStatus("codex", { percentLeft: 50 }),
+        }));
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          // The Fable model lane is known-empty: its responsive work moves on.
+          await expect(mesh.gateRun(ran, [fableEntry, codexEntry], true).result).resolves.toBe(
+            "gpt-5.6"
+          );
+          // Sonnet shares the provider but not the Fable window.
+          await expect(mesh.gateRun(ran, [claudeEntry], true).result).resolves.toBe(
+            "claude-sonnet-5"
+          );
+          const failure = await mesh.gateRun(ran, [fableEntry], true).result.then(
+            () => undefined,
+            (error: unknown) => error
+          );
+          expect(failure).toBeInstanceOf(PoolExhaustedError);
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+    });
   });
 
   it("keeps an in-progress coordinator history warmup from reading as authoritative empty history at readiness (#527)", async () => {
@@ -5185,17 +5261,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
     expect(activeMesh.actors.get("root")?.desiredModelConfig).toBeUndefined();
 
-    // Invoke the production beforeRun closure, then the root's lifecycle
-    // fanout, without driving a provider/gate/queue cycle.
-    const actorOpts = (
-      rootActor as unknown as {
-        opts: {
-          beforeRun?: (arg: { mode: string }) => boolean;
-        };
-      }
-    ).opts;
-    actorOpts.beforeRun?.({ mode: "yield-elicitation" });
-
     expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
 
     const liveSelected = activeMesh.actors.get("root")?.modelConfig?.[0];
@@ -5264,18 +5329,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     if (!mesh) throw new Error("mesh not ready");
     const activeMesh = mesh;
-    const rootActor = activeMesh.get("root");
-    if (!rootActor) throw new Error("root actor not ready");
-
-    // Directly invoke the production beforeRun closure — same technique used
-    // above for onRunStart — to exercise root's real halt-gate wiring without
-    // driving a full provider/gate/queue cycle. `mode: "yield-elicitation"`
-    // short-circuits past the unrelated inbox-watermark check so only the
-    // halt-gate logic under test is exercised.
-    const actorOpts = (
-      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
-    ).opts;
-
     // Move idle root from antigravity to claude; it applies at once (#652).
     activeMesh.setActorModel("root", { provider: "claude", model: "claude-sonnet-5" }, "root");
     expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("claude");
@@ -5284,22 +5337,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
     // Halt the NEW provider (claude) — the one root will actually launch on.
-    // Gap #2: beforeRun must consult the live launch tuple (claude), not the
+    // Gap #2: the launch gate must consult the live tuple (claude), not the
     // rootProviderName ("antigravity") frozen at root construction — so a
     // halt scoped to claude must still block dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
-    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    expect(activeMesh.prepareRun("root")).toBe(false);
     expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("claude");
     halt.resume();
 
     // Halt the OLD provider (antigravity) instead — root is no longer
     // launching on antigravity, so this halt must not wrongly block it.
     halt.halt("halt antigravity", { providers: ["antigravity"] });
-    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    expect(activeMesh.prepareRun("root")).toBe(true);
     halt.resume();
   });
 
-  it("root's beforeRun halt-gate allows dispatch when an unhalted pool fallback exists (#625)", async () => {
+  it("root's launch gate allows dispatch when an unhalted pool fallback exists (#625)", async () => {
     clearProviderModelCatalog("antigravity");
     clearProviderModelCatalog("claude");
     const config = {
@@ -5332,13 +5385,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     if (!mesh) throw new Error("mesh not ready");
     const activeMesh = mesh;
-    const rootActor = activeMesh.get("root");
-    if (!rootActor) throw new Error("root actor not ready");
-
-    const actorOpts = (
-      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
-    ).opts;
-
     // Set an ordered pool: claude (primary), antigravity (fallback)
     activeMesh.setActorModel(
       "root",
@@ -5352,14 +5398,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
     // Halt only primary provider (claude): unhalted fallback (antigravity) exists,
-    // so beforeRun must allow dispatch.
+    // so the launch gate must allow dispatch.
     halt.halt("halt claude", { providers: ["claude"] });
-    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    expect(activeMesh.prepareRun("root")).toBe(true);
     halt.resume();
 
-    // Halt both providers: all candidates are halted, so beforeRun must return false.
+    // Halt both providers: all candidates are halted, so the launch gate must return false.
     halt.halt("halt both", { providers: ["claude", "antigravity"] });
-    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    expect(activeMesh.prepareRun("root")).toBe(false);
     halt.resume();
   });
 
@@ -5408,9 +5454,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         kinds: ["actor_model_set"],
         limit: 20,
       }).events;
-    const rootActorOpts = (mesh: ActorMesh) =>
-      (mesh.get("root") as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } })
-        .opts;
     const bootRecords = (msg: string): Record<string, unknown>[] =>
       logCapture.lines
         .map((line) => JSON.parse(line) as Record<string, unknown>)
@@ -5754,7 +5797,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     it("does not retry an exhausted entry when launch begins on a later pool candidate", async () => {
       const mesh = await boot();
       mesh.setActorModel("root", operatorPool, "root");
-      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
 
       const recovered = await rootPoolFallbackRun(mesh, operatorPool[1] as ProviderModelConfig);
 
@@ -5848,7 +5890,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // under an unknown cliCommand and fails only when instantiated.
       const mesh = await boot();
       mesh.setActorModel("root", [{ provider: "claude", model: "claude-sonnet-5" }], "root");
-      rootActorOpts(mesh).beforeRun?.({ mode: "yield-elicitation" });
       await shutdownFn?.();
       shutdownFn = undefined;
       const config = portableRootConfig({ model: "Gemini 3.7 Flash", effort: "high" });

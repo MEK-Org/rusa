@@ -111,6 +111,10 @@ export interface QuotaHistoryPointDto {
 export interface QuotaHistorySeriesDto {
   provider: SupportedProvider;
   windowId: string;
+  /** Explicit lane identity; never inferred from the display label. */
+  scope: "provider" | "model";
+  /** Canonical model IDs when [scope] is model; empty for provider rows. */
+  modelIds: string[];
   label: string;
   points: QuotaHistoryPointDto[];
 }
@@ -323,8 +327,9 @@ export function buildQuotaHistory(
     .filter((point) => {
       const observedMs = Date.parse(point.observedAt);
       return (
-        point.scope === "provider" &&
         point.kind === "weekly" &&
+        (point.scope === "provider" ||
+          (point.scope === "model" && point.models !== undefined && point.models.length > 0)) &&
         Number.isFinite(observedMs) &&
         observedMs >= sinceMs &&
         observedMs <= untilMs
@@ -332,13 +337,24 @@ export function buildQuotaHistory(
     })
     .sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
   if (weekly.length === 0) return [];
-  const latest = weekly.at(-1);
-  return [
-    {
+  const groups = new Map<string, QuotaHistorySource[]>();
+  for (const point of weekly) {
+    const key =
+      point.scope === "provider" ? "provider" : `model:${(point.models ?? []).join("\u0000")}`;
+    const group = groups.get(key);
+    if (group) group.push(point);
+    else groups.set(key, [point]);
+  }
+  return [...groups.values()].map((points) => {
+    const latest = points.at(-1);
+    const scope = latest?.scope ?? "provider";
+    return {
       provider,
       windowId: "weekly",
+      scope,
+      modelIds: scope === "model" ? [...(latest?.models ?? [])] : [],
       label: latest?.label ?? "Weekly",
-      points: weekly.map((point) => ({
+      points: points.map((point) => ({
         observedAt: point.observedAt,
         remainingPercent: point.percentLeft,
         // The public chart convention is positive = quota surplus; persisted
@@ -347,8 +363,8 @@ export function buildQuotaHistory(
         resetAtIso: point.resetAtIso,
         intervalSeconds: point.intervalSeconds,
       })),
-    },
-  ];
+    };
+  });
 }
 
 const MAX_FALLBACK_HOLD_MS = 24 * 60 * 60 * 1000;

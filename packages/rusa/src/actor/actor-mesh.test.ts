@@ -7,8 +7,11 @@ import Database from "better-sqlite3";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { closeDb, getDb, initDb } from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { SqliteInboxRepository } from "../db/repositories/sqlite-inbox-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { createObligationsMcpServer } from "../mcp/obligations-mcp.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
@@ -216,6 +219,15 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
     actorsWithUnhandled: () => pendingActors((entry) => entry.handledAt === null),
     actorsWithUnseen: () =>
       pendingActors((entry) => entry.handledAt === null && entry.seenAt === null),
+    listRecentHandledEntries: (limit = 50) =>
+      entries
+        .filter((entry) => entry.handledAt !== null)
+        .sort(
+          (left, right) =>
+            (right.handledAt?.getTime() ?? 0) - (left.handledAt?.getTime() ?? 0) ||
+            right.id.localeCompare(left.id)
+        )
+        .slice(0, limit),
     markSeen: (actorId, seenAt = new Date("2026-01-01T00:00:00Z")) => {
       const unseen = entries.filter(
         (entry) => entry.actorId === actorId && entry.seenAt === null && entry.handledAt === null
@@ -12475,6 +12487,190 @@ describe("accountRun token accounting (#443)", () => {
       uncached_input: 50,
       cache_read: 10,
       output: 5,
+    });
+  });
+
+  describe("bounded inbox retry and exhaustion (#664)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("does not recover selected work after a failed provider return", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const provider = new FakeProvider(() => ({
+        success: false,
+        exitCode: 1,
+        output: "provider failed",
+      }));
+      const { mesh, tick } = setup({ inboxStore, sharedProvider: provider });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      inboxStore.append([
+        {
+          id: "failed-item",
+          actorId: worker,
+          source: "mesh:root",
+          payload: payload("mesh.message"),
+        },
+      ]);
+      await tick();
+
+      expect(provider.calls).toHaveLength(1);
+      // A second debounce would expose an automatic recovery if the
+      // successful-return gate were removed.
+      await tick();
+      expect(provider.calls).toHaveLength(1);
+    });
+
+    it("dispatches one retry for unhandled selected work and stops on exhaustion", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({
+        inboxStore,
+      });
+
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 0;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = () => new Map([["item-1", completed]]);
+
+      inboxStore.append([
+        { id: "item-1", actorId: worker, source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
+
+      await tick();
+      // It ran initial run + 1 retry = 2 calls
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // On second completion, retry budget is exhausted
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(true);
+
+      // Further tick does not dispatch a third run
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // reconcileInbox skips the exhausted actor
+      mesh.reconcileInbox();
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+
+      // When the entry is marked handled, exhaustion clears
+      inboxStore.markHandled(worker, ["item-1"]);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(false);
+      expect(mesh.hasOnlyExhaustedWork(worker)).toBe(false);
+    });
+
+    it("uses durable prior completions after restart instead of granting a third attempt", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 1;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+
+      // A prior process completed the first selection without handling it.
+      // This mesh receives the resumed run, whose own terminal row has not yet
+      // been recorded when finishInboxRun checks the durable count.
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = () => new Map([["resumed-item", completed]]);
+      inboxStore.append([
+        {
+          id: "resumed-item",
+          actorId: worker,
+          source: "mesh:root",
+          payload: payload("mesh.message"),
+        },
+      ]);
+
+      await tick();
+      expect(fake(worker).calls).toHaveLength(1);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+
+      mesh.reconcileInbox();
+      await tick();
+      expect(fake(worker).calls).toHaveLength(1);
+    });
+
+    it("rejects a durably exhausted selection while accepting newly delivered work", () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const runs = new ActorRunRepository(db);
+      const focus = new InboxFocusRepository(db, () => new Date("2026-01-01T00:00:00.000Z"));
+      const durableInbox = new SqliteInboxRepository(
+        db,
+        () => new Date("2026-01-01T00:00:00.000Z")
+      );
+
+      durableInbox.append([
+        { id: "old-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+        { id: "new-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+      const recordSelection = (runId: string, entryId: string) => {
+        runs.start({
+          id: runId,
+          actorId: "root",
+          modelConfig: { version: 1, provider: "fake", model: "test" },
+        });
+        focus.recordSelection({
+          runId,
+          actorId: "root",
+          entryIds: [entryId],
+          primaryObligationId: null,
+          resolution: "explicit",
+        });
+        runs.complete(runId, { success: true, exitCode: 0, output: "returned unhandled" });
+      };
+      // Both durable run rows record an ordinary successful selection of the
+      // old entry. The next selection must require a meaningful change.
+      recordSelection("old-first", "old-item");
+      recordSelection("old-recovery", "old-item");
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = (actorId, excludeRunId) =>
+        runs.completedFocusEntryCounts(actorId, excludeRunId);
+
+      inboxStore.append([
+        { id: "old-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+        { id: "new-item", actorId: "root", source: "mesh:root", payload: payload("mesh.message") },
+      ]);
+
+      expect(() => mesh.selectInboxEntries("root", ["old-item"])).toThrow(/needs attention/i);
+      expect(mesh.selectInboxEntries("root", ["new-item"])).toHaveLength(1);
+      expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
+      expect(mesh.hasOnlyExhaustedWork("root")).toBe(false);
     });
   });
 });

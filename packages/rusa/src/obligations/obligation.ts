@@ -372,6 +372,10 @@ export interface ObligationHistoryState {
   priority?: number | null;
   status?: ObligationStatus;
   externalRef?: string | null;
+  /** Immutable terminal explanation captured with a status transition. */
+  terminalNote?: string | null;
+  /** Immutable resolution citation captured with a status transition. */
+  resolutionRef?: string | null;
 }
 
 /**
@@ -443,6 +447,8 @@ export const obligationHistoryStateSchema = z
     priority: z.number().nullable().optional(),
     status: z.enum(OBLIGATION_STATUSES).optional(),
     externalRef: validatedBy(parseObligationReference).nullable().optional(),
+    terminalNote: z.string().nullable().optional(),
+    resolutionRef: validatedBy(parseObligationReference).nullable().optional(),
   })
   .strict();
 

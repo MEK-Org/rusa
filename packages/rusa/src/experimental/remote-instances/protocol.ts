@@ -117,8 +117,6 @@ export type ActorEvent =
     }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
-  | { type: "continue"; count: number }
-  | { type: "capped"; count: number }
   | { type: "coalesced"; count: number; ageMs: number }
   | { type: "log"; chunk: string }
   | { type: "fatal"; error: string };

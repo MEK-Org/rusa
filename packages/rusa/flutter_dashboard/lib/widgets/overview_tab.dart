@@ -15,6 +15,7 @@ import 'obligation_card.dart';
 import 'obligation_status.dart';
 import 'obligation_dialogs.dart';
 import 'quota_history_chart.dart';
+import 'reference_preview.dart';
 
 /// Overview tab: displays quota history, my obligations queue, live workers, queued actors, and yields.
 class OverviewTab extends StatefulWidget {
@@ -28,9 +29,6 @@ class OverviewTab extends StatefulWidget {
 }
 
 class _OverviewTabState extends State<OverviewTab> {
-  final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = '';
-  String? _statusFilter;
   late Future<Map<String, dynamic>> _humanQueueFuture;
   StreamSubscription<String?>? _viewerPrincipalSub;
 
@@ -100,7 +98,6 @@ class _OverviewTabState extends State<OverviewTab> {
   @override
   void initState() {
     super.initState();
-    widget.store.refreshYieldEvents();
     widget.store.refreshQuotaHistory();
     _humanQueueFuture = _loadHumanQueue();
     // The dashboard config — and with it the durable user principal — is
@@ -125,7 +122,6 @@ class _OverviewTabState extends State<OverviewTab> {
   void dispose() {
     _viewerPrincipalSub?.cancel();
     _startLabelTick?.cancel();
-    _searchController.dispose();
     super.dispose();
   }
 
@@ -147,7 +143,7 @@ class _OverviewTabState extends State<OverviewTab> {
           const SizedBox(height: 20),
           _buildQueuedActorsSection(),
           const SizedBox(height: 20),
-          _buildYieldEventsSection(),
+          _buildRecentActivitySection(),
         ],
       ),
     );
@@ -1075,36 +1071,13 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Tail of recent actor yield events section (Core feature).
-  Widget _buildYieldEventsSection() {
-    return StreamBuilder<List<Object?>>(
-      stream:
-          Rx.combineLatest2<List<MeshEvent>, ActorStateSnapshot, List<Object?>>(
-            widget.store.yieldEvents,
-            widget.store.actorStates,
-            (yields, actorStates) => [yields, actorStates],
-          ),
+  /// Recent activity section (#664) replacing ceremonial yields.
+  Widget _buildRecentActivitySection() {
+    return StreamBuilder<List<RecentActivityItem>>(
+      stream: widget.store.recentActivity,
+      initialData: widget.store.recentActivity.value,
       builder: (context, snap) {
-        final yields = widget.store.yieldEvents.value;
-        final actorStates = widget.store.actorStates.value.actors.values;
-        final handles = {
-          for (final a in actorStates) a.thread.id: a.thread.handle,
-        };
-
-        // Filter by search query & status filter
-        final filtered = yields.where((e) {
-          if (_statusFilter != null && _statusFilter!.isNotEmpty) {
-            if (e.detail != _statusFilter) return false;
-          }
-          if (_searchQuery.isNotEmpty) {
-            final handle = (handles[e.actorId] ?? e.actorId ?? '')
-                .toLowerCase();
-            final body = (e.body ?? e.detail ?? '').toLowerCase();
-            final q = _searchQuery.toLowerCase();
-            if (!handle.contains(q) && !body.contains(q)) return false;
-          }
-          return true;
-        }).toList();
+        final items = snap.data ?? widget.store.recentActivity.value;
 
         return Container(
           padding: const EdgeInsets.all(16),
@@ -1119,9 +1092,9 @@ class _OverviewTabState extends State<OverviewTab> {
               _sectionHeader(
                 Icons.output_outlined,
                 MeshColors.accent,
-                'Recent Yields',
+                'Recent Activity',
                 trailing: Text(
-                  '${filtered.length} events',
+                  '${items.length} items',
                   style: kMonoStyle.copyWith(
                     color: MeshColors.textSecondary,
                     fontSize: 12,
@@ -1130,19 +1103,17 @@ class _OverviewTabState extends State<OverviewTab> {
               ),
               const SizedBox(height: 4),
               const Text(
-                'The most recent times an actor paused and handed control '
-                'back, newest first.',
+                'What actors have completed recently, newest first. Handled cards report '
+                'what was addressed, with resolution notes and completion time.',
                 style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 12),
-              _buildYieldFilterBar(),
-              const SizedBox(height: 12),
-              if (filtered.isEmpty)
+              if (items.isEmpty)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 20),
                   child: Center(
                     child: Text(
-                      'No yield events recorded.',
+                      'No recent activity recorded.',
                       style: TextStyle(
                         color: MeshColors.textMuted,
                         fontSize: 13,
@@ -1154,11 +1125,15 @@ class _OverviewTabState extends State<OverviewTab> {
                 ListView.separated(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  itemCount: filtered.length,
+                  itemCount: items.length,
                   separatorBuilder: (_, _) =>
                       const Divider(height: 1, color: MeshColors.border),
                   itemBuilder: (context, i) {
-                    return _buildYieldRow(filtered[i]);
+                    final item = items[i];
+                    if (item.isTerminalObligation) {
+                      return _buildTerminalObligationRow(item);
+                    }
+                    return _buildHandledActivityRow(item);
                   },
                 ),
             ],
@@ -1168,165 +1143,392 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  Widget _buildYieldFilterBar() {
-    return Row(
-      children: [
-        Expanded(
-          child: TextField(
-            controller: _searchController,
-            style: kMonoStyle.copyWith(
-              color: MeshColors.textPrimary,
-              fontSize: 12,
-            ),
-            decoration: InputDecoration(
-              hintText: 'Search handle or message...',
-              hintStyle: kMonoStyle.copyWith(
-                color: MeshColors.textMuted,
-                fontSize: 12,
-              ),
-              isDense: true,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 10,
-                vertical: 8,
-              ),
-              filled: true,
-              fillColor: MeshColors.bgTertiary,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(6),
-                borderSide: const BorderSide(color: MeshColors.border),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(6),
-                borderSide: const BorderSide(color: MeshColors.border),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(6),
-                borderSide: const BorderSide(color: MeshColors.accent),
-              ),
-            ),
-            onChanged: (val) => setState(() => _searchQuery = val),
-          ),
-        ),
-        const SizedBox(width: 12),
-        DropdownButton<String?>(
-          value: _statusFilter,
-          dropdownColor: MeshColors.bgTertiary,
-          style: kMonoStyle.copyWith(
-            color: MeshColors.textPrimary,
-            fontSize: 12,
-          ),
-          underline: Container(height: 1, color: MeshColors.border),
-          items: const [
-            DropdownMenuItem(value: null, child: Text('All Yields')),
-            DropdownMenuItem(value: 'complete', child: Text('complete')),
-            DropdownMenuItem(value: 'blocked', child: Text('blocked')),
-          ],
-          onChanged: (v) => setState(() => _statusFilter = v),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildYieldRow(MeshEvent e) {
-    final actorId = e.actorId ?? 'unknown';
-    final status = e.detail ?? 'yielded';
-    final message = e.body ?? e.detail ?? 'No yield summary note provided.';
-
-    final isComplete = status == 'complete';
-    final isBlocked = status == 'blocked';
-
-    final pillColor = isComplete
-        ? MeshColors.statusActive
-        : (isBlocked ? MeshColors.statusIdle : MeshColors.accent);
-
-    final pill = Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: pillColor.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        'yielded · $status',
-        style: kMonoStyle.copyWith(
-          fontSize: 11,
-          color: pillColor,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-    );
-    final timestamp = Text(
-      formatTs(e.ts),
-      style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 11),
-    );
-    final messageText = Text(
-      message,
-      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
-    );
-    final handle = Text(
-      widget.store.actorDisplay(actorId),
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      style: kMonoStyle.copyWith(
-        color: MeshColors.textPrimary,
-        fontSize: 12.5,
-        fontWeight: FontWeight.w700,
-      ),
-    );
+  Widget _buildHandledActivityRow(RecentActivityItem item) {
+    final timeLabel = formatTs(item.time);
+    final handledTime = item.handledTime != null
+        ? formatTs(item.handledTime!)
+        : timeLabel;
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          // Below this width the fixed-width timestamp + avatar + pill + gaps
-          // leave no viable room for the message on one line, so stack the
-          // header (avatar/pill/timestamp) above the message instead.
-          if (constraints.maxWidth < 480) {
-            return Column(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 80,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                timeLabel,
+                style: kMonoStyle.copyWith(
+                  color: MeshColors.textMuted,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 170,
+            child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    ActorAvatar(id: actorId, size: 24, store: widget.store),
-                    const SizedBox(width: 8),
-                    Flexible(child: handle),
-                    const SizedBox(width: 8),
-                    pill,
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: timestamp,
+                ActorAvatarWithStatus(
+                  id: item.actorId,
+                  state: DotState.idle,
+                  size: 26,
+                  store: widget.store,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.actorHandle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: kMonoStyle.copyWith(
+                          color: MeshColors.textPrimary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        item.actorModel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: MeshColors.textSecondary,
+                          fontSize: 10.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: MeshColors.bgTertiary,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: MeshColors.border),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (item.reference != null)
+                    ReferencePreview(
+                      reference: item.reference!,
+                      kindLabel: item.sourceKind,
+                      summary: item.summary,
+                      showBody: false,
+                      margin: EdgeInsets.zero,
+                    )
+                  else
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ReferenceKindChip(item.sourceKind ?? 'INBOX'),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: MeshColors.textPrimary,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 9,
+                    ),
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF0D201D),
+                      border: Border(
+                        left: BorderSide(
+                          color: MeshColors.statusActive,
+                          width: 2,
+                        ),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Handled: $handledTime',
+                          style: const TextStyle(
+                            color: Color(0xFF6EE7B7),
+                            fontSize: 11,
+                            fontFamily: kMonoFontFamily,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text.rich(
+                          TextSpan(
+                            style: const TextStyle(
+                              color: Color(0xFFC8DED7),
+                              fontSize: 12,
+                              height: 1.4,
+                            ),
+                            children: [
+                              const TextSpan(
+                                text: 'Addressed: ',
+                                style: TextStyle(fontWeight: FontWeight.w700),
+                              ),
+                              TextSpan(text: item.addressedNote ?? ''),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (item.linkedObligation != null) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.account_tree_outlined,
+                          size: 13,
+                          color: MeshColors.textMuted,
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          item.linkedObligation!,
+                          style: kMonoStyle.copyWith(
+                            color: MeshColors.textMuted,
+                            fontSize: 10.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTerminalObligationRow(RecentActivityItem item) {
+    final timeLabel = formatTs(item.time);
+    final isDone = item.terminalStatus == 'done';
+    final statusColor =
+        isDone ? MeshColors.statusActive : MeshColors.statusIdle;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 80,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                timeLabel,
+                style: kMonoStyle.copyWith(
+                  color: MeshColors.textMuted,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 170,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ActorAvatarWithStatus(
+                  id: item.actorId,
+                  state: DotState.idle,
+                  size: 26,
+                  store: widget.store,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.actorHandle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: kMonoStyle.copyWith(
+                          color: MeshColors.textPrimary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        item.actorModel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: MeshColors.textSecondary,
+                          fontSize: 10.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: MeshColors.bgTertiary,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: MeshColors.border),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const ReferenceKindChip('OBLIGATION'),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '${item.sourceRef ?? ""}   ·   ${item.summary ?? ""}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: MeshColors.textPrimary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: statusColor.withValues(alpha: 0.14),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: statusColor.withValues(alpha: 0.45),
+                          ),
+                        ),
+                        child: Text(
+                          item.terminalStatus?.toUpperCase() ?? 'DONE',
+                          style: kMonoStyle.copyWith(
+                            color: statusColor,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (item.terminalNote != null &&
+                      item.terminalNote!.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 11,
+                        vertical: 9,
+                      ),
+                      decoration: BoxDecoration(
+                        color: isDone
+                            ? const Color(0xFF0D201D)
+                            : MeshColors.bgSecondary,
+                        border: Border(
+                          left: BorderSide(
+                            color: statusColor,
+                            width: 2,
+                          ),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Terminal: ${item.terminalStatus}',
+                            style: TextStyle(
+                              color: statusColor,
+                              fontSize: 11,
+                              fontFamily: kMonoFontFamily,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text.rich(
+                            TextSpan(
+                              style: TextStyle(
+                                color: isDone
+                                    ? const Color(0xFFC8DED7)
+                                    : MeshColors.textSecondary,
+                                fontSize: 12,
+                                height: 1.4,
+                              ),
+                              children: [
+                                const TextSpan(
+                                  text: 'Note: ',
+                                  style: TextStyle(fontWeight: FontWeight.w700),
+                                ),
+                                TextSpan(text: item.terminalNote!),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
-                ),
-                const SizedBox(height: 6),
-                messageText,
-              ],
-            );
-          }
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(width: 140, child: timestamp),
-              const SizedBox(width: 8),
-              ActorAvatar(id: actorId, size: 28, store: widget.store),
-              const SizedBox(width: 8),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 180),
-                child: Padding(
-                  // Level with the pill's text beside the 28px avatar.
-                  padding: const EdgeInsets.only(top: 3),
-                  child: handle,
-                ),
+                  if (item.resolutionRef != null) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.link,
+                          size: 13,
+                          color: MeshColors.textMuted,
+                        ),
+                        const SizedBox(width: 5),
+                        Text(
+                          'Resolution: ${item.resolutionRef!}',
+                          style: kMonoStyle.copyWith(
+                            color: MeshColors.textMuted,
+                            fontSize: 10.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
               ),
-              const SizedBox(width: 8),
-              pill,
-              const SizedBox(width: 12),
-              Expanded(child: messageText),
-            ],
-          );
-        },
+            ),
+          ),
+        ],
       ),
     );
   }

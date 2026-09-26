@@ -251,6 +251,35 @@ curl --unix-socket "$quota_socket" -sS 'http://localhost/v1/throttle?provider=cl
    it intentionally loses manual-mode state and receipts created after that
    backup.
 
+### Model-scoped quota lanes (schema v3, #588)
+
+A provider panel can report a window that applies only to some models, such as
+a Fable-only weekly allowance beside the provider-wide Claude windows. When the
+parser's model list survives the catalog check, the coordinator stores that
+window as its own lane and runs a separate controller for it. The lane key is a
+versioned model-scope value in `quota_observations.model_scope`, and the
+provider-wide lane keeps the empty key. `/v1/throttle` publishes such lanes
+under `modelLanes`, each with its own `models`, interval, exhaustion and
+freshness (protocol minor 2). A Fable start then waits for both the
+provider-wide lane and the Fable lane, and every other Claude model waits for
+the provider-wide lane alone. Manual readings stay provider-wide only, because
+they are not checked against the catalog. `rusa quota-pacing-reset` clears the
+model lanes together with their provider.
+
+A model lane stops being published once the provider has gone on reporting for
+longer than the hard-stale horizon without it: that window has left the panel.
+When the coordinator itself stops collecting, both lanes age together and
+widen to the ceiling as usual.
+
+Deploy and rollback follow the v2 order above, with one difference. Opening the
+database with a v3 build rebuilds `quota_observations` once, adding
+`model_scope`. Every existing row is kept, with its controller memory, as
+provider-wide, because older builds stored no model-scoped rows. The v3 guard
+then refuses every pre-v3 binary, `rusa quota-pacing-reset` included, so
+upgrade every process that opens `quota.db` together. A binary rollback means
+restoring the pre-deploy backup, which loses the model-lane history recorded
+since then.
+
 ### Stage-0 probe-off and the #499 staging proof
 
 `rusa quota-coordinator --probe-off` is the shipped stage-0 switch. It opens

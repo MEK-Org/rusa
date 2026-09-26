@@ -212,6 +212,8 @@ class ThreadDto {
     this.selectedInboxItem,
     this.moreInboxItemsCount,
     this.voiceConfig,
+    this.needsAttention = false,
+    this.needsAttentionReason,
   });
 
   final String id;
@@ -328,6 +330,10 @@ class ThreadDto {
   /// a stored voice setting, including all actors on an older server.
   final VoiceConfigDto? voiceConfig;
 
+  /// Whether selected inbox work has exhausted bounded retries and requires attention.
+  final bool needsAttention;
+  final String? needsAttentionReason;
+
   bool get isRetired => status == 'retired';
 
   ThreadDto copyWith({
@@ -368,6 +374,8 @@ class ThreadDto {
     Object? selectedInboxItem = _keepThreadField,
     Object? moreInboxItemsCount = _keepThreadField,
     Object? voiceConfig = _keepThreadField,
+    bool? needsAttention,
+    Object? needsAttentionReason = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -437,6 +445,10 @@ class ThreadDto {
     voiceConfig: identical(voiceConfig, _keepThreadField)
         ? this.voiceConfig
         : voiceConfig as VoiceConfigDto?,
+    needsAttention: needsAttention ?? this.needsAttention,
+    needsAttentionReason: identical(needsAttentionReason, _keepThreadField)
+        ? this.needsAttentionReason
+        : needsAttentionReason as String?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -508,7 +520,82 @@ class ThreadDto {
             config: {'voiceName': j['voiceName']},
           )
         : null,
+    needsAttention: j['needsAttention'] as bool? ?? false,
+    needsAttentionReason: j['needsAttentionReason'] as String?,
   );
+}
+
+/// One item in the Recent Activity feed (#664), representing either a handled
+/// inbox item or a terminal obligation status transition.
+class RecentActivityItem {
+  const RecentActivityItem({
+    required this.id,
+    required this.kind,
+    required this.time,
+    required this.actorId,
+    required this.actorHandle,
+    required this.actorModel,
+    this.sourceKind,
+    this.sourceRef,
+    this.reference,
+    this.summary,
+    this.handledTime,
+    this.addressedNote,
+    this.linkedObligation,
+    this.obligationId,
+    this.terminalStatus,
+    this.terminalNote,
+    this.resolutionRef,
+  });
+
+  final String id;
+  /// 'handled_inbox' | 'terminal_obligation'
+  final String kind;
+  final String time;
+  final String actorId;
+  final String actorHandle;
+  final String actorModel;
+
+  // Handled inbox fields
+  final String? sourceKind;
+  final String? sourceRef;
+  final ReferenceDto? reference;
+  final String? summary;
+  final String? handledTime;
+  final String? addressedNote;
+  final String? linkedObligation;
+
+  // Terminal obligation fields
+  final String? obligationId;
+  final String? terminalStatus;
+  final String? terminalNote;
+  final String? resolutionRef;
+
+  bool get isHandledInbox => kind == 'handled_inbox';
+  bool get isTerminalObligation => kind == 'terminal_obligation';
+
+  factory RecentActivityItem.fromJson(Map<String, dynamic> j) =>
+      RecentActivityItem(
+        id: j['id'] as String? ?? '',
+        kind: j['kind'] as String? ?? 'handled_inbox',
+        time: j['time'] as String? ?? '',
+        actorId: j['actorId'] as String? ?? '',
+        actorHandle: j['actorHandle'] as String? ?? '',
+        actorModel: j['actorModel'] as String? ?? '',
+        sourceKind: j['sourceKind'] as String?,
+        sourceRef: j['sourceRef'] as String?,
+        reference: j['reference'] is Map<String, dynamic>
+            ? ReferenceDto.fromJson(j['reference'] as Map<String, dynamic>)
+            : null,
+        summary: j['summary'] as String?,
+        handledTime: j['handledTime'] as String?,
+        addressedNote: j['addressedNote'] as String?,
+        linkedObligation: j['linkedObligation'] as String?,
+        obligationId: j['obligationId'] as String?,
+        terminalStatus: j['terminalStatus'] as String?,
+        terminalNote: j['terminalNote'] as String?,
+        resolutionRef: j['resolutionRef'] as String?,
+      );
 }
 
 /// Opaque provider-specific settings passed unchanged between the catalog and API.
@@ -1374,6 +1461,8 @@ class QuotaHistorySeriesDto {
     required this.windowId,
     required this.label,
     required this.points,
+    this.scope = 'provider',
+    this.modelIds = const [],
   });
 
   final String provider;
@@ -1381,11 +1470,21 @@ class QuotaHistorySeriesDto {
   final String label;
   final List<QuotaHistoryPointDto> points;
 
+  /// Explicit scope from the coordinator; no display-label parsing is needed.
+  final String scope;
+
+  /// Canonical configured model IDs for a model-scoped history series.
+  final List<String> modelIds;
+
   factory QuotaHistorySeriesDto.fromJson(Map<String, dynamic> j) =>
       QuotaHistorySeriesDto(
         provider: j['provider'] as String? ?? '',
         windowId: j['windowId'] as String? ?? '',
         label: j['label'] as String? ?? '',
+        scope: j['scope'] as String? ?? 'provider',
+        modelIds: (j['modelIds'] as List<dynamic>? ?? const [])
+            .whereType<String>()
+            .toList(),
         points: (j['points'] as List<dynamic>? ?? const [])
             .map(
               (e) => QuotaHistoryPointDto.fromJson(e as Map<String, dynamic>),

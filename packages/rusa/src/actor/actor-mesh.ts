@@ -618,6 +618,15 @@ export interface ActorMeshOptions {
   /** Persist the active run's yield fact and return its durable run id. */
   recordRunYield?: (actorId: string, status: string, note?: string) => string | null;
   /**
+   * Durable successful-return counts keyed by selected inbox entry.  The
+   * optional exclusion makes retry eligibility independent of lifecycle
+   * listener ordering while the current run is being recorded.
+   */
+  completedFocusEntryCounts?: (
+    actorId: string,
+    excludeRunId?: string
+  ) => ReadonlyMap<string, number>;
+  /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
    * kicking off avatar generation, ISSUE_NUM). Deliberately NOT invoked by
@@ -955,9 +964,14 @@ export class ActorMesh {
    */
   private readonly retiring = new Set<string>();
   private readonly lifecycles = new Map<string, ActorLifecycle>();
+  private readonly completedFocusEntryCounts?: (
+    actorId: string,
+    excludeRunId?: string
+  ) => ReadonlyMap<string, number>;
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
+    this.completedFocusEntryCounts = opts.completedFocusEntryCounts;
     this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
@@ -1201,7 +1215,10 @@ export class ActorMesh {
           },
           onEnd: (event) => {
             if (event.terminal.kind === "result") {
-              this.finishInboxRun(event.actorId);
+              this.finishInboxRun(event.actorId, {
+                successful: event.terminal.result.success,
+                runId: event.runId,
+              });
               this.accountRun(event.actorId, event.terminal.result, event.runId);
             } else {
               this.abandonInboxRun(event.actorId);
@@ -1306,6 +1323,7 @@ export class ActorMesh {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
         const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
+        if (this.hasOnlyExhaustedWork(work.actorId)) continue;
         this.dispatch(work.actorId);
       }
     } catch (err) {
@@ -1427,7 +1445,7 @@ export class ActorMesh {
       if (entry.payload.type === "operator.run_now") continue;
       const incomingEntryId = entry.id;
       void classifier
-        .evaluate({ incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .evaluate({ actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
         .then((decision) => {
           this.recordEvent({
             kind: "responsive_interruption_shadow",
@@ -1627,6 +1645,12 @@ export class ActorMesh {
     if (unique.length === 0 || unique.length > 100 || unique.length !== entryIds.length) {
       throw new Error("Select between 1 and 100 unique inbox entry ids");
     }
+    const exhausted = this.exhaustedInboxEntryIds(actorId, unique);
+    if (exhausted.size > 0) {
+      throw new Error(
+        `Selected inbox work needs attention after its bounded recovery: ${[...exhausted].join(", ")}`
+      );
+    }
     const entries = unique.map((id) => {
       const entry = inboxStore.read(actorId, id);
       if (!entry) throw new Error(`Inbox entry not found: ${id}`);
@@ -1769,7 +1793,7 @@ export class ActorMesh {
     const heads = [...runState.headObligationIds];
     const selected =
       heads.length === 1 ? `head obligation ${heads[0]}` : `head obligations ${heads.join(", ")}`;
-    return `This run selected ${selected}. Before \`yield_run\`, every selected head must take one of these exits: ${STRICT_HEAD_CLOSURE_EXITS}. A clean yield that leaves any selected head as it was found is rejected.`;
+    return `This run selected ${selected}. An explicit \`yield_run\` that leaves any selected head as it was found is rejected: every selected head must ${STRICT_HEAD_CLOSURE_EXITS}. Otherwise provider return settles the run and unhandled selected work remains visible for bounded recovery.`;
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {
@@ -1777,8 +1801,9 @@ export class ActorMesh {
     return this.selectedInboxEntryIds.get(actorId) ?? [];
   }
 
-  finishInboxRun(actorId: string): void {
+  finishInboxRun(actorId: string, outcome: { successful?: boolean; runId?: string } = {}): void {
     actorId = this.resolveThreadId(actorId);
+    const selectedIds = [...this.selectedInboxEntries(actorId)];
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
@@ -1789,6 +1814,86 @@ export class ActorMesh {
     // run after. A tuple set while idle/queued was already applied by
     // {@link setActorModel}, so this call is then a no-op.
     this.applyPendingModel(actorId);
+
+    // A real provider failure follows the ordinary failure route.  The one
+    // bounded retry is exclusively a recovery for selected work a provider
+    // successfully returned without handling.
+    if (
+      outcome.successful !== false &&
+      selectedIds.length > 0 &&
+      this.inboxStore &&
+      this.completedFocusEntryCounts
+    ) {
+      const unhandledIds = selectedIds.filter((id) => {
+        const entry = this.inboxStore?.read(actorId, id);
+        return entry && !entry.handledAt;
+      });
+
+      if (unhandledIds.length > 0) {
+        // Count only prior successful returns.  Excluding this run means the
+        // calculation is unchanged if a later lifecycle listener has already
+        // persisted its terminal row.
+        const priorCounts = this.completedFocusEntryCounts(actorId, outcome.runId);
+        const hasRetryableUnhandled = unhandledIds.some((id) => (priorCounts.get(id) ?? 0) + 1 < 2);
+
+        // An older exhausted entry must not consume a later entry's one
+        // recovery attempt when a multi-item selection contains both.
+        if (hasRetryableUnhandled) {
+          this.dispatch(actorId);
+        } else {
+          this.log(
+            `actor ${actorId} exhausted selected work retries for entries: ${unhandledIds.join(", ")}`
+          );
+        }
+      }
+    }
+  }
+
+  hasExhaustedSelectedWork(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    const entries = this.unhandledInboxEntries(actorId);
+    return (
+      this.exhaustedInboxEntryIds(
+        actorId,
+        entries.map((entry) => entry.id)
+      ).size > 0
+    );
+  }
+
+  hasOnlyExhaustedWork(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    const entries = this.unhandledInboxEntries(actorId);
+    if (entries.length === 0) return false;
+    return (
+      this.exhaustedInboxEntryIds(
+        actorId,
+        entries.map((entry) => entry.id)
+      ).size === entries.length
+    );
+  }
+
+  private unhandledInboxEntries(actorId: string): InboxEntry[] {
+    if (!this.inboxStore) return [];
+    const entries: InboxEntry[] = [];
+    const visitedCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 100, cursor });
+      entries.push(...page.entries);
+      cursor = page.nextCursor ?? undefined;
+      if (cursor && visitedCursors.has(cursor)) {
+        this.log(`inbox cursor repeated while reading unhandled work for ${actorId}`);
+        break;
+      }
+      if (cursor) visitedCursors.add(cursor);
+    } while (cursor);
+    return entries;
+  }
+
+  private exhaustedInboxEntryIds(actorId: string, entryIds: readonly string[]): Set<string> {
+    if (!this.completedFocusEntryCounts || entryIds.length === 0) return new Set();
+    const counts = this.completedFocusEntryCounts(actorId);
+    return new Set(entryIds.filter((id) => (counts.get(id) ?? 0) >= 2));
   }
 
   /**
@@ -4917,9 +5022,8 @@ export class ActorMesh {
       mesh: this,
       lifecycle: this.lifecycleFor(record.id),
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
-      beforeRun: ({ mode }) => {
+      beforeRun: () => {
         if (!this.prepareRun(record.id)) return false;
-        if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
         const actor = this.runs.liveActor(record.id);
         const watermark = actor?.getInterruptedWatermark?.();
@@ -4929,8 +5033,7 @@ export class ActorMesh {
         }
         return this.inboxStore.countUnhandled(record.id) > 0;
       },
-      admitRun: ({ responsive, mode }) =>
-        responsive || mode !== "ordinary" || !this.isVoiceSessionActive(record.id),
+      admitRun: ({ responsive }) => responsive || !this.isVoiceSessionActive(record.id),
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
     };

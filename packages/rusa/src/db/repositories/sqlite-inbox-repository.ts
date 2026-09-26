@@ -334,4 +334,19 @@ export class SqliteInboxRepository implements InboxRepository {
       .all() as InboxActorWork[];
     return rows.map((row) => ({ actorId: row.actorId, priority: row.priority }));
   }
+
+  listRecentHandledEntries(limit = 50): InboxEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, actor_id, source, delivered_at, seen_at, handled_at, handled_note, payload_json
+         FROM actor_inbox_entries
+         WHERE handled_at IS NOT NULL
+         ORDER BY handled_at DESC, id DESC
+         LIMIT ?`
+      )
+      .all(limit) as InboxRow[];
+    // A matching timestamp/note is not a durable batch identifier. Keep every
+    // row visible rather than collapsing unrelated operator actions.
+    return rows.map(toEntry);
+  }
 }

@@ -1,9 +1,16 @@
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import type { PersistedQuotaBucketStatus, PersistedQuotaProviderStatus } from "./shared-store.js";
+import type {
+  PersistedQuotaBucketStatus,
+  PersistedQuotaModelLaneStatus,
+  PersistedQuotaProviderStatus,
+} from "./shared-store.js";
 import { isProviderScopedWindow } from "./window-scope.js";
 
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
-export const COORDINATOR_PROTOCOL_MINOR = 1;
+// Minor 2 adds model identities to model-scoped history rows and model-scoped
+// throttle lanes (#588). Both are additive: an older reader ignores them and
+// keeps its provider-only behavior.
+export const COORDINATOR_PROTOCOL_MINOR = 2;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
 /**
@@ -102,6 +109,17 @@ export interface PublishedThrottleProviderStatus {
   updatedAt: string;
   buckets: PersistedQuotaBucketStatus[];
   freshness: QuotaFreshness;
+  /**
+   * Independently reasoned model-scoped lanes (#588), each with its own
+   * freshness and stale widening. Omitted when the provider reports none.
+   */
+  modelLanes?: PublishedThrottleModelLaneStatus[];
+}
+
+export interface PublishedThrottleModelLaneStatus
+  extends Omit<PublishedThrottleProviderStatus, "modelLanes"> {
+  /** Canonical configured model IDs this lane's windows apply to. */
+  models: string[];
 }
 
 export interface PublishedThrottleResponse extends PublishedThrottleProviderStatus {
@@ -134,6 +152,11 @@ export interface PublishedThrottleCollectionResponse {
 
 export interface PublishedHistoryRecord {
   scope: "provider" | "model";
+  /**
+   * Canonical configured model IDs for a model-scoped row. Provider-scoped
+   * rows omit this, so clients never have to infer scope from a display label.
+   */
+  models?: string[];
   kind: string;
   label: string;
   observedAt: string;
@@ -153,8 +176,16 @@ export interface PublishedHistoryResponse {
 export function isValidHistoryRecord(record: unknown): record is PublishedHistoryRecord {
   if (typeof record !== "object" || record === null) return false;
   const r = record as Record<string, unknown>;
+  const models = r.models;
+  const hasValidModelIdentity =
+    r.scope === "provider"
+      ? models === undefined
+      : Array.isArray(models) &&
+        models.length > 0 &&
+        models.every((model) => typeof model === "string" && model.length > 0);
   return (
     (r.scope === "provider" || r.scope === "model") &&
+    hasValidModelIdentity &&
     typeof r.kind === "string" &&
     typeof r.label === "string" &&
     typeof r.observedAt === "string" &&
@@ -362,6 +393,35 @@ export function publishedThrottle(
   stored: PersistedQuotaProviderStatus,
   options?: PublishedThrottleOptions
 ): PublishedThrottleProviderStatus {
+  const published = publishedLane(stored, options);
+  const hardStaleAfterMs =
+    options?.hardStaleAfterMs ?? freshnessThresholds(options?.mode).hardStaleAfterMs;
+  const providerUpdatedMs = Date.parse(stored.updatedAt);
+  // A model lane is retired, not hard-staled, once the provider has kept
+  // reporting for longer than the hard-stale horizon without it: the window
+  // is no longer on the panel, and pinning that model at the ceiling for the
+  // rest of observation retention would be a stale reading, not caution. A
+  // coordinator that stops collecting ages both lanes together instead, so
+  // the conservative widening still applies there.
+  const modelLanes = (stored.modelLanes ?? []).flatMap(
+    (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
+      const laneUpdatedMs = Date.parse(lane.updatedAt);
+      if (
+        Number.isFinite(providerUpdatedMs) &&
+        (!Number.isFinite(laneUpdatedMs) || providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs)
+      ) {
+        return [];
+      }
+      return [{ ...publishedLane(lane, options), models: [...lane.models] }];
+    }
+  );
+  return modelLanes.length > 0 ? { ...published, modelLanes } : published;
+}
+
+function publishedLane(
+  stored: Omit<PersistedQuotaProviderStatus, "modelLanes">,
+  options?: PublishedThrottleOptions
+): Omit<PublishedThrottleProviderStatus, "modelLanes"> {
   const maxIntervalSeconds = options?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
   const freshness = calculateFreshness(stored, options);
 
@@ -382,6 +442,74 @@ export function publishedThrottle(
     updatedAt: stored.updatedAt,
     buckets: stored.buckets,
     freshness,
+  };
+}
+
+/** The pacing a model-scoped lane set imposes on one concrete candidate model. */
+export interface ModelLanePacing {
+  /** Longest interval among applicable lanes. */
+  intervalSeconds: number;
+  /** Latest exhaustion deadline among applicable expired lanes, or null. */
+  deferUntil: string | null;
+  /**
+   * Latest exhaustion deadline among applicable expired lanes the coordinator
+   * still publishes as fresh, or null: the same evidence rule the provider
+   * lane uses before it reports a lane as absolutely exhausted.
+   */
+  exhaustedUntil: string | null;
+}
+
+function isPublishedModelLane(value: unknown): value is PublishedThrottleModelLaneStatus {
+  if (typeof value !== "object" || value === null) return false;
+  const lane = value as Partial<PublishedThrottleModelLaneStatus>;
+  return (
+    Array.isArray(lane.models) &&
+    lane.models.length > 0 &&
+    lane.models.every((model) => typeof model === "string" && model.length > 0) &&
+    typeof lane.intervalSeconds === "number" &&
+    Number.isFinite(lane.intervalSeconds) &&
+    lane.intervalSeconds >= 0 &&
+    typeof lane.expired === "boolean" &&
+    isValidQuotaFreshness(lane.freshness)
+  );
+}
+
+/**
+ * Combine every published model lane that applies to `model` (#588). Lanes
+ * scoped only to other models are ignored, and so is a malformed lane, which
+ * therefore cannot pace anything. Among applicable lanes the longest interval
+ * and the latest exhaustion win, which is order-independent and so
+ * deterministic. Returns undefined when no lane applies, leaving the candidate
+ * on its provider lane alone. The provider-wide lane is not folded in here:
+ * the caller's model pacer is linked to the provider pacer, which already
+ * enforces it.
+ */
+export function modelLanePacing(
+  status: Pick<PublishedThrottleProviderStatus, "modelLanes"> | undefined,
+  model: string | undefined
+): ModelLanePacing | undefined {
+  if (!model) return undefined;
+  const lanes: unknown[] = Array.isArray(status?.modelLanes) ? status.modelLanes : [];
+  const applicable = lanes.filter(
+    (lane): lane is PublishedThrottleModelLaneStatus =>
+      isPublishedModelLane(lane) && lane.models.includes(model)
+  );
+  if (applicable.length === 0) return undefined;
+  let intervalSeconds = 0;
+  let deferUntilMs = Number.NEGATIVE_INFINITY;
+  let exhaustedUntilMs = Number.NEGATIVE_INFINITY;
+  for (const lane of applicable) {
+    intervalSeconds = Math.max(intervalSeconds, lane.intervalSeconds);
+    const untilMs = lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : NaN;
+    if (!Number.isFinite(untilMs)) continue;
+    deferUntilMs = Math.max(deferUntilMs, untilMs);
+    if (!lane.freshness.stale) exhaustedUntilMs = Math.max(exhaustedUntilMs, untilMs);
+  }
+  const iso = (ms: number) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+  return {
+    intervalSeconds,
+    deferUntil: iso(deferUntilMs),
+    exhaustedUntil: iso(exhaustedUntilMs),
   };
 }
 

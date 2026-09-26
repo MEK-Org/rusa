@@ -183,6 +183,19 @@ function replayWorkingDatabase(path, since, scrapes, maxIntervalSeconds) {
       const state = parseState(scrape.parsedState, scrape.id);
       store.recordParsed(scrape.id, state, state);
     }
+    // The apply step copies rows without `model_scope`, so a model-scoped
+    // lane (#588) would land as provider-wide evidence. Refuse instead.
+    const modelScoped = store.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM quota_observations
+         WHERE provider = 'codex' AND model_scope <> '' AND observed_at >= ?`
+      )
+      .get(since).count;
+    if (modelScoped > 0) {
+      throw new Error(
+        `replay produced ${modelScoped} model-scoped Codex observations; this tool replays provider-wide rows only`
+      );
+    }
   } finally {
     store.close();
   }
