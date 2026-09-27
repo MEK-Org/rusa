@@ -477,6 +477,60 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
     });
   });
 
+  it("keeps publishing an outlived lane until its exhaustion deadline passes", () => {
+    const nowMs = Date.parse("2030-01-01T02:00:00.000Z");
+    const deadline = new Date(nowMs + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const options = {
+      maxIntervalSeconds: 3600,
+      staleAfterMs: 600_000,
+      hardStaleAfterMs: 3_600_000,
+    };
+    const provider = {
+      provider: "claude",
+      intervalSeconds: 5,
+      uncappedIntervalSeconds: 5,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: "2030-01-01T01:59:00.000Z",
+      buckets: [],
+    };
+    // Last seen at 0% well past the hard-stale horizon: the provider kept
+    // reporting without the Fable window.
+    const stored = {
+      ...provider,
+      modelLanes: [
+        {
+          ...provider,
+          governingBucketKey: `claude[${FABLE}]:weekly`,
+          intervalSeconds: 20,
+          uncappedIntervalSeconds: 20,
+          expired: true,
+          exhaustedUntil: deadline,
+          updatedAt: "2030-01-01T00:30:00.000Z",
+          models: [FABLE],
+        },
+      ],
+    };
+
+    // Before the deadline the lane is held, hard-staled: it still defers Fable
+    // to the deadline at the ceiling interval rather than retiring to no pacing.
+    const held = publishedThrottle(stored, { ...options, nowMs });
+    expect(modelLanePacing(held, FABLE)).toEqual({
+      intervalSeconds: 3600,
+      deferUntil: deadline,
+      exhaustedUntil: null,
+    });
+
+    // Once the deadline has passed, the outlived lane retires as before.
+    const released = publishedThrottle(stored, {
+      ...options,
+      nowMs: Date.parse(deadline) + 1,
+    });
+    expect(modelLanePacing(released, FABLE)).toBeUndefined();
+  });
+
   it("preserves scope identity from store to client over the coordinator socket", async () => {
     const path = tempDb("rusa-588-e2e-");
     const socketPath = join(path, "..", "coordinator.sock");

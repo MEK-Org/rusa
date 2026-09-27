@@ -393,13 +393,20 @@ export function publishedThrottle(
   // is no longer on the panel, and pinning that model at the ceiling for the
   // rest of observation retention would be a stale reading, not caution. A
   // coordinator that stops collecting ages both lanes together instead, so
-  // the conservative widening still applies there.
+  // the conservative widening still applies there. A lane last seen exhausted
+  // is not retired before its exhaustion deadline: until then it stays
+  // published, hard-staled, so the candidate keeps deferring to the deadline
+  // rather than pacing faster because its window vanished.
+  const nowMs = options?.nowMs ?? Date.now();
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
       const laneUpdatedMs = Date.parse(lane.updatedAt);
+      const exhaustedUntilMs =
+        lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
       if (
         Number.isFinite(providerUpdatedMs) &&
-        (!Number.isFinite(laneUpdatedMs) || providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs)
+        (!Number.isFinite(laneUpdatedMs) || providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs) &&
+        !(exhaustedUntilMs > nowMs)
       ) {
         return [];
       }
