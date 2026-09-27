@@ -25,7 +25,7 @@ import {
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
 import type { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
-import type { QuotaFreshness } from "../quota/coordinator-protocol.js";
+import { QUOTA_PROBE_TTL_MS, type QuotaFreshness } from "../quota/coordinator-protocol.js";
 import { configuredModelRefs, resolveWindowModels } from "../quota/model-window-scope.js";
 import {
   hasSameQuotaWindowScope,
@@ -1054,7 +1054,10 @@ export class QuotaService {
   private readonly deps: QuotaMcpDeps;
   private readonly configuredProviders: Set<string>;
   private readonly cache = new Map<string, { state: ProviderQuotaSnapshot; timestamp: number }>();
-  private readonly inFlightProbes = new Map<string, Promise<ProviderQuotaSnapshot>>();
+  private readonly inFlightProbes = new Map<
+    string,
+    { promise: Promise<ProviderQuotaSnapshot>; startedAt: number }
+  >();
 
   constructor(deps: QuotaMcpDeps) {
     this.deps = deps;
@@ -1150,26 +1153,17 @@ export class QuotaService {
     }
   }
 
-  private getTtlMs(provider: "claude" | "codex" | "agy" | "kimi"): number {
+  private getTtlMs(): number {
     if (this.deps.ttlMs !== undefined) {
       return this.deps.ttlMs;
     }
-    switch (provider) {
-      case "claude":
-      case "agy":
-        return 5 * 60 * 1000; // ~5 minutes
-      case "codex":
-        // Keep 30 minutes for codex due to placeholder responses on fast status requests.
-        // Tracked in ISSUE_NUM, must not lower this until codex placeholder-handling lands.
-        return 30 * 60 * 1000;
-      case "kimi":
-        // Was 60s from when the /usage pty scrape ran ~51s (only ~9s of useful
-        // freshness → retries kept stalling). The panel-anchored scrape
-        // is now ~8s, and kimi's windows are 5h/weekly — no need for sub-minute
-        // freshness. Match claude/agy at 5min so the (expensive) pty scrape
-        // isn't re-run every minute.
-        return 5 * 60 * 1000; // ~5 minutes
-    }
+    // #690: routine provider readings target ~30 minutes across all providers,
+    // so expensive interactive scrapes are not churned while QuotaCollectionLoop
+    // keeps ticking every 5m for manual observation ingestion and metric publication.
+    // (Controller evaluation on scrape lanes advances when a fresh 30m probe lands;
+    // manual lanes advance as operator observations arrive).
+    // Codex must not go lower until its placeholder handling lands.
+    return QUOTA_PROBE_TTL_MS;
   }
 
   /**
@@ -1193,7 +1187,7 @@ export class QuotaService {
     }
     const now = (this.deps.now ?? Date.now)();
     const cached = this.cache.get(provider);
-    const ttl = this.getTtlMs(provider);
+    const ttl = this.getTtlMs();
     if (cached && now - cached.timestamp < ttl) {
       return { state: cached.state, didProbe: false };
     }
@@ -1202,20 +1196,25 @@ export class QuotaService {
     let didProbe = false;
     if (!inFlight) {
       didProbe = true;
-      inFlight = this.executeProbe(provider).finally(() => {
-        this.inFlightProbes.delete(provider);
-      });
+      inFlight = {
+        startedAt: now,
+        promise: this.executeProbe(provider).finally(() => {
+          this.inFlightProbes.delete(provider);
+        }),
+      };
       this.inFlightProbes.set(provider, inFlight);
     }
 
     let state: ProviderQuotaSnapshot;
     try {
-      state = await inFlight;
+      state = await inFlight.promise;
     } catch (error) {
       return { didProbe, error };
     }
     if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
-      this.cache.set(provider, { state, timestamp: (this.deps.now ?? Date.now)() });
+      // Schedule the next probe from this probe's start, not its completion:
+      // a slow CLI must not silently add a collection tick to the 30m cadence.
+      this.cache.set(provider, { state, timestamp: inFlight.startedAt });
     }
     return { state, didProbe };
   }
@@ -1256,7 +1255,7 @@ export class QuotaService {
       };
     }
     const cached = this.cache.get(provider);
-    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs(provider);
+    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs();
     if (!isFresh) {
       // Stale or cold → refresh in the background; do not await the probe.
       // Probe startup is deferred off the synchronous request call stack via

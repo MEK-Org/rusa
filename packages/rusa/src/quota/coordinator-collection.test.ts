@@ -436,6 +436,34 @@ describe("QuotaCollectionLoop", () => {
     }
   });
 
+  it("does not create another observation or move the interval for a cached probe outcome", async () => {
+    const store = storeWithReading();
+    try {
+      store.advancePendingController({ maxIntervalSeconds: 3600 });
+      const beforeRows = observationRows(store);
+      const beforeThrottle = store.getProviderThrottle("claude");
+      const loop = new QuotaCollectionLoop({
+        store,
+        quotaService: {
+          getQuotaProbeOutcome: vi.fn().mockResolvedValue({
+            state: { provider: "claude", status: "available" },
+            didProbe: false,
+          }),
+          hydrate: vi.fn(),
+        } as unknown as QuotaService,
+        providers: ["claude"],
+      });
+
+      await loop.tick();
+
+      expect(observationRows(store)).toEqual(beforeRows);
+      expect(store.getProviderThrottle("claude")).toEqual(beforeThrottle);
+      expect(loop.getStats("claude")).toMatchObject({ attempts: 0, failures: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
   it("hydrates the coordinator probe prevState from the latest validated snapshot", () => {
     const store = storeWithReading();
     try {

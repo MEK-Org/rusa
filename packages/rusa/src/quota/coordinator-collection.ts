@@ -6,8 +6,10 @@ import {
 } from "./coordinator-metrics.js";
 import {
   DEFAULT_HARD_STALE_AFTER_MS,
+  DEFAULT_MANUAL_HARD_STALE_AFTER_MS,
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  freshnessThresholds,
   publishedThrottle,
 } from "./coordinator-protocol.js";
 import type { SharedQuotaStore } from "./shared-store.js";
@@ -52,6 +54,7 @@ export interface QuotaCollectionLoopOptions {
    */
   staleAfterMs?: number;
   hardStaleAfterMs?: number;
+  manualHardStaleAfterMs?: number;
   /** Metric sink; defaults to the discarding one. */
   metrics?: QuotaMetrics;
   /** Timer seams for tests. */
@@ -110,6 +113,7 @@ export class QuotaCollectionLoop {
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
   private readonly hardStaleAfterMs: number;
+  private readonly manualHardStaleAfterMs: number;
   private readonly metrics: QuotaMetrics;
   private readonly setIntervalFn: (fn: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
@@ -122,11 +126,23 @@ export class QuotaCollectionLoop {
     this.maxIntervalSeconds = options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.hardStaleAfterMs = options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+    // Manual thresholds never inherit the scrape ones: tuning one mode must not
+    // move the other's fail-safe (#690).
+    this.manualHardStaleAfterMs =
+      options.manualHardStaleAfterMs ?? DEFAULT_MANUAL_HARD_STALE_AFTER_MS;
     this.metrics = options.metrics ?? nullQuotaMetrics;
     this.setIntervalFn = options.setIntervalFn ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalFn =
       options.clearIntervalFn ??
       ((handle) => clearInterval(handle as Parameters<typeof clearInterval>[0]));
+  }
+
+  private freshnessThresholds(mode: "manual" | "scrape" | undefined) {
+    return freshnessThresholds(mode, {
+      scrapeStaleAfterMs: this.staleAfterMs,
+      scrapeHardStaleAfterMs: this.hardStaleAfterMs,
+      manualHardStaleAfterMs: this.manualHardStaleAfterMs,
+    });
   }
 
   private stat(provider: string): QuotaCollectionStats {
@@ -274,11 +290,12 @@ export class QuotaCollectionLoop {
     for (const provider of this.options.providers) {
       const stored = this.options.store.getProviderThrottle(provider);
       if (!stored) continue;
+      const { mode } = this.options.store.getQuotaReadingMode(provider);
       const published = publishedThrottle(stored, {
         maxIntervalSeconds: this.maxIntervalSeconds,
-        staleAfterMs: this.staleAfterMs,
-        hardStaleAfterMs: this.hardStaleAfterMs,
+        ...this.freshnessThresholds(mode),
         nowMs,
+        mode,
       });
       this.metrics.gauge(
         QUOTA_SERVICE_METRICS.publishedIntervalSeconds,

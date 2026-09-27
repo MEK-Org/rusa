@@ -1,11 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
-import type { LeaderCommand, ProviderFactory } from "./protocol.js";
+import type { ActorEvent, LeaderCommand, ProviderFactory } from "./protocol.js";
 
 const instances: ReturnType<typeof createHarness>[] = [];
 const dirs: string[] = [];
@@ -17,6 +19,9 @@ function setup(
     startupTimeoutMs?: number;
     stateStaleTimeoutMs?: number;
     providerFactory?: ProviderFactory;
+    isHalted?: (provider?: string, model?: string) => boolean;
+    onEvent?: (actorId: string, event: ActorEvent) => void;
+    maxConcurrent?: number;
   } = {}
 ) {
   const cwd = mkdtempSync(join(tmpdir(), "rusa-follower-unit-"));
@@ -27,6 +32,9 @@ function setup(
     pacer: options.pacer,
     startupTimeoutMs: options.startupTimeoutMs,
     stateStaleTimeoutMs: options.stateStaleTimeoutMs,
+    isHalted: options.isHalted,
+    onEvent: options.onEvent,
+    maxConcurrent: options.maxConcurrent,
     providerFactory: options.failInit
       ? () => {
           throw new Error("test provider initialization failed");
@@ -36,12 +44,247 @@ function setup(
   instances.push(h);
   return h;
 }
+
+function grantComputerUse(h: ReturnType<typeof createHarness>, actorId: string): void {
+  h.capabilityGrants.grant({
+    actorId,
+    capability: COMPUTER_USE_CAPABILITY,
+    grantedBy: "root",
+    grantedAt: "2026-09-25T00:00:00Z",
+  });
+}
+
 afterEach(async () => {
   for (const h of instances.splice(0)) await h.close();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+const capabilityBoundaryProvider: ProviderFactory = (bridge, _options, selected) => ({
+  name: "instance-fixture",
+  providerName: "instance-fixture",
+  model: selected?.model,
+  async run(run) {
+    const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
+    await delay(prompt.charter === "short provider blocker" ? 80 : 700, undefined, {
+      signal: run.signal,
+    });
+    await bridge.sendMessage(prompt.parentId, prompt.charter);
+    bridge.yieldRun("complete", "capability boundary fixture complete");
+    return {
+      success: true,
+      output: prompt.charter,
+      exitCode: 0,
+      sessionId: run.session?.id,
+      model: selected?.model,
+    };
+  },
+});
+
 describe("monolithic follower instance", () => {
+  it("serializes three computer-capable actors without holding unrelated actors", async () => {
+    // Provider admission happens before the per-instance lock. Give all four
+    // runs capacity here so the unrelated control proves the lock — rather
+    // than global provider capacity — is what keeps the other capable actors
+    // queued.
+    let activeComputerRuns = 0;
+    let maxActiveComputerRuns = 0;
+    const h = setup({
+      maxConcurrent: 4,
+      providerFactory: (bridge, _options, selected) => ({
+        name: "instance-fixture",
+        providerName: "instance-fixture",
+        model: selected?.model,
+        async run(run) {
+          const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
+          const controlsComputer = prompt.charter !== "Read-only work";
+          if (controlsComputer) {
+            activeComputerRuns++;
+            maxActiveComputerRuns = Math.max(maxActiveComputerRuns, activeComputerRuns);
+          }
+          try {
+            await delay(400, undefined, { signal: run.signal });
+            await bridge.sendMessage(prompt.parentId, prompt.charter);
+            bridge.yieldRun("complete", "computer use fixture complete");
+            return {
+              success: true,
+              output: prompt.charter,
+              exitCode: 0,
+              sessionId: run.session?.id,
+              model: selected?.model,
+            };
+          } finally {
+            if (controlsComputer) activeComputerRuns--;
+          }
+        },
+      }),
+    });
+    const long = h.spawn("Long computer run");
+    grantComputerUse(h, long);
+    await waitUntil(() => h.runtime(long).isRunning);
+    const short = h.spawn("Short computer run");
+    grantComputerUse(h, short);
+    const third = h.spawn("Third computer run");
+    grantComputerUse(h, third);
+    const unrelated = h.spawn("Read-only work");
+
+    await waitUntil(() => h.runtime(unrelated).isRunning);
+    expect(h.runtime(short).isRunning).toBe(false);
+    expect(h.runtime(third).isRunning).toBe(false);
+    await waitUntil(() => h.events.filter((event) => event.event.type === "result").length === 4);
+    // The leader can book a terminal result asynchronously after a follower's
+    // provider has returned. Count the actual provider runs rather than use
+    // that cross-process bookkeeping order as a proxy for computer control.
+    expect(maxActiveComputerRuns).toBe(1);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("reads a newly granted computer-use capability at provider admission", async () => {
+    const h = setup({
+      delayMs: 0,
+      maxConcurrent: 2,
+      providerFactory: capabilityBoundaryProvider,
+    });
+    const holder = h.spawn("long computer holder");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const blocker = h.spawn("short provider blocker");
+    await waitUntil(() => h.runtime(blocker).isRunning);
+    const target = h.spawn("late capability target");
+    await waitUntil(() => h.runtime(target).isQueued);
+
+    h.capabilityGrants.grant({
+      actorId: target,
+      capability: COMPUTER_USE_CAPABILITY,
+      grantedBy: "root",
+      grantedAt: "2026-09-26T00:00:00Z",
+    });
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === blocker && event.event.type === "result")
+    );
+    // The target is now provider-admitted but must wait for the current
+    // computer holder: the grant happened after beforeRun, while it paced.
+    expect(
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    ).toBe(false);
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === holder && event.event.type === "result")
+    );
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    );
+
+    const resultIndex = h.events.findIndex(
+      (event) => event.actorId === holder && event.event.type === "result"
+    );
+    const startIndex = h.events.findIndex(
+      (event) => event.actorId === target && event.event.type === "runStart"
+    );
+    expect(startIndex).toBeGreaterThan(resultIndex);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("does not retain a revoked computer-use capability through provider pacing", async () => {
+    const h = setup({
+      delayMs: 0,
+      maxConcurrent: 2,
+      providerFactory: capabilityBoundaryProvider,
+    });
+    const holder = h.spawn("long computer holder");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const blocker = h.spawn("short provider blocker");
+    await waitUntil(() => h.runtime(blocker).isRunning);
+    const target = h.spawn("revoked capability target");
+    grantComputerUse(h, target);
+    await waitUntil(() => h.runtime(target).isQueued);
+
+    h.capabilityGrants.revoke(target, COMPUTER_USE_CAPABILITY, "2026-09-26T00:00:00Z");
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    );
+
+    const holderResult = h.events.findIndex(
+      (event) => event.actorId === holder && event.event.type === "result"
+    );
+    const targetStart = h.events.findIndex(
+      (event) => event.actorId === target && event.event.type === "runStart"
+    );
+    expect(holderResult).toBe(-1);
+    expect(targetStart).toBeGreaterThanOrEqual(0);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("lets separate follower instances control their own computers concurrently", async () => {
+    const left = setup({ delayMs: 500, maxConcurrent: 3 });
+    const right = setup({ delayMs: 500, maxConcurrent: 3 });
+    const leftActor = left.spawn("Left computer run");
+    grantComputerUse(left, leftActor);
+    const rightActor = right.spawn("Right computer run");
+    grantComputerUse(right, rightActor);
+
+    await waitUntil(() => left.runtime(leftActor).isRunning && right.runtime(rightActor).isRunning);
+    expect(left.failures).toEqual([]);
+    expect(right.failures).toEqual([]);
+  });
+
+  it("stops a normal computer holder before granting its responsive waiter", async () => {
+    const h = setup({ delayMs: 1500, maxConcurrent: 3 });
+    const holder = h.spawn("Long computer run");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const responsive = h.spawn("Urgent computer run");
+    grantComputerUse(h, responsive);
+    await waitUntil(() => h.runtime(responsive).isQueued);
+
+    h.dispatchResponsive(responsive);
+    await waitUntil(() => !h.runtime(holder).isRunning);
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === responsive && event.event.type === "runStart")
+    );
+    const initialStarts = h.events
+      .filter((event) => event.event.type === "runStart")
+      .map((event) => event.actorId);
+    expect(initialStarts.indexOf(responsive)).toBeGreaterThan(initialStarts.indexOf(holder));
+
+    // After the responsive waiter finishes, the preempted holder must automatically
+    // re-run without a new delivery and complete its durable work.
+    await waitUntil(() =>
+      h.events.some((event) => event.actorId === responsive && event.event.type === "result")
+    );
+    await waitUntil(
+      () =>
+        h.events.some(
+          (event) =>
+            event.actorId === holder && event.event.type === "result" && event.event.result.success
+        ),
+      15_000
+    );
+    const allStarts = h.events
+      .filter((event) => event.event.type === "runStart")
+      .map((event) => event.actorId);
+    expect(allStarts).toEqual([holder, responsive, holder]);
+    expect(h.messages.filter((msg) => msg.fromId === holder)).toHaveLength(1);
+    expect(h.messages.filter((msg) => msg.fromId === responsive)).toHaveLength(1);
+    expect(h.failures).toEqual([]);
+  });
+
+  it("cancels queued computer work when the follower disconnects", async () => {
+    const h = setup({ delayMs: 1000, maxConcurrent: 3 });
+    const holder = h.spawn("Long computer run");
+    grantComputerUse(h, holder);
+    await waitUntil(() => h.runtime(holder).isRunning);
+    const queued = h.spawn("Queued computer run");
+    grantComputerUse(h, queued);
+    await waitUntil(() => h.runtime(queued).isQueued);
+
+    h.follower.close();
+    h.remote.close();
+    await Promise.all([h.runtime(holder).exited, h.runtime(queued).exited]);
+    expect(
+      h.events.some((event) => event.actorId === queued && event.event.type === "runStart")
+    ).toBe(false);
+  });
+
   it("closes admission before waiting for active actors to quiesce", async () => {
     const follower = new FollowerInstance("/tmp/rusa-follower-drain", false, () => {});
     follower.beginDrain();
@@ -55,6 +298,7 @@ describe("monolithic follower instance", () => {
 
     expect(follower.actorIds).toEqual([]);
     await expect(follower.waitForQuiescence(20)).resolves.toMatchObject({ quiesced: true });
+    follower.close();
   });
 
   it("hosts multiple Actors in one PID and retires one without stopping its sibling", async () => {
@@ -1165,5 +1409,347 @@ describe("monolithic follower instance", () => {
     h.inboxStore.append([{ actorId: id, source: "test:negative", payload: { type: "test.work" } }]);
     h.mesh.dispatch(id);
     expect(h.events.filter((e) => e.actorId === id && e.event.type === "runStart")).toHaveLength(1);
+  });
+
+  describe("operator interrupt and halt cancellation (#607)", () => {
+    const queuedRunId = (h: ReturnType<typeof setup>, id: string) => {
+      const queued = h.events.find((e) => e.actorId === id && e.event.type === "queued")?.event;
+      return queued?.type === "queued" ? queued.runId : undefined;
+    };
+    const abandoned = (h: ReturnType<typeof setup>, id: string) =>
+      h.meshEvents.filter((e) => e.kind === "run_abandoned" && e.actorId === id);
+    const started = (h: ReturnType<typeof setup>, id: string) =>
+      h.events.filter((e) => e.actorId === id && e.event.type === "runStart");
+    const finished = (h: ReturnType<typeof setup>, id: string) =>
+      h.events.some((e) => e.actorId === id && e.event.type === "result");
+
+    it("cancels a queued remote run via mesh.interrupt and books start-cancelled", async () => {
+      const h = setup({ delayMs: 300 });
+      const first = h.spawn("Occupy the only admission slot");
+      await waitUntil(() => h.runtime(first).isRunning);
+      const second = h.spawn("Queued worker");
+      await waitUntil(() => h.runtime(second).isQueued);
+      const runId = queuedRunId(h, second);
+      expect(runId).toBeTruthy();
+
+      expect(h.mesh.interrupt(second, "human:operator")).toEqual({ interrupted: true });
+      expect(h.runtime(second).isQueued).toBe(false);
+      expect(h.runtime(second).getInterruptedWatermark()).not.toBeNull();
+      expect(h.meshEvents).toContainEqual(
+        expect.objectContaining({ kind: "root_control_action", actorId: second })
+      );
+
+      // The follower books the cancelled start once, under the run id it queued.
+      await waitUntil(() => abandoned(h, second).length === 1);
+      expect(abandoned(h, second)[0]).toMatchObject({
+        detail: "start-cancelled",
+        payload: JSON.stringify({ started: false, runId }),
+      });
+      // Its admission left the concurrency queue: when the slot frees, it does not run.
+      await waitUntil(() => finished(h, first));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, second)).toEqual([]);
+      expect(abandoned(h, second)).toHaveLength(1);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("interrupts a running remote actor via mesh.interrupt and honors the watermark", async () => {
+      const h = setup({ delayMs: 5_000 });
+      const id = h.spawn("Run long");
+      await waitUntil(() => h.runtime(id).isRunning);
+      const before = Date.now();
+
+      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      expect(h.meshEvents).toContainEqual(
+        expect.objectContaining({ kind: "root_control_action", actorId: id })
+      );
+
+      // The follower aborted the provider call instead of letting it run out.
+      await waitUntil(() => finished(h, id));
+      expect(Date.now() - before).toBeLessThan(4_000);
+      const result = h.events.find((e) => e.actorId === id && e.event.type === "result")?.event;
+      expect(result?.type === "result" && result.result.success).toBe(false);
+      expect(h.follower.actorIds).toContain(id);
+
+      // Work that predates the interrupted run does not wake it again...
+      await waitUntil(() => !h.runtime(id).isRunning);
+      h.mesh.dispatch(id);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, id)).toHaveLength(1);
+      // ...while newer work does.
+      h.dispatchNormal(id);
+      await waitUntil(() => started(h, id).length === 2);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+    });
+
+    it("cancels a queued remote run when its provider is halted and replays it after unhalt", async () => {
+      let halted = false;
+      const h = setup({ delayMs: 300, isHalted: () => halted });
+      const first = h.spawn("Occupy the only admission slot");
+      await waitUntil(() => h.runtime(first).isRunning);
+      const second = h.spawn("Queued behind the halt");
+      await waitUntil(() => h.runtime(second).isQueued);
+
+      halted = true;
+      expect(h.mesh.cancelHaltedQueuedRuns()).toEqual([second]);
+      await waitUntil(() => abandoned(h, second).length === 1 && !h.runtime(second).isQueued);
+      expect(abandoned(h, second)[0]).toMatchObject({ detail: "start-cancelled" });
+      await waitUntil(() => finished(h, first));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, second)).toEqual([]);
+
+      halted = false;
+      expect(h.mesh.resumeCancelledRuns()).toEqual([second]);
+      await waitUntil(() =>
+        h.events.some(
+          (e) => e.actorId === second && e.event.type === "result" && e.event.result.success
+        )
+      );
+      expect(started(h, second)).toHaveLength(1);
+      // Replay is one-shot.
+      expect(h.mesh.resumeCancelledRuns()).toEqual([]);
+    });
+
+    it("cancels a retained admission halted during a lease flap and replays it after unhalt", async () => {
+      let halted = false;
+      const pacer = new ProviderPacer(0);
+      pacer.deferUntil(Date.now() + 400);
+      const h = setup({ pacer, isHalted: () => halted });
+      const id = h.spawn("Wait out the pacing gap");
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+      const runId = queuedRunId(h, id);
+
+      h.remote.close();
+      await h.runtime(id).exited;
+      halted = true;
+      expect(h.mesh.cancelHaltedQueuedRuns()).toEqual([id]);
+      // The leader books the ticket it gave up; nothing else is left to report it.
+      await waitUntil(() => abandoned(h, id).length === 1);
+      expect(abandoned(h, id)[0]).toMatchObject({
+        detail: "start-cancelled",
+        payload: JSON.stringify({ started: false, runId }),
+      });
+      expect(pacer.waiting).toBe(0);
+
+      const reconnect = h.reconnect();
+      h.runtime(id).attachHost(reconnect.createHost(id));
+      await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+      await waitUntil(() => !h.runtime(id).isQueued);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, id)).toEqual([]);
+      expect(abandoned(h, id)).toHaveLength(1);
+
+      halted = false;
+      expect(h.mesh.resumeCancelledRuns()).toEqual([id]);
+      await waitUntil(() =>
+        h.events.some(
+          (e) => e.actorId === id && e.event.type === "result" && e.event.result.success
+        )
+      );
+      expect(abandoned(h, id)).toHaveLength(1);
+    });
+
+    it("keeps a replay requested during a transport gap until the follower reattaches", async () => {
+      let halted = false;
+      const pacer = new ProviderPacer(0);
+      pacer.deferUntil(Date.now() + 400);
+      const h = setup({ pacer, isHalted: () => halted });
+      const id = h.spawn("Wait out the pacing gap");
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+      h.remote.close();
+      await h.runtime(id).exited;
+      halted = true;
+      expect(h.mesh.cancelHaltedQueuedRuns()).toEqual([id]);
+      await waitUntil(() => abandoned(h, id).length === 1);
+
+      // Unhalted, re-halted, and unhalted again before the follower is back:
+      // the second halt parks the replay rather than letting it launch.
+      halted = false;
+      expect(h.mesh.resumeCancelledRuns()).toEqual([id]);
+      halted = true;
+      expect(h.mesh.cancelHaltedQueuedRuns()).toEqual([id]);
+      halted = false;
+      expect(h.mesh.resumeCancelledRuns()).toEqual([id]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(started(h, id)).toEqual([]);
+
+      const reconnect = h.reconnect();
+      h.runtime(id).attachHost(reconnect.createHost(id));
+      await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+      await waitUntil(() =>
+        h.events.some(
+          (e) => e.actorId === id && e.event.type === "result" && e.event.result.success
+        )
+      );
+      expect(started(h, id)).toHaveLength(1);
+      expect(abandoned(h, id)).toHaveLength(1);
+      expect(h.mesh.resumeCancelledRuns()).toEqual([]);
+    });
+
+    it("cancels a queued remote run whose admission request has not reached the leader", async () => {
+      let interrupted: { interrupted: boolean } | undefined;
+      const h: ReturnType<typeof setup> = setup({
+        onEvent: (actorId, event) => {
+          // The queued report precedes the admission request on the same channel.
+          if (event.type === "queued" && !interrupted) {
+            expect(h.runtime(actorId).isQueued).toBe(true);
+            interrupted = h.mesh.interrupt(actorId, "human:operator");
+          }
+        },
+      });
+      const id = h.spawn("Interrupted before its admission request arrives");
+      await waitUntil(() => interrupted !== undefined);
+      expect(interrupted).toEqual({ interrupted: true });
+      expect(h.runtime(id).isQueued).toBe(false);
+
+      await waitUntil(() => abandoned(h, id).length === 1);
+      expect(abandoned(h, id)[0]).toMatchObject({
+        detail: "start-cancelled",
+        payload: JSON.stringify({ started: false, runId: queuedRunId(h, id) }),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, id)).toEqual([]);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("withdraws a halt cancellation the follower has not seen when unhalted first", async () => {
+      let halted = false;
+      let cancelled: string[] | undefined;
+      let resumed: string[] | undefined;
+      const h: ReturnType<typeof setup> = setup({
+        isHalted: () => halted,
+        onEvent: (actorId, event) => {
+          // Halt and unhalt between the queued report and the admission request.
+          if (event.type === "queued" && !cancelled) {
+            halted = true;
+            cancelled = h.mesh.cancelHaltedQueuedRuns();
+            halted = false;
+            resumed = h.mesh.resumeCancelledRuns();
+            expect([cancelled, resumed]).toEqual([[actorId], [actorId]]);
+          }
+        },
+      });
+      const id = h.spawn("Halted and unhalted before its admission request arrives");
+      await waitUntil(() =>
+        h.events.some(
+          (e) => e.actorId === id && e.event.type === "result" && e.event.result.success
+        )
+      );
+      expect(started(h, id)).toHaveLength(1);
+      expect(abandoned(h, id)).toEqual([]);
+      expect(h.mesh.resumeCancelledRuns()).toEqual([]);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("refuses an admitted start that the interrupt reaches before the provider launches", async () => {
+      const h = setup({ delayMs: 300 });
+      const id = h.spawn("Interrupted between admission and launch");
+      const runtime = h.runtime(id);
+      const send = runtime.channel.send.bind(runtime.channel);
+      let interrupted: { interrupted: boolean } | undefined;
+      runtime.channel.send = ((message: LeaderCommand, callback: (error: Error | null) => void) => {
+        const sent = send(message, callback);
+        // The admission reply carries the reserved candidate; interrupt right behind it.
+        if (
+          !interrupted &&
+          message.type === "reply" &&
+          message.value &&
+          typeof message.value === "object" &&
+          "selected" in message.value
+        ) {
+          interrupted = h.mesh.interrupt(id, "human:operator");
+        }
+        return sent;
+      }) as typeof runtime.channel.send;
+
+      await waitUntil(() => interrupted !== undefined);
+      expect(interrupted).toEqual({ interrupted: true });
+      await waitUntil(() => abandoned(h, id).length === 1);
+      expect(abandoned(h, id)[0]).toMatchObject({ detail: "start-cancelled" });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(started(h, id)).toEqual([]);
+      expect(finished(h, id)).toBe(false);
+    });
+
+    it("keeps the watermark when the interrupted run's runStart arrives after the interrupt", async () => {
+      let interrupted: { interrupted: boolean } | undefined;
+      const h: ReturnType<typeof setup> = setup({
+        delayMs: 2_000,
+        onEvent: (actorId, event) => {
+          // The follower reports running before its runStart, so this lands in between.
+          if (event.type === "state" && event.state === "running" && !interrupted) {
+            interrupted = h.mesh.interrupt(actorId, "human:operator");
+          }
+        },
+      });
+      const id = h.spawn("Run long");
+      await waitUntil(() => finished(h, id));
+      expect(interrupted).toEqual({ interrupted: true });
+      expect(started(h, id)).toHaveLength(1);
+      expect(h.runtime(id).getInterruptedWatermark()).not.toBeNull();
+
+      // The work the interrupted run held does not wake it again...
+      await waitUntil(() => !h.runtime(id).isRunning);
+      h.mesh.dispatch(id);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(started(h, id)).toHaveLength(1);
+      // ...while newer work does, and that run clears the watermark.
+      h.dispatchNormal(id);
+      await waitUntil(() => started(h, id).length === 2);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+    });
+
+    it("redispatches work delivered after admission when runStart has already arrived", async () => {
+      const h = setup({ delayMs: 2_000 });
+      const id = h.spawn("Run long");
+      const runtime = h.runtime(id);
+      const send = runtime.channel.send.bind(runtime.channel);
+      let delivered = false;
+      runtime.channel.send = ((message: LeaderCommand, callback: (error: Error | null) => void) => {
+        const sent = send(message, callback);
+        // The admission reply's snapshot is the run's prompt; this work misses it.
+        if (
+          !delivered &&
+          message.type === "reply" &&
+          message.value &&
+          typeof message.value === "object" &&
+          "selected" in message.value
+        ) {
+          delivered = true;
+          const until = Date.now() + 5;
+          while (Date.now() < until) {}
+          h.dispatchNormal(id, "test:after-admission");
+        }
+        return sent;
+      }) as typeof runtime.channel.send;
+
+      await waitUntil(() => started(h, id).length === 1);
+      expect(h.mesh.interrupt(id, "human:operator")).toEqual({ interrupted: true });
+      await waitUntil(() => started(h, id).length === 2);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+    });
+
+    it("redispatches work delivered after the remote start when runStart has not arrived", async () => {
+      let interrupted: { interrupted: boolean } | undefined;
+      const h: ReturnType<typeof setup> = setup({
+        delayMs: 2_000,
+        onEvent: (actorId, event) => {
+          if (event.type === "state" && event.state === "running" && !interrupted) {
+            // Deliver strictly after the admission in wall-clock ms, then interrupt.
+            const until = Date.now() + 5;
+            while (Date.now() < until) {}
+            h.dispatchNormal(actorId, "test:after-start");
+            interrupted = h.mesh.interrupt(actorId, "human:operator");
+          }
+        },
+      });
+      const id = h.spawn("Run long");
+      await waitUntil(() => interrupted !== undefined);
+      expect(interrupted).toEqual({ interrupted: true });
+      // The watermark is the admission, not the interrupt, so this work is not hidden.
+      await waitUntil(() => started(h, id).length === 2);
+      expect(h.runtime(id).getInterruptedWatermark()).toBeNull();
+    });
   });
 });

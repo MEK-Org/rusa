@@ -88,11 +88,14 @@ const VERDICTS = ["interrupt", "queue"] as const satisfies readonly ResponsiveIn
  * than something adjacent.
  */
 export const RESPONSIVE_INTERRUPTION_QUESTION =
-  "The actor is working on the listed items. A new responsive item has just" +
-  " arrived. Given this information, should we interrupt the current run to" +
-  " handle it, or should it wait in the queue? Answer 'interrupt' only if the" +
-  " arriving item bears on the listed work clearly enough that continuing" +
-  " would waste or spoil it; otherwise answer 'queue'.";
+  "A new responsive item has arrived for an actor. Should it interrupt the" +
+  " current run or wait in the queue? Default to interrupt. Choose queue only" +
+  " when the arriving item is clearly unrelated to the current work." +
+  " Corrections, cancellations, clarifications, and follow-ups about that work" +
+  " should interrupt. If the relationship is uncertain or the current work is" +
+  " not known, choose interrupt. Use sender and timestamps to interpret the" +
+  " relationship between messages. Candidates marked selected are the current" +
+  " work; candidates marked pending are unread context, not confirmed current work.";
 
 /** What a would-interrupt looks like on the arriving Google Chat message. */
 export const SHADOW_INTERRUPT_EMOJI = "✅";
@@ -104,24 +107,25 @@ export const SHADOW_QUEUE_EMOJI = "❌";
  * scheduling, so this is the only way an operator sees a prediction where the
  * message actually lives; the audit event remains the durable record.
  */
-export function shadowVerdictEmoji(outcome: ResponsiveInterruptionVerdict): string {
-  return outcome === "interrupt" ? SHADOW_INTERRUPT_EMOJI : SHADOW_QUEUE_EMOJI;
+export function shadowVerdictEmoji(verdict: ResponsiveInterruptionVerdict): string {
+  return verdict === "interrupt" ? SHADOW_INTERRUPT_EMOJI : SHADOW_QUEUE_EMOJI;
 }
 
 /**
- * The verdict a decision actually predicts, or `null` when none was made.
+ * JEV's own verdict, or `null` when it gave none.
  *
  * Only a model that answered has predicted anything. No client, a client
  * error, a timeout, a malformed answer, or nothing to weigh the arrival
  * against are failures to evaluate, and showing them as ❌ would read as a
  * judgement nobody made — the operator could then "correct" it. A
- * below-threshold interrupt *is* a prediction: the policy's, of queue.
+ * below-threshold interrupt shows as the interrupt JEV answered, not as the
+ * policy's queue (#710): the reaction is there for the operator to judge the
+ * model, and the threshold is tuned from the audit, which keeps both.
  */
 export function shadowPrediction(
   decision: ResponsiveInterruptionDecision
 ): ResponsiveInterruptionVerdict | null {
-  if ("verdict" in decision) return decision.verdict;
-  return decision.reason === "low_confidence" ? "queue" : null;
+  return decision.verdict ?? null;
 }
 
 /**
@@ -137,12 +141,12 @@ export function shadowPrediction(
  */
 export function shadowReactionTarget(
   payload: Readonly<Record<string, unknown>>,
-  outcome: ResponsiveInterruptionVerdict
+  verdict: ResponsiveInterruptionVerdict
 ): { messageName: string; emoji: string } | null {
   if (payload.type !== "gchat.message") return null;
   const messageName = payload.messageName;
   if (typeof messageName !== "string" || messageName.length === 0) return null;
-  return { messageName, emoji: shadowVerdictEmoji(outcome) };
+  return { messageName, emoji: shadowVerdictEmoji(verdict) };
 }
 
 export interface ResponsiveInterruptionInput {
@@ -190,11 +194,13 @@ export type ResponsiveInterruptionDecision =
       reason: ResponsiveInterruptionQueueReason;
       /**
        * What was learned before the decision was rejected, when anything was.
-       * A threshold cannot be tuned from records that discard the confidence
-       * it rejected, so the below-threshold arm carries the same projection
-       * the accepted path does; arms that never got a well-formed answer
-       * carry nothing.
+       * A threshold cannot be tuned from records that discard the verdict and
+       * confidence it rejected, so the below-threshold arm carries the same
+       * projection the accepted path does, and `verdict` there is JEV's raw
+       * answer while `outcome` is the policy's; arms that never got a
+       * well-formed answer carry nothing.
        */
+      verdict?: ResponsiveInterruptionVerdict;
       confidence?: number;
       matchedCandidateIds?: readonly string[];
     });
@@ -255,7 +261,11 @@ export class ShadowResponsiveInterruptionClassifier {
     };
     const queue = (
       reason: ResponsiveInterruptionQueueReason,
-      learned?: { confidence: number; matchedCandidateIds: readonly string[] }
+      learned?: {
+        verdict: ResponsiveInterruptionVerdict;
+        confidence: number;
+        matchedCandidateIds: readonly string[];
+      }
     ): ResponsiveInterruptionDecision => ({ ...base, outcome: "queue", reason, ...learned });
 
     if (!this.client) return queue("unavailable");
@@ -288,14 +298,14 @@ export class ShadowResponsiveInterruptionClassifier {
     const matchedCandidateIds = [
       ...new Set((response.matchedCandidateIds ?? []).filter((id) => offered.has(id))),
     ];
-    const learned = { confidence: response.confidence, matchedCandidateIds };
+    const learned = { verdict, confidence: response.confidence, matchedCandidateIds };
 
     // Fail closed: only a confident interrupt is an interrupt. A confident
     // *queue* needs no threshold, because queueing is what happens anyway.
     if (verdict === "interrupt" && response.confidence < this.threshold) {
       return queue("low_confidence", learned);
     }
-    return { ...base, outcome: verdict, verdict, ...learned };
+    return { ...base, outcome: verdict, ...learned };
   }
 
   /**

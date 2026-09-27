@@ -13,6 +13,7 @@ type SubscriptionRow = {
   subscribed_by: string;
   subscribed_at: string;
   unsubscribed_at: string | null;
+  config: string | null;
 };
 
 function fromRow(row: SubscriptionRow): EventSourceOwnership {
@@ -25,7 +26,7 @@ function fromRow(row: SubscriptionRow): EventSourceOwnership {
   };
 }
 
-const SELECT_COLUMNS = "resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at";
+const SELECT_COLUMNS = "resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at, config";
 
 /**
  * SQLite implementation of {@link EventSourceOwnerStore} — every call reads
@@ -78,12 +79,13 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
       this.db
         .prepare(
           `INSERT INTO event_source_owners
-             (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at)
-           VALUES (?, ?, ?, ?, ?)
+             (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at, config)
+           VALUES (?, ?, ?, ?, ?, NULL)
            ON CONFLICT(resource, actor_id) DO UPDATE SET
              subscribed_by = excluded.subscribed_by,
              subscribed_at = excluded.subscribed_at,
-             unsubscribed_at = excluded.unsubscribed_at`
+             unsubscribed_at = excluded.unsubscribed_at,
+             config = excluded.config`
         )
         .run(
           resource,
@@ -121,5 +123,26 @@ export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
         )
         .all(resourceKey(resource)) as SubscriptionRow[]
     ).map(fromRow);
+  }
+
+  getConfig(resource: EventResource): string | null | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT config FROM event_source_owners WHERE resource = ? AND unsubscribed_at IS NULL"
+      )
+      .get(resourceKey(resource)) as { config: string | null } | undefined;
+    return row?.config;
+  }
+
+  setConfig(resource: EventResource, config: string | null): void {
+    const key = resourceKey(resource);
+    const result = this.db
+      .prepare(
+        "UPDATE event_source_owners SET config = ? WHERE resource = ? AND unsubscribed_at IS NULL"
+      )
+      .run(config, key);
+    if (result.changes !== 1) {
+      throw new Error(`cannot configure ${key}: no active event-source owner`);
+    }
   }
 }

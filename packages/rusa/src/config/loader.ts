@@ -94,6 +94,16 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
   ) {
     throw new Error("config.yaml: quota.throttle.tickSeconds must be a positive integer");
   }
+  if (
+    quotaThrottle.manualHardStaleSeconds !== undefined &&
+    (!Number.isFinite(quotaThrottle.manualHardStaleSeconds) ||
+      !Number.isInteger(quotaThrottle.manualHardStaleSeconds) ||
+      quotaThrottle.manualHardStaleSeconds <= 0)
+  ) {
+    throw new Error(
+      "config.yaml: quota.throttle.manualHardStaleSeconds must be a positive integer"
+    );
+  }
 }
 
 /**

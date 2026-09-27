@@ -15,9 +15,9 @@ Starting from merged PR #341 (closed-loop v1), this study audits eight modeler-s
 The eight modeler-selected coverage categories are accounted for as follows:
 
 1. **Applied throttling (Source-backed mechanism):** The model follows `ProviderPacer`'s one-staged-request-per-lane pipeline (`packages/rusa/src/actor/provider-pacer.ts`): an external request clears the start-to-start gate, then waits for mesh concurrency. It remains staged until the concurrency callback selects it; that callback revalidates `nextAvailableAt` and returns it to the provider queue if the interval lengthened while it waited. Raising the interval re-bases pending pacing on `lastStartedAt`, as production `setInterval` does. This is a one-provider-lane model, not a multi-provider claim.
-2. **Observation cadence (Source-backed slot width; modeled timing):** `SLOT_MS = 5 * 60 * 1000` in `packages/rusa/src/quota/shared-store.ts`, so the baseline uses a 300 s slot width. Earlier 600 s models made the update rule's `Math.min(dt, 300)` guard discard half of every simulated 600 s integration step. Exact 300 s steps avoid that artifact; live observation jitter or skipped slots remain uncalibrated and are not modeled as a distribution.
+2. **Observation cadence (Source-backed slot width; modeled timing):** `SLOT_MS = 5 * 60 * 1000` in `packages/rusa/src/quota/shared-store.ts`, so the baseline uses a 300 s slot width. Earlier 600 s models made the then-current update rule's `Math.min(dt, 300)` guard discard half of every simulated 600 s integration step; production now credits up to 1,800 s of elapsed time per observation and scales smoothing and slew from a 300 s reference step, so 300 s steps reproduce the tuned per-step response; live observation jitter or skipped slots remain uncalibrated and are not modeled as a distribution.
 3. **Execution duration and concurrency (Modeled duration; source-backed default capacity):** The 240 s duration is a modeled baseline. Four normal slots match the mesh configuration default. Completion lags of 30 s, 240 s, and 600 s across 1 and 4 slots are sensitivity cases, not measured execution telemetry.
-4. **Quota reset behavior (Source-backed mechanism):** The model reproduces `shared-store.ts` (staging revision `04a8b99228a5d6baa2992d3d0776fa75b060021a`) cycle rollover at 7 days (604,800 s), quota refill to 100%, integral and derivative reset to 0, and post-reset actuator smoothing (0.25) and slew limiting (±900 s).
+4. **Quota reset behavior (Source-backed mechanism):** The model reproduces `shared-store.ts` (source revision `f08dfb04a80ed6e7e6755d08251d35b63649d3e8`) cycle rollover at 7 days (604,800 s), quota refill to 100%, integral and derivative reset to 0, and post-reset actuator smoothing (0.25) and slew limiting (±900 s) per 300 s reference step, scaled by elapsed observation time up to one 1,800 s slot.
 5. **Responsive and external demand (Source-backed gating; modeled mix):** Responsive work bypasses pacing and normal concurrency limits but re-bases the interval clock (`lastStartedAt`), matching `ProviderPacer`. The demand mix (~23% responsive in nominal/burst, ~64% in responsive-heavy) is a modeler assumption; public traces do not record the priority split. The reported pending-external-work metric is a simulator count, not a claim about dashboard queued-versus-in-flight classification.
 6. **Quota usage (Modeled normalization + bounded sensitivity):** Fixed 0.050 points per completed run (a normalized 2,000-run weekly budget; ideal spacing 302 s) is not observed quota usage. The primary comparison uses this fixed cost. A deterministic [1.8×, 0.6×, 0.6×] pattern is attached to generated arrivals, not starts, so each candidate receives the same exogenous mean-preserving cost trace. It does not represent higher moments of real token usage.
 7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson arrival draws. No empirical arrival logs exist in public records, so arrivals are synthetic.
@@ -30,7 +30,7 @@ The eight modeler-selected coverage categories are accounted for as follows:
 | Nominal week (85% of budget) | 0.0 | 20.5 | 1379 | 444 | 0.00 | 0 |
 | Sustained overload (250% of budget) | 0.0 | 1.2 | 1083 | 1168 | 134.75 | 951 |
 | 36 h burst, then quiet | 0.0 | 6.9 | 1496 | 465 | 78.58 | 629 |
-| Responsive-dominated load | 0.3 | 0.0 | 497 | 1808 | 101.64 | 2331 |
+| Responsive-dominated load | 0.3 | 0.0 | 496 | 1808 | 101.64 | 2326 |
 
 ## Burst then quiet — the #291 recovery question
 
@@ -97,7 +97,7 @@ To evaluate the sensitivity of the findings to uncalibrated plant parameters, th
 | 600s-1-slot | 600 s | 1 | 300 s | fixed | 2.5 | 3.8 | 2.5 | 1.40 | 1 |
 | 600s-4-slot | 600 s | 4 | 300 s | fixed | 7.0 | 10.6 | 7.0 | 1.21 | 20 |
 | varcost-4-slot | 240 s | 4 | 300 s | bimodal | 5.5 | 10.4 | 5.5 | 2.22 | 21 |
-| obs-600s-4-slot | 240 s | 4 | 600 s | fixed | 11.0 | 13.8 | 11.0 | 2.18 | 36 |
+| obs-600s-4-slot | 240 s | 4 | 600 s | fixed | 6.3 | 10.3 | 6.3 | 2.16 | 35 |
 
 Across all variants:
 - The largest derivative contribution never exceeds 2.39 s in this bounded sensitivity matrix; this does not establish behavior for unobserved demand slopes or other sampling schedules.

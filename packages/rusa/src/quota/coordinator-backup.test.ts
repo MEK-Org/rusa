@@ -265,11 +265,15 @@ describe("QuotaBackupScheduler", () => {
     const hourMs = 60 * 60 * 1000;
     const { databasePath, backupDir } = seedWithAgedBackup(23 * hourMs);
     const timers = timerSeam();
+    // Pin the clock: backup names carry one-second resolution, so reading the
+    // wall clock twice lets start() and fire() land in different seconds and
+    // take two differently named backups instead of colliding on one.
+    const laterMs = Date.now() + QUOTA_BACKUP_INTERVAL_MS;
 
     const scheduler = new QuotaBackupScheduler({
       databasePath,
       backupDir,
-      now: () => Date.now() + QUOTA_BACKUP_INTERVAL_MS,
+      now: () => laterMs,
       ...timers.seam,
     });
     scheduler.start();

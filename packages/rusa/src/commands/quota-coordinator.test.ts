@@ -476,3 +476,55 @@ quota:
     }
   });
 });
+
+describe("freshness thresholds (#690)", () => {
+  it("keeps manual thresholds independent of the scrape ones the command always passes", async () => {
+    const home = join(
+      tmpdir(),
+      `rusa-coord-freshness-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    mkdirSync(join(home, "data"), { recursive: true });
+    testDirs.push(home);
+    writeFileSync(
+      join(home, "config.yaml"),
+      `
+github:
+  account: mock-bot
+rootActor:
+  provider: claude
+  model: claude-3-5-sonnet
+providers:
+  claude:
+    cliCommand: claude
+quota:
+  throttle:
+    tickSeconds: 900
+    manualHardStaleSeconds: 5400
+  coordinator:
+    socketPath: ${join(home, "coordinator.sock")}
+    databasePath: ${join(home, "data", "quota-coordinator.db")}
+`
+    );
+
+    let captured: QuotaCoordinatorService["options"] | undefined;
+    vi.spyOn(QuotaCoordinatorService.prototype, "start").mockImplementation(async function (
+      this: QuotaCoordinatorService
+    ) {
+      captured = this.options;
+      throw new Error("test-abort-freshness");
+    });
+
+    await expect(runQuotaCoordinator({ home, probeOff: true })).rejects.toThrow(
+      "test-abort-freshness"
+    );
+
+    // A long tick still loads: scrape soft stale (30m + 3 ticks) clamps to the
+    // 60m scrape hard stale, and the manual override reaches the service
+    // without the scrape value shadowing it.
+    expect(captured).toMatchObject({
+      staleAfterMs: 60 * 60_000,
+      manualHardStaleAfterMs: 5_400_000,
+    });
+    expect(captured?.hardStaleAfterMs).toBeUndefined();
+  });
+});

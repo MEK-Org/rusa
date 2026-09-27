@@ -178,6 +178,10 @@ export type MeshEventKind =
   // key, `payload` = { subscribedBy } on the add.
   | "event_source_subscriber_added"
   | "event_source_subscriber_removed"
+  // The effective owner of an event source replaced or cleared its generic
+  // configuration. `actorId` = the owner, `detail` = the source, and payload
+  // only says whether a config exists — arbitrary config is never logged.
+  | "event_source_config_set"
   | "stamp_invalid"
   // Host-plane `host-jobs` capability : a grantable systemd-run --user
   // runner for long host-side experiments. `actorId` = the submitting/owning

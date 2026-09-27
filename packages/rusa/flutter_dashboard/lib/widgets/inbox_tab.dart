@@ -117,6 +117,10 @@ class _InboxTabState extends State<InboxTab> {
 
   @override
   Widget build(BuildContext context) => FutureBuilder<Map<String, dynamic>>(
+    // A FutureBuilder retains its completed snapshot while a replacement
+    // future is pending. Key it by actor so changing selection immediately
+    // discards the previous actor's inbox rather than briefly rendering it.
+    key: ValueKey(widget.actorId),
     future: _page,
     builder: (_, snapshot) {
       if (snapshot.hasError && !snapshot.hasData) {

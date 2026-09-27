@@ -8,7 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,7 +16,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { Actor } from "../actor/actor.js";
+import { Actor, type ActorOptions } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
 import { ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
@@ -31,6 +31,7 @@ import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import type { RusaConfig } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
+import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
@@ -729,6 +730,123 @@ describe("runStart webhook event routing (Phase 4)", () => {
       getQuotaSpy.mockRestore();
     }
   });
+
+  it("serves non-empty dashboard history on the first request after a failed boot warmup, without a refresh tick (#707)", async () => {
+    const socketPath = join(homeDir, "coordinator.sock");
+    const observedAt = new Date(Date.now() - 60_000).toISOString();
+    const service = {
+      protocolMajor: 1,
+      protocolMinor: 0,
+      serverVersion: "test",
+      serverTime: observedAt,
+    };
+    const historyRequests: string[] = [];
+    const coordinator = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      res.setHeader("content-type", "application/json");
+      if (url.pathname !== "/v1/history") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ service, error: { code: "not_found" } }));
+        return;
+      }
+      historyRequests.push(url.searchParams.get("provider") ?? "");
+      // The boot warmup's read gets no response, so the production client's
+      // deadline times it out. The coordinator answers every later read.
+      if (historyRequests.length === 1) {
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          service,
+          provider: "agy",
+          since: new Date(Date.now() - HISTORY_WINDOW_MS).toISOString(),
+          records: [
+            {
+              scope: "provider",
+              kind: "weekly",
+              label: "Weekly",
+              observedAt,
+              percentLeft: 64,
+              resetAtIso: null,
+              controllerError: null,
+              intervalSeconds: null,
+            },
+          ],
+        })
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      coordinator.once("error", reject);
+      coordinator.listen(socketPath, resolve);
+    });
+    const startDashboardServerSpy = vi
+      .spyOn(webhookServer, "startDashboardServer")
+      .mockResolvedValue({ close: vi.fn(async () => {}) });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+        quota: { coordinator: { socketPath } },
+      }),
+      "utf8"
+    );
+
+    try {
+      await new Promise<void>((resolve) => {
+        void runStart({
+          e2e: {
+            dashboard: true,
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      // The dashboard bound after the boot warmup settled, and that read failed.
+      expect(historyRequests).toEqual(["agy"]);
+      const quotaApi = startDashboardServerSpy.mock.calls[0][0].quotaApi;
+      if (!quotaApi) throw new Error("quotaApi not wired");
+      expect(quotaApi.listHistory?.("agy", new Date(0).toISOString())).toEqual([]);
+
+      let status = 0;
+      let body = "";
+      const res = {
+        writeHead(code: number) {
+          status = code;
+          return res;
+        },
+        end(payload?: string) {
+          body = payload ?? "";
+        },
+      } as unknown as ServerResponse;
+      await handleQuotaApiRequest(
+        { method: "GET" } as IncomingMessage,
+        res,
+        new URL("http://dash/api/quota/history"),
+        quotaApi
+      );
+
+      expect(status).toBe(200);
+      const history = (JSON.parse(body) as QuotaHistoryDto).history;
+      expect(history.map((series) => [series.provider, series.points.length])).toEqual([
+        ["agy", 1],
+      ]);
+      expect(history[0].points[0]).toMatchObject({ observedAt, remainingPercent: 64 });
+      // One read on the request itself: no periodic refresh tick has run.
+      expect(historyRequests).toEqual(["agy", "agy"]);
+    } finally {
+      startDashboardServerSpy.mockRestore();
+      await shutdownFn?.();
+      shutdownFn = undefined;
+      await new Promise<void>((resolve, reject) => {
+        coordinator.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  }, 15_000);
 
   it("adopts the external E2E root through the configured-root construction path", async () => {
     let mesh: ActorMesh | undefined;
@@ -2164,6 +2282,69 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
   });
 
+  it("serializes locally hosted computer-use workers through the start gate without holding an unrelated worker", async () => {
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const liveMesh = mesh;
+    const spawnWorker = (charter: string) =>
+      liveMesh.spawn({
+        charter,
+        parentId: "root",
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+    const first = spawnWorker("local computer holder");
+    const second = spawnWorker("local computer waiter");
+    const unrelated = spawnWorker("local unrelated worker");
+    liveMesh.grantCapability(first, "computer-use", "root");
+    liveMesh.grantCapability(second, "computer-use", "root");
+
+    type GateOptions = Pick<ActorOptions, "gate" | "modelConfig">;
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    // Drive the gate each live Actor was composed with, as its run would.
+    const gateRun = (id: string): Promise<void> => {
+      const actor = liveMesh.get(id);
+      if (!actor) throw new Error(`worker missing: ${id}`);
+      const { gate, modelConfig } = (actor as unknown as { opts: GateOptions }).opts;
+      if (!gate || !modelConfig) throw new Error(`worker gate missing: ${id}`);
+      const handle = gate(
+        () =>
+          new Promise<void>((release) => {
+            started.push(id);
+            releases.set(id, release);
+          }),
+        modelConfig,
+        false
+      );
+      return "result" in handle ? handle.result : handle;
+    };
+
+    const firstRun = gateRun(first);
+    const secondRun = gateRun(second);
+    const unrelatedRun = gateRun(unrelated);
+    await vi.waitFor(() => expect(started).toEqual(expect.arrayContaining([first, unrelated])));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(started).not.toContain(second);
+
+    releases.get(first)?.();
+    await firstRun;
+    await vi.waitFor(() => expect(started).toContain(second));
+    releases.get(second)?.();
+    releases.get(unrelated)?.();
+    await Promise.all([secondRun, unrelatedRun]);
+  });
+
   it("mounts the actor-bound obligations MCP for root and rehydrated workers", async () => {
     writeFileSync(
       join(homeDir, "threads.json"),
@@ -3528,6 +3709,134 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(chatClient.reactions).toEqual([{ messageName, emoji: "👀" }]);
     });
     expect(getRepositories().inbox.list("root").entries[0]?.seenAt).not.toBeNull();
+  });
+
+  it("uses generic event-source config for Google Chat wake mode, defaulting by space size (#692)", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+          claude: { cliCommand: "claude" },
+          codex: { cliCommand: "codex" },
+        },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const liveMesh = mesh;
+
+    const emit = (space: string, name: string, opts: { dm?: boolean; mention?: boolean } = {}) =>
+      chatSource.emit({
+        name: `${space}/messages/${name}`,
+        spaceName: space,
+        spaceType: opts.dm ? "DIRECT_MESSAGE" : "SPACE",
+        senderName: "users/operator",
+        senderDisplayName: "Operator",
+        text: "ordinary update",
+        mentionsSelf: opts.mention ?? false,
+        isDirectMessage: opts.dm ?? false,
+      });
+    const delivered = () =>
+      getRepositories()
+        .inbox.list("root", { status: "all", limit: 100 })
+        .entries.map((entry) => (entry.payload as { messageName?: string }).messageName)
+        .sort();
+
+    // Unset: a DM wakes on every message, a larger space only on a mention.
+    await emit("spaces/dm", "d1", { dm: true });
+    await emit("spaces/team", "t1");
+    await emit("spaces/team", "t2", { mention: true });
+    expect(delivered()).toEqual(["spaces/dm/messages/d1", "spaces/team/messages/t2"]);
+
+    // The generic configuration requires the exact subscription boundary; the
+    // ownership and MCP authority cases are covered at the MCP seam.
+    liveMesh.subscribeEventSource("gchat:spaces/team", "root", "root");
+    liveMesh.subscribeEventSource("gchat:spaces/dm", "root", "root");
+    liveMesh.setEventSourceConfig("gchat:spaces/team", { version: 1, chatWakeMode: "all" }, "root");
+    liveMesh.setEventSourceConfig(
+      "gchat:spaces/dm",
+      { version: 1, chatWakeMode: "mentions" },
+      "root"
+    );
+    expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
+
+    await emit("spaces/team", "t3");
+    await emit("spaces/dm", "d2", { dm: true });
+    await emit("spaces/dm", "d3", { dm: true, mention: true });
+    await emit("spaces/other", "o1");
+    // A redelivered message is not duplicated, and a message dropped before the
+    // change is not resurrected by it.
+    await emit("spaces/team", "t3");
+    expect(delivered()).toEqual([
+      "spaces/dm/messages/d1",
+      "spaces/dm/messages/d3",
+      "spaces/team/messages/t2",
+      "spaces/team/messages/t3",
+    ]);
+
+    // Clearing generic config restores the default for that space alone.
+    liveMesh.setEventSourceConfig("gchat:spaces/team", null, "root");
+    await emit("spaces/team", "t4");
+    await emit("spaces/dm", "d4", { dm: true });
+    expect(delivered()).not.toContain("spaces/team/messages/t4");
+    expect(delivered()).not.toContain("spaces/dm/messages/d4");
+
+    // An unexpected inbound space name (e.g. thread-qualified, which chatSpaceResource
+    // rejects as not naming a single space) safely falls back to default mode
+    // without throwing, so it reaches inbox delivery and emergency halt (#695).
+    await emit("spaces/team/threads/t1", "u1", { mention: true });
+    expect(delivered()).toContain("spaces/team/threads/t1/messages/u1");
+
+    // Emergency halt brake functions even when the inbound space name is unparseable for wake mode
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/halt1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/halt",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Halted");
+    await chatSource.emit({
+      name: "spaces/team/threads/t2/messages/resume1",
+      spaceName: "spaces/team/threads/t2",
+      spaceType: "SPACE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "/resume",
+      mentionsSelf: true,
+      isDirectMessage: false,
+    });
+    expect(chatClient.sent.at(-1)?.text ?? "").toContain("Resumed");
   });
 
   it("handles scoped/timed halt commands mechanically and requires resume before replacement", async () => {
@@ -7455,7 +7764,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(rootServers.map((server) => server.name)).toEqual([
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "tracker",
         "repo",
@@ -7471,7 +7779,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "tracker",
         "repo",
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "mesh",
         "inbox",
@@ -7494,7 +7801,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(mcpServersOf(root).map((server) => server.name)).toEqual([
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "chat-read",
         "tracker",
@@ -7512,7 +7818,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "tracker",
         "repo",
         "understanding",
-        "stuck-loop-detector",
         "quota",
         "chat-read",
         "mesh",
@@ -7536,7 +7841,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         tracker: { tool: "list_open_issues", args: { repo: "dummy-org/dummy-repo" } },
         repo: { tool: "merge_pull_request", args: { repo: "dummy-org/dummy-repo", prNumber: 1 } },
         understanding: { tool: "overview", args: {} },
-        "stuck-loop-detector": { tool: "list_open_commitments", args: {} },
         quota: { tool: "list_models", args: {} },
         mesh: { tool: "list_threads", args: {} },
         inbox: { tool: "list", args: {} },
@@ -7572,7 +7876,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         tracker: true,
         repo: true,
         understanding: true,
-        "stuck-loop-detector": true,
         quota: true,
         mesh: true,
         inbox: true,
@@ -7582,7 +7885,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
       expect(await fencedByServer(mcpServersOf(root), ["repo", "pnpm-install"])).toEqual({
         understanding: false,
-        "stuck-loop-detector": false,
         quota: false,
         tracker: false,
         mesh: true,

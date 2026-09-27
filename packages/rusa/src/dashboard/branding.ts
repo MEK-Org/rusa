@@ -8,7 +8,7 @@ import { type RootAvatarIdentity, rootBrandingImage } from "../avatar/avatars.js
  * `scripts/build-dashboard-ui.mjs`, which is the right default for an instance
  * that has not been given its own identity. But `rootActor.handle` /
  * `rootActor.avatar` already name and picture *this* instance's root everywhere
- * else — the GitHub signing byline, the actor tree, the commitment ledger — and
+ * else — the GitHub signing byline, the actor tree — and
  * a bookmarked tab or an installed PWA reading "Rusa" is exactly the surface
  * where that identity matters most. So when a root actor has been configured,
  * its name titles the page and the PWA, and its own image becomes the favicon

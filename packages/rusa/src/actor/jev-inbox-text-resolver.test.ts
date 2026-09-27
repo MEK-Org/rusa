@@ -45,15 +45,35 @@ function deps(row: ReturnType<typeof entry> | null = entry()) {
 
 describe("createJevInboxTextResolver", () => {
   it("reads a Google Chat message only at the host-side decision boundary", async () => {
-    const source = deps();
+    const source = deps(entry({ deliveredAt: new Date("2026-09-26T17:00:07.000Z") }));
     await expect(createJevInboxTextResolver(source)("actor", "entry")).resolves.toEqual({
       id: "entry",
       source: "gchat:spaces/S",
       type: "gchat.message",
       text: "real chat text",
+      // The message carries no sender or createTime, so those source facts are
+      // explicitly unknown; row delivery time must not masquerade as send time.
+      sender: null,
+      timestamp: null,
     });
     expect(source.inbox.read).toHaveBeenCalledWith("actor", "entry");
     expect(source.chatClient.getMessage).toHaveBeenCalledWith("spaces/S/messages/M");
+  });
+
+  it("reports a Google Chat message's sender and its own send time (#710)", async () => {
+    const source = deps(entry({ deliveredAt: new Date("2026-09-26T17:00:07.000Z") }));
+    source.chatClient.getMessage.mockResolvedValue({
+      name: "spaces/S/messages/M",
+      text: "lands*",
+      sender: { name: "users/1", displayName: "Operator" },
+      createTime: "2026-09-26T17:00:06.000Z",
+    } as never);
+
+    await expect(createJevInboxTextResolver(source)("actor", "entry")).resolves.toMatchObject({
+      text: "lands*",
+      sender: "users/1",
+      timestamp: "2026-09-26T17:00:06.000Z",
+    });
   });
 
   it("reads the specific GitHub comment rather than the whole issue", async () => {

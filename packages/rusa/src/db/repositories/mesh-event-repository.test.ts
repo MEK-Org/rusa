@@ -719,7 +719,7 @@ describe("MeshEventRepository", () => {
       ]);
     });
   });
-  describe("listByKinds (the ledger reader's narrowed list)", () => {
+  describe("listByKinds (kind-filtered list with selective bodies)", () => {
     beforeEach(() => {
       db.prepare(
         `INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
@@ -754,7 +754,7 @@ describe("MeshEventRepository", () => {
 
     it("blanks the body of a kind the caller did not ask a body for", () => {
       // The whole point: `run_end` bodies are 138 MB of transcripts on the live
-      // mesh, and the ledger never reads one. Fetching the row must not fetch them.
+      // mesh, and a kind-filtered reader never reads one. Fetching the row must not fetch them.
       const [runEnd] = repo.listByKinds(["run_end"], { bodyKinds: ["run_yielded"] });
       expect(runEnd).toMatchObject({ kind: "run_end", success: true });
       expect(runEnd.body).toBeNull();

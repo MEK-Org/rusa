@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
+  Actor,
   type ActorOptions,
   formatPoolExhaustedFailure,
   type PoolSkippedEntry,
@@ -34,6 +35,7 @@ import {
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { SECRET_CAPABILITY_BASE } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
+import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../actor/computer-use-lock.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -134,6 +136,7 @@ import { GchatOAuth } from "../chat/gchat-oauth.js";
 import { PubsubChatSource } from "../chat/pubsub-source.js";
 import { listAllChatSpaces } from "../chat/spaces.js";
 import type { ChatClient, ChatMessage, ChatSource } from "../chat/types.js";
+import { chatMessageWakes } from "../chat/wake-mode.js";
 import {
   type SystemChatSubscriptionLapseEvent,
   WorkspaceEventsSubscriber,
@@ -194,10 +197,6 @@ import {
   SLACK_WRITE_MCP_NAME,
 } from "../mcp/slack-mcp.js";
 import { resolveStampedAuthor, stampAuthor } from "../mcp/stamp.js";
-import {
-  createStuckLoopDetectorMcpServer,
-  STUCK_LOOP_DETECTOR_MCP_NAME,
-} from "../mcp/stuck-loop-detector-mcp.js";
 import { createTrackerMcpServer, TRACKER_MCP_NAME } from "../mcp/tracker-mcp.js";
 import {
   createUnderstandingReadServer,
@@ -1007,6 +1006,14 @@ async function composeStart(
   else if (config.jevApiKeyFile) {
     log.warn("jev_classifier_unavailable", { reason: "credential_unavailable" });
   }
+  // This process owns one local desktop. Followers construct their own lock
+  // inside their process, so no coordinator-wide lock serializes separate hosts.
+  const computerUseLock = new ComputerUseLock((err) => {
+    log.warn("preempted_computer_use_re_request_failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
+  resources.acquire("computer-use lock", () => computerUseLock.close());
   resources.reportFailuresTo(({ resource, error }) =>
     log.error("shutdown_disposer_failed", { resource, err: error })
   );
@@ -1457,12 +1464,6 @@ async function composeStart(
         resolveUnderstandingRootNodeId(config),
         understandingStrings.loadStrings
       ),
-    [STUCK_LOOP_DETECTOR_MCP_NAME]: () =>
-      createStuckLoopDetectorMcpServer({
-        actors,
-        meshEvents: getRepositories().meshEvents,
-        rootHandle,
-      }),
     // Route agent get_quota through the coordinator client when configured (§12 item 4, #356)
     [QUOTA_MCP_NAME]: () =>
       createQuotaMcpServer(
@@ -1498,10 +1499,12 @@ async function composeStart(
     config.jevApiKeyFile === undefined
       ? undefined
       : new ShadowResponsiveInterruptionClassifier({
-          // Uncalibrated placeholder until shadow data exists. It only decides
-          // which recorded prediction (and chat reaction) a confident-enough
-          // interrupt gets; shadow mode never changes scheduling.
-          threshold: 0.8,
+          // Interrupt at interrupt confidence >= 0.5 (#710): a starting point
+          // from an offline run of operator-supplied examples, not a
+          // calibration; the shadow audit stays the calibration source. It
+          // decides the recorded policy outcome only; the chat reaction shows
+          // JEV's own verdict, and shadow mode never changes scheduling.
+          threshold: 0.5,
           ...(jevApiKey
             ? {
                 client: new HttpJevDecisionClient(
@@ -1714,12 +1717,21 @@ async function composeStart(
     candidatePacerFor(lane, model);
     return (modelExhaustedUntilMs.get(modelPacerKey(lane, model)) ?? 0) > nowMs;
   };
+  // Model pacers whose windows the coordinator no longer publishes, so a
+  // retirement is logged once rather than only as a zero interval per apply.
+  const retiredModelPacers = new Set<string>();
   const applyModelLaneStatuses = (lane: string, status: PublishedThrottleProviderStatus): void => {
     for (const [key, entry] of modelPacers) {
       if (entry.lane !== lane) continue;
       try {
         const pacing = modelLanePacing(status, entry.model);
         applyModelLanePacing(key, entry.pacer, pacing);
+        if (pacing) {
+          retiredModelPacers.delete(key);
+        } else if (!retiredModelPacers.has(key)) {
+          retiredModelPacers.add(key);
+          log.info("quota_model_lane_retired", { provider: lane, model: entry.model });
+        }
         log.info("quota_model_lane_throttle", {
           provider: lane,
           model: entry.model,
@@ -1814,6 +1826,7 @@ async function composeStart(
           error: bucket.error,
           requiredIntervalSeconds: bucket.requiredIntervalSeconds,
         })),
+        freshness: status.freshness,
       },
       status.updatedAt,
       status.exhaustedUntil,
@@ -2266,7 +2279,6 @@ async function composeStart(
     void mcpHttp.removeServer(`${actorId}:${REPO_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${TRACKER_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${UNDERSTANDING_READ_MCP_NAME}`);
-    void mcpHttp.removeServer(`${actorId}:${STUCK_LOOP_DETECTOR_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${QUOTA_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${CHAT_READ_MCP_NAME}`);
     void mcpHttp.removeServer(`${actorId}:${SLACK_READ_MCP_NAME}`);
@@ -2730,6 +2742,7 @@ async function composeStart(
     grantableCapabilities: new Set([
       ...grantableServers.keys(),
       SECRET_CAPABILITY_BASE,
+      COMPUTER_USE_CAPABILITY,
       ...ADMINISTRATIVE_CAPABILITIES,
     ]),
     secretsDir: secretsDirPath(mcHome),
@@ -3017,16 +3030,6 @@ async function composeStart(
             { isFenced }
           )
         );
-        const stuckLoopUrl = mcpHttp.addServer(`${id}:${STUCK_LOOP_DETECTOR_MCP_NAME}`, () =>
-          createStuckLoopDetectorMcpServer(
-            {
-              actors,
-              meshEvents: getRepositories().meshEvents,
-              rootHandle,
-            },
-            { isFenced }
-          )
-        );
         const quotaUrl = mcpHttp.addServer(`${id}:${QUOTA_MCP_NAME}`, () =>
           createQuotaMcpServer(
             { config, workersDir, coordinatorClient: quotaCoordinatorClient },
@@ -3039,7 +3042,6 @@ async function composeStart(
           { name: TRACKER_MCP_NAME, url: trackerUrl },
           { name: REPO_MCP_NAME, url: repoUrl },
           { name: UNDERSTANDING_READ_MCP_NAME, url: understandingUrl },
-          { name: STUCK_LOOP_DETECTOR_MCP_NAME, url: stuckLoopUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
         ];
         if (chatClient) {
@@ -3100,6 +3102,7 @@ async function composeStart(
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
+        let localActor: Actor | undefined;
         const actorOptions: ActorOptions = {
           id,
           cwd,
@@ -3167,7 +3170,23 @@ async function composeStart(
           // quota exhaustion is not something it self-heals out of — it's a
           // signal to the worker's parent, who judges what happens next (see
           // the exhaustion-classified onRun failure notice below).
-          gate: ctx.gate,
+          gate: (fn, candidates, responsive) => {
+            // A remote target executes inside its follower and obtains that
+            // follower's lock. Never make two independent instances contend
+            // through the leader process.
+            if (ctx.executionTarget === undefined) {
+              return computerUseLock.gateAfterProvider(
+                id,
+                responsive,
+                (start) => ctx.gate(start, candidates, responsive),
+                fn,
+                () => mesh.hasActiveCapability(id, COMPUTER_USE_CAPABILITY),
+                () => localActor?.preemptForResponsive(),
+                () => localActor?.requestRun()
+              );
+            }
+            return ctx.gate(fn, candidates, responsive);
+          },
           beforeRun: ctx.beforeRun,
           admitRun: ctx.admitRun,
           lifecycle: ctx.lifecycle,
@@ -3206,6 +3225,7 @@ async function composeStart(
           actorOptions,
           driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
         });
+        if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -3575,7 +3595,16 @@ async function composeStart(
     },
     admitRun: ({ responsive }): boolean =>
       responsive || !(voiceService?.hasActiveSession(rootId) ?? false),
-    gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+    gate: (fn, candidates, responsive) =>
+      computerUseLock.gateAfterProvider(
+        rootId,
+        responsive,
+        (start) => mesh.gateRun(start, candidates, responsive, rootId),
+        fn,
+        () => mesh.hasActiveCapability(rootId, COMPUTER_USE_CAPABILITY),
+        () => root.preemptForResponsive?.(),
+        () => root.requestRun?.()
+      ),
     onQueuedRunCancelled: () => mesh.clearSelection(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     onProviderAttempt: (attempt) => {
@@ -4044,6 +4073,11 @@ async function composeStart(
           listHistory: quotaCoordinatorClient
             ? (provider, sinceIso) => quotaCoordinatorClient.getCachedHistory(provider, sinceIso)
             : undefined,
+          // A provider the boot warmup or last refresh failed to read is read on
+          // the history request instead of waiting for the next tick (#707).
+          readThroughHistory: quotaCoordinatorClient
+            ? (provider) => quotaCoordinatorClient.readThroughHistory(provider)
+            : undefined,
         },
         // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
         // for the reports tab. The standalone `dashboard` command wires this
@@ -4065,12 +4099,15 @@ async function composeStart(
   if (config.chat && chatClient) {
     const cc = chatClient;
     // The inbound handler is the same for the real puller and the e2e fake: a
-    // trigger (DM or @mention) persists a source-backed pointer and wakes the root.
+    // trigger persists a source-backed pointer and wakes the space's owner. What
+    // triggers is the space's wake mode (#692): `all` or `mentions` as its owner
+    // set it, else every message in a DM/two-person space and mentions elsewhere.
+    // The mode is read per message, so a change governs the next arrival.
     const onChat = async (msg: ChatMessage): Promise<void> => {
       if (config.chat?.excludedSpaces?.includes(msg.spaceName)) {
         return;
       }
-      const trigger = msg.isDirectMessage || msg.mentionsSelf;
+      const trigger = chatMessageWakes(msg, mesh.chatWakeModeFor(msg.spaceName));
       const who = msg.senderDisplayName ?? msg.senderName;
       console.log(`[chat] ${trigger ? "▶ trigger" : "·"} ${msg.spaceName} from ${who}`);
       if (!trigger) return;

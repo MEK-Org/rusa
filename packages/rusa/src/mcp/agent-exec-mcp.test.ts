@@ -28,9 +28,11 @@ import {
   PARENT_GRANTABLE_CAPABILITIES,
 } from "../actor/capability-grants.js";
 import {
+  type EventSourceOwnerStore,
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
   parentOf,
+  reconcileEventSources,
 } from "../actor/event-subscriptions.js";
 import {
   type ExperimentEnrollmentStore,
@@ -126,6 +128,8 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     configuredEventSources?: readonly string[];
+    /** Defaults to an empty in-memory store; pass the boot union to test it. */
+    eventSourceOwners?: EventSourceOwnerStore;
     handleForId?: (id: string) => string;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -157,7 +161,7 @@ function setup(
     payload?: string;
   }[] = [];
   let seq = 0;
-  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
   let mesh!: ActorMesh;
   const eventSourceResolver = new HierarchicalEventSourceResolver({
@@ -669,6 +673,7 @@ describe("agent-execution MCP server", () => {
         "cancel_scheduled_message",
         "delegate_event_source",
         "enroll_actor_experiment",
+        "list_event_sources",
         "grant_capability",
         "introduce",
         "list_actor_experiments",
@@ -685,6 +690,7 @@ describe("agent-execution MCP server", () => {
         "send_message",
         "set_thread_charter",
         "set_actor_model",
+        "set_event_source_config",
         "set_thread_title",
         "spawn_thread",
         "subscribe_event_source",
@@ -941,6 +947,7 @@ describe("agent-execution MCP server", () => {
       [
         "cancel_scheduled_message",
         "delegate_event_source",
+        "list_event_sources",
         "grant_capability",
         "introduce",
         "list_followers",
@@ -951,6 +958,7 @@ describe("agent-execution MCP server", () => {
         "revoke_capability",
         "send_message",
         "set_actor_model",
+        "set_event_source_config",
         "spawn_thread",
         "subscribe_event_source",
         "transfer_voice_session",
@@ -2174,6 +2182,319 @@ describe("agent-execution MCP server", () => {
   });
 
   describe("Event source delegation tools (non-root, ISSUE_NUM §2)", () => {
+    it("omits and refuses config on a config-implied root source over the boot union (#695)", async () => {
+      const persistent = new InMemoryEventSourceOwnerStore();
+      const boot = reconcileEventSources(
+        persistent,
+        ["gchat:spaces"],
+        "root",
+        () => "2026-01-01T00:00:00Z"
+      );
+      const { mesh } = setup({
+        eventSourceOwners: boot.store,
+        configuredEventSources: ["gchat:spaces"],
+      });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const call = async (name: string, args: Record<string, unknown>) =>
+        (await rootClient.callTool({ name, arguments: args })) as CallToolResult;
+
+      // The root owns the configured source, but only through the boot-derived
+      // row: it is not listed as configurable and a write says why.
+      expect(dataOf(await call("list_event_sources", {}))).toEqual([]);
+      const res = await call("set_event_source_config", {
+        source: "gchat:spaces",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(/implied by configured event sources.*self-delegate/i);
+      expect(persistent.list()).toEqual([]);
+      expect(boot.store.activeForResource("gchat:spaces")).toEqual([
+        expect.objectContaining({ actorId: "root" }),
+      ]);
+
+      // Self-delegating an exact space creates the durable, configurable row.
+      await call("delegate_event_source", { child_thread_id: "root", source: "gchat:spaces/team" });
+      const set = await call("set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(set.isError).toBeFalsy();
+      expect(dataOf(await call("list_event_sources", {}))).toEqual([
+        { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+      ]);
+      expect(mesh.chatWakeModeFor("gchat:spaces/team")).toBe("all");
+    });
+
+    it("lists and configures only the caller's owned event sources (#692)", async () => {
+      const { mesh, events } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "space owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      mesh.subscribeEventSource("gchat:spaces", "root", "root");
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      // The config is a generic object attached to the exact source. Chat wake
+      // mode is its first consumer, and the list is the owner's read surface.
+      let res = await call(rootClient, "list_event_sources", {});
+      expect(dataOf(res)).toEqual([{ resource: "gchat:spaces", config: null }]);
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces",
+        config: { routing: { priority: "normal" } },
+      });
+      expect(dataOf(res)).toEqual({
+        resource: "gchat:spaces",
+        config: { routing: { priority: "normal" } },
+      });
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual([
+        { resource: "gchat:spaces", config: { routing: { priority: "normal" } } },
+      ]);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_config_set",
+          actorId: "root",
+          detail: "gchat:spaces",
+          payload: JSON.stringify({ configured: true }),
+        })
+      );
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      // An inherited parent source is not materialized by a config write: that
+      // would silently alter routing and retirement blockers. The owner must
+      // first make its exact source explicit through the ordinary tool.
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(
+        /active exact source.*self-delegate.*receive an exact delegation/i
+      );
+      expect(events).not.toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_subscribed",
+          actorId: "root",
+          detail: "gchat:spaces/team",
+        })
+      );
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "root", source: "gchat:spaces/team" },
+      });
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toEqual({
+        resource: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "event_source_subscribed",
+          actorId: "root",
+          detail: "gchat:spaces/team",
+        })
+      );
+
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
+      });
+
+      res = await call(ownerClient, "list_event_sources", {});
+      expect(dataOf(res)).toEqual([
+        { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+      ]);
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "mentions" },
+      });
+      expect(res.isError).toBeFalsy();
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
+      // Another of root's spaces is untouched, and the owner has no say over it.
+      expect(mesh.chatWakeModeFor("spaces/other")).toBeUndefined();
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/other",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      expect(res.isError).toBe(true);
+      expect(dataOf(res)).toMatch(/needs an active exact source/);
+
+      // Having delegated the space away, root is no longer its owner either.
+      res = await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "mentions" },
+      });
+      expect(res.isError).toBe(true);
+      expect(mesh.chatWakeModeFor("spaces/team")).toBe("mentions");
+
+      res = await call(ownerClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: null,
+      });
+      expect(dataOf(res)).toEqual({ resource: "gchat:spaces/team", config: null });
+      expect(mesh.chatWakeModeFor("spaces/team")).toBeUndefined();
+      // An unparseable or non-space resource returns undefined without throwing (#695).
+      expect(mesh.chatWakeModeFor("malformed space name")).toBeUndefined();
+      expect(mesh.chatWakeModeFor("gchat:spaces")).toBeUndefined();
+
+      // A configured space is deliberately an exact ownership boundary. Moving
+      // the broad Chat source does not silently move this source's config.
+      await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces/team" },
+      });
+      await call(rootClient, "set_event_source_config", {
+        source: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces" },
+      });
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
+      );
+      expect(dataOf(await call(ownerClient, "list_event_sources", {}))).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ resource: "gchat:spaces/team" })])
+      );
+    });
+
+    it("keeps opaque source configuration with its exact row during a live obligation claim (#692)", async () => {
+      const issue = "github:MEK-Org/rusa/issues/692";
+      const liveObligations: Record<string, string | null> = {};
+      const { mesh } = setup({
+        obligations: {
+          findLiveByExternalRef: (ref) => {
+            const ownerId = liveObligations[ref];
+            return ownerId ? { ownerId } : null;
+          },
+        },
+      });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "live obligation owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const claimClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      mesh.subscribeEventSource(issue, "root", "root");
+      expect(
+        dataOf(
+          await call(rootClient, "set_event_source_config", {
+            source: issue,
+            config: { version: 1, label: "durable-row" },
+          })
+        )
+      ).toEqual({ resource: issue, config: { version: 1, label: "durable-row" } });
+
+      // The live obligation controls delivery, not the stored subscription row
+      // or its opaque configuration.
+      liveObligations[issue] = "t1";
+      expect(dataOf(await call(claimClient, "list_event_sources", {}))).toEqual([]);
+      const deniedClear = await call(claimClient, "set_event_source_config", {
+        source: issue,
+        config: null,
+      });
+      expect(deniedClear.isError).toBe(true);
+      expect(dataOf(deniedClear)).toMatch(/needs an active exact source/);
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual([
+        { resource: issue, config: { version: 1, label: "durable-row" } },
+      ]);
+
+      // The exact owner may update its durable config without disturbing the
+      // live claim that is currently routing delivery.
+      expect(
+        dataOf(
+          await call(rootClient, "set_event_source_config", {
+            source: issue,
+            config: { version: 1, label: "retained-row" },
+          })
+        )
+      ).toEqual({ resource: issue, config: { version: 1, label: "retained-row" } });
+      expect(mesh.resolveEffectiveRoute(issue)).toMatchObject({
+        governingSource: "obligation",
+        principal: "t1",
+      });
+    });
+
+    it("requires exact reclaim for a child-created chat wake boundary (#692)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "space owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const ownerClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const call = async (client: typeof rootClient, name: string, args: Record<string, unknown>) =>
+        (await client.callTool({ name, arguments: args })) as CallToolResult;
+
+      mesh.subscribeEventSource("gchat:spaces", "root", "root");
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces" },
+      });
+      await ownerClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t1", source: "gchat:spaces/team" },
+      });
+      expect(
+        dataOf(
+          await call(ownerClient, "set_event_source_config", {
+            source: "gchat:spaces/team",
+            config: { version: 1, chatWakeMode: "all" },
+          })
+        )
+      ).toEqual({
+        resource: "gchat:spaces/team",
+        config: { version: 1, chatWakeMode: "all" },
+      });
+
+      // Reclaiming the broad source leaves the child's newly materialized exact
+      // boundary in place. The parent must reclaim that exact source before the
+      // child can be retired or the parent can change its mode.
+      const broadReclaim = (await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces" },
+      })) as CallToolResult;
+      expect(broadReclaim.isError).toBeFalsy();
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ resource: "gchat:spaces/team" })])
+      );
+      expect(dataOf(await call(ownerClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
+      );
+
+      const exactReclaim = (await rootClient.callTool({
+        name: "reclaim_event_source",
+        arguments: { source: "gchat:spaces/team" },
+      })) as CallToolResult;
+      expect(exactReclaim.isError).toBeFalsy();
+      expect(dataOf(await call(rootClient, "list_event_sources", {}))).toEqual(
+        expect.arrayContaining([
+          { resource: "gchat:spaces/team", config: { version: 1, chatWakeMode: "all" } },
+        ])
+      );
+    });
+
     it("lets a subscribed parent delegate to a child and reclaim the topic", async () => {
       const { mesh } = setup();
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));

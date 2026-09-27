@@ -18,6 +18,7 @@ import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   DEFAULT_MAX_INTERVAL_SECONDS,
   DEFAULT_STALE_AFTER_MS,
+  scrapeStaleAfterMs,
 } from "../quota/coordinator-protocol.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { DEFAULT_RELOCATED_QUOTA_DB_NAME, relocateQuotaDatabase } from "../quota/relocate.js";
@@ -287,8 +288,11 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
     const maxIntervalSeconds =
       config.quota?.throttle?.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
     const staleAfterMs = config.quota?.throttle?.tickSeconds
-      ? config.quota.throttle.tickSeconds * 3 * 1000
+      ? scrapeStaleAfterMs(config.quota.throttle.tickSeconds)
       : DEFAULT_STALE_AFTER_MS;
+    const manualHardStaleSeconds = config.quota?.throttle?.manualHardStaleSeconds;
+    const manualHardStaleAfterMs =
+      manualHardStaleSeconds !== undefined ? manualHardStaleSeconds * 1000 : undefined;
 
     const store = new SharedQuotaStore(databasePath);
     const metrics = createQuotaMetrics(log);
@@ -323,6 +327,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
           // controller step, so it needs the same freshness thresholds the service
           // serves with; otherwise the gauge and the response would disagree.
           staleAfterMs,
+          manualHardStaleAfterMs,
           onError: (provider, error) =>
             log.warn("Quota collection tick failed", {
               provider,
@@ -336,6 +341,7 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
       configuredProviders,
       maxIntervalSeconds,
       staleAfterMs,
+      manualHardStaleAfterMs,
       metrics,
       collectionStats: collection ? () => collection.getAllStats() : undefined,
     });

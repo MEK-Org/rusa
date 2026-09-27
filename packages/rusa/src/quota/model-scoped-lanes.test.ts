@@ -287,7 +287,19 @@ describe("model-scoped quota lanes: store (#588)", () => {
           (provider, kind, observed_slot, label, observed_at, percent_left, reset_at_iso,
            window_ms, processed, controller_error, controller_derivative, controller_integral,
            uncapped_interval_seconds, interval_seconds)
-         VALUES ('claude', 'weekly', 1, 'Weekly', '2030-01-01T00:00:00.000Z', 50, ?,
+         VALUES ('claude', 'weekly', 2, 'Weekly', '2030-01-01T00:00:00.000Z', 50, ?,
+                 604800000, 1, 3, 0.5, 120, 40, 40)`
+      )
+      .run(RESET);
+    // Equal timestamps use rowid as the deterministic latest-reading tie
+    // break. The migration must preserve that order as it rebuilds the table.
+    legacy
+      .prepare(
+        `INSERT INTO quota_observations
+          (provider, kind, observed_slot, label, observed_at, percent_left, reset_at_iso,
+           window_ms, processed, controller_error, controller_derivative, controller_integral,
+           uncapped_interval_seconds, interval_seconds)
+         VALUES ('claude', 'weekly', 1, 'Weekly', '2030-01-01T00:00:00.000Z', 0, ?,
                  604800000, 1, 3, 0.5, 120, 40, 40)`
       )
       .run(RESET);
@@ -300,11 +312,15 @@ describe("model-scoped quota lanes: store (#588)", () => {
       expect(
         store.db
           .prepare(
-            `SELECT model_scope AS modelScope, controller_integral AS integral,
-                    interval_seconds AS interval FROM quota_observations`
+            `SELECT model_scope AS modelScope, percent_left AS percentLeft,
+                    controller_integral AS integral, interval_seconds AS interval
+             FROM quota_observations ORDER BY rowid`
           )
           .all()
-      ).toEqual([{ modelScope: "", integral: 120, interval: 40 }]);
+      ).toEqual([
+        { modelScope: "", percentLeft: 50, integral: 120, interval: 40 },
+        { modelScope: "", percentLeft: 0, integral: 120, interval: 40 },
+      ]);
       const indices = (
         store.db
           .prepare(
@@ -314,7 +330,11 @@ describe("model-scoped quota lanes: store (#588)", () => {
       ).map((row) => row.name);
       expect(indices).toContain("idx_quota_observations_scope_kind_time");
       expect(indices).not.toContain("idx_quota_observations_provider_kind_time");
-      expect(store.getProviderThrottle("claude")).toMatchObject({ intervalSeconds: 40 });
+      expect(store.getProviderThrottle("claude")).toMatchObject({
+        intervalSeconds: 40,
+        expired: true,
+        exhaustedUntil: RESET,
+      });
       expect(store.getProviderThrottle("claude")?.modelLanes).toBeUndefined();
     } finally {
       store.close();
@@ -455,6 +475,60 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       intervalSeconds: 3600,
       freshness: expect.objectContaining({ hardStale: true }),
     });
+  });
+
+  it("keeps publishing an outlived lane until its exhaustion deadline passes", () => {
+    const nowMs = Date.parse("2030-01-01T02:00:00.000Z");
+    const deadline = new Date(nowMs + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const options = {
+      maxIntervalSeconds: 3600,
+      staleAfterMs: 600_000,
+      hardStaleAfterMs: 3_600_000,
+    };
+    const provider = {
+      provider: "claude",
+      intervalSeconds: 5,
+      uncappedIntervalSeconds: 5,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: "2030-01-01T01:59:00.000Z",
+      buckets: [],
+    };
+    // Last seen at 0% well past the hard-stale horizon: the provider kept
+    // reporting without the Fable window.
+    const stored = {
+      ...provider,
+      modelLanes: [
+        {
+          ...provider,
+          governingBucketKey: `claude[${FABLE}]:weekly`,
+          intervalSeconds: 20,
+          uncappedIntervalSeconds: 20,
+          expired: true,
+          exhaustedUntil: deadline,
+          updatedAt: "2030-01-01T00:30:00.000Z",
+          models: [FABLE],
+        },
+      ],
+    };
+
+    // Before the deadline the lane is held, hard-staled: it still defers Fable
+    // to the deadline at the ceiling interval rather than retiring to no pacing.
+    const held = publishedThrottle(stored, { ...options, nowMs });
+    expect(modelLanePacing(held, FABLE)).toEqual({
+      intervalSeconds: 3600,
+      deferUntil: deadline,
+      exhaustedUntil: null,
+    });
+
+    // Once the deadline has passed, the outlived lane retires as before.
+    const released = publishedThrottle(stored, {
+      ...options,
+      nowMs: Date.parse(deadline) + 1,
+    });
+    expect(modelLanePacing(released, FABLE)).toBeUndefined();
   });
 
   it("preserves scope identity from store to client over the coordinator socket", async () => {

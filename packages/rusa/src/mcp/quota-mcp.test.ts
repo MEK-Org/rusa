@@ -2255,13 +2255,13 @@ describe("quota MCP server", () => {
         workersDir: "/tmp/workers",
       }) as unknown as { getTtlMs: (provider: string) => number };
 
-      // Default TTLs
-      expect(service.getTtlMs("claude")).toBe(5 * 60 * 1000);
-      expect(service.getTtlMs("agy")).toBe(5 * 60 * 1000);
+      // #690: routine provider readings target ~30 minutes across all
+      // providers; the fast 5-minute QuotaCollectionLoop tick handles
+      // controller evaluation and manual observation ingestion instead.
+      expect(service.getTtlMs("claude")).toBe(30 * 60 * 1000);
+      expect(service.getTtlMs("agy")).toBe(30 * 60 * 1000);
       expect(service.getTtlMs("codex")).toBe(30 * 60 * 1000);
-      // kimi raised 60s→5min once the /usage pty scrape dropped ~51s→~8s ;
-      // 5h/weekly windows don't need sub-minute freshness.
-      expect(service.getTtlMs("kimi")).toBe(5 * 60 * 1000);
+      expect(service.getTtlMs("kimi")).toBe(30 * 60 * 1000);
 
       // Overridden TTLs
       const serviceWithOverride = new QuotaService({
@@ -2289,7 +2289,7 @@ describe("quota MCP server", () => {
         expect(first.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
         expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
-        // Still within the 5-minute claude TTL — cache hit, scrapedAt rides
+        // Still within the 30-minute TTL — cache hit, scrapedAt rides
         // through unchanged rather than reflecting this later read time.
         vi.setSystemTime(new Date("2026-07-14T09:16:00.000Z"));
         const second = await service.getQuota("claude");
@@ -2297,13 +2297,42 @@ describe("quota MCP server", () => {
         expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
         // Past the TTL — a fresh probe runs and stamps a new scrapedAt.
-        vi.setSystemTime(new Date("2026-07-14T09:25:00.000Z"));
+        vi.setSystemTime(new Date("2026-07-14T09:46:00.000Z"));
         const third = await service.getQuota("claude");
-        expect(third.scrapedAt).toBe("2026-07-14T09:25:00.000Z");
+        expect(third.scrapedAt).toBe("2026-07-14T09:46:00.000Z");
         expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it("starts the probe TTL before a slow probe resolves, so the 5m collector does not add a tick", async () => {
+      let nowMs = Date.parse("2026-07-14T09:15:00.000Z");
+      vi.mocked(mockClaudeProvider.run).mockImplementationOnce(async () => {
+        nowMs += 5 * 60 * 1000;
+        return {
+          success: true,
+          output:
+            "using your subscription to power...\nCurrent session: 10% used · resets Jul 5, 10:50am (UTC)",
+          exitCode: 0,
+        };
+      });
+      const service = new QuotaService({
+        config: mockConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: mockResolveProvider,
+        now: () => nowMs,
+      });
+
+      await service.getQuota("claude");
+      expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+
+      // The completed observation is five minutes old, but its TTL began at
+      // probe start. At the next 30m boundary the collector must refresh now,
+      // not wait for a seventh five-minute tick.
+      nowMs = Date.parse("2026-07-14T09:45:00.000Z");
+      await service.getQuota("claude");
+      expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
     });
 
     describe("getQuotaCached (non-blocking request path, issue #10)", () => {
@@ -2366,8 +2395,8 @@ describe("quota MCP server", () => {
           expect(warm.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
           expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
-          // Advance past the 5-minute claude TTL so the entry is stale.
-          vi.setSystemTime(new Date("2026-07-14T09:25:00.000Z"));
+          // Advance past the 30-minute TTL so the entry is stale.
+          vi.setSystemTime(new Date("2026-07-14T09:46:00.000Z"));
 
           // The stale reading is served immediately — same scrapedAt as the warm
           // probe, NOT a fresh probe time — while a refresh is kicked behind it.
@@ -2378,7 +2407,7 @@ describe("quota MCP server", () => {
           await vi.runAllTimersAsync();
           expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
           const refreshed = service.getQuotaCached("claude");
-          expect(refreshed.scrapedAt).toBe("2026-07-14T09:25:00.000Z");
+          expect(refreshed.scrapedAt).toBe("2026-07-14T09:46:00.000Z");
         } finally {
           vi.useRealTimers();
         }
@@ -2405,8 +2434,8 @@ describe("quota MCP server", () => {
             timestamp: Date.parse("2026-07-14T09:15:00.000Z"),
           });
 
-          // Advance past the 5-minute claude TTL so the entry is stale.
-          vi.setSystemTime(new Date("2026-07-14T09:25:00.000Z"));
+          // Advance past the 30-minute TTL so the entry is stale.
+          vi.setSystemTime(new Date("2026-07-14T09:46:00.000Z"));
 
           // Scraper/provider run fails closed (returns unknown status).
           vi.mocked(mockClaudeProvider.run).mockResolvedValueOnce({
@@ -2454,7 +2483,7 @@ describe("quota MCP server", () => {
           await service.getQuota("claude");
           expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
 
-          // Still within the 5-minute TTL — no background probe.
+          // Still within the 30-minute TTL — no background probe.
           vi.setSystemTime(new Date("2026-07-14T09:16:00.000Z"));
           const fresh = service.getQuotaCached("claude");
           expect(fresh.scrapedAt).toBe("2026-07-14T09:15:00.000Z");

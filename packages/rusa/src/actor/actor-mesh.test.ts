@@ -3211,6 +3211,63 @@ describe("ActorMesh", () => {
     ]);
   });
 
+  it("reacts with JEV's own interrupt below the threshold, and audits verdict and outcome (#710)", async () => {
+    // The reaction is for judging the model, so a below-threshold interrupt
+    // shows ✅, not the policy's queue. The audit keeps both, so tuning the
+    // threshold never has to infer what JEV said from the code.
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const reactions: Array<{ messageName: string; emoji: string }> = [];
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: async () => ({ verdict: "interrupt", confidence: 0.2 }),
+      },
+    });
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      reactToChatMessage: async (messageName, emoji) => {
+        reactions.push({ messageName, emoji });
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "chat_space:spaces/S",
+        payload: {
+          type: "gchat.message",
+          messageName: "spaces/S/messages/M",
+          priority: "responsive",
+        },
+      },
+    ]);
+    mesh.dispatch(worker);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reactions).toEqual([
+      { messageName: "spaces/S/messages/M", emoji: SHADOW_INTERRUPT_EMOJI },
+    ]);
+    const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
+    expect(shadow).toHaveLength(1);
+    expect(JSON.parse(shadow[0]?.payload ?? "{}").decision).toMatchObject({
+      outcome: "queue",
+      reason: "low_confidence",
+      verdict: "interrupt",
+      confidence: 0.2,
+      threshold: 0.5,
+    });
+  });
+
   it("posts no reaction when no classifier is configured", async () => {
     // The gate is the classifier itself: a default install has none, so it
     // must not touch the operator's chat space at all.
@@ -7994,6 +8051,53 @@ describe("ActorMesh", () => {
       mesh.delegateEventSource(pr, child, parent);
 
       expect(() => mesh.reclaimEventSource(pr, sibling)).toThrow(/effective owner after reclaim/);
+    });
+
+    it("refuses an ancestor bypassing the owner of the underlying source (#695 review)", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
+      const child = mesh.spawn({ charter: "pr worker", parentId: parent });
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
+
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource(pr, child, parent);
+
+      expect(() => mesh.reclaimEventSource(pr, "root")).toThrow(/effective owner after reclaim/);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === pr && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([child]);
+    });
+
+    it("lets only the delegator reclaim a delegated root source (#695 review)", () => {
+      const { mesh } = setup();
+      const delegator = mesh.spawn({ charter: "space steward", parentId: "root" });
+      const branch = mesh.spawn({ charter: "other branch", parentId: "root" });
+      const holder = mesh.spawn({ charter: "space worker", parentId: branch });
+      const spaces = "gchat:spaces";
+
+      mesh.subscribeEventSource(spaces, delegator, "root");
+      mesh.delegateEventSource(spaces, holder, delegator);
+
+      // No underlying source owner remains; the holder's own ancestors gain nothing.
+      expect(() => mesh.reclaimEventSource(spaces, branch)).toThrow(/delegator of an unowned/);
+      expect(() => mesh.reclaimEventSource(spaces, "root")).toThrow(/delegator of an unowned/);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === spaces && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([holder]);
+
+      mesh.reclaimEventSource(spaces, delegator);
+      expect(
+        mesh
+          .listSubscriptions()
+          .filter((s) => s.resource === spaces && !s.unsubscribedAt)
+          .map((s) => s.actorId)
+      ).toEqual([delegator]);
     });
 
     it("an actor may self-delegate a strict descendant of a parent it effectively owns", () => {
