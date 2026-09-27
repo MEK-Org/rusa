@@ -21,11 +21,7 @@ import type {
   FollowerUpdateStatusEvent,
   LeaderCommand,
 } from "./protocol.js";
-import {
-  INSTANCE_PROTOCOL_VERSION,
-  isSupportedFollowerProtocol,
-  OLDEST_FOLLOWER_PROTOCOL_VERSION,
-} from "./protocol.js";
+import { INSTANCE_PROTOCOL_VERSION, OLDEST_FOLLOWER_PROTOCOL_VERSION } from "./protocol.js";
 import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
 
@@ -444,8 +440,11 @@ export class FollowerHub {
       return;
     }
     if (path === "/register") {
-      // Every refusal is logged: a follower the hub never registers is otherwise
-      // invisible, and a stuck rollout looks like silence.
+      // Every refusal past authentication and JSON parsing is logged: a follower
+      // the hub never registers is otherwise invisible, and a stuck rollout looks
+      // like silence. A 401 or unparseable body is not: it carries no identity the
+      // hub can trust, and logging it would let any caller write to this log. The
+      // follower's own registration-failure log covers those.
       const rejectRegistration = (reason: string, extra: Record<string, unknown> = {}): void => {
         this.log.warn("follower_register_rejected", {
           reason,
@@ -455,16 +454,19 @@ export class FollowerHub {
           ...extra,
         });
       };
-      if (!isSupportedFollowerProtocol(body.protocolVersion)) {
+      // The session speaks the follower's protocol, which the reply echoes: a
+      // follower accepts only its own version back.
+      const protocolVersion = body.protocolVersion;
+      if (
+        protocolVersion !== INSTANCE_PROTOCOL_VERSION &&
+        protocolVersion !== OLDEST_FOLLOWER_PROTOCOL_VERSION
+      ) {
         rejectRegistration("incompatible_protocol", {
           supportedProtocolVersions: [OLDEST_FOLLOWER_PROTOCOL_VERSION, INSTANCE_PROTOCOL_VERSION],
         });
         reply(res, 409, { error: "Incompatible instance protocol; rebuild leader and follower" });
         return;
       }
-      // The session speaks the follower's protocol, which the reply echoes: a
-      // follower accepts only its own version back.
-      const protocolVersion = body.protocolVersion;
       if (
         typeof body.id !== "string" ||
         !/^[a-zA-Z0-9_-]{1,64}$/.test(body.id) ||

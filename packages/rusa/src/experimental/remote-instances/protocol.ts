@@ -15,14 +15,6 @@ import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/t
 export const INSTANCE_PROTOCOL_VERSION = 8;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
-export function isSupportedFollowerProtocol(version: unknown): version is number {
-  return (
-    typeof version === "number" &&
-    Number.isInteger(version) &&
-    version >= OLDEST_FOLLOWER_PROTOCOL_VERSION &&
-    version <= INSTANCE_PROTOCOL_VERSION
-  );
-}
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
