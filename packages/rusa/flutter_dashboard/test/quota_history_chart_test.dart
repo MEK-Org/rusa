@@ -42,20 +42,22 @@ void main() {
     ],
   );
 
-  QuotaHistorySeriesDto weeklySeries(String provider, double remainingPercent) =>
-      QuotaHistorySeriesDto(
-        provider: provider,
-        windowId: 'weekly',
-        label: 'Weekly',
-        points: [
-          QuotaHistoryPointDto(
-            observedAt: '2026-07-26T19:00:00.000Z',
-            remainingPercent: remainingPercent,
-            error: 0,
-            intervalSeconds: 60,
-          ),
-        ],
-      );
+  QuotaHistorySeriesDto weeklySeries(
+    String provider,
+    double remainingPercent,
+  ) => QuotaHistorySeriesDto(
+    provider: provider,
+    windowId: 'weekly',
+    label: 'Weekly',
+    points: [
+      QuotaHistoryPointDto(
+        observedAt: '2026-07-26T19:00:00.000Z',
+        remainingPercent: remainingPercent,
+        error: 0,
+        intervalSeconds: 60,
+      ),
+    ],
+  );
 
   final providerIdentityHistory = QuotaHistoryDto(
     generatedAt: '2026-07-26T20:00:00.000Z',
@@ -103,16 +105,10 @@ void main() {
       Color(0xFF10B981),
       Color(0xFFA855F7),
     ];
-    expect(legendColors, [
-      ...providerColors,
-      ...providerColors,
-      ...providerColors,
-    ]);
+    expect(legendColors, [...providerColors, ...providerColors]);
   });
 
-  testWidgets('plots headroom, throttle period and remaining with keys', (
-    tester,
-  ) async {
+  testWidgets('plots headroom and throttle period with keys', (tester) async {
     tester.view.physicalSize = const Size(900, 1200);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -132,21 +128,16 @@ void main() {
       ),
     );
 
-    // Headroom leads; recorded remaining follows the controller plots (#706).
     expect(find.byKey(const Key('quota-history-chart')), findsNothing);
     expect(find.byKey(const Key('quota-pace-error-chart')), findsOneWidget);
     expect(
       find.byKey(const Key('quota-throttle-interval-chart')),
       findsOneWidget,
     );
-    expect(find.byKey(const Key('quota-remaining-chart')), findsOneWidget);
+    expect(find.byKey(const Key('quota-remaining-chart')), findsNothing);
     expect(find.text('Quota Headroom'), findsOneWidget);
     expect(find.text('Throttle Period'), findsOneWidget);
-    expect(find.text('Quota Remaining'), findsOneWidget);
-    expect(
-      tester.getTopLeft(find.text('Quota Headroom')).dy,
-      lessThan(tester.getTopLeft(find.text('Quota Remaining')).dy),
-    );
+    expect(find.text('Quota Remaining'), findsNothing);
     expect(
       find.text(
         'How long the mesh waits between runs. The scale is logarithmic.',
@@ -164,11 +155,11 @@ void main() {
       findsNothing,
     );
     // One color key per chart.
-    expect(find.text('Claude'), findsNWidgets(3));
+    expect(find.text('Claude'), findsNWidgets(2));
     expect(find.text('Claude · Weekly'), findsNothing);
     expect(find.text('Claude · Session'), findsNothing);
     expect(find.text('55% · as of 2026-07-26T19:00:00.000Z'), findsNothing);
-    expect(find.text('now'), findsNWidgets(3));
+    expect(find.text('now'), findsNWidgets(2));
     expect(find.byType(LinearProgressIndicator), findsNothing);
 
     final errorPaint = tester.widget<CustomPaint>(
@@ -239,10 +230,10 @@ void main() {
         ),
       );
 
-      expect(find.text('Claude'), findsNWidgets(3));
+      expect(find.text('Claude'), findsNWidgets(2));
       // Fable carries a throttle period but no headroom decision, so the
       // headroom key does not name it.
-      expect(find.text('Claude · Fable'), findsNWidgets(2));
+      expect(find.text('Claude · Fable'), findsOneWidget);
       final errorPaint = tester.widget<CustomPaint>(
         find.byKey(const Key('quota-pace-error-chart')),
       );
@@ -288,7 +279,7 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('55% · as of 2026-07-26T19:00:00.000Z'), findsNothing);
-      expect(find.text('cached'), findsNWidgets(3));
+      expect(find.text('cached'), findsNWidgets(2));
       expect(find.text('now'), findsNothing);
     },
   );
@@ -316,7 +307,10 @@ void main() {
       findsOneWidget,
     );
     expect(find.byKey(const Key('quota-pace-error-chart')), findsNothing);
-    expect(find.byKey(const Key('quota-throttle-interval-chart')), findsNothing);
+    expect(
+      find.byKey(const Key('quota-throttle-interval-chart')),
+      findsNothing,
+    );
   });
 
   testWidgets(
@@ -398,66 +392,52 @@ void main() {
     },
   );
 
-  group('historical model quota remaining (#706)', () {
-    // Synthetic Fable model history as the coordinator records it: remaining
-    // percent with no controller decision, from Sep 14 through the reset to Sep 26.
-    QuotaHistoryPointDto fablePoint(
-      String observedAt,
-      double remaining,
-      String resetAt,
-    ) => QuotaHistoryPointDto(
-      observedAt: observedAt,
-      remainingPercent: remaining,
-      resetAtIso: resetAt,
-    );
-    const firstReset = '2026-09-19T00:00:00.000Z';
-    const secondReset = '2026-09-26T00:00:00.000Z';
-    const thirdReset = '2026-10-03T00:00:00.000Z';
-    final fable = QuotaHistorySeriesDto(
+  group('model quota readings without a controller decision (#706)', () {
+    // Fable model history as the coordinator records it: remaining percent
+    // with no controller decision.
+    const reset = '2026-10-03T00:00:00.000Z';
+    const fable = QuotaHistorySeriesDto(
       provider: 'claude',
       windowId: 'weekly',
       scope: 'model',
-      modelIds: const ['claude-fable'],
+      modelIds: ['claude-fable'],
       label: 'Fable',
       points: [
-        fablePoint('2026-09-14T00:05:00.000Z', 97, firstReset),
-        fablePoint('2026-09-14T00:35:00.000Z', 96, firstReset),
-        fablePoint('2026-09-18T23:30:00.000Z', 12, firstReset),
-        fablePoint('2026-09-19T00:30:00.000Z', 100, secondReset),
-        fablePoint('2026-09-19T01:00:00.000Z', 99, secondReset),
-        // Nothing recorded for two days.
-        fablePoint('2026-09-21T01:00:00.000Z', 70, secondReset),
-        fablePoint('2026-09-21T01:30:00.000Z', 69, secondReset),
-        fablePoint('2026-09-26T00:30:00.000Z', 0, thirdReset),
-        fablePoint('2026-09-26T14:55:00.000Z', 61, thirdReset),
+        QuotaHistoryPointDto(
+          observedAt: '2026-09-24T01:00:00.000Z',
+          remainingPercent: 70,
+          resetAtIso: reset,
+        ),
+        QuotaHistoryPointDto(
+          observedAt: '2026-09-26T14:55:00.000Z',
+          remainingPercent: 61,
+          resetAtIso: reset,
+        ),
       ],
     );
-    final claude = QuotaHistorySeriesDto(
+    const claude = QuotaHistorySeriesDto(
       provider: 'claude',
       windowId: 'weekly',
       label: 'Weekly',
-      points: const [
+      points: [
         QuotaHistoryPointDto(
           observedAt: '2026-09-26T14:00:00.000Z',
           remainingPercent: 60,
           error: 5,
           intervalSeconds: 45,
-          resetAtIso: thirdReset,
+          resetAtIso: reset,
         ),
         QuotaHistoryPointDto(
           observedAt: '2026-09-26T14:55:00.000Z',
           remainingPercent: 58,
           error: 4,
           intervalSeconds: 50,
-          resetAtIso: thirdReset,
+          resetAtIso: reset,
         ),
       ],
     );
-    final fortnight = QuotaHistoryDto(
-      generatedAt: '2026-09-26T15:00:00.000Z',
-      historySince: '2026-09-12T15:00:00.000Z',
-      history: [claude, fable],
-    );
+    const generatedAt = '2026-09-26T15:00:00.000Z';
+    const historySince = '2026-09-23T15:00:00.000Z';
 
     Future<void> pumpChart(WidgetTester tester, QuotaHistoryDto history) async {
       tester.view.physicalSize = const Size(900, 1400);
@@ -479,79 +459,65 @@ void main() {
       );
     }
 
-    testWidgets(
-      'draws the Fable line on the remaining plot while the controller plots stay honest',
-      (tester) async {
-        await pumpChart(tester, fortnight);
+    testWidgets('headroom and throttle draw and name only controller series', (
+      tester,
+    ) async {
+      await pumpChart(
+        tester,
+        const QuotaHistoryDto(
+          generatedAt: generatedAt,
+          historySince: historySince,
+          history: [claude, fable],
+        ),
+      );
 
-        final remainingFinder = find.byKey(const Key('quota-remaining-chart'));
-        final remaining =
-            tester.widget<CustomPaint>(remainingFinder).painter!
-                as QuotaRemainingChartPainter;
-        expect(remaining.series.map((s) => s.label), ['Weekly', 'Fable']);
-        expect(remaining.start, DateTime.parse('2026-09-12T15:00:00.000Z'));
-        expect(remaining.end, DateTime.parse('2026-09-26T15:00:00.000Z'));
-        final fableColor = remaining.colors[1];
-        expect(fableColor, isNot(remaining.colors[0]));
-        expect(
-          tester.renderObject(remainingFinder),
-          // Series paint in order: the provider line, then Fable's.
-          paints
-            ..path(color: remaining.colors[0])
-            ..path(color: fableColor),
-        );
+      final headroom =
+          tester
+                  .widget<CustomPaint>(
+                    find.byKey(const Key('quota-pace-error-chart')),
+                  )
+                  .painter!
+              as QuotaPaceErrorChartPainter;
+      final throttle =
+          tester
+                  .widget<CustomPaint>(
+                    find.byKey(const Key('quota-throttle-interval-chart')),
+                  )
+                  .painter!
+              as QuotaThrottleIntervalChartPainter;
+      expect(headroom.series.map((s) => s.label), ['Weekly']);
+      expect(throttle.series.map((s) => s.label), ['Weekly']);
+      expect(find.text('Claude · Fable'), findsNothing);
+      expect(find.text('Claude'), findsNWidgets(2));
 
-        // Headroom and throttle draw and name only the controller series.
-        final headroom =
-            tester
-                    .widget<CustomPaint>(
-                      find.byKey(const Key('quota-pace-error-chart')),
-                    )
-                    .painter!
-                as QuotaPaceErrorChartPainter;
-        final throttle =
-            tester
-                    .widget<CustomPaint>(
-                      find.byKey(const Key('quota-throttle-interval-chart')),
-                    )
-                    .painter!
-                as QuotaThrottleIntervalChartPainter;
-        expect(headroom.series.map((s) => s.label), ['Weekly']);
-        expect(throttle.series.map((s) => s.label), ['Weekly']);
-        expect(find.text('Claude · Fable'), findsOneWidget);
-        expect(find.text('Claude'), findsNWidgets(3));
-
-        // Labels name the range the API returned.
-        expect(
-          find.bySemanticsLabel(
-            RegExp('^Quota remaining over the prior 14 days'),
-          ),
-          findsOneWidget,
-        );
-      },
-    );
+      // Labels name the range the API returned.
+      expect(
+        find.bySemanticsLabel(RegExp('^Quota headroom over the prior 3 days')),
+        findsOneWidget,
+      );
+    });
 
     testWidgets(
       'says so when no series has a controller decision instead of an empty key',
       (tester) async {
         await pumpChart(
           tester,
-          QuotaHistoryDto(
-            generatedAt: fortnight.generatedAt,
-            historySince: fortnight.historySince,
+          const QuotaHistoryDto(
+            generatedAt: generatedAt,
+            historySince: historySince,
             history: [fable],
           ),
         );
 
         expect(
-          find.text('No controller decisions recorded in the prior 14 days.'),
+          find.text('No controller decisions recorded in the prior 3 days.'),
           findsOneWidget,
         );
         expect(
-          find.text('No throttle decisions recorded in the prior 14 days.'),
+          find.text('No throttle decisions recorded in the prior 3 days.'),
           findsOneWidget,
         );
-        expect(find.text('Claude · Fable'), findsOneWidget);
+        expect(find.text('Claude · Fable'), findsNothing);
       },
     );
 
@@ -559,124 +525,51 @@ void main() {
       tester,
     ) async {
       // claude-fable's hashed palette slot is the Codex green.
+      QuotaHistorySeriesDto withInterval(QuotaHistorySeriesDto series) =>
+          QuotaHistorySeriesDto(
+            provider: series.provider,
+            windowId: series.windowId,
+            scope: series.scope,
+            modelIds: series.modelIds,
+            label: series.label,
+            points: const [
+              QuotaHistoryPointDto(
+                observedAt: '2026-09-26T14:00:00.000Z',
+                remainingPercent: 40,
+                intervalSeconds: 60,
+              ),
+            ],
+          );
       await pumpChart(
         tester,
         QuotaHistoryDto(
-          generatedAt: fortnight.generatedAt,
-          historySince: fortnight.historySince,
+          generatedAt: generatedAt,
+          historySince: historySince,
           history: [
-            QuotaHistorySeriesDto(
-              provider: 'codex',
-              windowId: 'weekly',
-              label: 'Weekly',
-              points: const [
-                QuotaHistoryPointDto(
-                  observedAt: '2026-09-26T14:00:00.000Z',
-                  remainingPercent: 40,
-                ),
-              ],
+            withInterval(
+              const QuotaHistorySeriesDto(
+                provider: 'codex',
+                windowId: 'weekly',
+                label: 'Weekly',
+                points: [],
+              ),
             ),
-            fable,
+            withInterval(fable),
           ],
         ),
       );
-      final remaining =
+      final throttle =
           tester
                   .widget<CustomPaint>(
-                    find.byKey(const Key('quota-remaining-chart')),
+                    find.byKey(const Key('quota-throttle-interval-chart')),
                   )
                   .painter!
-              as QuotaRemainingChartPainter;
-      expect(remaining.colors[0], const Color(0xFF10B981));
-      expect(remaining.colors[1], isNot(const Color(0xFF10B981)));
+              as QuotaThrottleIntervalChartPainter;
+      expect(throttle.colors[0], const Color(0xFF10B981));
+      expect(throttle.colors[1], isNot(const Color(0xFF10B981)));
     });
 
-    test('breaks the line at resets and gaps and never invents a reading', () {
-      const plot = Rect.fromLTWH(0, 0, 1400, 100);
-      final trace = QuotaRemainingChartPainter.traceFor(
-        fable,
-        DateTime.parse('2026-09-12T15:00:00.000Z'),
-        DateTime.parse('2026-09-26T15:00:00.000Z'),
-        plot,
-      );
-
-      // [Sep 14 ×2] gap [Sep 18] reset [Sep 19 ×2] gap [Sep 21 ×2] reset+gap
-      // [Sep 26 00:30] gap [Sep 26 14:55].
-      expect(trace.segments.map((s) => s.length), [2, 1, 2, 2, 1, 1]);
-      expect(trace.segments.expand((s) => s), hasLength(fable.points.length));
-      // Two resets, each marked between the readings it separates.
-      expect(trace.resetXs, hasLength(2));
-      final sep19 =
-          plot.width *
-          DateTime.parse(firstReset)
-              .difference(DateTime.parse('2026-09-12T15:00:00.000Z'))
-              .inMilliseconds /
-          const Duration(days: 14).inMilliseconds;
-      expect(trace.resetXs.first, closeTo(sep19, 0.01));
-      // A recorded 0% sits on the floor; 100% on the ceiling.
-      expect(trace.segments[4].single.dy, plot.bottom);
-      expect(trace.segments[2].first.dy, plot.top);
-    });
-
-    test('marks a reset once when later readings repeat a passed reset', () {
-      QuotaHistoryPointDto at(String time, double remaining) =>
-          QuotaHistoryPointDto(
-            observedAt: '2026-09-26T$time:00.000Z',
-            remainingPercent: remaining,
-            resetAtIso: '2026-09-26T14:30:00.000Z',
-          );
-      final stale = QuotaHistorySeriesDto(
-        provider: 'claude',
-        windowId: 'weekly',
-        label: 'Weekly',
-        points: [
-          at('14:00', 5),
-          at('14:40', 100),
-          at('14:50', 99),
-          at('15:00', 98),
-        ],
-      );
-      final trace = QuotaRemainingChartPainter.traceFor(
-        stale,
-        DateTime.parse('2026-09-26T13:00:00.000Z'),
-        DateTime.parse('2026-09-26T15:00:00.000Z'),
-        const Rect.fromLTWH(0, 0, 120, 100),
-      );
-      expect(trace.segments.map((s) => s.length), [1, 3]);
-      expect(trace.resetXs, [90]);
-    });
-
-    test('breaks the line at a reading with no remaining value, never 0%', () {
-      final withMissing = QuotaHistorySeriesDto(
-        provider: 'claude',
-        windowId: 'weekly',
-        label: 'Weekly',
-        points: const [
-          QuotaHistoryPointDto(
-            observedAt: '2026-09-26T14:00:00.000Z',
-            remainingPercent: 50,
-          ),
-          QuotaHistoryPointDto(
-            observedAt: '2026-09-26T14:10:00.000Z',
-            remainingPercent: null,
-          ),
-          QuotaHistoryPointDto(
-            observedAt: '2026-09-26T14:20:00.000Z',
-            remainingPercent: 48,
-          ),
-        ],
-      );
-      final trace = QuotaRemainingChartPainter.traceFor(
-        withMissing,
-        DateTime.parse('2026-09-26T13:00:00.000Z'),
-        DateTime.parse('2026-09-26T15:00:00.000Z'),
-        const Rect.fromLTWH(0, 0, 120, 100),
-      );
-      expect(trace.segments.map((s) => s.map((o) => o.dy)), [
-        [50],
-        [52],
-      ]);
-
+    test('parses a missing remaining value as null, never 0%', () {
       expect(
         QuotaHistoryPointDto.fromJson(const {
           'observedAt': '2026-09-26T14:10:00.000Z',
@@ -718,14 +611,7 @@ void main() {
         end,
         plot,
       );
-      final remaining = QuotaRemainingChartPainter.traceFor(
-        stale,
-        start,
-        end,
-        plot,
-      );
       expect(headroom.segments.map((s) => s.length), [1, 1, 1, 1]);
-      expect(remaining.segments.map((s) => s.length), [1, 3]);
     });
 
     test('joins readings across a long silence', () {
@@ -750,15 +636,6 @@ void main() {
           plot,
         ).segments.map((s) => s.length),
         [2],
-      );
-      expect(
-        QuotaRemainingChartPainter.traceFor(
-          sparse,
-          start,
-          end,
-          plot,
-        ).segments.map((s) => s.length),
-        [1, 1],
       );
     });
 
@@ -872,15 +749,18 @@ void main() {
       expect(lowStep, greaterThan(highStep * 10));
     });
 
-    test('keeps a full decade for a flat series and pins sub-second readings', () {
-      final axis = ThrottleLogAxis.forSeries([
-        seriesWith([0.0, 0.25, null]),
-      ]);
-      expect(axis.minExponent, 0);
-      expect(axis.maxExponent, 1);
-      expect(axis.fractionOf(0), 0.0);
-      expect(axis.fractionOf(0.25), 0.0);
-    });
+    test(
+      'keeps a full decade for a flat series and pins sub-second readings',
+      () {
+        final axis = ThrottleLogAxis.forSeries([
+          seriesWith([0.0, 0.25, null]),
+        ]);
+        expect(axis.minExponent, 0);
+        expect(axis.maxExponent, 1);
+        expect(axis.fractionOf(0), 0.0);
+        expect(axis.fractionOf(0.25), 0.0);
+      },
+    );
 
     test('falls back to a default decade when no interval was recorded', () {
       final axis = ThrottleLogAxis.forSeries([

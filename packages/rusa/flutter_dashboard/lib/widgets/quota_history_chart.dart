@@ -60,13 +60,12 @@ const _windowResetShift = Duration(hours: 1);
 
 /// The range a history snapshot covers, from the API's own bounds, so every
 /// label names the range that was actually returned. The API's range is a
-/// whole number of days (`HISTORY_WINDOW_MS`); [phrase] reads "prior 14 days"
+/// whole number of days (`HISTORY_WINDOW_MS`); [phrase] reads "prior 3 days"
 /// and [title] is its heading form.
 ({DateTime start, DateTime end, String phrase, String title})
 quotaHistoryRangeOf(QuotaHistoryDto history) {
   final end =
-      DateTime.tryParse(history.generatedAt)?.toUtc() ??
-      DateTime.now().toUtc();
+      DateTime.tryParse(history.generatedAt)?.toUtc() ?? DateTime.now().toUtc();
   // An unreadable bound draws an empty range rather than a guessed one.
   final start = DateTime.tryParse(history.historySince)?.toUtc() ?? end;
   final days = (end.difference(start).inMinutes / (24 * 60)).round();
@@ -86,8 +85,8 @@ String _providerTitle(String provider) => switch (provider) {
   _ => provider,
 };
 
-/// Time-series plots for quota headroom, throttle period and quota remaining,
-/// each carrying its own color key directly beneath it.
+/// Time-series plots for quota headroom and throttle period, each carrying its
+/// own color key directly beneath it.
 class QuotaHistoryChart extends StatelessWidget {
   const QuotaHistoryChart({
     super.key,
@@ -147,13 +146,6 @@ class QuotaHistoryChart extends StatelessWidget {
         .where(
           (series) => series.points.any(
             (point) => point.intervalSeconds?.isFinite ?? false,
-          ),
-        )
-        .toList();
-    final remainingSeries = visible
-        .where(
-          (series) => series.points.any(
-            (point) => point.remainingPercent?.isFinite ?? false,
           ),
         )
         .toList();
@@ -218,29 +210,6 @@ class QuotaHistoryChart extends StatelessWidget {
           series: throttleSeries,
           colors: colors,
           emptyLegend: 'No throttle decisions recorded in the $range.',
-          isStale: isStale,
-        ),
-        const SizedBox(height: 16),
-        _ChartSection(
-          title: 'Quota Remaining',
-          subtitle:
-              'The share of each weekly quota still unused, as recorded. '
-              'Dashed lines mark quota resets; breaks mark missing readings.',
-          semanticsLabel:
-              'Quota remaining over the $range. '
-              'Vertical scale zero to one hundred percent remaining.'
-              '$cachedNote',
-          chartKey: const Key('quota-remaining-chart'),
-          endLabelKey: const Key('quota-remaining-end-label'),
-          painter: QuotaRemainingChartPainter(
-            series: remainingSeries,
-            colors: [for (final s in remainingSeries) colors[s]!],
-            start: start,
-            end: end,
-          ),
-          series: remainingSeries,
-          colors: colors,
-          emptyLegend: 'No quota readings recorded in the $range.',
           isStale: isStale,
         ),
       ],
@@ -379,30 +348,17 @@ class _LegendItem extends StatelessWidget {
   }
 }
 
-/// Where one series lands on a plot: the connected runs of readings, and the
-/// x position of each quota reset between them.
+/// Where one series lands on a plot: the connected runs of readings.
 @visibleForTesting
 class QuotaSeriesTrace {
-  const QuotaSeriesTrace({required this.segments, required this.resetXs});
+  const QuotaSeriesTrace({required this.segments});
 
   final List<List<Offset>> segments;
-  final List<double> resetXs;
 }
-
-/// Whether the reading at [observedAt], reporting [resetAt], starts a new
-/// quota window after the last drawn reading.
-typedef _ResetRule =
-    bool Function(
-      DateTime observedAt,
-      DateTime resetAt,
-      DateTime lastObservedAt,
-      DateTime lastResetAt,
-    );
 
 /// Maps one series onto [plot]. [valueOf] picks the reading a chart plots, or
 /// null where there is none, and [yFor] places it. Readings outside the range
-/// are skipped and a reading without a value breaks the line. The reset and
-/// gap rules intentionally differ between charts, so each passes its own.
+/// are skipped, and a reading without a value or after a reset breaks the line.
 QuotaSeriesTrace _traceSeries(
   QuotaHistorySeriesDto series, {
   required DateTime start,
@@ -410,15 +366,10 @@ QuotaSeriesTrace _traceSeries(
   required Rect plot,
   required double? Function(QuotaHistoryPointDto point) valueOf,
   required double Function(double value) yFor,
-  required _ResetRule isReset,
-  bool Function(DateTime observedAt, DateTime lastObservedAt)? isGap,
 }) {
   final spanMs = end.millisecondsSinceEpoch - start.millisecondsSinceEpoch;
   final segments = <List<Offset>>[];
-  final resetXs = <double>[];
-  if (spanMs <= 0) {
-    return QuotaSeriesTrace(segments: segments, resetXs: resetXs);
-  }
+  if (spanMs <= 0) return QuotaSeriesTrace(segments: segments);
   double xFor(DateTime at) =>
       plot.left +
       ((at.millisecondsSinceEpoch - start.millisecondsSinceEpoch) / spanMs)
@@ -427,7 +378,6 @@ QuotaSeriesTrace _traceSeries(
 
   List<Offset>? current;
   DateTime? lastResetAt;
-  DateTime? lastObservedAt;
   for (final point in series.points) {
     // A reading that can't be placed on the axis is skipped, not a break.
     final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
@@ -450,54 +400,33 @@ QuotaSeriesTrace _traceSeries(
     final reset =
         lastResetAt != null &&
         resetAt != null &&
-        isReset(observedAt, resetAt, lastObservedAt!, lastResetAt);
-    if (reset) {
-      // Mark the reported reset instant, kept between the two readings it
-      // separates.
-      var marker = lastResetAt;
-      if (marker.isBefore(lastObservedAt)) marker = lastObservedAt;
-      if (marker.isAfter(observedAt)) marker = observedAt;
-      resetXs.add(xFor(marker));
-    }
-    final gap =
-        isGap != null &&
-        lastObservedAt != null &&
-        isGap(observedAt, lastObservedAt);
+        _windowReset(observedAt, resetAt, lastResetAt);
 
     final offset = Offset(xFor(observedAt), yFor(value));
-    if (current == null || reset || gap) {
+    if (current == null || reset) {
       if (current != null) segments.add(current);
       current = [offset];
     } else {
       current.add(offset);
     }
     lastResetAt = resetAt;
-    lastObservedAt = observedAt;
   }
   if (current != null) segments.add(current);
-  return QuotaSeriesTrace(segments: segments, resetXs: resetXs);
+  return QuotaSeriesTrace(segments: segments);
 }
 
-/// The controller plots break at every reading after the last reading's
-/// reported reset, and wherever that instant moves.
-bool _controllerWindowReset(
+/// The plots break at every reading after the last reading's reported reset,
+/// and wherever that instant moves.
+bool _windowReset(
   DateTime observedAt,
   DateTime resetAt,
-  DateTime lastObservedAt,
   DateTime lastResetAt,
 ) =>
     resetAt.difference(lastResetAt).abs() > _windowResetShift ||
     observedAt.isAfter(lastResetAt);
 
-/// Strokes each segment of [trace] in [color]. With [dotEveryReading] every
-/// reading also gets a dot; otherwise only a lone reading does, so it stays
-/// visible without a line.
-void _paintTrace(
-  Canvas canvas,
-  QuotaSeriesTrace trace,
-  Color color, {
-  required bool dotEveryReading,
-}) {
+/// Strokes each segment of [trace] in [color], with a dot at every reading.
+void _paintTrace(Canvas canvas, QuotaSeriesTrace trace, Color color) {
   final linePaint = Paint()
     ..color = color
     ..strokeWidth = 2
@@ -517,7 +446,6 @@ void _paintTrace(
     ..color = color
     ..style = PaintingStyle.fill;
   for (final seg in trace.segments) {
-    if (!dotEveryReading && seg.length > 1) continue;
     for (final point in seg) {
       canvas.drawCircle(point, 2.5, dotPaint);
     }
@@ -607,7 +535,6 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
     valueOf: (point) => point.error,
     yFor: (error) =>
         plot.top + ((50.0 - error.clamp(-50.0, 50.0)) / 100.0) * plot.height,
-    isReset: _controllerWindowReset,
   );
 
   @override
@@ -636,9 +563,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
         Offset(plot.right, y),
         percent == 0 ? zeroPaint : gridPaint,
       );
-      final labelText = percent > 0
-          ? '+$percent%'
-          : '$percent%';
+      final labelText = percent > 0 ? '+$percent%' : '$percent%';
       _paintAxisLabel(
         canvas,
         labelText,
@@ -650,12 +575,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
     _paintTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
-      _paintTrace(
-        canvas,
-        traceFor(series[i], start, end, plot),
-        colors[i],
-        dotEveryReading: true,
-      );
+      _paintTrace(canvas, traceFor(series[i], start, end, plot), colors[i]);
     }
   }
 
@@ -761,7 +681,6 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
         ? point.intervalSeconds
         : null,
     yFor: yFor,
-    isReset: _controllerWindowReset,
   );
 
   @override
@@ -820,137 +739,12 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
         canvas,
         traceFor(series[i], start, end, plot, yFor),
         colors[i],
-        dotEveryReading: true,
       );
     }
   }
 
   @override
   bool shouldRepaint(covariant QuotaThrottleIntervalChartPainter oldDelegate) =>
-      oldDelegate.series != series ||
-      oldDelegate.colors != colors ||
-      oldDelegate.start != start ||
-      oldDelegate.end != end;
-}
-
-/// Paints the recorded quota remaining, 0% to 100%, for every series with a
-/// reading. Unlike headroom and throttle it needs no controller decision, so
-/// model history recorded before its lane had a controller still draws (#706).
-///
-/// Only recorded readings are drawn. The line breaks at a quota reset (marked
-/// by a dashed vertical line), at a reading with no value, and across any
-/// stretch longer than [maxJoinGap] without a reading, so a gap never reads
-/// as a flat or zero value.
-class QuotaRemainingChartPainter extends CustomPainter {
-  QuotaRemainingChartPainter({
-    required this.series,
-    required this.colors,
-    required this.start,
-    required this.end,
-  });
-
-  final List<QuotaHistorySeriesDto> series;
-
-  /// One color per [series] entry, matching the legend.
-  final List<Color> colors;
-  final DateTime start;
-  final DateTime end;
-
-  /// The longest silence still drawn as one line. The API keeps the newest
-  /// reading in each 30-minute bucket of the 14-day range, so readings kept
-  /// from adjacent buckets can sit almost 60 minutes apart with nothing
-  /// missing; this must stay comfortably above 60 minutes. Two hours breaks
-  /// the line only after at least three empty buckets in a row. It is a
-  /// judgment call, not fitted to the recording cadence, which is minutes.
-  static const maxJoinGap = Duration(hours: 2);
-
-  static const _left = 42.0;
-  static const _right = 10.0;
-  static const _top = 10.0;
-  static const _bottom = 27.0;
-
-  /// Map one series onto [plot], breaking at resets and gaps.
-  @visibleForTesting
-  static QuotaSeriesTrace traceFor(
-    QuotaHistorySeriesDto series,
-    DateTime start,
-    DateTime end,
-    Rect plot,
-  ) => _traceSeries(
-    series,
-    start: start,
-    end: end,
-    plot: plot,
-    valueOf: (point) => (point.remainingPercent?.isFinite ?? false)
-        ? point.remainingPercent
-        : null,
-    yFor: (remaining) =>
-        plot.top + (1 - remaining.clamp(0.0, 100.0) / 100) * plot.height,
-    isReset: _windowReset,
-    isGap: (observedAt, lastObservedAt) =>
-        observedAt.difference(lastObservedAt) > maxJoinGap,
-  );
-
-  /// A reset is the reported instant moving, or the readings crossing it.
-  /// Readings that keep repeating a passed instant are one reset.
-  static bool _windowReset(
-    DateTime observedAt,
-    DateTime resetAt,
-    DateTime lastObservedAt,
-    DateTime lastResetAt,
-  ) =>
-      resetAt.difference(lastResetAt).abs() > _windowResetShift ||
-      (observedAt.isAfter(lastResetAt) && !lastObservedAt.isAfter(lastResetAt));
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final plot = Rect.fromLTRB(
-      _left,
-      _top,
-      size.width - _right,
-      size.height - _bottom,
-    );
-    if (plot.width <= 0 || plot.height <= 0) return;
-
-    final gridPaint = Paint()
-      ..color = MeshColors.border.withValues(alpha: 0.7)
-      ..strokeWidth = 1;
-    for (final percent in [100, 75, 50, 25, 0]) {
-      final y = plot.top + (1 - percent / 100) * plot.height;
-      canvas.drawLine(Offset(plot.left, y), Offset(plot.right, y), gridPaint);
-      _paintAxisLabel(
-        canvas,
-        '$percent%',
-        Offset(0, y - 7),
-        width: _left - 6,
-        align: TextAlign.right,
-      );
-    }
-    _paintTimeAxis(canvas, plot, start, end, gridPaint);
-
-    for (var i = 0; i < series.length; i++) {
-      final trace = traceFor(series[i], start, end, plot);
-      final color = colors[i];
-
-      final resetPaint = Paint()
-        ..color = color.withValues(alpha: 0.45)
-        ..strokeWidth = 1;
-      for (final x in trace.resetXs) {
-        for (var y = plot.top; y < plot.bottom; y += 6) {
-          canvas.drawLine(
-            Offset(x, y),
-            Offset(x, math.min(y + 3, plot.bottom)),
-            resetPaint,
-          );
-        }
-      }
-
-      _paintTrace(canvas, trace, color, dotEveryReading: false);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant QuotaRemainingChartPainter oldDelegate) =>
       oldDelegate.series != series ||
       oldDelegate.colors != colors ||
       oldDelegate.start != start ||
