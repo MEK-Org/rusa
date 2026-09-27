@@ -21,7 +21,11 @@ import type {
   FollowerUpdateStatusEvent,
   LeaderCommand,
 } from "./protocol.js";
-import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import {
+  INSTANCE_PROTOCOL_VERSION,
+  isSupportedFollowerProtocol,
+  OLDEST_FOLLOWER_PROTOCOL_VERSION,
+} from "./protocol.js";
 import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
 import { isSafeFollowerBind } from "./safe-bind.js";
 
@@ -440,10 +444,27 @@ export class FollowerHub {
       return;
     }
     if (path === "/register") {
-      if (body.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
+      // Every refusal is logged: a follower the hub never registers is otherwise
+      // invisible, and a stuck rollout looks like silence.
+      const rejectRegistration = (reason: string, extra: Record<string, unknown> = {}): void => {
+        this.log.warn("follower_register_rejected", {
+          reason,
+          followerId: body.id,
+          protocolVersion: body.protocolVersion,
+          commitSha: body.commitSha,
+          ...extra,
+        });
+      };
+      if (!isSupportedFollowerProtocol(body.protocolVersion)) {
+        rejectRegistration("incompatible_protocol", {
+          supportedProtocolVersions: [OLDEST_FOLLOWER_PROTOCOL_VERSION, INSTANCE_PROTOCOL_VERSION],
+        });
         reply(res, 409, { error: "Incompatible instance protocol; rebuild leader and follower" });
         return;
       }
+      // The session speaks the follower's protocol, which the reply echoes: a
+      // follower accepts only its own version back.
+      const protocolVersion = body.protocolVersion;
       if (
         typeof body.id !== "string" ||
         !/^[a-zA-Z0-9_-]{1,64}$/.test(body.id) ||
@@ -452,6 +473,7 @@ export class FollowerHub {
         typeof body.generation !== "string" ||
         !/^[a-zA-Z0-9_-]{1,128}$/.test(body.generation)
       ) {
+        rejectRegistration("invalid_identity");
         throw new Error("Invalid follower identity");
       }
       const existing = this.followers.get(body.id);
@@ -459,6 +481,7 @@ export class FollowerHub {
       if (superseded?.has(body.generation)) {
         // An older process must never reclaim this ID, even after its newer
         // replacement has stopped; its session and any queued work are stale.
+        rejectRegistration("superseded_generation");
         reply(res, 409, { error: "Follower generation was superseded" });
         return;
       }
@@ -479,7 +502,7 @@ export class FollowerHub {
           }
           reply(res, 200, {
             session: existing.session,
-            protocolVersion: INSTANCE_PROTOCOL_VERSION,
+            protocolVersion: existing.protocolVersion,
             leaderToken: this.leaderToken,
           });
           return;
@@ -500,7 +523,7 @@ export class FollowerHub {
         body.pid,
         tracker,
         commitSha,
-        body.protocolVersion as number,
+        protocolVersion,
         body.generation,
         FollowerHub.STALE_AFTER_MS
       );
@@ -511,6 +534,7 @@ export class FollowerHub {
         platform: follower.platform,
         pid: follower.pid,
         commitSha: follower.commitSha,
+        protocolVersion: follower.protocolVersion,
       });
       for (const listener of this.onRegisterListeners) {
         try {
@@ -521,7 +545,7 @@ export class FollowerHub {
       }
       reply(res, 200, {
         session: follower.session,
-        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        protocolVersion,
         leaderToken: this.leaderToken,
       });
       return;
