@@ -89,6 +89,11 @@ export class ActorHandle implements MeshActor {
    * admission request; that request is refused as cancelled when it arrives.
    */
   private pendingQueuedCancel = false;
+  /**
+   * The pool changed between the follower's queued report and its admission
+   * request, which was quoted under the old pool; refuse it as stale on arrival.
+   */
+  private pendingQueuedRequote = false;
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
@@ -386,6 +391,8 @@ export class ActorHandle implements MeshActor {
   private rejectCancelledAdmission(requestId: number): boolean {
     if (!this.pendingQueuedCancel) return false;
     this.pendingQueuedCancel = false;
+    // The resumed start asks again under the pool the follower holds by then.
+    this.pendingQueuedRequote = false;
     this.pendingQueuedPromotion = false;
     this.send({ type: "cancelQueued" });
     this.send({ type: "reply", requestId, error: COORDINATOR_ADMISSION_CANCELLED_ERROR });
@@ -462,21 +469,68 @@ export class ActorHandle implements MeshActor {
     return { preempted: false };
   }
 
+  /**
+   * Adopt the next-run pool, as a local Actor does. A queued reservation keeps
+   * its quote until the mesh decides what the change means for it: a
+   * {@link rescheduleQueuedRun} re-quote, or a {@link cancelQueuedRun} when the
+   * new pool cannot run.
+   */
   setModelConfig(modelConfig: ProviderModelConfig[]): void {
     if (sameModelConfigPool(this.modelConfig, modelConfig)) return;
     this.modelConfig = [...modelConfig];
     this.modelConfigGeneration++;
     this.send({ type: "modelConfig", modelConfig: [...modelConfig] });
-    // Keep remote placement at the same queued-start boundary as a local Actor:
-    // update the follower's pool first, then make each stale reservation retry
-    // the same opportunity through its current provider candidates. A retained
-    // reservation stays untouched until attachHost can perform that re-quote.
-    if (this.closed || !this.channel.connected) return;
-    for (const gate of this.gates.values()) {
-      if (gate.handle.started) continue;
-      gate.modelConfigStale = true;
-      gate.handle.cancel?.();
+  }
+
+  /**
+   * Retry a reservation quoted under an older pool through the current one.
+   * The `modelConfig` command already precedes the stale reply on the channel,
+   * so the follower's Actor re-asks for the same opportunity under that pool.
+   */
+  rescheduleQueuedRun(): boolean {
+    if (this.terminated) return false;
+    if (this.closed || !this.channel.connected) {
+      // attachHost's init carries the current pool, and claimRetainedAdmission
+      // re-quotes a ticket quoted under an older one.
+      const retained = this.retainedAdmission && this.gates.get(this.retainedAdmission.requestId);
+      return (
+        retained !== undefined && retained.modelConfigGeneration !== this.modelConfigGeneration
+      );
     }
+    let rescheduled = false;
+    for (const gate of this.gates.values()) {
+      if (gate.handle.started || gate.modelConfigGeneration === this.modelConfigGeneration) {
+        continue;
+      }
+      // Repeated updates before the stale reply unwinds share that one retry.
+      if (gate.modelConfigStale) {
+        rescheduled = true;
+        continue;
+      }
+      gate.modelConfigStale = true;
+      if (gate.handle.cancel?.()) rescheduled = true;
+    }
+    if (
+      !rescheduled &&
+      this.state === "queued" &&
+      !this.runOpen &&
+      this.gates.size === 0 &&
+      !this.pendingQueuedCancel
+    ) {
+      this.pendingQueuedRequote = true;
+      rescheduled = true;
+    }
+    // As Actor.rescheduleQueuedRun: the old quote's recorded selection is gone.
+    if (rescheduled) this.opts.context.onQueuedRunCancelled?.();
+    return rescheduled;
+  }
+
+  /** Refuse an admission request quoted under a pool replaced before it arrived. */
+  private rejectStaleAdmission(requestId: number): boolean {
+    if (!this.pendingQueuedRequote) return false;
+    this.pendingQueuedRequote = false;
+    this.send({ type: "reply", requestId, error: COORDINATOR_MODEL_CONFIG_CHANGED_ERROR });
+    return true;
   }
 
   close(): void {
@@ -489,6 +543,7 @@ export class ActorHandle implements MeshActor {
     this.pendingPreempt = false;
     this.pendingQueuedPromotion = false;
     this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
     this.resumeCancelledPending = false;
     this.outstandingPreempt = undefined;
     void this.cancelRetainedAdmission();
@@ -532,6 +587,7 @@ export class ActorHandle implements MeshActor {
     if (!this.retainedAdmission) this.pendingQueuedPromotion = false;
     // The follower re-derives its queued run on reattach; that is a fresh request.
     this.pendingQueuedCancel = false;
+    this.pendingQueuedRequote = false;
   }
 
   private releaseGates(): void {
@@ -994,6 +1050,7 @@ export class ActorHandle implements MeshActor {
                 // Any other admission says the retained run is not coming back.
                 await this.cancelRetainedAdmission();
                 if (this.rejectCancelledAdmission(requestId)) return;
+                if (this.rejectStaleAdmission(requestId)) return;
                 // A responsive item that landed between the follower's queued
                 // report and this request is admitted at the priority it asked
                 // for, not the one the follower knew about when it asked.
