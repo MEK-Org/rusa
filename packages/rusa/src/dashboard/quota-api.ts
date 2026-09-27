@@ -129,7 +129,7 @@ export interface QuotaHistoryDto {
   /** Inclusive lower bound for the quota history returned with this snapshot. */
   historySince: string;
   /**
-   * Durable real-scrape readings from the prior `HISTORY_WINDOW_MS` (14 days),
+   * Durable real-scrape readings from the prior `HISTORY_WINDOW_MS` (3 days),
    * grouped by quota pool, each series bounded to `MAX_HISTORY_POINTS_PER_SERIES`.
    */
   history: QuotaHistorySeriesDto[];
@@ -299,9 +299,8 @@ export { HISTORY_WINDOW_MS };
 
 /**
  * Most points one history series may carry to the dashboard. Five-minute
- * readings over the 14-day range would be ~4,000 per series; 672 is one per
- * half hour. This is a reading of #706's "bounded" ask, not a measured
- * response or paint budget: half-hourly is finer than the chart can draw.
+ * readings over the 3-day range would be ~865 per series; 672 keeps the bound
+ * #708 shipped. It is not a measured response or paint budget.
  */
 export const MAX_HISTORY_POINTS_PER_SERIES = 672;
 
