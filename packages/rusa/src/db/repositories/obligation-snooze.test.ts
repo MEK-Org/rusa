@@ -168,6 +168,16 @@ describe("obligation snooze (#722)", () => {
       expect(moved.snoozedUntil).toBe(iso(T0 + HOUR));
       expect(snooze("a", null, "actor-b").snoozedUntil).toBeNull();
     });
+
+    it("survives working the obligation: checkpoint and artifact writes keep it", () => {
+      snooze("a", iso(T0 + HOUR));
+      repository.setCheckpoint("a", "waiting on the quota reset", "actor-a");
+      repository.attachArtifact("a", "github:MEK-Org/rusa/issues/722", { attachedBy: "actor-a" });
+      const worked = repository.require("a");
+      expect(worked.snoozedUntil).toBe(iso(T0 + HOUR));
+      expect(worked.status).toBe("ready");
+      expect(repository.readyHeads().has("actor-a")).toBe(false);
+    });
   });
 
   describe("attention gate", () => {
