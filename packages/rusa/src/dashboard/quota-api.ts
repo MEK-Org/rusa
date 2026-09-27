@@ -157,6 +157,13 @@ export interface QuotaApiDeps {
   getThrottle?: (provider: SupportedProvider) => QuotaThrottleStatus | null;
   /** Canonical quota evidence joined to the controller decision persisted for that observation. */
   listHistory?: (provider: SupportedProvider, sinceIso: string) => readonly QuotaHistorySource[];
+  /**
+   * Awaited per provider before `GET /api/quota/history` reads `listHistory`
+   * (#707): refills a provider whose history has never been read, or whose last
+   * read failed, instead of serving empty history until the next periodic
+   * refresh. Must resolve (never reject) within a bounded time.
+   */
+  readThroughHistory?: (provider: SupportedProvider) => Promise<void>;
   /** Wall-clock timestamp source, injectable for tests. Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -509,6 +516,16 @@ export async function handleQuotaApiRequest(
   }
   try {
     if (url.pathname === HISTORY_PATH) {
+      if (deps.readThroughHistory) {
+        const readThrough = deps.readThroughHistory;
+        // The production client resolves a failed provider to its last-good
+        // history (or no history). Keep that provider isolation at the route
+        // boundary too, so an unexpected rejection cannot suppress the other
+        // providers' cached series.
+        await Promise.allSettled(
+          (deps.providers ?? SUPPORTED_PROVIDERS).map((p) => readThrough(p))
+        );
+      }
       const historySnapshot = buildQuotaHistorySnapshot(deps);
       sendJson(res, 200, historySnapshot);
     } else {
