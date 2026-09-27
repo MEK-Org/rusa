@@ -94,6 +94,12 @@ export class ActorHandle implements MeshActor {
    * request, which was quoted under the old pool; refuse it as stale on arrival.
    */
   private pendingQueuedRequote = false;
+  /**
+   * The oldest pool generation the follower's next admission request can have
+   * been quoted under: the pool at its queued report, or at the latest re-quote
+   * the leader asked for. Only a pool newer than this makes that request stale.
+   */
+  private quotedGeneration = 0;
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
@@ -498,6 +504,7 @@ export class ActorHandle implements MeshActor {
       );
     }
     let rescheduled = false;
+    let cancelledGate = false;
     for (const gate of this.gates.values()) {
       if (gate.handle.started || gate.modelConfigGeneration === this.modelConfigGeneration) {
         continue;
@@ -508,20 +515,25 @@ export class ActorHandle implements MeshActor {
         continue;
       }
       gate.modelConfigStale = true;
-      if (gate.handle.cancel?.()) rescheduled = true;
+      if (gate.handle.cancel?.()) rescheduled = cancelledGate = true;
     }
     if (
       !rescheduled &&
       this.state === "queued" &&
       !this.runOpen &&
       this.gates.size === 0 &&
-      !this.pendingQueuedCancel
+      !this.pendingQueuedCancel &&
+      this.quotedGeneration !== this.modelConfigGeneration
     ) {
       this.pendingQueuedRequote = true;
       rescheduled = true;
     }
+    // The stale reply follows the `modelConfig` command, so the re-ask is quoted
+    // under the current pool.
+    if (rescheduled) this.quotedGeneration = this.modelConfigGeneration;
     // As Actor.rescheduleQueuedRun: the old quote's recorded selection is gone.
-    if (rescheduled) this.opts.context.onQueuedRunCancelled?.();
+    // Only a gate records one; the request-in-flight branch has none to clear.
+    if (cancelledGate) this.opts.context.onQueuedRunCancelled?.();
     return rescheduled;
   }
 
@@ -847,6 +859,11 @@ export class ActorHandle implements MeshActor {
         clearTimeout(this.stateStaleTimer);
         this.stateStaleTimer = undefined;
         const reattachReport = this.stateStale || this.stateUnconfirmed;
+        // A fresh queued report, including the follower's re-derived run after
+        // a reattach, quotes the pool the leader has already sent.
+        if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
+          this.quotedGeneration = this.modelConfigGeneration;
+        }
         this.state = message.state;
         this.yielded = message.yielded;
         this.stateStale = false;
@@ -1050,7 +1067,6 @@ export class ActorHandle implements MeshActor {
                 // Any other admission says the retained run is not coming back.
                 await this.cancelRetainedAdmission();
                 if (this.rejectCancelledAdmission(requestId)) return;
-                if (this.rejectStaleAdmission(requestId)) return;
                 // A responsive item that landed between the follower's queued
                 // report and this request is admitted at the priority it asked
                 // for, not the one the follower knew about when it asked.
@@ -1074,6 +1090,9 @@ export class ActorHandle implements MeshActor {
                 }
                 // Cancelled while the host-authority preflight was pending.
                 if (this.rejectCancelledAdmission(requestId)) return;
+                // Quoted under a replaced pool, including one pinned during that
+                // preflight: refuse it before its candidates are reserved.
+                if (this.rejectStaleAdmission(requestId)) return;
                 let release!: () => void;
                 const finished = new Promise<void>((resolve) => {
                   release = resolve;

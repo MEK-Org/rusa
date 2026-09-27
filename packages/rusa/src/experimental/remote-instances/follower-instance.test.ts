@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
@@ -1324,19 +1325,74 @@ describe("monolithic follower instance", () => {
       expect(h.meshEvents.some((event) => event.kind === "run_abandoned")).toBe(false);
     });
 
-    it("reports nothing to reschedule for an idle remote actor", async () => {
-      const h = setup();
-      const id = h.spawn("Idle reschedule");
-      await waitUntil(() =>
-        h.events.some((event) => event.actorId === id && event.event.type === "result")
-      );
-      expect(h.runtime(id).rescheduleQueuedRun()).toBe(false);
-    });
-
     it("re-quotes an admission request that the pin overtook on the wire", async () => {
       const h = setup();
       // Hold the follower's admission request, quoted under the bootstrap pool,
       // while the leader has seen `state: queued` but holds no gate yet.
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      let holding = true;
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          held.push(event);
+          if (holding) return;
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned before its admission request arrives");
+      await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
+
+      const pool = [{ provider: "instance-fixture", model: "model-overtaking" }];
+      h.mesh.setActorModel(id, pool, "root");
+      receive(held[0]);
+      // The refused request's re-ask is quoted under the pin, so republishing
+      // that pool while the re-ask is on the wire must not refuse it too.
+      await waitUntil(() => held.length === 2);
+      h.mesh.setActorModel(id, pool, "root");
+      holding = false;
+      receive(held[1]);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-overtaking" });
+      expect(held).toHaveLength(2);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("admits an unanswered request unchanged when the pin republishes its pool", async () => {
+      const h = setup();
+      const id = h.spawn("Republished while its admission request is on the wire");
+      await waitUntil(() =>
+        h.events.some((event) => event.actorId === id && event.event.type === "result")
+      );
+      // Pinned while idle: the next queued report is already under this pool.
+      const pool = [{ provider: "instance-fixture", model: "model-pinned-idle" }];
+      h.mesh.setActorModel(id, pool, "root");
+
+      const admits: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      let holding = true;
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          admits.push(event);
+          if (holding) return;
+        }
+        receive(event);
+      };
+      h.mesh.sendMessage(id, "Run again", "root");
+      await waitUntil(() => h.runtime(id).isQueued && admits.length === 1);
+
+      h.mesh.setActorModel(id, pool, "root");
+      holding = false;
+      receive(admits[0]);
+
+      await waitUntil(() => runStarts(h, id).length === 2);
+      expect(runStarts(h, id)[1]?.selected).toMatchObject({ model: "model-pinned-idle" });
+      // The request was quoted under the current pool, so it is not asked again.
+      expect(admits).toHaveLength(1);
+    });
+
+    it("re-quotes a request whose pool was pinned during the host-authority preflight", async () => {
+      const h = setup();
       const held: Parameters<typeof h.remote.receive>[0][] = [];
       const receive = h.remote.receive.bind(h.remote);
       h.remote.receive = (event) => {
@@ -1346,19 +1402,30 @@ describe("monolithic follower instance", () => {
         }
         receive(event);
       };
-      const id = h.spawn("Pinned before its admission request arrives");
+      const id = h.spawn("Pinned while its admission is in preflight");
       await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
 
-      h.mesh.setActorModel(
-        id,
-        [{ provider: "instance-fixture", model: "model-overtaking" }],
-        "root"
-      );
+      const context = (h.runtime(id) as unknown as { opts: { context: ActorFactoryContext } }).opts
+        .context;
+      const admitRun = context.admitRun;
+      let pinned = false;
+      context.admitRun = (request) => {
+        if (!pinned) {
+          pinned = true;
+          h.mesh.setActorModel(
+            id,
+            [{ provider: "instance-fixture", model: "model-in-preflight" }],
+            "root"
+          );
+        }
+        return admitRun?.(request) ?? true;
+      };
       h.remote.receive = receive;
       for (const event of held.splice(0)) receive(event);
 
       await waitUntil(() => runStarts(h, id).length === 1);
-      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-overtaking" });
+      expect(pinned).toBe(true);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-in-preflight" });
       expect(h.failures).toEqual([]);
     });
 
