@@ -8,6 +8,7 @@ import {
   deliverHostAlarm,
   diskAlertUncovered,
   hostAlarmProducerActive,
+  quotaModelLaneRetiredEvent,
 } from "./start.js";
 
 /** The minimum a loaded config carries; every case below varies only observability. */
@@ -95,6 +96,28 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
     expect(configuredRootEventSources(config)).toEqual(
       expect.arrayContaining(["gchat:spaces", "system:events"])
     );
+  });
+});
+
+describe("quota model lane retirement alarm (#588)", () => {
+  it("keeps system:events covered for the quota throttle when the disk sensor is off", () => {
+    const config = {
+      ...withObservability({ diskAlert: { enabled: false } }),
+      quota: { throttle: { enabled: true } },
+    } as unknown as RusaConfig;
+    expect(hostAlarmProducerActive(config)).toBe(true);
+    expect(configuredRootEventSources(config)).toContain("system:events");
+  });
+
+  it("names the provider and model and asks root to check the scrapes", () => {
+    const event = quotaModelLaneRetiredEvent("claude", "claude-fable-5-1");
+    expect(event).toMatchObject({
+      type: "system.quota_model_lane_retired",
+      provider: "claude",
+      model: "claude-fable-5-1",
+    });
+    expect(event.message).toContain("claude-fable-5-1");
+    expect(event.message).toContain("check the scrapes");
   });
 });
 

@@ -470,11 +470,14 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
 
 /**
  * Every producer that raises host alarms into `system:events`: the disk sensor,
- * and the chat subscription keeper's lapse alert (#578) whenever chat is
- * configured. Root's `system:events` ownership is derived from this same call.
+ * the chat subscription keeper's lapse alert (#578) whenever chat is
+ * configured, and the quota throttle's model lane retirement alert (#588).
+ * Root's `system:events` ownership is derived from this same call.
  */
 export function hostAlarmProducerActive(config: RusaConfig): boolean {
-  return diskAlertActive(config) || config.chat !== undefined;
+  return (
+    diskAlertActive(config) || config.chat !== undefined || config.quota?.throttle?.enabled === true
+  );
 }
 
 /**
@@ -489,6 +492,31 @@ export function diskAlertUncovered(
 ): boolean {
   if (!diskAlertActive(config)) return false;
   return !configuredRoots.some((configured) => isSubResourceOf("system:events", configured));
+}
+
+/** The host alarm raised when a model lane the coordinator published retires (#588). */
+export interface SystemQuotaModelLaneRetiredEvent {
+  [key: string]: unknown;
+  type: "system.quota_model_lane_retired";
+  provider: string;
+  model: string;
+  message: string;
+}
+
+export function quotaModelLaneRetiredEvent(
+  provider: string,
+  model: string
+): SystemQuotaModelLaneRetiredEvent {
+  return {
+    type: "system.quota_model_lane_retired",
+    provider,
+    model,
+    message:
+      `Quota model lane retired: ${provider} no longer publishes a window for ${model}, ` +
+      "which now paces on its provider lane alone. The window stopped appearing in quota " +
+      "readings and no new reading arrived before it retired; check the scrapes to confirm " +
+      "whether it is really gone.",
+  };
 }
 
 /** What happened to a host-level alarm once it left the sensor. */
@@ -1718,8 +1746,10 @@ async function composeStart(
     return (modelExhaustedUntilMs.get(modelPacerKey(lane, model)) ?? 0) > nowMs;
   };
   // Model pacers whose windows the coordinator no longer publishes, so a
-  // retirement is logged once rather than only as a zero interval per apply.
+  // retirement is logged and raised to root once rather than only as a zero
+  // interval per apply. The alarm is bound once the mesh exists.
   const retiredModelPacers = new Set<string>();
+  let raiseModelLaneRetiredAlarm: ((event: SystemQuotaModelLaneRetiredEvent) => void) | null = null;
   const applyModelLaneStatuses = (lane: string, status: PublishedThrottleProviderStatus): void => {
     for (const [key, entry] of modelPacers) {
       if (entry.lane !== lane) continue;
@@ -1731,6 +1761,7 @@ async function composeStart(
         } else if (!retiredModelPacers.has(key)) {
           retiredModelPacers.add(key);
           log.info("quota_model_lane_retired", { provider: lane, model: entry.model });
+          raiseModelLaneRetiredAlarm?.(quotaModelLaneRetiredEvent(lane, entry.model));
         }
         log.info("quota_model_lane_throttle", {
           provider: lane,
@@ -4463,6 +4494,31 @@ async function composeStart(
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
   }
+
+  raiseModelLaneRetiredAlarm = (event) => {
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: event,
+          priority: "responsive",
+          eventSummary: event.message,
+        }),
+      message: event.message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_model_lane_retired",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_model_lane_retired_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: event.provider,
+          model: event.model,
+        });
+      }
+    });
+  };
 
   const diskAlertConfig = config.observability?.diskAlert;
   const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);

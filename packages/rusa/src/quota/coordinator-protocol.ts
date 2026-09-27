@@ -388,32 +388,66 @@ export function publishedThrottle(
   const hardStaleAfterMs =
     options?.hardStaleAfterMs ?? freshnessThresholds(options?.mode).hardStaleAfterMs;
   const providerUpdatedMs = Date.parse(stored.updatedAt);
-  // A model lane is retired, not hard-staled, once the provider has kept
-  // reporting for longer than the hard-stale horizon without it: the window
-  // is no longer on the panel, and pinning that model at the ceiling for the
-  // rest of observation retention would be a stale reading, not caution. A
-  // coordinator that stops collecting ages both lanes together instead, so
-  // the conservative widening still applies there. A lane last seen exhausted
-  // is not retired before its exhaustion deadline: until then it stays
-  // published, hard-staled, so the candidate keeps deferring to the deadline
-  // rather than pacing faster because its window vanished.
   const nowMs = options?.nowMs ?? Date.now();
+  // A model lane the provider's newest reading no longer includes is
+  // dead-reckoned: its window stopped appearing, so it keeps the interval of
+  // its last reading, not the hard-stale ceiling, until that window's reset
+  // (or, if later, its #712 exhaustion deadline) has passed, and then it
+  // retires. A lane with no known reset retires once the provider has kept
+  // reporting for longer than the hard-stale horizon without it. A
+  // coordinator that stops collecting ages both lanes together instead, so
+  // the conservative widening still applies there.
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
+      const current = { ...publishedLane(lane, options), models: [...lane.models] };
       const laneUpdatedMs = Date.parse(lane.updatedAt);
-      const exhaustedUntilMs =
-        lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
-      if (
-        Number.isFinite(providerUpdatedMs) &&
-        (!Number.isFinite(laneUpdatedMs) || providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs) &&
-        !(exhaustedUntilMs > nowMs)
-      ) {
-        return [];
+      if (!Number.isFinite(providerUpdatedMs) || laneUpdatedMs >= providerUpdatedMs) {
+        return [current];
       }
-      return [{ ...publishedLane(lane, options), models: [...lane.models] }];
+      if (!Number.isFinite(laneUpdatedMs)) return [];
+      const retireAtMs = modelLaneRetireAtMs(lane);
+      if (Number.isFinite(retireAtMs)) {
+        if (retireAtMs <= nowMs) return [];
+        return [
+          {
+            ...current,
+            intervalSeconds: lane.intervalSeconds,
+            capped: lane.uncappedIntervalSeconds > lane.intervalSeconds,
+          },
+        ];
+      }
+      return providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs ? [] : [current];
     }
   );
   return modelLanes.length > 0 ? { ...published, modelLanes } : published;
+}
+
+/**
+ * When a model lane missing from the provider's newest reading retires: the
+ * reset of its last-seen governing window (else the latest reset among the
+ * windows of its last reading), held at least to its exhaustion deadline.
+ * NaN when the lane carries no reset to reckon to.
+ */
+function modelLaneRetireAtMs(lane: PersistedQuotaModelLaneStatus): number {
+  const resetMs = (bucket: PersistedQuotaBucketStatus | undefined) =>
+    bucket?.resetAtIso ? Date.parse(bucket.resetAtIso) : Number.NaN;
+  let windowResetMs = resetMs(lane.buckets.find((b) => b.key === lane.governingBucketKey));
+  if (!Number.isFinite(windowResetMs)) {
+    windowResetMs = Math.max(
+      Number.NEGATIVE_INFINITY,
+      ...lane.buckets
+        .filter((b) => b.observedAt === lane.updatedAt)
+        .map(resetMs)
+        .filter(Number.isFinite)
+    );
+  }
+  const exhaustedUntilMs =
+    lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
+  const retireAtMs = Math.max(
+    Number.isFinite(windowResetMs) ? windowResetMs : Number.NEGATIVE_INFINITY,
+    Number.isFinite(exhaustedUntilMs) ? exhaustedUntilMs : Number.NEGATIVE_INFINITY
+  );
+  return Number.isFinite(retireAtMs) ? retireAtMs : Number.NaN;
 }
 
 function publishedLane(
