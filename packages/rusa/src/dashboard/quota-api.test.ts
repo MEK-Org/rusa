@@ -940,7 +940,7 @@ describe("GET /api/quota and GET /api/quota/history", () => {
     expect(r.json()).toEqual(buildQuotaHistorySnapshot(deps));
   });
 
-  it("reads each configured provider through before serving GET /api/quota/history (#707)", async () => {
+  it("reads each configured provider through and isolates a failed provider before serving history (#707)", async () => {
     const nowMs = Date.parse("2026-09-26T16:00:00.000Z");
     const cache = new Map<string, QuotaHistorySource[]>();
     const readThrough: string[] = [];
@@ -958,6 +958,8 @@ describe("GET /api/quota and GET /api/quota/history", () => {
           cache.set(provider, [
             historyPoint({ observedAt: "2026-09-26T15:00:00.000Z", percentLeft: 64 }),
           ]);
+        } else {
+          throw new Error("coordinator unavailable");
         }
       },
     };

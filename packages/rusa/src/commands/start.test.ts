@@ -750,10 +750,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         return;
       }
       historyRequests.push(url.searchParams.get("provider") ?? "");
-      // The boot warmup's read fails; the coordinator answers every later read.
+      // The boot warmup's read gets no response, so the production client's
+      // deadline times it out. The coordinator answers every later read.
       if (historyRequests.length === 1) {
-        res.statusCode = 503;
-        res.end(JSON.stringify({ service, error: { code: "unavailable" } }));
         return;
       }
       res.end(
@@ -847,7 +846,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         coordinator.close((error) => (error ? reject(error) : resolve()));
       });
     }
-  });
+  }, 15_000);
 
   it("adopts the external E2E root through the configured-root construction path", async () => {
     let mesh: ActorMesh | undefined;

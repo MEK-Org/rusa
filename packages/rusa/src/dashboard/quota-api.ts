@@ -482,7 +482,13 @@ export async function handleQuotaApiRequest(
     if (url.pathname === HISTORY_PATH) {
       if (deps.readThroughHistory) {
         const readThrough = deps.readThroughHistory;
-        await Promise.all((deps.providers ?? SUPPORTED_PROVIDERS).map((p) => readThrough(p)));
+        // The production client resolves a failed provider to its last-good
+        // history (or no history). Keep that provider isolation at the route
+        // boundary too, so an unexpected rejection cannot suppress the other
+        // providers' cached series.
+        await Promise.allSettled(
+          (deps.providers ?? SUPPORTED_PROVIDERS).map((p) => readThrough(p))
+        );
       }
       const historySnapshot = buildQuotaHistorySnapshot(deps);
       sendJson(res, 200, historySnapshot);

@@ -1236,7 +1236,7 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(requests.filter((p) => p === "codex")).toHaveLength(1);
     });
 
-    it("clears a history read that rejects, so the next read starts afresh (#707)", async () => {
+    it("normalizes an unexpected rejected history read, marks it failed, and retries last-good (#707)", async () => {
       root = mkdtempSync(join(tmpdir(), "quota-client-history-reject-"));
       const socketPath = join(root, "coordinator.sock");
       const requests: string[] = [];
@@ -1248,14 +1248,18 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
         res.end(JSON.stringify({ service: serviceInfo(), provider: "claude", records: [] }));
       });
       const client = new QuotaCoordinatorClient({ socketPath });
+
+      // A valid empty response is a successful cached result, not a cold
+      // cache. The later unexpected failure must still make it retryable.
+      expect(await client.getHistory("claude")).toEqual([]);
       const request = vi.spyOn(http, "request").mockImplementationOnce(() => {
         throw new Error("socket unavailable");
       });
 
-      await expect(client.getHistory("claude")).rejects.toThrow("socket unavailable");
+      await expect(client.getHistory("claude")).resolves.toBeNull();
       request.mockRestore();
-      expect(await client.getHistory("claude")).toEqual([]);
-      expect(requests).toEqual(["claude"]);
+      await client.readThroughHistory("claude");
+      expect(requests).toEqual(["claude", "claude"]);
     });
   });
 

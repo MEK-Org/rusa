@@ -542,6 +542,21 @@ export class QuotaCoordinatorClient {
         else this.historyReadFailed.delete(provider);
         return records;
       })
+      .catch((err) => {
+        // `requestHistory` deliberately resolves expected transport and
+        // protocol failures as null. Keep the same public contract if an
+        // unexpected failure escapes it (for example, a synchronous
+        // http.request throw), so one provider cannot make the dashboard
+        // history route reject. It is still a failed read: retain last-good
+        // cache and make the next read-through eligible to retry.
+        this.historyReadFailed.add(provider);
+        this.options.logger?.warn(
+          `[quota-client] Coordinator history read failed unexpectedly for ${provider}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        return null;
+      })
       .finally(() => {
         // Cleared however the read settles, so a rejection cannot leave later
         // reads joining a dead promise.
