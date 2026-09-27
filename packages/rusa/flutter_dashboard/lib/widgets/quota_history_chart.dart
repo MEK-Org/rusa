@@ -866,8 +866,9 @@ class QuotaRemainingTrace {
 /// model history recorded before its lane had a controller still draws (#706).
 ///
 /// Only recorded readings are drawn. The line breaks at a quota reset (marked
-/// by a dashed vertical line) and across any stretch longer than [maxJoinGap]
-/// without a reading, so a gap never reads as a flat or zero value.
+/// by a dashed vertical line), at a reading with no value, and across any
+/// stretch longer than [maxJoinGap] without a reading, so a gap never reads
+/// as a flat or zero value.
 class QuotaRemainingChartPainter extends CustomPainter {
   QuotaRemainingChartPainter({
     required this.series,
@@ -922,23 +923,29 @@ class QuotaRemainingChartPainter extends CustomPainter {
     for (final point in series.points) {
       final remaining = point.remainingPercent;
       final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
-      if (remaining == null ||
-          !remaining.isFinite ||
-          observedAt == null ||
+      if (observedAt == null ||
           observedAt.isBefore(start) ||
           observedAt.isAfter(end)) {
+        continue;
+      }
+      if (remaining == null || !remaining.isFinite) {
+        // A reading without a value is a missing reading: break the line.
+        if (current != null) segments.add(current);
+        current = null;
         continue;
       }
       final resetAt = point.resetAtIso != null
           ? DateTime.tryParse(point.resetAtIso!)?.toUtc()
           : null;
 
-      // Same window-reset rule as the headroom and throttle plots.
+      // A reset is the reported instant moving, or the readings crossing
+      // it. Readings that keep repeating a passed instant are one reset.
       var isReset = false;
       if (lastResetAt != null && resetAt != null) {
         isReset =
             resetAt.difference(lastResetAt).abs() > _windowResetShift ||
-            observedAt.isAfter(lastResetAt);
+            (observedAt.isAfter(lastResetAt) &&
+                !lastObservedAt!.isAfter(lastResetAt));
       }
       if (isReset) {
         // Mark the reported reset instant, kept between the two readings it

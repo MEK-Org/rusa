@@ -843,6 +843,48 @@ describe("dashboard quota snapshot", () => {
     expect(series.points.at(-1)?.observedAt).toBe(new Date(untilMs).toISOString());
   });
 
+  it("keeps a reset visible when it falls inside a bucket whose prior bucket is empty", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const bucketMs = HISTORY_WINDOW_MS / MAX_HISTORY_POINTS_PER_SERIES;
+    // The reset lands 17 minutes into bucket 312; bucket 311 has no reading.
+    const resetMs = sinceMs + 312 * bucketMs + 17 * 60 * 1000;
+    const oldReset = new Date(resetMs).toISOString();
+    const newReset = new Date(resetMs + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const rows: QuotaHistorySource[] = [];
+    for (let t = sinceMs; t <= untilMs; t += 5 * 60 * 1000) {
+      if (t >= sinceMs + 311 * bucketMs && t < sinceMs + 312 * bucketMs) continue;
+      rows.push(
+        historyPoint({
+          observedAt: new Date(t).toISOString(),
+          percentLeft: t < resetMs ? 3 : 100,
+          resetAtIso: t < resetMs ? oldReset : newReset,
+        })
+      );
+    }
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    // The newest reading of bucket 312 is post-reset, and the reading kept
+    // before it is still pre-reset from bucket 310: the reported reset
+    // instant changes between two adjacent kept points, which is what the
+    // chart marks.
+    const firstAfter = series.points.findIndex((point) => point.resetAtIso === newReset);
+    expect(firstAfter).toBeGreaterThan(0);
+    expect(series.points[firstAfter - 1]).toMatchObject({
+      resetAtIso: oldReset,
+      remainingPercent: 3,
+    });
+    expect(Date.parse(series.points[firstAfter - 1].observedAt)).toBeLessThan(
+      sinceMs + 311 * bucketMs
+    );
+  });
+
   it("leaves a series at or under the bound untouched", () => {
     const rows = Array.from({ length: 12 }, (_, i) =>
       historyPoint({

@@ -618,7 +618,35 @@ void main() {
       expect(trace.segments[2].first.dy, plot.top);
     });
 
-    test('skips a reading with no remaining value rather than drawing 0%', () {
+    test('marks a reset once when later readings repeat a passed reset', () {
+      QuotaHistoryPointDto at(String time, double remaining) =>
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T$time:00.000Z',
+            remainingPercent: remaining,
+            resetAtIso: '2026-09-26T14:30:00.000Z',
+          );
+      final stale = QuotaHistorySeriesDto(
+        provider: 'claude',
+        windowId: 'weekly',
+        label: 'Weekly',
+        points: [
+          at('14:00', 5),
+          at('14:40', 100),
+          at('14:50', 99),
+          at('15:00', 98),
+        ],
+      );
+      final trace = QuotaRemainingChartPainter.traceFor(
+        stale,
+        DateTime.parse('2026-09-26T13:00:00.000Z'),
+        DateTime.parse('2026-09-26T15:00:00.000Z'),
+        const Rect.fromLTWH(0, 0, 120, 100),
+      );
+      expect(trace.segments.map((s) => s.length), [1, 3]);
+      expect(trace.resetXs, [90]);
+    });
+
+    test('breaks the line at a reading with no remaining value, never 0%', () {
       final withMissing = QuotaHistorySeriesDto(
         provider: 'claude',
         windowId: 'weekly',
@@ -644,7 +672,10 @@ void main() {
         DateTime.parse('2026-09-26T15:00:00.000Z'),
         const Rect.fromLTWH(0, 0, 120, 100),
       );
-      expect(trace.segments.single.map((o) => o.dy), [50, 52]);
+      expect(trace.segments.map((s) => s.map((o) => o.dy)), [
+        [50],
+        [52],
+      ]);
 
       expect(
         QuotaHistoryPointDto.fromJson(const {
