@@ -11569,6 +11569,7 @@ describe("strict obligation handling experiment (#382)", () => {
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
   }
@@ -12016,6 +12017,7 @@ describe("strict obligation handling experiment (#382)", () => {
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     resumed.mesh.rehydrateAll();
@@ -12093,6 +12095,7 @@ describe("strict obligation handling experiment (#382)", () => {
         get: (id) => (unreadable.has(id) ? null : repo.get(id)),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     const source = worker(mesh, "source");
@@ -12206,6 +12209,7 @@ describe("strict obligation handling experiment (#382)", () => {
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
       onRetire: (record) => {
         if (record.id !== child) return;
@@ -12246,6 +12250,7 @@ describe("strict obligation handling experiment (#382)", () => {
         get: (id) => repo.get(id),
         listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
         listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+        expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
       },
     });
     const source = worker(mesh, "source");
@@ -12505,7 +12510,7 @@ describe("strict obligation handling experiment (#382)", () => {
     repo.create({ id: "partial-control-head", title: "Control head", ownerId: unenrolled });
 
     expect(() => selectHead(mesh, enrolled, "partial-head")).toThrow(
-      /enrolled in strict_obligation_handling, but this mesh has no obligation closure reads/
+      /enrolled in strict_obligation_handling, but this mesh has no obligation closure port/
     );
     // Nothing was armed and nothing was committed, so no clean yield can pass
     // unenforced on a stale selection either.
@@ -12526,7 +12531,7 @@ describe("strict obligation handling experiment (#382)", () => {
       repo = new ObligationRepository(db, undefined, () => clock);
     });
 
-    function snoozeMesh(withExpiry = true) {
+    function snoozeMesh() {
       return setup({
         inboxStore,
         experimentEnrollments: enrollments,
@@ -12536,7 +12541,7 @@ describe("strict obligation handling experiment (#382)", () => {
           get: (id) => repo.get(id),
           listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
           listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
-          ...(withExpiry ? { expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids) } : {}),
+          expireDueSnoozes: (ids) => repo.expireDueSnoozes(ids, "system:mesh"),
         },
       });
     }
@@ -12604,23 +12609,6 @@ describe("strict obligation handling experiment (#382)", () => {
         mutationKind: "snooze",
         actingPrincipal: "system:mesh",
       });
-    });
-
-    it("treats a lapsed snooze as absent even on a port that cannot expire it", () => {
-      const { mesh } = snoozeMesh(false);
-      const subject = enrolled(mesh, "no expiry port");
-      repo.create({ id: "head", title: "Head", ownerId: subject });
-      selectHead(mesh, subject, "head");
-      repo.setSnooze("head", new Date(T0 + HOUR).toISOString(), subject);
-      expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
-
-      const { mesh: again } = snoozeMesh(false);
-      const later = enrolled(again, "later run");
-      repo.create({ id: "later", title: "Later", ownerId: later });
-      selectHead(again, later, "later");
-      repo.setSnooze("later", new Date(T0 + HOUR).toISOString(), later);
-      clock = T0 + HOUR;
-      expect(() => again.declareYield(later, "complete")).toThrow(/selected head obligation later/);
     });
   });
 });

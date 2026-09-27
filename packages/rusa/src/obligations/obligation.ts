@@ -278,11 +278,13 @@ export function normalizeCheckpoint(checkpoint: string | null | undefined): stri
 /**
  * Whether a stored deadline (`snoozed_until`, `next_ready_at`) has come due.
  *
- * Due at the start of the deadline's minute, not its exact millisecond: the
- * host timers that deliver these wakes (`at -t`, cron) fire on minute
- * boundaries, so a wake for 09:00:30 arrives at 09:00:00. Comparing against the
- * exact instant would make that callback look early and drop it with no later
- * wake armed. Unparseable input is never due.
+ * Due at the start of the deadline's minute, not its exact millisecond: `at`
+ * runs jobs at minute granularity, so a wake for 09:00:30 arrives at 09:00:00.
+ * Both deadlines it arms can carry seconds — a snooze keeps the caller's
+ * instant, and a completion-interval `next_ready_at` is completion time plus
+ * the interval — so comparing against the exact instant would make that
+ * callback look early. (Cron occurrences are minute-aligned either way.)
+ * Unparseable input is never due.
  */
 export function isDeadlineDue(iso: string, now: Date = new Date()): boolean {
   const at = Date.parse(iso);

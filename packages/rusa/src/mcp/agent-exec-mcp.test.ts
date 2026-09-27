@@ -727,6 +727,7 @@ describe("agent-execution MCP server", () => {
           get: (id) => obligations.get(id),
           listDirectChildEdges: (id) => obligations.listDirectChildEdges(id),
           listPrerequisiteEdges: (id) => obligations.listPrerequisiteEdges(id),
+          expireDueSnoozes: (ids) => obligations.expireDueSnoozes(ids, "system:mesh"),
         },
       });
       const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));

@@ -10,7 +10,6 @@ import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import {
   isBlockingObligationStatus,
-  isDeadlineDue,
   isReadyForAttention,
   isTerminalObligationStatus,
   type Obligation,
@@ -271,9 +270,7 @@ export interface MeshObligationPort {
   ): Array<{ prerequisiteId: string; status: ObligationStatus }>;
   /**
    * Clear the already-expired snoozes among `ids` in one transaction (#722),
-   * so strict closure judges an expired snooze by the ordinary rules. Optional:
-   * without it closure still refuses to honor a snooze past its deadline, it
-   * just leaves clearing that snooze to its timer.
+   * so strict closure judges an expired snooze by the ordinary rules.
    */
   expireDueSnoozes?(ids: readonly string[]): readonly string[];
 }
@@ -288,13 +285,20 @@ export interface MeshObligationPort {
  * rather than letting an enrolled run yield cleanly on an untouched head.
  */
 export type MeshObligationClosurePort = MeshObligationPort &
-  Required<Pick<MeshObligationPort, "get" | "listDirectChildEdges" | "listPrerequisiteEdges">>;
+  Required<
+    Pick<
+      MeshObligationPort,
+      "get" | "listDirectChildEdges" | "listPrerequisiteEdges" | "expireDueSnoozes"
+    >
+  >;
 
 /** Whether a wired port can answer every read strict closure needs. */
 export function supportsObligationClosureReads(
   port: MeshObligationPort | undefined
 ): port is MeshObligationClosurePort {
-  return Boolean(port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges);
+  return Boolean(
+    port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges && port.expireDueSnoozes
+  );
 }
 
 /** One live obligation owned inside a retiring subtree (#191). */
@@ -1743,7 +1747,7 @@ export class ActorMesh {
     const closure = this.obligations;
     if (focusedObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
       throw new Error(
-        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure reads (get, listDirectChildEdges, listPrerequisiteEdges) wired. Wire the closure port or unenroll the actor.`
+        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure port (get, listDirectChildEdges, listPrerequisiteEdges, expireDueSnoozes) wired. Wire the closure port or unenroll the actor.`
       );
     }
     // Membership and status are both selection-time facts. Keeping only ready
@@ -3988,15 +3992,12 @@ export class ActorMesh {
     // (#722). One whose deadline already passed is cleared first, through the
     // normal mutation path, and the obligation then answers to the ordinary
     // ready/waiting rules below.
-    closure.expireDueSnoozes?.([...runState.headObligationIds]);
-    const now = new Date(this.now());
+    closure.expireDueSnoozes([...runState.headObligationIds]);
 
     for (const obligationId of runState.headObligationIds) {
       const obligation = closure.get(obligationId);
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
-      if (obligation.snoozedUntil !== null && !isDeadlineDue(obligation.snoozedUntil, now)) {
-        continue;
-      }
+      if (obligation.snoozedUntil !== null) continue;
 
       if (obligation.status === "ready") {
         const shortfall = this.strictHandoffShortfall(

@@ -111,6 +111,8 @@ describe("obligation snooze (#722)", () => {
       const snoozed = snooze("a", "2026-09-27T15:30:00+02:00");
       expect(snoozed.snoozedUntil).toBe("2026-09-27T13:30:00.000Z");
       expect(snoozed.status).toBe("ready");
+      // No duration cap.
+      expect(snooze("a", "2100-01-01T00:00:00.000Z").snoozedUntil).toBe("2100-01-01T00:00:00.000Z");
     });
 
     it("rejects a zone-less, past, or already-due deadline without writing", () => {
@@ -120,10 +122,6 @@ describe("obligation snooze (#722)", () => {
       expect(() => snooze("a", iso(T0 + 30_000))).toThrow(/pass null to clear/);
       expect(repository.require("a").snoozedUntil).toBeNull();
       expect(repository.listHistory("a").some((h) => h.mutationKind === "snooze")).toBe(false);
-    });
-
-    it("has no duration cap", () => {
-      expect(snooze("a", "2100-01-01T00:00:00.000Z").snoozedUntil).toBe("2100-01-01T00:00:00.000Z");
     });
 
     it("rejects a terminal obligation", () => {
@@ -272,7 +270,7 @@ describe("obligation snooze (#722)", () => {
       snooze("gate", iso(T0 + HOUR), "actor-b");
       expect(repository.require("dep").status).toBe("waiting");
       t = T0 + HOUR;
-      expect(repository.expireDueSnoozes(["gate"])).toEqual(["gate"]);
+      expect(repository.expireDueSnoozes(["gate"], "system:mesh")).toEqual(["gate"]);
       expect(repository.require("dep").status).toBe("waiting");
     });
 
@@ -419,6 +417,21 @@ describe("obligation snooze (#722)", () => {
       expect(scheduler.activations.get("c")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
     });
 
+    it("a callback that finds nothing due re-arms its timer from the committed row", () => {
+      intervalScheduled();
+      // The host consumed its one-shot job; an early callback must not strand the occurrence.
+      scheduler.activations.delete("rec");
+      t = T0 + HOUR - MIN;
+      expect(repository.wakeScheduled("rec", "system:mesh")?.status).toBe("scheduled");
+      expect(scheduler.activations.get("rec")).toEqual({ kind: "at", date: new Date(T0 + HOUR) });
+
+      repository.create({ title: "a", id: "a", ownerId: "actor-a" });
+      snooze("a", iso(T0 + 2 * HOUR));
+      scheduler.activations.delete("a");
+      expect(repository.wakeScheduled("a", "system:mesh")?.snoozedUntil).toBe(iso(T0 + 2 * HOUR));
+      expect(scheduler.activations.get("a")).toEqual({ kind: "at", date: new Date(T0 + 2 * HOUR) });
+    });
+
     it("a cron tick whose occurrence is not yet due does not activate", () => {
       repository.create({ title: "c", id: "c", ownerId: "actor-a" });
       repository.setRecurrence("c", { policy: "cron", cronExpr: "0 * * * *" }, "actor-a");
@@ -443,13 +456,14 @@ describe("obligation snooze (#722)", () => {
       expect(repository.listHistory("a").some((h) => h.mutationKind === "snooze")).toBe(false);
     });
 
-    it("surfaces a post-commit timer failure as scheduleError", () => {
+    it("surfaces this call's post-commit timer failure, and an identical rewrite retries it", () => {
       scheduler.failAt = true;
       const result = repository.setSnooze("a", iso(T0 + HOUR), "actor-a");
       expect(result.obligation.snoozedUntil).toBe(iso(T0 + HOUR));
       expect(result.scheduleError).toMatch(/queue write failed/);
       scheduler.failAt = false;
-      expect(repository.setSnooze("a", iso(T0 + 2 * HOUR), "actor-a").scheduleError).toBeNull();
+      expect(repository.setSnooze("a", iso(T0 + HOUR), "actor-a").scheduleError).toBeNull();
+      expect(scheduler.activations.get("a")).toEqual({ kind: "at", date: new Date(T0 + HOUR) });
     });
   });
 
@@ -519,7 +533,9 @@ describe("obligation snooze (#722)", () => {
       snooze("a", iso(T0 + HOUR));
       snooze("b", iso(T0 + 3 * HOUR));
       t = T0 + 2 * HOUR;
-      expect(repository.expireDueSnoozes(["a", "b", "c", "missing", "a"])).toEqual(["a"]);
+      expect(repository.expireDueSnoozes(["a", "b", "c", "missing", "a"], "system:mesh")).toEqual([
+        "a",
+      ]);
       expect(repository.require("b").snoozedUntil).toBe(iso(T0 + 3 * HOUR));
       expect(
         repository.listHistory("a").find((h) => h.mutationKind === "snooze")?.actingPrincipal

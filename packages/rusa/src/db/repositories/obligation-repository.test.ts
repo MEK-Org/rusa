@@ -56,6 +56,9 @@ class FakeObligationScheduler implements ObligationActivationScheduler {
       instanceId: this.instanceId,
     }));
   }
+  canScheduleAt(): boolean {
+    return true;
+  }
 }
 
 describe("ObligationRepository", () => {

@@ -59,10 +59,9 @@ export interface ObligationActivationScheduler {
   listObligationActivations(): ObligationActivationRecord[];
   /**
    * Whether a one-shot (`at`) activation can currently be installed. `false`
-   * only when the host is already known to lack a working `at`; absent is
-   * treated as available.
+   * only when the host is already known to lack a working `at`.
    */
-  canScheduleAt?(): boolean;
+  canScheduleAt(): boolean;
 }
 
 /** A complete one-shot message persisted inside its versioned `at` job. */

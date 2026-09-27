@@ -1499,19 +1499,12 @@ describe("obligations MCP", () => {
       expect(repository.require("task").snoozedUntil).toBeNull();
     });
 
-    it("reports a past deadline and a terminal obligation as errors", async () => {
+    it("reports a repository validation refusal as a tool error", async () => {
       repository.create({ title: "task", id: "task", ownerId: "actor-a" });
       const client = await connect(createObligationsMcpServer(repository, "actor-a"));
-      const refusal = async (until: string) => {
-        const res = await call(client, "task", until);
-        expect(res.isError).toBe(true);
-        const first = res.content[0];
-        return first && first.type === "text" ? first.text : "";
-      };
-      expect(await refusal("2020-01-01T00:00:00Z")).toContain("must be in the future");
-      expect(await refusal("2999-01-01T00:00:00")).toContain("timezone offset");
-      repository.setTerminalStatus("task", "done", null, null, "actor-a");
-      expect(await refusal(inHours(1))).toContain("terminal obligations cannot be snoozed");
+      const res = await call(client, "task", "2020-01-01T00:00:00Z");
+      expect(res.isError).toBe(true);
+      expect(JSON.stringify(res.content)).toContain("must be in the future");
     });
 
     it("returns the committed snooze with a warning when its timer fails to arm", async () => {
@@ -1523,6 +1516,7 @@ describe("obligations MCP", () => {
         },
         cancelObligationActivation: () => {},
         listObligationActivations: () => [],
+        canScheduleAt: () => true,
       });
       const client = await connect(createObligationsMcpServer(repository, "actor-a"));
       const until = inHours(1);

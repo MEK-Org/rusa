@@ -631,11 +631,12 @@ export class ObligationRepository {
   }
 
   /**
-   * The last post-commit scheduling failure per obligation, cleared by the next
-   * successful reconcile. Lets a caller whose write committed report that its
-   * host timer did not arm, instead of the failure living only in a log line.
+   * The scheduling failures of the most recent `mutate()` flush, by obligation.
+   * Replaced on every flush, so a caller reading it right after its own
+   * mutation learns whether *that* write's host timer armed — never a failure
+   * left behind by an earlier, unrelated write.
    */
-  private scheduleFailures = new Map<string, string>();
+  private lastFlushScheduleErrors = new Map<string, string>();
 
   /** Re-derive `id`'s OS scheduler job from its committed row. */
   private reconcileObligationSchedule(id: string): void {
@@ -647,14 +648,8 @@ export class ObligationRepository {
       )
       .get(id) as ScheduleRow | undefined;
     const plan = row ? activationPlan(row) : null;
-    try {
-      if (plan) this.scheduler.scheduleObligationActivation(id, plan);
-      else this.scheduler.cancelObligationActivation(id);
-      this.scheduleFailures.delete(id);
-    } catch (err) {
-      this.scheduleFailures.set(id, err instanceof Error ? err.message : String(err));
-      throw err;
-    }
+    if (plan) this.scheduler.scheduleObligationActivation(id, plan);
+    else this.scheduler.cancelObligationActivation(id);
   }
 
   setOsScheduler(scheduler: ObligationActivationScheduler): void {
@@ -1283,20 +1278,20 @@ export class ObligationRepository {
     // rollback couldn't take them back with it.
     const toReconcile = Array.from(this.dirtyScheduleIds);
     this.dirtyScheduleIds.clear();
-    const failedReconciliations: string[] = [];
+    const scheduleErrors = new Map<string, string>();
     for (const id of toReconcile) {
       try {
         this.reconcileObligationSchedule(id);
       } catch (err) {
-        failedReconciliations.push(id);
+        const message = err instanceof Error ? err.message : String(err);
+        scheduleErrors.set(id, message);
         console.warn(
-          `[obligations] failed to reconcile scheduled activation for ${id}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
+          `[obligations] failed to reconcile scheduled activation for ${id}: ${message}`
         );
       }
     }
-    this.scheduleReconcileRetry(failedReconciliations);
+    this.lastFlushScheduleErrors = scheduleErrors;
+    this.scheduleReconcileRetry([...scheduleErrors.keys()]);
 
     return result;
   }
@@ -2915,10 +2910,12 @@ export class ObligationRepository {
    * parent block. Setting one on a host already known to lack `at` is refused
    * before anything is written, since nothing could end it.
    *
-   * Returns the committed obligation, plus `scheduleError` when the write
-   * committed but its host timer did not arm. The mutation retries the timer
-   * in-process and boot reconciliation re-derives it, but the caller learns now
-   * rather than from a snooze that silently never ends.
+   * Returns the committed obligation, plus `scheduleError` when this call's
+   * write committed but its host timer did not arm. The mutation retries the
+   * timer in-process and boot reconciliation re-derives it, but the caller
+   * learns now rather than from a snooze that silently never ends. An identical
+   * rewrite changes no row but still re-derives the timer, so it doubles as a
+   * retry whose `scheduleError` reports the timer's current state.
    */
   setSnooze(
     id: string,
@@ -2926,7 +2923,7 @@ export class ObligationRepository {
     principal: EntityId
   ): { obligation: Obligation; scheduleError: string | null } {
     const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
-    if (snoozedUntil !== null && this.scheduler?.canScheduleAt?.() === false) {
+    if (snoozedUntil !== null && this.scheduler?.canScheduleAt() === false) {
       throw new ObligationValidationError(
         "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
       );
@@ -2936,7 +2933,10 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(existing.status)) {
         throw new ObligationValidationError("terminal obligations cannot be snoozed");
       }
-      if (existing.snoozedUntil === snoozedUntil) return existing;
+      if (existing.snoozedUntil === snoozedUntil) {
+        this.markScheduleDirty(id);
+        return existing;
+      }
       if (snoozedUntil === null) {
         this.releaseSnooze(existing);
       } else {
@@ -2947,7 +2947,7 @@ export class ObligationRepository {
       }
       return this.require(id);
     });
-    return { obligation, scheduleError: this.scheduleFailures.get(id) ?? null };
+    return { obligation, scheduleError: this.lastFlushScheduleErrors.get(id) ?? null };
   }
 
   /**
@@ -2993,7 +2993,9 @@ export class ObligationRepository {
    * — including one extended after this job was armed — is left in force, and
    * a scheduled occurrence activates only once its `next_ready_at` is due. An
    * expired snooze is cleared first, then any due occurrence it was holding
-   * back activates, in one transaction.
+   * back activates, in one transaction. A snooze or occurrence judged not yet due
+   * re-derives its timer from the row, since the host may have consumed the
+   * one-shot job that delivered the callback.
    */
   wakeScheduled(id: string, principal: EntityId): Obligation | null {
     return this.mutate(principal, () => {
@@ -3001,17 +3003,19 @@ export class ObligationRepository {
       if (!obligation || isTerminalObligationStatus(obligation.status)) return obligation;
       const now = new Date(this.now());
       if (obligation.snoozedUntil !== null) {
-        if (!isDeadlineDue(obligation.snoozedUntil, now)) return obligation;
+        if (!isDeadlineDue(obligation.snoozedUntil, now)) {
+          this.markScheduleDirty(id);
+          return obligation;
+        }
         this.releaseSnooze(obligation);
         return this.require(id);
       }
-      if (
-        obligation.status === "scheduled" &&
-        obligation.nextReadyAt !== null &&
-        isDeadlineDue(obligation.nextReadyAt, now)
-      ) {
-        this.activateScheduledRow(id);
+      if (obligation.status !== "scheduled" || obligation.nextReadyAt === null) return obligation;
+      if (!isDeadlineDue(obligation.nextReadyAt, now)) {
+        this.markScheduleDirty(id);
+        return obligation;
       }
+      this.activateScheduledRow(id);
       return this.require(id);
     });
   }
@@ -3023,8 +3027,9 @@ export class ObligationRepository {
    * closure, so a snooze whose deadline passed mid-run no longer excuses the
    * obligation — the ordinary ready/waiting rules apply to it instead. Returns
    * the ids it cleared. A live snooze, a terminal row, and an unknown id are
-   * left alone. The principal defaults to the mesh, its only caller, so the
-   * repository still satisfies `MeshObligationPort` structurally.
+   * left alone. The principal defaults to the mesh, its only production
+   * caller, because some tests hand the repository itself to the mesh as its
+   * `MeshObligationPort`, whose member takes ids alone.
    */
   expireDueSnoozes(ids: readonly string[], principal: EntityId = "system:mesh"): string[] {
     const cleared: string[] = [];
