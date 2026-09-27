@@ -379,6 +379,193 @@ class _LegendItem extends StatelessWidget {
   }
 }
 
+/// Where one series lands on a plot: the connected runs of readings, and the
+/// x position of each quota reset between them.
+@visibleForTesting
+class QuotaSeriesTrace {
+  const QuotaSeriesTrace({required this.segments, required this.resetXs});
+
+  final List<List<Offset>> segments;
+  final List<double> resetXs;
+}
+
+/// Whether the reading at [observedAt], reporting [resetAt], starts a new
+/// quota window after the last drawn reading.
+typedef _ResetRule =
+    bool Function(
+      DateTime observedAt,
+      DateTime resetAt,
+      DateTime lastObservedAt,
+      DateTime lastResetAt,
+    );
+
+/// Maps one series onto [plot]. [valueOf] picks the reading a chart plots, or
+/// null where there is none, and [yFor] places it. Readings outside the range
+/// are skipped and a reading without a value breaks the line. The reset and
+/// gap rules intentionally differ between charts, so each passes its own.
+QuotaSeriesTrace _traceSeries(
+  QuotaHistorySeriesDto series, {
+  required DateTime start,
+  required DateTime end,
+  required Rect plot,
+  required double? Function(QuotaHistoryPointDto point) valueOf,
+  required double Function(double value) yFor,
+  required _ResetRule isReset,
+  bool Function(DateTime observedAt, DateTime lastObservedAt)? isGap,
+}) {
+  final spanMs = end.millisecondsSinceEpoch - start.millisecondsSinceEpoch;
+  final segments = <List<Offset>>[];
+  final resetXs = <double>[];
+  if (spanMs <= 0) {
+    return QuotaSeriesTrace(segments: segments, resetXs: resetXs);
+  }
+  double xFor(DateTime at) =>
+      plot.left +
+      ((at.millisecondsSinceEpoch - start.millisecondsSinceEpoch) / spanMs)
+              .clamp(0.0, 1.0) *
+          plot.width;
+
+  List<Offset>? current;
+  DateTime? lastResetAt;
+  DateTime? lastObservedAt;
+  for (final point in series.points) {
+    final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
+    if (observedAt == null ||
+        observedAt.isBefore(start) ||
+        observedAt.isAfter(end)) {
+      continue;
+    }
+    final value = valueOf(point);
+    if (value == null) {
+      // A reading without a value is a missing reading: break the line.
+      if (current != null) segments.add(current);
+      current = null;
+      continue;
+    }
+    final resetAt = point.resetAtIso != null
+        ? DateTime.tryParse(point.resetAtIso!)?.toUtc()
+        : null;
+
+    final reset =
+        lastResetAt != null &&
+        resetAt != null &&
+        isReset(observedAt, resetAt, lastObservedAt!, lastResetAt);
+    if (reset) {
+      // Mark the reported reset instant, kept between the two readings it
+      // separates.
+      var marker = lastResetAt;
+      if (marker.isBefore(lastObservedAt)) marker = lastObservedAt;
+      if (marker.isAfter(observedAt)) marker = observedAt;
+      resetXs.add(xFor(marker));
+    }
+    final gap =
+        isGap != null &&
+        lastObservedAt != null &&
+        isGap(observedAt, lastObservedAt);
+
+    final offset = Offset(xFor(observedAt), yFor(value));
+    if (current == null || reset || gap) {
+      if (current != null) segments.add(current);
+      current = [offset];
+    } else {
+      current.add(offset);
+    }
+    lastResetAt = resetAt;
+    lastObservedAt = observedAt;
+  }
+  if (current != null) segments.add(current);
+  return QuotaSeriesTrace(segments: segments, resetXs: resetXs);
+}
+
+/// The controller plots break at every reading after the last reading's
+/// reported reset, and wherever that instant moves.
+bool _controllerWindowReset(
+  DateTime observedAt,
+  DateTime resetAt,
+  DateTime lastObservedAt,
+  DateTime lastResetAt,
+) =>
+    resetAt.difference(lastResetAt).abs() > _windowResetShift ||
+    observedAt.isAfter(lastResetAt);
+
+/// Strokes each segment of [trace] in [color]. With [dotEveryReading] every
+/// reading also gets a dot; otherwise only a lone reading does, so it stays
+/// visible without a line.
+void _paintTrace(
+  Canvas canvas,
+  QuotaSeriesTrace trace,
+  Color color, {
+  required bool dotEveryReading,
+}) {
+  final linePaint = Paint()
+    ..color = color
+    ..strokeWidth = 2
+    ..style = PaintingStyle.stroke
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round;
+  for (final seg in trace.segments) {
+    if (seg.length < 2) continue;
+    final path = Path()..moveTo(seg.first.dx, seg.first.dy);
+    for (final point in seg.skip(1)) {
+      path.lineTo(point.dx, point.dy);
+    }
+    canvas.drawPath(path, linePaint);
+  }
+
+  final dotPaint = Paint()
+    ..color = color
+    ..style = PaintingStyle.fill;
+  for (final seg in trace.segments) {
+    if (!dotEveryReading && seg.length > 1) continue;
+    for (final point in seg) {
+      canvas.drawCircle(point, 2.5, dotPaint);
+    }
+  }
+}
+
+/// Paints one axis label in the charts' muted monospace.
+void _paintAxisLabel(
+  Canvas canvas,
+  String text,
+  Offset offset, {
+  double width = 40,
+  TextAlign align = TextAlign.left,
+}) {
+  final painter = TextPainter(
+    text: TextSpan(
+      text: text,
+      style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
+    ),
+    textDirection: TextDirection.ltr,
+    textAlign: align,
+  )..layout(maxWidth: width);
+  painter.paint(canvas, offset);
+}
+
+/// Paints the quarter gridlines and the "ago" labels along the time axis.
+void _paintTimeAxis(
+  Canvas canvas,
+  Rect plot,
+  DateTime start,
+  DateTime end,
+  Paint gridPaint,
+) {
+  for (var quarter = 0; quarter <= 4; quarter++) {
+    final x = plot.left + (quarter / 4) * plot.width;
+    canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
+  }
+
+  final span = end.difference(start);
+  _paintAxisLabel(canvas, _agoLabel(span), Offset(plot.left, plot.bottom + 7));
+  _paintAxisLabel(
+    canvas,
+    _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
+    Offset(plot.center.dx - 28, plot.bottom + 7),
+    width: 56,
+    align: TextAlign.center,
+  );
+}
+
 /// Paints quota headroom (percentLeft - timeRemainingPct).
 /// Vertically centered at 0% (range -50% to +50%).
 /// Positive = surplus quota / additional quota to burn (above 0), negative = underwater / burning fast (below 0).
@@ -403,6 +590,24 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
   static const _right = 10.0;
   static const _top = 10.0;
   static const _bottom = 27.0;
+
+  /// Map one series onto [plot], breaking at resets and missing decisions.
+  @visibleForTesting
+  static QuotaSeriesTrace traceFor(
+    QuotaHistorySeriesDto series,
+    DateTime start,
+    DateTime end,
+    Rect plot,
+  ) => _traceSeries(
+    series,
+    start: start,
+    end: end,
+    plot: plot,
+    valueOf: (point) => point.error,
+    yFor: (error) =>
+        plot.top + ((50.0 - error.clamp(-50.0, 50.0)) / 100.0) * plot.height,
+    isReset: _controllerWindowReset,
+  );
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -433,7 +638,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
       final labelText = percent > 0
           ? '+$percent%'
           : '$percent%';
-      _paintLabel(
+      _paintAxisLabel(
         canvas,
         labelText,
         Offset(0, y - 7),
@@ -441,139 +646,16 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
         align: TextAlign.right,
       );
     }
-
-    for (var quarter = 0; quarter <= 4; quarter++) {
-      final x = plot.left + (quarter / 4) * plot.width;
-      canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
-    }
-
-    final span = end.difference(start);
-    _paintLabel(
-      canvas,
-      _agoLabel(span),
-      Offset(plot.left, plot.bottom + 7),
-    );
-    _paintLabel(
-      canvas,
-      _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
-      Offset(plot.center.dx - 28, plot.bottom + 7),
-      width: 56,
-      align: TextAlign.center,
-    );
-
-    final spanMs = end.millisecondsSinceEpoch - start.millisecondsSinceEpoch;
-    if (spanMs <= 0) return;
+    _paintTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
-      final segments = <List<Offset>>[];
-      List<Offset>? currentSegment;
-      DateTime? lastResetAt;
-      DateTime? lastObservedAt;
-
-      for (final point in series[i].points) {
-        if (point.error == null) {
-          if (currentSegment != null && currentSegment.isNotEmpty) {
-            segments.add(currentSegment);
-            currentSegment = null;
-          }
-          continue;
-        }
-
-        final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
-        if (observedAt == null ||
-            observedAt.isBefore(start) ||
-            observedAt.isAfter(end)) {
-          continue;
-        }
-
-        final resetAt = point.resetAtIso != null
-            ? DateTime.tryParse(point.resetAtIso!)?.toUtc()
-            : null;
-
-        bool isReset = false;
-        if (lastResetAt != null && resetAt != null) {
-          final resetDiff = resetAt.difference(lastResetAt).abs();
-          if (resetDiff > _windowResetShift ||
-              (lastObservedAt != null && observedAt.isAfter(lastResetAt))) {
-            isReset = true;
-          }
-        }
-
-        final x = plot.left +
-            ((observedAt.millisecondsSinceEpoch -
-                            start.millisecondsSinceEpoch) /
-                        spanMs)
-                    .clamp(0.0, 1.0) *
-                plot.width;
-        final clampedError = point.error!.clamp(-50.0, 50.0);
-        final y = plot.top + ((50.0 - clampedError) / 100.0) * plot.height;
-        final offset = Offset(x, y);
-
-        if (isReset || currentSegment == null) {
-          if (currentSegment != null && currentSegment.isNotEmpty) {
-            segments.add(currentSegment);
-          }
-          currentSegment = [offset];
-        } else {
-          currentSegment.add(offset);
-        }
-
-        lastResetAt = resetAt;
-        lastObservedAt = observedAt;
-      }
-
-      if (currentSegment != null && currentSegment.isNotEmpty) {
-        segments.add(currentSegment);
-      }
-
-      if (segments.isEmpty) continue;
-
-      final color = colors[i];
-      final linePaint = Paint()
-        ..color = color
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round;
-
-      for (final seg in segments) {
-        if (seg.length > 1) {
-          final path = Path()..moveTo(seg.first.dx, seg.first.dy);
-          for (final point in seg.skip(1)) {
-            path.lineTo(point.dx, point.dy);
-          }
-          canvas.drawPath(path, linePaint);
-        }
-      }
-
-      final dotPaint = Paint()
-        ..color = color
-        ..style = PaintingStyle.fill;
-
-      for (final seg in segments) {
-        for (final point in seg) {
-          canvas.drawCircle(point, 2.5, dotPaint);
-        }
-      }
+      _paintTrace(
+        canvas,
+        traceFor(series[i], start, end, plot),
+        colors[i],
+        dotEveryReading: true,
+      );
     }
-  }
-
-  void _paintLabel(
-    Canvas canvas,
-    String text,
-    Offset offset, {
-    double width = 40,
-    TextAlign align = TextAlign.left,
-  }) {
-    final painter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
-      ),
-      textDirection: TextDirection.ltr,
-      textAlign: align,
-    )..layout(maxWidth: width);
-    painter.paint(canvas, offset);
   }
 
   @override
@@ -690,7 +772,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
       final decadeSeconds = math.pow(10, exponent).toDouble();
       final y = yFor(decadeSeconds);
       canvas.drawLine(Offset(plot.left, y), Offset(plot.right, y), gridPaint);
-      _paintLabel(
+      _paintAxisLabel(
         canvas,
         '${decadeSeconds.round()}s',
         Offset(0, y - 7),
@@ -710,137 +792,26 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
       }
     }
 
-    for (var quarter = 0; quarter <= 4; quarter++) {
-      final x = plot.left + (quarter / 4) * plot.width;
-      canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
-    }
-
-    final span = end.difference(start);
-    _paintLabel(
-      canvas,
-      _agoLabel(span),
-      Offset(plot.left, plot.bottom + 7),
-    );
-    _paintLabel(
-      canvas,
-      _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
-      Offset(plot.center.dx - 28, plot.bottom + 7),
-      width: 56,
-      align: TextAlign.center,
-    );
-
-    final spanMs = end.millisecondsSinceEpoch - start.millisecondsSinceEpoch;
-    if (spanMs <= 0) return;
+    _paintTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
-      final segments = <List<Offset>>[];
-      List<Offset>? currentSegment;
-      DateTime? lastResetAt;
-      DateTime? lastObservedAt;
-
-      for (final point in series[i].points) {
-        final interval = point.intervalSeconds;
-        if (interval == null || !interval.isFinite) {
-          if (currentSegment != null && currentSegment.isNotEmpty) {
-            segments.add(currentSegment);
-            currentSegment = null;
-          }
-          continue;
-        }
-
-        final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
-        if (observedAt == null ||
-            observedAt.isBefore(start) ||
-            observedAt.isAfter(end)) {
-          continue;
-        }
-
-        final resetAt = point.resetAtIso != null
-            ? DateTime.tryParse(point.resetAtIso!)?.toUtc()
-            : null;
-
-        bool isReset = false;
-        if (lastResetAt != null && resetAt != null) {
-          final resetDiff = resetAt.difference(lastResetAt).abs();
-          if (resetDiff > _windowResetShift ||
-              (lastObservedAt != null && observedAt.isAfter(lastResetAt))) {
-            isReset = true;
-          }
-        }
-
-        final x = plot.left +
-            ((observedAt.millisecondsSinceEpoch -
-                            start.millisecondsSinceEpoch) /
-                        spanMs)
-                    .clamp(0.0, 1.0) *
-                plot.width;
-        final offset = Offset(x, yFor(interval));
-
-        if (isReset || currentSegment == null) {
-          if (currentSegment != null && currentSegment.isNotEmpty) {
-            segments.add(currentSegment);
-          }
-          currentSegment = [offset];
-        } else {
-          currentSegment.add(offset);
-        }
-
-        lastResetAt = resetAt;
-        lastObservedAt = observedAt;
-      }
-
-      if (currentSegment != null && currentSegment.isNotEmpty) {
-        segments.add(currentSegment);
-      }
-
-      if (segments.isEmpty) continue;
-
-      final color = colors[i];
-      final linePaint = Paint()
-        ..color = color
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round;
-
-      for (final seg in segments) {
-        if (seg.length > 1) {
-          final path = Path()..moveTo(seg.first.dx, seg.first.dy);
-          for (final point in seg.skip(1)) {
-            path.lineTo(point.dx, point.dy);
-          }
-          canvas.drawPath(path, linePaint);
-        }
-      }
-
-      final dotPaint = Paint()
-        ..color = color
-        ..style = PaintingStyle.fill;
-
-      for (final seg in segments) {
-        for (final point in seg) {
-          canvas.drawCircle(point, 2.5, dotPaint);
-        }
-      }
+      _paintTrace(
+        canvas,
+        _traceSeries(
+          series[i],
+          start: start,
+          end: end,
+          plot: plot,
+          valueOf: (point) => (point.intervalSeconds?.isFinite ?? false)
+              ? point.intervalSeconds
+              : null,
+          yFor: yFor,
+          isReset: _controllerWindowReset,
+        ),
+        colors[i],
+        dotEveryReading: true,
+      );
     }
-  }
-
-  void _paintLabel(
-    Canvas canvas,
-    String text,
-    Offset offset, {
-    double width = 40,
-    TextAlign align = TextAlign.left,
-  }) {
-    final painter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
-      ),
-      textDirection: TextDirection.ltr,
-      textAlign: align,
-    )..layout(maxWidth: width);
-    painter.paint(canvas, offset);
   }
 
   @override
@@ -849,16 +820,6 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
       oldDelegate.colors != colors ||
       oldDelegate.start != start ||
       oldDelegate.end != end;
-}
-
-/// Where one series lands on the quota-remaining plot: the connected runs of
-/// readings, and the x position of each quota reset between them.
-@visibleForTesting
-class QuotaRemainingTrace {
-  const QuotaRemainingTrace({required this.segments, required this.resetXs});
-
-  final List<List<Offset>> segments;
-  final List<double> resetXs;
 }
 
 /// Paints the recorded quota remaining, 0% to 100%, for every series with a
@@ -899,82 +860,36 @@ class QuotaRemainingChartPainter extends CustomPainter {
 
   /// Map one series onto [plot], breaking at resets and gaps.
   @visibleForTesting
-  static QuotaRemainingTrace traceFor(
+  static QuotaSeriesTrace traceFor(
     QuotaHistorySeriesDto series,
     DateTime start,
     DateTime end,
     Rect plot,
-  ) {
-    final spanMs = end.millisecondsSinceEpoch - start.millisecondsSinceEpoch;
-    final segments = <List<Offset>>[];
-    final resetXs = <double>[];
-    if (spanMs <= 0) {
-      return QuotaRemainingTrace(segments: segments, resetXs: resetXs);
-    }
-    double xFor(DateTime at) =>
-        plot.left +
-        ((at.millisecondsSinceEpoch - start.millisecondsSinceEpoch) / spanMs)
-                .clamp(0.0, 1.0) *
-            plot.width;
-
-    List<Offset>? current;
-    DateTime? lastResetAt;
-    DateTime? lastObservedAt;
-    for (final point in series.points) {
-      final remaining = point.remainingPercent;
-      final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
-      if (observedAt == null ||
-          observedAt.isBefore(start) ||
-          observedAt.isAfter(end)) {
-        continue;
-      }
-      if (remaining == null || !remaining.isFinite) {
-        // A reading without a value is a missing reading: break the line.
-        if (current != null) segments.add(current);
-        current = null;
-        continue;
-      }
-      final resetAt = point.resetAtIso != null
-          ? DateTime.tryParse(point.resetAtIso!)?.toUtc()
-          : null;
-
-      // A reset is the reported instant moving, or the readings crossing
-      // it. Readings that keep repeating a passed instant are one reset.
-      var isReset = false;
-      if (lastResetAt != null && resetAt != null) {
-        isReset =
-            resetAt.difference(lastResetAt).abs() > _windowResetShift ||
-            (observedAt.isAfter(lastResetAt) &&
-                !lastObservedAt!.isAfter(lastResetAt));
-      }
-      if (isReset) {
-        // Mark the reported reset instant, kept between the two readings it
-        // separates.
-        var marker = lastResetAt!;
-        if (marker.isBefore(lastObservedAt!)) marker = lastObservedAt;
-        if (marker.isAfter(observedAt)) marker = observedAt;
-        resetXs.add(xFor(marker));
-      }
-      final isGap =
-          lastObservedAt != null &&
-          observedAt.difference(lastObservedAt) > maxJoinGap;
-
-      final offset = Offset(
-        xFor(observedAt),
+  ) => _traceSeries(
+    series,
+    start: start,
+    end: end,
+    plot: plot,
+    valueOf: (point) => (point.remainingPercent?.isFinite ?? false)
+        ? point.remainingPercent
+        : null,
+    yFor: (remaining) =>
         plot.top + (1 - remaining.clamp(0.0, 100.0) / 100) * plot.height,
-      );
-      if (current == null || isReset || isGap) {
-        if (current != null) segments.add(current);
-        current = [offset];
-      } else {
-        current.add(offset);
-      }
-      lastResetAt = resetAt;
-      lastObservedAt = observedAt;
-    }
-    if (current != null) segments.add(current);
-    return QuotaRemainingTrace(segments: segments, resetXs: resetXs);
-  }
+    isReset: _windowReset,
+    isGap: (observedAt, lastObservedAt) =>
+        observedAt.difference(lastObservedAt) > maxJoinGap,
+  );
+
+  /// A reset is the reported instant moving, or the readings crossing it.
+  /// Readings that keep repeating a passed instant are one reset.
+  static bool _windowReset(
+    DateTime observedAt,
+    DateTime resetAt,
+    DateTime lastObservedAt,
+    DateTime lastResetAt,
+  ) =>
+      resetAt.difference(lastResetAt).abs() > _windowResetShift ||
+      (observedAt.isAfter(lastResetAt) && !lastObservedAt.isAfter(lastResetAt));
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -992,7 +907,7 @@ class QuotaRemainingChartPainter extends CustomPainter {
     for (final percent in [100, 75, 50, 25, 0]) {
       final y = plot.top + (1 - percent / 100) * plot.height;
       canvas.drawLine(Offset(plot.left, y), Offset(plot.right, y), gridPaint);
-      _paintLabel(
+      _paintAxisLabel(
         canvas,
         '$percent%',
         Offset(0, y - 7),
@@ -1000,24 +915,7 @@ class QuotaRemainingChartPainter extends CustomPainter {
         align: TextAlign.right,
       );
     }
-    for (var quarter = 0; quarter <= 4; quarter++) {
-      final x = plot.left + (quarter / 4) * plot.width;
-      canvas.drawLine(Offset(x, plot.top), Offset(x, plot.bottom), gridPaint);
-    }
-
-    final span = end.difference(start);
-    _paintLabel(
-      canvas,
-      _agoLabel(span),
-      Offset(plot.left, plot.bottom + 7),
-    );
-    _paintLabel(
-      canvas,
-      _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
-      Offset(plot.center.dx - 28, plot.bottom + 7),
-      width: 56,
-      align: TextAlign.center,
-    );
+    _paintTimeAxis(canvas, plot, start, end, gridPaint);
 
     for (var i = 0; i < series.length; i++) {
       final trace = traceFor(series[i], start, end, plot);
@@ -1036,46 +934,8 @@ class QuotaRemainingChartPainter extends CustomPainter {
         }
       }
 
-      final linePaint = Paint()
-        ..color = color
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round;
-      final dotPaint = Paint()
-        ..color = color
-        ..style = PaintingStyle.fill;
-      for (final seg in trace.segments) {
-        if (seg.length == 1) {
-          // A lone reading has no line; a dot keeps it visible.
-          canvas.drawCircle(seg.single, 2.5, dotPaint);
-          continue;
-        }
-        final path = Path()..moveTo(seg.first.dx, seg.first.dy);
-        for (final point in seg.skip(1)) {
-          path.lineTo(point.dx, point.dy);
-        }
-        canvas.drawPath(path, linePaint);
-      }
+      _paintTrace(canvas, trace, color, dotEveryReading: false);
     }
-  }
-
-  void _paintLabel(
-    Canvas canvas,
-    String text,
-    Offset offset, {
-    double width = 40,
-    TextAlign align = TextAlign.left,
-  }) {
-    final painter = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 9),
-      ),
-      textDirection: TextDirection.ltr,
-      textAlign: align,
-    )..layout(maxWidth: width);
-    painter.paint(canvas, offset);
   }
 
   @override
