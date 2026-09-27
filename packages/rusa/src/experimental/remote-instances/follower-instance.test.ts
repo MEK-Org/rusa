@@ -1387,32 +1387,33 @@ describe("monolithic follower instance", () => {
       expect(h.failures).toEqual([]);
     });
 
-    it("re-quotes a v8 follower's admission, which names no pool, that the pin overtook", async () => {
+    it("re-quotes an admission that names no pool, from a follower built before #725, that the pin overtook", async () => {
       const h = setup();
-      // A v8 follower sends `admit` without the generation it quoted under.
+      // A v7/v8 follower built before #725 ignores the numbered pool and sends
+      // `admit` without the generation it quoted under (the pre-echo adapter).
       const held: Parameters<typeof h.remote.receive>[0][] = [];
       const receive = h.remote.receive.bind(h.remote);
       h.remote.receive = (event) => {
         const { message } = event;
         if (message.type === "request" && message.request.op === "admit") {
-          const { modelConfigGeneration: _omitted, ...v8Request } = message.request;
-          const v8Event = { ...event, message: { ...message, request: v8Request } };
+          const { modelConfigGeneration: _omitted, ...preEchoRequest } = message.request;
+          const preEchoEvent = { ...event, message: { ...message, request: preEchoRequest } };
           if (held.length === 0) {
-            held.push(v8Event);
+            held.push(preEchoEvent);
             return;
           }
-          return receive(v8Event);
+          return receive(preEchoEvent);
         }
         receive(event);
       };
-      const id = h.spawn("Pinned before a v8 admission arrives");
+      const id = h.spawn("Pinned before a pre-echo admission arrives");
       await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
 
-      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-v8" }], "root");
+      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-pre-echo" }], "root");
       receive(held[0]);
 
       await waitUntil(() => runStarts(h, id).length === 1);
-      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-v8" });
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-pre-echo" });
       expect(h.failures).toEqual([]);
     });
 

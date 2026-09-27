@@ -100,8 +100,8 @@ export function createActorRuntime(
       }
       if (bootstrap.modelConfig?.length) {
         actor.setModelConfig(bootstrap.modelConfig as ProviderModelConfig[]);
-        modelConfigGeneration = bootstrap.modelConfigGeneration;
       }
+      modelConfigGeneration = bootstrap.modelConfigGeneration;
       if (bootstrap.sessionId) {
         sessionId = bootstrap.sessionId;
       }

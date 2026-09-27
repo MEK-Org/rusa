@@ -864,13 +864,13 @@ describe("follower protocol window (#719)", () => {
     ...extra,
   });
 
-  it("fully admits a deployed v8 follower, dispatches the pending update and records it reconciled", async () => {
-    // The client is the deployed v8 follower.ts, reduced to its wire handling: it
+  it("fully admits a deployed v7 follower, dispatches the pending update and records it reconciled", async () => {
+    // The client is the deployed v7 follower.ts, reduced to its wire handling: it
     // sends its own constant, stops unless the reply carries exactly that constant,
     // and takes an update as a command without actorId whose type is "update",
     // reading targetSha and branch. The literal is the release this leader must
     // still serve; when a bump moves it out of the window, move it to the new N−1.
-    const V8 = 8;
+    const V7 = 7;
     const root = mkdtempSync(join(tmpdir(), "follower-protocol-window-"));
     roots.push(root);
     const store = new FollowerUpdateTriggerStore(root);
@@ -880,22 +880,22 @@ describe("follower protocol window (#719)", () => {
     h.hub.onRegister((follower) => registered.push(follower.generation));
     h.hub.armReconciliation();
 
-    const registerV8 = async () => {
-      const response = await h.post("/register", identity("lagging", V8));
+    const registerV7 = async () => {
+      const response = await h.post("/register", identity("lagging", V7));
       expect(response.status).toBe(200);
       const registration = (await response.json()) as { session: string; protocolVersion: number };
-      if (registration.protocolVersion !== V8) {
+      if (registration.protocolVersion !== V7) {
         throw new Error("Incompatible instance protocol; rebuild leader and follower");
       }
       return registration.session;
     };
 
-    await registerV8();
+    await registerV7();
     // A dropped session (410) re-registers the same generation, the reconnect path.
-    const session = await registerV8();
+    const session = await registerV7();
     expect(registered).toEqual(["lagging-process-one", "lagging-process-one"]);
     expect(h.hub.list()).toEqual([
-      expect.objectContaining({ id: "lagging", protocolVersion: V8, commitSha: oldSha }),
+      expect.objectContaining({ id: "lagging", protocolVersion: V7, commitSha: oldSha }),
     ]);
     // Full admission: it takes actor placement like any current follower.
     expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();

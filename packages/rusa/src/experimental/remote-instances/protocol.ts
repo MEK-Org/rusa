@@ -13,10 +13,12 @@ import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/t
 // sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
 // this, delete the adapters that only served the version now falling out of range.
 //
-// v9 (#725): the leader numbers each pool it sends (`init`, `modelConfig`) and the
-// follower echoes that number on `admit`. A v8 follower omits it; the leader then
-// falls back to judging staleness from its own view of the queued report.
-export const INSTANCE_PROTOCOL_VERSION = 9;
+// #725 added optional fields without a bump: the leader numbers each pool it sends
+// (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
+// built before #725 (v7 or v8) omits it, and the leader falls back to its own view
+// of the queued report. That fallback is tagged `pre-echo adapter (#725)`; delete it
+// at the next bump that makes a real wire change.
+export const INSTANCE_PROTOCOL_VERSION = 8;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
@@ -32,7 +34,7 @@ export interface Bootstrap {
   sessionId?: string;
   /** The actor's declared candidate pool. */
   modelConfig?: RawProviderModelConfig[];
-  /** The leader's generation for `modelConfig`, echoed on `admit` (v9). */
+  /** The leader's generation for `modelConfig`, echoed on `admit` (#725). */
   modelConfigGeneration?: number;
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
@@ -96,7 +98,7 @@ export type Request =
       resume?: boolean;
       /**
        * The pool generation `candidates` were quoted under, as last numbered by
-       * the leader. Absent from a v8 follower.
+       * the leader. Absent from a follower built before #725.
        */
       modelConfigGeneration?: number;
     }
@@ -105,7 +107,12 @@ export type Request =
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
-  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[]; generation: number }
+  | {
+      type: "modelConfig";
+      modelConfig: RawProviderModelConfig[];
+      /** The leader's number for this pool, echoed on `admit`; absent before #725. */
+      generation?: number;
+    }
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }
