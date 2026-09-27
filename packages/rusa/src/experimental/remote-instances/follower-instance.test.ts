@@ -1358,6 +1358,65 @@ describe("monolithic follower instance", () => {
       expect(h.failures).toEqual([]);
     });
 
+    it("re-quotes an admission whose queued report the pin crossed on the wire (#725)", async () => {
+      const h = setup();
+      // Hold the follower's queued report and its admission request, both
+      // quoted under the bootstrap pool, so the leader still books it idle.
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        const { message } = event;
+        if (
+          (message.type === "state" && message.state === "queued") ||
+          (message.type === "request" && message.request.op === "admit")
+        ) {
+          held.push(event);
+          return;
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned across its queued report");
+      await waitUntil(() => held.length === 2);
+
+      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-crossing" }], "root");
+      h.remote.receive = receive;
+      for (const event of held.splice(0)) receive(event);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-crossing" });
+      expect(h.failures).toEqual([]);
+    });
+
+    it("re-quotes an admission that names no pool, from a follower built before #725, that the pin overtook", async () => {
+      const h = setup();
+      // A v7/v8 follower built before #725 ignores the numbered pool and sends
+      // `admit` without the generation it quoted under (the pre-echo adapter).
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        const { message } = event;
+        if (message.type === "request" && message.request.op === "admit") {
+          const { modelConfigGeneration: _omitted, ...preEchoRequest } = message.request;
+          const preEchoEvent = { ...event, message: { ...message, request: preEchoRequest } };
+          if (held.length === 0) {
+            held.push(preEchoEvent);
+            return;
+          }
+          return receive(preEchoEvent);
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned before a pre-echo admission arrives");
+      await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
+
+      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-pre-echo" }], "root");
+      receive(held[0]);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-pre-echo" });
+      expect(h.failures).toEqual([]);
+    });
+
     it("admits an unanswered request unchanged when the pin republishes its pool", async () => {
       const h = setup();
       const id = h.spawn("Republished while its admission request is on the wire");
