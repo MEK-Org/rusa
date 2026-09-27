@@ -429,6 +429,7 @@ QuotaSeriesTrace _traceSeries(
   DateTime? lastResetAt;
   DateTime? lastObservedAt;
   for (final point in series.points) {
+    // A reading that can't be placed on the axis is skipped, not a break.
     final observedAt = DateTime.tryParse(point.observedAt)?.toUtc();
     if (observedAt == null ||
         observedAt.isBefore(start) ||
@@ -743,6 +744,26 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
   static const _top = 10.0;
   static const _bottom = 27.0;
 
+  /// Map one series onto [plot], breaking at resets and non-finite intervals.
+  @visibleForTesting
+  static QuotaSeriesTrace traceFor(
+    QuotaHistorySeriesDto series,
+    DateTime start,
+    DateTime end,
+    Rect plot,
+    double Function(double seconds) yFor,
+  ) => _traceSeries(
+    series,
+    start: start,
+    end: end,
+    plot: plot,
+    valueOf: (point) => (point.intervalSeconds?.isFinite ?? false)
+        ? point.intervalSeconds
+        : null,
+    yFor: yFor,
+    isReset: _controllerWindowReset,
+  );
+
   @override
   void paint(Canvas canvas, Size size) {
     final plot = Rect.fromLTRB(
@@ -797,17 +818,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
     for (var i = 0; i < series.length; i++) {
       _paintTrace(
         canvas,
-        _traceSeries(
-          series[i],
-          start: start,
-          end: end,
-          plot: plot,
-          valueOf: (point) => (point.intervalSeconds?.isFinite ?? false)
-              ? point.intervalSeconds
-              : null,
-          yFor: yFor,
-          isReset: _controllerWindowReset,
-        ),
+        traceFor(series[i], start, end, plot, yFor),
         colors[i],
         dotEveryReading: true,
       );

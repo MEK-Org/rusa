@@ -789,6 +789,47 @@ void main() {
         [plot.bottom],
       ]);
     });
+
+    test('throttle breaks at non-finite intervals and every passed reset, '
+        'not at a long silence', () {
+      QuotaHistoryPointDto at(String time, [double interval = 10]) =>
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T$time:00.000Z',
+            remainingPercent: 50,
+            intervalSeconds: interval,
+            resetAtIso: '2026-09-26T14:30:00.000Z',
+          );
+      double yFor(double seconds) => 100 - seconds;
+      QuotaSeriesTrace traceOf(List<QuotaHistoryPointDto> points) =>
+          QuotaThrottleIntervalChartPainter.traceFor(
+            seriesOf(points),
+            start,
+            end,
+            plot,
+            yFor,
+          );
+
+      final nonFinite = traceOf([
+        at('09:00', 10),
+        at('10:00', double.infinity),
+        at('11:00', 20),
+      ]);
+      expect(nonFinite.segments.map((s) => s.map((o) => o.dy)), [
+        [yFor(10)],
+        [yFor(20)],
+      ]);
+
+      final stale = traceOf([
+        at('14:00'),
+        at('14:40'),
+        at('14:50'),
+        at('15:00'),
+      ]);
+      expect(stale.segments.map((s) => s.length), [1, 1, 1, 1]);
+
+      final sparse = traceOf([at('08:30'), at('12:30')]);
+      expect(sparse.segments.map((s) => s.length), [2]);
+    });
   });
 
   group('ThrottleLogAxis', () {
