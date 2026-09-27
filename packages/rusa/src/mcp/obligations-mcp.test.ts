@@ -1502,10 +1502,16 @@ describe("obligations MCP", () => {
     it("reports a past deadline and a terminal obligation as errors", async () => {
       repository.create({ title: "task", id: "task", ownerId: "actor-a" });
       const client = await connect(createObligationsMcpServer(repository, "actor-a"));
-      expect((await call(client, "task", "2020-01-01T00:00:00Z")).isError).toBe(true);
-      expect((await call(client, "task", "2999-01-01T00:00:00")).isError).toBe(true);
+      const refusal = async (until: string) => {
+        const res = await call(client, "task", until);
+        expect(res.isError).toBe(true);
+        const first = res.content[0];
+        return first && first.type === "text" ? first.text : "";
+      };
+      expect(await refusal("2020-01-01T00:00:00Z")).toContain("must be in the future");
+      expect(await refusal("2999-01-01T00:00:00")).toContain("timezone offset");
       repository.setTerminalStatus("task", "done", null, null, "actor-a");
-      expect((await call(client, "task", inHours(1))).isError).toBe(true);
+      expect(await refusal(inHours(1))).toContain("terminal obligations cannot be snoozed");
     });
 
     it("returns the committed snooze with a warning when its timer fails to arm", async () => {
