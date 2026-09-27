@@ -686,6 +686,111 @@ void main() {
     });
   });
 
+  group('controller plot traces keep their own break rules (#713)', () {
+    final start = DateTime.parse('2026-09-26T08:00:00.000Z');
+    final end = DateTime.parse('2026-09-26T16:00:00.000Z');
+    const plot = Rect.fromLTWH(0, 0, 480, 100);
+    QuotaHistorySeriesDto seriesOf(List<QuotaHistoryPointDto> points) =>
+        QuotaHistorySeriesDto(
+          provider: 'claude',
+          windowId: 'weekly',
+          label: 'Weekly',
+          points: points,
+        );
+
+    test('breaks at every reading after a passed reset', () {
+      QuotaHistoryPointDto at(String time) => QuotaHistoryPointDto(
+        observedAt: '2026-09-26T$time:00.000Z',
+        remainingPercent: 50,
+        error: 0,
+        resetAtIso: '2026-09-26T14:30:00.000Z',
+      );
+      final stale = seriesOf([
+        at('14:00'),
+        at('14:40'),
+        at('14:50'),
+        at('15:00'),
+      ]);
+
+      final headroom = QuotaPaceErrorChartPainter.traceFor(
+        stale,
+        start,
+        end,
+        plot,
+      );
+      final remaining = QuotaRemainingChartPainter.traceFor(
+        stale,
+        start,
+        end,
+        plot,
+      );
+      expect(headroom.segments.map((s) => s.length), [1, 1, 1, 1]);
+      expect(remaining.segments.map((s) => s.length), [1, 3]);
+    });
+
+    test('joins readings across a long silence', () {
+      final sparse = seriesOf(const [
+        QuotaHistoryPointDto(
+          observedAt: '2026-09-26T08:30:00.000Z',
+          remainingPercent: 50,
+          error: 0,
+        ),
+        QuotaHistoryPointDto(
+          observedAt: '2026-09-26T15:30:00.000Z',
+          remainingPercent: 50,
+          error: 0,
+        ),
+      ]);
+
+      expect(
+        QuotaPaceErrorChartPainter.traceFor(
+          sparse,
+          start,
+          end,
+          plot,
+        ).segments.map((s) => s.length),
+        [2],
+      );
+      expect(
+        QuotaRemainingChartPainter.traceFor(
+          sparse,
+          start,
+          end,
+          plot,
+        ).segments.map((s) => s.length),
+        [1, 1],
+      );
+    });
+
+    test('breaks at a missing decision and clamps to the ±50% edges', () {
+      final trace = QuotaPaceErrorChartPainter.traceFor(
+        seriesOf(const [
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T09:00:00.000Z',
+            remainingPercent: 50,
+            error: 60,
+          ),
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T10:00:00.000Z',
+            remainingPercent: 50,
+          ),
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T11:00:00.000Z',
+            remainingPercent: 50,
+            error: -80,
+          ),
+        ]),
+        start,
+        end,
+        plot,
+      );
+      expect(trace.segments.map((s) => s.map((o) => o.dy)), [
+        [plot.top],
+        [plot.bottom],
+      ]);
+    });
+  });
+
   group('ThrottleLogAxis', () {
     QuotaHistorySeriesDto seriesWith(List<double?> intervals) =>
         QuotaHistorySeriesDto(
