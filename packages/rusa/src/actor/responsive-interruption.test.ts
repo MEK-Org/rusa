@@ -10,6 +10,7 @@ import {
   type JevDecisionClient,
   type JevDecisionRequest,
   JevInputUnavailableError,
+  RESPONSIVE_INTERRUPTION_QUESTION,
   SHADOW_INTERRUPT_EMOJI,
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -98,7 +99,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       candidateEntryIds: ["selected-a", "selected-b"],
       candidateSource: "selected",
     });
-    expect(asked[0].question).toContain("should we interrupt");
+    expect(asked[0].question).toBe(RESPONSIVE_INTERRUPTION_QUESTION);
 
     expect(decision).toEqual({
       outcome: "interrupt",
@@ -325,9 +326,9 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
     });
 
-    it("queues an interrupt the client is not confident enough about, keeping the confidence", async () => {
-      // A threshold cannot be tuned from records that discard the confidence
-      // they rejected.
+    it("queues an interrupt the client is not confident enough about, keeping its verdict and confidence", async () => {
+      // A threshold cannot be tuned from records that discard the verdict and
+      // confidence they rejected (#710).
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
         client: client(async () => ({
@@ -345,6 +346,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       expect(decision).toMatchObject({
         outcome: "queue",
         reason: "low_confidence",
+        verdict: "interrupt",
         confidence: 0.62,
         matchedCandidateIds: ["selected-a"],
       });
@@ -445,6 +447,14 @@ describe("shadowVerdictEmoji", () => {
   });
 });
 
+describe("RESPONSIVE_INTERRUPTION_QUESTION", () => {
+  it("is the operator-approved wording, verbatim (#710)", () => {
+    expect(RESPONSIVE_INTERRUPTION_QUESTION).toBe(
+      "A new responsive item has arrived for an actor. Should it interrupt the current run or wait in the queue? Default to interrupt. Choose queue only when the arriving item is clearly unrelated to the current work. Corrections, cancellations, clarifications, and follow-ups about that work should interrupt. If the relationship is uncertain or the current work is not known, choose interrupt. Use sender and timestamps to interpret the relationship between messages. Candidates marked selected are the current work; candidates marked pending are unread context, not confirmed current work."
+    );
+  });
+});
+
 describe("shadowPrediction", () => {
   const decide = (decideFn?: JevDecisionClient["decide"]) =>
     new ShadowResponsiveInterruptionClassifier({
@@ -465,10 +475,15 @@ describe("shadowPrediction", () => {
     expect(
       shadowPrediction(await decide(async () => ({ verdict: "queue", confidence: 0.3 })))
     ).toBe("queue");
-    // A weak interrupt turned back by the threshold is still a prediction.
-    expect(
-      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.5 })))
-    ).toBe("queue");
+    // A weak interrupt turned back by the threshold still shows what JEV
+    // said, not the policy's queue (#710).
+    const weak = await decide(async () => ({ verdict: "interrupt", confidence: 0.5 }));
+    expect(weak).toMatchObject({
+      outcome: "queue",
+      reason: "low_confidence",
+      verdict: "interrupt",
+    });
+    expect(shadowPrediction(weak)).toBe("interrupt");
   });
 
   it("is nothing when no judgement was made", async () => {
