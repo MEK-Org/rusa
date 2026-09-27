@@ -7,7 +7,9 @@ import {
   buildQuotaHistory,
   buildQuotaHistorySnapshot,
   buildQuotaSnapshot,
+  HISTORY_WINDOW_MS,
   handleQuotaApiRequest,
+  MAX_HISTORY_POINTS_PER_SERIES,
   type QuotaApiDeps,
   type QuotaHistorySource,
   type QuotaSnapshotDto,
@@ -764,6 +766,146 @@ describe("dashboard quota snapshot", () => {
       intervalSeconds: null,
       resetAtIso: null,
     });
+  });
+
+  it("bounds a dense 3-day series to one real reading per time bucket and leaves an outage empty", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const reset = "2026-09-14T06:00:00.000Z";
+    const rows: QuotaHistorySource[] = [];
+    for (let t = sinceMs; t <= untilMs; t += 5 * 60 * 1000) {
+      // A twelve-hour outage with no readings at all must stay a gap.
+      if (
+        t >= Date.parse("2026-09-13T00:00:00.000Z") &&
+        t < Date.parse("2026-09-13T12:00:00.000Z")
+      ) {
+        continue;
+      }
+      const beforeReset = t < Date.parse(reset);
+      rows.push(
+        historyPoint({
+          scope: "model",
+          models: ["claude-fable"],
+          label: "Fable",
+          observedAt: new Date(t).toISOString(),
+          percentLeft: Math.round((beforeReset ? 40 : 90) - ((t - sinceMs) % 1000) / 100),
+          resetAtIso: beforeReset ? reset : "2026-09-21T06:00:00.000Z",
+          controllerError: 0.05 + ((t - sinceMs) % 7) / 10,
+          intervalSeconds: 300 + ((t - sinceMs) % 11),
+        })
+      );
+    }
+    expect(rows.length).toBeGreaterThan(MAX_HISTORY_POINTS_PER_SERIES);
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    expect(series.points.length).toBeLessThanOrEqual(MAX_HISTORY_POINTS_PER_SERIES);
+    // Every point is a real reading with its stored controller fields, never
+    // an average or a filled value.
+    const byObservedAt = new Map(rows.map((row) => [row.observedAt, row]));
+    for (const point of series.points) {
+      const source = byObservedAt.get(point.observedAt);
+      expect(source).toBeDefined();
+      expect(point.remainingPercent).toBe(source?.percentLeft);
+      // The DTO carries the stored controller error sign-flipped, as for every reading.
+      expect(point.error).toBe(-(source?.controllerError ?? 0));
+      expect(point.intervalSeconds).toBe(source?.intervalSeconds);
+    }
+    expect(series.points.at(-1)?.observedAt).toBe(rows.at(-1)?.observedAt);
+    // Nothing is invented inside the outage.
+    expect(
+      series.points.filter(
+        (point) =>
+          point.observedAt >= "2026-09-13T00:00:00.000Z" &&
+          point.observedAt < "2026-09-13T12:00:00.000Z"
+      )
+    ).toEqual([]);
+  });
+
+  it("holds the bound for a fully covered 3-day range with a reading exactly at its end", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const rows: QuotaHistorySource[] = [];
+    for (let t = sinceMs; t <= untilMs; t += 5 * 60 * 1000) {
+      rows.push(historyPoint({ observedAt: new Date(t).toISOString(), percentLeft: 50 }));
+    }
+    expect(rows.at(-1)?.observedAt).toBe(new Date(untilMs).toISOString());
+    expect(rows.length).toBeGreaterThan(MAX_HISTORY_POINTS_PER_SERIES);
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    expect(series.points.length).toBeLessThanOrEqual(MAX_HISTORY_POINTS_PER_SERIES);
+    expect(series.points.at(-1)?.observedAt).toBe(new Date(untilMs).toISOString());
+  });
+
+  it("keeps a reset visible when it falls inside a bucket whose prior bucket is empty", () => {
+    const sinceMs = Date.parse("2026-09-12T12:00:00.000Z");
+    const untilMs = sinceMs + HISTORY_WINDOW_MS;
+    const bucketMs = HISTORY_WINDOW_MS / MAX_HISTORY_POINTS_PER_SERIES;
+    // The reset lands two minutes into bucket 312; bucket 311 has no reading.
+    const resetMs = sinceMs + 312 * bucketMs + 2 * 60 * 1000;
+    const oldReset = new Date(resetMs).toISOString();
+    const newReset = new Date(resetMs + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const rows: QuotaHistorySource[] = [];
+    // One-minute readings, so bucket 312 holds readings on both sides of the reset.
+    for (let t = sinceMs; t <= untilMs; t += 60 * 1000) {
+      if (t >= sinceMs + 311 * bucketMs && t < sinceMs + 312 * bucketMs) continue;
+      rows.push(
+        historyPoint({
+          observedAt: new Date(t).toISOString(),
+          percentLeft: t < resetMs ? 3 : 100,
+          resetAtIso: t < resetMs ? oldReset : newReset,
+        })
+      );
+    }
+
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      new Date(sinceMs).toISOString(),
+      new Date(untilMs).toISOString()
+    );
+
+    // The newest reading of bucket 312 is post-reset, and the reading kept
+    // before it is still pre-reset from bucket 310: the reported reset
+    // instant changes between two adjacent kept points.
+    const firstAfter = series.points.findIndex((point) => point.resetAtIso === newReset);
+    expect(firstAfter).toBeGreaterThan(0);
+    expect(series.points[firstAfter - 1]).toMatchObject({
+      resetAtIso: oldReset,
+      remainingPercent: 3,
+    });
+    expect(Date.parse(series.points[firstAfter - 1].observedAt)).toBeLessThan(
+      sinceMs + 311 * bucketMs
+    );
+  });
+
+  it("leaves a series at or under the bound untouched", () => {
+    const rows = Array.from({ length: 12 }, (_, i) =>
+      historyPoint({
+        observedAt: new Date(Date.parse("2026-09-20T00:00:00.000Z") + i * 60_000).toISOString(),
+        percentLeft: 50 - i,
+      })
+    );
+    const [series] = buildQuotaHistory(
+      "claude",
+      rows,
+      "2026-09-18T00:00:00.000Z",
+      "2026-09-21T00:00:00.000Z"
+    );
+    expect(series.points.map((point) => point.remainingPercent)).toEqual(
+      rows.map((row) => row.percentLeft)
+    );
   });
 });
 
