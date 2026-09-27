@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
 import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
@@ -1293,6 +1294,197 @@ describe("monolithic follower instance", () => {
 
     expect(sent.filter((message) => message.type === "modelConfig")).toEqual([]);
     expect(pacer.waiting).toBe(1);
+  });
+
+  describe("model changes on a queued remote actor (#608)", () => {
+    const runStarts = (h: ReturnType<typeof setup>, id: string) =>
+      h.events.flatMap((event) =>
+        event.actorId === id && event.event.type === "runStart" ? [event.event] : []
+      );
+
+    it("adopts a pool without re-quoting until the mesh asks for a reschedule", async () => {
+      const pacer = new ProviderPacer(0);
+      pacer.deferUntil(Date.now() + 1_000);
+      const h = setup({ pacer });
+      const id = h.spawn("Adopt then reschedule");
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+      const runtime = h.runtime(id);
+
+      // A quote under the current pool is not stale.
+      expect(runtime.rescheduleQueuedRun()).toBe(false);
+      // As on a local Actor, adopting a pool is a next-run assignment...
+      runtime.setModelConfig([{ provider: "instance-fixture", model: "model-rescheduled" }]);
+      await delay(50);
+      expect(pacer.waiting).toBe(1);
+      expect(runStarts(h, id)).toEqual([]);
+
+      // ...and the reschedule is what releases the stale quote and re-admits.
+      expect(runtime.rescheduleQueuedRun()).toBe(true);
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-rescheduled" });
+      expect(h.meshEvents.some((event) => event.kind === "run_abandoned")).toBe(false);
+    });
+
+    it("re-quotes an admission request that the pin overtook on the wire", async () => {
+      const h = setup();
+      // Hold the follower's admission request, quoted under the bootstrap pool,
+      // while the leader has seen `state: queued` but holds no gate yet.
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      let holding = true;
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          held.push(event);
+          if (holding) return;
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned before its admission request arrives");
+      await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
+
+      const pool = [{ provider: "instance-fixture", model: "model-overtaking" }];
+      h.mesh.setActorModel(id, pool, "root");
+      receive(held[0]);
+      // The refused request's re-ask is quoted under the pin, so republishing
+      // that pool while the re-ask is on the wire must not refuse it too.
+      await waitUntil(() => held.length === 2);
+      h.mesh.setActorModel(id, pool, "root");
+      holding = false;
+      receive(held[1]);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-overtaking" });
+      expect(held).toHaveLength(2);
+      expect(h.failures).toEqual([]);
+    });
+
+    it("admits an unanswered request unchanged when the pin republishes its pool", async () => {
+      const h = setup();
+      const id = h.spawn("Republished while its admission request is on the wire");
+      await waitUntil(() =>
+        h.events.some((event) => event.actorId === id && event.event.type === "result")
+      );
+      // Pinned while idle: the next queued report is already under this pool.
+      const pool = [{ provider: "instance-fixture", model: "model-pinned-idle" }];
+      h.mesh.setActorModel(id, pool, "root");
+
+      const admits: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      let holding = true;
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          admits.push(event);
+          if (holding) return;
+        }
+        receive(event);
+      };
+      h.mesh.sendMessage(id, "Run again", "root");
+      await waitUntil(() => h.runtime(id).isQueued && admits.length === 1);
+
+      h.mesh.setActorModel(id, pool, "root");
+      holding = false;
+      receive(admits[0]);
+
+      await waitUntil(() => runStarts(h, id).length === 2);
+      expect(runStarts(h, id)[1]?.selected).toMatchObject({ model: "model-pinned-idle" });
+      // The request was quoted under the current pool, so it is not asked again.
+      expect(admits).toHaveLength(1);
+    });
+
+    it("re-quotes a request whose pool was pinned during the host-authority preflight", async () => {
+      const h = setup();
+      const held: Parameters<typeof h.remote.receive>[0][] = [];
+      const receive = h.remote.receive.bind(h.remote);
+      h.remote.receive = (event) => {
+        if (event.message.type === "request" && event.message.request.op === "admit") {
+          held.push(event);
+          return;
+        }
+        receive(event);
+      };
+      const id = h.spawn("Pinned while its admission is in preflight");
+      await waitUntil(() => h.runtime(id).isQueued && held.length === 1);
+
+      const context = (h.runtime(id) as unknown as { opts: { context: ActorFactoryContext } }).opts
+        .context;
+      const admitRun = context.admitRun;
+      let pinned = false;
+      context.admitRun = (request) => {
+        if (!pinned) {
+          pinned = true;
+          h.mesh.setActorModel(
+            id,
+            [{ provider: "instance-fixture", model: "model-in-preflight" }],
+            "root"
+          );
+        }
+        return admitRun?.(request) ?? true;
+      };
+      h.remote.receive = receive;
+      for (const event of held.splice(0)) receive(event);
+
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(pinned).toBe(true);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-in-preflight" });
+      expect(h.failures).toEqual([]);
+    });
+
+    it("admits and executes a remote run on the second candidate when the first is halted", async () => {
+      const h = setup({
+        pacer: new ProviderPacer(0),
+        isHalted: (_provider, model) => model === "model-halted",
+      });
+      const id = h.spawn("Run on whichever candidate can", [
+        { provider: "instance-fixture", model: "model-halted" },
+        { provider: "instance-fixture", model: "model-second" },
+      ]);
+      await waitUntil(() =>
+        h.events.some(
+          (event) =>
+            event.actorId === id && event.event.type === "result" && event.event.result.success
+        )
+      );
+      expect(runStarts(h, id).map((event) => event.selected)).toEqual([
+        expect.objectContaining({ model: "model-second" }),
+      ]);
+      // The follower built and ran the provider for the admitted tuple.
+      expect(
+        h.events.find((event) => event.actorId === id && event.event.type === "result")?.event
+      ).toMatchObject({ result: { model: "model-second" } });
+      expect(h.failures).toEqual([]);
+    });
+
+    it("parks a queued remote run pinned onto a halted pool and replays it on unhalt", async () => {
+      let haltedModel: string | undefined;
+      const pacer = new ProviderPacer(0);
+      pacer.deferUntil(Date.now() + 1_000);
+      const h = setup({ pacer, isHalted: (_provider, model) => model === haltedModel });
+      const id = h.spawn("Pinned onto a halted pool");
+      await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+      haltedModel = "model-halted";
+      h.mesh.setActorModel(id, [{ provider: "instance-fixture", model: "model-halted" }], "root");
+      // The same boundary as a local Actor: cancel and retain, never re-quote
+      // the opportunity into a pool that cannot run.
+      await waitUntil(
+        () =>
+          h.meshEvents.some(
+            (event) =>
+              event.kind === "run_abandoned" &&
+              event.actorId === id &&
+              event.detail === "start-cancelled"
+          ) && !h.runtime(id).isQueued
+      );
+      // The parked run gave its place in pacing back.
+      expect(pacer.waiting).toBe(0);
+      await delay(100);
+      expect(runStarts(h, id)).toEqual([]);
+
+      haltedModel = undefined;
+      expect(h.mesh.resumeCancelledRuns()).toEqual([id]);
+      await waitUntil(() => runStarts(h, id).length === 1);
+      expect(runStarts(h, id)[0]?.selected).toMatchObject({ model: "model-halted" });
+    });
   });
 
   it("executes the follower provider constructed for a staged pin", async () => {
