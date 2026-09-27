@@ -4360,18 +4360,32 @@ describe("handleMeshApiRequest", () => {
         await settled(res);
         return { status: res.statusCode, data: JSON.parse(res.body) };
       };
+      /** The wake timers `rusa start` would arm; the standalone dashboard attaches none. */
+      let armed: Map<string, unknown>;
+      beforeEach(() => {
+        armed = new Map();
+        obligations.setOsScheduler({
+          instanceId: "test",
+          scheduleObligationActivation: (id, time) => armed.set(id, time),
+          cancelObligationActivation: (id) => armed.delete(id),
+          listObligationActivations: () => [],
+          canScheduleAt: () => true,
+        });
+      });
 
-      it("lets the owning human set and clear a snooze", async () => {
+      it("lets the owning human set and clear a snooze, arming and cancelling its timer", async () => {
         obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
         const until = future();
         const set = await snooze("mine", { until });
         expect(set.status).toBe(200);
         expect(set.data.obligation).toMatchObject({ status: "ready", snoozedUntil: until });
         expect(set.data.warning).toBeUndefined();
+        expect(armed.get("mine")).toEqual({ kind: "at", date: new Date(until) });
 
         const cleared = await snooze("mine", { until: null });
         expect(cleared.status).toBe(200);
         expect(cleared.data.obligation.snoozedUntil).toBeNull();
+        expect(armed.has("mine")).toBe(false);
         expect(obligations.listHistory("mine")[0]).toMatchObject({
           mutationKind: "snooze",
           actingPrincipal: LOCAL_USER,
@@ -4389,6 +4403,25 @@ describe("handleMeshApiRequest", () => {
         expect(res.status).toBe(403);
         expect(res.data.error).toContain("only the obligation's current owner");
         expect(obligations.get("theirs")?.snoozedUntil).toBeNull();
+      });
+
+      it("503s a snooze where no scheduler is attached, writing nothing", async () => {
+        // The standalone `rusa dashboard` serves this route over a repository
+        // with no host scheduler, so nothing there could end a snooze.
+        const bare = new ObligationRepository(db);
+        const standalone = { ...deps, obligations: bare };
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const { res } = await call(
+          standalone,
+          "POST",
+          "/api/mesh/obligations/mine/snooze",
+          JSON.stringify({ until: future() })
+        );
+        await settled(res);
+        expect(res.statusCode).toBe(503);
+        expect(JSON.parse(res.body).error).toContain("no host activation scheduler");
+        expect(bare.get("mine")?.snoozedUntil).toBeNull();
+        expect(bare.listHistory("mine").some((h) => h.mutationKind === "snooze")).toBe(false);
       });
 
       it("404s a missing obligation and 400s an invalid deadline", async () => {

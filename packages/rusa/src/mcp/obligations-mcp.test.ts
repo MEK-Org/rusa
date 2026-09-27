@@ -1423,6 +1423,16 @@ describe("obligations MCP", () => {
     const inHours = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString();
     const call = (client: Client, id: string, until: string | null) =>
       client.callTool({ name: "set_snooze", arguments: { id, until } }) as Promise<CallToolResult>;
+    // `rusa start` attaches the host scheduler; without one a snooze is refused.
+    beforeEach(() => {
+      repository.setOsScheduler({
+        instanceId: "test",
+        scheduleObligationActivation: () => {},
+        cancelObligationActivation: () => {},
+        listObligationActivations: () => [],
+        canScheduleAt: () => true,
+      });
+    });
 
     it("lets the owner snooze and clear, and orders snoozed work after actionable work", async () => {
       repository.create({ title: "first", id: "first", ownerId: "actor-a" });

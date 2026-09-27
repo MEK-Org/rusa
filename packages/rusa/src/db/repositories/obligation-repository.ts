@@ -30,6 +30,7 @@ import {
   parseHistoryRow,
   parseObligationReference,
   prerequisiteEdgeKey,
+  SnoozeTimerUnavailableError,
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
@@ -2907,8 +2908,10 @@ export class ObligationRepository {
    * this method cannot tell an owner from anyone else. The deadline is
    * normalized to UTC and must be in the future; rewriting the current value is
    * a no-op. A snooze keeps the underlying status and every dependency and
-   * parent block. Setting one on a host already known to lack `at` is refused
-   * before anything is written, since nothing could end it.
+   * parent block. Setting one where nothing could end it — no scheduler is
+   * attached to this process (the standalone dashboard), or the host is known
+   * to lack `at` — is refused with {@link SnoozeTimerUnavailableError} before
+   * anything is written. Clearing needs no timer and is always allowed.
    *
    * Returns the committed obligation, plus `scheduleError` when this call's
    * write committed but its host timer did not arm. The mutation retries the
@@ -2923,10 +2926,17 @@ export class ObligationRepository {
     principal: EntityId
   ): { obligation: Obligation; scheduleError: string | null } {
     const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
-    if (snoozedUntil !== null && this.scheduler?.canScheduleAt() === false) {
-      throw new ObligationValidationError(
-        "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
-      );
+    if (snoozedUntil !== null) {
+      if (!this.scheduler) {
+        throw new SnoozeTimerUnavailableError(
+          "cannot snooze: this process has no host activation scheduler attached, so nothing would end the snooze"
+        );
+      }
+      if (!this.scheduler.canScheduleAt()) {
+        throw new SnoozeTimerUnavailableError(
+          "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
+        );
+      }
     }
     const obligation = this.mutate(principal, () => {
       const existing = this.require(id);

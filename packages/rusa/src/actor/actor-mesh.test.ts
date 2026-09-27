@@ -12529,6 +12529,14 @@ describe("strict obligation handling experiment (#382)", () => {
     beforeEach(() => {
       clock = T0;
       repo = new ObligationRepository(db, undefined, () => clock);
+      // `rusa start` attaches the host scheduler; without one a snooze is refused.
+      repo.setOsScheduler({
+        instanceId: "test",
+        scheduleObligationActivation: () => {},
+        cancelObligationActivation: () => {},
+        listObligationActivations: () => [],
+        canScheduleAt: () => true,
+      });
     });
 
     function snoozeMesh() {

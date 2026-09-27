@@ -25,7 +25,11 @@ import {
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
+import {
+  type Obligation,
+  type ObligationStatus,
+  SnoozeTimerUnavailableError,
+} from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import {
@@ -1490,7 +1494,10 @@ export async function handleMeshApiRequest(
                 : {}),
             });
           } catch (err) {
-            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+            // No timer here could end the snooze (the standalone dashboard
+            // attaches none): the service is unavailable, not the request bad.
+            const status = err instanceof SnoozeTimerUnavailableError ? 503 : 400;
+            sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
           }
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));

@@ -200,6 +200,14 @@ export class ObligationValidationError extends Error {
   }
 }
 
+/** A snooze refused because this process has no timer that could end it (#722). */
+export class SnoozeTimerUnavailableError extends ObligationValidationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SnoozeTimerUnavailableError";
+  }
+}
+
 const STATUSES = new Set<ObligationStatus>(OBLIGATION_STATUSES);
 
 export function isBlockingObligationStatus(status: ObligationStatus): boolean {
