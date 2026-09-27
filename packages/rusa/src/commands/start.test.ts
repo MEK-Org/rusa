@@ -48,6 +48,7 @@ import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
+import { writeBuildSentinel } from "../update/build-sentinel.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -3382,7 +3383,32 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(requestRunCalls).toHaveLength(0);
   });
 
-  it("routes the production low-water check to root as responsive system.disk work without DMing the error chat", async () => {
+  // runStart posts "✅ Back online" whenever the resolved repository root holds
+  // dist/.build-ok, so a test that pins what reaches the error chat must pick the
+  // checkout state instead of inheriting the one it happens to run in (#500).
+  const BUILT_SHA = "0123456789abcdef0123456789abcdef01234567";
+  function useCheckout(state: "unbuilt" | "built") {
+    const repoRoot = join(homeDir, "checkout");
+    mkdirSync(repoRoot, { recursive: true });
+    if (state === "built") {
+      writeBuildSentinel(join(repoRoot, "packages", "rusa", "dist"), BUILT_SHA);
+    }
+    serviceInstanceMock.resolveRepoRoot.mockReturnValue(repoRoot);
+    return state === "built"
+      ? [
+          expect.objectContaining({
+            spaceName: "spaces/operator-dm",
+            text: `✅ Back online on ${BUILT_SHA.slice(0, 7)}`,
+          }),
+        ]
+      : [];
+  }
+
+  it.each([
+    "unbuilt",
+    "built",
+  ] as const)("routes the production low-water check to root as responsive system.disk work without DMing the error chat (%s checkout)", async (checkout) => {
+    const lifecyclePings = useCheckout(checkout);
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     writeFileSync(
@@ -3433,13 +3459,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       actorId: "root",
       reason: JSON.stringify({ priority: "responsive" }),
     });
-    expect(chatClient.sent).toEqual([]);
+    // The only error-chat traffic is the lifecycle ping the checkout earns.
+    expect(chatClient.sent).toEqual(lifecyclePings);
   });
 
-  it("delivers the alert to root when config carries no observability block at all", async () => {
+  it.each([
+    "unbuilt",
+    "built",
+  ] as const)("delivers the alert to root when config carries no observability block at all (%s checkout)", async (checkout) => {
     // The production shape behind the outage: no observability block, so the
     // sensor ran on defaults and emitted into a source nobody covered. Root's
     // subscription now follows the sensor's own predicate, so the alert lands.
+    const lifecyclePings = useCheckout(checkout);
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     writeFileSync(
@@ -3510,8 +3541,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       actorId: "root",
       reason: JSON.stringify({ priority: "responsive" }),
     });
-    // The mesh carried it, so the last-resort error-chat send stays unused.
-    expect(chatClient.sent).toEqual([]);
+    // The mesh carried it, so the last-resort error-chat send stays unused;
+    // only the checkout's lifecycle ping may reach the error chat.
+    expect(chatClient.sent).toEqual(lifecyclePings);
   });
 
   it("keeps generated E2E configs free of disk alerts and system:events, even with an enabled base", async () => {
