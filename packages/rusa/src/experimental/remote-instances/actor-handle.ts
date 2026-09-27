@@ -93,7 +93,8 @@ export class ActorHandle implements MeshActor {
    * The pool changed between the follower's queued report and its admission
    * request, which was quoted under the old pool; refuse it as stale on arrival.
    * Only a request that does not name its pool relies on this.
-   * pre-echo adapter (#725): remove at the next wire bump, with quotedGeneration.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with quotedGeneration.
    */
   private pendingQueuedRequote = false;
   /**
@@ -102,8 +103,8 @@ export class ActorHandle implements MeshActor {
    * report on the wire is stamped here as already quoted, so for a follower
    * built before #725, which does not name its pool on `admit`, that one run can
    * start on the pre-pin pool.
-   * pre-echo adapter (#725): remove at the next wire bump, with the branch of
-   * rescheduleQueuedRun that reads it.
+   * pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+   * with the branch of rescheduleQueuedRun that reads it.
    */
   private quotedGeneration = 0;
   private state: ActorRuntimeState = "idle";
@@ -531,9 +532,10 @@ export class ActorHandle implements MeshActor {
       gate.modelConfigStale = true;
       if (gate.handle.cancel?.()) rescheduled = cancelledGate = true;
     }
-    // pre-echo adapter (#725): remove at the next wire bump. An echoed generation
-    // refuses the stale request by itself; the mesh re-dispatches nothing for a
-    // queued actor, so returning false here changes no outcome.
+    // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8.
+    // An echoed generation refuses the stale request by itself; the mesh
+    // re-dispatches nothing for a queued actor, so returning false here changes
+    // no outcome.
     if (
       !rescheduled &&
       this.state === "queued" &&
@@ -546,7 +548,8 @@ export class ActorHandle implements MeshActor {
       rescheduled = true;
     }
     // The stale reply follows the `modelConfig` command, so the re-ask is quoted
-    // under the current pool. pre-echo adapter (#725), with quotedGeneration.
+    // under the current pool. pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8, with quotedGeneration.
     if (rescheduled) this.quotedGeneration = this.modelConfigGeneration;
     // As Actor.rescheduleQueuedRun: the old quote's recorded selection is gone.
     // Only a gate records one; the request-in-flight branch has none to clear.
@@ -557,7 +560,8 @@ export class ActorHandle implements MeshActor {
   /** Refuse an admission request quoted under a pool replaced before it arrived. */
   private rejectStaleAdmission(requestId: number, quotedGeneration: number | undefined): boolean {
     // A follower names the pool it quoted; one built before #725 leaves the
-    // leader to infer it (pre-echo adapter (#725): remove at the next wire bump).
+    // leader to infer it (pre-echo adapter (#725): remove once
+    // OLDEST_FOLLOWER_PROTOCOL_VERSION > 8).
     const stale =
       quotedGeneration === undefined
         ? this.pendingQueuedRequote
@@ -886,7 +890,8 @@ export class ActorHandle implements MeshActor {
         // a reattach, is taken as quoted under the pool the leader had sent
         // before processing it. A pin that crossed the report on the wire
         // breaks that; only the generation an `admit` echoes catches it.
-        // pre-echo adapter (#725), with quotedGeneration.
+        // pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8,
+        // with quotedGeneration.
         if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
           this.quotedGeneration = this.modelConfigGeneration;
         }

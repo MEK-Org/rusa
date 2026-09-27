@@ -16,8 +16,9 @@ import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/t
 // #725 added optional fields without a bump: the leader numbers each pool it sends
 // (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
 // built before #725 (v7 or v8) omits it, and the leader falls back to its own view
-// of the queued report. That fallback is tagged `pre-echo adapter (#725)`; delete it
-// at the next bump that makes a real wire change.
+// of the queued report. Pre- and post-#725 v8 followers share a version, so the
+// fallback lives until v8 leaves the window, not at the next bump. It is tagged
+// `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
 export const INSTANCE_PROTOCOL_VERSION = 8;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
