@@ -12,7 +12,11 @@ import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/t
 // to N keeps N−1 working (the leader adapts to any v(N−1) shape it changed, and never
 // sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
 // this, delete the adapters that only served the version now falling out of range.
-export const INSTANCE_PROTOCOL_VERSION = 8;
+//
+// v9 (#725): the leader numbers each pool it sends (`init`, `modelConfig`) and the
+// follower echoes that number on `admit`. A v8 follower omits it; the leader then
+// falls back to judging staleness from its own view of the queued report.
+export const INSTANCE_PROTOCOL_VERSION = 9;
 /** Oldest follower protocol the leader still admits; see the rule above. */
 export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
@@ -28,6 +32,8 @@ export interface Bootstrap {
   sessionId?: string;
   /** The actor's declared candidate pool. */
   modelConfig?: RawProviderModelConfig[];
+  /** The leader's generation for `modelConfig`, echoed on `admit` (v9). */
+  modelConfigGeneration?: number;
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
   actorOptions?: Pick<
@@ -88,13 +94,18 @@ export type Request =
        * retained, under the request id the leader's gate still answers on.
        */
       resume?: boolean;
+      /**
+       * The pool generation `candidates` were quoted under, as last numbered by
+       * the leader. Absent from a v8 follower.
+       */
+      modelConfigGeneration?: number;
     }
   | { op: "sendMessage"; to: string; body: string };
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
-  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[] }
+  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[]; generation: number }
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }

@@ -40,6 +40,8 @@ export function createActorRuntime(
   // provider gate. Carry its mode to the leader's final admission boundary.
   let pendingRunMode: ActorRunMode = "ordinary";
   let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
+  /** The leader's number for the pool the Actor holds; `admit` echoes it (#725). */
+  let modelConfigGeneration: number | undefined;
   /** The admission request in flight, which a reconnecting leader can resume. */
   let pendingAdmission: { id: number; request: AdmitRequest } | undefined;
   /**
@@ -98,6 +100,7 @@ export function createActorRuntime(
       }
       if (bootstrap.modelConfig?.length) {
         actor.setModelConfig(bootstrap.modelConfig as ProviderModelConfig[]);
+        modelConfigGeneration = bootstrap.modelConfigGeneration;
       }
       if (bootstrap.sessionId) {
         sessionId = bootstrap.sessionId;
@@ -117,6 +120,7 @@ export function createActorRuntime(
     }
     let snapshot: RunSnapshot;
     sessionId = bootstrap.sessionId;
+    modelConfigGeneration = bootstrap.modelConfigGeneration;
     const bridge = {
       sendMessage: (to: string, body: string) => request({ op: "sendMessage", to, body }).result,
       yieldRun: (status?: string, note?: string) => {
@@ -182,6 +186,9 @@ export function createActorRuntime(
         }
       },
       gate: (fn, candidates, responsive) => {
+        // `candidates` is the pool the Actor held at this call, which the
+        // computer-use lock can hand to leaderGate later.
+        const quotedGeneration = modelConfigGeneration;
         let providerStarted = false;
         // This must be set by the leader's selected-provider reply, not by
         // beforeRun: a durable grant can change while provider pacing waits.
@@ -197,6 +204,7 @@ export function createActorRuntime(
             candidates: [...candidates],
             responsive,
             mode: pendingRunMode,
+            modelConfigGeneration: quotedGeneration,
           };
           const admission = request<RunSnapshot | { deferred: true }>(admitRequest);
           pendingAdmission = { id: admission.id, request: admitRequest };
@@ -353,6 +361,7 @@ export function createActorRuntime(
         break;
       case "modelConfig":
         actor?.setModelConfig(message.modelConfig as ProviderModelConfig[]);
+        modelConfigGeneration = message.generation;
         break;
       case "reply": {
         const call = pending.get(message.requestId);
