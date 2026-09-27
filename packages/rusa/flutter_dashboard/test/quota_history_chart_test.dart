@@ -498,6 +498,83 @@ void main() {
     });
 
     testWidgets(
+      'draws a controller-valued Fable line on headroom and throttle',
+      (tester) async {
+        const controlledFable = QuotaHistorySeriesDto(
+          provider: 'claude',
+          windowId: 'weekly',
+          scope: 'model',
+          modelIds: ['claude-fable'],
+          label: 'Fable',
+          points: [
+            QuotaHistoryPointDto(
+              observedAt: '2026-09-26T14:00:00.000Z',
+              remainingPercent: 62,
+              error: 3,
+              intervalSeconds: 40,
+              resetAtIso: reset,
+            ),
+            QuotaHistoryPointDto(
+              observedAt: '2026-09-26T14:55:00.000Z',
+              remainingPercent: 61,
+              error: 2,
+              intervalSeconds: 55,
+              resetAtIso: reset,
+            ),
+          ],
+        );
+        await pumpChart(
+          tester,
+          const QuotaHistoryDto(
+            generatedAt: generatedAt,
+            historySince: historySince,
+            history: [claude, controlledFable],
+          ),
+        );
+
+        final headroom =
+            tester
+                    .widget<CustomPaint>(
+                      find.byKey(const Key('quota-pace-error-chart')),
+                    )
+                    .painter!
+                as QuotaPaceErrorChartPainter;
+        final throttle =
+            tester
+                    .widget<CustomPaint>(
+                      find.byKey(const Key('quota-throttle-interval-chart')),
+                    )
+                    .painter!
+                as QuotaThrottleIntervalChartPainter;
+        expect(headroom.series.map((s) => s.label), ['Weekly', 'Fable']);
+        expect(throttle.series.map((s) => s.label), ['Weekly', 'Fable']);
+        expect(find.text('Claude · Fable'), findsNWidgets(2));
+
+        // Both readings join into one painted segment on each plot.
+        const plot = Rect.fromLTWH(0, 0, 480, 100);
+        expect(
+          QuotaPaceErrorChartPainter.traceFor(
+            headroom.series[1],
+            headroom.start,
+            headroom.end,
+            plot,
+          ).segments.map((s) => s.length),
+          [2],
+        );
+        expect(
+          QuotaThrottleIntervalChartPainter.traceFor(
+            throttle.series[1],
+            throttle.start,
+            throttle.end,
+            plot,
+            (seconds) => 100 - seconds,
+          ).segments.map((s) => s.length),
+          [2],
+        );
+      },
+    );
+
+    testWidgets(
       'says so when no series has a controller decision instead of an empty key',
       (tester) async {
         await pumpChart(
