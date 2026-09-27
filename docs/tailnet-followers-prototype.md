@@ -235,7 +235,8 @@ not require actor coordination or interrupt running actors prematurely.
 
 Follower nodes report their active git `commitSha`, process generation, and
 `protocolVersion` upon enrollment via `POST /register`.
-- Enrollment verifies that the follower's `protocolVersion` matches `INSTANCE_PROTOCOL_VERSION` (currently 5). Mismatches fail closed with HTTP 409.
+- Enrollment admits a follower whose `protocolVersion` is the leader's `INSTANCE_PROTOCOL_VERSION` (N, currently 8) or the previous one (N−1). An N−1 follower is fully admitted and runs normally until the update reconciler moves it to the leader's build; the registration reply echoes the follower's own version, which is the protocol that session speaks. Anything else fails closed with HTTP 409. Every refusal of an authenticated, parseable register request logs `follower_register_rejected` with the follower id, `protocolVersion`, `commitSha` and reason; a 401 or unparseable body carries no trustworthy identity, so only the follower's own registration-failure log records it.
+- Release order is leader first, then followers. Each protocol bump therefore keeps N−1 working (the leader handles any changed v(N−1) shape and does not send a v(N−1) follower a command it cannot parse) and drops N−2. The rule sits next to the constant in `protocol.ts`.
 - Update commands can specify an explicit full SHA-1/SHA-256 `targetSha`. The follower rejects an invalid branch or a target outside the fetched branch before checkout. Enrollment is the sole protocol-compatibility fence; a command cannot override it.
 
 ### Build and deploy trigger semantics

@@ -6,7 +6,15 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 7;
+//
+// Compatibility rule (#719): the leader deploys first and must keep followers on the
+// previous protocol fully working until the reconciler updates them. So every bump
+// to N keeps N−1 working (the leader adapts to any v(N−1) shape it changed, and never
+// sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
+// this, delete the adapters that only served the version now falling out of range.
+export const INSTANCE_PROTOCOL_VERSION = 8;
+/** Oldest follower protocol the leader still admits; see the rule above. */
+export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
