@@ -12,8 +12,11 @@ import {
   buildHistoryPayload,
   type EntityId,
   isBlockingObligationStatus,
+  isDeadlineDue,
+  isReadyForAttention,
   isTerminalObligationStatus,
   normalizeCheckpoint,
+  normalizeSnoozeUntil,
   OBLIGATION_STATUSES,
   type Obligation,
   type ObligationArtifact,
@@ -62,6 +65,7 @@ interface ObligationRow {
   recurrence_cron: string | null;
   recurrence_interval_seconds: number | null;
   next_ready_at: string | null;
+  snoozed_until: string | null;
   has_completion_history: 0 | 1;
 }
 
@@ -84,6 +88,7 @@ interface TrackedObligationRow {
   external_ref: string | null;
   terminal_note: string | null;
   resolution_ref: string | null;
+  snoozed_until: string | null;
 }
 
 /** One captured UPDATE, as the TEMP history-capture trigger records it. */
@@ -96,6 +101,7 @@ interface ObligationDeltaRow {
   before_external_ref: string | null;
   before_terminal_note: string | null;
   before_resolution_ref: string | null;
+  before_snoozed_until: string | null;
   after_owner_id: string;
   after_parent_id: string | null;
   after_priority: number | null;
@@ -103,6 +109,7 @@ interface ObligationDeltaRow {
   after_external_ref: string | null;
   after_terminal_note: string | null;
   after_resolution_ref: string | null;
+  after_snoozed_until: string | null;
 }
 
 export interface CreateObligationInput {
@@ -297,6 +304,30 @@ const EFFECTIVE_PRIORITY_CTE = `
   )
 `;
 
+/**
+ * Ready work that should draw automatic attention now: `ready` and not snoozed
+ * (#722). The one gate every ready-attention reader applies — ready heads,
+ * responsive ready delivery, and the owner-queue grouping. Dependency and
+ * parent readiness deliberately never use it: a snoozed obligation still blocks.
+ */
+const ACTIONABLE_READY_SQL = `(obligation.status = 'ready' AND obligation.snoozed_until IS NULL)`;
+
+/**
+ * Owner-queue order: actionable ready work first, then snoozed ready work, then
+ * waiting, then the rest; by effective priority then id within each group. The
+ * ready head is this order's first row when that row is actionable, so the two
+ * must not diverge.
+ */
+const OWNER_QUEUE_ORDER_SQL = `
+  CASE
+    WHEN ${ACTIONABLE_READY_SQL} THEN 0
+    WHEN obligation.status = 'ready' THEN 1
+    WHEN obligation.status = 'waiting' THEN 2
+    ELSE 3
+  END,
+  effective_priority.effective_priority,
+  obligation.id`;
+
 const PROJECTED_OBLIGATION = `
   SELECT obligation.*,
          effective_priority.effective_priority,
@@ -419,6 +450,7 @@ function toObligation(row: ObligationRow): Obligation {
     recurrenceCron: row.recurrence_cron,
     recurrenceIntervalSeconds: row.recurrence_interval_seconds,
     nextReadyAt: row.next_ready_at,
+    snoozedUntil: row.snoozed_until,
     hasCompletionHistory: row.has_completion_history === 1,
   };
 }
@@ -432,6 +464,44 @@ function toArtifact(row: ObligationArtifactRow): ObligationArtifact {
     attachedBy: row.attached_by,
     attachedAt: row.attached_at,
   };
+}
+
+/** The columns an obligation's host activation job is derived from. */
+interface ScheduleRow {
+  id: string;
+  status: string;
+  recurrence_policy: string | null;
+  recurrence_cron: string | null;
+  next_ready_at: string | null;
+  snoozed_until: string | null;
+}
+
+type ActivationPlan = { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date };
+
+/**
+ * The single derivation of an obligation's host activation job, shared by the
+ * post-commit reconcile and boot reconciliation so the two cannot disagree.
+ *
+ * - Terminal rows own no job.
+ * - A snooze owns the one job: an `at` at its deadline (#722). It replaces a
+ *   cron entry rather than joining it, so no tick can fire into a snoozed row;
+ *   ticks missed meanwhile leave `next_ready_at` where it was and coalesce into
+ *   one occurrence when the snooze ends.
+ * - Otherwise a cron policy keeps its tagged crontab entry across every live
+ *   status — a tick into a ready/waiting row is a no-op callback, cheaper than
+ *   tearing the entry down and reinstalling it every cycle.
+ * - A scheduled completion-interval row gets an `at` at `next_ready_at`.
+ */
+function activationPlan(row: ScheduleRow): ActivationPlan | null {
+  if (row.status === "done" || row.status === "cancelled") return null;
+  if (row.snoozed_until !== null) return { kind: "at", date: new Date(row.snoozed_until) };
+  if (row.recurrence_policy === "cron" && row.recurrence_cron) {
+    return { kind: "cron", cronExpr: row.recurrence_cron };
+  }
+  if (row.status === "scheduled" && row.next_ready_at) {
+    return { kind: "at", date: new Date(row.next_ready_at) };
+  }
+  return null;
 }
 
 /** Internal persistence boundary for the R3-ratified obligation contract . */
@@ -484,13 +554,15 @@ export class ObligationRepository {
         before_external_ref TEXT,
         before_terminal_note TEXT,
         before_resolution_ref TEXT,
+        before_snoozed_until TEXT,
         after_owner_id      TEXT NOT NULL,
         after_parent_id     TEXT,
         after_priority      REAL,
         after_status        TEXT NOT NULL,
         after_external_ref  TEXT,
         after_terminal_note TEXT,
-        after_resolution_ref TEXT
+        after_resolution_ref TEXT,
+        after_snoozed_until TEXT
       );
 
       CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
@@ -502,19 +574,20 @@ export class ObligationRepository {
         OR old.external_ref IS NOT new.external_ref
         OR old.terminal_note IS NOT new.terminal_note
         OR old.resolution_ref IS NOT new.resolution_ref
+        OR old.snoozed_until IS NOT new.snoozed_until
       BEGIN
         INSERT INTO obligation_history_delta (
           obligation_id,
           before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-          before_terminal_note, before_resolution_ref,
+          before_terminal_note, before_resolution_ref, before_snoozed_until,
           after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-          after_terminal_note, after_resolution_ref
+          after_terminal_note, after_resolution_ref, after_snoozed_until
         ) VALUES (
           new.id,
           old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
-          old.terminal_note, old.resolution_ref,
+          old.terminal_note, old.resolution_ref, old.snoozed_until,
           new.owner_id, new.parent_id, new.priority, new.status, new.external_ref,
-          new.terminal_note, new.resolution_ref
+          new.terminal_note, new.resolution_ref, new.snoozed_until
         );
       END;
     `);
@@ -557,40 +630,30 @@ export class ObligationRepository {
     if (this.scheduler) this.dirtyScheduleIds.add(id);
   }
 
+  /**
+   * The last post-commit scheduling failure per obligation, cleared by the next
+   * successful reconcile. Lets a caller whose write committed report that its
+   * host timer did not arm, instead of the failure living only in a log line.
+   */
+  private scheduleFailures = new Map<string, string>();
+
   /** Re-derive `id`'s OS scheduler job from its committed row. */
   private reconcileObligationSchedule(id: string): void {
     if (!this.scheduler) return;
     const row = this.db
       .prepare(
-        `SELECT status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE id = ?`
+        `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at, snoozed_until
+         FROM obligations WHERE id = ?`
       )
-      .get(id) as
-      | {
-          status: string;
-          recurrence_policy: string | null;
-          recurrence_cron: string | null;
-          next_ready_at: string | null;
-        }
-      | undefined;
-
-    if (
-      row &&
-      row.recurrence_policy === "cron" &&
-      row.recurrence_cron &&
-      row.status !== "cancelled" &&
-      row.status !== "done"
-    ) {
-      this.scheduler.scheduleObligationActivation(id, {
-        kind: "cron",
-        cronExpr: row.recurrence_cron,
-      });
-    } else if (row && row.status === "scheduled" && row.next_ready_at) {
-      this.scheduler.scheduleObligationActivation(id, {
-        kind: "at",
-        date: new Date(row.next_ready_at),
-      });
-    } else {
-      this.scheduler.cancelObligationActivation(id);
+      .get(id) as ScheduleRow | undefined;
+    const plan = row ? activationPlan(row) : null;
+    try {
+      if (plan) this.scheduler.scheduleObligationActivation(id, plan);
+      else this.scheduler.cancelObligationActivation(id);
+      this.scheduleFailures.delete(id);
+    } catch (err) {
+      this.scheduleFailures.set(id, err instanceof Error ? err.message : String(err));
+      throw err;
     }
   }
 
@@ -598,60 +661,60 @@ export class ObligationRepository {
     this.scheduler = scheduler;
   }
 
+  /**
+   * Boot reconciliation: re-arm every live activation from the database and
+   * tear down this instance's orphaned host entries.
+   *
+   * Each row's job comes from {@link activationPlan}, the same derivation the
+   * post-commit reconcile uses. A deadline that passed while the process was
+   * down is settled once through {@link wakeScheduled} rather than handed back
+   * to the host scheduler in the past: an overdue snooze is cleared, and an
+   * overdue completion-interval occurrence activates. A cron occurrence keeps
+   * waiting for its next tick, as it always has; one whose snooze just expired
+   * activates here because the snooze is what held it back.
+   */
   reconcileScheduledObligations(): void {
     if (!this.scheduler) return;
     const validIds = new Set<string>();
-
-    // A cron policy keeps one tagged crontab entry alive across every status
-    // except cancelled/done — ready/waiting callbacks are a no-op activation
-    // (`activateScheduled` only acts on `scheduled`), so the job stays armed
-    // rather than being torn down and reinstalled each cycle. A
-    // completion_interval obligation instead gets a one-off `at` job, and only
-    // while `scheduled` with a `next_ready_at` to fire at; an occurrence that
-    // is already overdue (e.g. the process was down) activates immediately
-    // rather than being handed back to the OS scheduler in the past.
     const stmt = this.db.prepare(
-      `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE recurrence_policy = 'cron' OR status = 'scheduled'`
+      `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at, snoozed_until
+       FROM obligations
+       WHERE status NOT IN (${TERMINAL_STATUS_SQL})
+         AND (recurrence_policy = 'cron' OR status = 'scheduled' OR snoozed_until IS NOT NULL)`
     );
 
-    for (const row of stmt.all() as {
-      id: string;
-      status: string;
-      recurrence_policy: string | null;
-      recurrence_cron: string | null;
-      next_ready_at: string | null;
-    }[]) {
+    const now = new Date(this.now());
+    for (const candidate of stmt.all() as ScheduleRow[]) {
       try {
-        if (
-          row.recurrence_policy === "cron" &&
-          row.recurrence_cron &&
-          row.status !== "cancelled" &&
-          row.status !== "done"
-        ) {
+        let row: ScheduleRow | undefined = candidate;
+        const overdue =
+          row.snoozed_until !== null
+            ? isDeadlineDue(row.snoozed_until, now)
+            : row.status === "scheduled" &&
+              row.recurrence_policy !== "cron" &&
+              row.next_ready_at !== null &&
+              isDeadlineDue(row.next_ready_at, now);
+        if (overdue) {
+          // Background scheduler activation is an automated system process; bind "system:mesh"
+          this.wakeScheduled(row.id, "system:mesh");
+          row = this.db
+            .prepare(
+              `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at, snoozed_until
+               FROM obligations WHERE id = ?`
+            )
+            .get(row.id) as ScheduleRow | undefined;
+        }
+        const plan = row ? activationPlan(row) : null;
+        if (row && plan) {
           validIds.add(row.id);
-          this.scheduler.scheduleObligationActivation(row.id, {
-            kind: "cron",
-            cronExpr: row.recurrence_cron,
-          });
-        } else if (row.status === "scheduled" && row.next_ready_at) {
-          const nextDate = new Date(row.next_ready_at);
-          if (nextDate.getTime() <= this.now()) {
-            // Background scheduler activation is an automated system process; bind "system:mesh"
-            this.activateScheduled(row.id, "system:mesh");
-          } else {
-            validIds.add(row.id);
-            this.scheduler.scheduleObligationActivation(row.id, {
-              kind: "at",
-              date: nextDate,
-            });
-          }
+          this.scheduler.scheduleObligationActivation(row.id, plan);
         }
       } catch (err) {
         // One row's OS scheduler failure — e.g. `at` confirmed unavailable at
         // boot (AtUnavailableError) — must not abort reconciliation for every
         // other row, cron-backed or not, queued behind it.
         console.warn(
-          `[obligations] failed to reconcile scheduled activation for ${row.id}: ${
+          `[obligations] failed to reconcile scheduled activation for ${candidate.id}: ${
             err instanceof Error ? err.message : String(err)
           }`
         );
@@ -868,12 +931,12 @@ export class ObligationRepository {
                     ) AS rank
              FROM obligations obligation
              JOIN effective_priority ON effective_priority.id = obligation.id
-             WHERE obligation.status = 'ready'
+             WHERE ${ACTIONABLE_READY_SQL}
            )
            WHERE rank = 1
          )
          ${PROJECTED_OBLIGATION}
-         WHERE obligation.status = 'ready'
+         WHERE ${ACTIONABLE_READY_SQL}
            AND effective_priority.effective_responsive = 1
            AND NOT EXISTS (
              SELECT 1 FROM ready_heads
@@ -918,21 +981,14 @@ export class ObligationRepository {
   }
 
   /**
-   * Current ready head per owner, keyed by owner id.
-   *
-   * "Head" is the first row of the owner's ready queue, which must stay
-   * byte-identical to `listOwned`'s ordering (effective priority, then id) or
-   * an actor would be told about a head its own queue does not show first.
-   */
-  /**
-   * Current ready head per owner, keyed by owner id.
-   *
-   * "Head" is the first row of the owner's ready queue, which must stay
-   * byte-identical to `listOwned`'s ordering (effective priority, then id) or
-   * an actor would be told about a head its own queue does not show first.
-   */
-  /**
    * Current ready head per owner along with resolved responsiveness.
+   *
+   * "Head" is the first row of the owner's queue when that row is actionable
+   * ready work — ready and not snoozed (#722). It must stay byte-identical to
+   * `listOwned`'s ordering (actionable ready first, by effective priority, then
+   * id) or an actor would be told about a head its own queue does not show
+   * first. An owner whose only ready work is snoozed has no head.
+   *
    * Runs in a single CTE pass so callers do not need subsequent
    * `isEffectivelyResponsive` evaluations.
    */
@@ -964,7 +1020,7 @@ export class ObligationRepository {
                   ) AS rank
            FROM obligations obligation
            JOIN effective_priority ON effective_priority.id = obligation.id
-           WHERE obligation.status = 'ready'
+           WHERE ${ACTIONABLE_READY_SQL}
          )
          WHERE rank = 1 OR effective_responsive = 1`
       )
@@ -1177,7 +1233,7 @@ export class ObligationRepository {
       for (const id of new Set(this.pendingResponsiveReady)) {
         const obligation = this.get(id);
         if (!obligation) continue;
-        if (obligation.status !== "ready" || !obligation.effectiveResponsive) continue;
+        if (!isReadyForAttention(obligation) || !obligation.effectiveResponsive) continue;
         if (!this.isActorOwner(obligation.ownerId)) continue;
         // The owner's ready head announces itself through the ready-head
         // change, responsively when the head is responsive — only obligations
@@ -1260,9 +1316,9 @@ export class ObligationRepository {
       .prepare(
         `SELECT obligation_id,
                 before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
-                before_terminal_note, before_resolution_ref,
+                before_terminal_note, before_resolution_ref, before_snoozed_until,
                 after_owner_id, after_parent_id, after_priority, after_status, after_external_ref,
-                after_terminal_note, after_resolution_ref
+                after_terminal_note, after_resolution_ref, after_snoozed_until
          FROM obligation_history_delta
          ORDER BY seq`
       )
@@ -1281,6 +1337,7 @@ export class ObligationRepository {
         external_ref: delta.after_external_ref,
         terminal_note: delta.after_terminal_note,
         resolution_ref: delta.after_resolution_ref,
+        snoozed_until: delta.after_snoozed_until,
       };
       const existing = net.get(delta.obligation_id);
       if (existing) {
@@ -1297,6 +1354,7 @@ export class ObligationRepository {
           external_ref: delta.before_external_ref,
           terminal_note: delta.before_terminal_note,
           resolution_ref: delta.before_resolution_ref,
+          snoozed_until: delta.before_snoozed_until,
         },
         after,
       });
@@ -1315,6 +1373,7 @@ export class ObligationRepository {
       const externalRefChanged = b.external_ref !== a.external_ref;
       const terminalNoteChanged = b.terminal_note !== a.terminal_note;
       const resolutionRefChanged = b.resolution_ref !== a.resolution_ref;
+      const snoozeChanged = b.snoozed_until !== a.snoozed_until;
 
       if (
         !ownerChanged &&
@@ -1323,7 +1382,8 @@ export class ObligationRepository {
         !statusChanged &&
         !externalRefChanged &&
         !terminalNoteChanged &&
-        !resolutionRefChanged
+        !resolutionRefChanged &&
+        !snoozeChanged
       ) {
         continue;
       }
@@ -1359,6 +1419,10 @@ export class ObligationRepository {
         beforeState.resolutionRef = b.resolution_ref;
         afterState.resolutionRef = a.resolution_ref;
       }
+      if (snoozeChanged) {
+        beforeState.snoozedUntil = b.snoozed_until;
+        afterState.snoozedUntil = a.snoozed_until;
+      }
 
       // Map the primary modified field to its semantic mutation kind.
       const kind: ObligationMutationKind = ownerChanged
@@ -1369,7 +1433,9 @@ export class ObligationRepository {
             ? "priority"
             : statusChanged
               ? "status"
-              : "external_ref";
+              : snoozeChanged && !externalRefChanged
+                ? "snooze"
+                : "external_ref";
 
       insert.run(
         id,
@@ -1899,10 +1965,7 @@ export class ObligationRepository {
         .prepare(
           `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
            WHERE obligation.owner_id = ?${statusClause}
-           ORDER BY
-             CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
-             effective_priority.effective_priority,
-             obligation.id`
+           ORDER BY ${OWNER_QUEUE_ORDER_SQL}`
         )
         .all(...params) as ObligationRow[]
     ).map(toObligation);
@@ -1919,10 +1982,7 @@ export class ObligationRepository {
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
          WHERE obligation.owner_id = ?${statusClause}
-         ORDER BY
-           CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
-           effective_priority.effective_priority,
-           obligation.id
+         ORDER BY ${OWNER_QUEUE_ORDER_SQL}
          LIMIT ? OFFSET ?`
       )
       .all(...params, limit + 1, offset) as ObligationRow[];
@@ -1961,10 +2021,7 @@ export class ObligationRepository {
         .prepare(
           `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
            ${where}
-           ORDER BY
-             CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
-             effective_priority.effective_priority,
-             obligation.id`
+           ORDER BY ${OWNER_QUEUE_ORDER_SQL}`
         )
         .all(...params) as ObligationRow[]
     ).map(toObligation);
@@ -1997,10 +2054,7 @@ export class ObligationRepository {
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
          ${where}
-         ORDER BY
-           CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
-           effective_priority.effective_priority,
-           obligation.id
+         ORDER BY ${OWNER_QUEUE_ORDER_SQL}
          LIMIT ? OFFSET ?`
       )
       .all(...params, limit + 1, offset) as ObligationRow[];
@@ -2658,18 +2712,19 @@ export class ObligationRepository {
             `UPDATE obligations
            SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
                next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
-               recurrence_interval_seconds = NULL,
+               recurrence_interval_seconds = NULL, snoozed_until = NULL,
                checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
            WHERE id = ?`
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
-        // A never-recurring obligation has no cron entry and can never reach
-        // `scheduled`, so it never owned an OS activation — only recurring
-        // obligations (cron, still-armed while ready/waiting, or
-        // completion_interval, owning a pending `at` job while scheduled)
-        // need the post-commit reconciliation to tear anything down.
-        if (obligation.recurrencePolicy !== null) {
+        // A never-recurring, never-snoozed obligation has no cron entry and
+        // can never reach `scheduled`, so it never owned an OS activation —
+        // only recurring obligations (cron, still-armed while ready/waiting,
+        // or completion_interval, owning a pending `at` job while scheduled)
+        // and snoozed ones (owning the `at` for the deadline, #722) need the
+        // post-commit reconciliation to tear anything down.
+        if (obligation.recurrencePolicy !== null || obligation.snoozedUntil !== null) {
           this.markScheduleDirty(id);
         }
 
@@ -2753,7 +2808,7 @@ export class ObligationRepository {
             .prepare(
               `UPDATE obligations
              SET status = 'done', recurrence_policy = NULL, recurrence_cron = NULL,
-                 recurrence_interval_seconds = NULL, next_ready_at = NULL,
+                 recurrence_interval_seconds = NULL, next_ready_at = NULL, snoozed_until = NULL,
                  checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL,
                  updated_at = ?
              WHERE id = ?`
@@ -2832,18 +2887,160 @@ export class ObligationRepository {
       const obligation = this.get(id);
       if (!obligation) return null;
       if (obligation.status !== "scheduled") return obligation;
-      // A recurring/scheduled obligation can never itself be a dependent
-      // (#212, {@link assertNotInDependencyGraph}), so this transition has no
-      // prerequisite to check.
-      this.db
-        .prepare(
-          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, ready_count = ready_count + 1, updated_at = ? WHERE id = ?`
-        )
-        .run(this.stamp(), id);
-      this.pendingResponsiveReady.push(id);
-
+      this.activateScheduledRow(id);
       return this.require(id);
     });
+  }
+
+  /** The scheduled→ready transition itself; callers own the "is it due" decision. */
+  private activateScheduledRow(id: string): void {
+    // A recurring/scheduled obligation can never itself be a dependent
+    // (#212, {@link assertNotInDependencyGraph}), so this transition has no
+    // prerequisite to check.
+    this.db
+      .prepare(
+        `UPDATE obligations SET status = 'ready', next_ready_at = NULL, ready_count = ready_count + 1, updated_at = ? WHERE id = ?`
+      )
+      .run(this.stamp(), id);
+    this.pendingResponsiveReady.push(id);
+  }
+
+  /**
+   * Set, replace, or clear (`until = null`) an obligation's snooze (#722).
+   *
+   * Authorization belongs to the calling surface: snoozing is owner-only, and
+   * this method cannot tell an owner from anyone else. The deadline is
+   * normalized to UTC and must be in the future; rewriting the current value is
+   * a no-op. A snooze keeps the underlying status and every dependency and
+   * parent block. Setting one on a host already known to lack `at` is refused
+   * before anything is written, since nothing could end it.
+   *
+   * Returns the committed obligation, plus `scheduleError` when the write
+   * committed but its host timer did not arm. The mutation retries the timer
+   * in-process and boot reconciliation re-derives it, but the caller learns now
+   * rather than from a snooze that silently never ends.
+   */
+  setSnooze(
+    id: string,
+    until: string | null,
+    principal: EntityId
+  ): { obligation: Obligation; scheduleError: string | null } {
+    const snoozedUntil = normalizeSnoozeUntil(until, new Date(this.now()));
+    if (snoozedUntil !== null && this.scheduler?.canScheduleAt?.() === false) {
+      throw new ObligationValidationError(
+        "cannot snooze: this host has no working `at` scheduler, so nothing would end the snooze"
+      );
+    }
+    const obligation = this.mutate(principal, () => {
+      const existing = this.require(id);
+      if (isTerminalObligationStatus(existing.status)) {
+        throw new ObligationValidationError("terminal obligations cannot be snoozed");
+      }
+      if (existing.snoozedUntil === snoozedUntil) return existing;
+      if (snoozedUntil === null) {
+        this.releaseSnooze(existing);
+      } else {
+        this.db
+          .prepare("UPDATE obligations SET snoozed_until = ?, updated_at = ? WHERE id = ?")
+          .run(snoozedUntil, this.stamp(), id);
+        this.markScheduleDirty(id);
+      }
+      return this.require(id);
+    });
+    return { obligation, scheduleError: this.scheduleFailures.get(id) ?? null };
+  }
+
+  /**
+   * End a snooze inside the current mutation, by expiry or by the owner.
+   *
+   * What happens next depends on the status the snooze left alone: a ready row
+   * starts a fresh ready-attention episode (it became actionable again without
+   * changing status), a waiting row keeps waiting, and a scheduled row
+   * activates only if its own `next_ready_at` is already due — missed ticks
+   * coalesce into that one occurrence, and a future one is not pulled forward.
+   */
+  private releaseSnooze(obligation: Obligation): void {
+    const stamp = this.stamp();
+    if (obligation.status === "ready") {
+      this.db
+        .prepare(
+          `UPDATE obligations SET snoozed_until = NULL, ready_count = ready_count + 1, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(stamp, obligation.id);
+      this.pendingResponsiveReady.push(obligation.id);
+    } else {
+      this.db
+        .prepare("UPDATE obligations SET snoozed_until = NULL, updated_at = ? WHERE id = ?")
+        .run(stamp, obligation.id);
+      if (
+        obligation.status === "scheduled" &&
+        obligation.nextReadyAt !== null &&
+        isDeadlineDue(obligation.nextReadyAt, new Date(this.now()))
+      ) {
+        this.activateScheduledRow(obligation.id);
+      }
+    }
+    this.markScheduleDirty(obligation.id);
+  }
+
+  /**
+   * The host activation callback (`wake-obligation`), for snooze deadlines and
+   * scheduled occurrences alike.
+   *
+   * Re-reads the row and acts only on what is due now, so an early, stale, or
+   * duplicate callback is harmless: a snooze that has not reached its deadline
+   * — including one extended after this job was armed — is left in force, and
+   * a scheduled occurrence activates only once its `next_ready_at` is due. An
+   * expired snooze is cleared first, then any due occurrence it was holding
+   * back activates, in one transaction.
+   */
+  wakeScheduled(id: string, principal: EntityId): Obligation | null {
+    return this.mutate(principal, () => {
+      const obligation = this.get(id);
+      if (!obligation || isTerminalObligationStatus(obligation.status)) return obligation;
+      const now = new Date(this.now());
+      if (obligation.snoozedUntil !== null) {
+        if (!isDeadlineDue(obligation.snoozedUntil, now)) return obligation;
+        this.releaseSnooze(obligation);
+        return this.require(id);
+      }
+      if (
+        obligation.status === "scheduled" &&
+        obligation.nextReadyAt !== null &&
+        isDeadlineDue(obligation.nextReadyAt, now)
+      ) {
+        this.activateScheduledRow(id);
+      }
+      return this.require(id);
+    });
+  }
+
+  /**
+   * Clear every already-expired snooze among `ids` in one transaction (#722).
+   *
+   * Strict yield runs this over the run's selected obligations before judging
+   * closure, so a snooze whose deadline passed mid-run no longer excuses the
+   * obligation — the ordinary ready/waiting rules apply to it instead. Returns
+   * the ids it cleared. A live snooze, a terminal row, and an unknown id are
+   * left alone. The principal defaults to the mesh, its only caller, so the
+   * repository still satisfies `MeshObligationPort` structurally.
+   */
+  expireDueSnoozes(ids: readonly string[], principal: EntityId = "system:mesh"): string[] {
+    const cleared: string[] = [];
+    if (ids.length === 0) return cleared;
+    this.mutate(principal, () => {
+      const now = new Date(this.now());
+      for (const id of new Set(ids)) {
+        const obligation = this.get(id);
+        if (!obligation || obligation.snoozedUntil === null) continue;
+        if (isTerminalObligationStatus(obligation.status)) continue;
+        if (!isDeadlineDue(obligation.snoozedUntil, now)) continue;
+        this.releaseSnooze(obligation);
+        cleared.push(id);
+      }
+    });
+    return cleared;
   }
 
   reparent(id: string, newParentId: string | null, principal: EntityId): Obligation {

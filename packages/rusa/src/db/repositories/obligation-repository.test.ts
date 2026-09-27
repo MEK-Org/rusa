@@ -28,6 +28,7 @@ import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.j
 import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_ready_heads.js";
+import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
   ObligationRepository,
@@ -76,6 +77,7 @@ describe("ObligationRepository", () => {
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
     obligationResponsive.up(db);
+    obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
     now = 1_000;
     repository = new ObligationRepository(
@@ -4386,6 +4388,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationCheckpoint.up(d);
     obligationHistory.up(d);
     obligationResponsive.up(d);
+    obligationSnooze.up(d);
     return d;
   };
 

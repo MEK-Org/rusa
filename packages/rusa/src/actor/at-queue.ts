@@ -49,6 +49,12 @@ function defaultAtProbe(): AtProbe {
 
 /** The `at` queue read/write seam. */
 export interface AtIo {
+  /**
+   * `false` when boot preflight already found `at` unusable, so a caller can
+   * refuse a write that depends on a one-shot job before committing it rather
+   * than discovering the failure afterwards. Absent means "believed usable".
+   */
+  readonly available?: boolean;
   schedule(script: string, date: Date): string;
   list(): { id: string; script: string }[];
   remove(id: string): void;
@@ -65,6 +71,7 @@ export class AtUnavailableError extends Error {
 /** An explicit unavailable adapter used when preflight fails during boot. */
 export function unavailableAtIo(issues: string[]): AtIo {
   return {
+    available: false,
     schedule(): string {
       throw new AtUnavailableError(issues);
     },

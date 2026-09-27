@@ -272,6 +272,24 @@ class ObligationRow extends StatelessWidget {
                 ],
               ),
             ],
+            if (obligation.isSnoozed) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.snooze, size: 13, color: MeshColors.textMuted),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      snoozeLabel(obligation),
+                      style: const TextStyle(
+                        color: MeshColors.textMuted,
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
             if (hasTerminalNote) ...[
               const SizedBox(height: 12),
               Container(
@@ -337,7 +355,8 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${store.ownerLabel(blocker.ownerId)})',
+                          '• ${blocker.intent ?? blocker.id} (${store.ownerLabel(blocker.ownerId)})'
+                          '${blocker.isSnoozed ? ' — snoozed until ${formatTs(blocker.snoozedUntil!)}' : ''}',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,
@@ -354,6 +373,16 @@ class ObligationRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// The owner's deferral, phrased as a choice rather than a stall: a snoozed
+/// obligation keeps its status, so it still blocks its parent and dependents
+/// even though nobody is being asked to act on it until the deadline.
+String snoozeLabel(ObligationDto obligation) {
+  final until = obligation.snoozedUntil!;
+  final blocks = obligation.parentId != null ? '; still blocks its parent' : '';
+  return 'Intentionally deferred until ${formatTs(until)} '
+      '(${formatReturnsIn(until)})$blocks';
 }
 
 /// Who last said where this obligation stands, and when — `handle · timestamp`.

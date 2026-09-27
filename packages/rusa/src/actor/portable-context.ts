@@ -319,11 +319,20 @@ const OBLIGATIONS_HEADING =
   "Work state lives in the obligation store, not here. This is a read-through:\n" +
   "use your obligation tools to change any of it.\n\n";
 
+/**
+ * A snoozed obligation keeps its status and its place in the section (#722);
+ * the marker is what tells the reader it was deliberately deferred, and until
+ * when, rather than overlooked.
+ */
+function snoozeMarker(obligation: Obligation): string {
+  return obligation.snoozedUntil ? ` [snoozed until ${obligation.snoozedUntil}]` : "";
+}
+
 function renderObligation(obligation: Obligation): string {
   const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
   const checkpoint = obligation.checkpoint?.trim();
   const standing = checkpoint ? `\n  Current standing: ${checkpoint}` : "";
-  return `- [READY] ${obligation.id}${ref}: ${obligation.intent ?? "(no intent recorded)"}${standing}`;
+  return `- [READY] ${obligation.id}${ref}${snoozeMarker(obligation)}: ${obligation.intent ?? "(no intent recorded)"}${standing}`;
 }
 
 /**
@@ -333,13 +342,13 @@ function renderObligation(obligation: Obligation): string {
  */
 function renderWaitingRef(obligation: Obligation): string {
   const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
-  return `- [WAITING] ${obligation.id}${ref}`;
+  return `- [WAITING] ${obligation.id}${ref}${snoozeMarker(obligation)}`;
 }
 
 function renderScheduledRef(obligation: Obligation): string {
   const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
   const when = obligation.nextReadyAt ? ` returns at ${obligation.nextReadyAt}` : "";
-  return `- [SCHEDULED] ${obligation.id}${ref}${when}`;
+  return `- [SCHEDULED] ${obligation.id}${ref}${when}${snoozeMarker(obligation)}`;
 }
 
 /**
@@ -362,8 +371,9 @@ function renderScheduledRef(obligation: Obligation): string {
  *    obligation was cut, the waiting section is empty regardless of how much room
  *    is left, because the room is only there as a consequence of the cut.
  *
- * `obligations` arrives in the store's own queue order (ready before waiting,
- * then ascending effective priority) — the authoritative ordering, so this
+ * `obligations` arrives in the store's own queue order (actionable ready, then
+ * snoozed ready, then waiting, each by ascending effective priority) — the
+ * authoritative ordering, so this
  * function reads priority off the sequence rather than re-deriving it.
  */
 function renderObligations(obligations: Obligation[]): string {

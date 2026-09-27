@@ -28,7 +28,10 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
-import { resolveSoleActiveUser } from "../principals/operator-principal.js";
+import {
+  resolveLegacyOperatorAlias,
+  resolveSoleActiveUser,
+} from "../principals/operator-principal.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import {
   type ResolvedReference,
@@ -1419,6 +1422,73 @@ export async function handleMeshApiRequest(
               actingPrincipal
             );
             sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/snooze — set, replace or clear (`until:
+    // null`) the snooze on an obligation the acting human owns (#722). The
+    // same owner-only operation actors reach through `set_snooze`.
+    const snoozeMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/snooze$/);
+    if (snoozeMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(snoozeMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const until = (parsed as Record<string, unknown>).until;
+          if (until !== null && typeof until !== "string") {
+            sendJson(res, 400, { error: "until must be an ISO-8601 timestamp or null" });
+            return;
+          }
+          const existing = obligations.get(id);
+          if (!existing) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          const actingPrincipal = requireOperatorPrincipal(req, res, deps);
+          if (!actingPrincipal) return;
+          // A row still owned by the legacy operator alias belongs to whoever
+          // that alias resolves to now, the same reading every owner write uses.
+          const owner = resolveLegacyOperatorAlias(existing.ownerId, deps?.principals);
+          if (
+            existing.ownerId !== actingPrincipal &&
+            !(owner.ok && owner.ownerId === actingPrincipal)
+          ) {
+            sendJson(res, 403, {
+              error: "only the obligation's current owner may snooze or unsnooze it",
+            });
+            return;
+          }
+          try {
+            const { obligation, scheduleError } = obligations.setSnooze(id, until, actingPrincipal);
+            sendJson(res, 200, {
+              ok: true,
+              obligation,
+              ...(scheduleError !== null
+                ? {
+                    warning: `snooze saved, but its wake timer could not be armed (${scheduleError}); it is retried in-process and re-armed on restart`,
+                  }
+                : {}),
+            });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }

@@ -555,6 +555,7 @@ describe("handleMeshApiRequest", () => {
       ["POST", "/api/mesh/obligations", JSON.stringify({ ownerId: UUID_A, title: "t" })],
       ["POST", "/api/mesh/obligations/task/status", JSON.stringify({ status: "done" })],
       ["POST", "/api/mesh/obligations/task/reassign", JSON.stringify({ ownerId: UUID_A })],
+      ["POST", "/api/mesh/obligations/task/snooze", JSON.stringify({ until: null })],
       [
         "POST",
         "/api/mesh/admission-queue/reorder",
@@ -4344,6 +4345,59 @@ describe("handleMeshApiRequest", () => {
         // "[object Object]" stored as a stated reason is worse than no reason.
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.terminalNote).toBeNull();
+      });
+    });
+
+    describe("POST /api/mesh/obligations/:id/snooze (#722)", () => {
+      const future = () => new Date(Date.now() + 2 * 3_600_000).toISOString();
+      const snooze = async (id: string, body: unknown) => {
+        const { res } = await call(
+          deps,
+          "POST",
+          `/api/mesh/obligations/${id}/snooze`,
+          JSON.stringify(body)
+        );
+        await settled(res);
+        return { status: res.statusCode, data: JSON.parse(res.body) };
+      };
+
+      it("lets the owning human set and clear a snooze", async () => {
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const until = future();
+        const set = await snooze("mine", { until });
+        expect(set.status).toBe(200);
+        expect(set.data.obligation).toMatchObject({ status: "ready", snoozedUntil: until });
+        expect(set.data.warning).toBeUndefined();
+
+        const cleared = await snooze("mine", { until: null });
+        expect(cleared.status).toBe(200);
+        expect(cleared.data.obligation.snoozedUntil).toBeNull();
+        expect(obligations.listHistory("mine")[0]).toMatchObject({
+          mutationKind: "snooze",
+          actingPrincipal: LOCAL_USER,
+        });
+      });
+
+      it("treats a row still owned by the legacy operator alias as the operator's", async () => {
+        obligations.create({ title: "legacy", id: "legacy", ownerId: HUMAN_OPERATOR });
+        expect((await snooze("legacy", { until: future() })).status).toBe(200);
+      });
+
+      it("refuses an obligation the human does not own", async () => {
+        obligations.create({ title: "theirs", id: "theirs", ownerId: "actor-1" });
+        const res = await snooze("theirs", { until: future() });
+        expect(res.status).toBe(403);
+        expect(res.data.error).toContain("only the obligation's current owner");
+        expect(obligations.get("theirs")?.snoozedUntil).toBeNull();
+      });
+
+      it("404s a missing obligation and 400s an invalid deadline", async () => {
+        expect((await snooze("missing", { until: future() })).status).toBe(404);
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        expect((await snooze("mine", { until: "2020-01-01T00:00:00Z" })).status).toBe(400);
+        expect((await snooze("mine", { until: 1234 })).status).toBe(400);
+        expect((await snooze("mine", {})).status).toBe(400);
+        expect(obligations.get("mine")?.snoozedUntil).toBeNull();
       });
     });
 

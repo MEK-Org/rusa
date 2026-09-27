@@ -1812,6 +1812,7 @@ class ObligationDto {
     this.recurrenceCron,
     this.recurrenceIntervalSeconds,
     this.nextReadyAt,
+    this.snoozedUntil,
     this.checkpoint,
     this.checkpointAt,
     this.checkpointBy,
@@ -1874,6 +1875,11 @@ class ObligationDto {
   /// `scheduled`.
   final String? nextReadyAt;
 
+  /// The owner's intentional deferral: until this instant the obligation keeps
+  /// its [status] (and so still blocks its parent and dependents) but is not
+  /// offered as a ready head or delivered as attention. Null when not snoozed.
+  final String? snoozedUntil;
+
   /// Where this obligation's work stands right now, in its owner's words.
   /// Rewritten in place, so this is the current standing and never a history
   /// to replay. Null means no standing has been recorded — which is also what
@@ -1922,6 +1928,7 @@ class ObligationDto {
   bool get isScheduled => status == 'scheduled';
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
+  bool get isSnoozed => snoozedUntil != null;
 
   /// How this obligation should read on the dashboard, given whether an actor
   /// is actively working on it (see [ActorStateSnapshot.isObligationActive]).
@@ -1977,6 +1984,7 @@ class ObligationDto {
       recurrenceCron: j['recurrenceCron'] as String?,
       recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
       nextReadyAt: j['nextReadyAt'] as String?,
+      snoozedUntil: j['snoozedUntil'] as String?,
       checkpoint: j['checkpoint'] as String?,
       checkpointAt: j['checkpointAt'] as String?,
       checkpointBy: j['checkpointBy'] as String?,
@@ -2005,6 +2013,7 @@ class ObligationDto {
     if (recurrenceIntervalSeconds != null)
       'recurrenceIntervalSeconds': recurrenceIntervalSeconds,
     if (nextReadyAt != null) 'nextReadyAt': nextReadyAt,
+    if (snoozedUntil != null) 'snoozedUntil': snoozedUntil,
     if (checkpoint != null) 'checkpoint': checkpoint,
     if (checkpointAt != null) 'checkpointAt': checkpointAt,
     if (checkpointBy != null) 'checkpointBy': checkpointBy,

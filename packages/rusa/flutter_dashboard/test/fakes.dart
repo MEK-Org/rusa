@@ -165,6 +165,7 @@ ObligationDto makeObligation(
   String? recurrenceCron,
   int? recurrenceIntervalSeconds,
   String? nextReadyAt,
+  String? snoozedUntil,
   String? checkpoint,
   String? checkpointAt,
   String? checkpointBy,
@@ -189,6 +190,7 @@ ObligationDto makeObligation(
   recurrenceCron: recurrenceCron,
   recurrenceIntervalSeconds: recurrenceIntervalSeconds,
   nextReadyAt: nextReadyAt,
+  snoozedUntil: snoozedUntil,
   checkpoint: checkpoint,
   // A checkpoint's stamp is set with it server-side, so a fixture that names a
   // standing without one would exercise a state the store cannot produce.
