@@ -601,7 +601,7 @@ void main() {
     testWidgets('gives a model series a color no visible provider uses', (
       tester,
     ) async {
-      // claude-fable's hashed palette slot is the Codex green.
+      // codex-mini's hashed palette slot is the Codex green.
       QuotaHistorySeriesDto withInterval(QuotaHistorySeriesDto series) =>
           QuotaHistorySeriesDto(
             provider: series.provider,
@@ -631,7 +631,16 @@ void main() {
                 points: [],
               ),
             ),
-            withInterval(fable),
+            withInterval(
+              const QuotaHistorySeriesDto(
+                provider: 'codex',
+                windowId: 'weekly',
+                scope: 'model',
+                modelIds: ['codex-mini'],
+                label: 'Mini',
+                points: [],
+              ),
+            ),
           ],
         ),
       );
@@ -644,6 +653,110 @@ void main() {
               as QuotaThrottleIntervalChartPainter;
       expect(throttle.colors[0], const Color(0xFF10B981));
       expect(throttle.colors[1], isNot(const Color(0xFF10B981)));
+    });
+
+    group('Fable is drawn in #CF8063 (#728)', () {
+      const fableColor = Color(0xFFCF8063);
+      QuotaHistorySeriesDto controlled(
+        String provider,
+        List<String> modelIds, {
+        String label = 'Model',
+      }) => QuotaHistorySeriesDto(
+        provider: provider,
+        windowId: 'weekly',
+        scope: modelIds.isEmpty ? 'provider' : 'model',
+        modelIds: modelIds,
+        label: label,
+        points: const [
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T14:00:00.000Z',
+            remainingPercent: 62,
+            error: 3,
+            intervalSeconds: 40,
+          ),
+        ],
+      );
+      List<Color> plotColors(WidgetTester tester, String key) {
+        final painter = tester
+            .widget<CustomPaint>(find.byKey(Key(key)))
+            .painter!;
+        return painter is QuotaPaceErrorChartPainter
+            ? painter.colors
+            : (painter as QuotaThrottleIntervalChartPainter).colors;
+      }
+
+      Color legendColor(WidgetTester tester, Finder label) {
+        final key = tester.widget<Container>(
+          find.descendant(
+            of: find.ancestor(of: label, matching: find.byType(Row)).first,
+            matching: find.byType(Container),
+          ),
+        );
+        return (key.decoration! as BoxDecoration).color!;
+      }
+
+      testWidgets('on both plots and both legend keys', (tester) async {
+        await pumpChart(
+          tester,
+          QuotaHistoryDto(
+            generatedAt: generatedAt,
+            historySince: historySince,
+            history: [
+              controlled('claude', const []),
+              controlled('codex', const []),
+              controlled('claude', const ['claude-fable-5-1'], label: 'Fable'),
+            ],
+          ),
+        );
+
+        // Provider colors are unchanged: Claude, then Codex.
+        const expected = [Color(0xFFC15F3C), Color(0xFF10B981), fableColor];
+        expect(plotColors(tester, 'quota-pace-error-chart'), expected);
+        expect(plotColors(tester, 'quota-throttle-interval-chart'), expected);
+        final legends = find.text('Claude · Fable');
+        expect(legends, findsNWidgets(2));
+        expect(legendColor(tester, legends.at(0)), fableColor);
+        expect(legendColor(tester, legends.at(1)), fableColor);
+      });
+
+      testWidgets('and no other series ever lands on it', (tester) async {
+        const others = [
+          'claude-opus-5-5',
+          'claude-sonnet-5',
+          'claude-haiku-4-5',
+          'claude-opus-4-8',
+          'claude-sonnet-4-6',
+          'claude-opus',
+          'claude-mythos',
+          'claude-sonnet',
+          'claude-haiku',
+        ];
+        await pumpChart(
+          tester,
+          QuotaHistoryDto(
+            generatedAt: generatedAt,
+            historySince: historySince,
+            history: [
+              controlled('claude', const []),
+              for (final id in others) controlled('claude', [id]),
+              // A Fable-named model on another provider is not Claude's Fable.
+              controlled('codex', const ['claude-fable']),
+              controlled('claude', const ['claude-fable'], label: 'Fable'),
+              // A second Fable series still gets a color of its own.
+              controlled('claude', const ['claude-fable-5-1'], label: 'Fable'),
+            ],
+          ),
+        );
+
+        final colors = plotColors(tester, 'quota-throttle-interval-chart');
+        expect(colors, hasLength(others.length + 4));
+        final fableAt = [
+          for (var i = 0; i < colors.length; i++)
+            if (colors[i] == fableColor) i,
+        ];
+        expect(fableAt, [others.length + 2]);
+        expect(plotColors(tester, 'quota-pace-error-chart'), colors);
+      });
     });
 
     test('parses a missing remaining value as null, never 0%', () {

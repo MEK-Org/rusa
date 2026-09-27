@@ -23,6 +23,13 @@ const _fallbackSeriesColors = <Color>[
   Color(0xFFF97316),
 ];
 
+/// Fable is drawn in a lighter tone of the Claude color (#728). It is not in
+/// [_fallbackSeriesColors], so no hashed series can land on it.
+const _fableSeriesColor = Color(0xFFCF8063);
+
+/// Claude's passable Fable IDs (`claude-fable`, `claude-fable-5-1`, ...).
+final _fableModelId = RegExp(r'^claude-fable($|[-\[])');
+
 /// Keeps known provider colors stable when the API changes the series order.
 Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
     _providerSeriesColors[provider] ??
@@ -35,6 +42,14 @@ Color _quotaChartColorForSeries(
 }) {
   if (series.scope != 'model') {
     return _quotaChartColorForProvider(series.provider, fallbackIndex);
+  }
+  // Pinned by canonical IDs, like the hash below, while no other visible
+  // series has taken it.
+  if (series.provider == 'claude' &&
+      series.modelIds.isNotEmpty &&
+      series.modelIds.every(_fableModelId.hasMatch) &&
+      !taken.contains(_fableSeriesColor)) {
+    return _fableSeriesColor;
   }
   // Model history must be visually distinct from its provider-wide series.
   // Hash canonical IDs rather than the display label, which is presentation.
