@@ -306,6 +306,9 @@ export class ActorHandle implements MeshActor {
   get isYielded(): boolean {
     return this.yielded;
   }
+  get isClosed(): boolean {
+    return this.terminated;
+  }
 
   requestRun(nudge?: RunNudge): void {
     void this.ready
@@ -384,6 +387,10 @@ export class ActorHandle implements MeshActor {
     this.resumeCancelledPending = true;
     this.deliverResumeCancelled();
     return true;
+  }
+
+  hasCancelledQueuedRun(): boolean {
+    return this.cancelledQueuedRun;
   }
 
   /** Send a pending replay in wake order; a closed channel leaves it for attachHost. */
@@ -798,6 +805,10 @@ export class ActorHandle implements MeshActor {
     this.admittedAt = undefined;
     this.startedRunId = undefined;
     this.queuedRunId = undefined;
+    if (this.state === "queued") {
+      this.state = "idle";
+      this.opts.context.onRuntimeStateChanged("idle");
+    }
     return this.opts.context.lifecycle.emit("onEnd", {
       actorId: this.id,
       runId,

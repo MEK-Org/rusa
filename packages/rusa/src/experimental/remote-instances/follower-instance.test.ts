@@ -1053,6 +1053,215 @@ describe("monolithic follower instance", () => {
     expect(pacer.waiting).toBe(0);
   });
 
+  it("re-dispatches unhandled inbox work after remote admission drop on post-reattach without requiring a new message (#613)", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 400);
+    const h = setup({ pacer });
+
+    const id = h.spawn("Dropped admission recovery test");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+    const initialQueued = h.events.find(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )?.event;
+    expect(initialQueued?.type === "queued" && initialQueued.runId).toBeTruthy();
+    const oldRunId = (initialQueued as { runId: string }).runId;
+
+    // Lease flap occurs while waiting in pacing
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Reconnect follower without claiming the retained admission
+    const reconnect = h.reconnect();
+    const origDispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      if (envelope.message.type === "init") {
+        envelope.message.bootstrap.resumeAdmission = false;
+      }
+      origDispatch(envelope);
+    };
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    // Leader drops retained admission on first post-reattach state report and books start-cancelled
+    await waitUntil(() =>
+      h.meshEvents.some(
+        (event) =>
+          event.kind === "run_abandoned" &&
+          event.actorId === id &&
+          event.detail === "start-cancelled"
+      )
+    );
+    const abandonedEvents = h.meshEvents.filter(
+      (event) => event.kind === "run_abandoned" && event.actorId === id
+    );
+    expect(abandonedEvents).toHaveLength(1);
+    expect(JSON.parse(abandonedEvents[0].payload ?? "{}")).toEqual({
+      started: false,
+      runId: oldRunId,
+    });
+
+    // Without any new external message arriving, verify the unhandled durable work is re-dispatched
+    // and enters the queued state with a fresh distinct run ID
+    await waitUntil(() => {
+      const queuedEvents = h.events.filter(
+        (event) => event.actorId === id && event.event.type === "queued"
+      );
+      return (
+        queuedEvents.length >= 2 &&
+        queuedEvents.some((e) => e.event.type === "queued" && e.event.runId !== oldRunId)
+      );
+    });
+
+    const replacementQueued = h.events.filter(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )[1]?.event;
+    expect(replacementQueued?.type === "queued" && replacementQueued.runId).toBeTruthy();
+    const replacementRunId = (replacementQueued as { runId: string }).runId;
+    expect(replacementRunId).not.toBe(oldRunId);
+
+    // Replacement run starts and completes
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id &&
+          event.event.type === "runStart" &&
+          event.event.runId === replacementRunId
+      )
+    );
+
+    await waitUntil(() =>
+      h.events.some(
+        (event) =>
+          event.actorId === id && event.event.type === "result" && event.event.result.success
+      )
+    );
+
+    // Verify exactly-once lifecycle accounting: only 1 run_abandoned event occurred
+    expect(
+      h.meshEvents.filter((event) => event.kind === "run_abandoned" && event.actorId === id)
+    ).toHaveLength(1);
+
+    // Verify message provenance: exactly the single initial spawn message was sent
+    expect(h.messages.filter((m) => m.toId === id)).toHaveLength(1);
+  });
+
+  it("does not re-dispatch unhandled inbox work after genuine close/retire (#613)", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 10_000);
+    const h = setup({ pacer });
+
+    const id = h.spawn("Genuine close test");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+    // Flap transport
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Leader genuinely closes the actor while disconnected
+    h.runtime(id).close();
+
+    // Retained admission cancelled immediately and booked start-cancelled
+    await waitUntil(() =>
+      h.meshEvents.some(
+        (event) =>
+          event.kind === "run_abandoned" &&
+          event.actorId === id &&
+          event.detail === "start-cancelled"
+      )
+    );
+
+    // Allow any microtasks to settle
+    await delay(50);
+
+    // Actor runtime is closed; no fresh queued or runStart is scheduled
+    expect(h.runtime(id).isClosed).toBe(true);
+    expect(
+      h.events.filter((event) => event.actorId === id && event.event.type === "queued")
+    ).toHaveLength(1);
+    expect(
+      h.events.filter((event) => event.actorId === id && event.event.type === "runStart")
+    ).toHaveLength(0);
+  });
+
+  it("reconcileInbox is idempotent and does not create duplicate runs (#613)", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 10_000);
+    const h = setup({ pacer });
+
+    const id = h.spawn("Idempotent reconciliation test");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+    // Call reconcileInbox repeatedly while the actor has unhandled work
+    h.mesh.reconcileInbox();
+    h.mesh.reconcileInbox();
+    h.mesh.reconcileInbox();
+
+    await delay(50);
+
+    // Only one queued run exists and pacer is still waiting for exactly 1 admission
+    expect(pacer.waiting).toBe(1);
+    expect(
+      h.events.filter((event) => event.actorId === id && event.event.type === "queued")
+    ).toHaveLength(1);
+  });
+
+  it("derives responsive priority from the durable inbox on re-dispatch after remote admission drop (#613)", async () => {
+    const pacer = new ProviderPacer(0);
+    pacer.deferUntil(Date.now() + 500);
+    const h = setup({ pacer });
+
+    const id = h.spawn("Responsive priority recovery test");
+    await waitUntil(() => h.runtime(id).isQueued && pacer.waiting === 1);
+
+    // Append responsive work to the actor's durable inbox
+    h.inboxStore.append([
+      {
+        actorId: id,
+        source: "test:responsive",
+        payload: { type: "test.responsive", priority: "responsive" },
+      },
+    ]);
+
+    // Flap transport
+    h.remote.close();
+    await h.runtime(id).exited;
+
+    // Reconnect follower without claiming the retained admission
+    const reconnect = h.reconnect();
+    const origDispatch = h.follower.dispatch.bind(h.follower);
+    h.follower.dispatch = (envelope) => {
+      if (envelope.message.type === "init") {
+        envelope.message.bootstrap.resumeAdmission = false;
+      }
+      origDispatch(envelope);
+    };
+    h.runtime(id).attachHost(reconnect.createHost(id));
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    // Abandoned admission booked
+    await waitUntil(() =>
+      h.meshEvents.some(
+        (event) =>
+          event.kind === "run_abandoned" &&
+          event.actorId === id &&
+          event.detail === "start-cancelled"
+      )
+    );
+
+    // Re-dispatch occurs and replacement run is queued as responsive
+    await waitUntil(() => {
+      const queuedEvents = h.events.filter(
+        (event) => event.actorId === id && event.event.type === "queued"
+      );
+      return queuedEvents.length >= 2;
+    });
+
+    const replacementQueued = h.events.filter(
+      (event) => event.actorId === id && event.event.type === "queued"
+    )[1]?.event;
+    expect(replacementQueued?.type === "queued" && replacementQueued.responsive).toBe(true);
+  });
+
   it("rejects duplicate actor init without reconnect flag but permits reconnect", async () => {
     const h = setup();
     const id = h.spawn("Duplicate test");
