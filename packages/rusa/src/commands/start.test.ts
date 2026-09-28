@@ -1377,6 +1377,85 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }
       });
 
+      it("raises one root alarm when a published Fable lane retires", async () => {
+        let publishFable = true;
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: publishFable
+            ? withFableLane(throttleStatus("claude"), { intervalSeconds: 1 })
+            : throttleStatus("claude"),
+        }));
+        const retiredAlarms = () =>
+          getRepositories()
+            .inbox.list("root")
+            .entries.filter(
+              (entry) =>
+                (entry.payload as { type?: string }).type === "system.quota_model_lane_retired"
+            );
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          // A Fable start materializes the model pacer the lane paces.
+          await expect(mesh.gateRun(ran, [fableEntry], false).result).resolves.toBe(
+            "claude-fable-5-1"
+          );
+          expect(retiredAlarms()).toEqual([]);
+
+          publishFable = false;
+          await triggerQuotaThrottleTick();
+          await vi.waitFor(() => expect(retiredAlarms()).toHaveLength(1));
+          expect(retiredAlarms()[0]).toMatchObject({
+            actorId: "root",
+            source: "system:events",
+            payload: expect.objectContaining({
+              provider: "claude",
+              model: "claude-fable-5-1",
+              priority: "responsive",
+              message: expect.stringContaining("check the scrapes"),
+            }),
+          });
+
+          // Still retired on the next tick: raised once, not per apply.
+          await triggerQuotaThrottleTick();
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(retiredAlarms()).toHaveLength(1);
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
+      it("raises the retirement alarm for a published lane no candidate has paced", async () => {
+        let publishFable = true;
+        const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: publishFable
+            ? withFableLane(throttleStatus("claude"), { intervalSeconds: 1 })
+            : throttleStatus("claude"),
+        }));
+        const retiredAlarms = () =>
+          getRepositories()
+            .inbox.list("root")
+            .entries.filter(
+              (entry) =>
+                (entry.payload as { type?: string }).type === "system.quota_model_lane_retired"
+            );
+        try {
+          // Published, but no Fable start ever materializes its model pacer.
+          await triggerQuotaThrottleTick();
+          publishFable = false;
+          await triggerQuotaThrottleTick();
+          await vi.waitFor(() => expect(retiredAlarms()).toHaveLength(1));
+          expect(retiredAlarms()[0]?.payload).toMatchObject({
+            provider: "claude",
+            model: "claude-fable-5-1",
+          });
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
       it("skips only Fable when the coordinator reports its own window exhausted", async () => {
         const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
           claude: withFableLane(throttleStatus("claude", { percentLeft: 90 }), {

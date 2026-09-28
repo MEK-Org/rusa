@@ -263,6 +263,7 @@ import {
 import { createQuotaMetrics } from "../quota/coordinator-metrics.js";
 import {
   HISTORY_WINDOW_MS,
+  isPublishedModelLane,
   type ModelLanePacing,
   modelLanePacing,
   type PublishedThrottleProviderStatus,
@@ -470,11 +471,16 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
 
 /**
  * Every producer that raises host alarms into `system:events`: the disk sensor,
- * and the chat subscription keeper's lapse alert (#578) whenever chat is
- * configured. Root's `system:events` ownership is derived from this same call.
+ * the chat subscription keeper's lapse alert (#578) whenever chat is
+ * configured, and the model lane retirement alert (#588) whenever the quota
+ * throttle reads a coordinator. Root's `system:events` ownership is derived from this same call.
  */
 export function hostAlarmProducerActive(config: RusaConfig): boolean {
-  return diskAlertActive(config) || config.chat !== undefined;
+  return (
+    diskAlertActive(config) ||
+    config.chat !== undefined ||
+    (config.quota?.throttle?.enabled === true && config.quota.coordinator?.socketPath !== undefined)
+  );
 }
 
 /**
@@ -1717,21 +1723,29 @@ async function composeStart(
     candidatePacerFor(lane, model);
     return (modelExhaustedUntilMs.get(modelPacerKey(lane, model)) ?? 0) > nowMs;
   };
-  // Model pacers whose windows the coordinator no longer publishes, so a
-  // retirement is logged once rather than only as a zero interval per apply.
-  const retiredModelPacers = new Set<string>();
+  // The models each provider's last applied status published a lane for. A
+  // model that drops out has retired, whether or not a candidate ever
+  // materialized its pacer, so it is logged and raised to root once per
+  // transition rather than per apply. The alarm is bound once the mesh exists.
+  const publishedModelsByLane = new Map<string, Set<string>>();
+  let raiseModelLaneRetiredAlarm: ((lane: string, model: string) => void) | null = null;
   const applyModelLaneStatuses = (lane: string, status: PublishedThrottleProviderStatus): void => {
+    const published = new Set(
+      (Array.isArray(status.modelLanes) ? status.modelLanes : []).flatMap((modelLane) =>
+        isPublishedModelLane(modelLane) ? modelLane.models : []
+      )
+    );
+    for (const model of publishedModelsByLane.get(lane) ?? []) {
+      if (published.has(model)) continue;
+      log.info("quota_model_lane_retired", { provider: lane, model });
+      raiseModelLaneRetiredAlarm?.(lane, model);
+    }
+    publishedModelsByLane.set(lane, published);
     for (const [key, entry] of modelPacers) {
       if (entry.lane !== lane) continue;
       try {
         const pacing = modelLanePacing(status, entry.model);
         applyModelLanePacing(key, entry.pacer, pacing);
-        if (pacing) {
-          retiredModelPacers.delete(key);
-        } else if (!retiredModelPacers.has(key)) {
-          retiredModelPacers.add(key);
-          log.info("quota_model_lane_retired", { provider: lane, model: entry.model });
-        }
         log.info("quota_model_lane_throttle", {
           provider: lane,
           model: entry.model,
@@ -4463,6 +4477,36 @@ async function composeStart(
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
   }
+
+  raiseModelLaneRetiredAlarm = (provider, model) => {
+    const message =
+      `Quota model lane retired: ${provider} no longer publishes a window for ${model}, ` +
+      "which now paces on its provider lane alone. The window stopped appearing in quota " +
+      "readings and no new reading arrived before it reset; check the scrapes to confirm " +
+      "whether it is really gone.";
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_model_lane_retired", provider, model, message },
+          priority: "responsive",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_model_lane_retired",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_model_lane_retired_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider,
+          model,
+        });
+      }
+    });
+  };
 
   const diskAlertConfig = config.observability?.diskAlert;
   const diskAlertSettings = resolveDiskAlertConfig(diskAlertConfig);

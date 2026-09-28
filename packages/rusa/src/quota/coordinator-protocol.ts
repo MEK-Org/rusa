@@ -388,32 +388,55 @@ export function publishedThrottle(
   const hardStaleAfterMs =
     options?.hardStaleAfterMs ?? freshnessThresholds(options?.mode).hardStaleAfterMs;
   const providerUpdatedMs = Date.parse(stored.updatedAt);
-  // A model lane is retired, not hard-staled, once the provider has kept
-  // reporting for longer than the hard-stale horizon without it: the window
-  // is no longer on the panel, and pinning that model at the ceiling for the
-  // rest of observation retention would be a stale reading, not caution. A
-  // coordinator that stops collecting ages both lanes together instead, so
-  // the conservative widening still applies there. A lane last seen exhausted
-  // is not retired before its exhaustion deadline: until then it stays
-  // published, hard-staled, so the candidate keeps deferring to the deadline
-  // rather than pacing faster because its window vanished.
   const nowMs = options?.nowMs ?? Date.now();
+  // A model lane the provider's newest reading no longer includes is
+  // dead-reckoned: its window stopped appearing, so it keeps the interval of
+  // its last reading, not the hard-stale ceiling, until that window's reset
+  // (or, if later, its #712 exhaustion deadline) has passed, and then it
+  // retires. A lane with no known reset retires once the provider has kept
+  // reporting for longer than the hard-stale horizon without it. A
+  // coordinator that stops collecting ages both lanes together instead, so
+  // the conservative widening still applies there.
   const modelLanes = (stored.modelLanes ?? []).flatMap(
     (lane: PersistedQuotaModelLaneStatus): PublishedThrottleModelLaneStatus[] => {
+      const current = { ...publishedLane(lane, options), models: [...lane.models] };
       const laneUpdatedMs = Date.parse(lane.updatedAt);
-      const exhaustedUntilMs =
-        lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
-      if (
-        Number.isFinite(providerUpdatedMs) &&
-        (!Number.isFinite(laneUpdatedMs) || providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs) &&
-        !(exhaustedUntilMs > nowMs)
-      ) {
-        return [];
+      if (!Number.isFinite(providerUpdatedMs) || laneUpdatedMs >= providerUpdatedMs) {
+        return [current];
       }
-      return [{ ...publishedLane(lane, options), models: [...lane.models] }];
+      if (!Number.isFinite(laneUpdatedMs)) return [];
+      const retireAtMs = modelLaneRetireAtMs(lane);
+      if (Number.isFinite(retireAtMs)) {
+        if (retireAtMs <= nowMs) return [];
+        return [
+          {
+            ...current,
+            intervalSeconds: lane.intervalSeconds,
+            capped: lane.uncappedIntervalSeconds > lane.intervalSeconds,
+          },
+        ];
+      }
+      return providerUpdatedMs - laneUpdatedMs > hardStaleAfterMs ? [] : [current];
     }
   );
   return modelLanes.length > 0 ? { ...published, modelLanes } : published;
+}
+
+/**
+ * When a model lane missing from the provider's newest reading retires: the
+ * reset of its last-seen governing window, whose reading set the interval it
+ * is held at, or later its exhaustion deadline. NaN when neither is known.
+ */
+function modelLaneRetireAtMs(lane: PersistedQuotaModelLaneStatus): number {
+  const governing = lane.buckets.find((b) => b.key === lane.governingBucketKey);
+  const windowResetMs = governing?.resetAtIso ? Date.parse(governing.resetAtIso) : Number.NaN;
+  const exhaustedUntilMs =
+    lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
+  const retireAtMs = Math.max(
+    Number.isFinite(windowResetMs) ? windowResetMs : Number.NEGATIVE_INFINITY,
+    Number.isFinite(exhaustedUntilMs) ? exhaustedUntilMs : Number.NEGATIVE_INFINITY
+  );
+  return Number.isFinite(retireAtMs) ? retireAtMs : Number.NaN;
 }
 
 function publishedLane(
@@ -457,7 +480,8 @@ export interface ModelLanePacing {
   exhaustedUntil: string | null;
 }
 
-function isPublishedModelLane(value: unknown): value is PublishedThrottleModelLaneStatus {
+/** Whether `value` is a well-formed published model lane; a malformed one paces nothing. */
+export function isPublishedModelLane(value: unknown): value is PublishedThrottleModelLaneStatus {
   if (typeof value !== "object" || value === null) return false;
   const lane = value as Partial<PublishedThrottleModelLaneStatus>;
   return (
