@@ -687,7 +687,9 @@ describe("agent-execution MCP server", () => {
         "list_pending_messages",
         "list_subscriptions",
         "list_threads",
+        "mark_exhausted_inbox_handled",
         "reclaim_event_source",
+        "release_selection_lock",
         "reparent_thread",
         "retire_thread",
         "revive_thread",
@@ -958,7 +960,9 @@ describe("agent-execution MCP server", () => {
         "list_followers",
         "list_pending_messages",
         "list_threads",
+        "mark_exhausted_inbox_handled",
         "reclaim_event_source",
+        "release_selection_lock",
         "retire_thread",
         "revoke_capability",
         "send_message",
@@ -4755,11 +4759,8 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       expect(clearedEntries).toEqual(["item-1"]);
     });
 
-    it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled and mark_child_inbox_handled", async () => {
-      const countsMap = new Map([
-        ["item-1", 2],
-        ["item-2", 2],
-      ]);
+    it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled", async () => {
+      const countsMap = new Map([["item-1", 2]]);
 
       const { mesh, inboxStore } = setup({
         completedFocusEntryCounts: () => countsMap,
@@ -4792,7 +4793,6 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
       const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
 
-      // mark_exhausted_inbox_handled
       const res1 = (await parentClient.callTool({
         name: "mark_exhausted_inbox_handled",
         arguments: {
@@ -4812,25 +4812,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       expect(entry1?.handledNote).toBe(
         `Marked handled by parent (${parent}): cleared after review`
       );
-
-      // mark_child_inbox_handled (alias)
-      const res2 = (await parentClient.callTool({
-        name: "mark_child_inbox_handled",
-        arguments: {
-          thread_id: child,
-          entry_ids: ["item-2"],
-          note: "cleared alias",
-        },
-      })) as CallToolResult;
-
-      expect(res2.isError).toBeFalsy();
-      const data2 = dataOf(res2) as { handled: Array<{ id: string; handledAt: string }> };
-      expect(data2.handled).toHaveLength(1);
-      expect(data2.handled[0].id).toBe("item-2");
-
-      const entry2 = inboxStore.read(child, "item-2");
-      expect(entry2?.handledAt).not.toBeNull();
-      expect(entry2?.handledNote).toBe(`Marked handled by parent (${parent}): cleared alias`);
+      expect(inboxStore.read(child, "item-2")?.handledAt).toBeNull();
     });
 
     it("enforces authority: rejects self-clear, non-parent, and non-exhausted entries", async () => {
