@@ -50,13 +50,17 @@ describe.skipIf(!BWRAP_CAPABLE)("Antigravity provider-state isolation (real bwra
     writeFileSync(join(stateDir, "antigravity-oauth-token"), "shared-auth");
     mkdirSync(join(actorStateDir, "scratch"), { recursive: true });
     writeFileSync(join(actorStateDir, "scratch", "owned.txt"), "actor-owned");
+    mkdirSync(join(fixtureHome, ".config", "gh"), { recursive: true });
   });
 
   afterEach(() => {
-    teardownFlutterOverlay(actorDir);
-    rmSync(fixtureHome, { recursive: true, force: true });
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    try {
+      teardownFlutterOverlay(actorDir);
+      rmSync(fixtureHome, { recursive: true, force: true });
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
   });
 
   it("hides sibling worktrees and conversation state while sharing auth", () => {

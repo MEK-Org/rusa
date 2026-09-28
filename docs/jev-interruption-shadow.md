@@ -39,7 +39,7 @@ these to TypeSafe for the actors that receive responsive items.
 
 Each decision is bounded: at most 20 candidates are read and sent (the number
 left out is sent as `omittedCandidates`), and each entry's text is cut at 4,000
-characters. Both numbers, the 0.8 interrupt threshold, and the 5-second
+characters. Both numbers, the 0.5 interrupt-probability threshold, and the 5-second
 decision deadline are uncalibrated placeholders that the shadow data is meant
 to calibrate. The deadline covers source reads and the request: expiry cancels
 the request, but a source read in progress runs to completion unobserved,
@@ -52,14 +52,23 @@ posts `https://api.typesafe.ai/v1/systemone` with a Bearer credential. The API
 root is set explicitly, so a `TYPESAFE_BASE_URL` in the daemon's environment
 cannot redirect the credential. The request carries model `jev-latest`, the
 resolved incoming and candidate entries (id, inbox source, payload type, text)
-as `state`, and one `choice` question named `interruption`. The choices are
-`interrupt` and `queue`; it accepts an answer only if it selects one of those
-and carries a numeric confidence.
+as `state`, and one [Noul](https://docs.typesafe.ai/primitives/noul) question
+named `interruption`: “Should we interrupt the current work for the arriving
+item?” A Noul returns the probability of yes, with no separate confidence
+score. The client accepts only a finite number in [0, 1] from a `noul` answer.
 
-The shadow audit retains stable inbox IDs, candidate source, verdict/confidence,
-and baseline scheduler behavior; it does not retain message bodies, TypeSafe
-responses, credentials, or request-error bodies. Google Chat predictions react
-on the arriving message with `✅` (would interrupt) or `❌` (would queue).
+The policy interrupts at `interruptProbability >= 0.5`; a lower value queues
+with reason `below_threshold`. This threshold is an initial setting to
+calibrate from observations, not a translation of the old choice confidence.
+The shadow audit retains the original `interruptProbability`, threshold,
+policy `outcome`, stable inbox IDs, candidate source, and baseline scheduler
+behavior. It does not retain message bodies, TypeSafe responses, credentials,
+or request-error bodies. Historical audit rows retain their old
+`verdict`/`confidence` fields; new rows use `interruptProbability` instead.
+No stored rows or database schema are migrated.
+
+Google Chat predictions use the same threshold-applied outcome: `✅` for
+would interrupt, `❌` for would queue. Failed evaluations post no prediction.
 
 ## Failure behavior
 
