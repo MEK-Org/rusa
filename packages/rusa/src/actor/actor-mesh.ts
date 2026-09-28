@@ -128,8 +128,6 @@ export interface MeshActor {
   /** Cancel a queued reservation and re-admit its same work against current next-run config. */
   rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
-  hasCancelledQueuedRun?(): boolean;
-  readonly isClosed?: boolean;
   preemptForResponsive():
     | { preempted: false }
     | { preempted: true; phase: "running" | "winding_down" | "queued" };
@@ -1257,13 +1255,6 @@ export class ActorMesh {
               // A launched run that ended without a result still ended: a pool
               // staged while it ran is due now, not at some later dispatch (#652).
               if (event.terminal.started) this.applyPendingModel(event.actorId);
-              if (
-                event.terminal.kind === "abandoned" &&
-                !event.terminal.started &&
-                event.terminal.reason === "start-cancelled"
-              ) {
-                queueMicrotask(() => this.redispatchAbandonedAdmission(event.actorId));
-              }
             }
             // A selection is run-scoped regardless of its terminal shape.
             this.clearSelection(event.actorId);
@@ -1360,10 +1351,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
-        const record = this.actors.get(work.actorId);
-        if (record && record.status !== "active") continue;
-        if (this.hasOnlyExhaustedWork(work.actorId)) continue;
-        this.dispatch(work.actorId);
+        this.reconcileActorInbox(work.actorId);
       }
     } catch (err) {
       // Recovery is a nudge over durable state, not the durability boundary.
@@ -1371,6 +1359,19 @@ export class ActorMesh {
       // failure-isolated while making the missed nudge journal-visible.
       this.log(`inbox reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * One actor's share of {@link reconcileInbox}: nudge its durable unhandled
+   * work unless it is retired or holds only exhausted entries. A remote handle
+   * calls this when it drops an admission its follower did not reclaim, since
+   * no delivery is coming to wake the work that admission was for (#613).
+   */
+  reconcileActorInbox(actorId: string): boolean {
+    const record = this.actors.get(actorId);
+    if (record && record.status !== "active") return false;
+    if (this.hasOnlyExhaustedWork(actorId)) return false;
+    return this.dispatch(actorId);
   }
 
   /** Resume recovery: nudge only work that never passed a pre-run halt gate. */
@@ -1946,32 +1947,6 @@ export class ActorMesh {
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     this.flushRunResponsiveReadyAttention(actorId);
-  }
-
-  /**
-   * After an unstarted remote admission is booked `run_abandoned` / `start-cancelled`
-   * (e.g. dropped on post-reattach state report with no claim, or pacing timeout
-   * while disconnected), re-dispatch any remaining unhandled durable inbox work
-   * if the actor is still eligible (#613).
-   */
-  private redispatchAbandonedAdmission(actorId: string): void {
-    const resolvedId = this.resolveThreadId(actorId);
-    if (this.isShuttingDown()) return;
-    const record = this.actors.get(resolvedId);
-    if (!record || record.status !== "active") return;
-    if (this.allCandidatesHalted(this.launchModelConfig(resolvedId))) return;
-    if (!this.runs.isLive(resolvedId)) return;
-    const actor = this.runs.liveActor(resolvedId);
-    if (!actor || actor.isClosed || actor.isRunning || actor.isQueued) return;
-    if (actor.hasCancelledQueuedRun?.()) return;
-    const watermark = actor.getInterruptedWatermark?.();
-    if (watermark) {
-      const unhandled = this.unhandledInboxEntries(resolvedId);
-      if (!unhandled.some((e) => e.deliveredAt > watermark)) return;
-    }
-    if (!this.inboxStore || this.inboxStore.countUnhandled(resolvedId) === 0) return;
-    if (this.hasOnlyExhaustedWork(resolvedId)) return;
-    this.dispatch(resolvedId);
   }
 
   /**

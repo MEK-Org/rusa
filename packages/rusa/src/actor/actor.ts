@@ -424,10 +424,6 @@ export class Actor {
     return this.queued;
   }
 
-  get isClosed(): boolean {
-    return this.closed;
-  }
-
   markUnkillable(): void {
     this.killable = false;
   }
@@ -491,10 +487,6 @@ export class Actor {
     // retained opportunity into that exact one replay.
     this.runner.requestRun(nudge);
     return true;
-  }
-
-  hasCancelledQueuedRun(): boolean {
-    return this.cancelledQueuedRun;
   }
 
   /**
