@@ -2,7 +2,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildActorBwrapArgs, teardownFlutterOverlay } from "./sandbox.js";
 import { runSubprocess } from "./subprocess-execution.js";
 
@@ -208,22 +208,28 @@ describe.skipIf(!BWRAP_CAPABLE)(
 );
 
 describe("Sandbox provider args generation (always executed)", () => {
+  let fakeDir: string;
+
+  beforeEach(() => {
+    fakeDir = mkdtempSync(join(tmpdir(), "mc-sandbox-args-"));
+  });
+
   afterEach(() => {
-    teardownFlutterOverlay("/tmp/fake");
+    teardownFlutterOverlay(fakeDir);
     try {
-      rmSync("/tmp/fake", { recursive: true, force: true });
+      rmSync(fakeDir, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
   });
 
   it("includes exactly one --new-session for actor isolation (issue #164)", () => {
-    const result = buildActorBwrapArgs("/tmp/fake", undefined, undefined, false);
+    const result = buildActorBwrapArgs(fakeDir, undefined, undefined, false);
     expect(result.args.filter((a) => a === "--new-session")).toHaveLength(1);
   });
 
   it("omits --new-session for e2e-root", () => {
-    const result = buildActorBwrapArgs("/tmp/fake", undefined, undefined, true);
+    const result = buildActorBwrapArgs(fakeDir, undefined, undefined, true);
     expect(result.args.filter((a) => a === "--new-session")).toHaveLength(0);
   });
 });
