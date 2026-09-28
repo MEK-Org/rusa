@@ -92,6 +92,7 @@ import {
 } from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
+  SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
 } from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
@@ -3078,8 +3079,7 @@ describe("ActorMesh", () => {
       threshold: 0.8,
       client: {
         decide: async (request) => ({
-          verdict: "interrupt",
-          confidence: 0.95,
+          interruptProbability: 0.95,
           rationale: "the arriving message reverses the selected work",
           matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
         }),
@@ -3174,7 +3174,7 @@ describe("ActorMesh", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
       client: {
-        decide: async () => ({ verdict: "interrupt", confidence: 0.95 }),
+        decide: async () => ({ interruptProbability: 0.95 }),
       },
     });
     const { mesh, tick } = setup({
@@ -3211,10 +3211,8 @@ describe("ActorMesh", () => {
     ]);
   });
 
-  it("reacts with JEV's own interrupt below the threshold, and audits verdict and outcome (#710)", async () => {
-    // The reaction is for judging the model, so a below-threshold interrupt
-    // shows ✅, not the policy's queue. The audit keeps both, so tuning the
-    // threshold never has to infer what JEV said from the code.
+  it("reacts with queue below the threshold and audits the original probability", async () => {
+    // The reaction and audit outcome agree; the probability remains available.
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
     const reactions: Array<{ messageName: string; emoji: string }> = [];
@@ -3222,7 +3220,7 @@ describe("ActorMesh", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.5,
       client: {
-        decide: async () => ({ verdict: "interrupt", confidence: 0.2 }),
+        decide: async () => ({ interruptProbability: 0.2 }),
       },
     });
     const { mesh, tick } = setup({
@@ -3254,16 +3252,13 @@ describe("ActorMesh", () => {
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(reactions).toEqual([
-      { messageName: "spaces/S/messages/M", emoji: SHADOW_INTERRUPT_EMOJI },
-    ]);
+    expect(reactions).toEqual([{ messageName: "spaces/S/messages/M", emoji: SHADOW_QUEUE_EMOJI }]);
     const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
     expect(shadow).toHaveLength(1);
     expect(JSON.parse(shadow[0]?.payload ?? "{}").decision).toMatchObject({
       outcome: "queue",
-      reason: "low_confidence",
-      verdict: "interrupt",
-      confidence: 0.2,
+      reason: "below_threshold",
+      interruptProbability: 0.2,
       threshold: 0.5,
     });
   });
@@ -3363,7 +3358,7 @@ describe("ActorMesh", () => {
     const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
-      client: { decide: async () => ({ verdict: "queue", confidence: 0.95 }) },
+      client: { decide: async () => ({ interruptProbability: 0.05 }) },
     });
     const { mesh, tick } = setup({
       inboxStore,
@@ -3407,8 +3402,7 @@ describe("ActorMesh", () => {
       threshold: 0.8,
       client: {
         decide: async (request) => ({
-          verdict: "interrupt",
-          confidence: 0.95,
+          interruptProbability: 0.95,
           rationale: "the arriving message reverses the selected work",
           matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
         }),

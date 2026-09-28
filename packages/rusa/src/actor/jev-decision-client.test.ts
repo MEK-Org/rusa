@@ -3,11 +3,7 @@
 // and refuse to hold a credential.
 import type { Fetch } from "@typesafe-ai/sdk";
 import { describe, expect, it, vi } from "vitest";
-import {
-  HttpJevDecisionClient,
-  INTERRUPTION_CRITERIA,
-  JEV_MAX_CANDIDATES,
-} from "./jev-decision-client.js";
+import { HttpJevDecisionClient, JEV_MAX_CANDIDATES } from "./jev-decision-client.js";
 import { createJevInboxTextResolver } from "./jev-inbox-text-resolver.js";
 import {
   JevInputUnavailableError,
@@ -21,10 +17,10 @@ const json = (body: unknown, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 
-const answer = (choice: string, confidence: number) =>
+const answer = (noul: number) =>
   json({
     model: "jev-test",
-    answers: { interruption: { type: "choice", choice, confidence } },
+    answers: { interruption: { type: "noul", noul } },
     usage: { input_tokens: 1, output_tokens: 1 },
   });
 
@@ -49,7 +45,7 @@ const text = async (_actorId: string, id: string) => ({
 
 describe("HttpJevDecisionClient", () => {
   it("sends resolved live text only in the typed System One request", async () => {
-    const fetch = vi.fn<Fetch>(async () => answer("interrupt", 0.93));
+    const fetch = vi.fn<Fetch>(async () => answer(0.93));
     const resolve = vi.fn(async (_actorId: string, id: string) => ({
       id,
       source: "mesh:root",
@@ -66,7 +62,7 @@ describe("HttpJevDecisionClient", () => {
         { ...request(), question: "Given this information, should we interrupt?" },
         { signal: controller.signal }
       )
-    ).resolves.toEqual({ verdict: "interrupt", confidence: 0.93 });
+    ).resolves.toEqual({ interruptProbability: 0.93 });
 
     expect(resolve).toHaveBeenCalledWith("worker", "incoming", controller.signal);
     expect(resolve).toHaveBeenCalledWith("worker", "candidate", controller.signal);
@@ -97,9 +93,8 @@ describe("HttpJevDecisionClient", () => {
       },
       questions: {
         interruption: {
-          type: "choice",
+          type: "noul",
           instructions: "Given this information, should we interrupt?",
-          criteria: INTERRUPTION_CRITERIA,
         },
       },
     });
@@ -109,7 +104,7 @@ describe("HttpJevDecisionClient", () => {
   it("ignores TYPESAFE_BASE_URL, so the credential goes only to TypeSafe", async () => {
     vi.stubEnv("TYPESAFE_BASE_URL", "https://elsewhere.invalid");
     try {
-      const fetch = vi.fn<Fetch>(async () => answer("queue", 0.9));
+      const fetch = vi.fn<Fetch>(async () => answer(0.1));
       await new HttpJevDecisionClient("synthetic-key", text, fetch).decide(request());
       expect(fetch.mock.calls[0]?.[0]).toBe("https://api.typesafe.ai/v1/systemone");
     } finally {
@@ -124,16 +119,27 @@ describe("HttpJevDecisionClient", () => {
     await expect(client.decide(request())).rejects.toThrow("invalid interruption answer");
   });
 
-  it("rejects an answer without a confidence", async () => {
+  it("rejects an answer without a probability", async () => {
     const client = new HttpJevDecisionClient("synthetic-key", text, async () =>
-      json({ answers: { interruption: { type: "choice", choice: "queue" } } })
+      json({ answers: { interruption: { type: "noul" } } })
     );
     await expect(client.decide(request())).rejects.toThrow("invalid interruption answer");
   });
 
-  it("rejects a choice that was not offered", async () => {
+  it.each([null, true, "0.9", -0.1, 1.1])("rejects invalid probability %s", async (noul) => {
     const client = new HttpJevDecisionClient("synthetic-key", text, async () =>
-      answer("maybe", 0.99)
+      json({ answers: { interruption: { type: "noul", noul } } })
+    );
+    await expect(client.decide(request())).rejects.toThrow("invalid interruption answer");
+  });
+
+  it("rejects the old choice response even if it has a noul field", async () => {
+    const client = new HttpJevDecisionClient("synthetic-key", text, async () =>
+      json({
+        answers: {
+          interruption: { type: "choice", choice: "interrupt", confidence: 0.9, noul: 0.9 },
+        },
+      })
     );
     await expect(client.decide(request())).rejects.toThrow("invalid interruption answer");
   });
@@ -167,7 +173,7 @@ describe("HttpJevDecisionClient", () => {
   });
 
   it("sends textless candidates by type and caps how many are read", async () => {
-    const fetch = vi.fn<Fetch>(async () => answer("queue", 0.9));
+    const fetch = vi.fn<Fetch>(async () => answer(0.1));
     const resolve = vi.fn(async (_actorId: string, id: string) => ({
       id,
       source: "mesh:root",
@@ -184,7 +190,7 @@ describe("HttpJevDecisionClient", () => {
         ...request(candidateEntryIds),
         input: { incomingEntryId: "incoming", candidateEntryIds, candidateSource: "pending" },
       })
-    ).resolves.toEqual({ verdict: "queue", confidence: 0.9 });
+    ).resolves.toEqual({ interruptProbability: 0.1 });
 
     expect(resolve).toHaveBeenCalledTimes(JEV_MAX_CANDIDATES + 1);
     const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as {
@@ -219,15 +225,6 @@ describe("HttpJevDecisionClient", () => {
   });
 });
 
-describe("INTERRUPTION_CRITERIA", () => {
-  it("is the operator-approved choice wording, verbatim (#710)", () => {
-    expect(INTERRUPTION_CRITERIA).toEqual({
-      interrupt: "the arriving item relates to the current work, or its relationship is uncertain.",
-      queue: "the arriving item is clearly unrelated to the current work.",
-    });
-  });
-});
-
 /**
  * #710 regressions. Each pair is one sender writing twice, six seconds apart,
  * where the second message corrects or cancels the first. The model can only
@@ -244,7 +241,7 @@ describe("JEV interruption regressions (#710)", () => {
     earlier: string;
     later: string;
     candidateSource: "selected" | "pending";
-    answer: { choice: string; confidence: number };
+    probability: number;
   }) {
     const messages: Record<string, { text: string; createTime: string }> = {
       "spaces/S/messages/earlier": { text: pair.earlier, createTime: "2026-09-26T17:00:00.000Z" },
@@ -276,7 +273,7 @@ describe("JEV interruption regressions (#710)", () => {
         getSpace: vi.fn(),
       },
     });
-    const fetch = vi.fn<Fetch>(async () => answer(pair.answer.choice, pair.answer.confidence));
+    const fetch = vi.fn<Fetch>(async () => answer(pair.probability));
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.5,
       client: new HttpJevDecisionClient("synthetic-key", resolve, fetch),
@@ -290,7 +287,7 @@ describe("JEV interruption regressions (#710)", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as {
       state: Record<string, unknown>;
-      questions: { interruption: { instructions: string; criteria: unknown } };
+      questions: { interruption: { type: string; instructions: string } };
     };
     return { decision, body };
   }
@@ -300,12 +297,12 @@ describe("JEV interruption regressions (#710)", () => {
       earlier: "This is a test of the jev stuff",
       later: "On second thought let's not test it",
       candidateSource: "selected",
-      answer: { choice: "interrupt", confidence: 0.77 },
+      probability: 0.77,
     });
 
     expect(body.questions.interruption).toMatchObject({
       instructions: RESPONSIVE_INTERRUPTION_QUESTION,
-      criteria: INTERRUPTION_CRITERIA,
+      type: "noul",
     });
     expect(body.state).toMatchObject({
       incoming: {
@@ -325,11 +322,10 @@ describe("JEV interruption regressions (#710)", () => {
       ],
       candidateSource: "selected",
     });
-    // 0.77 is the selected-mode interrupt from the #710 offline run that 0.8 missed.
+    // Synthetic probability: the live API is exercised separately from unit tests.
     expect(decision).toMatchObject({
       outcome: "interrupt",
-      verdict: "interrupt",
-      confidence: 0.77,
+      interruptProbability: 0.77,
     });
     // The audit stays ids-only: no text, sender or source time reaches it.
     const audit = JSON.stringify(decision);
@@ -344,7 +340,7 @@ describe("JEV interruption regressions (#710)", () => {
       earlier: "Keep shadow mode on for now, and disable the jev integration until that fails.",
       later: "lands*",
       candidateSource: "pending",
-      answer: { choice: "interrupt", confidence: 0.99 },
+      probability: 0.99,
     });
 
     expect(body.state).toMatchObject({
@@ -365,7 +361,7 @@ describe("JEV interruption regressions (#710)", () => {
       ],
       candidateSource: "pending",
     });
-    expect(decision).toMatchObject({ outcome: "interrupt", verdict: "interrupt" });
+    expect(decision).toMatchObject({ outcome: "interrupt", interruptProbability: 0.99 });
     const audit = JSON.stringify(decision);
     for (const leaked of ["lands*", "jev integration", DISPLAY_NAME, STABLE_SENDER, "17:00:0"]) {
       expect(audit).not.toContain(leaked);

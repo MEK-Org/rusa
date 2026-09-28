@@ -49,16 +49,11 @@ function fixtureClient(fixture: ResponsiveInterruptionFixture): JevDecisionClien
         .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
       const best = scored[0];
       const runnerUp = scored[1];
-      if (!best || best.score === 0) return { verdict: "queue", confidence: 0.95 };
-      // A lead over the field is what makes a match a match. Without one this
-      // fake still leans toward interrupting, but says how weakly through its
-      // confidence: the confident guess the classifier's threshold exists to
-      // turn back. A fake that answered `queue` here would pass with the
-      // threshold deleted.
+      if (!best || best.score === 0) return { interruptProbability: 0.05 };
+      // Overlap is a synthetic probability signal, not a live model claim.
       const lead = best.score - (runnerUp?.score ?? 0);
       return {
-        verdict: "interrupt",
-        confidence: lead >= 2 ? 0.94 : 0.41,
+        interruptProbability: lead >= 2 ? 0.94 : 0.41,
         rationale: `overlap ${best.score}, lead ${lead}`,
         matchedCandidateIds:
           lead >= 2 ? [best.id] : scored.filter((c) => c.score === best.score).map((c) => c.id),
@@ -77,8 +72,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       client: client(async (request) => {
         asked.push(request);
         return {
-          verdict: "interrupt",
-          confidence: 0.91,
+          interruptProbability: 0.91,
           rationale: "the arriving item cancels selected-a",
           matchedCandidateIds: ["selected-a"],
         };
@@ -103,8 +97,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
 
     expect(decision).toEqual({
       outcome: "interrupt",
-      verdict: "interrupt",
-      confidence: 0.91,
+      interruptProbability: 0.91,
       matchedCandidateIds: ["selected-a"],
       incomingEntryId: "incoming-z",
       candidateSource: "selected",
@@ -117,6 +110,29 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     });
   });
 
+  it.each([
+    [0, "queue"],
+    [0.37, "queue"],
+    [0.499999, "queue"],
+    [0.5, "interrupt"],
+    [1, "interrupt"],
+  ] as const)("applies the 0.5 threshold to probability %s", async (probability, outcome) => {
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: client(async () => ({ interruptProbability: probability })),
+    });
+    const decision = await classifier.evaluate({
+      actorId: "actor",
+      incomingEntryId: "incoming",
+      selectedEntryIds: ["selected"],
+      pendingEntryIds: [],
+    });
+    expect(decision).toMatchObject({ outcome, interruptProbability: probability, threshold: 0.5 });
+    expect(shadowPrediction(decision)).toBe(outcome);
+    expect(decision).not.toHaveProperty("confidence");
+    expect(decision).not.toHaveProperty("verdict");
+  });
+
   it("keeps the model's prose out of the decision entirely", async () => {
     // The rationale is useful to a human reading a live response and is exactly
     // the field that could smuggle message text into a durable record. The
@@ -124,8 +140,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
       client: client(async () => ({
-        verdict: "interrupt",
-        confidence: 0.99,
+        interruptProbability: 0.99,
         rationale: "because the operator wrote 'cancel the payroll run for alice@example.com'",
         matchedCandidateIds: ["selected-a"],
       })),
@@ -176,8 +191,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
     const classifier = new ShadowResponsiveInterruptionClassifier({
       threshold: 0.8,
       client: client(async () => ({
-        verdict: "interrupt",
-        confidence: 0.99,
+        interruptProbability: 0.99,
         matchedCandidateIds: ["selected-a", "an entry that was never offered", "selected-a"],
       })),
     });
@@ -201,7 +215,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       threshold: 0.8,
       client: client(async (request) => {
         asked.push(request);
-        return { verdict: "queue", confidence: 0.9 };
+        return { interruptProbability: 0.1 };
       }),
     });
 
@@ -225,7 +239,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       threshold: 0.8,
       client: client(async (request) => {
         asked.push(request);
-        return { verdict: "queue", confidence: 0.9 };
+        return { interruptProbability: 0.1 };
       }),
     });
 
@@ -242,19 +256,19 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
   describe("fails closed to queue", () => {
     const cases: Array<{ what: string; response: unknown; reason: string }> = [
       {
-        what: "an unrecognised verdict",
-        response: { verdict: "maybe", confidence: 0.99 },
-        reason: "invalid_verdict",
+        what: "a nonnumeric probability",
+        response: { interruptProbability: "invalid" },
+        reason: "invalid_probability",
       },
       {
-        what: "a confidence above one",
-        response: { verdict: "interrupt", confidence: 1.4 },
-        reason: "invalid_confidence",
+        what: "a probability above one",
+        response: { interruptProbability: 1.4 },
+        reason: "invalid_probability",
       },
       {
-        what: "a NaN confidence",
-        response: { verdict: "interrupt", confidence: Number.NaN },
-        reason: "invalid_confidence",
+        what: "a NaN probability",
+        response: { interruptProbability: Number.NaN },
+        reason: "invalid_probability",
       },
     ];
     for (const { what, response, reason } of cases) {
@@ -326,14 +340,12 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       expect(decision).toMatchObject({ outcome: "queue", reason: "timeout" });
     });
 
-    it("queues an interrupt the client is not confident enough about, keeping its verdict and confidence", async () => {
-      // A threshold cannot be tuned from records that discard the verdict and
-      // confidence they rejected (#710).
+    it("queues a below-threshold probability and retains it for audit", async () => {
+      // Preserve the probability so the threshold can be tuned from observations.
       const classifier = new ShadowResponsiveInterruptionClassifier({
         threshold: 0.8,
         client: client(async () => ({
-          verdict: "interrupt",
-          confidence: 0.62,
+          interruptProbability: 0.62,
           matchedCandidateIds: ["selected-a"],
         })),
       });
@@ -345,9 +357,8 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       });
       expect(decision).toMatchObject({
         outcome: "queue",
-        reason: "low_confidence",
-        verdict: "interrupt",
-        confidence: 0.62,
+        reason: "below_threshold",
+        interruptProbability: 0.62,
         matchedCandidateIds: ["selected-a"],
       });
     });
@@ -369,7 +380,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         threshold: 0.8,
         client: client(async () => {
           asked++;
-          return { verdict: "interrupt", confidence: 0.99 };
+          return { interruptProbability: 0.99 };
         }),
       });
       const decision = await classifier.evaluate({
@@ -407,7 +418,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
       // The cost of being wrong here is a false preemption of real work, so
       // the right behaviour is an unconfident queue, not a plausible pick.
       const decision = await evaluate(AMBIGUOUS_FIXTURE);
-      expect(decision).toMatchObject({ outcome: "queue", reason: "low_confidence" });
+      expect(decision).toMatchObject({ outcome: "queue", reason: "below_threshold" });
     });
 
     it(`still finds the one match inside ${SCALE_FIXTURE.name}`, async () => {
@@ -424,7 +435,7 @@ describe("ShadowResponsiveInterruptionClassifier", () => {
         threshold: 0.8,
         client: client(async (request) => {
           asked.push(request);
-          return { verdict: "queue", confidence: 0.9 };
+          return { interruptProbability: 0.1 };
         }),
       });
       await classifier.evaluate({
@@ -448,10 +459,12 @@ describe("shadowVerdictEmoji", () => {
 });
 
 describe("RESPONSIVE_INTERRUPTION_QUESTION", () => {
-  it("is the operator-approved wording, verbatim (#710)", () => {
-    expect(RESPONSIVE_INTERRUPTION_QUESTION).toBe(
-      "A new responsive item has arrived for an actor. Should it interrupt the current run or wait in the queue? Default to interrupt. Choose queue only when the arriving item is clearly unrelated to the current work. Corrections, cancellations, clarifications, and follow-ups about that work should interrupt. If the relationship is uncertain or the current work is not known, choose interrupt. Use sender and timestamps to interpret the relationship between messages. Candidates marked selected are the current work; candidates marked pending are unread context, not confirmed current work."
+  it("asks a yes/no question with selected and pending context distinguished", () => {
+    expect(RESPONSIVE_INTERRUPTION_QUESTION).toMatch(/^Should we interrupt/);
+    expect(RESPONSIVE_INTERRUPTION_QUESTION).toContain(
+      "Candidates marked selected are the current work"
     );
+    expect(RESPONSIVE_INTERRUPTION_QUESTION).toContain("pending are unread context");
   });
 });
 
@@ -468,22 +481,20 @@ describe("shadowPrediction", () => {
       pendingEntryIds: [],
     });
 
-  it("is the model's verdict whenever the model answered", async () => {
-    expect(
-      shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.9 })))
-    ).toBe("interrupt");
-    expect(
-      shadowPrediction(await decide(async () => ({ verdict: "queue", confidence: 0.3 })))
-    ).toBe("queue");
-    // A weak interrupt turned back by the threshold still shows what JEV
-    // said, not the policy's queue (#710).
-    const weak = await decide(async () => ({ verdict: "interrupt", confidence: 0.5 }));
+  it("is the threshold-applied outcome whenever the model answered", async () => {
+    expect(shadowPrediction(await decide(async () => ({ interruptProbability: 0.9 })))).toBe(
+      "interrupt"
+    );
+    expect(shadowPrediction(await decide(async () => ({ interruptProbability: 0.3 })))).toBe(
+      "queue"
+    );
+    // A below-threshold probability shows the policy queue, with the score retained.
+    const weak = await decide(async () => ({ interruptProbability: 0.5 }));
     expect(weak).toMatchObject({
       outcome: "queue",
-      reason: "low_confidence",
-      verdict: "interrupt",
+      reason: "below_threshold",
     });
-    expect(shadowPrediction(weak)).toBe("interrupt");
+    expect(shadowPrediction(weak)).toBe("queue");
   });
 
   it("is nothing when no judgement was made", async () => {
@@ -496,9 +507,9 @@ describe("shadowPrediction", () => {
       )
     ).toBe(null);
     expect(shadowPrediction(await decide(() => new Promise(() => {})))).toBe(null);
-    expect(
-      shadowPrediction(await decide(async () => ({ verdict: "maybe", confidence: 0.9 })))
-    ).toBe(null);
+    expect(shadowPrediction(await decide(async () => ({ interruptProbability: Number.NaN })))).toBe(
+      null
+    );
   });
 });
 

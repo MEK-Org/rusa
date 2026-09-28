@@ -19,7 +19,7 @@
  * taxonomy artefact rather than a judgement.
  *
  * Asking the decision directly keeps the judgement open while the *answer*
- * stays closed: a two-valued verdict plus a confidence is exactly as
+ * stays closed: a probability of yes is exactly as
  * machine-readable as a taxonomy, so scheduling and audit remain
  * deterministic. The thing that was narrowed is the question, not the record.
  */
@@ -64,9 +64,8 @@ export interface JevDecisionRequest {
 }
 
 export interface JevDecisionResponse {
-  /** Expected to be `interrupt` or `queue`; anything else fails closed. */
-  verdict: string;
-  confidence: number;
+  /** Noul probability of yes (interrupt), finite and in [0, 1]. */
+  interruptProbability: number;
   /**
    * Free prose for a human reading a live response. It is accepted here and
    * deliberately dropped before the decision is returned — this is the single
@@ -80,22 +79,19 @@ export interface JevDecisionResponse {
 export type ResponsiveInterruptionVerdict = "interrupt" | "queue";
 export type ResponsiveInterruptionCandidateSource = "selected" | "pending";
 
-const VERDICTS = ["interrupt", "queue"] as const satisfies readonly ResponsiveInterruptionVerdict[];
-
 /**
  * The question itself, exported because it is the policy — the thing a review
  * argues about — and because a test can then assert the seam asks it rather
  * than something adjacent.
  */
 export const RESPONSIVE_INTERRUPTION_QUESTION =
-  "A new responsive item has arrived for an actor. Should it interrupt the" +
-  " current run or wait in the queue? Default to interrupt. Choose queue only" +
-  " when the arriving item is clearly unrelated to the current work." +
-  " Corrections, cancellations, clarifications, and follow-ups about that work" +
-  " should interrupt. If the relationship is uncertain or the current work is" +
-  " not known, choose interrupt. Use sender and timestamps to interpret the" +
-  " relationship between messages. Candidates marked selected are the current" +
-  " work; candidates marked pending are unread context, not confirmed current work.";
+  "Should we interrupt the current work for the arriving item?" +
+  " Corrections, cancellations, clarifications, and follow-ups about the current" +
+  " work should interrupt. An item that is clearly unrelated should wait." +
+  " If the relationship is uncertain or the current work is not known, favor" +
+  " interrupting. Use sender and timestamps to interpret the relationship" +
+  " between messages. Candidates marked selected are the current work;" +
+  " candidates marked pending are unread context, not confirmed current work.";
 
 /** What a would-interrupt looks like on the arriving Google Chat message. */
 export const SHADOW_INTERRUPT_EMOJI = "✅";
@@ -111,21 +107,11 @@ export function shadowVerdictEmoji(verdict: ResponsiveInterruptionVerdict): stri
   return verdict === "interrupt" ? SHADOW_INTERRUPT_EMOJI : SHADOW_QUEUE_EMOJI;
 }
 
-/**
- * JEV's own verdict, or `null` when it gave none.
- *
- * Only a model that answered has predicted anything. No client, a client
- * error, a timeout, a malformed answer, or nothing to weigh the arrival
- * against are failures to evaluate, and showing them as ❌ would read as a
- * judgement nobody made — the operator could then "correct" it. A
- * below-threshold interrupt shows as the interrupt JEV answered, not as the
- * policy's queue (#710): the reaction is there for the operator to judge the
- * model, and the threshold is tuned from the audit, which keeps both.
- */
+/** The threshold-applied prediction, or null when no valid probability arrived. */
 export function shadowPrediction(
   decision: ResponsiveInterruptionDecision
 ): ResponsiveInterruptionVerdict | null {
-  return decision.verdict ?? null;
+  return decision.interruptProbability === undefined ? null : decision.outcome;
 }
 
 /**
@@ -178,30 +164,20 @@ export type ResponsiveInterruptionQueueReason =
   | "input_unavailable"
   | "timeout"
   | "no_candidates"
-  | "invalid_verdict"
-  | "invalid_confidence"
-  | "low_confidence";
+  | "invalid_probability"
+  | "below_threshold";
 
 export type ResponsiveInterruptionDecision =
   | (DecisionBase & {
       outcome: ResponsiveInterruptionVerdict;
-      verdict: ResponsiveInterruptionVerdict;
-      confidence: number;
+      interruptProbability: number;
       matchedCandidateIds: readonly string[];
     })
   | (DecisionBase & {
       outcome: "queue";
       reason: ResponsiveInterruptionQueueReason;
-      /**
-       * What was learned before the decision was rejected, when anything was.
-       * A threshold cannot be tuned from records that discard the verdict and
-       * confidence it rejected, so the below-threshold arm carries the same
-       * projection the accepted path does, and `verdict` there is JEV's raw
-       * answer while `outcome` is the policy's; arms that never got a
-       * well-formed answer carry nothing.
-       */
-      verdict?: ResponsiveInterruptionVerdict;
-      confidence?: number;
+      /** The original Noul probability survives a below-threshold outcome. */
+      interruptProbability?: number;
       matchedCandidateIds?: readonly string[];
     });
 
@@ -216,7 +192,7 @@ export type ResponsiveInterruptionDecision =
  */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
-function isConfidence(value: unknown): value is number {
+function isProbability(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
@@ -262,8 +238,7 @@ export class ShadowResponsiveInterruptionClassifier {
     const queue = (
       reason: ResponsiveInterruptionQueueReason,
       learned?: {
-        verdict: ResponsiveInterruptionVerdict;
-        confidence: number;
+        interruptProbability: number;
         matchedCandidateIds: readonly string[];
       }
     ): ResponsiveInterruptionDecision => ({ ...base, outcome: "queue", reason, ...learned });
@@ -286,11 +261,7 @@ export class ShadowResponsiveInterruptionClassifier {
       return queue(err instanceof JevInputUnavailableError ? "input_unavailable" : "client_error");
     }
 
-    if (!isConfidence(response?.confidence)) return queue("invalid_confidence");
-    if (!VERDICTS.includes(response.verdict as ResponsiveInterruptionVerdict)) {
-      return queue("invalid_verdict");
-    }
-    const verdict = response.verdict as ResponsiveInterruptionVerdict;
+    if (!isProbability(response?.interruptProbability)) return queue("invalid_probability");
     // Anything the client names that it was not offered is dropped, so a
     // defective or future client cannot write free text into the audit
     // through the one field that survives redaction.
@@ -298,14 +269,14 @@ export class ShadowResponsiveInterruptionClassifier {
     const matchedCandidateIds = [
       ...new Set((response.matchedCandidateIds ?? []).filter((id) => offered.has(id))),
     ];
-    const learned = { verdict, confidence: response.confidence, matchedCandidateIds };
+    const learned = { interruptProbability: response.interruptProbability, matchedCandidateIds };
 
-    // Fail closed: only a confident interrupt is an interrupt. A confident
-    // *queue* needs no threshold, because queueing is what happens anyway.
-    if (verdict === "interrupt" && response.confidence < this.threshold) {
-      return queue("low_confidence", learned);
+    // Noul is P(yes), so apply the threshold directly. There is no winning
+    // label or second confidence score to gate first.
+    if (response.interruptProbability < this.threshold) {
+      return queue("below_threshold", learned);
     }
-    return { ...base, outcome: verdict, ...learned };
+    return { ...base, outcome: "interrupt", ...learned };
   }
 
   /**

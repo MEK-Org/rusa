@@ -1,4 +1,4 @@
-import { APIError, choice, type Fetch, type JsonValue, TypeSafeClient } from "@typesafe-ai/sdk";
+import { APIError, type Fetch, type JsonValue, noul, TypeSafeClient } from "@typesafe-ai/sdk";
 import {
   type JevDecisionClient,
   type JevDecisionRequest,
@@ -21,15 +21,6 @@ export const JEV_DEFAULT_MODEL = "jev-latest";
  * The count left out is still sent, so the model knows the list was cut.
  */
 export const JEV_MAX_CANDIDATES = 20;
-
-/**
- * The two outcomes offered to the model, which are also the verdicts accepted
- * back. Exported so a test can pin the wording the operator approved (#710).
- */
-export const INTERRUPTION_CRITERIA = {
-  interrupt: "the arriving item relates to the current work, or its relationship is uncertain.",
-  queue: "the arriving item is clearly unrelated to the current work.",
-};
 
 /** A type alias rather than an interface, so it is assignable to the SDK's JSON state. */
 export type JevResolvedInboxEntry = {
@@ -107,13 +98,13 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
     };
 
-    let answer: { choice: unknown; confidence: unknown } | undefined;
+    let answer: { type: unknown; noul: unknown } | undefined;
     try {
       const result = await this.client.systemOne(
         {
           model: JEV_DEFAULT_MODEL,
           state,
-          questions: { interruption: choice(request.question, INTERRUPTION_CRITERIA) },
+          questions: { interruption: noul(request.question) },
         },
         { signal: options.signal }
       );
@@ -124,15 +115,17 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       }
       throw err;
     }
-    // The SDK types the answer but does not validate the wire, so the two
-    // fields the policy uses are checked here.
+    // The SDK types the answer but does not validate the wire, so the probability
+    // used by the policy is checked here, without coercion or clamping.
     if (
-      typeof answer?.choice !== "string" ||
-      !Object.hasOwn(INTERRUPTION_CRITERIA, answer.choice) ||
-      typeof answer.confidence !== "number"
+      answer?.type !== "noul" ||
+      typeof answer.noul !== "number" ||
+      !Number.isFinite(answer.noul) ||
+      answer.noul < 0 ||
+      answer.noul > 1
     ) {
       throw new Error("JEV decision service returned an invalid interruption answer");
     }
-    return { verdict: answer.choice, confidence: answer.confidence };
+    return { interruptProbability: answer.noul };
   }
 }
