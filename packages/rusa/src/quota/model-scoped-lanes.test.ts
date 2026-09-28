@@ -608,22 +608,21 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       )
     ).toBeUndefined();
 
-    // Without a governing window, the latest reset of its last reading applies.
-    const ungoverned = {
+    // A governing window last read without a reset has nothing to reckon to:
+    // the lane retires at the hard-stale horizon, which this one is past, even
+    // though another last-seen window still carries a later reset.
+    const unreset = {
       ...stored,
-      modelLanes: stored.modelLanes.map((lane) => ({ ...lane, governingBucketKey: null })),
+      modelLanes: stored.modelLanes.map((lane) => ({
+        ...lane,
+        buckets: [
+          { ...bucket("five_hour", windowReset), resetAtIso: null },
+          bucket("weekly", laterReset),
+        ],
+      })),
     };
     expect(
-      modelLanePacing(
-        publishedThrottle(ungoverned, { ...options, nowMs: Date.parse(windowReset) + 1 }),
-        FABLE
-      )?.intervalSeconds
-    ).toBe(45);
-    expect(
-      modelLanePacing(
-        publishedThrottle(ungoverned, { ...options, nowMs: Date.parse(laterReset) }),
-        FABLE
-      )
+      modelLanePacing(publishedThrottle(unreset, { ...options, nowMs }), FABLE)
     ).toBeUndefined();
 
     // A lane seen again in the provider's newest reading is published as usual.

@@ -424,23 +424,12 @@ export function publishedThrottle(
 
 /**
  * When a model lane missing from the provider's newest reading retires: the
- * reset of its last-seen governing window (else the latest reset among the
- * windows of its last reading), held at least to its exhaustion deadline.
- * NaN when the lane carries no reset to reckon to.
+ * reset of its last-seen governing window, whose reading set the interval it
+ * is held at, or later its exhaustion deadline. NaN when neither is known.
  */
 function modelLaneRetireAtMs(lane: PersistedQuotaModelLaneStatus): number {
-  const resetMs = (bucket: PersistedQuotaBucketStatus | undefined) =>
-    bucket?.resetAtIso ? Date.parse(bucket.resetAtIso) : Number.NaN;
-  let windowResetMs = resetMs(lane.buckets.find((b) => b.key === lane.governingBucketKey));
-  if (!Number.isFinite(windowResetMs)) {
-    windowResetMs = Math.max(
-      Number.NEGATIVE_INFINITY,
-      ...lane.buckets
-        .filter((b) => b.observedAt === lane.updatedAt)
-        .map(resetMs)
-        .filter(Number.isFinite)
-    );
-  }
+  const governing = lane.buckets.find((b) => b.key === lane.governingBucketKey);
+  const windowResetMs = governing?.resetAtIso ? Date.parse(governing.resetAtIso) : Number.NaN;
   const exhaustedUntilMs =
     lane.expired && lane.exhaustedUntil ? Date.parse(lane.exhaustedUntil) : Number.NaN;
   const retireAtMs = Math.max(
