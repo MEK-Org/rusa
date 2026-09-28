@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
-import { COMPUTER_USE_CAPABILITY } from "../../actor/computer-use-lock.js";
+import { COMPUTER_USE_CAPABILITY, ComputerUseLock } from "../../actor/computer-use-lock.js";
 import { ProviderPacer } from "../../actor/provider-pacer.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { createHarness, waitUntil } from "./harness.js";
@@ -161,6 +161,19 @@ describe("monolithic follower instance", () => {
   });
 
   it("reads a newly granted computer-use capability at provider admission", async () => {
+    // Record which actors enter the instance lock, so the test waits for the
+    // target's admission to reach it instead of inferring that from timing.
+    const lockEntries: string[] = [];
+    const originalGate = ComputerUseLock.prototype.gate;
+    const gateSpy = vi.spyOn(ComputerUseLock.prototype, "gate").mockImplementation(function (
+      this: ComputerUseLock,
+      actorId,
+      ...rest
+    ) {
+      lockEntries.push(actorId);
+      return originalGate.call(this, actorId, ...rest);
+    } as typeof originalGate);
+    onTestFinished(() => gateSpy.mockRestore());
     const provider = releasableCapabilityProvider();
     const h = setup({
       delayMs: 0,
@@ -182,12 +195,11 @@ describe("monolithic follower instance", () => {
       grantedAt: "2026-09-26T00:00:00Z",
     });
     provider.release("short provider blocker");
-    await waitUntil(() =>
-      h.events.some((event) => event.actorId === blocker && event.event.type === "result")
-    );
-    // The target is now provider-admitted but must wait for the current
-    // computer holder, which the test has not released: the grant happened
-    // after beforeRun, while it paced.
+    // The grant happened after beforeRun, while the target paced, so its
+    // provider admission must still send it into the lock. Bound the wait under
+    // the test timeout so a run admitted without the lock fails here.
+    await waitUntil(() => lockEntries.includes(target), 3_000);
+    // The target is queued behind the holder, which the test has not released.
     expect(
       h.events.some((event) => event.actorId === target && event.event.type === "runStart")
     ).toBe(false);
