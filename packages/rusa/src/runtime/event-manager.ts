@@ -818,8 +818,7 @@ export class EventManager {
     // "subscriber" copy so the notification acts as an advisory prompt and
     // joins rather than preempts an active run (#632).
     // A failing or unknown suite keeps its normal owner/subscriber route, plus
-    // one advisory copy for each opted-in source owner that is not already a
-    // recipient. This lets a repository source opt into every outcome without
+    // one advisory copy for each opted-in source owner not already a recipient. This lets a repository source opt into every outcome without
     // changing another PR owner's role or preempting unrelated work (#632).
     let ownerIds: readonly string[];
     let subscriberIds: readonly string[];
@@ -829,13 +828,11 @@ export class EventManager {
       subscriberIds = optInRecipients.filter((id) => !recipients.ownerIds.includes(id));
     } else {
       ownerIds = recipients.ownerIds;
-      const advisorySubscribers = [...recipients.subscriberIds];
-      for (const optedInOwner of normalized.checkSuiteCompletionOwnerIds ?? []) {
-        if (!ownerIds.includes(optedInOwner) && !advisorySubscribers.includes(optedInOwner)) {
-          advisorySubscribers.push(optedInOwner);
-        }
-      }
-      subscriberIds = advisorySubscribers;
+      // The destination merge below dedupes, and an owner copy wins its role.
+      subscriberIds = [
+        ...recipients.subscriberIds,
+        ...(normalized.checkSuiteCompletionOwnerIds ?? []),
+      ];
     }
 
     // Owners first, then subscribers — an explicit ordered array rather than a
