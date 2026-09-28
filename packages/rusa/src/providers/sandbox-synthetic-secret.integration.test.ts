@@ -111,7 +111,9 @@ describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant entrypoint (real
     ]);
     const out2 = execFileSync("bwrap", argv2, { encoding: "utf8" });
     expect(out2).toBe("revoked");
-  });
+    // Real bwrap setup runs SQLite migrations, mounts fuse-overlayfs, and launches bwrap;
+    // 15s tolerates full-suite scheduling and I/O contention; a slower run still fails.
+  }, 15_000);
 
   it("a granted file swapped for an escaping symlink or a directory after the grant is unreadable at the next spawn", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "mc-synthetic-bwrap-swap-"));
@@ -172,5 +174,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Generic synthetic secret grant entrypoint (real
       'test ! -e "$HOME/.rusa/secrets/synthetic-swap-secret" && printf "%s" "masked"',
     ]);
     expect(execFileSync("bwrap", argvDir, { encoding: "utf8" })).toBe("masked");
-  });
+    // Real bwrap setup runs SQLite migrations, mounts fuse-overlayfs, and launches bwrap;
+    // 15s tolerates full-suite scheduling and I/O contention; a slower run still fails.
+  }, 15_000);
 });
