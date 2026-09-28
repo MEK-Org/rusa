@@ -257,29 +257,25 @@ describe.skipIf(!BWRAP_CAPABLE)(
         const { args } = buildActorBwrapArgs(actorPath, undefined, undefined, isE2eRoot);
         const branch = `${actorKind}-feature`;
 
-        try {
-          await execFileAsync(
-            "bwrap",
-            [
-              ...args,
-              "--",
-              "/bin/sh",
-              "-c",
-              `set -e
-               cd '${actorPath}'
-               git clone '${syntheticUrl}' clone
-               cd clone
-               git checkout -b '${branch}'
-               echo '${actorKind}' > file.txt
-               git add file.txt
-               git -c user.name=sandbox -c user.email=sandbox@example.com commit -m "${actorKind} push"
-               git push origin '${branch}'`,
-            ],
-            { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: gitConfig } }
-          );
-        } finally {
-          teardownFlutterOverlay(actorPath);
-        }
+        await execFileAsync(
+          "bwrap",
+          [
+            ...args,
+            "--",
+            "/bin/sh",
+            "-c",
+            `set -e
+             cd '${actorPath}'
+             git clone '${syntheticUrl}' clone
+             cd clone
+             git checkout -b '${branch}'
+             echo '${actorKind}' > file.txt
+             git add file.txt
+             git -c user.name=sandbox -c user.email=sandbox@example.com commit -m "${actorKind} push"
+             git push origin '${branch}'`,
+          ],
+          { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: gitConfig } }
+        );
 
         // Post-push visibility, read straight from the bare repo on the host.
         const revParse = execFileSync(
@@ -289,7 +285,9 @@ describe.skipIf(!BWRAP_CAPABLE)(
         ).trim();
         expect(revParse).toMatch(/^[0-9a-f]{40}$/);
       }
-    }, 30_000);
+      // Two sequential sandboxed clone/push cycles take ~2.2s isolated, but exceeded Vitest's
+      // 5s default under cut #37 full-suite concurrency; 15s bounds peak contention without hiding hangs.
+    }, 15_000);
 
     it("cannot write directly to the remote's bare repo path from inside the sandbox (no writable host-remote bind)", async () => {
       const { args } = buildActorBwrapArgs(actorDir);

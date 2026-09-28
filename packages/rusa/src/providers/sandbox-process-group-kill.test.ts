@@ -20,14 +20,10 @@ describe.skipIf(!BWRAP_CAPABLE)(
   "Sandbox — transitive process-group kill inside bwrap (Issue #164 leg 1)",
   () => {
     const temps: string[] = [];
-    const actorDirs: string[] = [];
 
     afterEach(() => {
-      for (const d of actorDirs) {
-        teardownFlutterOverlay(d);
-      }
-      actorDirs.length = 0;
       for (const d of temps) {
+        teardownFlutterOverlay(d);
         try {
           rmSync(d, { recursive: true, force: true });
         } catch {
@@ -39,7 +35,6 @@ describe.skipIf(!BWRAP_CAPABLE)(
 
     it("refuses a group kill that resolves to its own group, reaps a setsid one", async () => {
       const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-"));
-      actorDirs.push(tmp);
       temps.push(tmp);
 
       const script = join(tmp, "fake-cli.sh");
@@ -135,7 +130,6 @@ describe.skipIf(!BWRAP_CAPABLE)(
 
     it("aborting runSubprocess from outside kills grandchild processes inside bwrap", async () => {
       const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-abort-"));
-      actorDirs.push(tmp);
       temps.push(tmp);
 
       const script = join(tmp, "fake-cli-long.sh");
