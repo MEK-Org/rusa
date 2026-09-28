@@ -1505,11 +1505,9 @@ async function composeStart(
     config.jevApiKeyFile === undefined
       ? undefined
       : new ShadowResponsiveInterruptionClassifier({
-          // Interrupt at interrupt confidence >= 0.5 (#710): a starting point
-          // from an offline run of operator-supplied examples, not a
-          // calibration; the shadow audit stays the calibration source. It
-          // decides the recorded policy outcome only; the chat reaction shows
-          // JEV's own verdict, and shadow mode never changes scheduling.
+          // Noul is P(yes): both the shadow audit and reaction interrupt at
+          // probability >= 0.5. Shadow mode never changes scheduling; use its
+          // observations to calibrate this initial threshold.
           threshold: 0.5,
           ...(jevApiKey
             ? {
