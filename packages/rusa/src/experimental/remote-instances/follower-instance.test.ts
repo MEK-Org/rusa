@@ -1995,6 +1995,8 @@ describe("monolithic follower instance", () => {
         )
       );
       expect(abandoned(h, id)).toHaveLength(1);
+      // The reattach re-dispatch (#613) and the unhalt replay share one run.
+      expect(started(h, id)).toHaveLength(1);
     });
 
     it("keeps a replay requested during a transport gap until the follower reattaches", async () => {
