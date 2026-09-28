@@ -5,6 +5,7 @@
  * those with injected fakes and only this file selects the configured providers.
  */
 
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { VoiceConfig } from "../config/types.js";
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
@@ -81,6 +82,31 @@ export function createVoiceService(options: {
     },
     onSessionEnded: options.onSessionEnded,
     logger: options.logger,
+  });
+}
+
+/** Most actor ids named by the legacy-voice startup diagnostic; the count is always exact. */
+export const LEGACY_VOICE_ACTOR_SAMPLE_LIMIT = 10;
+
+/**
+ * Warn once at boot when Google TTS is unavailable and active actors have no
+ * stored voice: their replies fall back to the Google instance default and
+ * fail as `voice_reply_tts_failed` until an operator assigns them a voice
+ * (#544). Warning-only — startup and voice selection are unchanged.
+ */
+export function warnLegacyVoiceGaps(
+  actors: readonly Pick<ActorRecord, "id" | "status" | "voiceConfig">[],
+  options: { apiKey: string },
+  logger: Logger
+): void {
+  if (options.apiKey.trim()) return;
+  const actorIds = actors
+    .filter((record) => record.status === "active" && !record.voiceConfig)
+    .map((record) => record.id);
+  if (actorIds.length === 0) return;
+  logger.warn("voice_legacy_actors_unconfigured", {
+    count: actorIds.length,
+    actorIds: actorIds.slice(0, LEGACY_VOICE_ACTOR_SAMPLE_LIMIT),
   });
 }
 

@@ -307,7 +307,7 @@ import { BuildRunner, GitRunner } from "../update/runner.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
-import { createVoiceService } from "../voice/wiring.js";
+import { createVoiceService, warnLegacyVoiceGaps } from "../voice/wiring.js";
 import {
   directiveBodyForWebhookPayload,
   parseDirectedDeliveryDirective,
@@ -3948,6 +3948,7 @@ async function composeStart(
           logger: log.child({ component: "voice-session" }),
         })
       : null;
+  if (voiceService) warnLegacyVoiceGaps(actors.list(), { apiKey: geminiApiKey ?? "" }, log);
   const bindDashboard = shouldBindDashboardServer({
     e2eMode,
     e2eDashboard: opts?.e2e?.dashboard === true,

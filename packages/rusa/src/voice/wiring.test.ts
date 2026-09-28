@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Logger } from "../observability/logger.js";
 import type { VoiceConfigDocument } from "./voice-config.js";
-import { createVoiceService } from "./wiring.js";
+import {
+  createVoiceService,
+  LEGACY_VOICE_ACTOR_SAMPLE_LIMIT,
+  warnLegacyVoiceGaps,
+} from "./wiring.js";
 
 const clients = vi.hoisted(() => ({
   google: { transcribe: vi.fn(), streamSynthesize: vi.fn(), synthesize: vi.fn() },
@@ -123,5 +128,58 @@ describe("voice provider routing", () => {
     await expect(googleOnlyService.handleMeshEvent(event)).rejects.toThrow(
       "ElevenLabs TTS: elevenlabsApiKey is not configured; select an available actor voice"
     );
+  });
+});
+
+describe("legacy voice startup diagnostic (#544)", () => {
+  const elevenlabsVoice: VoiceConfigDocument = {
+    schemaVersion: 1,
+    provider: "elevenlabs",
+    config: { voiceId: "assigned" },
+  };
+  const recorder = () => {
+    const warn = vi.fn();
+    const logger = { warn } as unknown as Logger;
+    return { warn, logger };
+  };
+
+  it("names active actors without a stored voice when Google TTS is unavailable", () => {
+    const { warn, logger } = recorder();
+    warnLegacyVoiceGaps(
+      [
+        { id: "legacy", status: "active" },
+        { id: "assigned", status: "active", voiceConfig: elevenlabsVoice },
+        { id: "retired", status: "retired" },
+      ],
+      { apiKey: " " },
+      logger
+    );
+    expect(warn).toHaveBeenCalledExactlyOnceWith("voice_legacy_actors_unconfigured", {
+      count: 1,
+      actorIds: ["legacy"],
+    });
+  });
+
+  it("bounds the named actors while reporting the exact count", () => {
+    const { warn, logger } = recorder();
+    const actors = Array.from({ length: LEGACY_VOICE_ACTOR_SAMPLE_LIMIT + 3 }, (_, i) => ({
+      id: `legacy-${i}`,
+      status: "active" as const,
+    }));
+    warnLegacyVoiceGaps(actors, { apiKey: "" }, logger);
+    const fields = warn.mock.calls[0]?.[1];
+    expect(fields.count).toBe(LEGACY_VOICE_ACTOR_SAMPLE_LIMIT + 3);
+    expect(fields.actorIds).toHaveLength(LEGACY_VOICE_ACTOR_SAMPLE_LIMIT);
+  });
+
+  it("stays silent when Google TTS is configured or every active actor has a voice", () => {
+    const { warn, logger } = recorder();
+    warnLegacyVoiceGaps([{ id: "legacy", status: "active" }], { apiKey: "key" }, logger);
+    warnLegacyVoiceGaps(
+      [{ id: "assigned", status: "active", voiceConfig: elevenlabsVoice }],
+      { apiKey: "" },
+      logger
+    );
+    expect(warn).not.toHaveBeenCalled();
   });
 });
