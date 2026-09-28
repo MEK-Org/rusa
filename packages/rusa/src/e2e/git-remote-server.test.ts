@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildActorBwrapArgs } from "../providers/sandbox.js";
+import { buildActorBwrapArgs, teardownFlutterOverlay } from "../providers/sandbox.js";
 import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "./git-remote-server.js";
 import { LocalTracker } from "./local-tracker.js";
 
@@ -205,20 +205,30 @@ describe.skipIf(!BWRAP_CAPABLE)(
     let remoteDir: string;
     let server: E2EGitRemoteServer | undefined;
     let actorDir = "";
+    const actorDirs: string[] = [];
 
     beforeEach(async () => {
+      actorDirs.length = 0;
       instanceRoot = mkdtempSync(join(process.cwd(), ".e2e-git-remote-"));
       remoteDir = join(instanceRoot, "remote", "repo.git");
       initBareRemoteWithInitialCommit(remoteDir);
       server = await startE2EGitRemoteServer({ repoDir: remoteDir, port: 0 });
       actorDir = join(instanceRoot, "actor");
       mkdirSync(actorDir, { recursive: true });
+      actorDirs.push(actorDir);
     });
 
     afterEach(async () => {
-      await server?.close();
-      server = undefined;
-      rmSync(instanceRoot, { recursive: true, force: true });
+      try {
+        await server?.close();
+      } finally {
+        server = undefined;
+        for (const dir of actorDirs) {
+          teardownFlutterOverlay(dir);
+        }
+        actorDirs.length = 0;
+        rmSync(instanceRoot, { recursive: true, force: true });
+      }
     });
 
     it("rewrites the synthetic GitHub URL and pushes from sandboxed root and worker actors, visible on the host afterward", async () => {
@@ -243,6 +253,7 @@ describe.skipIf(!BWRAP_CAPABLE)(
       ] as const) {
         const actorPath = join(instanceRoot, actorKind);
         mkdirSync(actorPath, { recursive: true });
+        actorDirs.push(actorPath);
         const { args } = buildActorBwrapArgs(actorPath, undefined, undefined, isE2eRoot);
         const branch = `${actorKind}-feature`;
 
@@ -274,7 +285,9 @@ describe.skipIf(!BWRAP_CAPABLE)(
         ).trim();
         expect(revParse).toMatch(/^[0-9a-f]{40}$/);
       }
-    });
+      // Two sequential sandboxed clone/push cycles take ~2.2s isolated, but exceeded Vitest's
+      // 5s default under cut #37 full-suite concurrency; 15s bounds peak contention without hiding hangs.
+    }, 15_000);
 
     it("cannot write directly to the remote's bare repo path from inside the sandbox (no writable host-remote bind)", async () => {
       const { args } = buildActorBwrapArgs(actorDir);
