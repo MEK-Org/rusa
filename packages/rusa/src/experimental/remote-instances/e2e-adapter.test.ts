@@ -4,6 +4,7 @@ import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
 import type { RusaConfig } from "../../config/types.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorHandle } from "./actor-handle.js";
+import { createProvider } from "./configured-provider.js";
 import { instanceWorkerFactory } from "./e2e-adapter.js";
 import type { FollowerHub } from "./follower-hub.js";
 import { RemoteInstance } from "./remote-instance.js";
@@ -109,7 +110,7 @@ describe("instanceWorkerFactory", () => {
     );
   });
 
-  it("refuses to place an actor declaring more than one candidate", () => {
+  it("places an actor declaring several candidates with its whole pool (#608)", () => {
     const remote = new RemoteInstance(TARGET, process.platform, process.pid);
     const hub = {
       createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
@@ -120,15 +121,41 @@ describe("instanceWorkerFactory", () => {
       record: { id: ACTOR_ID },
       getRecord: () => ({ id: ACTOR_ID }),
     } as unknown as ActorFactoryContext;
+    const pool = [
+      { provider: "codex", model: "gpt-5.5", effort: "high" },
+      { provider: "claude", model: "claude-opus-5" },
+    ];
     const options = {
-      modelConfig: [
-        { provider: "codex", model: "gpt-5.5" },
-        { provider: "claude", model: "claude-opus-5" },
-      ],
+      cwd: "/tmp/placed-actor",
+      mcpServers: [],
+      modelConfig: pool,
+      loadSessionId: () => undefined,
     } as unknown as ActorOptions;
 
-    expect(() => instanceWorkerFactory(configWith({}), hub)(context, options)).toThrow(
-      /single declared provider\/model/
+    // The follower resolves each admitted tuple itself, so the leader hands it
+    // the declared pool and admission picks the candidate per run.
+    const config = configWith({ codex: { cliCommand: "codex" }, claude: { cliCommand: "claude" } });
+    instanceWorkerFactory(config, hub)(context, options);
+    const init = remote.commands.find(
+      (command) => "actorId" in command && command.message.type === "init"
     );
+    const bootstrap =
+      init && "actorId" in init && init.message.type === "init"
+        ? init.message.bootstrap
+        : undefined;
+    expect(bootstrap).toMatchObject({ modelConfig: pool });
+
+    // A deployed follower builds each admitted tuple from these provider
+    // options, filling the tuple's unset fields from them. The second
+    // candidate must not run at the first one's model or effort.
+    const bridge = { sendMessage: async () => "", yieldRun: () => {} };
+    for (const candidate of pool) {
+      const provider = createProvider(bridge, bootstrap?.providerOptions ?? {}, candidate);
+      expect({
+        name: provider.providerName,
+        model: provider.model,
+        effort: provider.effort,
+      }).toEqual({ name: candidate.provider, model: candidate.model, effort: candidate.effort });
+    }
   });
 });

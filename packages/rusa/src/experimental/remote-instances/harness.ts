@@ -13,6 +13,7 @@ import { type ProviderPacer, submitPoolGate } from "../../actor/provider-pacer.j
 import { runMigrations } from "../../db/migrations/runner.js";
 import { SqliteInboxRepository } from "../../db/repositories/sqlite-inbox-repository.js";
 import type { LogFields, Logger } from "../../observability/logger.js";
+import type { ProviderModelConfig } from "../../providers/model-config.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./fixture-provider.js";
@@ -127,12 +128,19 @@ export function createHarness(options: {
     idgen: () => `instance-worker-${++sequence}`,
     ...(pacer
       ? {
+          // Every declared candidate is a lane, and a halted one is skipped as
+          // in the production pool gate, so a pool admits a healthy candidate.
           providerGate: (fn, candidates, request) =>
-            submitPoolGate(fn, [{ config: candidates[0], lane: "instance-fixture", pacer }], {
-              responsive: request.responsive,
-              threadId: request.threadId,
-              enqueueNormal: request.enqueueNormal,
-            }),
+            submitPoolGate(
+              fn,
+              candidates.map((config) => ({ config, lane: "instance-fixture", pacer })),
+              {
+                responsive: request.responsive,
+                threadId: request.threadId,
+                enqueueNormal: request.enqueueNormal,
+                isHalted: (config) => options.isHalted?.(config.provider, config.model) ?? false,
+              }
+            ),
         }
       : {}),
     recordChat: (message) => {
@@ -260,12 +268,14 @@ export function createHarness(options: {
       if (!runtime) throw new Error(`No runtime for ${id}`);
       return runtime;
     },
-    spawn: (charter: string) => {
-      const id = mesh.spawn({
-        charter,
-        parentId: "root",
-        modelConfig: { provider: "instance-fixture", model: "scripted" },
-      });
+    spawn: (
+      charter: string,
+      modelConfig: ProviderModelConfig | ProviderModelConfig[] = {
+        provider: "instance-fixture",
+        model: "scripted",
+      }
+    ) => {
+      const id = mesh.spawn({ charter, parentId: "root", modelConfig });
       mesh.sendMessage(id, "Begin your charter", "root");
       return id;
     },

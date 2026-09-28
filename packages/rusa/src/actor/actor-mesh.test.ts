@@ -9684,6 +9684,16 @@ describe("ActorMesh", () => {
     });
 
     describe("boot reconciliation across co-hosted instances sharing one at queue (#466)", () => {
+      /**
+       * A delivery time an hour ahead of the test clock, on a minute boundary as
+       * `at` keeps it. The mesh accepts it as future, and its run minute cannot
+       * have begun when the queue is re-read, so a missing job is unconfirmed
+       * rather than excused as already run.
+       */
+      function futureDeliverAt() {
+        return new Date(Math.ceil((Date.now() + 3_600_000) / 60_000) * 60_000).toISOString();
+      }
+
       /** A per-user `at` queue every instance on the host reads and writes. */
       function sharedAtQueue() {
         const jobs: { id: string; script: string }[] = [
@@ -9697,7 +9707,7 @@ describe("ActorMesh", () => {
                 toId: "nobody",
                 fromId: "nobody",
                 body: "legacy",
-                deliverAt: "2026-09-16T12:00:00.000Z",
+                deliverAt: futureDeliverAt(),
               })
             ).toString("base64url")}'\n`,
           },
@@ -9741,13 +9751,12 @@ describe("ActorMesh", () => {
           `scheduled on ${instanceId}`,
           sender,
           undefined,
-          "2026-09-16T12:00:00.000Z"
+          futureDeliverAt()
         );
         return { mesh, scheduler, inboxStore, recipient };
       }
 
-      // TODO(#512): re-enable once stable future-time test construction lands
-      it.skip.each([
+      it.each([
         ["prod then staging", ["prod", "staging"] as const],
         ["staging then prod", ["staging", "prod"] as const],
       ])("in boot order %s neither instance cancels the other's message or the legacy job", (_, order) => {
@@ -9770,8 +9779,7 @@ describe("ActorMesh", () => {
         }
       });
 
-      // TODO(#512): re-enable once stable future-time test construction lands
-      it.skip("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
+      it("returns no message id, and records no acceptance, when the at queue re-read does not show the job", () => {
         const { at, jobs } = sharedAtQueue();
         // `at` prints a job id, but the job never reaches the spool.
         const lossy: AtIo = { ...at, schedule: () => "200" };
@@ -9797,13 +9805,7 @@ describe("ActorMesh", () => {
         events.length = 0;
 
         expect(() =>
-          mesh.sendMessage(
-            recipient,
-            "lost in the spool",
-            sender,
-            undefined,
-            "2026-09-16T12:00:00.000Z"
-          )
+          mesh.sendMessage(recipient, "lost in the spool", sender, undefined, futureDeliverAt())
         ).toThrow(AtEnqueueUnconfirmedError);
 
         expect(jobs.map((job) => job.id)).toEqual(["legacy"]);
@@ -9812,8 +9814,7 @@ describe("ActorMesh", () => {
         expect(scheduler.listMessageDeliveries()).toEqual([]);
       });
 
-      // TODO(#512): re-enable once stable future-time test construction lands
-      it.skip("still cancels its own job for a recipient it does not know, and only that one", () => {
+      it("still cancels its own job for a recipient it does not know, and only that one", () => {
         const { at, jobs } = sharedAtQueue();
         const prod = bootInstance("/srv/rusa/prod", at);
         const staging = bootInstance("/srv/rusa/staging", at);
@@ -9822,7 +9823,7 @@ describe("ActorMesh", () => {
           toId: "recipient-prod-never-knew",
           fromId: "sender",
           body: "drop",
-          deliverAt: "2026-09-16T12:00:00.000Z",
+          deliverAt: futureDeliverAt(),
         });
 
         staging.mesh.reconcilePendingDeliveries();

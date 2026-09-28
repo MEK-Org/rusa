@@ -16,15 +16,12 @@ export function instanceWorkerFactory(
     // Only an omitted target means "run here". A defined-but-unusable one falls
     // through to the hub, which refuses it by name.
     if (target === undefined) return new Actor(options);
-    // Remote placement admits one candidate at a time. Refuse a multi-candidate
-    // pool rather than silently choosing its first entry.
-    if (options.modelConfig.length > 1) {
-      throw new Error(
-        `actor ${record.id} declares ${options.modelConfig.length} candidates; remote placement supports a single declared provider/model`
-      );
-    }
-    const declared = options.modelConfig[0];
-    const name = declared?.provider ?? config.rootActor?.provider ?? "antigravity";
+    // The follower receives the whole pool, and the leader's provider gate
+    // chooses one candidate per run and carries that tuple in the admission
+    // (#608). The follower fills a tuple's unset fields from providerOptions,
+    // so they carry no model or effort: the first candidate's would otherwise
+    // leak into every other candidate's provider.
+    const name = options.modelConfig[0]?.provider ?? config.rootActor?.provider ?? "antigravity";
     const host = hub.createHost(target, record.id);
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
     const runtime = new ActorHandle({
@@ -40,8 +37,6 @@ export function instanceWorkerFactory(
           // cross-provider staged pin, without reading leader configuration.
           providers: config.providers,
           name,
-          model: declared?.model,
-          effort: declared?.effort,
         },
         mcpServers: toolUrls(),
         actorOptions: {

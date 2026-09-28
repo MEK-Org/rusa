@@ -98,6 +98,26 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
   });
 });
 
+describe("quota model lane retirement alarm (#588)", () => {
+  const withQuota = (quota: RusaConfig["quota"]) =>
+    ({ ...withObservability({ diskAlert: { enabled: false } }), quota }) as unknown as RusaConfig;
+
+  it("keeps system:events covered for a throttle reading a coordinator when the disk sensor is off", () => {
+    const config = withQuota({
+      throttle: { enabled: true },
+      coordinator: { socketPath: "/tmp/coordinator.sock" },
+    } as RusaConfig["quota"]);
+    expect(hostAlarmProducerActive(config)).toBe(true);
+    expect(configuredRootEventSources(config)).toContain("system:events");
+  });
+
+  it("adds no system:events coverage for a throttle with no coordinator to read", () => {
+    const config = withQuota({ throttle: { enabled: true } } as RusaConfig["quota"]);
+    expect(hostAlarmProducerActive(config)).toBe(false);
+    expect(configuredRootEventSources(config)).not.toContain("system:events");
+  });
+});
+
 describe("diskAlertUncovered", () => {
   it("is the loud case: an active sensor whose events nobody covers", () => {
     expect(diskAlertUncovered(baseConfig, ["github:dummy-org"])).toBe(true);

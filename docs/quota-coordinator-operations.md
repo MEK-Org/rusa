@@ -266,10 +266,18 @@ the provider-wide lane alone. Manual readings stay provider-wide only, because
 they are not checked against the catalog. `rusa quota-pacing-reset` clears the
 model lanes together with their provider.
 
-A model lane stops being published once the provider has gone on reporting for
-longer than the hard-stale horizon without it: that window has left the panel.
-When the coordinator itself stops collecting, both lanes age together and
-widen to the ceiling as usual.
+A model lane that the provider's newest reading no longer includes is
+dead-reckoned: it keeps the interval of its last reading, not the hard-stale
+ceiling, until its last-seen governing window resets (or, if later, its
+exhaustion deadline passes). Then it stops being published, and each
+`rusa start` process that saw it published raises one responsive
+`system.quota_model_lane_retired` alarm to root on `system:events`, asking
+root to check the scrapes. A lane with neither a governing reset nor an
+exhaustion deadline stops being published once the provider has gone on
+reporting for longer than the hard-stale horizon without it. Manual readings
+carry no model windows, so a provider in manual mode dead-reckons its model
+lanes the same way. When the coordinator itself stops collecting, both lanes
+age together and widen to the ceiling as usual.
 
 Deploy and rollback follow the v2 order above, with one difference. Opening the
 database with a v3 build rebuilds `quota_observations` once, adding

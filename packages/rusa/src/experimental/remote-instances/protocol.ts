@@ -6,7 +6,22 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 7;
+//
+// Compatibility rule (#719): the leader deploys first and must keep followers on the
+// previous protocol fully working until the reconciler updates them. So every bump
+// to N keeps N−1 working (the leader adapts to any v(N−1) shape it changed, and never
+// sends a v(N−1) follower a command it cannot parse) and drops N−2. When you bump
+// this, delete the adapters that only served the version now falling out of range.
+//
+// #725 added optional fields without a bump: the leader numbers each pool it sends
+// (`init`, `modelConfig`) and the follower echoes that number on `admit`. A follower
+// built before #725 (v7 or v8) omits it, and the leader falls back to its own view
+// of the queued report. Pre- and post-#725 v8 followers share a version, so the
+// fallback lives until v8 leaves the window, not at the next bump. It is tagged
+// `pre-echo adapter (#725): remove once OLDEST_FOLLOWER_PROTOCOL_VERSION > 8`.
+export const INSTANCE_PROTOCOL_VERSION = 8;
+/** Oldest follower protocol the leader still admits; see the rule above. */
+export const OLDEST_FOLLOWER_PROTOCOL_VERSION = INSTANCE_PROTOCOL_VERSION - 1;
 export const COORDINATOR_RECONNECTED_ERROR = "Coordinator reconnected";
 export const COORDINATOR_RECONNECTED_WITHOUT_ADMISSION_ERROR =
   "Coordinator reconnected without the queued admission";
@@ -20,6 +35,8 @@ export interface Bootstrap {
   sessionId?: string;
   /** The actor's declared candidate pool. */
   modelConfig?: RawProviderModelConfig[];
+  /** The leader's generation for `modelConfig`, echoed on `admit` (#725). */
+  modelConfigGeneration?: number;
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
   actorOptions?: Pick<
@@ -80,13 +97,23 @@ export type Request =
        * retained, under the request id the leader's gate still answers on.
        */
       resume?: boolean;
+      /**
+       * The pool generation `candidates` were quoted under, as last numbered by
+       * the leader. Absent from a follower built before #725.
+       */
+      modelConfigGeneration?: number;
     }
   | { op: "sendMessage"; to: string; body: string };
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   /** Replace the follower Actor's next-run pool without resetting its runtime. */
-  | { type: "modelConfig"; modelConfig: RawProviderModelConfig[] }
+  | {
+      type: "modelConfig";
+      modelConfig: RawProviderModelConfig[];
+      /** The leader's number for this pool, echoed on `admit`; absent before #725. */
+      generation?: number;
+    }
   | { type: "wake"; nudge?: RunNudge }
   /** Ask the follower to replace its current opportunity with responsive work. */
   | { type: "preempt"; requestId: number }

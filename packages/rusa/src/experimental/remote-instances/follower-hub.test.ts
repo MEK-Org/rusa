@@ -844,3 +844,150 @@ describe("leader follower gateway", () => {
     });
   });
 });
+
+describe("follower protocol window (#719)", () => {
+  // The leader speaks N and keeps N−1 fully working; anything older is refused.
+  const N = INSTANCE_PROTOCOL_VERSION;
+  const targetSha = "b".repeat(40);
+  const oldSha = "c".repeat(40);
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+  const identity = (id: string, protocolVersion: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    platform: "linux",
+    pid: 321,
+    generation: `${id}-process-one`,
+    protocolVersion,
+    commitSha: oldSha,
+    ...extra,
+  });
+
+  it("fully admits a deployed v7 follower, dispatches the pending update and records it reconciled", async () => {
+    // The client is the deployed v7 follower.ts, reduced to its wire handling: it
+    // sends its own constant, stops unless the reply carries exactly that constant,
+    // and takes an update as a command without actorId whose type is "update",
+    // reading targetSha and branch. The literal is the release this leader must
+    // still serve; when a bump moves it out of the window, move it to the new N−1.
+    const V7 = 7;
+    const root = mkdtempSync(join(tmpdir(), "follower-protocol-window-"));
+    roots.push(root);
+    const store = new FollowerUpdateTriggerStore(root);
+    store.createTrigger({ targetSha, branch: "staging" });
+    const h = await setup({ triggerStore: store });
+    const registered: string[] = [];
+    h.hub.onRegister((follower) => registered.push(follower.generation));
+    h.hub.armReconciliation();
+
+    const registerV7 = async () => {
+      const response = await h.post("/register", identity("lagging", V7));
+      expect(response.status).toBe(200);
+      const registration = (await response.json()) as { session: string; protocolVersion: number };
+      if (registration.protocolVersion !== V7) {
+        throw new Error("Incompatible instance protocol; rebuild leader and follower");
+      }
+      return registration.session;
+    };
+
+    await registerV7();
+    // A dropped session (410) re-registers the same generation, the reconnect path.
+    const session = await registerV7();
+    expect(registered).toEqual(["lagging-process-one", "lagging-process-one"]);
+    expect(h.hub.list()).toEqual([
+      expect.objectContaining({ id: "lagging", protocolVersion: V7, commitSha: oldSha }),
+    ]);
+    // Full admission: it takes actor placement like any current follower.
+    expect(() => h.hub.createHost("lagging", "actor-1")).not.toThrow();
+
+    const commands = (await (await h.post("/poll", { id: "lagging", session })).json()) as Array<
+      Record<string, unknown>
+    >;
+    const updates = commands
+      .filter((command) => !("actorId" in command) && command.type === "update")
+      .map((command) => ({ targetSha: command.targetSha, branch: command.branch }));
+    expect(updates).toEqual([{ targetSha, branch: "staging" }]);
+    expect(store.getActiveTrigger()?.attempts.lagging?.status).toBe("pending");
+
+    // The updated process returns as a new generation on the leader's protocol and build.
+    const updated = await h.post(
+      "/register",
+      identity("lagging", N, { generation: "lagging-process-two", commitSha: targetSha })
+    );
+    expect(updated.status).toBe(200);
+    expect(((await updated.json()) as { protocolVersion: number }).protocolVersion).toBe(N);
+    expect(store.getActiveTrigger()?.attempts.lagging).toMatchObject({
+      status: "success",
+      targetSha,
+    });
+    expect(h.hub.list()).toEqual([
+      expect.objectContaining({ id: "lagging", protocolVersion: N, commitSha: targetSha }),
+    ]);
+  });
+
+  it("registers a current-protocol follower normally", async () => {
+    const h = await setup();
+    const response = await h.post("/register", identity("current", N));
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { protocolVersion: number }).protocolVersion).toBe(N);
+    expect(h.hub.list()).toEqual([expect.objectContaining({ id: "current", protocolVersion: N })]);
+  });
+
+  it.each([
+    ["older than N−1", N - 2],
+    ["newer than the leader", N + 1],
+  ])("rejects a follower %s with 409 and logs its id, protocol version and commitSha", async (_side, protocolVersion) => {
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const h = await setup({ logger: captureLogger(records) });
+    const response = await h.post("/register", identity("outside", protocolVersion));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "Incompatible instance protocol; rebuild leader and follower",
+    });
+    expect(h.hub.list()).toEqual([]);
+    expect(records.filter((record) => record.event === "follower_register_rejected")).toEqual([
+      {
+        event: "follower_register_rejected",
+        fields: {
+          reason: "incompatible_protocol",
+          followerId: "outside",
+          protocolVersion,
+          commitSha: oldSha,
+          supportedProtocolVersions: [N - 1, N],
+        },
+      },
+    ]);
+  });
+
+  it("logs every other register rejection with the same identifying fields", async () => {
+    const records: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+    const h = await setup({ logger: captureLogger(records) });
+    const invalid = await h.post("/register", identity("bad id!", N));
+    expect(invalid.status).toBe(400);
+    await h.register("fenced", "fenced-old");
+    await h.register("fenced", "fenced-new");
+    const superseded = await h.post(
+      "/register",
+      identity("fenced", N, { generation: "fenced-old", commitSha: undefined })
+    );
+    expect(superseded.status).toBe(409);
+    expect(
+      records
+        .filter((record) => record.event === "follower_register_rejected")
+        .map((record) => record.fields)
+    ).toEqual([
+      {
+        reason: "invalid_identity",
+        followerId: "bad id!",
+        protocolVersion: N,
+        commitSha: oldSha,
+      },
+      {
+        reason: "superseded_generation",
+        followerId: "fenced",
+        protocolVersion: N,
+        commitSha: undefined,
+      },
+    ]);
+  });
+});

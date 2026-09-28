@@ -48,6 +48,7 @@ import { QuotaCoordinatorClient } from "../quota/coordinator-client.js";
 import { HISTORY_WINDOW_MS } from "../quota/coordinator-protocol.js";
 import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { SlackSocketSource } from "../slack/socket-source.js";
+import { writeBuildSentinel } from "../update/build-sentinel.js";
 import { SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import * as webhookServer from "../webhook/server.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
@@ -1369,6 +1370,88 @@ describe("runStart webhook event routing (Phase 4)", () => {
           await new Promise((resolve) => setTimeout(resolve, 200));
           expect(fableGate.started).toBe(false);
           fableGate.cancel?.();
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
+      it("raises one root alarm when a published Fable lane retires", async () => {
+        let publishFable = true;
+        const { mesh, close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: publishFable
+            ? withFableLane(throttleStatus("claude"), { intervalSeconds: 1 })
+            : throttleStatus("claude"),
+        }));
+        const retiredAlarms = () =>
+          getRepositories()
+            .inbox.list("root")
+            .entries.filter(
+              (entry) =>
+                (entry.payload as { type?: string }).type === "system.quota_model_lane_retired"
+            );
+        try {
+          await triggerQuotaThrottleTick();
+          const ran = vi.fn(async (candidate: RawProviderModelConfig) => candidate.model);
+          // A Fable start materializes the model pacer the lane paces.
+          await expect(mesh.gateRun(ran, [fableEntry], false).result).resolves.toBe(
+            "claude-fable-5-1"
+          );
+          expect(retiredAlarms()).toEqual([]);
+
+          publishFable = false;
+          await triggerQuotaThrottleTick();
+          await vi.waitFor(() => expect(retiredAlarms()).toHaveLength(1));
+          expect(retiredAlarms()[0]).toMatchObject({
+            actorId: "root",
+            source: "system:events",
+            payload: expect.objectContaining({
+              provider: "claude",
+              model: "claude-fable-5-1",
+              priority: "responsive",
+              // "retired", not "reset": the hard-stale horizon and manual switches retire without one.
+              message: expect.stringContaining(
+                "no new reading arrived before it retired; check the scrapes"
+              ),
+            }),
+          });
+
+          // Still retired on the next tick: raised once, not per apply.
+          await triggerQuotaThrottleTick();
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(retiredAlarms()).toHaveLength(1);
+        } finally {
+          await shutdownFn?.();
+          shutdownFn = undefined;
+          await close();
+        }
+      });
+
+      it("raises the retirement alarm for a published lane no candidate has paced", async () => {
+        let publishFable = true;
+        const { close, triggerQuotaThrottleTick } = await bootWithCoordinator(() => ({
+          claude: publishFable
+            ? withFableLane(throttleStatus("claude"), { intervalSeconds: 1 })
+            : throttleStatus("claude"),
+        }));
+        const retiredAlarms = () =>
+          getRepositories()
+            .inbox.list("root")
+            .entries.filter(
+              (entry) =>
+                (entry.payload as { type?: string }).type === "system.quota_model_lane_retired"
+            );
+        try {
+          // Published, but no Fable start ever materializes its model pacer.
+          await triggerQuotaThrottleTick();
+          publishFable = false;
+          await triggerQuotaThrottleTick();
+          await vi.waitFor(() => expect(retiredAlarms()).toHaveLength(1));
+          expect(retiredAlarms()[0]?.payload).toMatchObject({
+            provider: "claude",
+            model: "claude-fable-5-1",
+          });
         } finally {
           await shutdownFn?.();
           shutdownFn = undefined;
@@ -3382,7 +3465,32 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(requestRunCalls).toHaveLength(0);
   });
 
-  it("routes the production low-water check to root as responsive system.disk work without DMing the error chat", async () => {
+  // runStart posts "✅ Back online" whenever the resolved repository root holds
+  // dist/.build-ok, so a test that pins what reaches the error chat must pick the
+  // checkout state instead of inheriting the one it happens to run in (#500).
+  const BUILT_SHA = "0123456789abcdef0123456789abcdef01234567";
+  function useCheckout(state: "unbuilt" | "built") {
+    const repoRoot = join(homeDir, "checkout");
+    mkdirSync(repoRoot, { recursive: true });
+    if (state === "built") {
+      writeBuildSentinel(join(repoRoot, "packages", "rusa", "dist"), BUILT_SHA);
+    }
+    serviceInstanceMock.resolveRepoRoot.mockReturnValue(repoRoot);
+    return state === "built"
+      ? [
+          expect.objectContaining({
+            spaceName: "spaces/operator-dm",
+            text: `✅ Back online on ${BUILT_SHA.slice(0, 7)}`,
+          }),
+        ]
+      : [];
+  }
+
+  it.each([
+    "unbuilt",
+    "built",
+  ] as const)("routes the production low-water check to root as responsive system.disk work without DMing the error chat (%s checkout)", async (checkout) => {
+    const lifecyclePings = useCheckout(checkout);
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     writeFileSync(
@@ -3433,13 +3541,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       actorId: "root",
       reason: JSON.stringify({ priority: "responsive" }),
     });
-    expect(chatClient.sent).toEqual([]);
+    // The only error-chat traffic is the lifecycle ping the checkout earns.
+    expect(chatClient.sent).toEqual(lifecyclePings);
   });
 
-  it("delivers the alert to root when config carries no observability block at all", async () => {
+  it.each([
+    "unbuilt",
+    "built",
+  ] as const)("delivers the alert to root when config carries no observability block at all (%s checkout)", async (checkout) => {
     // The production shape behind the outage: no observability block, so the
     // sensor ran on defaults and emitted into a source nobody covered. Root's
     // subscription now follows the sensor's own predicate, so the alert lands.
+    const lifecyclePings = useCheckout(checkout);
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
     writeFileSync(
@@ -3510,8 +3623,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       actorId: "root",
       reason: JSON.stringify({ priority: "responsive" }),
     });
-    // The mesh carried it, so the last-resort error-chat send stays unused.
-    expect(chatClient.sent).toEqual([]);
+    // The mesh carried it, so the last-resort error-chat send stays unused;
+    // only the checkout's lifecycle ping may reach the error chat.
+    expect(chatClient.sent).toEqual(lifecyclePings);
   });
 
   it("keeps generated E2E configs free of disk alerts and system:events, even with an enabled base", async () => {

@@ -514,11 +514,12 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       ],
     };
 
-    // Before the deadline the lane is held, hard-staled: it still defers Fable
-    // to the deadline at the ceiling interval rather than retiring to no pacing.
+    // Before the deadline the lane is held: it still defers Fable to the
+    // deadline, dead-reckoned at its last interval, rather than retiring to no
+    // pacing.
     const held = publishedThrottle(stored, { ...options, nowMs });
     expect(modelLanePacing(held, FABLE)).toEqual({
-      intervalSeconds: 3600,
+      intervalSeconds: 20,
       deferUntil: deadline,
       exhaustedUntil: null,
     });
@@ -529,6 +530,115 @@ describe("model-scoped quota lanes: protocol (#588)", () => {
       nowMs: Date.parse(deadline) + 1,
     });
     expect(modelLanePacing(released, FABLE)).toBeUndefined();
+  });
+
+  it("dead-reckons a lane missing from scrapes at its last interval until its window resets", () => {
+    const nowMs = Date.parse("2030-01-01T02:00:00.000Z");
+    const windowReset = "2030-01-01T05:00:00.000Z";
+    const laterReset = "2030-01-02T00:00:00.000Z";
+    const options = {
+      maxIntervalSeconds: 3600,
+      staleAfterMs: 600_000,
+      hardStaleAfterMs: 3_600_000,
+    };
+    const provider = {
+      provider: "claude",
+      intervalSeconds: 5,
+      uncappedIntervalSeconds: 5,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: "2030-01-01T01:59:00.000Z",
+      buckets: [],
+    };
+    const lastSeen = "2030-01-01T00:30:00.000Z";
+    const bucket = (kind: string, resetAtIso: string) => ({
+      key: `claude[${FABLE}]:${kind}`,
+      percentLeft: 40,
+      timeRemainingPct: 50,
+      error: 0,
+      derivative: 0,
+      requiredIntervalSeconds: 45,
+      resetAtIso,
+      observedAt: lastSeen,
+    });
+    // Last seen well past the hard-stale horizon before the provider's latest
+    // reading, and governed by a window that resets before the other one.
+    const stored = {
+      ...provider,
+      modelLanes: [
+        {
+          ...provider,
+          governingBucketKey: `claude[${FABLE}]:five_hour`,
+          intervalSeconds: 45,
+          uncappedIntervalSeconds: 45,
+          updatedAt: lastSeen,
+          buckets: [bucket("five_hour", windowReset), bucket("weekly", laterReset)],
+          models: [FABLE],
+        },
+      ],
+    };
+
+    // Held at its last interval, not widened to the ceiling, even though its
+    // own reading is hard-stale.
+    const reckoned = publishedThrottle(stored, { ...options, nowMs });
+    expect(reckoned.modelLanes?.[0]).toMatchObject({
+      intervalSeconds: 45,
+      capped: false,
+      freshness: expect.objectContaining({ hardStale: true }),
+    });
+    expect(modelLanePacing(reckoned, FABLE)).toEqual({
+      intervalSeconds: 45,
+      deferUntil: null,
+      exhaustedUntil: null,
+    });
+    expect(
+      modelLanePacing(
+        publishedThrottle(stored, { ...options, nowMs: Date.parse(windowReset) - 1 }),
+        FABLE
+      )?.intervalSeconds
+    ).toBe(45);
+
+    // The governing window's reset passed with no new reading: retired.
+    expect(
+      modelLanePacing(
+        publishedThrottle(stored, { ...options, nowMs: Date.parse(windowReset) }),
+        FABLE
+      )
+    ).toBeUndefined();
+
+    // A governing window last read without a reset has nothing to reckon to:
+    // the lane retires at the hard-stale horizon, which this one is past, even
+    // though another last-seen window still carries a later reset.
+    const unreset = {
+      ...stored,
+      modelLanes: stored.modelLanes.map((lane) => ({
+        ...lane,
+        buckets: [
+          { ...bucket("five_hour", windowReset), resetAtIso: null },
+          bucket("weekly", laterReset),
+        ],
+      })),
+    };
+    expect(
+      modelLanePacing(publishedThrottle(unreset, { ...options, nowMs }), FABLE)
+    ).toBeUndefined();
+
+    // A lane seen again in the provider's newest reading is published as usual.
+    const seenAgain = publishedThrottle(
+      {
+        ...stored,
+        modelLanes: stored.modelLanes.map((lane) => ({
+          ...lane,
+          updatedAt: provider.updatedAt,
+          buckets: lane.buckets.map((b) => ({ ...b, observedAt: provider.updatedAt })),
+        })),
+      },
+      { ...options, nowMs }
+    );
+    expect(seenAgain.modelLanes?.[0]?.freshness.hardStale).toBe(false);
+    expect(seenAgain.modelLanes?.[0]?.intervalSeconds).toBe(45);
   });
 
   it("preserves scope identity from store to client over the coordinator socket", async () => {
