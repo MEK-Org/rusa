@@ -12990,14 +12990,32 @@ describe("accountRun token accounting (#443)", () => {
     it("releases selection lock via append-only re-queue with audit trail (#748)", async () => {
       const inboxStore = createMemoryInboxStore();
       const countsMap = new Map([["item-1", 2]]);
+      // Stand in for the run repository so every retry loop stays bounded: the
+      // child's released item stays exhausted, its replacement accrues one
+      // completed focus run per child run since release, and any other actor
+      // (the parent woken by the exhaustion notice) accrues its prior runs on
+      // every entry it holds. The run being finished is excluded, as in prod.
+      let child = "";
+      let replacementId = "";
+      let replacementCompletedRuns: () => number = () => 0;
+      let priorRuns: (actorId: string) => number = () => 0;
 
       const { mesh, fake, tick } = setup({
         inboxStore,
-        completedFocusEntryCounts: () => countsMap,
+        completedFocusEntryCounts: (actorId) => {
+          if (actorId === child) {
+            return new Map([...countsMap, [replacementId, replacementCompletedRuns()]]);
+          }
+          const prior = priorRuns(actorId);
+          return new Map(
+            inboxStore.list(actorId, { status: "all" }).entries.map((e) => [e.id, prior])
+          );
+        },
       });
+      priorRuns = (actorId) => Math.max(0, (fake(actorId)?.calls.length ?? 0) - 1);
 
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
-      const child = mesh.spawn({ charter: "child", parentId: parent });
+      child = mesh.spawn({ charter: "child", parentId: parent });
       await tick();
 
       inboxStore.append([
@@ -13010,6 +13028,7 @@ describe("accountRun token accounting (#443)", () => {
 
       // Parent releases selection lock
       const initialCalls = fake(child).calls.length;
+      replacementCompletedRuns = () => Math.max(0, fake(child).calls.length - initialCalls - 1);
       const res = mesh.releaseChildInboxSelectionLock(
         parent,
         child,
@@ -13018,7 +13037,7 @@ describe("accountRun token accounting (#443)", () => {
       );
       expect(res.released).toEqual(["item-1"]);
       expect(res.replacements).toHaveLength(1);
-      const replacementId = res.replacements[0];
+      replacementId = res.replacements[0];
       expect(replacementId).not.toBe("item-1");
 
       // Original entry is marked handled with attributed audit note
@@ -13038,9 +13057,11 @@ describe("accountRun token accounting (#443)", () => {
       expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
       expect(mesh.selectInboxEntries(child, [replacementId])).toHaveLength(1);
 
-      // Child is dispatched upon release
+      // Child is dispatched upon release, and the replacement gets the full
+      // bounded recovery: one run plus one retry, then no further dispatch.
       await tick();
-      expect(fake(child).calls.length).toBeGreaterThan(initialCalls);
+      await tick();
+      expect(fake(child).calls.length - initialCalls).toBe(2);
     });
 
     it("marks exhausted child work handled with audit note (#748)", async () => {
