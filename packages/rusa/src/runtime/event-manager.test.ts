@@ -395,7 +395,7 @@ describe("EventManager", () => {
       expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
     });
 
-    it("preserves normal red routing for a failing suite on a coder PR even when repo owner opted in to all outcomes", async () => {
+    it("preserves normal red routing and adds one advisory copy for an opted-in repo owner", async () => {
       const inbox = new FakeInboxStore();
       const owners = new InMemoryEventSourceOwnerStore();
       const subscriptions = new InMemoryEventSourceSubscriptionStore();
@@ -435,9 +435,62 @@ describe("EventManager", () => {
       });
 
       expect(delivery.ownerIds).toEqual(["coder"]);
-      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder", "steward"]);
       expect(inbox.entries[0]?.payload.deliveryRole).toBe("owner");
-      expect(inbox.list("steward").entries).toEqual([]);
+      expect(inbox.entries[1]?.payload.deliveryRole).toBe("subscriber");
+      expect(inbox.list("coder").entries).toHaveLength(1);
+      expect(inbox.list("steward").entries).toHaveLength(1);
+    });
+
+    it("preserves normal unknown routing and adds one advisory copy for an opted-in repo owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: {
+              id: 747,
+              conclusion: "future_provider_conclusion",
+              pull_requests: [{ number: 746 }],
+            },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["coder"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder", "steward"]);
+      expect(inbox.entries.map((entry) => entry.payload.deliveryRole)).toEqual([
+        "owner",
+        "subscriber",
+      ]);
     });
 
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {

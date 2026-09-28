@@ -678,7 +678,10 @@ export class EventManager {
       throw new Error("GitHub event repository could not be resolved");
     }
     const resource = raw.rawResource ?? notification.resource;
-    const checkSuiteCompletionOwnerIds = quietCheckSuiteCompletion
+    // An all-outcomes source asks for every completed outcome, not only the
+    // quiet ones. For a normal red/unknown outcome this is later composed as
+    // an advisory subscriber alongside the ordinary accountable-owner route.
+    const checkSuiteCompletionOwnerIds = completedCheckSuite
       ? this.routing.allOutcomesCheckSuiteOwners(resource)
       : [];
     if (quietCheckSuiteCompletion && checkSuiteCompletionOwnerIds.length === 0) {
@@ -814,7 +817,10 @@ export class EventManager {
     // receives an "owner" copy; an opted-in ancestor or observer receives a
     // "subscriber" copy so the notification acts as an advisory prompt and
     // joins rather than preempts an active run (#632).
-    // Failing or unknown suites keep their normal owner/subscriber route.
+    // A failing or unknown suite keeps its normal owner/subscriber route, plus
+    // one advisory copy for each opted-in source owner that is not already a
+    // recipient. This lets a repository source opt into every outcome without
+    // changing another PR owner's role or preempting unrelated work (#632).
     let ownerIds: readonly string[];
     let subscriberIds: readonly string[];
     if (normalized.quietCheckSuiteCompletion) {
@@ -823,7 +829,13 @@ export class EventManager {
       subscriberIds = optInRecipients.filter((id) => !recipients.ownerIds.includes(id));
     } else {
       ownerIds = recipients.ownerIds;
-      subscriberIds = recipients.subscriberIds;
+      const advisorySubscribers = [...recipients.subscriberIds];
+      for (const optedInOwner of normalized.checkSuiteCompletionOwnerIds ?? []) {
+        if (!ownerIds.includes(optedInOwner) && !advisorySubscribers.includes(optedInOwner)) {
+          advisorySubscribers.push(optedInOwner);
+        }
+      }
+      subscriberIds = advisorySubscribers;
     }
 
     // Owners first, then subscribers — an explicit ordered array rather than a
