@@ -1352,10 +1352,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
-        const record = this.actors.get(work.actorId);
-        if (record && record.status !== "active") continue;
-        if (this.hasOnlyExhaustedWork(work.actorId)) continue;
-        this.dispatch(work.actorId);
+        this.reconcileActorInbox(work.actorId);
       }
     } catch (err) {
       // Recovery is a nudge over durable state, not the durability boundary.
@@ -1363,6 +1360,19 @@ export class ActorMesh {
       // failure-isolated while making the missed nudge journal-visible.
       this.log(`inbox reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * One actor's share of {@link reconcileInbox}: nudge its durable unhandled
+   * work unless it is retired or holds only exhausted entries. A remote handle
+   * calls this when it drops an admission its follower did not reclaim, since
+   * no delivery is coming to wake the work that admission was for (#613).
+   */
+  reconcileActorInbox(actorId: string): boolean {
+    const record = this.actors.get(actorId);
+    if (record && record.status !== "active") return false;
+    if (this.hasOnlyExhaustedWork(actorId)) return false;
+    return this.dispatch(actorId);
   }
 
   /** Resume recovery: nudge only work that never passed a pre-run halt gate. */
