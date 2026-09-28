@@ -32,6 +32,7 @@ import {
   type InboxEntry,
   type InboxPayload,
   type InboxRepository,
+  type MarkHandledResult,
 } from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
@@ -1875,8 +1876,47 @@ export class ActorMesh {
             `actor ${actorId} exhausted selected work retries for entries: ${unhandledIds.join(", ")}`
           );
         }
+
+        const exhaustedIds = unhandledIds.filter((id) => (priorCounts.get(id) ?? 0) + 1 >= 2);
+        if (exhaustedIds.length > 0) {
+          this.escalateExhaustedInboxWorkToParent(actorId, exhaustedIds, outcome.runId);
+        }
       }
     }
+  }
+
+  private escalateExhaustedInboxWorkToParent(
+    actorId: string,
+    exhaustedIds: readonly string[],
+    runId?: string
+  ): void {
+    if (actorId === this.rootId) {
+      return;
+    }
+    const record = this.actors.get(actorId);
+    const parentId = record?.parentId;
+    if (!parentId || !this.isActiveActor(parentId)) {
+      return;
+    }
+
+    const note =
+      `[inbox recovery exhausted] Child ${actorId} exhausted bounded recovery for selected inbox entries: ${exhaustedIds.join(", ")}.\n\n` +
+      "Please investigate why recovery exhausted. In cases observed so far, the child completed the work but skipped mark_handled; other possible causes include a tool failure, a run killed before yield, or work that genuinely could not be handled.\n\n" +
+      `If the investigation reveals a convention slip, remind the child in mesh chat and update its charter (and its children's charters). Then use release_selection_lock or mark_exhausted_inbox_handled with thread_id '${actorId}' to resolve the entries.`;
+
+    this.deliverMechanicalInboxNotice(
+      parentId,
+      note,
+      actorId,
+      {
+        runId: runId ?? actorId,
+        actorId,
+        status: "exhausted_inbox",
+      },
+      runId
+        ? `exhausted:${actorId}:${runId}`
+        : `exhausted:${actorId}:${exhaustedIds.slice().sort().join(",")}`
+    );
   }
 
   hasExhaustedSelectedWork(actorId: string): boolean {
@@ -1924,6 +1964,149 @@ export class ActorMesh {
     if (!this.completedFocusEntryCounts || entryIds.length === 0) return new Set();
     const counts = this.completedFocusEntryCounts(actorId);
     return new Set(entryIds.filter((id) => (counts.get(id) ?? 0) >= 2));
+  }
+
+  /**
+   * Validate authority and preconditions for parent clearance of exhausted inbox work.
+   */
+  assertParentExhaustedInboxAuthority(
+    callerId: string,
+    childId: string,
+    entryIds: readonly string[]
+  ): { childId: string; entries: InboxEntry[] } {
+    callerId = this.resolveThreadId(callerId);
+    childId = this.resolveThreadId(childId);
+
+    if (callerId === childId) {
+      throw new Error(
+        "Actors cannot self-clear exhausted inbox work; escalation resolves through the parent"
+      );
+    }
+
+    const childRecord = this.actors.get(childId);
+    if (!childRecord) {
+      throw new Error(`unknown thread id: ${childId}`);
+    }
+
+    if (childId === this.rootId || !childRecord.parentId) {
+      throw new Error(
+        "Root has no parent in the mesh; root inbox work must be dismissed by the operator via the dashboard"
+      );
+    }
+
+    if (this.resolveThreadId(childRecord.parentId) !== callerId) {
+      throw new Error(
+        `Only the parent thread (${childRecord.parentId}) can clear exhausted inbox work for thread ${childId}`
+      );
+    }
+
+    const uniqueIds = [...new Set(entryIds)];
+    if (uniqueIds.length === 0 || uniqueIds.length > 100) {
+      throw new Error("Provide between 1 and 100 unique inbox entry ids");
+    }
+
+    if (!this.inboxStore) {
+      throw new Error("Inbox is not configured");
+    }
+
+    const exhaustedIds = this.exhaustedInboxEntryIds(childId, uniqueIds);
+    const entries: InboxEntry[] = [];
+
+    for (const id of uniqueIds) {
+      const entry = this.inboxStore.read(childId, id);
+      if (!entry) {
+        throw new Error(`inbox entry not found: ${id}`);
+      }
+      if (entry.handledAt) {
+        throw new Error(`inbox entry already handled: ${id}`);
+      }
+      if (!exhaustedIds.has(id)) {
+        throw new Error(
+          `Cannot clear entry ${id}: entry has not exhausted bounded recovery; parent clearance is restricted to exhausted entries`
+        );
+      }
+      entries.push(entry);
+    }
+
+    return { childId, entries };
+  }
+
+  /**
+   * Release the selection lock on exhausted inbox entries for a child thread.
+   * Marks the exhausted entries handled with an attributed audit note,
+   * appends fresh replacement entries so the work returns to ordinary unhandled work,
+   * and dispatches the child.
+   */
+  releaseChildInboxSelectionLock(
+    callerId: string,
+    childId: string,
+    entryIds: readonly string[],
+    note: string
+  ): { released: string[]; replacements: string[] } {
+    const trimmedNote = note.trim();
+    if (!trimmedNote) {
+      throw new Error(
+        "note cannot be empty — explain why these inbox items are being released for re-handling"
+      );
+    }
+    const { childId: resolvedChildId, entries } = this.assertParentExhaustedInboxAuthority(
+      callerId,
+      childId,
+      entryIds
+    );
+    const inboxStore = this.inboxStore;
+    if (!inboxStore) {
+      throw new Error("Inbox is not configured");
+    }
+
+    const ids = entries.map((e) => e.id);
+    const auditNote = `Released by parent (${callerId}) for re-handling: ${trimmedNote}`;
+    const { replacements } = inboxStore.replaceEntries(
+      resolvedChildId,
+      ids,
+      auditNote,
+      entries.map((e) => ({
+        actorId: resolvedChildId,
+        source: e.source,
+        payload: e.payload,
+      }))
+    );
+
+    this.inboxHandled(resolvedChildId);
+    this.dispatch(resolvedChildId);
+    return {
+      released: ids,
+      replacements: replacements.map((r) => r.id),
+    };
+  }
+
+  /**
+   * Mark exhausted inbox entries handled on behalf of a child thread with an audit note.
+   */
+  markChildInboxHandled(
+    callerId: string,
+    childId: string,
+    entryIds: readonly string[],
+    note: string
+  ): { handled: MarkHandledResult[] } {
+    const trimmedNote = note.trim();
+    if (!trimmedNote) {
+      throw new Error(
+        "note cannot be empty — explain how this inbox item was handled or why no action was needed"
+      );
+    }
+    const { childId: resolvedChildId, entries } = this.assertParentExhaustedInboxAuthority(
+      callerId,
+      childId,
+      entryIds
+    );
+    const ids = entries.map((e) => e.id);
+    const auditNote = `Marked handled by parent (${callerId}): ${trimmedNote}`;
+    const inboxStore = this.inboxStore;
+    if (!inboxStore) throw new Error("inbox store not configured");
+    const handled = inboxStore.markHandled(resolvedChildId, ids, undefined, auditNote);
+    this.inboxHandled(resolvedChildId);
+    return { handled };
   }
 
   /**

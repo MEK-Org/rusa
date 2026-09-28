@@ -113,6 +113,10 @@ class FakeInboxStore implements InboxRepository {
   markHandled(): MarkHandledResult[] {
     return [];
   }
+
+  replaceEntries(): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
+    return { handled: [], replacements: [] };
+  }
 }
 
 function createRoutingKernel(opts: {
