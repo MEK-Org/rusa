@@ -309,7 +309,6 @@ function setup(
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
     recordRunYield?: ActorMeshOptions["recordRunYield"];
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
-    clearFocusEntryIds?: ActorMeshOptions["clearFocusEntryIds"];
     inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -391,7 +390,6 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    clearFocusEntryIds: opts.clearFocusEntryIds,
     experimentEnrollments: opts.experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
@@ -12834,8 +12832,10 @@ describe("accountRun token accounting (#443)", () => {
       expect(failureNotice?.payload.note).toContain(worker);
       expect(failureNotice?.payload.note).toContain("exhausted-item");
       expect(failureNotice?.payload.note).toContain("skipped mark_handled");
-      expect(failureNotice?.payload.note).toContain("release the selection lock");
-      expect(failureNotice?.payload.note).toContain("mark the entries handled with a note");
+      expect(failureNotice?.payload.note).toContain("release_selection_lock");
+      expect(failureNotice?.payload.note).toContain("mark_exhausted_inbox_handled");
+      expect(failureNotice?.payload.note).toContain(`thread_id '${worker}'`);
+      expect(failureNotice?.payload.note).toContain("remind the child in mesh chat");
 
       // Root was dispatched due to the notice delivery
       await tick();
@@ -12900,30 +12900,33 @@ describe("accountRun token accounting (#443)", () => {
       ]);
 
       // Child cannot self-clear
-      expect(() => mesh.releaseChildInboxSelectionLock(child, child, ["exhausted-1"])).toThrow(
-        /self-clear/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(child, child, ["exhausted-1"], "note")
+      ).toThrow(/self-clear/i);
       expect(() => mesh.markChildInboxHandled(child, child, ["exhausted-1"], "handled it")).toThrow(
         /self-clear/i
       );
 
       // Stranger cannot clear
-      expect(() => mesh.releaseChildInboxSelectionLock(stranger, child, ["exhausted-1"])).toThrow(
-        /Only the parent thread/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(stranger, child, ["exhausted-1"], "note")
+      ).toThrow(/Only the parent thread/i);
       expect(() =>
         mesh.markChildInboxHandled(stranger, child, ["exhausted-1"], "handled it")
       ).toThrow(/Only the parent thread/i);
 
       // Root has no mesh parent and cannot be cleared by an actor
-      expect(() => mesh.releaseChildInboxSelectionLock(parent, "root", ["exhausted-1"])).toThrow(
-        /Root has no parent in the mesh/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, "root", ["exhausted-1"], "note")
+      ).toThrow(/Root has no parent in the mesh/i);
       expect(() =>
         mesh.markChildInboxHandled(parent, "root", ["exhausted-1"], "handled it")
       ).toThrow(/Root has no parent in the mesh/i);
 
-      // Empty note is rejected for markChildInboxHandled
+      // Empty note is rejected for both releaseChildInboxSelectionLock and markChildInboxHandled
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "   ")
+      ).toThrow(/note cannot be empty/i);
       expect(() => mesh.markChildInboxHandled(parent, child, ["exhausted-1"], "   ")).toThrow(
         /note cannot be empty/i
       );
@@ -12955,48 +12958,46 @@ describe("accountRun token accounting (#443)", () => {
       ]);
 
       // Non-exhausted entry is rejected
-      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["unexhausted-1"])).toThrow(
-        /not exhausted/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["unexhausted-1"], "note")
+      ).toThrow(/not exhausted/i);
       expect(() => mesh.markChildInboxHandled(parent, child, ["unexhausted-1"], "note")).toThrow(
         /not exhausted/i
       );
 
       // Non-existent entry is rejected
-      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["missing-entry"])).toThrow(
-        /not found/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["missing-entry"], "note")
+      ).toThrow(/not found/i);
 
       // Already handled entry is rejected
       inboxStore.markHandled(child, ["exhausted-1"]);
-      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"])).toThrow(
-        /already handled/i
-      );
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "note")
+      ).toThrow(/already handled/i);
     });
 
-    it("releases selection lock and returns work to unhandled queue (#748)", async () => {
+    it("fails closed when inboxStore is missing (#748)", () => {
+      const { mesh } = setup();
+      (mesh as unknown as { inboxStore?: unknown }).inboxStore = undefined;
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"], "note")
+      ).toThrow(/Inbox is not configured/i);
+    });
+
+    it("releases selection lock via append-only re-queue with audit trail (#748)", async () => {
       const inboxStore = createMemoryInboxStore();
-      let completed = 2;
-      const clearedEntries: string[] = [];
+      const countsMap = new Map([["item-1", 2]]);
 
       const { mesh, fake, tick } = setup({
         inboxStore,
-        completedFocusEntryCounts: () =>
-          completed > 0 ? new Map([["item-1", completed]]) : new Map(),
-        clearFocusEntryIds: (_actorId, ids) => {
-          clearedEntries.push(...ids);
-          completed = 0;
-          return ids.length;
-        },
+        completedFocusEntryCounts: () => countsMap,
       });
 
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
-      mesh.lifecycleFor(child).add({
-        onEnd: (event) => {
-          if (event.terminal.kind === "result") completed++;
-        },
-      });
       await tick();
 
       inboxStore.append([
@@ -13009,13 +13010,33 @@ describe("accountRun token accounting (#443)", () => {
 
       // Parent releases selection lock
       const initialCalls = fake(child).calls.length;
-      const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"]);
+      const res = mesh.releaseChildInboxSelectionLock(
+        parent,
+        child,
+        ["item-1"],
+        "released after investigating"
+      );
       expect(res.released).toEqual(["item-1"]);
-      expect(clearedEntries).toEqual(["item-1"]);
+      expect(res.replacements).toHaveLength(1);
+      const replacementId = res.replacements[0];
+      expect(replacementId).not.toBe("item-1");
 
-      // Selection lock is cleared; child can select it again
+      // Original entry is marked handled with attributed audit note
+      const original = inboxStore.read(child, "item-1");
+      expect(original?.handledAt).not.toBeNull();
+      expect(original?.handledNote).toBe(
+        `Released by parent (${parent}) for re-handling: released after investigating`
+      );
+
+      // Replacement entry is unhandled in child's inbox with matching source and payload
+      const replacement = inboxStore.read(child, replacementId);
+      expect(replacement?.handledAt).toBeNull();
+      expect(replacement?.source).toBe("chat");
+      expect(replacement?.payload).toEqual(payload("mesh.message"));
+
+      // Old entry is handled, fresh entry has 0 completed focus runs; child has no exhausted work
       expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
-      expect(mesh.selectInboxEntries(child, ["item-1"])).toHaveLength(1);
+      expect(mesh.selectInboxEntries(child, [replacementId])).toHaveLength(1);
 
       // Child is dispatched upon release
       await tick();

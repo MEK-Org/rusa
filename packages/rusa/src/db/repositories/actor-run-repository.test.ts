@@ -140,33 +140,6 @@ describe("ActorRunRepository", () => {
     expect(runs.completedFocusEntryCounts("actor-a", "excluded-success").get("entry-1")).toBe(1);
   });
 
-  it("clears specified entry IDs from completed focus entries for an actor", () => {
-    const completeWithFocus = (id: string, entries: string[]) => {
-      runs.start({
-        id,
-        actorId: "actor-a",
-        modelConfig: launch("codex", "gpt-5.5"),
-      });
-      db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`).run(
-        JSON.stringify(entries),
-        id
-      );
-      runs.complete(id, { success: true, exitCode: 0, output: id });
-    };
-
-    completeWithFocus("run-1", ["entry-1", "entry-2"]);
-    completeWithFocus("run-2", ["entry-1"]);
-
-    expect(runs.completedFocusEntryCounts("actor-a").get("entry-1")).toBe(2);
-    expect(runs.completedFocusEntryCounts("actor-a").get("entry-2")).toBe(1);
-
-    const changed = runs.clearFocusEntryIds("actor-a", ["entry-1"]);
-    expect(changed).toBe(2);
-
-    expect(runs.completedFocusEntryCounts("actor-a").get("entry-1")).toBeUndefined();
-    expect(runs.completedFocusEntryCounts("actor-a").get("entry-2")).toBe(1);
-  });
-
   it("retains the launch model and effort on an interrupted (abandoned) run", () => {
     const id = runs.start({
       id: "run-interrupted",

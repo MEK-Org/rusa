@@ -150,7 +150,6 @@ function setup(
      */
     idgen?: () => string;
     completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
-    clearFocusEntryIds?: ActorMeshOptions["clearFocusEntryIds"];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -202,7 +201,6 @@ function setup(
     eventManager,
     inboxStore,
     completedFocusEntryCounts: opts.completedFocusEntryCounts,
-    clearFocusEntryIds: opts.clearFocusEntryIds,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -4714,16 +4712,10 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
   describe("exhausted inbox escalation tools (#748)", () => {
     it("releases selection lock via release_selection_lock tool", async () => {
-      let countsMap = new Map([["item-1", 2]]);
-      const clearedEntries: string[] = [];
+      const countsMap = new Map([["item-1", 2]]);
 
       const { mesh, inboxStore } = setup({
         completedFocusEntryCounts: () => countsMap,
-        clearFocusEntryIds: (_actorId, ids) => {
-          clearedEntries.push(...ids);
-          countsMap = new Map();
-          return ids.length;
-        },
       });
 
       const parent = mesh.spawn({
@@ -4751,12 +4743,29 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
         arguments: {
           thread_id: child,
           entry_ids: ["item-1"],
+          note: "releasing for retry",
         },
       })) as CallToolResult;
 
       expect(res.isError).toBeFalsy();
-      expect(dataOf(res)).toEqual({ released: ["item-1"] });
-      expect(clearedEntries).toEqual(["item-1"]);
+      const data = dataOf(res) as { released: string[]; replacements: string[] };
+      expect(data.released).toEqual(["item-1"]);
+      expect(data.replacements).toHaveLength(1);
+
+      const entry1 = inboxStore.read(child, "item-1");
+      expect(entry1?.handledAt).not.toBeNull();
+      expect(entry1?.handledNote).toBe(
+        `Released by parent (${parent}) for re-handling: releasing for retry`
+      );
+
+      const replacement = inboxStore.read(child, data.replacements[0]);
+      expect(replacement?.handledAt).toBeNull();
+      expect(replacement?.source).toBe("mesh:parent");
+      expect(replacement?.payload).toEqual({
+        type: "mesh.message",
+        messageId: "m1",
+        fromId: parent,
+      });
     });
 
     it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled", async () => {
@@ -4815,11 +4824,8 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       expect(inboxStore.read(child, "item-2")?.handledAt).toBeNull();
     });
 
-    it("enforces authority: rejects self-clear, non-parent, and non-exhausted entries", async () => {
-      const countsMap = new Map([
-        ["exhausted-1", 2],
-        ["unexhausted-1", 1],
-      ]);
+    it("translates mesh authority errors to tool errors at MCP boundary", async () => {
+      const countsMap = new Map([["exhausted-1", 2]]);
 
       const { mesh, inboxStore } = setup({
         completedFocusEntryCounts: () => countsMap,
@@ -4848,56 +4854,20 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
           source: "mesh:parent",
           payload: { type: "mesh.message", messageId: "m1", fromId: parent },
         },
-        {
-          id: "unexhausted-1",
-          actorId: child,
-          source: "mesh:parent",
-          payload: { type: "mesh.message", messageId: "m2", fromId: parent },
-        },
       ]);
 
-      const childClient = await connect(createAgentExecMcpServer(mesh, child, child));
       const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, stranger));
-      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
 
-      // Self-clear rejected
-      const selfClear = (await childClient.callTool({
-        name: "release_selection_lock",
-        arguments: { thread_id: child, entry_ids: ["exhausted-1"] },
-      })) as CallToolResult;
-      expect(selfClear.isError).toBe(true);
-      expect(JSON.stringify(selfClear.content)).toMatch(/self-clear/i);
-
-      const selfHandled = (await childClient.callTool({
-        name: "mark_exhausted_inbox_handled",
-        arguments: { thread_id: child, entry_ids: ["exhausted-1"], note: "self" },
-      })) as CallToolResult;
-      expect(selfHandled.isError).toBe(true);
-      expect(JSON.stringify(selfHandled.content)).toMatch(/self-clear/i);
-
-      // Stranger clearance rejected
       const strangerClear = (await strangerClient.callTool({
         name: "release_selection_lock",
-        arguments: { thread_id: child, entry_ids: ["exhausted-1"] },
+        arguments: {
+          thread_id: child,
+          entry_ids: ["exhausted-1"],
+          note: "unauthorized release",
+        },
       })) as CallToolResult;
       expect(strangerClear.isError).toBe(true);
       expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
-
-      // Non-exhausted clearance rejected
-      const nonExhausted = (await parentClient.callTool({
-        name: "release_selection_lock",
-        arguments: { thread_id: child, entry_ids: ["unexhausted-1"] },
-      })) as CallToolResult;
-      expect(nonExhausted.isError).toBe(true);
-      expect(JSON.stringify(nonExhausted.content)).toMatch(/not exhausted/i);
-
-      // Empty note rejected
-      const emptyNote = (await parentClient.callTool({
-        name: "mark_exhausted_inbox_handled",
-        arguments: { thread_id: child, entry_ids: ["exhausted-1"], note: "   " },
-      })) as CallToolResult;
-      expect(emptyNote.isError).toBe(true);
-      expect(JSON.stringify(emptyNote.content)).toMatch(/note cannot be empty/i);
     });
   });
 });

@@ -657,8 +657,6 @@ export interface ActorMeshOptions {
     actorId: string,
     excludeRunId?: string
   ) => ReadonlyMap<string, number>;
-  /** Clear specified entry IDs from completed focus records for an actor, resetting retry counts. */
-  clearFocusEntryIds?: (actorId: string, entryIds: readonly string[]) => number;
   /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
@@ -1001,12 +999,10 @@ export class ActorMesh {
     actorId: string,
     excludeRunId?: string
   ) => ReadonlyMap<string, number>;
-  clearFocusEntryIds?: (actorId: string, entryIds: readonly string[]) => number;
 
   constructor(opts: ActorMeshOptions) {
     this.actors = opts.actors;
     this.completedFocusEntryCounts = opts.completedFocusEntryCounts;
-    this.clearFocusEntryIds = opts.clearFocusEntryIds;
     this.principals = opts.principals;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
@@ -1906,7 +1902,7 @@ export class ActorMesh {
     const note =
       `[inbox recovery exhausted] Child ${actorId} exhausted bounded recovery for selected inbox entries: ${exhaustedIds.join(", ")}.\n\n` +
       "Please investigate why recovery exhausted. In cases observed so far, the child completed the work but skipped mark_handled; other possible causes include a tool failure, a run killed before yield, or work that genuinely could not be handled.\n\n" +
-      "Use the failure-scoped inbox tools to either release the selection lock (returning unhandled work to the queue) or mark the entries handled with a note once investigated.";
+      `If the investigation reveals a convention slip, remind the child in mesh chat and update its charter (and its children's charters). Then use release_selection_lock or mark_exhausted_inbox_handled with thread_id '${actorId}' to resolve the entries.`;
 
     this.deliverMechanicalInboxNotice(
       parentId,
@@ -2037,23 +2033,50 @@ export class ActorMesh {
 
   /**
    * Release the selection lock on exhausted inbox entries for a child thread.
-   * Resets the retry count so the entries return to ordinary unhandled work,
+   * Marks the exhausted entries handled with an attributed audit note,
+   * appends fresh replacement entries so the work returns to ordinary unhandled work,
    * and dispatches the child.
    */
   releaseChildInboxSelectionLock(
     callerId: string,
     childId: string,
-    entryIds: readonly string[]
-  ): { released: string[] } {
+    entryIds: readonly string[],
+    note: string
+  ): { released: string[]; replacements: string[] } {
+    const trimmedNote = note.trim();
+    if (!trimmedNote) {
+      throw new Error(
+        "note cannot be empty — explain why these inbox items are being released for re-handling"
+      );
+    }
     const { childId: resolvedChildId, entries } = this.assertParentExhaustedInboxAuthority(
       callerId,
       childId,
       entryIds
     );
+    const inboxStore = this.inboxStore;
+    if (!inboxStore) {
+      throw new Error("Inbox is not configured");
+    }
+
     const ids = entries.map((e) => e.id);
-    this.clearFocusEntryIds?.(resolvedChildId, ids);
+    const auditNote = `Released by parent (${callerId}) for re-handling: ${trimmedNote}`;
+    inboxStore.markHandled(resolvedChildId, ids, undefined, auditNote);
+
+    const replacements = inboxStore.append(
+      entries.map((e) => ({
+        actorId: resolvedChildId,
+        source: e.source,
+        payload: e.payload,
+      }))
+    );
+
+    this.inboxHandled(resolvedChildId);
     this.dispatch(resolvedChildId);
-    return { released: ids };
+    return {
+      released: ids,
+      replacements: replacements.map((r) => r.id),
+    };
   }
 
   /**

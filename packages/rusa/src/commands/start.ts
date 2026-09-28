@@ -2654,8 +2654,6 @@ async function composeStart(
     },
     completedFocusEntryCounts: (actorId, excludeRunId) =>
       getRepositories().actorRuns.completedFocusEntryCounts(actorId, excludeRunId),
-    clearFocusEntryIds: (actorId, entryIds) =>
-      getRepositories().actorRuns.clearFocusEntryIds(actorId, entryIds),
     capabilityGrants,
     // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
     // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
