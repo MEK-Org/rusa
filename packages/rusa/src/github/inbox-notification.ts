@@ -1,4 +1,5 @@
 import type { EventResource } from "../actor/event-subscriptions.js";
+import { parseEventSourceConfigV1 } from "../chat/wake-mode.js";
 import { githubBranchReference } from "../references/reference.js";
 import type { InboxPayload } from "../repositories/inbox-repository.js";
 
@@ -193,22 +194,7 @@ export type CheckSuiteCompletionMode = "failures-only" | "all-outcomes";
 export function checkSuiteCompletionModeFromConfig(
   raw: string | null | undefined
 ): CheckSuiteCompletionMode | undefined {
-  if (raw === null || raw === undefined) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      Array.isArray(parsed) ||
-      (parsed as { version?: unknown }).version !== 1
-    ) {
-      return undefined;
-    }
-    const mode = (parsed as { checkSuiteCompletionMode?: unknown }).checkSuiteCompletionMode;
-    return mode === "failures-only" || mode === "all-outcomes" ? mode : undefined;
-  } catch {
-    return undefined;
-  }
+  return parseEventSourceConfigV1(raw)?.checkSuiteCompletionMode;
 }
 
 /**

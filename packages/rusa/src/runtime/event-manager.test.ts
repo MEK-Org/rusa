@@ -270,6 +270,35 @@ describe("EventManager", () => {
       expect(inbox.entries).toEqual([]);
     });
 
+    it("quietly drops a completed quiet check suite even when repository cannot be resolved", async () => {
+      const inbox = new FakeInboxStore();
+      const logs: string[] = [];
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: {
+          resolveOwner: unusedLadder,
+          allOutcomesCheckSuiteOwners: () => [],
+          resolveRecipients: unusedLadder,
+        },
+        log: (msg) => logs.push(msg),
+      });
+
+      const { entries } = await em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            check_suite: { id: 1, conclusion: "success" },
+          },
+        },
+      });
+
+      expect(entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+      expect(logs.some((msg) => msg.includes("non-actionable check suite dropped"))).toBe(true);
+    });
+
     it("delivers a green suite only to an opted-in covering source owner", async () => {
       const inbox = new FakeInboxStore();
       const owners = new InMemoryEventSourceOwnerStore();

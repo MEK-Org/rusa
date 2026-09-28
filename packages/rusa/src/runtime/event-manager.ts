@@ -664,16 +664,20 @@ export class EventManager {
     // GitHub's event name is an ingress fact, never inferred from overlapping
     // payload keys. `pull_request_review` and `pull_request_review_comment`,
     // for example, both carry `pull_request`.
+    const completedCheckSuite = event === "check_suite" && githubPayload.action === "completed";
+    const quietCheckSuiteCompletion = completedCheckSuite && !checkSuiteWakesAnyone(githubPayload);
     const notification = deriveGitHubInboxNotification(event, githubPayload);
     if (!notification) {
+      if (quietCheckSuiteCompletion) {
+        this.log?.(`non-actionable check suite dropped (${raw.eventSummary ?? event})`);
+        return null;
+      }
       // This is the same error the former start.ts ingress raised after it had
       // accepted a repository-backed webhook but could not derive its durable
       // source pointer.
       throw new Error("GitHub event repository could not be resolved");
     }
     const resource = raw.rawResource ?? notification.resource;
-    const completedCheckSuite = event === "check_suite" && githubPayload.action === "completed";
-    const quietCheckSuiteCompletion = completedCheckSuite && !checkSuiteWakesAnyone(githubPayload);
     const checkSuiteCompletionOwnerIds = quietCheckSuiteCompletion
       ? this.routing.allOutcomesCheckSuiteOwners(resource)
       : [];

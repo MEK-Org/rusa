@@ -357,6 +357,7 @@ describe("checkSuiteCompletionModeFromConfig", () => {
       '{"version":2,"checkSuiteCompletionMode":"all-outcomes"}',
       '{"version":1,"checkSuiteCompletionMode":"unknown"}',
       '{"version":1,"chatWakeMode":"all"}',
+      '{"version":1,"chatWakeMode":"invalid","checkSuiteCompletionMode":"all-outcomes"}',
     ]) {
       expect(checkSuiteCompletionModeFromConfig(raw)).toBeUndefined();
     }
