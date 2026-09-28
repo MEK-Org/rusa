@@ -172,7 +172,15 @@ const NON_WAKING_CHECK_SUITE_CONCLUSIONS: ReadonlySet<string> = new Set([
   "stale",
 ]);
 
-/** How a source owner wants completed check suites from that source's subtree. */
+/**
+ * How a source owner wants completed check suites from that source's subtree.
+ *
+ * "failures-only" represents the default quiet behavior (only failing or unknown
+ * conclusions wake the owner). An explicit "failures-only" setting is an explicit
+ * no-op: it does not mask or override an ancestor source's independent "all-outcomes"
+ * opt-in, as each source configuration in the hierarchy governs delivery to that
+ * source's own owner independently.
+ */
 export type CheckSuiteCompletionMode = "failures-only" | "all-outcomes";
 
 /**

@@ -306,7 +306,7 @@ export interface EventRoutingReadPorts {
    * The opaque config on an active exact durable source. `undefined` means the
    * source has no durable row; `null` means it has no explicit config.
    */
-  eventSourceConfigFor?: (resource: EventResource) => string | null | undefined;
+  eventSourceConfigFor: (resource: EventResource) => string | null | undefined;
   /**
    * Looks up a live obligation by its already-canonical external reference.
    * The resolver, rather than each host, decides which resource kinds an
@@ -376,7 +376,7 @@ export interface EventRoutingKernel extends EventSourceResolver {
    * completed check-suite outcomes. This supplements, never changes, ordinary
    * ownership routing.
    */
-  allOutcomesCheckSuiteOwners?(resource: EventResource | string): string[];
+  allOutcomesCheckSuiteOwners(resource: EventResource | string): string[];
 }
 
 /**
@@ -476,8 +476,6 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
    */
   allOutcomesCheckSuiteOwners(resource: EventResource | string): string[] {
     const configFor = this.options.ports.eventSourceConfigFor;
-    if (!configFor) return [];
-
     const owners: string[] = [];
     let current: EventResource | undefined = safeResourceKey(resource);
     while (current) {
@@ -676,8 +674,8 @@ export class EventManager {
     const resource = raw.rawResource ?? notification.resource;
     const completedCheckSuite = event === "check_suite" && githubPayload.action === "completed";
     const quietCheckSuiteCompletion = completedCheckSuite && !checkSuiteWakesAnyone(githubPayload);
-    const checkSuiteCompletionOwnerIds = completedCheckSuite
-      ? (this.routing.allOutcomesCheckSuiteOwners?.(resource) ?? [])
+    const checkSuiteCompletionOwnerIds = quietCheckSuiteCompletion
+      ? this.routing.allOutcomesCheckSuiteOwners(resource)
       : [];
     if (quietCheckSuiteCompletion && checkSuiteCompletionOwnerIds.length === 0) {
       this.log?.(`non-actionable check suite dropped (${raw.eventSummary ?? event})`);
@@ -807,15 +805,22 @@ export class EventManager {
       eventSummary: normalized.eventSummary,
     });
 
-    // A source-specific all-outcomes setting creates an additional owner copy;
-    // it never makes the normal PR owner green by implication. For a quiet
-    // completion, only the explicit source owners receive a row. A failing or
-    // unknown conclusion keeps its normal owner/subscriber route and adds any
-    // opt-in owners, so `all-outcomes` means exactly that.
-    const ownerIds = normalized.quietCheckSuiteCompletion
-      ? [...(normalized.checkSuiteCompletionOwnerIds ?? [])]
-      : uniqueRecipientIds(recipients.ownerIds, normalized.checkSuiteCompletionOwnerIds ?? []);
-    const subscriberIds = normalized.quietCheckSuiteCompletion ? [] : recipients.subscriberIds;
+    // For a quiet check suite completion, only sources that explicitly opted in
+    // receive a copy. An opted-in actor that is the ladder's accountable owner
+    // receives an "owner" copy; an opted-in ancestor or observer receives a
+    // "subscriber" copy so the notification acts as an advisory prompt and
+    // joins rather than preempts an active run (#632).
+    // Failing or unknown suites keep their normal owner/subscriber route.
+    let ownerIds: readonly string[];
+    let subscriberIds: readonly string[];
+    if (normalized.quietCheckSuiteCompletion) {
+      const optInRecipients = normalized.checkSuiteCompletionOwnerIds ?? [];
+      ownerIds = optInRecipients.filter((id) => recipients.ownerIds.includes(id));
+      subscriberIds = optInRecipients.filter((id) => !recipients.ownerIds.includes(id));
+    } else {
+      ownerIds = recipients.ownerIds;
+      subscriberIds = recipients.subscriberIds;
+    }
 
     // Owners first, then subscribers — an explicit ordered array rather than a
     // Set, so delivery order is a property of this code instead of an unwritten
@@ -883,14 +888,4 @@ export class EventManager {
     }
     return { entries, ownerIds };
   }
-}
-
-function uniqueRecipientIds(...groups: ReadonlyArray<readonly string[]>): string[] {
-  const ids: string[] = [];
-  for (const group of groups) {
-    for (const id of group) {
-      if (!ids.includes(id)) ids.push(id);
-    }
-  }
-  return ids;
 }
