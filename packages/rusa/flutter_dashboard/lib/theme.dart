@@ -32,6 +32,9 @@ abstract final class MeshColors {
   /// states and grey draws idle/waiting states.
   static const statusQueued = statusIdle;
   static const statusWaiting = statusRetired;
+
+  /// Fable's identity color, a lighter tone of the Claude color (#728).
+  static const fable = Color(0xFFCF8063);
 }
 
 /// Per-kind chip colors, lifted verbatim from the mockup's `.inline-kind-chip`

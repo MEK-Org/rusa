@@ -1096,13 +1096,14 @@ void main() {
         expect(find.text('0%'), findsNothing);
 
         // Each provider now renders two concentric rings — weekly (outer),
-        // then session/5h (inner) — in that order .
+        // then session/5h (inner) — in that order . Claude's is followed by
+        // the single-ring Fable indicator (#752), unknown with no Fable window.
         final rings = tester
             .widgetList<CircularProgressIndicator>(
               find.byType(CircularProgressIndicator),
             )
             .toList();
-        expect(rings, hasLength(6));
+        expect(rings, hasLength(7));
         expect(
           rings[0].value,
           0.97,
@@ -1111,11 +1112,12 @@ void main() {
           rings[1].value,
           0.68,
         ); // claude session: 32% used => 68% remaining.
-        expect(rings[2].value, 0.1); // codex weekly: 90% used => 10% remaining.
-        expect(rings[3].value, 0.88); // codex 5h: 12% used => 88% remaining.
-        expect(rings[4].value, 0.5); // agy weekly: 50% used => 50% remaining.
+        expect(rings[2].value, 0.0); // fable: no Fable window => unknown.
+        expect(rings[3].value, 0.1); // codex weekly: 90% used => 10% remaining.
+        expect(rings[4].value, 0.88); // codex 5h: 12% used => 88% remaining.
+        expect(rings[5].value, 0.5); // agy weekly: 50% used => 50% remaining.
         expect(
-          rings[5].value,
+          rings[6].value,
           0.92,
         ); // agy five_hour: 8% used => 92% remaining.
 
@@ -1265,21 +1267,24 @@ void main() {
         final tooltips = tester
             .widgetList<Tooltip>(find.byType(Tooltip))
             .toList();
-        // 4 providers in order: Claude, Codex, Agy, Kimi
-        expect(tooltips, hasLength(4));
+        // 4 providers in order: Claude, then Fable (#752), Codex, Agy, Kimi
+        expect(tooltips, hasLength(5));
 
         // Claude: < 2m ago -> just "as of HH:mm"
         expect(tooltips[0].message, contains('as of '));
         expect(tooltips[0].message, isNot(contains('ago)')));
 
+        // Fable: no Fable window, so no scrape stamp of its own.
+        expect(tooltips[1].message, isNot(contains('as of ')));
+
         // Codex: 5m ago -> "(5m ago)"
-        expect(tooltips[1].message, contains('(5m ago)'));
+        expect(tooltips[2].message, contains('(5m ago)'));
 
         // Agy: 2h ago -> "(2h ago)"
-        expect(tooltips[2].message, contains('(2h ago)'));
+        expect(tooltips[3].message, contains('(2h ago)'));
 
         // Kimi: 2d ago -> "(2d ago)"
-        expect(tooltips[3].message, contains('(2d ago)'));
+        expect(tooltips[4].message, contains('(2d ago)'));
 
         await store.dispose();
       });
@@ -1400,13 +1405,15 @@ void main() {
               find.byType(CircularProgressIndicator),
             )
             .toList();
-        expect(rings, hasLength(3));
+        // Claude's session-primary ring, then Fable's (#752), Codex, Agy.
+        expect(rings, hasLength(4));
         expect(
           rings[0].value,
           0.68,
         ); // claude session, not the unknown weekly slot.
-        expect(rings[1].value, 0.1);
-        expect(rings[2].value, 0.5);
+        expect(rings[1].value, 0.0); // fable: no Fable window => unknown.
+        expect(rings[2].value, 0.1);
+        expect(rings[3].value, 0.5);
         expect(find.text('68%'), findsNothing);
 
         await store.dispose();

@@ -27,6 +27,7 @@ import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
@@ -248,6 +249,65 @@ void main() {
     });
   });
 
+  testWidgets(
+    'renders the header quota rings with Fable beside Claude (#752)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = _seedThreads()
+          ..quotaResult = _seedFableQuota();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await store.refreshQuota();
+        addTearDown(store.dispose);
+
+        // Room below the header for the ring's tooltip.
+        await tester.binding.setSurfaceSize(const Size(1200, 220));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        // The boundary wraps the whole app so the tooltip overlay is captured.
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: Align(
+                  alignment: Alignment.topCenter,
+                  child: MeshHeader(
+                    store: store,
+                    selected: DashboardView.overview,
+                    onSelect: (_) {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        expect(find.text('Fable'), findsOneWidget);
+        await captureBoundary(key, '$_outDir/header_quota_fable.png');
+
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Fable'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('Current week (Fable)'), findsOneWidget);
+        await captureBoundary(key, '$_outDir/header_quota_fable_tooltip.png');
+      });
+    },
+  );
+
   testWidgets('renders the avatar circle/size strip (26 / 52 / 91 px)', (
     tester,
   ) async {
@@ -415,6 +475,38 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
     ),
   ],
 );
+
+/// Claude with a Fable weekly allocation beside its provider-wide week (#752),
+/// plus Codex. Reset and scrape instants are null for a reproducible shot.
+QuotaSnapshotDto _seedFableQuota() {
+  final base = _seedQuota();
+  final claude = base.providers.first;
+  return QuotaSnapshotDto(
+    generatedAt: base.generatedAt,
+    providers: [
+      ProviderQuotaDto(
+        provider: claude.provider,
+        status: claude.status,
+        usedPercent: claude.usedPercent,
+        tier: null,
+        message: null,
+        windows: claude.windows,
+        modelWindows: const [
+          QuotaWindowDto(
+            id: 'weekly',
+            label: 'Current week (Fable)',
+            usedPercent: 74,
+            status: 'available',
+            headline: true,
+            windowMs: 604800000,
+            modelIds: ['claude-fable-5-1'],
+          ),
+        ],
+      ),
+      ...base.providers.skip(1),
+    ],
+  );
+}
 
 QuotaHistoryDto _overviewQuotaHistory() => const QuotaHistoryDto(
   generatedAt: '2026-06-26T09:00:00Z',

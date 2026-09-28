@@ -752,7 +752,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
         .toList(growable: false);
     if (providers.isEmpty) return const SizedBox.shrink();
     final rings = [
-      for (final entry in providers)
+      for (final entry in providers) ...[
         _ProviderQuotaRing(
           axis: axis,
           provider: entry.provider!,
@@ -761,6 +761,20 @@ class _QuotaHeaderStrip extends StatelessWidget {
               ? null
               : _findWindow(entry.provider, entry.config.sessionWindow!),
         ),
+        // #752: Fable rides the Claude reading but has its own weekly
+        // allocation, so it gets its own ring beside Claude's. It is shown
+        // wherever Claude is, reading unknown when no Fable window is known.
+        if (entry.provider!.provider == 'claude')
+          _ProviderQuotaRing(
+            axis: axis,
+            provider: entry.provider!,
+            weeklyWindow: fableWeeklyWindow(entry.provider!),
+            sessionWindow: null,
+            label: 'Fable',
+            labelColor: MeshColors.fable,
+            showThrottle: false,
+          ),
+      ],
     ];
     return AnimatedOpacity(
       opacity: refreshing ? 0.55 : 1.0,
@@ -817,6 +831,19 @@ QuotaWindowDto? _findWindow(ProviderQuotaDto? provider, String windowId) {
   return null;
 }
 
+/// Fable's weekly window on the Claude reading (#752): the one weekly model
+/// window scoped to Fable alone. Null when there is none, or when more than one
+/// claims to be it — an ambiguous identity reads unknown rather than picking
+/// one. Claude's provider windows are never consulted, so neither ring can
+/// stand in for the other.
+QuotaWindowDto? fableWeeklyWindow(ProviderQuotaDto claude) {
+  final matches = [
+    for (final window in claude.modelWindows)
+      if (window.id == 'weekly' && isFableModelScope(window.modelIds)) window,
+  ];
+  return matches.length == 1 ? matches.single : null;
+}
+
 /// Renders a provider's weekly quota as the outer ring and its session/5h
 /// quota as a smaller concentric ring inside it . Either ring shows grey
 /// (no crash) when its window is missing, unread, or otherwise unknown.
@@ -826,11 +853,23 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.weeklyWindow,
     required this.sessionWindow,
     this.axis = Axis.horizontal,
+    this.label,
+    this.labelColor,
+    this.showThrottle = true,
   });
 
   final ProviderQuotaDto provider;
   final QuotaWindowDto? weeklyWindow;
   final QuotaWindowDto? sessionWindow;
+
+  /// Overrides the provider name, for a ring that shows one model's
+  /// allocation within the provider (#752).
+  final String? label;
+  final Color? labelColor;
+
+  /// Whether the tooltip carries the provider's launch pacing. A model ring
+  /// leaves it out: that pacing is provider-wide, not the model's.
+  final bool showThrottle;
 
   /// How the strip this ring belongs to is laid out. Stacked in the drawer the
   /// row has a real width to fit inside, so the label gives way first; in the
@@ -853,10 +892,12 @@ class _ProviderQuotaRing extends StatelessWidget {
       now: now,
       freshness: provider.throttle?.freshness,
     );
+    final name = label ?? _providerLabel(provider.provider);
     final tooltip = [
-      _providerLabel(provider.provider),
+      name,
       tooltipParts.join('\n\n'),
-      if (provider.throttle != null) quotaThrottleTooltip(provider.throttle!),
+      if (showThrottle && provider.throttle != null)
+        quotaThrottleTooltip(provider.throttle!),
       ?asOf,
     ].join('\n');
     return Tooltip(
@@ -903,12 +944,12 @@ class _ProviderQuotaRing extends StatelessWidget {
             _LabelSlot(
               axis: axis,
               child: Text(
-                _providerLabel(provider.provider),
+                name,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 13,
-                  color: MeshColors.textSecondary,
+                  color: labelColor ?? MeshColors.textSecondary,
                   fontWeight: FontWeight.w500,
                 ),
               ),

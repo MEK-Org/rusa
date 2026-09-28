@@ -25,17 +25,12 @@ const _fallbackSeriesColors = <Color>[
 
 /// Fable is drawn in a lighter tone of the Claude color (#728). It is not in
 /// [_fallbackSeriesColors], so no hashed series can land on it.
-const _fableSeriesColor = Color(0xFFCF8063);
-
-/// Fable's canonical IDs, as the Claude model catalog lists them and quota
-/// history records them.
-const _fableModelIds = {'claude-fable-5', 'claude-fable-5-1'};
+const _fableSeriesColor = MeshColors.fable;
 
 bool _isFableSeries(QuotaHistorySeriesDto series) =>
     series.scope == 'model' &&
     series.provider == 'claude' &&
-    series.modelIds.isNotEmpty &&
-    series.modelIds.every(_fableModelIds.contains);
+    isFableModelScope(series.modelIds);
 
 /// Keeps known provider colors stable when the API changes the series order.
 Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
