@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { type EventResource, resourceKey } from "../actor/event-subscriptions.js";
 import {
+  checkSuiteCompletionModeFromConfig,
   checkSuiteWakesAnyone,
   deriveGitHubInboxNotification,
 } from "../github/inbox-notification.js";
@@ -135,6 +136,14 @@ export interface NormalizedIntegrationEvent {
   stampedAuthor?: StampedAuthorInfo | null;
   instanceId?: string;
   eventSummary?: string;
+  /**
+   * Source owners that explicitly requested every completed check-suite result.
+   * This stays transient at the ingress boundary; inbox payloads remain the
+   * established public `check_suite.completed` shape.
+   */
+  checkSuiteCompletionOwnerIds?: readonly string[];
+  /** True when the normal failures-only route must remain quiet. */
+  quietCheckSuiteCompletion?: boolean;
 }
 
 /**
@@ -294,6 +303,11 @@ export interface EventRoutingReadPorts {
   activeDelegationsFor: (resource: EventResource) => readonly { actorId: string }[];
   directSubscribersFor: (resource: EventResource) => readonly { actorId: string }[];
   /**
+   * The opaque config on an active exact durable source. `undefined` means the
+   * source has no durable row; `null` means it has no explicit config.
+   */
+  eventSourceConfigFor?: (resource: EventResource) => string | null | undefined;
+  /**
    * Looks up a live obligation by its already-canonical external reference.
    * The resolver, rather than each host, decides which resource kinds an
    * obligation may govern.
@@ -357,6 +371,12 @@ export interface EventRoutingKernel extends EventSourceResolver {
     resource: EventResource | string,
     options?: ResolveOwnerOptions
   ): EventSourceOwnerResolution;
+  /**
+   * Live owners of matching durable sources that independently opted in to
+   * completed check-suite outcomes. This supplements, never changes, ordinary
+   * ownership routing.
+   */
+  allOutcomesCheckSuiteOwners?(resource: EventResource | string): string[];
 }
 
 /**
@@ -446,6 +466,34 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
     }
 
     return { directed, ownerIds, subscriberIds, ownership };
+  }
+
+  /**
+   * Find each live, durable source owner that explicitly opted in to every
+   * completed suite under its source. Ordinary suite routing still selects one
+   * accountable owner; this independent, per-source list is how a repository
+   * steward can observe a coder-owned PR without changing the coder's default.
+   */
+  allOutcomesCheckSuiteOwners(resource: EventResource | string): string[] {
+    const configFor = this.options.ports.eventSourceConfigFor;
+    if (!configFor) return [];
+
+    const owners: string[] = [];
+    let current: EventResource | undefined = safeResourceKey(resource);
+    while (current) {
+      if (checkSuiteCompletionModeFromConfig(configFor(current)) === "all-outcomes") {
+        for (const sourceOwner of this.options.ports.activeDelegationsFor(current)) {
+          if (
+            this.options.ports.isLive(sourceOwner.actorId) &&
+            !owners.includes(sourceOwner.actorId)
+          ) {
+            owners.push(sourceOwner.actorId);
+          }
+        }
+      }
+      current = this.options.ports.parentOf(current);
+    }
+    return owners;
   }
 
   resolveOwner(
@@ -618,14 +666,6 @@ export class EventManager {
     // GitHub's event name is an ingress fact, never inferred from overlapping
     // payload keys. `pull_request_review` and `pull_request_review_comment`,
     // for example, both carry `pull_request`.
-    if (
-      event === "check_suite" &&
-      githubPayload.action === "completed" &&
-      !checkSuiteWakesAnyone(githubPayload)
-    ) {
-      this.log?.(`non-actionable check suite dropped (${raw.eventSummary ?? event})`);
-      return null;
-    }
     const notification = deriveGitHubInboxNotification(event, githubPayload);
     if (!notification) {
       // This is the same error the former start.ts ingress raised after it had
@@ -633,10 +673,20 @@ export class EventManager {
       // source pointer.
       throw new Error("GitHub event repository could not be resolved");
     }
+    const resource = raw.rawResource ?? notification.resource;
+    const completedCheckSuite = event === "check_suite" && githubPayload.action === "completed";
+    const quietCheckSuiteCompletion = completedCheckSuite && !checkSuiteWakesAnyone(githubPayload);
+    const checkSuiteCompletionOwnerIds = completedCheckSuite
+      ? (this.routing.allOutcomesCheckSuiteOwners?.(resource) ?? [])
+      : [];
+    if (quietCheckSuiteCompletion && checkSuiteCompletionOwnerIds.length === 0) {
+      this.log?.(`non-actionable check suite dropped (${raw.eventSummary ?? event})`);
+      return null;
+    }
     const payload: InboxPayload = { ...notification.payload };
     if (raw.priority === "responsive") payload.priority = "responsive";
     return {
-      resource: raw.rawResource ?? notification.resource,
+      resource,
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt: raw.receivedAt,
@@ -644,6 +694,8 @@ export class EventManager {
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
       eventSummary: raw.eventSummary,
+      checkSuiteCompletionOwnerIds,
+      quietCheckSuiteCompletion,
     };
   }
 
@@ -755,14 +807,24 @@ export class EventManager {
       eventSummary: normalized.eventSummary,
     });
 
+    // A source-specific all-outcomes setting creates an additional owner copy;
+    // it never makes the normal PR owner green by implication. For a quiet
+    // completion, only the explicit source owners receive a row. A failing or
+    // unknown conclusion keeps its normal owner/subscriber route and adds any
+    // opt-in owners, so `all-outcomes` means exactly that.
+    const ownerIds = normalized.quietCheckSuiteCompletion
+      ? [...(normalized.checkSuiteCompletionOwnerIds ?? [])]
+      : uniqueRecipientIds(recipients.ownerIds, normalized.checkSuiteCompletionOwnerIds ?? []);
+    const subscriberIds = normalized.quietCheckSuiteCompletion ? [] : recipients.subscriberIds;
+
     // Owners first, then subscribers — an explicit ordered array rather than a
     // Set, so delivery order is a property of this code instead of an unwritten
     // dependency on Set iteration semantics.
     const destinations: string[] = [];
-    for (const id of recipients.ownerIds) {
+    for (const id of ownerIds) {
       if (!destinations.includes(id)) destinations.push(id);
     }
-    for (const sub of recipients.subscriberIds) {
+    for (const sub of subscriberIds) {
       if (!destinations.includes(sub)) destinations.push(sub);
     }
 
@@ -804,7 +866,7 @@ export class EventManager {
       deliveredAt: normalized.deliveredAt,
       payload: {
         ...normalized.payload,
-        deliveryRole: recipients.ownerIds.includes(actorId) ? "owner" : "subscriber",
+        deliveryRole: ownerIds.includes(actorId) ? "owner" : "subscriber",
       },
     }));
 
@@ -819,6 +881,16 @@ export class EventManager {
         throw new Error(`Inbox append returned an unexpected actor: ${entry.actorId}`);
       }
     }
-    return { entries, ownerIds: recipients.ownerIds };
+    return { entries, ownerIds };
   }
+}
+
+function uniqueRecipientIds(...groups: ReadonlyArray<readonly string[]>): string[] {
+  const ids: string[] = [];
+  for (const group of groups) {
+    for (const id of group) {
+      if (!ids.includes(id)) ids.push(id);
+    }
+  }
+  return ids;
 }

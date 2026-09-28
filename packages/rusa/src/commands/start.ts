@@ -2377,6 +2377,7 @@ async function composeStart(
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      eventSourceConfigFor: (resource) => eventSourceOwners.getConfig(resource),
       findLiveObligationByExternalRef: (ref) =>
         getRepositories().obligations.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),

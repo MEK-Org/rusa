@@ -128,6 +128,7 @@ function createRoutingKernel(opts: {
       isLive: opts.isLive ?? (() => true),
       activeDelegationsFor: (resource) => opts.owners.activeForResource(resource),
       directSubscribersFor: (resource) => opts.subscriptions.subscribersOf(resource),
+      eventSourceConfigFor: (resource) => opts.owners.getConfig(resource),
       findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: opts.resolveActor,
     },
@@ -263,6 +264,146 @@ describe("EventManager", () => {
       expect(entries).toEqual([]);
       expect(resolved).toBe(false);
       expect(inbox.entries).toEqual([]);
+    });
+
+    it("delivers a green suite only to an opted-in covering source owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      owners.setConfig(
+        pullRequest,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "failures-only" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        idempotencyKey: "green-suite-on-coder-pr",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 746, conclusion: "success", pull_requests: [{ number: 746 }] },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["steward"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
+      expect(inbox.entries[0]?.payload.deliveryRole).toBe("owner");
+      expect(inbox.list("coder").entries).toEqual([]);
+    });
+
+    it("uses the opt-in for branch fallback once, then restores the quiet default when cleared", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+      const greenBranchSuite: RawIntegrationEvent = {
+        sourceType: "github",
+        idempotencyKey: "green-branch-suite",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 747, conclusion: "success", head_branch: "staging" },
+          },
+        },
+      };
+
+      expect(
+        manager.handleExternalEvent(greenBranchSuite).entries.map((entry) => entry.actorId)
+      ).toEqual(["steward"]);
+      expect(manager.handleExternalEvent(greenBranchSuite).entries).toEqual([]);
+
+      owners.setConfig(repository, null);
+      const afterClear = manager.handleExternalEvent({
+        ...greenBranchSuite,
+        idempotencyKey: "green-branch-suite-after-clear",
+      });
+      expect(afterClear.entries).toEqual([]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
+    });
+
+    it("adds an opted-in source owner to a failing suite without replacing its PR owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 746, conclusion: "failure", pull_requests: [{ number: 746 }] },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["coder", "steward"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder", "steward"]);
+      expect(inbox.entries.every((entry) => entry.payload.deliveryRole === "owner")).toBe(true);
     });
 
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {

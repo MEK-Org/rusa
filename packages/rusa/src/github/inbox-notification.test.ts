@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resourceKey } from "../actor/event-subscriptions.js";
 import {
+  checkSuiteCompletionModeFromConfig,
   checkSuiteWakesAnyone,
   deriveGitHubInboxNotification,
   githubInboxEventReference,
@@ -336,6 +337,29 @@ describe("checkSuiteWakesAnyone", () => {
         check_suite: { id: 456, status: "queued", conclusion: null },
       })
     ).toBe(true);
+  });
+});
+
+describe("checkSuiteCompletionModeFromConfig", () => {
+  it("reads the opt-in alongside another version-1 event-source setting", () => {
+    expect(
+      checkSuiteCompletionModeFromConfig(
+        '{"version":1,"chatWakeMode":"all","checkSuiteCompletionMode":"all-outcomes"}'
+      )
+    ).toBe("all-outcomes");
+  });
+
+  it("keeps failures-only behavior for absent, malformed, or unknown-version values", () => {
+    for (const raw of [
+      undefined,
+      null,
+      "not JSON",
+      '{"version":2,"checkSuiteCompletionMode":"all-outcomes"}',
+      '{"version":1,"checkSuiteCompletionMode":"unknown"}',
+      '{"version":1,"chatWakeMode":"all"}',
+    ]) {
+      expect(checkSuiteCompletionModeFromConfig(raw)).toBeUndefined();
+    }
   });
 });
 
