@@ -1508,8 +1508,8 @@ async function composeStart(
           // Interrupt at interrupt confidence >= 0.5 (#710): a starting point
           // from an offline run of operator-supplied examples, not a
           // calibration; the shadow audit stays the calibration source. It
-          // decides the recorded policy outcome only; the chat reaction shows
-          // JEV's own verdict, and shadow mode never changes scheduling.
+          // decides the recorded policy outcome and the chat reaction; shadow
+          // mode never changes scheduling.
           threshold: 0.5,
           ...(jevApiKey
             ? {

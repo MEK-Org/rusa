@@ -59,7 +59,8 @@ and carries a numeric confidence.
 The shadow audit retains stable inbox IDs, candidate source, verdict/confidence,
 and baseline scheduler behavior; it does not retain message bodies, TypeSafe
 responses, credentials, or request-error bodies. Google Chat predictions react
-on the arriving message with `✅` (would interrupt) or `❌` (would queue).
+on the arriving message with the threshold-applied policy outcome: `✅` (would
+interrupt) or `❌` (would queue).
 
 ## Failure behavior
 

@@ -92,6 +92,7 @@ import {
 } from "./provider-pacer.js";
 import {
   SHADOW_INTERRUPT_EMOJI,
+  SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
 } from "./responsive-interruption.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
@@ -3211,10 +3212,9 @@ describe("ActorMesh", () => {
     ]);
   });
 
-  it("reacts with JEV's own interrupt below the threshold, and audits verdict and outcome (#710)", async () => {
-    // The reaction is for judging the model, so a below-threshold interrupt
-    // shows ✅, not the policy's queue. The audit keeps both, so tuning the
-    // threshold never has to infer what JEV said from the code.
+  it("reacts with the policy queue below the threshold, and audits verdict and outcome", async () => {
+    // The reaction shows the threshold-applied outcome. The audit keeps JEV's
+    // raw verdict and confidence, so threshold tuning still has its evidence.
     const inboxStore = createMemoryInboxStore();
     const events: MeshEventInput[] = [];
     const reactions: Array<{ messageName: string; emoji: string }> = [];
@@ -3254,9 +3254,7 @@ describe("ActorMesh", () => {
     await tick();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(reactions).toEqual([
-      { messageName: "spaces/S/messages/M", emoji: SHADOW_INTERRUPT_EMOJI },
-    ]);
+    expect(reactions).toEqual([{ messageName: "spaces/S/messages/M", emoji: SHADOW_QUEUE_EMOJI }]);
     const shadow = events.filter((event) => event.kind === "responsive_interruption_shadow");
     expect(shadow).toHaveLength(1);
     expect(JSON.parse(shadow[0]?.payload ?? "{}").decision).toMatchObject({

@@ -112,20 +112,20 @@ export function shadowVerdictEmoji(verdict: ResponsiveInterruptionVerdict): stri
 }
 
 /**
- * JEV's own verdict, or `null` when it gave none.
+ * The threshold-applied policy outcome, or `null` when JEV gave none.
  *
  * Only a model that answered has predicted anything. No client, a client
  * error, a timeout, a malformed answer, or nothing to weigh the arrival
  * against are failures to evaluate, and showing them as ❌ would read as a
  * judgement nobody made — the operator could then "correct" it. A
- * below-threshold interrupt shows as the interrupt JEV answered, not as the
- * policy's queue (#710): the reaction is there for the operator to judge the
- * model, and the threshold is tuned from the audit, which keeps both.
+ * below-threshold interrupt shows as the policy's queue, because the reaction
+ * reports what shadow mode would have done. The audit retains JEV's raw
+ * verdict and confidence as the evidence for tuning the threshold.
  */
 export function shadowPrediction(
   decision: ResponsiveInterruptionDecision
 ): ResponsiveInterruptionVerdict | null {
-  return decision.verdict ?? null;
+  return decision.verdict ? decision.outcome : null;
 }
 
 /**

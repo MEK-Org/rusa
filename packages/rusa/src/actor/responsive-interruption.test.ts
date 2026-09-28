@@ -11,6 +11,8 @@ import {
   type JevDecisionRequest,
   JevInputUnavailableError,
   RESPONSIVE_INTERRUPTION_QUESTION,
+  type ResponsiveInterruptionDecision,
+  type ResponsiveInterruptionQueueReason,
   SHADOW_INTERRUPT_EMOJI,
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -468,25 +470,25 @@ describe("shadowPrediction", () => {
       pendingEntryIds: [],
     });
 
-  it("is the model's verdict whenever the model answered", async () => {
+  it("is the policy outcome whenever the model answered", async () => {
     expect(
       shadowPrediction(await decide(async () => ({ verdict: "interrupt", confidence: 0.9 })))
     ).toBe("interrupt");
     expect(
       shadowPrediction(await decide(async () => ({ verdict: "queue", confidence: 0.3 })))
     ).toBe("queue");
-    // A weak interrupt turned back by the threshold still shows what JEV
-    // said, not the policy's queue (#710).
+    // A weak interrupt becomes the policy's queue, while the decision keeps
+    // JEV's original verdict for the audit.
     const weak = await decide(async () => ({ verdict: "interrupt", confidence: 0.5 }));
     expect(weak).toMatchObject({
       outcome: "queue",
       reason: "low_confidence",
       verdict: "interrupt",
     });
-    expect(shadowPrediction(weak)).toBe("interrupt");
+    expect(shadowPrediction(weak)).toBe("queue");
   });
 
-  it("is nothing when no judgement was made", async () => {
+  it("is nothing for every reason JEV did not answer", async () => {
     expect(shadowPrediction(await decide())).toBe(null);
     expect(
       shadowPrediction(
@@ -499,6 +501,31 @@ describe("shadowPrediction", () => {
     expect(
       shadowPrediction(await decide(async () => ({ verdict: "maybe", confidence: 0.9 })))
     ).toBe(null);
+
+    const noAnswerReasons: Exclude<ResponsiveInterruptionQueueReason, "low_confidence">[] = [
+      "unavailable",
+      "client_error",
+      "input_unavailable",
+      "timeout",
+      "no_candidates",
+      "invalid_verdict",
+      "invalid_confidence",
+    ];
+    for (const reason of noAnswerReasons) {
+      const decision: ResponsiveInterruptionDecision = {
+        incomingEntryId: "incoming-z",
+        candidateSource: "selected",
+        threshold: 0.8,
+        input: {
+          incomingEntryId: "incoming-z",
+          selectedEntryIds: ["selected-a"],
+          pendingEntryIds: [],
+        },
+        outcome: "queue",
+        reason,
+      };
+      expect(shadowPrediction(decision)).toBe(null);
+    }
   });
 });
 
