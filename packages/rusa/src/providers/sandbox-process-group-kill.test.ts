@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildActorBwrapArgs } from "./sandbox.js";
+import { buildActorBwrapArgs, teardownFlutterOverlay } from "./sandbox.js";
 import { runSubprocess } from "./subprocess-execution.js";
 
 function probeBwrapCapable(): boolean {
@@ -20,8 +20,13 @@ describe.skipIf(!BWRAP_CAPABLE)(
   "Sandbox — transitive process-group kill inside bwrap (Issue #164 leg 1)",
   () => {
     const temps: string[] = [];
+    const actorDirs: string[] = [];
 
     afterEach(() => {
+      for (const d of actorDirs) {
+        teardownFlutterOverlay(d);
+      }
+      actorDirs.length = 0;
       for (const d of temps) {
         try {
           rmSync(d, { recursive: true, force: true });
@@ -34,6 +39,7 @@ describe.skipIf(!BWRAP_CAPABLE)(
 
     it("refuses a group kill that resolves to its own group, reaps a setsid one", async () => {
       const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-"));
+      actorDirs.push(tmp);
       temps.push(tmp);
 
       const script = join(tmp, "fake-cli.sh");
@@ -129,6 +135,7 @@ describe.skipIf(!BWRAP_CAPABLE)(
 
     it("aborting runSubprocess from outside kills grandchild processes inside bwrap", async () => {
       const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-abort-"));
+      actorDirs.push(tmp);
       temps.push(tmp);
 
       const script = join(tmp, "fake-cli-long.sh");
@@ -201,6 +208,15 @@ describe.skipIf(!BWRAP_CAPABLE)(
 );
 
 describe("Sandbox provider args generation (always executed)", () => {
+  afterEach(() => {
+    teardownFlutterOverlay("/tmp/fake");
+    try {
+      rmSync("/tmp/fake", { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
+
   it("includes exactly one --new-session for actor isolation (issue #164)", () => {
     const result = buildActorBwrapArgs("/tmp/fake", undefined, undefined, false);
     expect(result.args.filter((a) => a === "--new-session")).toHaveLength(1);
