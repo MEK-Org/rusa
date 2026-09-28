@@ -601,7 +601,7 @@ void main() {
     testWidgets('gives a model series a color no visible provider uses', (
       tester,
     ) async {
-      // codex-mini's hashed palette slot is the Codex green.
+      // claude-fable's hashed palette slot is the Codex green.
       QuotaHistorySeriesDto withInterval(QuotaHistorySeriesDto series) =>
           QuotaHistorySeriesDto(
             provider: series.provider,
@@ -631,16 +631,7 @@ void main() {
                 points: [],
               ),
             ),
-            withInterval(
-              const QuotaHistorySeriesDto(
-                provider: 'codex',
-                windowId: 'weekly',
-                scope: 'model',
-                modelIds: ['codex-mini'],
-                label: 'Mini',
-                points: [],
-              ),
-            ),
+            withInterval(fable),
           ],
         ),
       );
@@ -658,11 +649,10 @@ void main() {
     group('Fable is drawn in #CF8063 (#728)', () {
       const fableColor = Color(0xFFCF8063);
       QuotaHistorySeriesDto controlled(
-        String provider,
         List<String> modelIds, {
         String label = 'Model',
       }) => QuotaHistorySeriesDto(
-        provider: provider,
+        provider: 'claude',
         windowId: 'weekly',
         scope: modelIds.isEmpty ? 'provider' : 'model',
         modelIds: modelIds,
@@ -676,6 +666,12 @@ void main() {
           ),
         ],
       );
+      final claudeWide = controlled(const [], label: 'Weekly');
+      final fableSeries = controlled(const [
+        'claude-fable-5',
+        'claude-fable-5-1',
+      ], label: 'Fable');
+
       List<Color> plotColors(WidgetTester tester, String key) {
         final painter = tester
             .widget<CustomPaint>(find.byKey(Key(key)))
@@ -685,77 +681,59 @@ void main() {
             : (painter as QuotaThrottleIntervalChartPainter).colors;
       }
 
-      Color legendColor(WidgetTester tester, Finder label) {
-        final key = tester.widget<Container>(
-          find.descendant(
-            of: find.ancestor(of: label, matching: find.byType(Row)).first,
-            matching: find.byType(Container),
-          ),
-        );
-        return (key.decoration! as BoxDecoration).color!;
-      }
-
       testWidgets('on both plots and both legend keys', (tester) async {
         await pumpChart(
           tester,
           QuotaHistoryDto(
             generatedAt: generatedAt,
             historySince: historySince,
-            history: [
-              controlled('claude', const []),
-              controlled('codex', const []),
-              controlled('claude', const ['claude-fable-5-1'], label: 'Fable'),
-            ],
+            history: [claudeWide, fableSeries],
           ),
         );
 
-        // Provider colors are unchanged: Claude, then Codex.
-        const expected = [Color(0xFFC15F3C), Color(0xFF10B981), fableColor];
+        const expected = [Color(0xFFC15F3C), fableColor];
         expect(plotColors(tester, 'quota-pace-error-chart'), expected);
         expect(plotColors(tester, 'quota-throttle-interval-chart'), expected);
         final legends = find.text('Claude · Fable');
         expect(legends, findsNWidgets(2));
-        expect(legendColor(tester, legends.at(0)), fableColor);
-        expect(legendColor(tester, legends.at(1)), fableColor);
+        for (var i = 0; i < 2; i++) {
+          final key = tester.widget<Container>(
+            find.descendant(
+              of: find
+                  .ancestor(of: legends.at(i), matching: find.byType(Row))
+                  .first,
+              matching: find.byType(Container),
+            ),
+          );
+          expect((key.decoration! as BoxDecoration).color, fableColor);
+        }
       });
 
-      testWidgets('and no other series ever lands on it', (tester) async {
-        const others = [
-          'claude-opus-5-5',
-          'claude-sonnet-5',
-          'claude-haiku-4-5',
-          'claude-opus-4-8',
-          'claude-sonnet-4-6',
-          'claude-opus',
-          'claude-mythos',
-          'claude-sonnet',
-          'claude-haiku',
-        ];
-        await pumpChart(
-          tester,
-          QuotaHistoryDto(
-            generatedAt: generatedAt,
-            historySince: historySince,
-            history: [
-              controlled('claude', const []),
-              for (final id in others) controlled('claude', [id]),
-              // A Fable-named model on another provider is not Claude's Fable.
-              controlled('codex', const ['claude-fable']),
-              controlled('claude', const ['claude-fable'], label: 'Fable'),
-              // A second Fable series still gets a color of its own.
-              controlled('claude', const ['claude-fable-5-1'], label: 'Fable'),
-            ],
-          ),
-        );
+      testWidgets('while every other series keeps its hashed color', (
+        tester,
+      ) async {
+        // model-h hashes to Fable's slot (#EC4899), so with Fable present it
+        // steps past that slot exactly as it did before #728.
+        final later = controlled(const ['model-h']);
+        Future<List<Color>> colorsWith(List<QuotaHistorySeriesDto> history) =>
+            pumpChart(
+              tester,
+              QuotaHistoryDto(
+                generatedAt: generatedAt,
+                historySince: historySince,
+                history: history,
+              ),
+            ).then((_) => plotColors(tester, 'quota-pace-error-chart'));
 
-        final colors = plotColors(tester, 'quota-throttle-interval-chart');
-        expect(colors, hasLength(others.length + 4));
-        final fableAt = [
-          for (var i = 0; i < colors.length; i++)
-            if (colors[i] == fableColor) i,
-        ];
-        expect(fableAt, [others.length + 2]);
-        expect(plotColors(tester, 'quota-pace-error-chart'), colors);
+        expect(await colorsWith([claudeWide, fableSeries, later]), const [
+          Color(0xFFC15F3C),
+          fableColor,
+          Color(0xFF14B8A6),
+        ]);
+        expect(await colorsWith([claudeWide, later]), const [
+          Color(0xFFC15F3C),
+          Color(0xFFEC4899),
+        ]);
       });
     });
 

@@ -27,8 +27,15 @@ const _fallbackSeriesColors = <Color>[
 /// [_fallbackSeriesColors], so no hashed series can land on it.
 const _fableSeriesColor = Color(0xFFCF8063);
 
-/// Claude's passable Fable IDs (`claude-fable`, `claude-fable-5-1`, ...).
-final _fableModelId = RegExp(r'^claude-fable($|[-\[])');
+/// Fable's canonical IDs, as the Claude model catalog lists them and quota
+/// history records them.
+const _fableModelIds = {'claude-fable-5', 'claude-fable-5-1'};
+
+bool _isFableSeries(QuotaHistorySeriesDto series) =>
+    series.scope == 'model' &&
+    series.provider == 'claude' &&
+    series.modelIds.isNotEmpty &&
+    series.modelIds.every(_fableModelIds.contains);
 
 /// Keeps known provider colors stable when the API changes the series order.
 Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
@@ -42,14 +49,6 @@ Color _quotaChartColorForSeries(
 }) {
   if (series.scope != 'model') {
     return _quotaChartColorForProvider(series.provider, fallbackIndex);
-  }
-  // Pinned by canonical IDs, like the hash below, while no other visible
-  // series has taken it.
-  if (series.provider == 'claude' &&
-      series.modelIds.isNotEmpty &&
-      series.modelIds.every(_fableModelId.hasMatch) &&
-      !taken.contains(_fableSeriesColor)) {
-    return _fableSeriesColor;
   }
   // Model history must be visually distinct from its provider-wide series.
   // Hash canonical IDs rather than the display label, which is presentation.
@@ -149,6 +148,15 @@ class QuotaHistoryChart extends StatelessWidget {
           i,
           taken: colors.values.toSet(),
         );
+      }
+    }
+    // Fable keeps its hashed slot above, so every other series steps past it
+    // exactly as before; only the color Fable is drawn in changes (#728). Only
+    // the first Fable series is repainted, so two never share a color.
+    for (final series in visible) {
+      if (_isFableSeries(series)) {
+        colors[series] = _fableSeriesColor;
+        break;
       }
     }
     // Headroom and throttle are controller decisions. A reading recorded
