@@ -236,14 +236,22 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       for (const entry of unseen) entry.seenAt = seenAt;
       return unseen;
     },
-    markHandled: (actorId, entryIds, handledAt = new Date("2026-01-01T00:00:00Z")) => {
+    markHandled: (
+      actorId,
+      entryIds,
+      handledAt = new Date("2026-01-01T00:00:00Z"),
+      handledNote?: string
+    ) => {
       return entryIds.map((id) => {
         const entry = entries.find(
           (candidate) => candidate.actorId === actorId && candidate.id === id
         );
         if (!entry) throw new Error("inbox entry not found");
         const alreadyHandled = entry.handledAt !== null;
-        if (!entry.handledAt) entry.handledAt = handledAt;
+        if (!entry.handledAt) {
+          entry.handledAt = handledAt;
+          entry.handledNote = handledNote?.trim() || null;
+        }
         return { id, handledAt: entry.handledAt, alreadyHandled };
       });
     },
@@ -300,6 +308,8 @@ function setup(
     idgen?: () => string;
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
     recordRunYield?: ActorMeshOptions["recordRunYield"];
+    completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
+    clearFocusEntryIds?: ActorMeshOptions["clearFocusEntryIds"];
     inboxStore?: InboxRepository;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
@@ -380,6 +390,8 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
+    completedFocusEntryCounts: opts.completedFocusEntryCounts,
+    clearFocusEntryIds: opts.clearFocusEntryIds,
     experimentEnrollments: opts.experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
@@ -12771,6 +12783,282 @@ describe("accountRun token accounting (#443)", () => {
       expect(mesh.selectInboxEntries("root", ["new-item"])).toHaveLength(1);
       expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
       expect(mesh.hasOnlyExhaustedWork("root")).toBe(false);
+    });
+
+    it("escalates exhausted inbox work to parent with failure notice and wakes parent (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      await tick();
+
+      let completed = 0;
+      mesh.lifecycleFor(worker).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = () => new Map([["exhausted-item", completed]]);
+
+      inboxStore.append([
+        {
+          id: "exhausted-item",
+          actorId: worker,
+          source: "mesh:root",
+          payload: payload("mesh.message"),
+        },
+      ]);
+
+      // Initial run + 1 retry = 2 calls
+      await tick();
+      expect(fake(worker).calls).toHaveLength(2);
+      expect(mesh.hasExhaustedSelectedWork(worker)).toBe(true);
+
+      // Parent (root) received mechanical failure notice
+      const parentInbox = inboxStore.list("root");
+      const failureNotice = parentInbox.entries.find(
+        (e) => e.source === `mesh:mechanical:${worker}`
+      );
+      expect(failureNotice).toBeDefined();
+      expect(failureNotice?.payload.type).toBe("mesh.mechanical_note");
+      expect(failureNotice?.payload.status).toBe("exhausted_inbox");
+      expect(failureNotice?.payload.actorId).toBe(worker);
+      expect(failureNotice?.payload.note).toContain("[inbox recovery exhausted]");
+      expect(failureNotice?.payload.note).toContain(worker);
+      expect(failureNotice?.payload.note).toContain("exhausted-item");
+      expect(failureNotice?.payload.note).toContain("skipped mark_handled");
+      expect(failureNotice?.payload.note).toContain("release the selection lock");
+      expect(failureNotice?.payload.note).toContain("mark the entries handled with a note");
+
+      // Root was dispatched due to the notice delivery
+      await tick();
+      expect(fake("root").calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("does not escalate root exhaustion to a parent (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+
+      let completed = 1;
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = () => new Map([["root-item", completed]]);
+
+      inboxStore.append([
+        {
+          id: "root-item",
+          actorId: "root",
+          source: "mesh:operator",
+          payload: payload("mesh.message"),
+        },
+      ]);
+
+      mesh.selectInboxEntries("root", ["root-item"]);
+      // Root finishes run without handling, reaching recovery limit
+      completed = 2;
+      mesh.finishInboxRun("root", { successful: true, runId: "root-run-1" });
+
+      expect(mesh.hasExhaustedSelectedWork("root")).toBe(true);
+      // No mechanical notices appended anywhere
+      const rootList = inboxStore.list("root", { status: "all" });
+      const mechanical = rootList.entries.filter((e) => e.source.startsWith("mesh:mechanical:"));
+      expect(mechanical).toHaveLength(0);
+    });
+
+    it("enforces authority checks for parent inbox actions (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({ inboxStore });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const stranger = mesh.spawn({ charter: "stranger", parentId: "root" });
+      await tick();
+
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = (actorId) =>
+        actorId === child ? new Map([["exhausted-1", 2]]) : new Map();
+
+      inboxStore.append([
+        { id: "exhausted-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+      ]);
+
+      // Child cannot self-clear
+      expect(() => mesh.releaseChildInboxSelectionLock(child, child, ["exhausted-1"])).toThrow(
+        /self-clear/i
+      );
+      expect(() => mesh.markChildInboxHandled(child, child, ["exhausted-1"], "handled it")).toThrow(
+        /self-clear/i
+      );
+
+      // Stranger cannot clear
+      expect(() => mesh.releaseChildInboxSelectionLock(stranger, child, ["exhausted-1"])).toThrow(
+        /Only the parent thread/i
+      );
+      expect(() =>
+        mesh.markChildInboxHandled(stranger, child, ["exhausted-1"], "handled it")
+      ).toThrow(/Only the parent thread/i);
+
+      // Root has no mesh parent and cannot be cleared by an actor
+      expect(() => mesh.releaseChildInboxSelectionLock(parent, "root", ["exhausted-1"])).toThrow(
+        /Root has no parent in the mesh/i
+      );
+      expect(() =>
+        mesh.markChildInboxHandled(parent, "root", ["exhausted-1"], "handled it")
+      ).toThrow(/Root has no parent in the mesh/i);
+
+      // Empty note is rejected for markChildInboxHandled
+      expect(() => mesh.markChildInboxHandled(parent, child, ["exhausted-1"], "   ")).toThrow(
+        /note cannot be empty/i
+      );
+    });
+
+    it("rejects parent clearance outside the exhaustion path (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({ inboxStore });
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      await tick();
+
+      (
+        mesh as unknown as {
+          completedFocusEntryCounts: (
+            actorId: string,
+            excludeRunId?: string
+          ) => ReadonlyMap<string, number>;
+        }
+      ).completedFocusEntryCounts = () =>
+        new Map([
+          ["exhausted-1", 2],
+          ["unexhausted-1", 1],
+        ]);
+
+      inboxStore.append([
+        { id: "exhausted-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+        { id: "unexhausted-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+      ]);
+
+      // Non-exhausted entry is rejected
+      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["unexhausted-1"])).toThrow(
+        /not exhausted/i
+      );
+      expect(() => mesh.markChildInboxHandled(parent, child, ["unexhausted-1"], "note")).toThrow(
+        /not exhausted/i
+      );
+
+      // Non-existent entry is rejected
+      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["missing-entry"])).toThrow(
+        /not found/i
+      );
+
+      // Already handled entry is rejected
+      inboxStore.markHandled(child, ["exhausted-1"]);
+      expect(() => mesh.releaseChildInboxSelectionLock(parent, child, ["exhausted-1"])).toThrow(
+        /already handled/i
+      );
+    });
+
+    it("releases selection lock and returns work to unhandled queue (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      let completed = 2;
+      const clearedEntries: string[] = [];
+
+      const { mesh, fake, tick } = setup({
+        inboxStore,
+        completedFocusEntryCounts: () =>
+          completed > 0 ? new Map([["item-1", completed]]) : new Map(),
+        clearFocusEntryIds: (_actorId, ids) => {
+          clearedEntries.push(...ids);
+          completed = 0;
+          return ids.length;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      mesh.lifecycleFor(child).add({
+        onEnd: (event) => {
+          if (event.terminal.kind === "result") completed++;
+        },
+      });
+      await tick();
+
+      inboxStore.append([
+        { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+      ]);
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
+
+      // Child cannot select while locked
+      expect(() => mesh.selectInboxEntries(child, ["item-1"])).toThrow(/needs attention/i);
+
+      // Parent releases selection lock
+      const initialCalls = fake(child).calls.length;
+      const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"]);
+      expect(res.released).toEqual(["item-1"]);
+      expect(clearedEntries).toEqual(["item-1"]);
+
+      // Selection lock is cleared; child can select it again
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
+      expect(mesh.selectInboxEntries(child, ["item-1"])).toHaveLength(1);
+
+      // Child is dispatched upon release
+      await tick();
+      expect(fake(child).calls.length).toBeGreaterThan(initialCalls);
+    });
+
+    it("marks exhausted child work handled with audit note (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const countsMap = new Map([["item-1", 2]]);
+
+      const { mesh, tick } = setup({
+        inboxStore,
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      await tick();
+
+      inboxStore.append([
+        { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+      ]);
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
+
+      // Parent marks handled
+      const res = mesh.markChildInboxHandled(
+        parent,
+        child,
+        ["item-1"],
+        "confirmed review feedback was completed in PR #730"
+      );
+      expect(res.handled).toHaveLength(1);
+      expect(res.handled[0].id).toBe("item-1");
+
+      // Entry is marked handled and bears audit note
+      const readEntry = inboxStore.read(child, "item-1");
+      expect(readEntry?.handledAt).not.toBeNull();
+      expect(readEntry?.handledNote).toBe(
+        `Marked handled by parent (${parent}): confirmed review feedback was completed in PR #730`
+      );
+
+      // Exhaustion clears because the entry is now handled
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
     });
   });
 });

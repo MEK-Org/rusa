@@ -673,6 +673,164 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
+    "release_selection_lock",
+    {
+      title: "Release inbox selection lock for a child thread",
+      description:
+        "Release the selection lock on exhausted inbox entries for a child thread after " +
+        "investigating why recovery exhausted. This returns truly unhandled work to the " +
+        "child's ordinary unhandled queue so it can be selected again. Available only to " +
+        "the child's parent, and scoped exclusively to unhandled entries that exhausted bounded recovery.",
+      inputSchema: {
+        thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The child thread whose exhausted inbox entries are being released."),
+        actor_id: z.string().min(1).optional().describe("Alternative alias for thread_id."),
+        entry_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("The exhausted inbox entry IDs to release."),
+        entry_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Single exhausted inbox entry ID to release."),
+      },
+    },
+    async ({ thread_id, actor_id, entry_ids, entry_id }) => {
+      try {
+        const targetId = thread_id ?? actor_id;
+        if (!targetId) throw new Error("provide thread_id (or actor_id)");
+        if ((entry_id === undefined) === (entry_ids === undefined)) {
+          throw new Error("provide exactly one of entry_id or entry_ids");
+        }
+        const ids = entry_id !== undefined ? [entry_id] : (entry_ids ?? []);
+        const result = mesh.releaseChildInboxSelectionLock(selfId, targetId, ids);
+        options?.onWrite?.();
+        return toolOk(result);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  const markChildHandledHandler = async ({
+    thread_id,
+    actor_id,
+    entry_ids,
+    entry_id,
+    note,
+  }: {
+    thread_id?: string;
+    actor_id?: string;
+    entry_ids?: string[];
+    entry_id?: string;
+    note: string;
+  }) => {
+    try {
+      const targetId = thread_id ?? actor_id;
+      if (!targetId) throw new Error("provide thread_id (or actor_id)");
+      if ((entry_id === undefined) === (entry_ids === undefined)) {
+        throw new Error("provide exactly one of entry_id or entry_ids");
+      }
+      const ids = entry_id !== undefined ? [entry_id] : (entry_ids ?? []);
+      const result = mesh.markChildInboxHandled(selfId, targetId, ids, note);
+      options?.onWrite?.();
+      return toolOk(result);
+    } catch (err) {
+      return toolError(err);
+    }
+  };
+
+  server.registerTool(
+    "mark_exhausted_inbox_handled",
+    {
+      title: "Mark exhausted child inbox entries handled",
+      description:
+        "Mark exhausted inbox entries handled on behalf of a child thread with an audit note, " +
+        "after investigating and confirming the work was in fact dealt with. Available only to " +
+        "the child's parent, and scoped exclusively to entries that exhausted bounded recovery.",
+      inputSchema: {
+        thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The child thread whose exhausted inbox entries are being marked handled."),
+        actor_id: z.string().min(1).optional().describe("Alternative alias for thread_id."),
+        entry_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("The exhausted inbox entry IDs to mark handled."),
+        entry_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Single exhausted inbox entry ID to mark handled."),
+        note: z
+          .string()
+          .trim()
+          .min(1, {
+            error:
+              "note cannot be empty — explain how this inbox item was handled or why no action was needed.",
+          })
+          .max(2_000)
+          .describe(
+            "An explanation of how this inbox item was handled or why no action was needed."
+          ),
+      },
+    },
+    markChildHandledHandler
+  );
+
+  server.registerTool(
+    "mark_child_inbox_handled",
+    {
+      title: "Mark exhausted child inbox entries handled",
+      description:
+        "Mark exhausted inbox entries handled on behalf of a child thread with an audit note, " +
+        "after investigating and confirming the work was in fact dealt with. Available only to " +
+        "the child's parent, and scoped exclusively to entries that exhausted bounded recovery.",
+      inputSchema: {
+        thread_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The child thread whose exhausted inbox entries are being marked handled."),
+        actor_id: z.string().min(1).optional().describe("Alternative alias for thread_id."),
+        entry_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("The exhausted inbox entry IDs to mark handled."),
+        entry_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Single exhausted inbox entry ID to mark handled."),
+        note: z
+          .string()
+          .trim()
+          .min(1, {
+            error:
+              "note cannot be empty — explain how this inbox item was handled or why no action was needed.",
+          })
+          .max(2_000)
+          .describe(
+            "An explanation of how this inbox item was handled or why no action was needed."
+          ),
+      },
+    },
+    markChildHandledHandler
+  );
+
+  server.registerTool(
     "delegate_event_source",
     {
       title: "Delegate event source to an actor",

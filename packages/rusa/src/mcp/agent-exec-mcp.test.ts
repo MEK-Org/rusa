@@ -149,6 +149,8 @@ function setup(
      * id order to differ from spawn order has to name the ids itself.
      */
     idgen?: () => string;
+    completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
+    clearFocusEntryIds?: ActorMeshOptions["clearFocusEntryIds"];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -199,6 +201,8 @@ function setup(
     eventSourceSubscriptions,
     eventManager,
     inboxStore,
+    completedFocusEntryCounts: opts.completedFocusEntryCounts,
+    clearFocusEntryIds: opts.clearFocusEntryIds,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -4702,5 +4706,216 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       tool?.inputSchema as { properties?: Record<string, { description?: string }> }
     )?.properties?.experiment;
     expect(experimentProp?.description).toMatch(/unregistered/i);
+  });
+
+  describe("exhausted inbox escalation tools (#748)", () => {
+    it("releases selection lock via release_selection_lock tool", async () => {
+      let countsMap = new Map([["item-1", 2]]);
+      const clearedEntries: string[] = [];
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+        clearFocusEntryIds: (_actorId, ids) => {
+          clearedEntries.push(...ids);
+          countsMap = new Map();
+          return ids.length;
+        },
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+      ]);
+
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+      const res = (await parentClient.callTool({
+        name: "release_selection_lock",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["item-1"],
+        },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toEqual({ released: ["item-1"] });
+      expect(clearedEntries).toEqual(["item-1"]);
+    });
+
+    it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled and mark_child_inbox_handled", async () => {
+      const countsMap = new Map([
+        ["item-1", 2],
+        ["item-2", 2],
+      ]);
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+        {
+          id: "item-2",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m2", fromId: parent },
+        },
+      ]);
+
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+
+      // mark_exhausted_inbox_handled
+      const res1 = (await parentClient.callTool({
+        name: "mark_exhausted_inbox_handled",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["item-1"],
+          note: "cleared after review",
+        },
+      })) as CallToolResult;
+
+      expect(res1.isError).toBeFalsy();
+      const data1 = dataOf(res1) as { handled: Array<{ id: string; handledAt: string }> };
+      expect(data1.handled).toHaveLength(1);
+      expect(data1.handled[0].id).toBe("item-1");
+
+      const entry1 = inboxStore.read(child, "item-1");
+      expect(entry1?.handledAt).not.toBeNull();
+      expect(entry1?.handledNote).toBe(
+        `Marked handled by parent (${parent}): cleared after review`
+      );
+
+      // mark_child_inbox_handled (alias)
+      const res2 = (await parentClient.callTool({
+        name: "mark_child_inbox_handled",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["item-2"],
+          note: "cleared alias",
+        },
+      })) as CallToolResult;
+
+      expect(res2.isError).toBeFalsy();
+      const data2 = dataOf(res2) as { handled: Array<{ id: string; handledAt: string }> };
+      expect(data2.handled).toHaveLength(1);
+      expect(data2.handled[0].id).toBe("item-2");
+
+      const entry2 = inboxStore.read(child, "item-2");
+      expect(entry2?.handledAt).not.toBeNull();
+      expect(entry2?.handledNote).toBe(`Marked handled by parent (${parent}): cleared alias`);
+    });
+
+    it("enforces authority: rejects self-clear, non-parent, and non-exhausted entries", async () => {
+      const countsMap = new Map([
+        ["exhausted-1", 2],
+        ["unexhausted-1", 1],
+      ]);
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const stranger = mesh.spawn({
+        charter: "stranger",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      inboxStore.append([
+        {
+          id: "exhausted-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+        {
+          id: "unexhausted-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m2", fromId: parent },
+        },
+      ]);
+
+      const childClient = await connect(createAgentExecMcpServer(mesh, child, child));
+      const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, stranger));
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+
+      // Self-clear rejected
+      const selfClear = (await childClient.callTool({
+        name: "release_selection_lock",
+        arguments: { thread_id: child, entry_ids: ["exhausted-1"] },
+      })) as CallToolResult;
+      expect(selfClear.isError).toBe(true);
+      expect(JSON.stringify(selfClear.content)).toMatch(/self-clear/i);
+
+      const selfHandled = (await childClient.callTool({
+        name: "mark_exhausted_inbox_handled",
+        arguments: { thread_id: child, entry_ids: ["exhausted-1"], note: "self" },
+      })) as CallToolResult;
+      expect(selfHandled.isError).toBe(true);
+      expect(JSON.stringify(selfHandled.content)).toMatch(/self-clear/i);
+
+      // Stranger clearance rejected
+      const strangerClear = (await strangerClient.callTool({
+        name: "release_selection_lock",
+        arguments: { thread_id: child, entry_ids: ["exhausted-1"] },
+      })) as CallToolResult;
+      expect(strangerClear.isError).toBe(true);
+      expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
+
+      // Non-exhausted clearance rejected
+      const nonExhausted = (await parentClient.callTool({
+        name: "release_selection_lock",
+        arguments: { thread_id: child, entry_ids: ["unexhausted-1"] },
+      })) as CallToolResult;
+      expect(nonExhausted.isError).toBe(true);
+      expect(JSON.stringify(nonExhausted.content)).toMatch(/not exhausted/i);
+
+      // Empty note rejected
+      const emptyNote = (await parentClient.callTool({
+        name: "mark_exhausted_inbox_handled",
+        arguments: { thread_id: child, entry_ids: ["exhausted-1"], note: "   " },
+      })) as CallToolResult;
+      expect(emptyNote.isError).toBe(true);
+      expect(JSON.stringify(emptyNote.content)).toMatch(/note cannot be empty/i);
+    });
   });
 });

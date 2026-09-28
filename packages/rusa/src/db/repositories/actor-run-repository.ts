@@ -292,6 +292,46 @@ export class ActorRunRepository {
   }
 
   /**
+   * Remove entry IDs from focus_entry_ids_json in completed successful runs for an actor.
+   * This resets the durable retry/focus count for those entries, clearing their selection lock.
+   */
+  clearFocusEntryIds(actorId: string, entryIds: readonly string[]): number {
+    const entryIdSet = new Set(entryIds);
+    if (entryIdSet.size === 0) return 0;
+    const rows = this.db
+      .prepare(
+        `SELECT id, focus_entry_ids_json
+         FROM actor_runs
+         WHERE actor_id = ?
+           AND outcome = 'completed'
+           AND success = 1
+           AND focus_entry_ids_json IS NOT NULL`
+      )
+      .all(actorId) as Array<{ id: string; focus_entry_ids_json: string }>;
+
+    let changed = 0;
+    const update = this.db.prepare(`UPDATE actor_runs SET focus_entry_ids_json = ? WHERE id = ?`);
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        try {
+          const parsed = JSON.parse(row.focus_entry_ids_json);
+          if (Array.isArray(parsed)) {
+            const filtered = parsed.filter((id) => !entryIdSet.has(id));
+            if (filtered.length !== parsed.length) {
+              update.run(filtered.length > 0 ? JSON.stringify(filtered) : null, row.id);
+              changed++;
+            }
+          }
+        } catch {
+          // ignore corrupted JSON
+        }
+      }
+    });
+    tx();
+    return changed;
+  }
+
+  /**
    * Completed runs that retained a selected-inbox snapshot, newest first.
    * Invalid historical focus JSON is ignored so a dashboard read can still
    * render its independent activity rows.
