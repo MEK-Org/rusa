@@ -60,26 +60,47 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const capabilityBoundaryProvider: ProviderFactory = (bridge, _options, selected) => ({
-  name: "instance-fixture",
-  providerName: "instance-fixture",
-  model: selected?.model,
-  async run(run) {
-    const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
-    await delay(prompt.charter === "short provider blocker" ? 80 : 700, undefined, {
-      signal: run.signal,
-    });
-    await bridge.sendMessage(prompt.parentId, prompt.charter);
-    bridge.yieldRun("complete", "capability boundary fixture complete");
-    return {
-      success: true,
-      output: prompt.charter,
-      exitCode: 0,
-      sessionId: run.session?.id,
-      model: selected?.model,
-    };
-  },
-});
+/**
+ * Holds each run until the test releases its charter, so capability-boundary
+ * tests order events explicitly instead of relying on wall-clock margins.
+ */
+function releasableCapabilityProvider() {
+  const gates = new Map<string, { promise: Promise<void>; release: () => void }>();
+  const gate = (charter: string) => {
+    let entry = gates.get(charter);
+    if (!entry) {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      entry = { promise, release };
+      gates.set(charter, entry);
+    }
+    return entry;
+  };
+  const factory: ProviderFactory = (bridge, _options, selected) => ({
+    name: "instance-fixture",
+    providerName: "instance-fixture",
+    model: selected?.model,
+    async run(run) {
+      const prompt = JSON.parse(run.prompt) as { charter: string; parentId: string };
+      await new Promise<void>((resolve, reject) => {
+        run.signal?.addEventListener("abort", () => reject(run.signal?.reason), { once: true });
+        void gate(prompt.charter).promise.then(resolve);
+      });
+      await bridge.sendMessage(prompt.parentId, prompt.charter);
+      bridge.yieldRun("complete", "capability boundary fixture complete");
+      return {
+        success: true,
+        output: prompt.charter,
+        exitCode: 0,
+        sessionId: run.session?.id,
+        model: selected?.model,
+      };
+    },
+  });
+  return { factory, release: (charter: string) => gate(charter).release() };
+}
 
 describe("monolithic follower instance", () => {
   it("serializes three computer-capable actors without holding unrelated actors", async () => {
@@ -140,10 +161,11 @@ describe("monolithic follower instance", () => {
   });
 
   it("reads a newly granted computer-use capability at provider admission", async () => {
+    const provider = releasableCapabilityProvider();
     const h = setup({
       delayMs: 0,
       maxConcurrent: 2,
-      providerFactory: capabilityBoundaryProvider,
+      providerFactory: provider.factory,
     });
     const holder = h.spawn("long computer holder");
     grantComputerUse(h, holder);
@@ -159,14 +181,17 @@ describe("monolithic follower instance", () => {
       grantedBy: "root",
       grantedAt: "2026-09-26T00:00:00Z",
     });
+    provider.release("short provider blocker");
     await waitUntil(() =>
       h.events.some((event) => event.actorId === blocker && event.event.type === "result")
     );
     // The target is now provider-admitted but must wait for the current
-    // computer holder: the grant happened after beforeRun, while it paced.
+    // computer holder, which the test has not released: the grant happened
+    // after beforeRun, while it paced.
     expect(
       h.events.some((event) => event.actorId === target && event.event.type === "runStart")
     ).toBe(false);
+    provider.release("long computer holder");
     await waitUntil(() =>
       h.events.some((event) => event.actorId === holder && event.event.type === "result")
     );
@@ -181,14 +206,16 @@ describe("monolithic follower instance", () => {
       (event) => event.actorId === target && event.event.type === "runStart"
     );
     expect(startIndex).toBeGreaterThan(resultIndex);
+    provider.release("late capability target");
     expect(h.failures).toEqual([]);
   });
 
   it("does not retain a revoked computer-use capability through provider pacing", async () => {
+    const provider = releasableCapabilityProvider();
     const h = setup({
       delayMs: 0,
       maxConcurrent: 2,
-      providerFactory: capabilityBoundaryProvider,
+      providerFactory: provider.factory,
     });
     const holder = h.spawn("long computer holder");
     grantComputerUse(h, holder);
@@ -200,8 +227,13 @@ describe("monolithic follower instance", () => {
     await waitUntil(() => h.runtime(target).isQueued);
 
     h.capabilityGrants.revoke(target, COMPUTER_USE_CAPABILITY, "2026-09-26T00:00:00Z");
-    await waitUntil(() =>
-      h.events.some((event) => event.actorId === target && event.event.type === "runStart")
+    provider.release("short provider blocker");
+    // The holder keeps the computer until the test releases it, so the target
+    // can start here only if its revoked capability no longer takes the lock.
+    // Bound the wait under the test timeout so a retained lock fails here.
+    await waitUntil(
+      () => h.events.some((event) => event.actorId === target && event.event.type === "runStart"),
+      3_000
     );
 
     const holderResult = h.events.findIndex(
@@ -212,6 +244,8 @@ describe("monolithic follower instance", () => {
     );
     expect(holderResult).toBe(-1);
     expect(targetStart).toBeGreaterThanOrEqual(0);
+    provider.release("long computer holder");
+    provider.release("revoked capability target");
     expect(h.failures).toEqual([]);
   });
 
