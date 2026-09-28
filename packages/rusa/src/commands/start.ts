@@ -3113,7 +3113,6 @@ async function composeStart(
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         let localActor: Actor | undefined;
         const actorOptions: ActorOptions = {
           id,
@@ -3237,6 +3236,7 @@ async function composeStart(
           actorOptions,
           driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
         });
+        addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
         return actor;
