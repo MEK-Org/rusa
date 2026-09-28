@@ -58,13 +58,16 @@ export function tryChatSpaceResource(space: string): string | undefined {
   }
 }
 
-type EventSourceConfigV1 = Record<string, unknown> & {
+export type EventSourceConfigV1 = Record<string, unknown> & {
   version: 1;
   chatWakeMode?: ChatWakeMode;
+  checkSuiteCompletionMode?: "failures-only" | "all-outcomes";
 };
 
-function parseEventSourceConfigV1(raw: string | null): EventSourceConfigV1 | undefined {
-  if (raw === null) return undefined;
+export function parseEventSourceConfigV1(
+  raw: string | null | undefined
+): EventSourceConfigV1 | undefined {
+  if (raw === null || raw === undefined) return undefined;
   try {
     const parsed: unknown = JSON.parse(raw);
     if (
@@ -79,6 +82,15 @@ function parseEventSourceConfigV1(raw: string | null): EventSourceConfigV1 | und
     if (chatWakeMode !== undefined && chatWakeMode !== "mentions" && chatWakeMode !== "all") {
       return undefined;
     }
+    const checkSuiteCompletionMode = (parsed as { checkSuiteCompletionMode?: unknown })
+      .checkSuiteCompletionMode;
+    if (
+      checkSuiteCompletionMode !== undefined &&
+      checkSuiteCompletionMode !== "failures-only" &&
+      checkSuiteCompletionMode !== "all-outcomes"
+    ) {
+      return undefined;
+    }
     return parsed as EventSourceConfigV1;
   } catch {
     return undefined;
@@ -87,7 +99,7 @@ function parseEventSourceConfigV1(raw: string | null): EventSourceConfigV1 | und
 
 /** Read this feature's value from the event source's versioned generic config blob. */
 export function chatWakeModeFromConfig(raw: string | null | undefined): ChatWakeMode | undefined {
-  return raw === undefined ? undefined : parseEventSourceConfigV1(raw)?.chatWakeMode;
+  return parseEventSourceConfigV1(raw)?.chatWakeMode;
 }
 
 /** The mode a space behaves as when none is stored, from what the message says about its space. */

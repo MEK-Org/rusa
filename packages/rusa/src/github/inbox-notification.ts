@@ -1,4 +1,5 @@
 import type { EventResource } from "../actor/event-subscriptions.js";
+import { parseEventSourceConfigV1 } from "../chat/wake-mode.js";
 import { githubBranchReference } from "../references/reference.js";
 import type { InboxPayload } from "../repositories/inbox-repository.js";
 
@@ -171,6 +172,30 @@ const NON_WAKING_CHECK_SUITE_CONCLUSIONS: ReadonlySet<string> = new Set([
   "cancelled",
   "stale",
 ]);
+
+/**
+ * How a source owner wants completed check suites from that source's subtree.
+ *
+ * "failures-only" represents the default quiet behavior (only failing or unknown
+ * conclusions wake the owner). An explicit "failures-only" setting is an explicit
+ * no-op: it does not mask or override an ancestor source's independent "all-outcomes"
+ * opt-in, as each source configuration in the hierarchy governs delivery to that
+ * source's own owner independently.
+ */
+export type CheckSuiteCompletionMode = "failures-only" | "all-outcomes";
+
+/**
+ * Reads this feature's value from the generic, versioned event-source config.
+ *
+ * Configuration stays additive: another consumer's valid keys share the same
+ * object, while an absent, malformed, or future-version object keeps the
+ * existing failures-only behavior.
+ */
+export function checkSuiteCompletionModeFromConfig(
+  raw: string | null | undefined
+): CheckSuiteCompletionMode | undefined {
+  return parseEventSourceConfigV1(raw)?.checkSuiteCompletionMode;
+}
 
 /**
  * Should this `check_suite` webhook payload wake anybody?

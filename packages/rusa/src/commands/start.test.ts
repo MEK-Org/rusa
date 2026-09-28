@@ -5209,6 +5209,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
 
       expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+      requestRunCalls.length = 0;
+
+      // The repository owner opted in through the existing generic source
+      // configuration. A green completion on the worker's PR reaches only the
+      // opted-in repository owner; the worker keeps the quiet default.
+      mesh.setEventSourceConfig(
+        "github:dummy-org/dummy-repo",
+        { version: 1, checkSuiteCompletionMode: "all-outcomes" },
+        "root"
+      );
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 503, conclusion: "success", pull_requests: [{ number: 77 }] },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
     });
   });
 

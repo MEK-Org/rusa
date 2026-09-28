@@ -744,7 +744,7 @@ export function createAgentExecMcpServer(
     {
       title: "Set an event source's configuration",
       description:
-        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
+        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, check-suite completion delivery uses { version: 1, checkSuiteCompletionMode: 'failures-only' | 'all-outcomes' }, and null restores built-in defaults.",
       inputSchema: {
         ...eventResourceInputSchema,
         config: z
