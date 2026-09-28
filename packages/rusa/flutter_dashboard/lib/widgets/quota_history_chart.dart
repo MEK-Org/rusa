@@ -23,6 +23,20 @@ const _fallbackSeriesColors = <Color>[
   Color(0xFFF97316),
 ];
 
+/// Fable is drawn in a lighter tone of the Claude color (#728). It is not in
+/// [_fallbackSeriesColors], so no hashed series can land on it.
+const _fableSeriesColor = Color(0xFFCF8063);
+
+/// Fable's canonical IDs, as the Claude model catalog lists them and quota
+/// history records them.
+const _fableModelIds = {'claude-fable-5', 'claude-fable-5-1'};
+
+bool _isFableSeries(QuotaHistorySeriesDto series) =>
+    series.scope == 'model' &&
+    series.provider == 'claude' &&
+    series.modelIds.isNotEmpty &&
+    series.modelIds.every(_fableModelIds.contains);
+
 /// Keeps known provider colors stable when the API changes the series order.
 Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
     _providerSeriesColors[provider] ??
@@ -134,6 +148,15 @@ class QuotaHistoryChart extends StatelessWidget {
           i,
           taken: colors.values.toSet(),
         );
+      }
+    }
+    // Fable keeps its hashed slot above, so every other series steps past it
+    // exactly as before; only the color Fable is drawn in changes (#728). Only
+    // the first Fable series is repainted, so two never share a color.
+    for (final series in visible) {
+      if (_isFableSeries(series)) {
+        colors[series] = _fableSeriesColor;
+        break;
       }
     }
     // Headroom and throttle are controller decisions. A reading recorded

@@ -646,6 +646,97 @@ void main() {
       expect(throttle.colors[1], isNot(const Color(0xFF10B981)));
     });
 
+    group('Fable is drawn in #CF8063 (#728)', () {
+      const fableColor = Color(0xFFCF8063);
+      QuotaHistorySeriesDto controlled(
+        List<String> modelIds, {
+        String label = 'Model',
+      }) => QuotaHistorySeriesDto(
+        provider: 'claude',
+        windowId: 'weekly',
+        scope: modelIds.isEmpty ? 'provider' : 'model',
+        modelIds: modelIds,
+        label: label,
+        points: const [
+          QuotaHistoryPointDto(
+            observedAt: '2026-09-26T14:00:00.000Z',
+            remainingPercent: 62,
+            error: 3,
+            intervalSeconds: 40,
+          ),
+        ],
+      );
+      final claudeWide = controlled(const [], label: 'Weekly');
+      final fableSeries = controlled(const [
+        'claude-fable-5',
+        'claude-fable-5-1',
+      ], label: 'Fable');
+
+      List<Color> plotColors(WidgetTester tester, String key) {
+        final painter = tester
+            .widget<CustomPaint>(find.byKey(Key(key)))
+            .painter!;
+        return painter is QuotaPaceErrorChartPainter
+            ? painter.colors
+            : (painter as QuotaThrottleIntervalChartPainter).colors;
+      }
+
+      testWidgets('on both plots and both legend keys', (tester) async {
+        await pumpChart(
+          tester,
+          QuotaHistoryDto(
+            generatedAt: generatedAt,
+            historySince: historySince,
+            history: [claudeWide, fableSeries],
+          ),
+        );
+
+        const expected = [Color(0xFFC15F3C), fableColor];
+        expect(plotColors(tester, 'quota-pace-error-chart'), expected);
+        expect(plotColors(tester, 'quota-throttle-interval-chart'), expected);
+        final legends = find.text('Claude · Fable');
+        expect(legends, findsNWidgets(2));
+        for (var i = 0; i < 2; i++) {
+          final key = tester.widget<Container>(
+            find.descendant(
+              of: find
+                  .ancestor(of: legends.at(i), matching: find.byType(Row))
+                  .first,
+              matching: find.byType(Container),
+            ),
+          );
+          expect((key.decoration! as BoxDecoration).color, fableColor);
+        }
+      });
+
+      testWidgets('while every other series keeps its hashed color', (
+        tester,
+      ) async {
+        // model-h hashes to Fable's slot (#EC4899), so with Fable present it
+        // steps past that slot exactly as it did before #728.
+        final later = controlled(const ['model-h']);
+        Future<List<Color>> colorsWith(List<QuotaHistorySeriesDto> history) =>
+            pumpChart(
+              tester,
+              QuotaHistoryDto(
+                generatedAt: generatedAt,
+                historySince: historySince,
+                history: history,
+              ),
+            ).then((_) => plotColors(tester, 'quota-pace-error-chart'));
+
+        expect(await colorsWith([claudeWide, fableSeries, later]), const [
+          Color(0xFFC15F3C),
+          fableColor,
+          Color(0xFF14B8A6),
+        ]);
+        expect(await colorsWith([claudeWide, later]), const [
+          Color(0xFFC15F3C),
+          Color(0xFFEC4899),
+        ]);
+      });
+    });
+
     test('parses a missing remaining value as null, never 0%', () {
       expect(
         QuotaHistoryPointDto.fromJson(const {
