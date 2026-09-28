@@ -575,12 +575,30 @@ describe("SqliteInboxRepository", () => {
       expect(appendedListener).toHaveBeenCalledWith(result.replacements);
     });
 
-    it("rolls back atomically if replacement insertion fails, preserving original entries unhandled", () => {
+    it("rolls back the handled mark when a replacement insert conflicts inside the transaction", () => {
+      store.append([entry("orig-1"), entry("orig-2")]);
+      const appendedListener = vi.fn();
+      store.onItemsAppended(appendedListener);
+
+      // Reusing an existing id passes validation, so the UPDATE runs inside the
+      // transaction before ON CONFLICT DO NOTHING inserts 0 rows and throws.
+      expect(() =>
+        store.replaceEntries("actor-a", ["orig-1"], "released for re-handling", [entry("orig-2")])
+      ).toThrow("failed to insert all replacement inbox entries");
+
+      const orig = store.read("actor-a", "orig-1");
+      expect(orig?.handledAt).toBeNull();
+      expect(orig?.handledNote).toBeNull();
+      expect(store.read("actor-a", "orig-2")?.handledAt).toBeNull();
+      expect(appendedListener).not.toHaveBeenCalled();
+    });
+
+    it("rejects an invalid replacement payload before touching the originals", () => {
       store.append([entry("orig-1")]);
       const appendedListener = vi.fn();
       store.onItemsAppended(appendedListener);
 
-      // Pass an invalid replacement payload to trigger failure during replacement preparation/insertion
+      // Payload validation runs before the transaction opens.
       expect(() =>
         store.replaceEntries("actor-a", ["orig-1"], "released for re-handling", [
           {
