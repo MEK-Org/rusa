@@ -2061,9 +2061,10 @@ export class ActorMesh {
 
     const ids = entries.map((e) => e.id);
     const auditNote = `Released by parent (${callerId}) for re-handling: ${trimmedNote}`;
-    inboxStore.markHandled(resolvedChildId, ids, undefined, auditNote);
-
-    const replacements = inboxStore.append(
+    const { replacements } = inboxStore.replaceEntries(
+      resolvedChildId,
+      ids,
+      auditNote,
       entries.map((e) => ({
         actorId: resolvedChildId,
         source: e.source,

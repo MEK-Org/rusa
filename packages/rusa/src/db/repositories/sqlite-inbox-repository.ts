@@ -298,6 +298,106 @@ export class SqliteInboxRepository implements InboxRepository {
     })();
   }
 
+  replaceEntries(
+    actorId: string,
+    entryIds: string[],
+    handledNote: string,
+    replacements: InboxAppendInput[],
+    at = this.now()
+  ): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
+    if (this.db.inTransaction) {
+      throw new Error("inbox replaceEntries must not run inside an enclosing transaction");
+    }
+    if (
+      entryIds.length < 1 ||
+      entryIds.length > 100 ||
+      new Set(entryIds).size !== entryIds.length
+    ) {
+      throw new Error("replaceEntries requires 1 to 100 unique entry ids");
+    }
+    if (!Number.isFinite(at.getTime())) throw new Error("invalid handledAt");
+    const note = handledNote.trim();
+    if (!note) throw new Error("replaceEntries requires a non-empty handledNote");
+
+    const insert = this.db.prepare(
+      `INSERT INTO actor_inbox_entries
+        (id, actor_id, source, delivered_at, seen_at, handled_at, payload_json)
+       VALUES (?, ?, ?, ?, NULL, NULL, ?)
+       ON CONFLICT(id) DO NOTHING`
+    );
+    const replacementRows = replacements.map((input) => {
+      if (!input.actorId.trim()) throw new Error("inbox actorId is required");
+      if (!input.source.trim()) throw new Error("inbox source is required");
+      validateInboxPayload(input.payload);
+      const deliveredAt = input.deliveredAt ?? this.now();
+      if (!Number.isFinite(deliveredAt.getTime())) throw new Error("invalid deliveredAt");
+      return {
+        id: input.id ?? randomUUID(),
+        actorId: input.actorId,
+        source: input.source,
+        deliveredAt,
+        payload: input.payload,
+      };
+    });
+
+    const { handled, insertedRows } = this.db.transaction(() => {
+      const placeholders = entryIds.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM actor_inbox_entries
+           WHERE actor_id = ? AND id IN (${placeholders})`
+        )
+        .all(actorId, ...entryIds) as InboxRow[];
+      if (rows.length !== entryIds.length) throw new Error("inbox entry not found");
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      const stamp = at.toISOString();
+      this.db
+        .prepare(
+          `UPDATE actor_inbox_entries SET handled_at = ?, handled_note = ?
+           WHERE actor_id = ? AND id IN (${placeholders}) AND handled_at IS NULL`
+        )
+        .run(stamp, note, actorId, ...entryIds);
+
+      const handledResults = entryIds.map((id) => {
+        const previous = byId.get(id);
+        if (!previous) throw new Error("inbox entry not found");
+        return {
+          id,
+          handledAt: new Date(previous.handled_at ?? stamp),
+          alreadyHandled: previous.handled_at !== null,
+        };
+      });
+
+      const inserted: InboxEntry[] = [];
+      for (const row of replacementRows) {
+        const result = insert.run(
+          row.id,
+          row.actorId,
+          row.source,
+          row.deliveredAt.toISOString(),
+          JSON.stringify(row.payload)
+        );
+        if (result.changes === 1) {
+          inserted.push({
+            ...row,
+            seenAt: null,
+            handledAt: null,
+            handledNote: null,
+          });
+        }
+      }
+
+      if (inserted.length !== replacementRows.length) {
+        throw new Error("failed to insert all replacement inbox entries");
+      }
+
+      return { handled: handledResults, insertedRows: inserted };
+    })();
+
+    if (insertedRows.length > 0) this.notifyItemsAppended(insertedRows);
+    return { handled, replacements: insertedRows };
+  }
+
   /**
    * Advisory delivery after commit. A listener that throws must neither undo
    * the durable write nor starve the listeners after it, so each failure is

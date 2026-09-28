@@ -38,6 +38,7 @@ import type {
   InboxPayload,
   InboxRepository,
 } from "../repositories/inbox-repository.js";
+import { validateInboxPayload } from "../repositories/inbox-repository.js";
 import {
   type DurableEventDelivery,
   EventManager,
@@ -254,6 +255,55 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         }
         return { id, handledAt: entry.handledAt, alreadyHandled };
       });
+    },
+    replaceEntries: (
+      actorId,
+      entryIds,
+      handledNote,
+      replacements,
+      at = new Date("2026-01-01T00:00:00Z")
+    ) => {
+      const targetEntries: InboxEntry[] = [];
+      for (const id of entryIds) {
+        const entry = entries.find((e) => e.actorId === actorId && e.id === id);
+        if (!entry) throw new Error("inbox entry not found");
+        targetEntries.push(entry);
+      }
+      const inserted: InboxEntry[] = [];
+      for (const input of replacements) {
+        validateInboxPayload(input.payload);
+        const id = input.id ?? `entry-${entries.length + inserted.length + 1}`;
+        if (entries.some((existing) => existing.id === id)) continue;
+        inserted.push({
+          id,
+          actorId: input.actorId,
+          source: input.source,
+          deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
+          seenAt: null,
+          handledAt: null,
+          handledNote: null,
+          payload: input.payload,
+        });
+      }
+      const handled = targetEntries.map((entry) => {
+        const alreadyHandled = entry.handledAt !== null;
+        if (!entry.handledAt) {
+          entry.handledAt = at;
+          entry.handledNote = handledNote.trim() || null;
+        }
+        return { id: entry.id, handledAt: entry.handledAt, alreadyHandled };
+      });
+      entries.push(...inserted);
+      if (inserted.length > 0) {
+        for (const listener of [...listeners]) {
+          try {
+            listener(inserted);
+          } catch {
+            // advisory
+          }
+        }
+      }
+      return { handled, replacements: inserted };
     },
   };
 }
@@ -13101,6 +13151,49 @@ describe("accountRun token accounting (#443)", () => {
 
       // Exhaustion clears because the entry is now handled
       expect(mesh.hasExhaustedSelectedWork(child)).toBe(false);
+    });
+
+    it("preserves unhandled entries if atomic replacement fails during release (#748)", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const countsMap = new Map([["item-1", 2]]);
+
+      const { mesh, tick } = setup({
+        inboxStore,
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      await tick();
+
+      inboxStore.append([
+        { id: "item-1", actorId: child, source: "chat", payload: payload("mesh.message") },
+      ]);
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
+
+      // Simulate a failure in replaceEntries (e.g. database insertion error)
+      const originalReplace = inboxStore.replaceEntries;
+      inboxStore.replaceEntries = () => {
+        throw new Error("simulated sqlite insertion failure");
+      };
+
+      expect(() =>
+        mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "releasing")
+      ).toThrow("simulated sqlite insertion failure");
+
+      // The original entry was NOT marked handled — it remains in the child's inbox
+      const entry = inboxStore.read(child, "item-1");
+      expect(entry?.handledAt).toBeNull();
+      expect(entry?.handledNote).toBeNull();
+
+      // Child still has the entry available (still exhausted, not lost)
+      expect(mesh.hasExhaustedSelectedWork(child)).toBe(true);
+
+      // Restore and verify release works cleanly
+      inboxStore.replaceEntries = originalReplace;
+      const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "retry release");
+      expect(res.released).toEqual(["item-1"]);
+      expect(inboxStore.read(child, "item-1")?.handledAt).not.toBeNull();
     });
   });
 });
