@@ -82,5 +82,7 @@ describe.skipIf(!BWRAP_CAPABLE)("Mistral grant entrypoint (real bwrap)", () => {
 
     expect(argv.join("\0")).not.toContain(fixtureValue);
     expect(execFileSync("bwrap", argv, { encoding: "utf8" })).toBe(fixtureValue);
-  });
+    // Real bwrap setup runs SQLite migrations, mounts fuse-overlayfs, and launches bwrap;
+    // 15s bounds full-suite scheduling and I/O contention without hiding hangs.
+  }, 15_000);
 });

@@ -44,7 +44,10 @@ const sendWithProcessKill: SendSignal = (target, signal) => {
 };
 
 const readProcessTable: RunPs = () =>
-  execFileSync("ps", ["-eo", "pgid=,args="], { encoding: "utf8" });
+  execFileSync("ps", ["-eo", "pgid=,args="], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
 
 /**
  * The caller's own process group.
