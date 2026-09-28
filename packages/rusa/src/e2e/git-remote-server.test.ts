@@ -285,8 +285,8 @@ describe.skipIf(!BWRAP_CAPABLE)(
         ).trim();
         expect(revParse).toMatch(/^[0-9a-f]{40}$/);
       }
-      // Two sequential sandboxed clone/push cycles take ~2.2s isolated, but exceeded Vitest's
-      // 5s default under cut #37 full-suite concurrency; 15s bounds peak contention without hiding hangs.
+      // Observed runs took 1.5–4.4s isolated and 2.83s in one full-suite run. Cut #37's timeout
+      // cause was not established, so 15s is a conservative allowance for this integration test.
     }, 15_000);
 
     it("cannot write directly to the remote's bare repo path from inside the sandbox (no writable host-remote bind)", async () => {
