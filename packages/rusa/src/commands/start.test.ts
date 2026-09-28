@@ -1410,7 +1410,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
               provider: "claude",
               model: "claude-fable-5-1",
               priority: "responsive",
-              message: expect.stringContaining("check the scrapes"),
+              // "retired", not "reset": the hard-stale horizon and manual switches retire without one.
+              message: expect.stringContaining(
+                "no new reading arrived before it retired; check the scrapes"
+              ),
             }),
           });
 

@@ -4482,7 +4482,7 @@ async function composeStart(
     const message =
       `Quota model lane retired: ${provider} no longer publishes a window for ${model}, ` +
       "which now paces on its provider lane alone. The window stopped appearing in quota " +
-      "readings and no new reading arrived before it reset; check the scrapes to confirm " +
+      "readings and no new reading arrived before it retired; check the scrapes to confirm " +
       "whether it is really gone.";
     void deliverHostAlarm({
       deliver: () =>
