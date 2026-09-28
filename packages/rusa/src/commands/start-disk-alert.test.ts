@@ -8,7 +8,6 @@ import {
   deliverHostAlarm,
   diskAlertUncovered,
   hostAlarmProducerActive,
-  quotaModelLaneRetiredEvent,
 } from "./start.js";
 
 /** The minimum a loaded config carries; every case below varies only observability. */
@@ -100,24 +99,22 @@ describe("configuredRootEventSources and the disk sensor agree", () => {
 });
 
 describe("quota model lane retirement alarm (#588)", () => {
-  it("keeps system:events covered for the quota throttle when the disk sensor is off", () => {
-    const config = {
-      ...withObservability({ diskAlert: { enabled: false } }),
-      quota: { throttle: { enabled: true } },
-    } as unknown as RusaConfig;
+  const withQuota = (quota: RusaConfig["quota"]) =>
+    ({ ...withObservability({ diskAlert: { enabled: false } }), quota }) as unknown as RusaConfig;
+
+  it("keeps system:events covered for a throttle reading a coordinator when the disk sensor is off", () => {
+    const config = withQuota({
+      throttle: { enabled: true },
+      coordinator: { socketPath: "/tmp/coordinator.sock" },
+    } as RusaConfig["quota"]);
     expect(hostAlarmProducerActive(config)).toBe(true);
     expect(configuredRootEventSources(config)).toContain("system:events");
   });
 
-  it("names the provider and model and asks root to check the scrapes", () => {
-    const event = quotaModelLaneRetiredEvent("claude", "claude-fable-5-1");
-    expect(event).toMatchObject({
-      type: "system.quota_model_lane_retired",
-      provider: "claude",
-      model: "claude-fable-5-1",
-    });
-    expect(event.message).toContain("claude-fable-5-1");
-    expect(event.message).toContain("check the scrapes");
+  it("adds no system:events coverage for a throttle with no coordinator to read", () => {
+    const config = withQuota({ throttle: { enabled: true } } as RusaConfig["quota"]);
+    expect(hostAlarmProducerActive(config)).toBe(false);
+    expect(configuredRootEventSources(config)).not.toContain("system:events");
   });
 });
 

@@ -491,7 +491,8 @@ export interface ModelLanePacing {
   exhaustedUntil: string | null;
 }
 
-function isPublishedModelLane(value: unknown): value is PublishedThrottleModelLaneStatus {
+/** Whether `value` is a well-formed published model lane; a malformed one paces nothing. */
+export function isPublishedModelLane(value: unknown): value is PublishedThrottleModelLaneStatus {
   if (typeof value !== "object" || value === null) return false;
   const lane = value as Partial<PublishedThrottleModelLaneStatus>;
   return (
