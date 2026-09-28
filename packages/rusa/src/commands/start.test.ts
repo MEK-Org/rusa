@@ -6949,6 +6949,44 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ])
     );
 
+    // Verify that rehydration retrying after late follower enrollment attached
+    // exactly one set of run lifecycle listeners (#743)
+    const lifecycle = mesh.lifecycleFor("placed-worker");
+    const runId = randomUUID();
+    await lifecycle.emit("onStart", {
+      actorId: "placed-worker",
+      runId,
+      responsive: false,
+      mode: "ordinary",
+      selected: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
+    });
+    await lifecycle.emit("onEnd", {
+      actorId: "placed-worker",
+      runId,
+      terminal: {
+        kind: "result",
+        result: { success: true, output: "done", exitCode: 0 },
+      },
+    });
+
+    const runRecord = getRepositories().actorRuns.getById(runId);
+    expect(runRecord).not.toBeNull();
+    expect(runRecord).toMatchObject({
+      id: runId,
+      actorId: "placed-worker",
+      outcome: "completed",
+    });
+
+    const allEvents = getRepositories().meshEvents.list();
+    const startEvents = allEvents.filter(
+      (e) => e.actorId === "placed-worker" && e.kind === "run_start"
+    );
+    expect(startEvents).toHaveLength(1);
+    const endEvents = allEvents.filter(
+      (e) => e.actorId === "placed-worker" && e.kind === "run_end"
+    );
+    expect(endEvents).toHaveLength(1);
+
     // A session fault inside the same follower process must rebind the active
     // host rather than treating the temporary loss as a new actor incarnation.
     const sameProcessRegistration = await fetch(`http://127.0.0.1:${port}/register`, {
