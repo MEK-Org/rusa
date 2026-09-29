@@ -607,14 +607,17 @@ void main() {
               ? LogicalKeyboardKey.metaLeft
               : LogicalKeyboardKey.controlLeft;
 
-      Future<void> pressWith(
+      /// Whether the framework handled [key]; an unhandled key goes on to the
+      /// platform's text input.
+      Future<bool> pressWith(
         WidgetTester tester,
         LogicalKeyboardKey modifier,
         LogicalKeyboardKey key,
       ) async {
         await tester.sendKeyDownEvent(modifier);
-        await tester.sendKeyEvent(key);
+        final handled = await tester.sendKeyEvent(key);
         await tester.sendKeyUpEvent(modifier);
+        return handled;
       }
 
       Future<void> openDialog(WidgetTester tester, String tooltip) async {
@@ -650,23 +653,38 @@ void main() {
         ('Cancel Obligation', 'cancelled'),
       ]) {
         testWidgets(
-          '$tooltip: shortcut submits the typed note; plain Enter does not',
+          '$tooltip: shortcut submits the typed note; plain Enter stays a newline',
           (tester) async {
             await openDialog(tester, tooltip);
             await tester.enterText(noteField(), 'Shipped behind the flag.');
 
-            await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+            // The test harness has no platform text input to type the newline.
+            // Plain Enter left unhandled by the framework is what the platform
+            // then inserts into the field; a handled one would never reach it.
+            expect(await tester.sendKeyEvent(LogicalKeyboardKey.enter), isFalse);
             await tester.pumpAndSettle();
             expect(find.byType(AlertDialog), findsOneWidget);
             expect(api.statusCalls, isEmpty);
+            // The newline the platform inserts, standing in for it.
+            const multiline = 'Shipped behind the flag.\nFlag removal tracked separately.';
+            tester.testTextInput.updateEditingValue(
+              const TextEditingValue(
+                text: multiline,
+                selection: TextSelection.collapsed(offset: multiline.length),
+              ),
+            );
+            await tester.pump();
 
-            await pressWith(tester, submitModifier(), LogicalKeyboardKey.enter);
+            expect(
+              await pressWith(tester, submitModifier(), LogicalKeyboardKey.enter),
+              isTrue,
+            );
             await tester.pumpAndSettle();
 
             expect(find.byType(AlertDialog), findsNothing);
             expect(api.statusCalls.single.id, 'ob-key-1');
             expect(api.statusCalls.single.status, status);
-            expect(api.statusCalls.single.note, 'Shipped behind the flag.');
+            expect(api.statusCalls.single.note, multiline);
           },
           variant: TargetPlatformVariant.only(TargetPlatform.macOS),
         );

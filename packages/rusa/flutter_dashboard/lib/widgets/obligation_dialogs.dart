@@ -699,7 +699,6 @@ class _StatusTransitionDialogState extends State<_StatusTransitionDialog> {
   // Owned by the State rather than the caller: the dialog keeps rebuilding the
   // field through its exit animation, and State.dispose runs only after that.
   final _note = TextEditingController();
-  bool _closed = false;
 
   @override
   void dispose() {
@@ -709,15 +708,7 @@ class _StatusTransitionDialogState extends State<_StatusTransitionDialog> {
 
   bool get _isDone => widget.status == 'done';
 
-  // One pop per dialog: a second, from a repeated shortcut or a click during
-  // the exit animation, would close the route underneath it.
-  void _close(String? note) {
-    if (_closed) return;
-    setState(() => _closed = true);
-    Navigator.of(context).pop(note);
-  }
-
-  void _submit() => _close(_note.text);
+  void _submit() => Navigator.of(context).pop(_note.text);
 
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final isApple = defaultTargetPlatform == TargetPlatform.macOS ||
@@ -803,11 +794,11 @@ class _StatusTransitionDialogState extends State<_StatusTransitionDialog> {
         ),
         actions: [
           TextButton(
-            onPressed: _closed ? null : () => _close(null),
+            onPressed: () => Navigator.of(context).pop(),
             child: Text(dismissLabel, style: const TextStyle(color: MeshColors.textSecondary)),
           ),
           ElevatedButton(
-            onPressed: _closed ? null : _submit,
+            onPressed: _submit,
             style: ElevatedButton.styleFrom(
               backgroundColor: isDone
                   ? ObligationStatusColors.done.dot
