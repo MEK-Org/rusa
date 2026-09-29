@@ -1812,6 +1812,7 @@ class ObligationDto {
     this.recurrenceCron,
     this.recurrenceIntervalSeconds,
     this.nextReadyAt,
+    this.snoozedUntil,
     this.checkpoint,
     this.checkpointAt,
     this.checkpointBy,
@@ -1874,6 +1875,11 @@ class ObligationDto {
   /// `scheduled`.
   final String? nextReadyAt;
 
+  /// The owner's intentional deferral: until this instant the obligation keeps
+  /// its [status] (and so still blocks its parent and dependents) but is not
+  /// offered as a ready head or delivered as attention. Null when not snoozed.
+  final String? snoozedUntil;
+
   /// Where this obligation's work stands right now, in its owner's words.
   /// Rewritten in place, so this is the current standing and never a history
   /// to replay. Null means no standing has been recorded — which is also what
@@ -1915,13 +1921,14 @@ class ObligationDto {
     return rest.isEmpty ? null : rest;
   }
 
-  bool get isReady => status == 'ready';
-  bool get isWaiting => status == 'waiting';
+  bool get isReady => status == 'ready' && !isSnoozed;
+  bool get isWaiting => (status == 'waiting' || isSnoozed) && !isTerminal;
   bool get isDone => status == 'done';
   bool get isCancelled => status == 'cancelled';
-  bool get isScheduled => status == 'scheduled';
+  bool get isScheduled => status == 'scheduled' && !isSnoozed;
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
+  bool get isSnoozed => snoozedUntil != null;
 
   /// How this obligation should read on the dashboard, given whether an actor
   /// is actively working on it (see [ActorStateSnapshot.isObligationActive]).
@@ -1931,10 +1938,14 @@ class ObligationDto {
   /// run is being worked right now. Terminal, scheduled, and waiting
   /// statuses represent durable lifecycle states (completed, cancelled,
   /// scheduled for future execution, or waiting on dependencies/blockers)
-  /// that are not overridden by a run focus.
+  /// that are not overridden by a run focus. A snoozed obligation is
+  /// considered in status waiting (intentionally deferred until its deadline).
   ObligationPresentationState presentationState({
     required bool activelyWorked,
   }) {
+    if (isSnoozed) {
+      return ObligationPresentationState.waiting;
+    }
     final base = ObligationPresentationState.fromStatus(status);
     if (activelyWorked && base == ObligationPresentationState.ready) {
       return ObligationPresentationState.active;
@@ -1977,6 +1988,7 @@ class ObligationDto {
       recurrenceCron: j['recurrenceCron'] as String?,
       recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
       nextReadyAt: j['nextReadyAt'] as String?,
+      snoozedUntil: j['snoozedUntil'] as String?,
       checkpoint: j['checkpoint'] as String?,
       checkpointAt: j['checkpointAt'] as String?,
       checkpointBy: j['checkpointBy'] as String?,
@@ -2005,6 +2017,7 @@ class ObligationDto {
     if (recurrenceIntervalSeconds != null)
       'recurrenceIntervalSeconds': recurrenceIntervalSeconds,
     if (nextReadyAt != null) 'nextReadyAt': nextReadyAt,
+    if (snoozedUntil != null) 'snoozedUntil': snoozedUntil,
     if (checkpoint != null) 'checkpoint': checkpoint,
     if (checkpointAt != null) 'checkpointAt': checkpointAt,
     if (checkpointBy != null) 'checkpointBy': checkpointBy,

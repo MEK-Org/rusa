@@ -46,6 +46,7 @@ import { portableContextSnapshots } from "./0048_portable_context_snapshots.js";
 import { obligationResponsive } from "./0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "./0050_drop_obligation_ready_heads.js";
 import { eventSourceConfig } from "./0051_event_source_config.js";
+import { obligationSnooze } from "./0052_obligation_snooze.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -104,4 +105,5 @@ export const migrations: Migration[] = [
   obligationResponsive,
   dropObligationReadyHeads,
   eventSourceConfig,
+  obligationSnooze,
 ];

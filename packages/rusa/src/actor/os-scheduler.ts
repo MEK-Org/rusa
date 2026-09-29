@@ -57,6 +57,11 @@ export interface ObligationActivationScheduler {
   ): void;
   cancelObligationActivation(id: string): void;
   listObligationActivations(): ObligationActivationRecord[];
+  /**
+   * Whether a one-shot (`at`) activation can currently be installed. `false`
+   * only when the host is already known to lack a working `at`.
+   */
+  canScheduleAt(): boolean;
 }
 
 /** A complete one-shot message persisted inside its versioned `at` job. */
@@ -815,6 +820,10 @@ export class DefaultOsScheduler implements OsScheduler {
         staleAtIds.filter((staleId) => staleId !== replacementId)
       );
     }
+  }
+
+  canScheduleAt(): boolean {
+    return this.atIo.available !== false;
   }
 
   cancelObligationActivation(id: string): void {

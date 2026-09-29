@@ -461,6 +461,7 @@ class DashboardApi {
   Future<ObligationPage> fetchObligations({
     String? ownerId,
     String? status,
+    String? queue,
     bool? rootsOnly,
     int? limit,
     int? offset,
@@ -468,6 +469,7 @@ class DashboardApi {
     final q = <String, String>{
       'ownerId': ?ownerId,
       'status': ?status,
+      'queue': ?queue,
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',

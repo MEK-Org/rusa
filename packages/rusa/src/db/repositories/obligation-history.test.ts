@@ -12,6 +12,7 @@ import { obligationDependencies } from "../migrations/0037_obligation_dependenci
 import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
 import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../migrations/0049_obligation_responsive.js";
+import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 function migratedDb(): Database.Database {
@@ -28,6 +29,7 @@ function migratedDb(): Database.Database {
   obligationCheckpoint.up(db);
   obligationHistory.up(db);
   obligationResponsive.up(db);
+  obligationSnooze.up(db);
   return db;
 }
 

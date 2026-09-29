@@ -69,9 +69,12 @@ export interface Obligation {
    */
   effectiveResponsive: boolean;
   /**
-   * How many times this obligation has transitioned into `ready` (0 = never).
+   * How many ready-attention episodes this obligation has started (0 = never).
    * Initialized to 1 at migration 0049 for rows already in `ready`, 0 for unready rows.
-   * Each transition starts a new episode of responsive attention: the
+   * An episode starts on each transition into `ready`, and when a snooze on a
+   * row that is already `ready` expires or is cleared (#722): the row did not
+   * change status, but it became actionable again. Each episode is a new
+   * round of responsive attention: the
    * behind-head announcement is deduped per (obligation, episode), so a
    * recurring responsive obligation re-armed behind a persistent head, or a
    * non-recurring one cycling waiting→ready more than once, announces once per
@@ -140,6 +143,18 @@ export interface Obligation {
   recurrenceIntervalSeconds: number | null;
   nextReadyAt: string | null;
   /**
+   * Owner-set deferral deadline (ISO-8601 UTC), or null when not snoozed (#722).
+   *
+   * A snooze keeps the underlying {@link status}: a snoozed obligation still
+   * blocks its parent and dependents exactly as before, and dependency
+   * satisfaction never looks at this field. It only defers *automatic ready
+   * attention* — the owner's ready head, responsive ready delivery, and the
+   * strict-yield closure check — until the deadline. Events still wake the
+   * owner. It survives reassignment (the new owner holds it) and recurrence
+   * (completion keeps it); final `done`/`cancelled` clears it.
+   */
+  snoozedUntil: string | null;
+  /**
    * Whether the `obligation_completions` ledger contains any rows, regardless
    * of whether recurrence is still enabled. This keeps a terminal obligation
    * with retained history reachable without making every core obligation read
@@ -182,6 +197,14 @@ export class ObligationValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ObligationValidationError";
+  }
+}
+
+/** A snooze refused because this process has no timer that could end it (#722). */
+export class SnoozeTimerUnavailableError extends ObligationValidationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SnoozeTimerUnavailableError";
   }
 }
 
@@ -261,6 +284,66 @@ export function normalizeCheckpoint(checkpoint: string | null | undefined): stri
 }
 
 /**
+ * Whether a stored deadline (`snoozed_until`, `next_ready_at`) has come due.
+ *
+ * Due at the start of the deadline's minute, not its exact millisecond: `at`
+ * runs jobs at minute granularity, so a wake for 09:00:30 arrives at 09:00:00.
+ * Both deadlines it arms can carry seconds — a snooze keeps the caller's
+ * instant, and a completion-interval `next_ready_at` is completion time plus
+ * the interval — so comparing against the exact instant would make that
+ * callback look early. (Cron occurrences are minute-aligned either way.)
+ * Unparseable input is never due.
+ */
+export function isDeadlineDue(iso: string, now: Date = new Date()): boolean {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return false;
+  return now.getTime() >= Math.floor(at / 60_000) * 60_000;
+}
+
+/** The actionable-ready predicate: ready, and not deferred by a snooze (#722). */
+export function isReadyForAttention(
+  obligation: Pick<Obligation, "status" | "snoozedUntil">
+): boolean {
+  return obligation.status === "ready" && obligation.snoozedUntil === null;
+}
+
+/**
+ * Normalize a snooze write: a future instant as UTC ISO-8601, or `null` to
+ * clear (#722).
+ *
+ * Only an explicit offset (`Z` or `±hh:mm`) is accepted, because a zone-less
+ * wall-clock time would silently resolve in the host's zone. A deadline that is
+ * already due is refused rather than treated as a clear: the caller asked to
+ * defer, and a snooze that expires on arrival defers nothing. There is no upper
+ * bound; how long to defer is the owner's call.
+ */
+export function normalizeSnoozeUntil(
+  until: string | null | undefined,
+  now: Date = new Date()
+): string | null {
+  if (until == null) return null;
+  const trimmed = until.trim();
+  const parsed = z.iso.datetime({ offset: true }).safeParse(trimmed);
+  if (!parsed.success) {
+    throw new ObligationValidationError(
+      "snooze deadline must be an ISO-8601 timestamp with a timezone offset " +
+        "(e.g. 2026-10-05T09:00:00Z), or null to clear the snooze"
+    );
+  }
+  const at = new Date(trimmed);
+  if (Number.isNaN(at.getTime())) {
+    throw new ObligationValidationError(`snooze deadline is not a valid time: ${until}`);
+  }
+  const normalized = at.toISOString();
+  if (isDeadlineDue(normalized, now)) {
+    throw new ObligationValidationError(
+      `snooze deadline must be in the future (got ${normalized}); pass null to clear a snooze`
+    );
+  }
+  return normalized;
+}
+
+/**
  * The exact-once key for one `(dependent, prerequisite)` prerequisite edge
  * (#212).
  *
@@ -334,16 +417,17 @@ export function parseExternalRef(value: string): ObligationExternalRef {
 }
 
 /**
- * Mutation kinds corresponding to the five tracked lifecycle fields (#185).
+ * Mutation kinds corresponding to the six tracked lifecycle fields (#185, #722).
  *
  * Maps directly to whichever tracked field changed on this obligation row
  * ("reassign" for ownerId, "reparent" for parentId, "priority" for priority,
- * "status" for status, "external_ref" for externalRef).
+ * "status" for status, "external_ref" for externalRef, "snooze" for
+ * snoozedUntil).
  *
  * If a single mutation touches multiple tracked fields on the same row (such as
  * reparenting to root without explicit priority, which clears parentId and sets
  * priority), the mutation kind reflects the highest-precedence changed field
- * (`owner > parent > priority > status > external_ref`).
+ * (`owner > parent > priority > status > external_ref > snooze`).
  *
  * Collateral updates to distinct rows (such as parent readiness status demotions
  * or promotions) record the exact field modified on that row ("status").
@@ -356,6 +440,7 @@ export const OBLIGATION_MUTATION_KINDS = [
   "priority",
   "status",
   "external_ref",
+  "snooze",
 ] as const;
 
 export type ObligationMutationKind = (typeof OBLIGATION_MUTATION_KINDS)[number];
@@ -376,6 +461,8 @@ export interface ObligationHistoryState {
   terminalNote?: string | null;
   /** Immutable resolution citation captured with a status transition. */
   resolutionRef?: string | null;
+  /** Snooze deadline (#722); null when not snoozed. */
+  snoozedUntil?: string | null;
 }
 
 /**
@@ -449,6 +536,7 @@ export const obligationHistoryStateSchema = z
     externalRef: validatedBy(parseObligationReference).nullable().optional(),
     terminalNote: z.string().nullable().optional(),
     resolutionRef: validatedBy(parseObligationReference).nullable().optional(),
+    snoozedUntil: z.iso.datetime().nullable().optional(),
   })
   .strict();
 

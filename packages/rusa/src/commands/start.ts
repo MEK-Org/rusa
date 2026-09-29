@@ -2684,6 +2684,9 @@ async function composeStart(
         getRepositories().obligations.listDirectChildEdges(parentId),
       listPrerequisiteEdges: (dependentId) =>
         getRepositories().obligations.listPrerequisiteEdges(dependentId),
+      // Yield-time snooze expiry is the mesh's own normalization, not the
+      // yielding actor's write, so it is attributed to the system principal.
+      expireDueSnoozes: (ids) => getRepositories().obligations.expireDueSnoozes(ids, "system:mesh"),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation
       // owned in the subtree is a blocker, so `scheduled` counts alongside
       // `ready` and `waiting` — a recurrence that has not fired yet is still
@@ -3364,8 +3367,11 @@ async function composeStart(
 
   mcpHttp.setWakeObligationHandler({
     token: wakeToken,
+    // One callback for occurrences and snooze deadlines alike. It re-reads the
+    // row and acts only on what is due, so an early, stale or duplicate job is
+    // harmless (#722).
     deliver: (id: string) => {
-      getRepositories().obligations.activateScheduled(id, "system:mesh");
+      getRepositories().obligations.wakeScheduled(id, "system:mesh");
     },
   });
 

@@ -513,6 +513,24 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
     );
   });
 
+  it("reports `at` as unschedulable so a snooze can be refused before it is written (#722)", () => {
+    const cron: CrontabIo = { read: () => "", write: () => {} };
+    const options = { tokenFile: "/token", portFile: "/port", instanceId: "test-instance" };
+    const missing = new DefaultOsScheduler(
+      new CrontabMutator(cron),
+      unavailableAtIo(["at missing"]),
+      options
+    );
+    expect(missing.canScheduleAt()).toBe(false);
+
+    const working = new DefaultOsScheduler(
+      new CrontabMutator(cron),
+      { schedule: () => "1", list: () => [], remove: () => {} },
+      options
+    );
+    expect(working.canScheduleAt()).toBe(true);
+  });
+
   it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
     const cron: CrontabIo = { read: () => "", write: () => {} };
     const scheduler = new DefaultOsScheduler(
