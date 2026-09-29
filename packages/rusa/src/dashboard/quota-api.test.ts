@@ -1806,6 +1806,37 @@ describe("dead-reckoned lane estimates (#759)", () => {
     ]);
   });
 
+  it("estimates a Fable window the newest scrape only carried forward from its last reading", async () => {
+    // The 13:00 extraction lost the Fable panel and carried the 12:00 window
+    // forward at its own time (#769). That is no new reading, so the lane is
+    // estimated from 12:00 like a missed one: 70 - 5 x 1.5 = 62.5.
+    const carried: ProviderQuotaSnapshot = {
+      ...providerOnly(at("13:00")),
+      limits: [
+        ...(providerOnly(at("13:00")).limits ?? []),
+        {
+          label: "Current week (Fable)",
+          kind: "weekly",
+          scope: { provider: "claude", models: FABLE },
+          percentLeft: 70,
+          resetAtIso: RESET,
+          scrapedAt: at("12:00"),
+        },
+      ],
+    };
+    const snapshot = await snapshotAt(at("13:30"), carried, [
+      fablePoint(at("10:00"), 80),
+      fablePoint(at("12:00"), 70),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 37.5, scrapedAt: at("12:00"), estimated: true }),
+    ]);
+    expect(snapshot.providers[0].windows).toEqual([
+      expect.objectContaining({ id: "weekly", scrapedAt: at("13:00"), estimated: false }),
+    ]);
+  });
+
   it("estimates a lane at the first scrape that misses it, however recent its last reading", async () => {
     // The 12:06 scrape missed the Fable panel six minutes after its last
     // reading, well inside the stale threshold: 70 - 5 x 0.1 = 69.5.

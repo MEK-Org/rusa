@@ -1,6 +1,11 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import type { PublishedHistoryRecord, PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { MissedQuotaWindowDetector } from "./missed-windows.js";
+import { SharedQuotaStore } from "./shared-store.js";
 
 function weekly(observedAt: string, percentLeft = 80): PublishedHistoryRecord {
   return {
@@ -219,5 +224,79 @@ describe("MissedQuotaWindowDetector (#759)", () => {
       history.push(weekly(at(15)), fable(at(15)));
       expect(detector.observe("claude", history, [parsed(at(0)), parsed(at(15))])).toEqual([]);
     });
+  });
+
+  it("raises a Fable window a scrape only carried forward, read through the store", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-missed-carried-"));
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const detector = new MissedQuotaWindowDetector();
+    const providerWeekly = {
+      label: "Current week (all models)",
+      kind: "weekly" as const,
+      percentLeft: 80,
+      resetAtIso: "2026-10-02T00:00:00.000Z",
+    };
+    const fableWeekly = {
+      label: "Current week (Fable)",
+      kind: "weekly" as const,
+      percentLeft: 60,
+      resetAtIso: "2026-10-02T00:00:00.000Z",
+      scope: { provider: "claude", models: ["claude-fable-5-1"] },
+    };
+    const scrape = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
+      const state: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt,
+        limits,
+      };
+      store.recordParsed(
+        store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "" }),
+        state,
+        state
+      );
+    };
+    const observe = () => {
+      const since = at(-60);
+      return detector.observe(
+        "claude",
+        store.listHistorySince("claude", since),
+        store.listScrapeOutcomesSince("claude", since)
+      );
+    };
+    try {
+      scrape(at(0), [providerWeekly, fableWeekly]);
+      expect(observe()).toEqual([]);
+      // The 12:15 extraction lost the Fable panel; the window is carried at its
+      // 12:00 reading time, so no Fable row carries the 12:15 stamp.
+      scrape(at(15), [providerWeekly, { ...fableWeekly, scrapedAt: at(0) }]);
+      expect(observe()).toEqual([
+        expect.objectContaining({
+          lane: "model:claude-fable-5-1:weekly",
+          lastReadingAt: at(0),
+          missedAt: at(15),
+          scrapeFailed: false,
+        }),
+      ]);
+      // A read that lost every panel carries both windows and writes no row at
+      // 12:30; only its scrape outcome shows the provider weekly went missing.
+      scrape(at(30), [
+        { ...providerWeekly, scrapedAt: at(15) },
+        { ...fableWeekly, scrapedAt: at(0) },
+      ]);
+      expect(store.listHistorySince("claude", at(-60)).map((r) => r.observedAt)).not.toContain(
+        at(30)
+      );
+      expect(observe()).toEqual([
+        expect.objectContaining({
+          lane: "provider:weekly",
+          lastReadingAt: at(15),
+          missedAt: at(30),
+        }),
+      ]);
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
