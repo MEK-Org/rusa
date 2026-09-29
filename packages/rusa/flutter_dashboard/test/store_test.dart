@@ -2145,7 +2145,7 @@ void main() {
   });
 
   group('Obligations browser cache (#505)', () {
-    final now = DateTime.utc(2026, 9, 22, 12);
+    final now = DateTime.timestamp();
     final cachedTree = ObligationTreeDto(
       obligation: makeObligation('cached-root', title: 'Cached Root Obligation'),
       children: const [],
