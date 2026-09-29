@@ -771,7 +771,6 @@ class _QuotaHeaderStrip extends StatelessWidget {
             weeklyWindow: fableWeeklyWindow(entry.provider!),
             sessionWindow: null,
             label: 'Fable',
-            labelColor: MeshColors.fable,
             showThrottle: false,
           ),
       ],
@@ -854,7 +853,6 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.sessionWindow,
     this.axis = Axis.horizontal,
     this.label,
-    this.labelColor,
     this.showThrottle = true,
   });
 
@@ -865,7 +863,6 @@ class _ProviderQuotaRing extends StatelessWidget {
   /// Overrides the provider name, for a ring that shows one model's
   /// allocation within the provider (#752).
   final String? label;
-  final Color? labelColor;
 
   /// Whether the tooltip carries the provider's launch pacing. A model ring
   /// leaves it out: that pacing is provider-wide, not the model's.
@@ -949,7 +946,7 @@ class _ProviderQuotaRing extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 13,
-                  color: labelColor ?? MeshColors.textSecondary,
+                  color: MeshColors.textSecondary,
                   fontWeight: FontWeight.w500,
                 ),
               ),

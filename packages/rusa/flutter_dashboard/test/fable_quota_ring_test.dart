@@ -169,9 +169,13 @@ void main() {
         expect(fableTip, contains('as of '));
         expect(fableTip, isNot(contains('all models')));
 
-        // The label carries Fable's identity color; semantics name it too.
-        final fableText = tester.widget<Text>(find.text('Fable'));
-        expect(fableText.style?.color, MeshColors.fable);
+        // The label is styled like every other ring label (#758); semantics
+        // name it too.
+        TextStyle? labelStyle(String name) =>
+            tester.widget<Text>(find.text(name)).style;
+        expect(labelStyle('Fable'), labelStyle('Claude'));
+        expect(labelStyle('Fable'), labelStyle('Codex'));
+        expect(labelStyle('Fable')?.color, isNot(MeshColors.fable));
         expect(find.bySemanticsLabel(RegExp(r'^Fable\n')), findsOneWidget);
         // Only Claude's ring has an inner session ring.
         expect(
