@@ -282,7 +282,7 @@ const LLM_WINDOW_ITEM_SCHEMA = {
       type: Type.STRING,
       description:
         "Percentage of this window's quota USED, 0-100, copied as text from the printed number " +
-        "without the % sign (e.g. '43' or '57.5') when the source reports it as used. Leave this empty when the source reports left/remaining; " +
+        "without the % sign (e.g. '43' or '57.5') when the source reports it as used. Leave this empty (or omit it) when the source reports left/remaining; " +
         "that goes in remainingPercent. A window must carry exactly one of usedPercent or " +
         "remainingPercent. Use numeric text, never the apparent length of a progress bar. " +
         "Omit when placeholder is true.",
@@ -292,7 +292,7 @@ const LLM_WINDOW_ITEM_SCHEMA = {
       description:
         "Percentage of this window's quota LEFT or REMAINING, 0-100, copied as text from the " +
         "printed number without the % sign when the source reports it as left/remaining. Do not convert it to used. Leave " +
-        "this empty when the source reports used; that goes in usedPercent. " +
+        "this empty (or omit it) when the source reports used; that goes in usedPercent. " +
         "Omit when placeholder is true.",
     },
     resetAtIso: {
@@ -454,20 +454,32 @@ function resolveResetAtIso(
   return undefined;
 }
 
-/** Output-token ceiling for one quota extraction attempt (#775). */
+/**
+ * Output-token ceiling for one quota extraction attempt (#775).
+ * A typical valid extraction reply is ~300 tokens; 8192 is an uncalibrated,
+ * generous power-of-two ceiling leaving ample headroom for multi-group
+ * agy panels while bounding an LLM token runaway to a few seconds
+ * (roughly 8x below the 65,536 limit observed on staging).
+ */
 const QUOTA_PARSE_MAX_OUTPUT_TOKENS = 8192;
 
 /**
  * Read the model's copied percentage text ("43", "57.5", "43%") as a number
- * in 0-100. Anything else, including a JSON number or an unbounded digit run,
- * is undefined.
+ * in 0-100 with at most 4 decimal places. Anything else, including a JSON
+ * number, an unprinted decimal tail, or a runaway zero sequence, is undefined.
  */
 function parsePrintedPercent(text: unknown): number | undefined {
   if (typeof text !== "string") return undefined;
-  const match = /^(\d{1,3}(?:\.\d+)?)\s*%?$/.exec(text.trim());
+  const match = /^(\d{1,3}(?:\.\d{1,4})?)\s*%?$/.exec(text.trim());
   if (!match?.[1]) return undefined;
   const value = Number(match[1]);
   return value <= 100 ? value : undefined;
+}
+
+function isPercentFieldPresent(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+  return true;
 }
 
 /**
@@ -476,8 +488,8 @@ function parsePrintedPercent(text: unknown): number | undefined {
  * carries both, neither, or text that is not a printed 0-100 percentage.
  */
 function resolvePercentLeft(w: LlmQuotaWindow): number | string {
-  const hasUsed = w.usedPercent !== undefined && w.usedPercent !== null;
-  const hasRemaining = w.remainingPercent !== undefined && w.remainingPercent !== null;
+  const hasUsed = isPercentFieldPresent(w.usedPercent);
+  const hasRemaining = isPercentFieldPresent(w.remainingPercent);
   if (hasUsed === hasRemaining) {
     return `must carry exactly one of usedPercent or remainingPercent, got ${hasUsed ? "both" : "neither"}`;
   }

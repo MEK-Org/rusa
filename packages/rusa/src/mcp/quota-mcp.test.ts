@@ -398,6 +398,13 @@ describe("quota MCP server", () => {
         ["remaining 0", { remainingPercent: "0" }, 0],
         ["remaining 100", { remainingPercent: "100" }, 100],
         ["remaining with a percent sign", { remainingPercent: "12.5%" }, 12.5],
+        ["remaining with empty usedPercent", { usedPercent: "", remainingPercent: "43" }, 43],
+        ["used with empty remainingPercent", { usedPercent: "43", remainingPercent: "" }, 57],
+        [
+          "remaining with whitespace usedPercent",
+          { usedPercent: "   ", remainingPercent: "43" },
+          43,
+        ],
       ])("maps %s to percentLeft in code", async (_name, percent, percentLeft) => {
         mockGenerateContent.mockResolvedValue(weeklyReply(percent));
 
@@ -443,8 +450,14 @@ describe("quota MCP server", () => {
       it.each([
         ["both fields", { usedPercent: "43", remainingPercent: "57" }, "got both"],
         ["neither field", {}, "got neither"],
+        ["both fields empty string", { usedPercent: "", remainingPercent: "" }, "got neither"],
         ["a used value above 100", { usedPercent: "500000" }, 'invalid usedPercent "500000"'],
         ["a runaway used value", { usedPercent: "3e+56" }, 'invalid usedPercent "3e+56"'],
+        [
+          "a runaway fractional tail",
+          { usedPercent: "43.0000000000" },
+          'invalid usedPercent "43.0000000000"',
+        ],
         ["a negative remaining value", { remainingPercent: "-5" }, 'invalid remainingPercent "-5"'],
         ["malformed text", { usedPercent: "43 of 100" }, 'invalid usedPercent "43 of 100"'],
         ["a JSON number instead of text", { remainingPercent: 57 }, "invalid remainingPercent 57"],
@@ -458,6 +471,11 @@ describe("quota MCP server", () => {
         const parsed = await parseClaudeQuota("Claude output here", "test-key");
 
         expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+        const calls = mockGenerateContent.mock.calls as Array<
+          [{ config?: { maxOutputTokens?: number } }]
+        >;
+        expect(calls[0][0].config?.maxOutputTokens).toBe(8192);
+        expect(calls[1][0].config?.maxOutputTokens).toBe(8192);
         expect(warn.mock.calls[0]?.[0]).toContain(reason);
         expect(parsed.limits?.[0]?.percentLeft).toBe(43);
         vi.restoreAllMocks();
