@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
 import type { CodingProvider } from "../providers/types.js";
+import { SharedQuotaStore } from "../quota/shared-store.js";
 import {
   buildQuotaHistory,
   buildQuotaHistorySnapshot,
@@ -272,6 +276,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: 604800000,
         scrapedAt: "2026-07-26T19:00:00.000Z",
+        estimated: false,
       },
     ]);
   });
@@ -332,6 +337,7 @@ describe("dashboard quota snapshot", () => {
         headline: false,
         windowMs: FIVE_HOUR_MS,
         scrapedAt: null,
+        estimated: false,
       },
       {
         id: "weekly",
@@ -342,6 +348,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: WEEK_MS,
         scrapedAt: null,
+        estimated: false,
       },
     ]);
     expect(kimi?.usedPercent).toBe(50);
@@ -362,6 +369,7 @@ describe("dashboard quota snapshot", () => {
         headline: false,
         windowMs: FIVE_HOUR_MS,
         scrapedAt: null,
+        estimated: false,
       },
       {
         id: "weekly",
@@ -372,6 +380,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: WEEK_MS,
         scrapedAt: null,
+        estimated: false,
       },
     ]);
     expect(claude?.usedPercent).toBe(3);
@@ -437,6 +446,7 @@ describe("dashboard quota snapshot", () => {
         headline: false,
         windowMs: FIVE_HOUR_MS,
         scrapedAt: null,
+        estimated: false,
       },
       {
         id: "weekly",
@@ -447,6 +457,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: WEEK_MS,
         scrapedAt: null,
+        estimated: false,
       },
     ]);
     expect(codex?.usedPercent).toBe(7);
@@ -501,6 +512,7 @@ describe("dashboard quota snapshot", () => {
           headline: true,
           windowMs: WEEK_MS,
           scrapedAt: "2026-09-28T13:00:00.000Z",
+          estimated: false,
           modelIds: ["claude-fable-5-1"],
         },
       ]);
@@ -587,6 +599,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: WEEK_MS,
         scrapedAt: null,
+        estimated: false,
       },
     ]);
     expect(codex?.usedPercent).toBe(48);
@@ -659,6 +672,7 @@ describe("dashboard quota snapshot", () => {
         headline: true,
         windowMs: WEEK_MS,
         scrapedAt: null,
+        estimated: false,
       },
       {
         id: "five_hour",
@@ -669,6 +683,7 @@ describe("dashboard quota snapshot", () => {
         headline: false,
         windowMs: FIVE_HOUR_MS,
         scrapedAt: null,
+        estimated: false,
       },
     ]);
     expect(agy).not.toHaveProperty("groups");
@@ -1436,5 +1451,213 @@ describe("GET /api/quota and GET /api/quota/history", () => {
         status: "unknown",
       });
     });
+  });
+});
+
+describe("dead-reckoned lane estimates (#759)", () => {
+  const FABLE = ["claude-fable-5-1"];
+  const RESET = "2026-10-02T09:00:00.000Z";
+  const at = (hhmm: string, day = "2026-09-28") => `${day}T${hhmm}:00.000Z`;
+  const fablePoint = (observedAt: string, percentLeft: number, resetAtIso: string | null = RESET) =>
+    historyPoint({
+      scope: "model",
+      models: FABLE,
+      label: "Current week (Fable)",
+      observedAt,
+      percentLeft,
+      resetAtIso,
+    });
+  /** A Claude reading carrying only the provider weekly, as when the Fable panel is missed. */
+  const providerOnly = (scrapedAt: string): ProviderQuotaSnapshot => ({
+    provider: "claude",
+    status: "available",
+    scrapedAt,
+    limits: [{ label: "Current week (all models)", kind: "weekly", percentLeft: 60, resetAtIso: RESET }],
+  });
+  const snapshotAt = (
+    nowIso: string,
+    state: ProviderQuotaSnapshot,
+    history: QuotaHistorySource[]
+  ): Promise<QuotaSnapshotDto> =>
+    buildQuotaSnapshot({
+      getQuota: async () => state,
+      providers: ["claude"],
+      now: () => Date.parse(nowIso),
+      listHistory: () => history,
+    });
+
+  it("estimates a missed lane from its window's pace, flagged with the last reading time", async () => {
+    // 80% at 10:00 and 70% at 12:00 is five points an hour; the 13:00 reading
+    // missed the Fable panel, so at 13:30 the lane reads 70 - 5 x 1.5 = 62.5.
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:00")), [
+      fablePoint(at("10:00"), 80),
+      fablePoint(at("12:00"), 70),
+    ]);
+    const claude = snapshot.providers[0];
+
+    expect(claude.modelWindows).toEqual([
+      {
+        id: "weekly",
+        label: "Current week (Fable)",
+        usedPercent: 37.5,
+        status: "available",
+        resetAtIso: RESET,
+        headline: true,
+        windowMs: WEEK_MS,
+        scrapedAt: at("12:00"),
+        estimated: true,
+        modelIds: FABLE,
+      },
+    ]);
+    // The provider weekly was read in the newest scrape and stays a reading.
+    expect(claude.windows).toEqual([
+      expect.objectContaining({ id: "weekly", usedPercent: 40, estimated: false }),
+    ]);
+  });
+
+  it("keeps a fresh reading as-is even when history could extend it", async () => {
+    const snapshot = await snapshotAt(
+      at("13:10"),
+      {
+        ...providerOnly(at("13:00")),
+        limits: [
+          {
+            label: "Current week (Fable)",
+            kind: "weekly",
+            scope: { provider: "claude", models: FABLE },
+            percentLeft: 65,
+            resetAtIso: RESET,
+          },
+        ],
+      },
+      [fablePoint(at("10:00"), 80), fablePoint(at("12:00"), 70), fablePoint(at("13:00"), 65)]
+    );
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 35, scrapedAt: at("13:00"), estimated: false }),
+    ]);
+  });
+
+  it("estimates a lane still in the newest reading once that reading has gone stale", async () => {
+    // The scraper stalled after 12:00: the lane is in the newest reading, but
+    // three hours on that reading is no longer fresh.
+    const snapshot = await snapshotAt(
+      at("15:00"),
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt: at("12:00"),
+        limits: [{ label: "Weekly", kind: "weekly", percentLeft: 70, resetAtIso: RESET }],
+      },
+      [historyPoint({ observedAt: at("10:00"), percentLeft: 80, resetAtIso: RESET })]
+    );
+
+    expect(snapshot.providers[0].windows).toEqual([
+      expect.objectContaining({ usedPercent: 45, scrapedAt: at("12:00"), estimated: true }),
+    ]);
+    expect(snapshot.providers[0].usedPercent).toBe(45);
+  });
+
+  it("keeps a one-reading lane unknown", async () => {
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:00")), [
+      fablePoint(at("12:00"), 70),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([]);
+  });
+
+  it("paces only on readings from the current window", async () => {
+    // The 90% reading belongs to the previous window (its reset differs), so
+    // the current window has one reading and nothing to pace on.
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:00")), [
+      fablePoint(at("10:00"), 90, "2026-09-28T11:00:00.000Z"),
+      fablePoint(at("12:00"), 70),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([]);
+  });
+
+  it("shows an approximately full estimate right after the window rolls over", async () => {
+    // Ten points an hour; the window reset at 13:00 with the last reading at
+    // 12:30, so at 13:30 the new window is estimated at 100 - 10 x 0.5 = 95.
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:15")), [
+      fablePoint(at("11:30"), 40, at("13:00")),
+      fablePoint(at("12:30"), 30, at("13:00")),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({
+        usedPercent: 5,
+        resetAtIso: null,
+        scrapedAt: at("12:30"),
+        estimated: true,
+      }),
+    ]);
+  });
+
+  it("returns no value past window end once the last reading is over two hours old", async () => {
+    const snapshot = await snapshotAt(at("14:31"), providerOnly(at("14:00")), [
+      fablePoint(at("11:30"), 40, at("13:00")),
+      fablePoint(at("12:30"), 30, at("13:00")),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([]);
+  });
+
+  it("keeps estimating inside the window however old the last reading is", async () => {
+    const snapshot = await snapshotAt(at("12:00", "2026-09-30"), providerOnly(at("11:00", "2026-09-30")), [
+      fablePoint(at("10:00"), 80),
+      fablePoint(at("12:00"), 78),
+    ]);
+
+    // One point an hour for 48 hours.
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 70, scrapedAt: at("12:00"), estimated: true }),
+    ]);
+  });
+
+  it("writes no estimate to the quota database", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-quota-estimate-"));
+    const store = new SharedQuotaStore(join(root, "quota.db"));
+    try {
+      const record = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
+        const state: ProviderQuotaSnapshot = { provider: "claude", status: "available", scrapedAt, limits };
+        store.recordParsed(store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" }), state, state);
+      };
+      const session = { label: "Current session", kind: "session" as const, percentLeft: 90, resetAtIso: at("15:00") };
+      const weekly = (percentLeft: number) => ({ label: "Weekly", kind: "weekly" as const, percentLeft, resetAtIso: RESET });
+      record(at("10:00"), [session, weekly(80)]);
+      record(at("12:00"), [session, weekly(70)]);
+      // The newest scrape missed the weekly panel.
+      record(at("13:00"), [session]);
+      const counts = () =>
+        store.db
+          .prepare(
+            `SELECT (SELECT count(*) FROM quota_observations) AS observations,
+                    (SELECT count(*) FROM quota_scrapes) AS scrapes`
+          )
+          .get();
+      const before = counts();
+
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => store.getLatestSnapshot("claude") ?? { provider: "claude", status: "unknown" },
+        providers: ["claude"],
+        now: () => Date.parse(at("13:30")),
+        listHistory: (provider, sinceIso) => store.listHistorySince(provider, sinceIso),
+      });
+
+      expect(snapshot.providers[0].windows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "weekly", usedPercent: 37.5, estimated: true }),
+        ])
+      );
+      expect(counts()).toEqual(before);
+      expect(
+        store.db.prepare("SELECT count(*) AS n FROM quota_observations WHERE percent_left = 62.5").get()
+      ).toEqual({ n: 0 });
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
