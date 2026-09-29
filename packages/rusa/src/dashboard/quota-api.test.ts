@@ -1517,6 +1517,19 @@ describe("dead-reckoned lane estimates (#759)", () => {
     ]);
   });
 
+  it("estimates a lane at the first scrape that misses it, however recent its last reading", async () => {
+    // The 12:06 scrape missed the Fable panel six minutes after its last
+    // reading, well inside the stale threshold: 70 - 5 x 0.1 = 69.5.
+    const snapshot = await snapshotAt(at("12:06"), providerOnly(at("12:06")), [
+      fablePoint(at("10:00"), 80),
+      fablePoint(at("12:00"), 70),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 30.5, scrapedAt: at("12:00"), estimated: true }),
+    ]);
+  });
+
   it("keeps a fresh reading as-is even when history could extend it", async () => {
     const snapshot = await snapshotAt(
       at("13:10"),

@@ -15,8 +15,12 @@ export interface MissedQuotaWindow {
 
 interface ScrapeLanes {
   slot: number;
+  /** The newest scrape stamp in the slot, and the windows that scrape carried. */
   observedAt: string;
+  observedMs: number;
   lanes: Map<string, PublishedHistoryRecord>;
+  /** Windows an earlier scrape in the same slot carried and its newest scrape did not. */
+  dropped: Map<string, PublishedHistoryRecord>;
 }
 
 /**
@@ -29,9 +33,16 @@ interface ScrapeLanes {
  * than the last one it saw and compares it with the scrape before. A window
  * present in one and absent in the next is reported, and the absence is then
  * the baseline, so later scrapes that still lack it report nothing until the
- * window returns and drops out again. A scrape is the observation slot its
- * readings share. The first history seen for a provider is a silent baseline:
- * a restart does not re-raise a gap this process never watched open.
+ * window returns and drops out again. The first history seen for a provider is
+ * a silent baseline: a restart does not re-raise a gap this process never
+ * watched open.
+ *
+ * A scrape is its `observedAt` stamp: the store writes every row of one
+ * snapshot with that one stamp, and keeps one row per window per observation
+ * slot, the later scrape overwriting. So a slot's rows stamped before its
+ * newest stamp are windows an earlier scrape in that slot carried and the
+ * newest one dropped. A scrape that published no window at all leaves no row,
+ * and so no gap to find here.
  */
 export class MissedQuotaWindowDetector {
   private readonly lastScrape = new Map<string, ScrapeLanes>();
@@ -47,13 +58,16 @@ export class MissedQuotaWindowDetector {
     }
     for (const scrape of scrapes) {
       if (scrape.slot < previous.slot) continue;
-      if (scrape.slot === previous.slot) {
-        // A scrape the last pass saw may have gained windows since, from a
-        // later read in the same slot; none of that is a gap.
+      if (scrape.slot === previous.slot && scrape.observedMs <= previous.observedMs) {
+        // The scrape the last pass saw; any rows it has gained are no gap.
         for (const [lane, record] of scrape.lanes) previous.lanes.set(lane, record);
         continue;
       }
-      for (const [lane, record] of previous.lanes) {
+      const carried = new Map(previous.lanes);
+      for (const [lane, record] of scrape.dropped) {
+        if (Date.parse(record.observedAt) > previous.observedMs) carried.set(lane, record);
+      }
+      for (const [lane, record] of carried) {
         if (scrape.lanes.has(lane)) continue;
         missed.push({
           provider,
@@ -71,18 +85,30 @@ export class MissedQuotaWindowDetector {
 }
 
 function groupByScrape(records: readonly PublishedHistoryRecord[]): ScrapeLanes[] {
-  const bySlot = new Map<number, ScrapeLanes>();
+  const bySlot = new Map<number, PublishedHistoryRecord[]>();
   for (const record of records) {
     const observedMs = Date.parse(record.observedAt);
     if (!Number.isFinite(observedMs)) continue;
     const slot = Math.floor(observedMs / QUOTA_OBSERVATION_SLOT_MS);
-    let scrape = bySlot.get(slot);
-    if (!scrape) {
-      scrape = { slot, observedAt: record.observedAt, lanes: new Map() };
-      bySlot.set(slot, scrape);
-    }
-    if (record.observedAt > scrape.observedAt) scrape.observedAt = record.observedAt;
-    scrape.lanes.set(quotaLaneKey(record.scope, record.models ?? [], record.kind), record);
+    const rows = bySlot.get(slot);
+    if (rows) rows.push(record);
+    else bySlot.set(slot, [record]);
   }
-  return [...bySlot.values()].sort((a, b) => a.slot - b.slot);
+  return [...bySlot]
+    .map(([slot, rows]) => {
+      const newest = rows.reduce((a, b) =>
+        Date.parse(b.observedAt) > Date.parse(a.observedAt) ? b : a
+      );
+      const observedMs = Date.parse(newest.observedAt);
+      const lanes = new Map<string, PublishedHistoryRecord>();
+      const dropped = new Map<string, PublishedHistoryRecord>();
+      for (const record of rows) {
+        const lane = quotaLaneKey(record.scope, record.models ?? [], record.kind);
+        if (Date.parse(record.observedAt) === observedMs) lanes.set(lane, record);
+        else dropped.set(lane, record);
+      }
+      for (const lane of lanes.keys()) dropped.delete(lane);
+      return { slot, observedAt: newest.observedAt, observedMs, lanes, dropped };
+    })
+    .sort((a, b) => a.slot - b.slot);
 }

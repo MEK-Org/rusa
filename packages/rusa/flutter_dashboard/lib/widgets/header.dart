@@ -988,11 +988,17 @@ class _ProviderQuotaRing extends StatelessWidget {
 /// no reset time, so a window still past its reset here is one it could not
 /// estimate.
 double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
-  final used = window?.usedPercent;
-  if (window == null || used == null || !window.isKnown) return 0.0;
-  if (now != null && window.isPastReset(now)) return 0.0;
-  return (100 - used.clamp(0, 100)) / 100;
+  if (!_ringShowsValue(window, now)) return 0.0;
+  return (100 - window!.usedPercent!.clamp(0, 100)) / 100;
 }
+
+/// Whether the ring draws [window]'s value — possibly 0%, when a reading or
+/// estimate says the window is exhausted — rather than empty for unknown.
+bool _ringShowsValue(QuotaWindowDto? window, DateTime? now) =>
+    window != null &&
+    window.usedPercent != null &&
+    window.isKnown &&
+    !(now != null && window.isPastReset(now));
 
 /// How long a lane may go without a real reading before its ring carries the
 /// yellow warning triangle (#759). The server's rollover estimate uses the
@@ -1013,7 +1019,7 @@ Duration? _readingAge(QuotaWindowDto? window, DateTime now) {
 Duration? _staleReadingAge(List<QuotaWindowDto?> windows, DateTime now) {
   Duration? oldest;
   for (final window in windows) {
-    if (window == null || _ringValue(window, now: now) == 0.0) continue;
+    if (!_ringShowsValue(window, now)) continue;
     final age = _readingAge(window, now);
     if (age == null || age <= kQuotaReadingStaleAfter) continue;
     if (oldest == null || age > oldest) oldest = age;

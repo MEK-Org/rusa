@@ -532,12 +532,14 @@ function withEstimates(
     if (lane) lane.push(record);
     else lanes.set(key, [record]);
   }
-  const estimate = <W extends QuotaWindowDto>(window: W, key: string, rollover = true): W => {
+  const estimate = <W extends QuotaWindowDto>(window: W, key: string, missed = false): W => {
     const scrapedMs = window.scrapedAt === null ? Number.NaN : Date.parse(window.scrapedAt);
     const resetMs = window.resetAtIso === null ? Number.NaN : Date.parse(window.resetAtIso);
     const fresh =
       !Number.isFinite(scrapedMs) ||
-      (nowMs - scrapedMs <= staleAfterMs && !(Number.isFinite(resetMs) && resetMs <= nowMs));
+      (!missed &&
+        nowMs - scrapedMs <= staleAfterMs &&
+        !(Number.isFinite(resetMs) && resetMs <= nowMs));
     if (fresh) return window;
     const readings: LaneReading[] = [...(lanes.get(key) ?? [])];
     if (window.usedPercent !== null && !readings.some((r) => r.observedAt === window.scrapedAt)) {
@@ -547,7 +549,7 @@ function withEstimates(
         resetAtIso: window.resetAtIso,
       });
     }
-    const reckoned = estimateLane(readings, window.windowMs, nowMs, { rollover });
+    const reckoned = estimateLane(readings, window.windowMs, nowMs, { rollover: !missed });
     if (!reckoned) return window;
     return {
       ...window,
@@ -577,7 +579,9 @@ function withEstimates(
       scrapedAt: last.observedAt,
       estimated: false,
     };
-    const reckoned = estimate(window, key, false);
+    // Missing from the newest scrape is itself the missed reading (#759): it is
+    // estimated however recent its last reading, and not past its reset.
+    const reckoned = estimate(window, key, true);
     return reckoned.estimated ? reckoned : null;
   };
 

@@ -89,10 +89,36 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     ).toEqual([]);
   });
 
-  it("reads windows landing in one observation slot as one scrape", () => {
+  it("reads a window the newest scrape in a slot overwrote as still carried", () => {
     const detector = new MissedQuotaWindowDetector();
-    detector.observe("claude", [weekly(at(0)), fable(at(1))]);
-    expect(detector.observe("claude", [weekly(at(0)), fable(at(1)), weekly(at(2))])).toEqual([]);
+    detector.observe("claude", [weekly(at(0)), fable(at(0))]);
+    // The store keeps one row per window per slot: a second scrape at 12:02
+    // overwrites the rows it carried and leaves the rest stamped 12:00.
+    expect(detector.observe("claude", [weekly(at(2)), fable(at(0))])).toEqual([
+      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(2) }),
+    ]);
+    expect(detector.observe("claude", [weekly(at(2)), fable(at(0)), weekly(at(15))])).toEqual([]);
+  });
+
+  it("finds a window an unseen scrape carried and the later scrape in its slot dropped", () => {
+    const detector = new MissedQuotaWindowDetector();
+    detector.observe("claude", [weekly(at(0))]);
+    expect(detector.observe("claude", [weekly(at(0)), fable(at(15)), weekly(at(17))])).toEqual([
+      expect.objectContaining({
+        lane: "model:claude-fable-5-1:weekly",
+        lastReadingAt: at(15),
+        missedAt: at(17),
+      }),
+    ]);
+  });
+
+  it("takes rows of one scrape that arrive across refreshes as that scrape", () => {
+    const detector = new MissedQuotaWindowDetector();
+    detector.observe("claude", [weekly(at(0))]);
+    expect(detector.observe("claude", [weekly(at(0)), fable(at(0))])).toEqual([]);
+    expect(detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15))])).toEqual([
+      expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(15) }),
+    ]);
   });
 
   it("keeps providers apart and ignores a refresh with no new scrape", () => {

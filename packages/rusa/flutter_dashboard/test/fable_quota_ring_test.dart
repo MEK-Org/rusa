@@ -542,6 +542,28 @@ void main() {
       });
     });
 
+    testWidgets('keeps the warning on an estimate drawn down to 0%', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        // A paced estimate can run out before the reset: the ring is empty
+        // because the lane is exhausted, not because it is unknown.
+        final store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            used: 100,
+            scrapedAgo: const Duration(hours: 3),
+            estimated: true,
+          ),
+        );
+        expect(_outerRingValue(tester, 'Fable'), 0.0);
+        expect(_staleWarning('Fable'), findsOneWidget);
+        await store.dispose();
+      });
+    });
+
     testWidgets('leaves a window it cannot estimate empty past its reset', (
       tester,
     ) async {

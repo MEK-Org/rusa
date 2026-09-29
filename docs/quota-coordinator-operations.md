@@ -283,8 +283,8 @@ age together and widen to the ceiling as usual.
 
 When a lane has no fresh reading, the dashboard quota API shows an estimate
 instead of an unknown value. This covers a lane that the newest scrape left
-out, a reading older than the provider's stale threshold, and a window whose
-reset has passed. It applies to every provider-wide and model-scoped lane.
+out (from that first missed scrape, however recent its last reading), a reading
+older than the provider's stale threshold, and a window whose reset has passed. It applies to every provider-wide and model-scoped lane.
 
 The estimate starts from the lane's last real reading and continues at the
 consumption pace between the first and last readings of the current window.
@@ -310,7 +310,11 @@ yellow warning triangle.
 
 Each `rusa start` process that has a coordinator configured compares
 consecutive scrapes in the history it refreshes. A scrape is the set of
-observations that share one five-minute observation slot. If a window appears
+observations that share one `observedAt` stamp, which the store writes on every
+row of one snapshot. The store keeps one row per window per five-minute slot, so
+when two scrapes land in one slot, a row still stamped with the earlier scrape
+is a window the later one dropped. A scrape that published no window at all
+leaves no row, so it raises no alarm. If a window appears
 in one scrape and is missing from the next, the process sends one normal-priority
 `system.quota_window_missed` alarm to its own root on `system:events`. Instances
 that share a coordinator each tell their own root once. The alarm is not
