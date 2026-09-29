@@ -1483,12 +1483,13 @@ export class SharedQuotaStore {
         continue;
       }
       seenLanes.add(lane);
-      // A window stamped with its own read time (Claude's bad-read carry,
+      // A Claude window stamped with its own read time (the bad-read carry,
       // #763) is old evidence, not a second observation at this scrape's
       // time. Persist that timestamp so dashboard age, history, and controller
-      // ingestion cannot mistake it for a new read.
+      // ingestion cannot mistake it for a new read. Other providers keep the
+      // scrape time, as before.
       const observedAt =
-        limit.scrapedAt && Number.isFinite(Date.parse(limit.scrapedAt))
+        provider === "claude" && limit.scrapedAt && Number.isFinite(Date.parse(limit.scrapedAt))
           ? limit.scrapedAt
           : fallbackObservedAt;
       const observedMs = Date.parse(observedAt);

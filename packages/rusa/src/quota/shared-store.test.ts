@@ -581,6 +581,43 @@ describe("SharedQuotaStore canonical observations", () => {
     }
   });
 
+  it("records another provider's window at the scrape time even with a per-limit scrapedAt", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-codex-limit-time-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const perLimitAt = "2030-01-01T00:00:00.000Z";
+    const scrapeAt = "2030-01-01T00:30:00.000Z";
+    const state: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "available",
+      scrapedAt: scrapeAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: "provider",
+          scrapedAt: perLimitAt,
+        },
+      ],
+    };
+    try {
+      const id = store.recordRaw({
+        provider: "codex",
+        scrapedAt: scrapeAt,
+        rawOutput: "synthetic scrape",
+      });
+      store.recordParsed(id, state, state);
+
+      expect(
+        store.db.prepare("SELECT observed_at AS observedAt FROM quota_observations").all()
+      ).toEqual([{ observedAt: scrapeAt }]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("still records another provider's carried window at the bad read's time", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-codex-"));
     roots.push(root);

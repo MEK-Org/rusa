@@ -231,7 +231,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         resetAtIso: limit.resetAtIso ?? null,
         headline: isWeekly,
         windowMs: windowMsFor(id),
-        scrapedAt: limit.scrapedAt ?? scrapedAt,
+        scrapedAt,
       };
     });
   }
@@ -252,13 +252,12 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
     resetAtIso: limit.resetAtIso ?? null,
     headline: limit.kind === "weekly",
     windowMs: windowMsFor(limit.kind ?? "other"),
-    scrapedAt: limit.scrapedAt ?? scrapedAt,
+    scrapedAt,
   }));
 }
 
 function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
   if (state.limits && state.limits.length > 0) {
-    const scrapedAt = state.scrapedAt ?? null;
     return state.limits.map((limit) => {
       // ISSUE_NUM: see claudeWindows above — key off `kind`, not label.
       const { id, isWeekly } = windowIdentity(limit.kind);
@@ -271,7 +270,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
-        scrapedAt: limit.scrapedAt ?? scrapedAt,
+        scrapedAt: state.scrapedAt ?? null,
       };
     });
   }
@@ -286,7 +285,10 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
  * `"model"` row names none, so it cannot be attributed to any model and is
  * dropped here as it is from the provider's own windows.
  */
-function modelWindowsFor(state: ProviderQuotaSnapshot): QuotaModelWindowDto[] {
+function modelWindowsFor(
+  provider: SupportedProvider,
+  state: ProviderQuotaSnapshot
+): QuotaModelWindowDto[] {
   const scrapedAt = state.scrapedAt ?? null;
   return (state.limits ?? []).flatMap((limit) => {
     const modelIds =
@@ -302,7 +304,8 @@ function modelWindowsFor(state: ProviderQuotaSnapshot): QuotaModelWindowDto[] {
         resetAtIso: limit.resetAtIso ?? null,
         headline: isWeekly,
         windowMs: windowMsFor(id),
-        scrapedAt: limit.scrapedAt ?? scrapedAt,
+        // Only Claude's bad-read carry dates a window on its own (#763).
+        scrapedAt: provider === "claude" ? (limit.scrapedAt ?? scrapedAt) : scrapedAt,
         modelIds: [...modelIds],
       },
     ];
@@ -331,7 +334,7 @@ function toProviderDto(
     tier: null,
     message: state.message ?? null,
     windows,
-    modelWindows: modelWindowsFor(state),
+    modelWindows: modelWindowsFor(provider, state),
     scrapedAt: state.scrapedAt ?? null,
     throttle,
   };

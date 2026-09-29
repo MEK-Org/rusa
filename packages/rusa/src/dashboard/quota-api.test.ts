@@ -822,6 +822,43 @@ describe("dashboard quota snapshot", () => {
       expect(claude.windows[0].scrapedAt).toBe("2026-09-28T14:00:00.000Z");
       expect(claude.modelWindows[0].scrapedAt).toBe("2026-09-28T11:00:00.000Z");
     });
+
+    it.each([
+      "codex",
+      "agy",
+      "kimi",
+    ] as const)("ignores a per-limit scrapedAt for %s, as before #763", async (provider) => {
+      const scrapeAt = "2026-09-28T14:00:00.000Z";
+      const perLimitAt = "2026-09-28T11:00:00.000Z";
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({
+          provider,
+          status: "available",
+          scrapedAt: scrapeAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 60,
+              scope: "provider",
+              scrapedAt: perLimitAt,
+            },
+            {
+              label: "Weekly (model)",
+              kind: "weekly",
+              percentLeft: 25,
+              scope: { provider, models: [`${provider}-model`] },
+              scrapedAt: perLimitAt,
+            },
+          ],
+        }),
+        providers: [provider],
+      });
+      const dto = snapshot.providers[0];
+
+      expect(dto.windows.map((w) => w.scrapedAt)).toEqual([scrapeAt]);
+      expect(dto.modelWindows.map((w) => w.scrapedAt)).toEqual([scrapeAt]);
+    });
   });
 
   it("codex: reports the provider's own weekly, not a model reserve at 100% left (#249)", async () => {
