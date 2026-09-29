@@ -1377,11 +1377,7 @@ class DashboardStore {
       unawaited(refreshRecentActivity());
     }
 
-    // A status transition changes the header of an open detail pane just as
-    // a checkpoint rewrite changes its standing (#771), and a cached forest
-    // replayed later would still show the old status.
-    if ((e.kind == 'obligation_checkpoint_set' ||
-            e.kind == 'obligation_status_changed') &&
+    if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
       invalidateObligationsCache();
       _obligationRefreshes.add(e.detail);

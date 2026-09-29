@@ -60,8 +60,7 @@ export interface ObligationsMcpOptions {
    */
   canManage?: (actorId: string, obligation: ManageableObligation) => boolean;
   /**
-   * Best-effort notification that a committed checkpoint or terminal status
-   * changed. Injected
+   * Best-effort notification that a committed checkpoint changed. Injected
    * rather than imported for the same reason the mesh's own sink is a bare
    * function type: this module has no storage dependency. This is deliberately
    * not an audit receipt or part of the repository transaction — a sink may be
@@ -457,18 +456,6 @@ export function createObligationsMcpServer(
           resolution_ref ?? null,
           actorId
         );
-        // Best-effort, like obligation_checkpoint_set: the committed
-        // transition is the result; the event only tells open views to refetch.
-        try {
-          options?.recordEvent?.({
-            kind: "obligation_status_changed",
-            actorId,
-            detail: id,
-            payload: JSON.stringify({ status: obligation.status }),
-          });
-        } catch {
-          // See set_checkpoint: a failing optional sink never fails the write.
-        }
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);

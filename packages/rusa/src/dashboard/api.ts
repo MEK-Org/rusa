@@ -1418,19 +1418,6 @@ export async function handleMeshApiRequest(
               resolutionRef,
               actingPrincipal
             );
-            // Other open dashboards learn of the transition over SSE (#771).
-            // Best-effort: the committed transition is the response, and a
-            // failing sink must not report it as a 400.
-            try {
-              deps?.mesh?.recordEvent({
-                kind: "obligation_status_changed",
-                actorId: actingPrincipal,
-                detail: id,
-                payload: JSON.stringify({ status: obligation.status }),
-              });
-            } catch {
-              // The write above already succeeded.
-            }
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

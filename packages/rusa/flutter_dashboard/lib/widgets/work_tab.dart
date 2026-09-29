@@ -780,8 +780,8 @@ class _DetailViewState extends State<_DetailView> {
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
 
   /// A write made from this pane also refetches the pane, so its header shows
-  /// the new status without waiting for the server's event to round-trip
-  /// (#771). The Work tab's own callback still reloads the tree.
+  /// the new status (#771); nothing else refreshes it on a status change. The
+  /// Work tab's own callback still reloads the tree.
   VoidCallback get onMutated => () {
     if (mounted) _refresh();
     widget.onMutated?.call();
