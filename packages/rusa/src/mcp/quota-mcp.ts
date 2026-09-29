@@ -216,13 +216,13 @@ interface LlmQuotaWindow {
    */
   kind?: QuotaWindowKind;
   /**
-   * The printed percentage number, copied as text (e.g. "43", "57.5"), and
-   * whether the source labels it used or left. Code does the `100 - N`
-   * conversion: asked to compute or preserve precision on a numeric field,
-   * the model could emit `43.000…` until the output-token cap (#775).
+   * Exactly one of these carries the printed percentage, according to whether
+   * the source labels it used or left. Code does the `100 - N` conversion:
+   * asked to compute it, the model could emit `43.000…` until the
+   * output-token cap (#775).
    */
-  percentText?: string;
-  percentBasis?: "used" | "left";
+  usedPercent?: number;
+  remainingPercent?: number;
   resetAtIso?: string;
   resetInIso?: string;
   placeholder?: boolean;
@@ -278,20 +278,22 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "current-session window; 'five_hour' for a 5-hour rolling window (e.g. codex '5h'); " +
         "'weekly' for a 7-day/weekly window; 'other' for anything that doesn't fit those.",
     },
-    percentText: {
-      type: Type.STRING,
+    usedPercent: {
+      type: Type.NUMBER,
       description:
-        "The printed percentage number for this window, 0-100, copied from the source text " +
-        "without the % sign, e.g. '43' or '57.5'. Do not convert it: say whether it is used or " +
-        "left in percentBasis. Use numeric text, never the apparent length of a progress bar. " +
+        "Percentage of this window's quota USED, 0-100, copied from the printed number when the " +
+        "source reports it as used. Leave this empty when the source reports left/remaining; " +
+        "that goes in remainingPercent. A window must carry exactly one of usedPercent or " +
+        "remainingPercent. Use numeric text, never the apparent length of a progress bar. " +
         "Omit when placeholder is true.",
     },
-    percentBasis: {
-      type: Type.STRING,
-      enum: ["used", "left"],
+    remainingPercent: {
+      type: Type.NUMBER,
       description:
-        "'used' when the source reports percentText as used; 'left' when it reports it as " +
-        "left or remaining. Omit when placeholder is true.",
+        "Percentage of this window's quota LEFT or REMAINING, 0-100, copied from the printed " +
+        "number when the source reports it as left/remaining. Do not convert it to used. Leave " +
+        "this empty when the source reports used; that goes in usedPercent. " +
+        "Omit when placeholder is true.",
     },
     resetAtIso: {
       type: Type.STRING,
@@ -456,15 +458,22 @@ function resolveResetAtIso(
 const QUOTA_PARSE_MAX_OUTPUT_TOKENS = 8192;
 
 /**
- * Read the model's copied percentage text ("43", "57.5", "43%") as a number
- * in 0-100. Anything else, such as a digit run with no bound, is undefined.
+ * Resolve a window's percentLeft from whichever of usedPercent or
+ * remainingPercent the model copied. Returns an error message when the window
+ * carries both, neither, or a value outside 0-100.
  */
-function parsePrintedPercent(text: string | undefined): number | undefined {
-  if (typeof text !== "string") return undefined;
-  const match = /^(\d{1,3}(?:\.\d+)?)\s*%?$/.exec(text.trim());
-  if (!match?.[1]) return undefined;
-  const value = Number(match[1]);
-  return value <= 100 ? value : undefined;
+function resolvePercentLeft(w: LlmQuotaWindow): number | string {
+  const hasUsed = w.usedPercent !== undefined && w.usedPercent !== null;
+  const hasRemaining = w.remainingPercent !== undefined && w.remainingPercent !== null;
+  if (hasUsed === hasRemaining) {
+    return `must carry exactly one of usedPercent or remainingPercent, got ${hasUsed ? "both" : "neither"}`;
+  }
+  const field = hasUsed ? "usedPercent" : "remainingPercent";
+  const value = hasUsed ? w.usedPercent : w.remainingPercent;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) {
+    return `has invalid ${field} ${String(value)}`;
+  }
+  return hasUsed ? 100 - value : value;
 }
 
 async function parseQuotaWithLlm(
@@ -525,7 +534,7 @@ async function parseQuotaWithLlm(
           "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
           "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
           "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
-          "Codex percentages say LEFT: copy the printed N% left as percentText N with percentBasis 'left'. " +
+          "Codex percentages say LEFT: copy the printed N% left into remainingPercent N and leave usedPercent empty. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted' only when that message applies to the provider-wide quota; extract provider-wide percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
@@ -540,16 +549,16 @@ async function parseQuotaWithLlm(
             "The shared GEMINI MODELS section is provider-wide: emit its rows with no `models`; they alone determine status. " +
             "Every other named model or model-group section is model-specific: emit its rows with `models` set to the matching IDs from the configured model list (sections matching nothing configured are omitted entirely), and never use them to determine status. " +
             "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage and ignore the apparent progress-bar length. " +
-            "Copy the printed remaining number N as percentText N with percentBasis 'left' " +
-            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → percentText '0.00'; '3% remaining' → percentText '3'; '48% remaining' → percentText '48'). " +
+            "Copy the printed remaining number N into remainingPercent and leave usedPercent empty " +
+            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → remainingPercent 0; '3% remaining' → remainingPercent 3; '48% remaining' → remainingPercent 48). " +
             "A window showing 'Quota available' with a full (100%) bar is fully available: " +
-            "emit percentText '100' with percentBasis 'left'. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
-            "emit this window with percentText '0' and percentBasis 'left' (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
+            "emit remainingPercent 100. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
+            "emit this window with remainingPercent 0 (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
             "Emit the GEMINI MODELS Weekly Limit and Five Hour Limit at top level in `windows`, each with no `models`. " +
             "If weekly limit is at 100% used (0% remaining), status is 'exhausted'.\n"
           : "For Kimi: the interactive /usage panel shows Kimi Code platform quota, commonly including 5h/five-hour and weekly windows. " +
-            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N as percentText, with percentBasis 'used' for 'used' and 'left' for 'left/remaining' " +
-            "(e.g. '63% used' → percentText '63', percentBasis 'used'; '0% left' → percentText '0', percentBasis 'left'). " +
+            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N into usedPercent for 'used' or into remainingPercent for 'left/remaining', never both " +
+            "(e.g. '63% used' → usedPercent 63; '0% left' → remainingPercent 0; '88% left' → remainingPercent 88). " +
             "Always use the numeric percentage text; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
             "Every named-model or model-group limit is model-specific: emit it with `models` set to the matching IDs from the configured model list (rows matching nothing configured are omitted entirely), and never use it to determine status. " +
             "Extract every visible provider-wide quota window and set kind " +
@@ -586,7 +595,7 @@ async function parseQuotaWithLlm(
     "GROUNDING REQUIREMENT: You MUST ONLY report windows and statuses that are physically printed in the provided output. " +
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
     "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
-    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text and never infer a value from progress-bar artwork. Copy the printed number N into percentText and never compute a new number: set percentBasis 'used' if the source reports USED, or 'left' if it reports LEFT or REMAINING. The precision of all numbers should be limited to at most 3 decimal places.\n" +
+    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text and never infer a value from progress-bar artwork. Copy the printed number N and never compute a new number: put N in usedPercent if the source reports USED, or in remainingPercent if it reports LEFT or REMAINING. Fill exactly one of the two for each window. The precision of all numbers should be limited to at most 3 decimal places.\n" +
     providerClause +
     configuredModelClause +
     describeLocalNow(generatedAtMs) +
@@ -701,22 +710,14 @@ async function parseQuotaWithLlm(
       const hasExplicitModelScope = w.models !== undefined;
       const canonicalModels = resolveWindowModels(rawModels, configuredModelRefs(configuredModels));
       if (hasExplicitModelScope && canonicalModels.length === 0) continue;
-      const printedPercent = parsePrintedPercent(w.percentText);
-      if (printedPercent === undefined) {
-        throw new Error(
-          `Quota parse failed: window '${w.label}' has invalid percentText ${JSON.stringify(w.percentText)}`
-        );
-      }
-      if (w.percentBasis !== "used" && w.percentBasis !== "left") {
-        throw new Error(
-          `Quota parse failed: window '${w.label}' has invalid percentBasis ${JSON.stringify(w.percentBasis)}`
-        );
+      const percentLeft = resolvePercentLeft(w);
+      if (typeof percentLeft === "string") {
+        throw new Error(`Quota parse failed: window '${w.label}' ${percentLeft}`);
       }
       const kind = normalizeQuotaWindowKind(w.kind);
       if (!kind) {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
-      const percentLeft = w.percentBasis === "left" ? printedPercent : 100 - printedPercent;
       // A duration the model did emit but that is not ISO-8601 is a bad read,
       // not a missing one: fail here so the stronger-model retry sees it,
       // rather than letting it degrade into "no reset" and, for a 100%-left

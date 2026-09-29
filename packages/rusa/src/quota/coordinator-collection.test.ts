@@ -72,8 +72,7 @@ function availableParse(resetAtIso: string) {
           {
             label: "Weekly",
             kind: "weekly",
-            percentText: "50",
-            percentBasis: "used",
+            usedPercent: 50,
             resetAtIso,
           },
         ],
@@ -86,9 +85,7 @@ function malformedParse() {
     text: () =>
       JSON.stringify({
         status: "available",
-        windows: [
-          { label: "Weekly", kind: "weekly", percentText: "not-a-number", percentBasis: "used" },
-        ],
+        windows: [{ label: "Weekly", kind: "weekly", usedPercent: "not-a-number" }],
       }),
   };
 }

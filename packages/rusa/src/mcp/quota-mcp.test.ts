@@ -103,8 +103,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "45",
-                percentBasis: "used",
+                usedPercent: 45,
                 resetAtIso: "2026-07-13T02:59:00.000Z",
               },
             ],
@@ -165,166 +164,6 @@ describe("quota MCP server", () => {
       expect(systemInstruction).not.toContain("reports quota REMAINING");
     });
 
-    describe("runaway percentage output (#775)", () => {
-      function lastCallConfig(): {
-        maxOutputTokens?: number;
-        systemInstruction: string;
-        responseSchema: {
-          properties: { windows: { items: { properties: Record<string, { type: string }> } } };
-        };
-      } {
-        return (
-          mockGenerateContent.mock.calls[0][0] as {
-            config: ReturnType<typeof lastCallConfig>;
-          }
-        ).config;
-      }
-
-      it("caps each extraction attempt's output tokens", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () => JSON.stringify({ status: "available", windows: [] }),
-        });
-
-        await parseClaudeQuota("Claude output here", "test-key");
-
-        expect(lastCallConfig().maxOutputTokens).toBe(8192);
-      });
-
-      it("asks for the printed percentage as text and never for a computed number", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () => JSON.stringify({ status: "available", windows: [] }),
-        });
-
-        await parseClaudeQuota("Claude output here", "test-key");
-
-        const config = lastCallConfig();
-        const windowProps = config.responseSchema.properties.windows.items.properties;
-        expect(windowProps.usedPercent).toBeUndefined();
-        expect(windowProps.percentText?.type).toBe("STRING");
-        expect(windowProps.percentBasis?.type).toBe("STRING");
-        expect(JSON.stringify(windowProps)).not.toContain("0.0001");
-        const percentage = config.systemInstruction
-          .split("\n")
-          .find((line) => line.startsWith("PERCENTAGE REQUIREMENT"));
-        expect(percentage).toContain("never compute a new number");
-        expect(percentage).not.toContain("exactly");
-        expect(percentage).not.toContain("100 - N");
-      });
-
-      it("converts a left reading in code without subtracting from 100", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: "available",
-              windows: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentText: "57.3",
-                  percentBasis: "left",
-                  resetAtIso: "2026-07-13T02:59:00.000Z",
-                },
-                {
-                  label: "Current Week (Fable)",
-                  kind: "weekly",
-                  percentText: "100%",
-                  percentBasis: "left",
-                  models: ["claude-fable-5-1"],
-                },
-                {
-                  label: "Session",
-                  kind: "session",
-                  percentText: "12.5",
-                  percentBasis: "used",
-                  resetInIso: "PT3H",
-                },
-              ],
-            }),
-        });
-
-        const parsed = await parseClaudeQuota("Claude output here", "test-key", undefined, [
-          { identifier: "claude-fable-5-1", displayLabel: "Fable", passable: true },
-        ]);
-
-        expect(parsed.status).toBe("available");
-        expect(parsed.limits?.map((limit) => [limit.label, limit.percentLeft])).toEqual([
-          ["Weekly", 57.3],
-          ["Current Week (Fable)", 100],
-          ["Session", 87.5],
-        ]);
-      });
-
-      it.each([
-        ["an unbounded digit run", "3000000000000000000000000000000000000000000000000000000000"],
-        ["exponent notation", "3e+56"],
-        ["a number above 100", "500000"],
-        ["a negative number", "-5"],
-        ["a JSON number instead of text", 43],
-        ["an empty string", ""],
-      ])("rejects %s and retries on the stronger model", async (_name, percentText) => {
-        mockGenerateContent
-          .mockResolvedValueOnce({
-            text: () =>
-              JSON.stringify({
-                status: "available",
-                windows: [
-                  {
-                    label: "Weekly",
-                    kind: "weekly",
-                    percentText,
-                    percentBasis: "left",
-                    resetInIso: "PT70H",
-                  },
-                ],
-              }),
-          })
-          .mockResolvedValueOnce({
-            text: () =>
-              JSON.stringify({
-                status: "available",
-                windows: [
-                  {
-                    label: "Weekly",
-                    kind: "weekly",
-                    percentText: "43",
-                    percentBasis: "left",
-                    resetInIso: "PT70H",
-                  },
-                ],
-              }),
-          });
-        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-        vi.spyOn(console, "info").mockImplementation(() => {});
-
-        const parsed = await parseClaudeQuota("Claude output here", "test-key");
-
-        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
-        expect(warn.mock.calls[0]?.[0]).toContain("invalid percentText");
-        expect(parsed.limits?.[0]?.percentLeft).toBe(43);
-        vi.restoreAllMocks();
-      });
-
-      it("rejects a window with no percentBasis", async () => {
-        mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: "available",
-              windows: [
-                { label: "Weekly", kind: "weekly", percentText: "43", resetInIso: "PT70H" },
-              ],
-            }),
-        });
-        vi.spyOn(console, "warn").mockImplementation(() => {});
-        vi.spyOn(console, "error").mockImplementation(() => {});
-
-        const parsed = await parseClaudeQuota("Claude output here", "test-key");
-
-        expect(parsed.status).toBe("unknown");
-        expect(parsed.message).toContain("invalid percentBasis");
-        vi.restoreAllMocks();
-      });
-    });
-
     it("parses Codex exhausted quota from golden error string successfully using LLM", async () => {
       const goldenFixture =
         "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 7th, 2026 12:25 PM.";
@@ -336,8 +175,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "100",
-                percentBasis: "used",
+                usedPercent: 100,
                 resetAtIso: "2026-07-07T12:25:00.000Z",
               },
             ],
@@ -403,8 +241,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "100",
-                percentBasis: "used",
+                usedPercent: 100,
                 resetAtIso: "2026-07-07T12:25:00.000Z",
               },
             ],
@@ -471,8 +308,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "7",
-                percentBasis: "used",
+                usedPercent: 7,
                 resetAtIso: "2026-07-14T12:34:00.000Z",
               },
             ],
@@ -497,9 +333,138 @@ describe("quota MCP server", () => {
       ]);
     });
 
+    describe("runaway percentage output (#775)", () => {
+      function lastCallConfig(): {
+        maxOutputTokens?: number;
+        systemInstruction: string;
+        responseSchema: {
+          properties: { windows: { items: { properties: Record<string, { type: string }> } } };
+        };
+      } {
+        return (
+          mockGenerateContent.mock.calls[0][0] as {
+            config: ReturnType<typeof lastCallConfig>;
+          }
+        ).config;
+      }
+
+      function weeklyReply(percent: Record<string, unknown>) {
+        return {
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [{ label: "Weekly", kind: "weekly", resetInIso: "PT70H", ...percent }],
+            }),
+        };
+      }
+
+      it("caps each extraction attempt's output tokens", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "available", windows: [] }),
+        });
+
+        await parseClaudeQuota("Claude output here", "test-key");
+
+        expect(lastCallConfig().maxOutputTokens).toBe(8192);
+      });
+
+      it("asks the model to copy a used or remaining number and never compute one", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () => JSON.stringify({ status: "available", windows: [] }),
+        });
+
+        await parseClaudeQuota("Claude output here", "test-key");
+
+        const config = lastCallConfig();
+        const windowProps = config.responseSchema.properties.windows.items.properties;
+        expect(windowProps.usedPercent?.type).toBe("NUMBER");
+        expect(windowProps.remainingPercent?.type).toBe("NUMBER");
+        expect(JSON.stringify(windowProps)).not.toContain("0.0001");
+        expect(JSON.stringify(windowProps)).not.toContain("exactly and preserve");
+        const percentage = config.systemInstruction
+          .split("\n")
+          .find((line) => line.startsWith("PERCENTAGE REQUIREMENT"));
+        expect(percentage).toContain("never compute a new number");
+        expect(percentage).toContain("Fill exactly one of the two for each window");
+        expect(percentage).not.toContain("100 - N");
+        expect(percentage).not.toContain("copy it exactly");
+      });
+
+      it.each([
+        ["used 43", { usedPercent: 43 }, 57],
+        ["remaining 57.5", { remainingPercent: 57.5 }, 57.5],
+        ["used 0", { usedPercent: 0 }, 100],
+        ["used 100", { usedPercent: 100 }, 0],
+        ["remaining 0", { remainingPercent: 0 }, 0],
+        ["remaining 100", { remainingPercent: 100 }, 100],
+      ])("maps %s to percentLeft in code", async (_name, percent, percentLeft) => {
+        mockGenerateContent.mockResolvedValue(weeklyReply(percent));
+
+        const parsed = await parseClaudeQuota("Claude output here", "test-key");
+
+        expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+        expect(parsed.limits?.[0]?.percentLeft).toBe(percentLeft);
+      });
+
+      it("maps a remaining reading on a model-scoped Fable window", async () => {
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  usedPercent: 42.7,
+                  resetAtIso: "2026-07-13T02:59:00.000Z",
+                },
+                {
+                  label: "Current Week (Fable)",
+                  kind: "weekly",
+                  remainingPercent: 100,
+                  models: ["claude-fable-5-1"],
+                },
+              ],
+            }),
+        });
+
+        const parsed = await parseClaudeQuota("Claude output here", "test-key", undefined, [
+          { identifier: "claude-fable-5-1", displayLabel: "Fable", passable: true },
+        ]);
+
+        expect(parsed.status).toBe("available");
+        expect(parsed.limits?.map((limit) => [limit.label, limit.percentLeft])).toEqual([
+          ["Weekly", 57.3],
+          ["Current Week (Fable)", 100],
+        ]);
+      });
+
+      it.each([
+        ["both fields", { usedPercent: 43, remainingPercent: 57 }, "got both"],
+        ["neither field", {}, "got neither"],
+        ["a used value above 100", { usedPercent: 500000 }, "invalid usedPercent 500000"],
+        ["a runaway used value", { usedPercent: 3e56 }, "invalid usedPercent 3e+56"],
+        ["a negative remaining value", { remainingPercent: -5 }, "invalid remainingPercent -5"],
+        ["remaining as text", { remainingPercent: "57" }, "invalid remainingPercent 57"],
+      ])("rejects %s and retries on the stronger model", async (_name, percent, reason) => {
+        mockGenerateContent
+          .mockResolvedValueOnce(weeklyReply(percent))
+          .mockResolvedValueOnce(weeklyReply({ remainingPercent: 43 }));
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        vi.spyOn(console, "info").mockImplementation(() => {});
+
+        const parsed = await parseClaudeQuota("Claude output here", "test-key");
+
+        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls[0]?.[0]).toContain(reason);
+        expect(parsed.limits?.[0]?.percentLeft).toBe(43);
+        vi.restoreAllMocks();
+      });
+    });
+
     it("retries and fails closed when a provider row is malformed beside a valid weekly row", async () => {
       // The 5h row is a provider reading, not an explicit placeholder or model
-      // allocation. Its missing percentText must reject the whole snapshot rather
+      // allocation. Its missing percentage must reject the whole snapshot rather
       // than silently preserving the Weekly row.
       const incompleteSnapshot = {
         status: "available",
@@ -510,8 +475,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             placeholder: false,
             scope: "provider",
-            percentText: "42",
-            percentBasis: "used",
+            usedPercent: 42,
             resetAtIso: "2026-09-14T00:00:00.000Z",
           },
         ],
@@ -523,7 +487,7 @@ describe("quota MCP server", () => {
       expect(mockGenerateContent).toHaveBeenCalledTimes(2);
       expect(parsed.status).toBe("unknown");
       expect(parsed.limits).toBeUndefined();
-      expect(parsed.message).toContain("invalid percentText");
+      expect(parsed.message).toContain("exactly one of usedPercent or remainingPercent");
     });
 
     it("retries a malformed provider snapshot and accepts a complete 5h and weekly replacement", async () => {
@@ -538,8 +502,7 @@ describe("quota MCP server", () => {
                   label: "Weekly",
                   kind: "weekly",
                   scope: "provider",
-                  percentText: "42",
-                  percentBasis: "used",
+                  usedPercent: 42,
                   resetAtIso: "2026-09-14T00:00:00.000Z",
                 },
               ],
@@ -554,16 +517,14 @@ describe("quota MCP server", () => {
                   label: "5h",
                   kind: "five_hour",
                   scope: "provider",
-                  percentText: "10",
-                  percentBasis: "used",
+                  usedPercent: 10,
                   resetAtIso: "2026-09-08T00:00:00.000Z",
                 },
                 {
                   label: "Weekly",
                   kind: "weekly",
                   scope: "provider",
-                  percentText: "42",
-                  percentBasis: "used",
+                  usedPercent: 42,
                   resetAtIso: "2026-09-14T00:00:00.000Z",
                 },
               ],
@@ -602,8 +563,7 @@ describe("quota MCP server", () => {
                 label: "Weekly",
                 kind: "weekly",
                 scope: "provider",
-                percentText: "100",
-                percentBasis: "used",
+                usedPercent: 100,
                 resetAtIso: "2026-09-14T00:00:00.000Z",
               },
             ],
@@ -627,8 +587,7 @@ describe("quota MCP server", () => {
                 label: "Weekly",
                 kind: "weekly",
                 scope: "provider",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-09-14T00:00:00.000Z",
               },
             ],
@@ -664,8 +623,7 @@ describe("quota MCP server", () => {
                 label: "Weekly",
                 kind: "weekly",
                 scope: "provider",
-                percentText: "100",
-                percentBasis: "used",
+                usedPercent: 100,
                 resetAtIso: "2026-09-14T00:00:00.000Z",
               },
             ],
@@ -707,14 +665,12 @@ describe("quota MCP server", () => {
               {
                 label: "Current session",
                 kind: "session",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
               },
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "3",
-                percentBasis: "used",
+                usedPercent: 3,
                 resetAtIso: "2026-07-13T02:59:00.000Z",
               },
             ],
@@ -731,9 +687,7 @@ describe("quota MCP server", () => {
         text: () =>
           JSON.stringify({
             status: "available",
-            windows: [
-              { label: "Mystery Window", kind: "bogus", percentText: "0", percentBasis: "used" },
-            ],
+            windows: [{ label: "Mystery Window", kind: "bogus", usedPercent: 0 }],
           }),
       });
 
@@ -835,15 +789,13 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "0",
-                  percentBasis: "used",
+                  usedPercent: 0,
                   scope: "provider",
                 },
                 {
                   label: "Named model weekly",
                   kind: "weekly",
-                  percentText: "0",
-                  percentBasis: "used",
+                  usedPercent: 0,
                   scope: "provider",
                   models: [],
                 },
@@ -873,15 +825,13 @@ describe("quota MCP server", () => {
               {
                 label: "Current Week",
                 kind: "weekly",
-                percentText: "20",
-                percentBasis: "used",
+                usedPercent: 20,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
               },
               {
                 label: "Current Week (Fable)",
                 kind: "weekly",
-                percentText: "30",
-                percentBasis: "used",
+                usedPercent: 30,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
                 models: ["FABLE", "claude-fable", "unknown-model"],
               },
@@ -910,15 +860,13 @@ describe("quota MCP server", () => {
               {
                 label: "Current Week",
                 kind: "weekly",
-                percentText: "20",
-                percentBasis: "used",
+                usedPercent: 20,
                 resetAtIso,
               },
               {
                 label: "Current Week (Fable)",
                 kind: "weekly",
-                percentText: "30",
-                percentBasis: "used",
+                usedPercent: 30,
                 models: ["Fable"],
               },
             ],
@@ -971,15 +919,13 @@ describe("quota MCP server", () => {
               {
                 label: "Current Week",
                 kind: "weekly",
-                percentText: "20",
-                percentBasis: "used",
+                usedPercent: 20,
                 resetAtIso,
               },
               {
                 label: "Session (Fable)",
                 kind: "session",
-                percentText: "30",
-                percentBasis: "used",
+                usedPercent: 30,
                 models: ["Fable"],
               },
             ],
@@ -1018,15 +964,13 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "42",
-                percentBasis: "used",
+                usedPercent: 42,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
               },
               {
                 label: "gpt-reserve Weekly limit",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
                 models: ["gpt-reserve"],
               },
@@ -1050,15 +994,13 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "42",
-                percentBasis: "used",
+                usedPercent: 42,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
               },
               {
                 label: "Unnamed reserve",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
                 models: [],
               },
@@ -1102,13 +1044,7 @@ describe("quota MCP server", () => {
               JSON.stringify({
                 status: "unknown",
                 windows: [
-                  {
-                    label: "Weekly",
-                    kind: "weekly",
-                    percentText: "7",
-                    percentBasis: "used",
-                    resetInIso: c.resetInIso,
-                  },
+                  { label: "Weekly", kind: "weekly", usedPercent: 7, resetInIso: c.resetInIso },
                 ],
               }),
           });
@@ -1143,8 +1079,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly GEMINI MODELS",
                   kind: "weekly",
-                  percentText: "100",
-                  percentBasis: "used",
+                  usedPercent: 100,
                   resetInIso: "PT70H13M",
                   scope: "provider",
                 },
@@ -1203,7 +1138,7 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("For agy:");
       expect(systemInstruction).toContain("reports quota REMAINING");
       expect(systemInstruction).toContain("Use the more precise printed percentage");
-      expect(systemInstruction).toContain("percentBasis 'left'");
+      expect(systemInstruction).toContain("into remainingPercent and leave usedPercent empty");
       expect(systemInstruction).toContain(
         "Every other named model or model-group section is model-specific"
       );
@@ -1223,8 +1158,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly Limit",
                 kind: "weekly",
-                percentText: "20",
-                percentBasis: "used",
+                usedPercent: 20,
                 resetInIso: "PT70H13M",
                 scope: "provider",
               },
@@ -1259,7 +1193,7 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("interactive /usage panel");
       expect(systemInstruction).toContain("either 'N% used' or 'N% left/remaining'");
       expect(systemInstruction).toContain(
-        "percentBasis 'used' for 'used' and 'left' for 'left/remaining'"
+        "Copy N into usedPercent for 'used' or into remainingPercent for 'left/remaining', never both"
       );
       expect(systemInstruction).toContain(
         "Every named-model or model-group limit is model-specific"
@@ -1318,15 +1252,13 @@ describe("quota MCP server", () => {
                 {
                   label: "5h",
                   kind: "five_hour",
-                  percentText: "28",
-                  percentBasis: "used",
+                  usedPercent: 28,
                   resetInIso: "PT3H10M",
                 },
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "50",
-                  percentBasis: "used",
+                  usedPercent: 50,
                   resetInIso: "P2DT22H",
                 },
               ],
@@ -1365,19 +1297,19 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       // ISSUE_NUM: agy's TUI prints "N% remaining" — the inverse of Claude/Codex's "used".
-      // The code maps percentText by percentBasis, so the parser must be told
-      // agy's number is remaining; this anchor MUST survive.
+      // Code maps remainingPercent straight to percentLeft, so the parser must be
+      // told agy's number is remaining; this anchor MUST survive.
       expect(systemInstruction).toContain("REMAINING");
-      expect(systemInstruction).toContain("percentBasis 'left'");
+      expect(systemInstruction).toContain("into remainingPercent and leave usedPercent empty");
       // The full-window "Quota available" case must map to 100% left, not be
       // misread as 100% used — anchor the instruction so it can't silently drop.
       expect(systemInstruction).toContain("Quota available");
-      expect(systemInstruction).toContain("emit percentText '100' with percentBasis 'left'");
+      expect(systemInstruction).toContain("emit remainingPercent 100");
     });
 
     it("maps a near-exhausted agy weekly ('3% remaining') to percentLeft 3, not 97 ", async () => {
-      // A correctly-instructed LLM copies the TUI's "3% remaining" as percentText 3,
-      // basis left; the mapping must report percentLeft 3 (near-dead), never 97.
+      // A correctly-instructed LLM copies the TUI's "3% remaining" as remainingPercent 3;
+      // the mapping must report percentLeft 3 (near-dead), never 97 (near-full).
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -1386,8 +1318,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "3",
-                percentBasis: "left",
+                remainingPercent: 3,
                 resetInIso: "PT70H",
                 scope: "provider",
               },
@@ -1406,7 +1337,7 @@ describe("quota MCP server", () => {
         text: () =>
           JSON.stringify({
             status: "available",
-            windows: [{ label: "Weekly", kind: "weekly", percentText: "10", percentBasis: "used" }],
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: 10 }],
           }),
       });
 
@@ -1426,13 +1357,7 @@ describe("quota MCP server", () => {
               status: "available",
               // Source text copied verbatim instead of an ISO-8601 duration.
               windows: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentText: "10",
-                  percentBasis: "used",
-                  resetInIso: "70h 13m",
-                },
+                { label: "Weekly", kind: "weekly", usedPercent: 10, resetInIso: "70h 13m" },
               ],
             }),
         })
@@ -1441,13 +1366,7 @@ describe("quota MCP server", () => {
             JSON.stringify({
               status: "available",
               windows: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentText: "10",
-                  percentBasis: "used",
-                  resetInIso: "PT70H13M",
-                },
+                { label: "Weekly", kind: "weekly", usedPercent: 10, resetInIso: "PT70H13M" },
               ],
             }),
         });
@@ -1481,15 +1400,7 @@ describe("quota MCP server", () => {
         text: () =>
           JSON.stringify({
             status: "available",
-            windows: [
-              {
-                label: "Weekly",
-                kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
-                resetInIso: "next week",
-              },
-            ],
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: 0, resetInIso: "next week" }],
           }),
       });
 
@@ -1511,16 +1422,14 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "40",
-                percentBasis: "used",
+                usedPercent: 40,
                 resetAtIso: "2026-08-27T10:00:00.000Z",
                 scope: "provider",
               },
               {
                 label: "Sonnet (weekly)",
                 kind: "weekly",
-                percentText: "40",
-                percentBasis: "used",
+                usedPercent: 40,
                 scope: "provider",
                 models: [],
               },
@@ -1550,8 +1459,7 @@ describe("quota MCP server", () => {
               {
                 label: "Sonnet (weekly)",
                 kind: "weekly",
-                percentText: "40",
-                percentBasis: "used",
+                usedPercent: 40,
                 scope: "provider",
                 models: [],
               },
@@ -1569,7 +1477,7 @@ describe("quota MCP server", () => {
         text: () =>
           JSON.stringify({
             status: "available",
-            windows: [{ label: "Weekly", kind: "weekly", percentText: "0", percentBasis: "used" }],
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: 0 }],
           }),
       });
 
@@ -1595,9 +1503,7 @@ describe("quota MCP server", () => {
           text: () =>
             JSON.stringify({
               status: "available",
-              windows: [
-                { label: "Weekly", kind: "weekly", percentText: "10", percentBasis: "used" },
-              ],
+              windows: [{ label: "Weekly", kind: "weekly", usedPercent: 10 }],
             }),
         })
         .mockResolvedValueOnce({
@@ -1608,8 +1514,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "10",
-                  percentBasis: "used",
+                  usedPercent: 10,
                   resetAtIso: "2026-07-14T12:34:00.000Z",
                 },
               ],
@@ -1655,7 +1560,7 @@ describe("quota MCP server", () => {
         text: () =>
           JSON.stringify({
             status: "available",
-            windows: [{ label: "Weekly", kind: "weekly", percentText: "10", percentBasis: "used" }],
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: 10 }],
           }),
       });
 
@@ -1715,8 +1620,7 @@ describe("quota MCP server", () => {
                         {
                           label: "Current week (all models)",
                           kind: "weekly",
-                          percentText: "40",
-                          percentBasis: "used",
+                          usedPercent: 40,
                           resetAtIso: "2026-10-05T03:00:00.000Z",
                           scope: "provider",
                         },
@@ -1734,8 +1638,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Current week (all models)",
                   kind: "weekly",
-                  percentText: "40",
-                  percentBasis: "used",
+                  usedPercent: 40,
                   resetAtIso: "2026-10-05T03:00:00.000Z",
                   scope: "provider",
                 },
@@ -1790,8 +1693,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Current session",
                   kind: "session",
-                  percentText: "10",
-                  percentBasis: "used",
+                  usedPercent: 10,
                   resetAtIso: "2026-10-05T03:00:00.000Z",
                   scope: "provider",
                 },
@@ -1828,32 +1730,28 @@ describe("quota MCP server", () => {
               {
                 label: "gpt-reserve Weekly limit",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 scope: "provider",
                 models: [],
               },
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "42",
-                percentBasis: "used",
+                usedPercent: 42,
                 resetAtIso: "2026-09-07T18:08:00.000Z",
                 scope: "provider",
               },
               {
                 label: "5h limit",
                 kind: "five_hour",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 scope: "provider",
                 models: [],
               },
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 scope: "provider",
                 models: [],
               },
@@ -1903,8 +1801,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-09-12T14:56:00.000Z",
                 scope: "provider",
                 models: [],
@@ -1912,16 +1809,14 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "48",
-                percentBasis: "used",
+                usedPercent: 48,
                 resetAtIso: "2026-09-07T18:08:00.000Z",
                 scope: "provider",
               },
               {
                 label: "5h limit",
                 kind: "five_hour",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-09-05T19:56:00.000Z",
                 scope: "provider",
                 models: [],
@@ -1929,8 +1824,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly limit",
                 kind: "weekly",
-                percentText: "0",
-                percentBasis: "used",
+                usedPercent: 0,
                 resetAtIso: "2026-09-07T16:11:00.000Z",
                 scope: "provider",
                 models: [],
@@ -1971,8 +1865,7 @@ describe("quota MCP server", () => {
               {
                 label: "Weekly",
                 kind: "weekly",
-                percentText: "3",
-                percentBasis: "used",
+                usedPercent: 3,
                 resetAtIso: "2026-07-13T09:59:00.000Z",
               },
             ],
@@ -2020,8 +1913,7 @@ describe("quota MCP server", () => {
           {
             label: "Weekly limit",
             kind: "weekly",
-            percentText: "61",
-            percentBasis: "used",
+            usedPercent: 61,
             resetAtIso: displayedWeeklyReset,
             placeholder: false,
             scope: "provider",
@@ -2029,8 +1921,7 @@ describe("quota MCP server", () => {
           {
             label: "5h limit",
             kind: "five_hour",
-            percentText: "0",
-            percentBasis: "used",
+            usedPercent: 0,
             resetAtIso: sparkFiveHourReset,
             placeholder: false,
             scope: "provider",
@@ -2039,8 +1930,7 @@ describe("quota MCP server", () => {
           {
             label: "Weekly limit",
             kind: "weekly",
-            percentText: "0",
-            percentBasis: "used",
+            usedPercent: 0,
             resetAtIso: sparkWeeklyReset,
             placeholder: false,
             scope: "provider",
@@ -2150,8 +2040,7 @@ describe("quota MCP server", () => {
                   {
                     label: "Weekly limit",
                     kind: "weekly",
-                    percentText: "61",
-                    percentBasis: "used",
+                    usedPercent: 61,
                     resetAtIso: displayedWeeklyReset,
                     placeholder: false,
                     scope: "provider",
@@ -2159,8 +2048,7 @@ describe("quota MCP server", () => {
                   {
                     label: "Weekly limit",
                     kind: "weekly",
-                    percentText: "0",
-                    percentBasis: "used",
+                    usedPercent: 0,
                     resetAtIso: sparkWeeklyReset,
                     placeholder: false,
                     scope: "provider",
@@ -2948,8 +2836,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Current session",
                   kind: "session",
-                  percentText: "77",
-                  percentBasis: "used",
+                  usedPercent: 77,
                   resetAtIso: "2026-07-13T02:59:00.000Z",
                 },
               ],
@@ -3002,16 +2889,14 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "40",
-                  percentBasis: "used",
+                  usedPercent: 40,
                   resetAtIso: "2026-08-27T10:00:00.000Z",
                   scope: "provider",
                 },
                 {
                   label: "Sonnet (weekly)",
                   kind: "weekly",
-                  percentText: "50",
-                  percentBasis: "used",
+                  usedPercent: 50,
                   scope: "provider",
                   models: [],
                 },
@@ -3073,8 +2958,7 @@ describe("quota MCP server", () => {
                     label: "Weekly",
                     kind: "weekly",
                     scope: "provider",
-                    percentText: "40",
-                    percentBasis: "used",
+                    usedPercent: 40,
                     resetAtIso: "2030-01-01T00:00:00.000Z",
                   },
                 ],
@@ -3090,8 +2974,7 @@ describe("quota MCP server", () => {
                     label: "Weekly",
                     kind: "weekly",
                     scope: "provider",
-                    percentText: "40",
-                    percentBasis: "used",
+                    usedPercent: 40,
                     resetAtIso: "2030-01-01T00:00:00.000Z",
                   },
                 ],
@@ -3130,7 +3013,7 @@ describe("quota MCP server", () => {
           raw: malformedPanel,
         });
         expect(rawCurrent.limits).toBeUndefined();
-        expect(rawCurrent.message).toContain("invalid percentText");
+        expect(rawCurrent.message).toContain("exactly one of usedPercent or remainingPercent");
         expect(inferredCurrent).toMatchObject({
           provider: "codex",
           status: "available",
@@ -3202,16 +3085,14 @@ describe("quota MCP server", () => {
                   {
                     label: "Current week (all models)",
                     kind: "weekly",
-                    percentText: "35",
-                    percentBasis: "used",
+                    usedPercent: 35,
                     resetAtIso: "2030-01-08T00:00:00.000Z",
                     scope: "provider",
                   },
                   {
                     label: "Current week (Fable)",
                     kind: "weekly",
-                    percentText: "45",
-                    percentBasis: "used",
+                    usedPercent: 45,
                     resetAtIso: "2030-01-08T00:00:00.000Z",
                     scope: "provider",
                     models: ["claude-fable-5-1"],
@@ -3304,8 +3185,7 @@ describe("quota MCP server", () => {
                     label: "Weekly",
                     kind: "weekly",
                     scope: "provider",
-                    percentText: "40",
-                    percentBasis: "used",
+                    usedPercent: 40,
                     resetAtIso: "2020-01-01T00:00:00.000Z",
                   },
                 ],
@@ -3321,8 +3201,7 @@ describe("quota MCP server", () => {
                     label: "Weekly",
                     kind: "weekly",
                     scope: "provider",
-                    percentText: "40",
-                    percentBasis: "used",
+                    usedPercent: 40,
                     resetAtIso: "2020-01-01T00:00:00.000Z",
                   },
                 ],
@@ -3361,7 +3240,7 @@ describe("quota MCP server", () => {
           raw: malformedPanel,
         });
         expect(rawCurrent.limits).toBeUndefined();
-        expect(rawCurrent.message).toContain("invalid percentText");
+        expect(rawCurrent.message).toContain("exactly one of usedPercent or remainingPercent");
         expect(inferredCurrent).toMatchObject({
           provider: "codex",
           status: "unknown",
@@ -3381,15 +3260,13 @@ describe("quota MCP server", () => {
                 {
                   label: "5h limit",
                   kind: "five_hour",
-                  percentText: "1",
-                  percentBasis: "used",
+                  usedPercent: 1,
                   resetAtIso: "2026-07-14T23:32:00.000Z",
                 },
                 {
                   label: "Weekly limit",
                   kind: "weekly",
-                  percentText: "42",
-                  percentBasis: "used",
+                  usedPercent: 42,
                   resetAtIso: "2026-07-14T12:34:00.000Z",
                 },
               ],
@@ -3447,18 +3324,11 @@ describe("quota MCP server", () => {
             JSON.stringify({
               status: "available",
               windows: [
-                {
-                  label: "5h",
-                  kind: "five_hour",
-                  percentText: "1",
-                  percentBasis: "used",
-                  resetInIso: "PT23H32M",
-                },
+                { label: "5h", kind: "five_hour", usedPercent: 1, resetInIso: "PT23H32M" },
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "7",
-                  percentBasis: "used",
+                  usedPercent: 7,
                   resetAtIso: "2026-07-14T12:34:00.000Z",
                 },
               ],
@@ -3524,16 +3394,14 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "100",
-                  percentBasis: "used",
+                  usedPercent: 100,
                   resetAtIso: "2026-07-20T00:00:00.000Z",
                   scope: "provider",
                 },
                 {
                   label: "Five Hour Limit",
                   kind: "five_hour",
-                  percentText: "100",
-                  percentBasis: "used",
+                  usedPercent: 100,
                   resetAtIso: "2026-07-22T22:00:00.000Z",
                   scope: "provider",
                 },
@@ -3596,18 +3464,11 @@ describe("quota MCP server", () => {
             JSON.stringify({
               status: "available",
               windows: [
-                {
-                  label: "5h",
-                  kind: "five_hour",
-                  percentText: "1",
-                  percentBasis: "used",
-                  resetInIso: "PT23H32M",
-                },
+                { label: "5h", kind: "five_hour", usedPercent: 1, resetInIso: "PT23H32M" },
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "7",
-                  percentBasis: "used",
+                  usedPercent: 7,
                   resetAtIso: "2026-07-14T12:34:00.000Z",
                 },
               ],
@@ -3653,8 +3514,7 @@ describe("quota MCP server", () => {
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "100",
-                  percentBasis: "used",
+                  usedPercent: 100,
                   resetAtIso: "2026-07-07T12:25:00.000Z",
                 },
               ],
@@ -3756,18 +3616,11 @@ describe("quota MCP server", () => {
             JSON.stringify({
               status: "available",
               windows: [
-                {
-                  label: "5h",
-                  kind: "five_hour",
-                  percentText: "28",
-                  percentBasis: "used",
-                  resetInIso: "PT3H10M",
-                },
+                { label: "5h", kind: "five_hour", usedPercent: 28, resetInIso: "PT3H10M" },
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "50",
-                  percentBasis: "used",
+                  usedPercent: 50,
                   resetInIso: "P2DT22H",
                 },
               ],
@@ -3875,15 +3728,7 @@ describe("quota MCP server", () => {
           text: () =>
             JSON.stringify({
               status: "available",
-              windows: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentText: "50",
-                  percentBasis: "used",
-                  resetInIso: "P2D",
-                },
-              ],
+              windows: [{ label: "Weekly", kind: "weekly", usedPercent: 50, resetInIso: "P2D" }],
             }),
         });
 
@@ -4077,16 +3922,14 @@ describe("quota MCP server", () => {
                 {
                   label: "Session",
                   kind: "session",
-                  percentText: "12",
-                  percentBasis: "used",
+                  usedPercent: 12,
                   resetInIso: "PT4H12M",
                   scope: "provider",
                 },
                 {
                   label: "Weekly",
                   kind: "weekly",
-                  percentText: "45",
-                  percentBasis: "used",
+                  usedPercent: 45,
                   resetAtIso: "2026-07-13T02:59:00.000Z",
                   scope: "provider",
                 },
