@@ -32,6 +32,40 @@ const Duration _kRuntimeRetryMax = Duration(seconds: 5);
 const Duration _kQueuePacingPollInterval = Duration(seconds: 10);
 const Duration _kObligationLookupTtl = Duration(seconds: 30);
 
+/// One committed obligation write another client or an actor made, as the
+/// Work tab needs it (#773).
+class ObligationRefresh {
+  const ObligationRefresh({this.ids = const {}, this.statuses = const {}});
+
+  /// The obligations the write touched; empty when any may have changed.
+  final Set<String> ids;
+
+  /// The new status of each obligation whose status changed. A view already
+  /// showing these statuses has nothing to refetch for them.
+  final Map<String, String> statuses;
+
+  bool touches(String id) => ids.isEmpty || ids.contains(id);
+}
+
+/// The `{id, status}` pairs of an `obligation_status_changed` payload, in
+/// write order; empty when the payload is missing or malformed.
+Map<String, String> _statusChanges(String? payload) {
+  if (payload == null) return const {};
+  try {
+    final changes = (jsonDecode(payload) as Map<String, dynamic>)['changes'];
+    if (changes is! List) return const {};
+    return {
+      for (final change in changes)
+        if (change is Map<String, dynamic> &&
+            change['id'] is String &&
+            change['status'] is String)
+          change['id'] as String: change['status'] as String,
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
 /// One line in the merged live-output console.
 class LiveLine {
   const LiveLine({
@@ -380,7 +414,7 @@ class DashboardStore {
   final _generatingAvatars = <String>{};
   final _focusedObligationId = BehaviorSubject<String?>.seeded(null);
   final _detailPanelIndex = BehaviorSubject<int>.seeded(0);
-  final _obligationRefreshes = PublishSubject<String?>();
+  final _obligationRefreshes = PublishSubject<ObligationRefresh>();
 
   /// Anchor for shift-range selection (set by plain/ctrl clicks).
   String? _anchor;
@@ -442,11 +476,13 @@ class DashboardStore {
   ValueStream<String?> get focusedObligationId => _focusedObligationId.stream;
   ValueStream<int> get detailPanelIndex => _detailPanelIndex.stream;
 
-  /// Fires after a committed checkpoint rewrite arrives over the mesh stream.
-  /// WorkTab owns the forest snapshot, so it consumes this narrow invalidation
-  /// signal and reloads the visible tree instead of keeping stale standing,
-  /// while mounted detail views filter on their specific obligation ID.
-  Stream<String?> get obligationRefreshes => _obligationRefreshes.stream;
+  /// Fires after a committed checkpoint rewrite or status change arrives over
+  /// the mesh stream, once per commit. WorkTab owns the forest snapshot, so it
+  /// consumes this narrow invalidation signal and reloads the visible tree
+  /// instead of keeping stale standing, while mounted detail views filter on
+  /// the obligations they show.
+  Stream<ObligationRefresh> get obligationRefreshes =>
+      _obligationRefreshes.stream;
 
   // ── Normalized actor selectors ──
   ActorViewState? actor(String id) => _actorStates.value.actor(id);
@@ -1373,14 +1409,28 @@ class DashboardStore {
         _runSelections.add({..._runSelections.value, e.actorId!: selection});
       }
     }
-    if (e.kind == 'run_end' || e.kind == 'obligation_status_changed') {
-      unawaited(refreshRecentActivity());
-    }
+    if (e.kind == 'run_end') unawaited(refreshRecentActivity());
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
       invalidateObligationsCache();
-      _obligationRefreshes.add(e.detail);
+      _obligationRefreshes.add(
+        ObligationRefresh(ids: {if (e.detail != null) e.detail!}),
+      );
+    }
+    if (e.kind == 'obligation_status_changed' &&
+        !_obligationRefreshes.isClosed) {
+      final statuses = _statusChanges(e.payload);
+      invalidateObligationsCache();
+      statuses.keys.forEach(_obligationLookups.remove);
+      _obligationRefreshes.add(
+        ObligationRefresh(ids: statuses.keys.toSet(), statuses: statuses),
+      );
+      // Recent Activity lists closes only, so a re-ready or block adds no row.
+      if (statuses.isEmpty ||
+          statuses.values.any((s) => s == 'done' || s == 'cancelled')) {
+        unawaited(refreshRecentActivity());
+      }
     }
 
     // Prepend to the Events list only if it matches the *current* view filter.

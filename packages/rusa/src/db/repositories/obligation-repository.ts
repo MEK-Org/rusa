@@ -30,7 +30,14 @@ import {
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
+import { createLogger, type Logger } from "../../observability/logger.js";
 import type { PrincipalKind } from "../../principals/principal-ref.js";
+
+let _obligationLogger: Logger | undefined;
+function obligationLogger(): Logger {
+  _obligationLogger ??= createLogger({ context: { component: "obligations" } });
+  return _obligationLogger;
+}
 
 function isActorEntityId(id: EntityId): boolean {
   return !id.startsWith("human:") && !id.startsWith("system:");
@@ -198,6 +205,18 @@ export interface ChildObligationPageOptions extends ObligationPageOptions {
 
 export interface OwnedObligationPageOptions extends ObligationPageOptions {
   status?: ObligationStatus;
+}
+
+/**
+ * The statuses one committed mutation changed (#773), in the order it wrote
+ * them — the target first, then the parents and dependents it re-derived. It
+ * names each row and its new status and nothing else: no note, resolution ref,
+ * title, or owner, so a consumer can broadcast it without deciding who may read
+ * why something closed. A created row is not a change; its parent's demotion is.
+ */
+export interface ObligationStatusChange {
+  actingPrincipal: EntityId;
+  changes: { id: string; status: ObligationStatus }[];
 }
 
 /** An actor gained a ready head or its existing head became responsive. */
@@ -439,8 +458,13 @@ export class ObligationRepository {
   constructor(
     private readonly db: Database.Database,
     private actorExists?: (actorId: string) => boolean,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly logger?: Logger
   ) {}
+
+  private get log(): Logger {
+    return this.logger ?? obligationLogger();
+  }
 
   private scheduler?: ObligationActivationScheduler;
 
@@ -737,6 +761,23 @@ export class ObligationRepository {
   }
 
   /**
+   * Notified once per committed mutation that changed any obligation's status
+   * (#773), so open views can refetch what they show. Every status write goes
+   * through {@link mutate}, so this sees parent re-readies, prerequisite
+   * releases and scheduled activations without each caller announcing them.
+   * Best-effort and not retried: the committed row is the record, and a view
+   * that missed a notice reconciles on its next load.
+   */
+  private statusChangeListener?: (change: ObligationStatusChange) => void;
+
+  /** Status deltas captured by {@link recordMutationHistory}, fired after commit. */
+  private pendingStatusChanges: ObligationStatusChange["changes"] = [];
+
+  setStatusChangeListener(listener: ((change: ObligationStatusChange) => void) | undefined): void {
+    this.statusChangeListener = listener;
+  }
+
+  /**
    * Notified once per (dependent, prerequisite) edge left dangling by a
    * prerequisite reaching `cancelled` (#212). Unlike ready-head, this is a
    * one-shot fact rather than a continuously-recomputed transition — a
@@ -1010,6 +1051,7 @@ export class ObligationRepository {
     this.dirtyScheduleIds.clear();
     this.pendingCancellationAttention = [];
     this.pendingResponsiveReady = [];
+    this.pendingStatusChanges = [];
     const actingPrincipal = validateEntityId(principal);
     this.installHistoryCapture();
     let afterHeads = new Map<string, string>();
@@ -1222,6 +1264,17 @@ export class ObligationRepository {
     }
     this.pendingResponsiveReady = [];
 
+    const statusChanges = this.pendingStatusChanges;
+    this.pendingStatusChanges = [];
+    const statusChangeListener = this.statusChangeListener;
+    if (statusChangeListener && statusChanges.length > 0) {
+      try {
+        statusChangeListener({ actingPrincipal, changes: statusChanges });
+      } catch (err) {
+        this.log.warn("obligation_status_listener_failed", { err });
+      }
+    }
+
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
     // rollback couldn't take them back with it.
@@ -1346,6 +1399,7 @@ export class ObligationRepository {
       if (statusChanged) {
         beforeState.status = b.status;
         afterState.status = a.status;
+        this.pendingStatusChanges.push({ id, status: a.status });
       }
       if (externalRefChanged) {
         beforeState.externalRef = b.external_ref;
