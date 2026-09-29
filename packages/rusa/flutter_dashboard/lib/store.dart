@@ -35,14 +35,10 @@ const Duration _kObligationLookupTtl = Duration(seconds: 30);
 /// One committed obligation write another client or an actor made, as the
 /// Work tab needs it (#773).
 class ObligationRefresh {
-  const ObligationRefresh({this.ids = const {}, this.statuses = const {}});
+  const ObligationRefresh({this.ids = const {}});
 
   /// The obligations the write touched; empty when any may have changed.
   final Set<String> ids;
-
-  /// The new status of each obligation whose status changed. A view already
-  /// showing these statuses has nothing to refetch for them.
-  final Map<String, String> statuses;
 
   bool touches(String id) => ids.isEmpty || ids.contains(id);
 }
@@ -369,8 +365,9 @@ class DashboardStore {
   var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
-  final _recentActivity =
-      BehaviorSubject<List<RecentActivityItem>>.seeded(const []);
+  final _recentActivity = BehaviorSubject<List<RecentActivityItem>>.seeded(
+    const [],
+  );
 
   /// Model and effort of each active run, keyed by actor id. Seeded from the
   /// actor's newest `run_start` event and replaced by live ones; an actor's
@@ -1423,9 +1420,7 @@ class DashboardStore {
       final statuses = _statusChanges(e.payload);
       invalidateObligationsCache();
       statuses.keys.forEach(_obligationLookups.remove);
-      _obligationRefreshes.add(
-        ObligationRefresh(ids: statuses.keys.toSet(), statuses: statuses),
-      );
+      _obligationRefreshes.add(ObligationRefresh(ids: statuses.keys.toSet()));
       // Recent Activity lists closes only, so a re-ready or block adds no row.
       if (statuses.isEmpty ||
           statuses.values.any((s) => s == 'done' || s == 'cancelled')) {

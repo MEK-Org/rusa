@@ -179,7 +179,7 @@ void main() {
   );
 
   testWidgets(
-    'the echo of a local Mark Done does not refetch the pane or tree again (#773)',
+    'the echo of a local Mark Done refetches and still shows done (#773)',
     (tester) async {
       final api = FakeApi()
         ..obligationsResult = [
@@ -211,8 +211,11 @@ void main() {
       stream.meshCtrl.add(statusChanged('evt-echo', {'arc': 'done'}));
       await tester.pumpAndSettle();
 
-      expect(api.obligationDetailCallCount, detailLoads);
-      expect(api.fetchObligationForestCalls.length, forestLoads);
+      // Touch-based: the echo is not suppressed. The pane and tree reload
+      // again (the tree may also widen for the now-terminal focused root,
+      // #241) and converge on the same status.
+      expect(api.obligationDetailCallCount, greaterThan(detailLoads));
+      expect(api.fetchObligationForestCalls.length, greaterThan(forestLoads));
       expect(detailHeaderStatusOf(tester, 'arc'), 'done');
       await tester.runAsync(store.dispose);
     },

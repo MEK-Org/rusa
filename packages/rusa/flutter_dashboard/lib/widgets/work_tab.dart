@@ -87,7 +87,8 @@ class _WorkTabState extends State<WorkTab> {
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
-        _error = 'We could not refresh the work queue. Check your connection and retry.';
+        _error =
+            'We could not refresh the work queue. Check your connection and retry.';
         _loading = false;
         _isBackgroundRefreshing = false;
       });
@@ -98,14 +99,6 @@ class _WorkTabState extends State<WorkTab> {
     widget.store.invalidateObligationsCache();
     _loadRoots();
   }
-
-  /// Whether the tree already shows every status [refresh] reports, as it
-  /// does for the echo of a write this tab made and reloaded for (#773).
-  bool _treeShows(ObligationRefresh refresh) =>
-      refresh.statuses.isNotEmpty &&
-      refresh.statuses.entries.every(
-        (change) => _findTree(change.key)?.obligation.status == change.value,
-      );
 
   void _checkFocusLink() {
     final focusedId = widget.store.focusedObligationId.valueOrNull;
@@ -272,8 +265,8 @@ class _WorkTabState extends State<WorkTab> {
         _expandAncestors(focusedId);
       }
     });
-    _checkpointSub = widget.store.obligationRefreshes.listen((refresh) {
-      if (!_treeShows(refresh)) _handleMutation();
+    _checkpointSub = widget.store.obligationRefreshes.listen((_) {
+      _handleMutation();
     });
     // Owner/creator labels read the viewing principal off the dashboard
     // config, which lands after init returns; a tree drawn before then would
@@ -357,12 +350,19 @@ class _WorkTabState extends State<WorkTab> {
     ),
     child: Row(
       children: [
-        const Icon(Icons.warning_amber_rounded, size: 16, color: MeshColors.statusHalted),
+        const Icon(
+          Icons.warning_amber_rounded,
+          size: 16,
+          color: MeshColors.statusHalted,
+        ),
         const SizedBox(width: 8),
         Expanded(
           child: Text(
             _error ?? '',
-            style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+            style: const TextStyle(
+              color: MeshColors.textSecondary,
+              fontSize: 12,
+            ),
             maxLines: 3,
             overflow: TextOverflow.ellipsis,
           ),
@@ -784,9 +784,9 @@ class _DetailViewState extends State<_DetailView> {
   StreamSubscription<ObligationRefresh>? _checkpointSub;
   int _fetchGeneration = 0;
 
-  /// The status of every obligation the loaded snapshot draws: this one, its
-  /// parent, children and dependency edges (#773).
-  Map<String, String> _shownStatuses = const {};
+  /// Every obligation the loaded snapshot draws besides this one: its parent,
+  /// children and dependency edges (#773).
+  Set<String> _shownIds = const {};
 
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
@@ -815,7 +815,7 @@ class _DetailViewState extends State<_DetailView> {
       _checkpointSub = widget.store.obligationRefreshes.listen(_onRefresh);
     }
     if (oldWidget.obligationId != widget.obligationId) {
-      _shownStatuses = const {};
+      _shownIds = const {};
       _completions = const [];
       _completionsTotal = 0;
       _completionsHasMore = false;
@@ -837,7 +837,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
-          _shownStatuses = _statusesOf(data);
+          _shownIds = _idsOf(data);
           setState(() {
             _completions = data.completions;
             _completionsTotal = data.completionsTotal;
@@ -860,7 +860,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
-          _shownStatuses = _statusesOf(data);
+          _shownIds = _idsOf(data);
           setState(() {
             _completions = mergeCompletions(data.completions, _completions);
             _completionsTotal = data.completionsTotal;
@@ -870,33 +870,25 @@ class _DetailViewState extends State<_DetailView> {
         .catchError((_) {});
   }
 
-  /// A checkpoint rewrite refetches when it names this obligation. A status
-  /// change refetches when it moves anything the pane draws, and not for a
-  /// status the pane already shows, such as the echo of its own write.
+  /// Refetches when a committed write touches this obligation or anything the
+  /// pane draws. The echo of the pane's own write refetches too; #772's
+  /// generation guard keeps only the newest load.
   void _onRefresh(ObligationRefresh refresh) {
-    if (refresh.statuses.isEmpty) {
-      if (refresh.touches(widget.obligationId)) _refresh();
-      return;
+    if (refresh.touches(widget.obligationId) ||
+        refresh.ids.any(_shownIds.contains)) {
+      _refresh();
     }
-    final stale = refresh.statuses.entries.any(
-      (change) => change.key == widget.obligationId
-          ? _shownStatuses[change.key] != change.value
-          : _shownStatuses.containsKey(change.key) &&
-                _shownStatuses[change.key] != change.value,
-    );
-    if (stale) _refresh();
   }
 
-  static Map<String, String> _statusesOf(ObligationDetailSnapshot data) => {
+  static Set<String> _idsOf(ObligationDetailSnapshot data) => {
+    if (data.parent != null) data.parent!.id,
     for (final o in [
-      if (data.parent != null) data.parent!,
       ...data.children,
       ...data.blockingChildren,
       ...data.blockedBy,
       ...data.blocks,
-      data.obligation,
     ])
-      o.id: o.status,
+      o.id,
   };
 
   void _refresh() {
@@ -908,7 +900,7 @@ class _DetailViewState extends State<_DetailView> {
     future
         .then((data) {
           if (!mounted || gen != _fetchGeneration) return;
-          _shownStatuses = _statusesOf(data);
+          _shownIds = _idsOf(data);
           setState(() {
             if (!data.completionsHasMore ||
                 _completions.length <= data.completions.length) {

@@ -458,13 +458,8 @@ export class ObligationRepository {
   constructor(
     private readonly db: Database.Database,
     private actorExists?: (actorId: string) => boolean,
-    private readonly now: () => number = Date.now,
-    private readonly logger?: Logger
+    private readonly now: () => number = Date.now
   ) {}
-
-  private get log(): Logger {
-    return this.logger ?? obligationLogger();
-  }
 
   private scheduler?: ObligationActivationScheduler;
 
@@ -1271,7 +1266,7 @@ export class ObligationRepository {
       try {
         statusChangeListener({ actingPrincipal, changes: statusChanges });
       } catch (err) {
-        this.log.warn("obligation_status_listener_failed", { err });
+        obligationLogger().warn("obligation_status_listener_failed", { err });
       }
     }
 
