@@ -3622,8 +3622,8 @@ describe("ObligationRepository", () => {
       repository.setSnooze(id, until, principal).obligation;
 
     /** A completion_interval obligation completed at T0, next due at T0 + 1h. */
-    function intervalScheduled(id = "rec"): void {
-      repository.create({ title: id, id, ownerId: "actor-a" });
+    function intervalScheduled(id = "rec", priority?: number): void {
+      repository.create({ title: id, id, ownerId: "actor-a", priority });
       repository.setRecurrence(
         id,
         { policy: "completion_interval", intervalSeconds: 3600 },
@@ -3711,20 +3711,27 @@ describe("ObligationRepository", () => {
     });
 
     describe("attention gate", () => {
-      it("drops a snoozed head from every ready surface and queues it after actionable work", () => {
-        repository.create({ title: "first", id: "first", ownerId: "actor-a", priority: 1 });
-        repository.create({ title: "second", id: "second", ownerId: "actor-a", priority: 2 });
-        repository.create({ title: "parent", id: "parent", ownerId: "actor-a", priority: 0 });
+      it("drops a snoozed head from every ready surface and queues it in the waiting group after actionable work", () => {
+        repository.create({ title: "first", id: "first", ownerId: "actor-a", priority: 30 });
+        repository.create({ title: "second", id: "second", ownerId: "actor-a", priority: 50 });
+        repository.create({ title: "parent", id: "parent", ownerId: "actor-a", priority: 10 });
         repository.create({ title: "kid", id: "kid", ownerId: "actor-b", parentId: "parent" });
+        intervalScheduled("sched-snoozed", 20);
+        intervalScheduled("sched-unsnoozed", 0);
+        repository.create({ title: "done-row", id: "done-row", ownerId: "actor-a", priority: -10 });
+        repository.setTerminalStatus("done-row", "done", null, null, "actor-a");
+
         expect(repository.readyHeads().get("actor-a")).toBe("first");
         heads = [];
 
         snooze("first", iso(T0 + HOUR));
+        snooze("sched-snoozed", iso(T0 + HOUR));
 
         expect(heads).toEqual([{ ownerId: "actor-a", headId: "second" }]);
         expect(repository.readyHeads().get("actor-a")).toBe("second");
-        // Actionable ready, then snoozed ready, then waiting.
-        const order = ["second", "first", "parent"];
+
+        // Actionable ready first, then waiting group (waiting and snoozed rows by effective priority), then unsnoozed scheduled and terminal.
+        const order = ["second", "parent", "sched-snoozed", "first", "done-row", "sched-unsnoozed"];
         expect(repository.listOwned("actor-a").map((o) => o.id)).toEqual(order);
         expect(
           repository.listOwnedPage("actor-a", { limit: 10, offset: 0 }).obligations.map((o) => o.id)
@@ -3732,6 +3739,13 @@ describe("ObligationRepository", () => {
         expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
           "second",
           "first",
+        ]);
+        expect(repository.listOwned("actor-a", { status: "scheduled" }).map((o) => o.id)).toEqual([
+          "sched-snoozed",
+          "sched-unsnoozed",
+        ]);
+        expect(repository.listOwned("actor-a", { status: "waiting" }).map((o) => o.id)).toEqual([
+          "parent",
         ]);
       });
 

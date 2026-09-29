@@ -314,17 +314,17 @@ const EFFECTIVE_PRIORITY_CTE = `
 const ACTIONABLE_READY_SQL = `(obligation.status = 'ready' AND obligation.snoozed_until IS NULL)`;
 
 /**
- * Owner-queue order: actionable ready work first, then snoozed ready work, then
- * waiting, then the rest; by effective priority then id within each group. The
- * ready head is this order's first row when that row is actionable, so the two
- * must not diverge.
+ * Owner-queue order: actionable ready work first, then the waiting group
+ * (waiting rows and any snoozed non-terminal rows, including snoozed scheduled
+ * rows), then unsnoozed scheduled and terminal rows; by effective priority then
+ * id within each group. The ready head is this order's first row when that row
+ * is actionable, so the two must not diverge.
  */
 const OWNER_QUEUE_ORDER_SQL = `
   CASE
     WHEN ${ACTIONABLE_READY_SQL} THEN 0
-    WHEN obligation.status = 'ready' THEN 1
-    WHEN obligation.status = 'waiting' THEN 2
-    ELSE 3
+    WHEN obligation.status = 'waiting' OR (obligation.snoozed_until IS NOT NULL AND obligation.status NOT IN (${TERMINAL_STATUS_SQL})) THEN 1
+    ELSE 2
   END,
   effective_priority.effective_priority,
   obligation.id`;
