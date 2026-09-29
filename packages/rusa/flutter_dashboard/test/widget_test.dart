@@ -12,8 +12,18 @@ import 'package:rusa_dashboard/widgets/brand_mark.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/live_output_tab.dart';
+import 'package:rusa_dashboard/widgets/quota_tooltip.dart';
 
 import 'fakes.dart';
+
+String _tooltipMessage(Tooltip tooltip) {
+  if (tooltip.message != null) return tooltip.message!;
+  final rich = tooltip.richMessage;
+  if (rich is WidgetSpan && rich.child is QuotaTooltip) {
+    return (rich.child as QuotaTooltip).toPlainText();
+  }
+  return '';
+}
 
 // The store does real async I/O (Futures + broadcast streams) and the dashboard
 // has always-running animations (blinking cursor). So we drive each test
@@ -1125,8 +1135,9 @@ void main() {
         final claudeTooltip = tester.widget<Tooltip>(
           find.byType(Tooltip).first,
         );
-        expect(claudeTooltip.message, contains('Weekly: 97% remaining'));
-        expect(claudeTooltip.message, contains('Session: 68% remaining'));
+        final claudeMsg = _tooltipMessage(claudeTooltip);
+        expect(claudeMsg, contains('Weekly: 97% remaining'));
+        expect(claudeMsg, contains('Session: 68% remaining'));
 
         // Geometry check standing in for a pixel screenshot: this sandbox's
         // Flutter SDK cache is read-only, so a headless-Chrome/CDP capture of
@@ -1270,21 +1281,26 @@ void main() {
         // 4 providers in order: Claude, then Fable (#752), Codex, Agy, Kimi
         expect(tooltips, hasLength(5));
 
-        // Claude: < 2m ago -> just "as of HH:mm"
-        expect(tooltips[0].message, contains('as of '));
-        expect(tooltips[0].message, isNot(contains('ago)')));
+        // Claude: < 2m ago -> just now
+        final tip0 = _tooltipMessage(tooltips[0]);
+        expect(tip0, contains('Last Read: just now'));
+        expect(tip0, isNot(contains('ago')));
 
         // Fable: no Fable window, so no scrape stamp of its own.
-        expect(tooltips[1].message, isNot(contains('as of ')));
+        final tip1 = _tooltipMessage(tooltips[1]);
+        expect(tip1, contains('Last Read: n/a'));
 
-        // Codex: 5m ago -> "(5m ago)"
-        expect(tooltips[2].message, contains('(5m ago)'));
+        // Codex: 5m ago -> "5 minutes ago"
+        final tip2 = _tooltipMessage(tooltips[2]);
+        expect(tip2, contains('5 minutes ago'));
 
-        // Agy: 2h ago -> "(2h ago)"
-        expect(tooltips[3].message, contains('(2h ago)'));
+        // Agy: 2h ago -> "2 hours ago"
+        final tip3 = _tooltipMessage(tooltips[3]);
+        expect(tip3, contains('2 hours ago'));
 
-        // Kimi: 2d ago -> "(2d ago)"
-        expect(tooltips[4].message, contains('(2d ago)'));
+        // Kimi: 2d ago -> "2 days ago"
+        final tip4 = _tooltipMessage(tooltips[4]);
+        expect(tip4, contains('2 days ago'));
 
         await store.dispose();
       });
@@ -1356,12 +1372,13 @@ void main() {
         expect(rings[1].value, 0.0); // 5h: past reset => 0.0 (empty ring)
 
         final codexTooltip = tester.widget<Tooltip>(find.byType(Tooltip).first);
-        expect(codexTooltip.message, contains('Weekly: 90% remaining'));
-        expect(codexTooltip.message, contains('5h: window reset at '));
-        expect(codexTooltip.message, contains('no fresh read since'));
-        expect(codexTooltip.message, isNot(contains('5h: 53% remaining')));
+        final codexMsg = _tooltipMessage(codexTooltip);
+        expect(codexMsg, contains('Weekly: 90% remaining'));
+        expect(codexMsg, contains('5h: window reset at '));
+        expect(codexMsg, contains('no fresh read since'));
+        expect(codexMsg, isNot(contains('5h: 53% remaining')));
         expect(
-          codexTooltip.message,
+          codexMsg,
           isNot(contains('5h: 47% quota remaining')),
         );
 

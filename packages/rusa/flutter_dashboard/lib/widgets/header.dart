@@ -9,6 +9,7 @@ import 'actor_status_badge.dart';
 import 'actor_tree.dart';
 import 'avatar.dart';
 import 'brand_mark.dart';
+import 'quota_tooltip.dart';
 
 /// The top-level dashboard views the header nav switches between.
 enum DashboardView { overview, actors, understanding, reports, work }
@@ -877,28 +878,61 @@ class _ProviderQuotaRing extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
-    final tooltipParts = [
-      quotaWindowTooltip(weeklyWindow, fallbackLabel: 'Weekly', now: now),
-      if (sessionWindow != null)
-        quotaWindowTooltip(sessionWindow, fallbackLabel: 'Session', now: now),
-    ];
-    // Ground-truth "as of" scrape stamp (ISSUE_NUM ask 5) — the same instant rides
-    // every window on this provider, so either one supplies it.
-    final asOf = _asOfLine(
-      weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt,
-      now: now,
-      freshness: provider.throttle?.freshness,
-    );
     final name = label ?? _providerLabel(provider.provider);
-    final tooltip = [
-      name,
-      tooltipParts.join('\n\n'),
-      if (showThrottle && provider.throttle != null)
-        quotaThrottleTooltip(provider.throttle!),
-      ?asOf,
-    ].join('\n');
+    final List<QuotaWindowDto> windows;
+    if (label != null) {
+      windows = [
+        weeklyWindow ??
+            const QuotaWindowDto(
+              id: 'weekly',
+              label: 'Weekly',
+              usedPercent: null,
+              status: 'unknown',
+              headline: false,
+            ),
+        ?sessionWindow,
+      ];
+    } else {
+      final seenIds = <String>{};
+      windows = <QuotaWindowDto>[
+        weeklyWindow ??
+            const QuotaWindowDto(
+              id: 'weekly',
+              label: 'Weekly',
+              usedPercent: null,
+              status: 'unknown',
+              headline: false,
+            ),
+        ?sessionWindow,
+      ];
+      seenIds.add('weekly');
+      if (weeklyWindow != null) {
+        seenIds.add(weeklyWindow!.id);
+      }
+      if (sessionWindow != null) {
+        seenIds.add(sessionWindow!.id);
+      }
+      for (final w in provider.windows) {
+        if (!seenIds.contains(w.id)) {
+          windows.add(w);
+          seenIds.add(w.id);
+        }
+      }
+    }
+    final scrapedAt =
+        weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt ?? provider.scrapedAt;
+    final tooltipWidget = QuotaTooltip(
+      providerName: name,
+      windows: windows,
+      throttle: showThrottle ? provider.throttle : null,
+      scrapedAt: scrapedAt,
+      showThrottle: showThrottle,
+      now: now,
+    );
+    final tooltip = tooltipWidget.toPlainText(now);
     return Tooltip(
-      message: tooltip,
+      richMessage: WidgetSpan(child: tooltipWidget),
+      excludeFromSemantics: true,
       child: Semantics(
         label: tooltip,
         child: Row(
@@ -1046,41 +1080,6 @@ String? _resetLine(QuotaWindowDto window) {
   final reset = DateTime.tryParse(resetText);
   if (reset == null) return 'resets $resetText';
   return 'resets ${DateFormat('EEE h:mm a').format(reset.toLocal())}';
-}
-
-/// "as of <HH:mm>" — the ground-truth scrape stamp (ISSUE_NUM ask 5), never a
-/// cache hit or client SWR fetch time. Formatted in the viewer's local timezone
-/// to match reset timestamps. Carries relative age when [now] is provided so
-/// stale readings are visibly distinct. Null when the state behind this window
-/// never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(
-  String? scrapedAtIso, {
-  DateTime? now,
-  QuotaFreshnessDto? freshness,
-}) {
-  if (scrapedAtIso == null) return null;
-  final scraped = DateTime.tryParse(scrapedAtIso);
-  if (scraped == null) return null;
-  final timeStr = DateFormat('HH:mm').format(scraped.toLocal());
-  final parts = <String>['as of $timeStr'];
-  if (now != null && now.isAfter(scraped)) {
-    final age = now.difference(scraped);
-    if (age.inHours >= 24) {
-      parts.add('(${age.inDays}d ago)');
-    } else if (age.inHours >= 1) {
-      parts.add('(${age.inHours}h ago)');
-    } else if (age.inMinutes >= 2) {
-      parts.add('(${age.inMinutes}m ago)');
-    }
-  }
-  if (freshness != null) {
-    if (freshness.hardStale) {
-      parts.add('[overdue: hard-stale]');
-    } else if (freshness.stale) {
-      parts.add('[overdue: stale]');
-    }
-  }
-  return parts.join(' ');
 }
 
 /// Explain the control loop's current pacing decision in the same tooltip as
