@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models.dart';
 import '../principals.dart';
@@ -645,88 +647,13 @@ Future<void> confirmAndSetObligationStatus(
   String status, {
   VoidCallback? onUpdated,
 }) async {
-  final isDone = status == 'done';
-  final actionTitle = isDone ? 'Mark Done Obligation?' : 'Cancel Obligation?';
-  // "Cancel" is clear beside "Mark Done"; cancellation needs "Dismiss" to
-  // distinguish closing the dialog from confirming the destructive action.
-  final dismissLabel = isDone ? 'Cancel' : 'Dismiss';
-  final confirmLabel = isDone ? 'Mark Done' : 'Confirm cancellation';
-  // The note is the only record of *why* this transition happened. For a
-  // cancellation it is the only trace the intent ever existed, and for a
-  // human-owned decision child it is the answer itself, so it is offered on
-  // every transition rather than only on cancel.
-  //
-  // Captured through onChanged rather than a TextEditingController: the dialog
-  // keeps rebuilding the field through its exit animation, so a controller
-  // disposed on the await's far side is used after disposal.
-  var note = '';
-  final confirmed = await showDialog<bool>(
+  // The dialog resolves to the typed note on confirm and null on dismiss.
+  final note = await showDialog<String>(
     context: context,
-    builder: (dialogContext) => AlertDialog(
-      backgroundColor: MeshColors.bgSecondary,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(10),
-        side: const BorderSide(color: MeshColors.border),
-      ),
-      title: Text(
-        actionTitle,
-        style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
-      ),
-      // SizedBox inside a scroll view, matching the create/reparent dialogs:
-      // AlertDialog wraps content in IntrinsicWidth, and a TextField has no
-      // bounded intrinsic width, so an unwrapped one overflows the flex.
-      content: SingleChildScrollView(
-        child: SizedBox(
-          width: 440,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Are you sure you want to transition "${obligation.heading}" to status "$status"?',
-                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 13),
-              ),
-              const SizedBox(height: 14),
-              Text(
-                isDone ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
-                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
-              ),
-              const SizedBox(height: 4),
-              TextField(
-                onChanged: (value) => note = value,
-                maxLines: 3,
-                style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
-                decoration: InputDecoration(
-                  hintText: isDone
-                      ? 'What became true, or the answer if this was a question.'
-                      : 'Why this intent is no longer current.',
-                  hintStyle: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(dialogContext).pop(false),
-          child: Text(dismissLabel, style: const TextStyle(color: MeshColors.textSecondary)),
-        ),
-        ElevatedButton(
-          onPressed: () => Navigator.of(dialogContext).pop(true),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: isDone
-                ? ObligationStatusColors.done.dot
-                : ObligationStatusColors.cancelled.dot,
-            foregroundColor: MeshColors.textPrimary,
-          ),
-          child: Text(confirmLabel),
-        ),
-      ],
-    ),
+    builder: (_) => _StatusTransitionDialog(obligation: obligation, status: status),
   );
 
-  if (confirmed != true || !context.mounted) return;
+  if (note == null || !context.mounted) return;
 
   try {
     // Blank stays null all the way down: "no reason given" has one
@@ -751,6 +678,138 @@ Future<void> confirmAndSetObligationStatus(
         SnackBar(content: Text('Failed to update status: $err'), backgroundColor: MeshColors.statusHalted),
       );
     }
+  }
+}
+
+/// Confirmation for a done/cancelled transition, with its optional reason.
+///
+/// Command+Enter (macOS/iOS) or Ctrl+Enter (elsewhere) submits through the
+/// same path as the confirm button; plain Enter stays a newline in the note.
+class _StatusTransitionDialog extends StatefulWidget {
+  const _StatusTransitionDialog({required this.obligation, required this.status});
+
+  final ObligationDto obligation;
+  final String status;
+
+  @override
+  State<_StatusTransitionDialog> createState() => _StatusTransitionDialogState();
+}
+
+class _StatusTransitionDialogState extends State<_StatusTransitionDialog> {
+  // Owned by the State rather than the caller: the dialog keeps rebuilding the
+  // field through its exit animation, and State.dispose runs only after that.
+  final _note = TextEditingController();
+
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  bool get _isDone => widget.status == 'done';
+
+  void _submit() => Navigator.of(context).pop(_note.text);
+
+  KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
+    final isApple = defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+    final keyboard = HardwareKeyboard.instance;
+    final matches = [LogicalKeyboardKey.enter, LogicalKeyboardKey.numpadEnter].any(
+      (key) => SingleActivator(
+        key,
+        meta: isApple,
+        control: !isApple,
+        includeRepeats: false,
+      ).accepts(event, keyboard),
+    );
+    // Mid-composition the IME owns Enter; submitting would drop its text.
+    if (!matches || _note.value.composing.isValid) return KeyEventResult.ignored;
+    _submit();
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDone = _isDone;
+    final actionTitle = isDone ? 'Mark Done Obligation?' : 'Cancel Obligation?';
+    // "Cancel" is clear beside "Mark Done"; cancellation needs "Dismiss" to
+    // distinguish closing the dialog from confirming the destructive action.
+    final dismissLabel = isDone ? 'Cancel' : 'Dismiss';
+    final confirmLabel = isDone ? 'Mark Done' : 'Confirm cancellation';
+    // The note is the only record of *why* this transition happened. For a
+    // cancellation it is the only trace the intent ever existed, and for a
+    // human-owned decision child it is the answer itself, so it is offered on
+    // every transition rather than only on cancel.
+    //
+    // Autofocused so the shortcut works before the note field is clicked;
+    // events from the note field bubble up through it too.
+    return Focus(
+      autofocus: true,
+      skipTraversal: true,
+      onKeyEvent: _onKeyEvent,
+      child: AlertDialog(
+        backgroundColor: MeshColors.bgSecondary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: MeshColors.border),
+        ),
+        title: Text(
+          actionTitle,
+          style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        // SizedBox inside a scroll view, matching the create/reparent dialogs:
+        // AlertDialog wraps content in IntrinsicWidth, and a TextField has no
+        // bounded intrinsic width, so an unwrapped one overflows the flex.
+        content: SingleChildScrollView(
+          child: SizedBox(
+            width: 440,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Are you sure you want to transition "${widget.obligation.heading}" to status "${widget.status}"?',
+                  style: const TextStyle(color: MeshColors.textSecondary, fontSize: 13),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  isDone ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
+                  style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                ),
+                const SizedBox(height: 4),
+                TextField(
+                  controller: _note,
+                  maxLines: 3,
+                  style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                  decoration: InputDecoration(
+                    hintText: isDone
+                        ? 'What became true, or the answer if this was a question.'
+                        : 'Why this intent is no longer current.',
+                    hintStyle: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(dismissLabel, style: const TextStyle(color: MeshColors.textSecondary)),
+          ),
+          ElevatedButton(
+            onPressed: _submit,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isDone
+                  ? ObligationStatusColors.done.dot
+                  : ObligationStatusColors.cancelled.dot,
+              foregroundColor: MeshColors.textPrimary,
+            ),
+            child: Text(confirmLabel),
+          ),
+        ],
+      ),
+    );
   }
 }
 

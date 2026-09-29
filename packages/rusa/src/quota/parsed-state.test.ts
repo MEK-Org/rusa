@@ -21,6 +21,30 @@ describe("versioned parsed quota state", () => {
     expect(parseParsedState(serializeParsedState(snapshot))).toEqual(snapshot);
   });
 
+  it("round-trips limit.scrapedAt timestamp through the versioned blob", () => {
+    const withLimitScrapedAt = {
+      ...snapshot,
+      limits: [
+        {
+          ...snapshot.limits[0],
+          scrapedAt: "2029-12-31T23:30:00.000Z",
+        },
+      ],
+    };
+    expect(parseParsedState(serializeParsedState(withLimitScrapedAt))).toEqual(withLimitScrapedAt);
+    expect(
+      parseParsedState(
+        JSON.stringify({
+          version: 1,
+          snapshot: {
+            ...snapshot,
+            limits: [{ ...snapshot.limits[0], scrapedAt: "not-a-date" }],
+          },
+        })
+      )
+    ).toBeNull();
+  });
+
   it("accepts a fully valid legacy bare snapshot, normalising provider scope and discarding old model strings", () => {
     expect(
       parseParsedState(
