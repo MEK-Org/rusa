@@ -649,6 +649,35 @@ describe("dashboard quota snapshot", () => {
       ]);
     });
 
+    it("history fallback treats one lane read under two labels as a single window", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            label: "Current week (all models)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 0,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          historyPoint({
+            label: "Weekly (all models)",
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("available");
+      expect(claude.windows).toEqual([
+        expect.objectContaining({ usedPercent: 40, scrapedAt: "2026-09-28T14:00:00.000Z" }),
+      ]);
+    });
+
     it("passes limit.scrapedAt through to modelWindows and provider windows", async () => {
       const snapshot = await buildQuotaSnapshot({
         getQuota: async () => ({
