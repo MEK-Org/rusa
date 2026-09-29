@@ -72,7 +72,7 @@ function availableParse(resetAtIso: string) {
           {
             label: "Weekly",
             kind: "weekly",
-            usedPercent: 50,
+            usedPercent: "50",
             resetAtIso,
           },
         ],
