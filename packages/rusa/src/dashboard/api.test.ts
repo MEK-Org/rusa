@@ -3555,6 +3555,23 @@ describe("handleMeshApiRequest", () => {
         expect(badStatus.statusCode).toBe(400);
       });
 
+      it("pages one presentation queue, and 400s on an invalid one", async () => {
+        obligations.create({ title: "ready", id: "ready", ownerId: "actor-1" });
+        obligations.create({ title: "waiting", id: "waiting", ownerId: "actor-1" });
+        obligations.create({ title: "kid", id: "kid", ownerId: "actor-2", parentId: "waiting" });
+        const ids = async (query: string) => {
+          const { res } = await call(deps, "GET", `/api/mesh/obligations?ownerId=actor-1&${query}`);
+          expect(res.statusCode).toBe(200);
+          return JSON.parse(res.body).obligations.map((o: { id: string }) => o.id);
+        };
+        expect(await ids("queue=ready")).toEqual(["ready"]);
+        expect(await ids("queue=waiting")).toEqual(["waiting"]);
+        expect(await ids("queue=scheduled")).toEqual([]);
+
+        const { res: badQueue } = await call(deps, "GET", "/api/mesh/obligations?queue=done");
+        expect(badQueue.statusCode).toBe(400);
+      });
+
       it("503s when obligations data is unavailable", async () => {
         const noObligationsDeps = { ...deps, obligations: undefined };
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");

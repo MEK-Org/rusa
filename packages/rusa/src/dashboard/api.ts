@@ -21,6 +21,7 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
+  type ObligationQueue,
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
 import type { PrincipalRepository } from "../db/repositories/principal-repository.js";
@@ -2144,10 +2145,16 @@ export async function handleMeshApiRequest(
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
+    const queue = url.searchParams.get("queue") ?? undefined;
+    if (queue && !["ready", "waiting", "scheduled"].includes(queue)) {
+      sendJson(res, 400, { error: "invalid queue" });
+      return true;
+    }
 
     const page = deps.obligations.listPage({
       ownerId,
       status: status as ObligationStatus | undefined,
+      queue: queue as ObligationQueue | undefined,
       rootsOnly,
       limit,
       offset,

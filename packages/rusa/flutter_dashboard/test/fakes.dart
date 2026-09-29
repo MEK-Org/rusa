@@ -666,12 +666,17 @@ class FakeApi extends DashboardApi {
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId})>[];
   final fetchObligationsCalls =
-      <({String? ownerId, String? status, bool? rootsOnly})>[];
+      <({String? ownerId, String? status, String? queue, bool? rootsOnly})>[];
+
+  /// When set, pages are cut to `limit ?? obligationPageLimit` rows in
+  /// [obligationsResult] order, like the server's default page limit.
+  int? obligationPageLimit;
 
   @override
   Future<ObligationPage> fetchObligations({
     String? ownerId,
     String? status,
+    String? queue,
     bool? rootsOnly,
     int? limit,
     int? offset,
@@ -679,6 +684,7 @@ class FakeApi extends DashboardApi {
     fetchObligationsCalls.add((
       ownerId: ownerId,
       status: status,
+      queue: queue,
       rootsOnly: rootsOnly,
     ));
     var list = obligationsResult;
@@ -688,13 +694,27 @@ class FakeApi extends DashboardApi {
     if (status != null) {
       list = list.where((o) => o.status == status).toList();
     }
+    // Mirrors the server's queue predicates, which the DTO getters match.
+    switch (queue) {
+      case 'ready':
+        list = list.where((o) => o.isReady).toList();
+      case 'waiting':
+        list = list.where((o) => o.isWaiting).toList();
+      case 'scheduled':
+        list = list.where((o) => o.isScheduled).toList();
+    }
     if (rootsOnly == true) {
       list = list.where((o) => o.parentId == null).toList();
     }
+    final total = list.length;
+    final pageLimit = limit ?? obligationPageLimit;
+    if (pageLimit != null && list.length > pageLimit) {
+      list = list.take(pageLimit).toList();
+    }
     return ObligationPage(
       obligations: list,
-      total: list.length,
-      hasMore: false,
+      total: total,
+      hasMore: list.length < total,
     );
   }
 

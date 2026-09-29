@@ -162,9 +162,17 @@ export interface ListOwnedObligationsOptions {
   status?: ObligationStatus;
 }
 
+/** A dashboard section: one group of {@link OWNER_QUEUE_ORDER_SQL}. */
+export type ObligationQueue = "ready" | "waiting" | "scheduled";
+
 export interface ListObligationsOptions {
   ownerId?: EntityId;
   status?: ObligationStatus;
+  /**
+   * Keep only rows presented in this section, so each section pages on its
+   * own: snoozed rows sit in `waiting`, never in `ready` or `scheduled`.
+   */
+  queue?: ObligationQueue;
   rootsOnly?: boolean;
   /**
    * Drop terminal (done/cancelled) rows that carry no reason to keep
@@ -312,6 +320,12 @@ const EFFECTIVE_PRIORITY_CTE = `
  * parent readiness deliberately never use it: a snoozed obligation still blocks.
  */
 const ACTIONABLE_READY_SQL = `(obligation.status = 'ready' AND obligation.snoozed_until IS NULL)`;
+const WAITING_GROUP_SQL = `(obligation.status = 'waiting' OR (obligation.snoozed_until IS NOT NULL AND obligation.status NOT IN (${TERMINAL_STATUS_SQL})))`;
+const QUEUE_SQL: Record<ObligationQueue, string> = {
+  ready: ACTIONABLE_READY_SQL,
+  waiting: WAITING_GROUP_SQL,
+  scheduled: `(obligation.status = 'scheduled' AND obligation.snoozed_until IS NULL)`,
+};
 
 /**
  * Owner-queue order: actionable ready work first, then the waiting group
@@ -323,7 +337,7 @@ const ACTIONABLE_READY_SQL = `(obligation.status = 'ready' AND obligation.snooze
 const OWNER_QUEUE_ORDER_SQL = `
   CASE
     WHEN ${ACTIONABLE_READY_SQL} THEN 0
-    WHEN obligation.status = 'waiting' OR (obligation.snoozed_until IS NOT NULL AND obligation.status NOT IN (${TERMINAL_STATUS_SQL})) THEN 1
+    WHEN ${WAITING_GROUP_SQL} THEN 1
     ELSE 2
   END,
   effective_priority.effective_priority,
@@ -2008,6 +2022,7 @@ export class ObligationRepository {
       clauses.push("obligation.status = ?");
       params.push(options.status);
     }
+    if (options.queue) clauses.push(QUEUE_SQL[options.queue]);
     if (options.rootsOnly) {
       clauses.push("obligation.parent_id IS NULL");
     }
@@ -2035,6 +2050,7 @@ export class ObligationRepository {
       clauses.push("obligation.status = ?");
       params.push(options.status);
     }
+    if (options.queue) clauses.push(QUEUE_SQL[options.queue]);
     if (options.rootsOnly) {
       clauses.push("obligation.parent_id IS NULL");
     }

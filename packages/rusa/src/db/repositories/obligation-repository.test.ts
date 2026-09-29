@@ -31,6 +31,7 @@ import { dropObligationReadyHeads } from "../migrations/0050_drop_obligation_rea
 import { obligationSnooze } from "../migrations/0052_obligation_snooze.js";
 import {
   MAX_OBLIGATION_PAGE_LIMIT,
+  type ObligationQueue,
   ObligationRepository,
   type ReadyHeadChange,
 } from "./obligation-repository.js";
@@ -3747,6 +3748,17 @@ describe("ObligationRepository", () => {
         expect(repository.listOwned("actor-a", { status: "waiting" }).map((o) => o.id)).toEqual([
           "parent",
         ]);
+
+        // Each dashboard section pages on its own queue, so a snoozed row can
+        // neither crowd another section's page nor fall between sections.
+        const queue = (name: ObligationQueue, limit = 10) =>
+          repository
+            .listPage({ ownerId: "actor-a", queue: name, limit, offset: 0 })
+            .obligations.map((o) => o.id);
+        expect(queue("ready")).toEqual(["second"]);
+        expect(queue("waiting")).toEqual(["parent", "sched-snoozed", "first"]);
+        expect(queue("scheduled")).toEqual(["sched-unsnoozed"]);
+        expect(queue("scheduled", 1)).toEqual(["sched-unsnoozed"]);
       });
 
       it("leaves an owner whose only ready work is snoozed with no head", () => {

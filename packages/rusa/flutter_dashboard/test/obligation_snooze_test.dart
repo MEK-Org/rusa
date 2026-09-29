@@ -152,4 +152,51 @@ void main() {
       expect(find.textContaining('— snoozed until '), findsOneWidget);
     },
   );
+
+  testWidgets(
+    'Inbox pages each section on its own, so snoozed rows crowd out none',
+    (tester) async {
+      final until = DateTime.now()
+          .toUtc()
+          .add(const Duration(days: 2))
+          .toIso8601String();
+      // Server queue order: a full page of actionable ready rows, then a full
+      // page of snoozed scheduled rows (waiting group), then one unsnoozed
+      // scheduled row.
+      final api = FakeApi()
+        ..obligationPageLimit = 50
+        ..obligationsResult = [
+          for (var i = 0; i < 50; i++)
+            makeObligation('ob-ready-$i', ownerId: 'actor-a', status: 'ready'),
+          for (var i = 0; i < 50; i++)
+            makeObligation(
+              'ob-snoozed-$i',
+              ownerId: 'actor-a',
+              status: 'scheduled',
+              snoozedUntil: until,
+            ),
+          makeObligation(
+            'ob-scheduled',
+            ownerId: 'actor-a',
+            intent: 'Nightly digest',
+            status: 'scheduled',
+            nextReadyAt: '2026-10-01T06:00:00.000Z',
+          ),
+        ]
+        ..inboxResultsByStatus['unhandled'] = {'entries': []}
+        ..inboxResultsByStatus['handled'] = {'entries': []};
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+
+      await pumpInbox(tester, store);
+
+      expect(find.text('50 ready'), findsOneWidget);
+      expect(find.text('50 waiting'), findsOneWidget);
+      expect(find.text('1 scheduled'), findsOneWidget);
+    },
+  );
 }

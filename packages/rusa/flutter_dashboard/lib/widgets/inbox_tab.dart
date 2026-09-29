@@ -50,30 +50,22 @@ class _InboxTabState extends State<InboxTab> {
     final results = await Future.wait([
       api.fetchInbox(widget.actorId, status: 'unhandled'),
       api.fetchInbox(widget.actorId, status: 'handled', limit: 10),
-      api.fetchObligations(ownerId: widget.actorId),
-      // Fetched as its own filtered page rather than carved out of the
-      // unfiltered page above: with enough ready/waiting rows, that page's
-      // limit could be exhausted before a single scheduled row appears in
-      // it, silently dropping every scheduled row from this section.
-      api.fetchObligations(ownerId: widget.actorId, status: 'scheduled'),
+      // One page per section rather than carving sections out of a shared
+      // page: otherwise one section's rows could exhaust the page limit and
+      // silently drop another section's rows.
+      for (final queue in const ['ready', 'waiting', 'scheduled'])
+        api.fetchObligations(ownerId: widget.actorId, queue: queue),
     ]);
 
     final inboxPending = results[0] as Map<String, dynamic>;
     final inboxHandled = results[1] as Map<String, dynamic>;
-    final obligationPage = results[2] as ObligationPage;
-    final scheduledPage = results[3] as ObligationPage;
 
     final pending = inboxPending['entries'] ?? const [];
     final resolved = inboxHandled['entries'] ?? const [];
 
-    final readyObligations = obligationPage.obligations
-        .where((o) => o.isReady)
-        .toList();
-    final waitingObligations = obligationPage.obligations
-        .where((o) => o.isWaiting)
-        .toList();
-    final scheduledObligations = scheduledPage.obligations
-        .where((o) => o.isScheduled)
+    final readyObligations = (results[2] as ObligationPage).obligations;
+    final waitingObligations = (results[3] as ObligationPage).obligations;
+    final scheduledObligations = (results[4] as ObligationPage).obligations
         .toList()
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
 

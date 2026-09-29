@@ -48,14 +48,14 @@ class _OverviewTabState extends State<OverviewTab> {
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
     final ownerIds = _viewerOwnerIds;
+    const queues = ['ready', 'waiting', 'scheduled'];
+    // One page per section rather than carving sections out of a shared
+    // page: otherwise one section's rows could exhaust the page limit and
+    // silently drop another section's rows.
     final results = await Future.wait([
-      for (final ownerId in ownerIds) api.fetchObligations(ownerId: ownerId),
-      // Fetched as its own filtered page rather than carved out of the
-      // unfiltered page above: with enough ready/waiting rows, that page's
-      // limit could be exhausted before a single scheduled row appears in
-      // it, silently dropping every scheduled row from this section.
-      for (final ownerId in ownerIds)
-        api.fetchObligations(ownerId: ownerId, status: 'scheduled'),
+      for (final queue in queues)
+        for (final ownerId in ownerIds)
+          api.fetchObligations(ownerId: ownerId, queue: queue),
     ]);
     // One obligation has one owner, but the two ids are queried separately,
     // so dedupe by id rather than trusting the pages to be disjoint.
@@ -69,12 +69,11 @@ class _OverviewTabState extends State<OverviewTab> {
       return byId.values.toList();
     }
 
-    final owned = merge(results.take(ownerIds.length));
-    final ready = owned.where((o) => o.isReady).toList();
-    final waiting = owned.where((o) => o.isWaiting).toList();
-    final scheduled = merge(results.skip(ownerIds.length))
-        .where((o) => o.isScheduled)
-        .toList()
+    List<ObligationDto> section(int i) =>
+        merge(results.skip(i * ownerIds.length).take(ownerIds.length));
+    final ready = section(0);
+    final waiting = section(1);
+    final scheduled = section(2)
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
     final blockers = await Future.wait(
       waiting.map((o) => api.fetchObligationDetail(o.id)),
