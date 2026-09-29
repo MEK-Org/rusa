@@ -19,6 +19,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -31,6 +32,7 @@ import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
+import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
 import 'screenshot_support.dart';
@@ -248,6 +250,104 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'renders the status dialogs before and after Ctrl+Enter submits (#768)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..obligationsResult = [
+            makeObligation(
+              'ob-shortcut-done',
+              ownerId: 'human:operator',
+              intent: 'Publish the release notes',
+            ),
+            makeObligation(
+              'ob-shortcut-cancel',
+              ownerId: 'human:operator',
+              intent: 'Draft the migration guide',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1200, 700));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        // Real delays too: the detail pane reloads through async fetches.
+        Future<void> settle() async {
+          for (var i = 0; i < 6; i++) {
+            await Future<void>.delayed(const Duration(milliseconds: 20));
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+        }
+
+        for (final (heading, tooltip, name, note) in [
+          (
+            'Publish the release notes',
+            'Mark Done',
+            'done',
+            'Published to the docs site.\nLinked from the changelog.',
+          ),
+          (
+            'Draft the migration guide',
+            'Cancel Obligation',
+            'cancel',
+            'Superseded by the upgrade tool.\nNo manual steps remain.',
+          ),
+        ]) {
+          await tester.tap(find.text(heading).first);
+          await settle();
+          await tester.tap(find.byTooltip(tooltip));
+          await settle();
+          // Plain Enter stays a newline inside the note.
+          await tester.enterText(
+            find.descendant(
+              of: find.byType(AlertDialog),
+              matching: find.byType(TextField),
+            ),
+            note,
+          );
+          await settle();
+          await captureBoundary(key, '$_outDir/status_dialog_${name}_note.png');
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await settle();
+          expect(find.byType(AlertDialog), findsNothing);
+          await captureBoundary(
+            key,
+            '$_outDir/status_dialog_${name}_submitted.png',
+          );
+          ScaffoldMessenger.of(
+            tester.element(find.byType(WorkTab)),
+          ).removeCurrentSnackBar();
+          await settle();
+        }
+
+        expect(api.statusCalls.map((c) => c.status), ['done', 'cancelled']);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
 
   testWidgets(
     'renders the header quota rings with Fable beside Claude (#752)',
