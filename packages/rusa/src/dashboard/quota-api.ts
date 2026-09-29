@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
-import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import type { ProviderQuotaSnapshot, QuotaLimit } from "../mcp/quota-mcp.js";
 import { HISTORY_WINDOW_MS, type PublishedHistoryRecord } from "../quota/coordinator-protocol.js";
 import { isProviderScopedWindow } from "../quota/window-scope.js";
 
@@ -467,12 +467,21 @@ function latestStateFromHistory(
     .map((point) => point.observedAt)
     .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
   if (!latestObservedAt) return null;
-  // Carried windows keep their original observation time (#763), so one read
-  // can leave windows at different ages. Keep the newest point per window; an
-  // older window survives only while its known reset is still ahead, the same
-  // rule the live bad-read carry applies (model windows for Claude only).
-  // Window identity matches the store's lane (scope, kind, models); labels
-  // vary run to run and are not identity.
+  if (provider !== "claude") {
+    const latest = eligible.filter((point) => point.observedAt === latestObservedAt);
+    return {
+      provider,
+      status: latest.some((point) => point.percentLeft <= 0) ? "exhausted" : "available",
+      scrapedAt: latestObservedAt,
+      limits: latest.map((point) => historyPointLimit(provider, point)),
+    };
+  }
+  // Claude's carried windows keep their original observation time (#763), so
+  // one read can leave windows at different ages. Keep the newest point per
+  // window; an older window survives only while its known reset is still
+  // ahead, the same rule the live bad-read carry applies. Window identity
+  // matches the store's lane (scope, kind, models); labels vary run to run
+  // and are not identity.
   const newestPerWindow = new Map<string, QuotaHistorySource>();
   for (const point of eligible) {
     const key = [point.scope, point.kind, ...[...(point.models ?? [])].sort()].join("\u0000");
@@ -483,7 +492,6 @@ function latestStateFromHistory(
   }
   const latest = [...newestPerWindow.values()].filter((point) => {
     if (point.observedAt === latestObservedAt) return true;
-    if (point.scope !== "provider" && provider !== "claude") return false;
     const resetMs = point.resetAtIso === null ? Number.NaN : Date.parse(point.resetAtIso);
     return Number.isFinite(resetMs) && resetMs > nowMs;
   });
@@ -499,18 +507,24 @@ function latestStateFromHistory(
     status,
     scrapedAt: latestObservedAt,
     limits: latest.map((point) => ({
-      label: point.label,
-      kind: point.kind as "session" | "five_hour" | "weekly" | "other",
-      // Model rows keep their canonical IDs so the fallback serves the same
-      // model windows a live read would (#752).
-      scope:
-        point.scope === "model" && point.models && point.models.length > 0
-          ? { provider, models: [...point.models] }
-          : point.scope,
-      percentLeft: point.percentLeft,
-      resetAtIso: point.resetAtIso ?? undefined,
+      ...historyPointLimit(provider, point),
       scrapedAt: point.observedAt,
     })),
+  };
+}
+
+function historyPointLimit(provider: SupportedProvider, point: QuotaHistorySource): QuotaLimit {
+  return {
+    label: point.label,
+    kind: point.kind as "session" | "five_hour" | "weekly" | "other",
+    // Model rows keep their canonical IDs so the fallback serves the same
+    // model windows a live read would (#752).
+    scope:
+      point.scope === "model" && point.models && point.models.length > 0
+        ? { provider, models: [...point.models] }
+        : point.scope,
+    percentLeft: point.percentLeft,
+    resetAtIso: point.resetAtIso ?? undefined,
   };
 }
 

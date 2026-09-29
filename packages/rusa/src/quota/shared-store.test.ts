@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ProviderQuotaSnapshot, QuotaService, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import {
+  inferQuotaState,
+  type ProviderQuotaSnapshot,
+  type QuotaService,
+  type QuotaWindowKind,
+} from "../mcp/quota-mcp.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
@@ -571,6 +576,62 @@ describe("SharedQuotaStore canonical observations", () => {
           )
           .all()
       ).toEqual([{ observedAt: originalObservedAt, percentLeft: 80 }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("still records another provider's carried window at the bad read's time", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-codex-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalObservedAt = "2030-01-01T00:00:00.000Z";
+    const badReadAt = "2030-01-01T00:30:00.000Z";
+    const fresh: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "available",
+      scrapedAt: originalObservedAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: "provider",
+        },
+      ],
+    };
+    const badRead: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "unknown",
+      scrapedAt: badReadAt,
+      limits: [],
+    };
+    const carried = inferQuotaState(badRead, fresh, badReadAt);
+    try {
+      const firstId = store.recordRaw({
+        provider: "codex",
+        scrapedAt: originalObservedAt,
+        rawOutput: "synthetic fresh scrape",
+      });
+      store.recordParsed(firstId, fresh, fresh);
+      const secondId = store.recordRaw({
+        provider: "codex",
+        scrapedAt: badReadAt,
+        rawOutput: "synthetic failed extraction",
+      });
+      store.recordParsed(secondId, badRead, carried);
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT observed_at AS observedAt, percent_left AS percentLeft FROM quota_observations ORDER BY observed_at"
+          )
+          .all()
+      ).toEqual([
+        { observedAt: originalObservedAt, percentLeft: 80 },
+        { observedAt: badReadAt, percentLeft: 80 },
+      ]);
     } finally {
       store.close();
     }

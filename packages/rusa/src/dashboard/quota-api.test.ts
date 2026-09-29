@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import { inferQuotaState, type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
 import type { CodingProvider } from "../providers/types.js";
 import {
   buildQuotaHistory,
@@ -674,6 +674,93 @@ describe("dashboard quota snapshot", () => {
 
       expect(codex.status).toBe("available");
       expect(codex.modelWindows ?? []).toEqual([]);
+    });
+
+    it("history fallback for other providers reads only the newest scrape, as before #763", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const resetAtIso = "2026-10-01T00:00:00.000Z";
+      const fallback = (listHistory: QuotaApiDeps["listHistory"]) =>
+        buildQuotaSnapshot({
+          getQuota: async () => ({ provider: "codex", status: "unknown" }),
+          providers: ["codex"],
+          now: () => now,
+          listHistory,
+        }).then((snapshot) => snapshot.providers[0]);
+
+      // An older provider window is not revived beside a newer scrape.
+      const olderProvider = await fallback(() => [
+        historyPoint({ observedAt: "2026-09-28T11:00:00.000Z", percentLeft: 25, resetAtIso }),
+        historyPoint({
+          kind: "five_hour",
+          label: "5h",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 60,
+          resetAtIso,
+        }),
+      ]);
+      expect(olderProvider.windows.map((w) => w.label)).toEqual(["5h"]);
+
+      // A newest scrape with only model points still reads available.
+      const modelOnly = await fallback(() => [
+        historyPoint({
+          scope: "model",
+          models: ["gpt-spark"],
+          label: "Spark weekly",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 60,
+        }),
+      ]);
+      expect(modelOnly.status).toBe("available");
+
+      // An exhausted model window still reads exhausted.
+      const exhaustedModel = await fallback(() => [
+        historyPoint({ observedAt: "2026-09-28T14:00:00.000Z", percentLeft: 60 }),
+        historyPoint({
+          scope: "model",
+          models: ["gpt-spark"],
+          label: "Spark weekly",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 0,
+        }),
+      ]);
+      expect(exhaustedModel.status).toBe("exhausted");
+    });
+
+    it("dates a carried provider window at its original read for Claude only", async () => {
+      const t0 = "2026-09-28T11:00:00.000Z";
+      const t1 = "2026-09-28T14:00:00.000Z";
+      const resetAtIso = "2026-10-01T00:00:00.000Z";
+      for (const [provider, expected] of [
+        ["claude", t0],
+        ["codex", t1],
+        ["agy", t1],
+        ["kimi", t1],
+      ] as const) {
+        const carried = inferQuotaState(
+          { provider, status: "unknown", scrapedAt: t1, limits: [] },
+          {
+            provider,
+            status: "available",
+            scrapedAt: t0,
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 60,
+                resetAtIso,
+                scope: "provider",
+              },
+            ],
+          },
+          t1
+        );
+        const snapshot = await buildQuotaSnapshot({
+          getQuota: async () => carried,
+          providers: [provider],
+          now: () => Date.parse(t1),
+        });
+        expect(snapshot.providers[0].windows.map((w) => w.scrapedAt)).toEqual([expected]);
+      }
     });
 
     it("history fallback treats one lane read under two labels as a single window", async () => {

@@ -3994,7 +3994,11 @@ describe("quota MCP server", () => {
             t1Iso
           );
           expect(result.status).toBe("available");
-          expect(result.limits?.map((l) => l.label)).toEqual(["Weekly"]);
+          // No per-window scrapedAt: the carried window keeps taking the bad
+          // read's time, as before #763.
+          expect(result.limits).toEqual([
+            { label: "Weekly", kind: "weekly", percentLeft: 60, resetAtIso },
+          ]);
         }
       });
 

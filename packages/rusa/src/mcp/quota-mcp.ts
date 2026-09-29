@@ -924,6 +924,20 @@ function carriesBadReadWindow(provider: string, limit: QuotaLimit): boolean {
 }
 
 /**
+ * A window carried across a bad read, stamped with its original read time for
+ * Claude only (#763). Other providers keep the staging behaviour: the carried
+ * window takes the bad read's time.
+ */
+function carriedBadReadWindow(
+  provider: string,
+  limit: QuotaLimit,
+  prevScrapedAt: string | undefined
+): QuotaLimit {
+  if (provider !== "claude") return { ...limit };
+  return { ...limit, scrapedAt: limit.scrapedAt ?? prevScrapedAt };
+}
+
+/**
  * Derive effective/inferred quota state from raw parser output .
  *
  * Rules:
@@ -960,8 +974,9 @@ export function inferQuotaState(
   // Step 1: Bad read full-fallback (Rule: carried_forward_bad_read)
   // If the whole current parse returned status unknown or empty limits (bad read),
   // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso (#763).
-  // Claude's model-scoped windows (e.g. Fable) are preserved with their original observed time
-  // and provenance; other providers carry provider-scoped windows only.
+  // Claude also carries model-scoped windows (e.g. Fable), and its carried windows keep their
+  // original observed time and provenance; other providers carry provider-scoped windows only,
+  // at the bad read's time, as before.
   // Provider availability is derived strictly from provider-scoped windows: model-only readings
   // must never promote provider status to available/exhausted.
   if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
@@ -973,10 +988,7 @@ export function inferQuotaState(
         if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
         return !isAssumedReset(prevState, limit.label);
       })
-      .map((limit) => ({
-        ...limit,
-        scrapedAt: limit.scrapedAt ?? prevState.scrapedAt,
-      }));
+      .map((limit) => carriedBadReadWindow(rawState.provider, limit, prevState.scrapedAt));
 
     if (activeUnexpiredLimits.length > 0) {
       const activeProviderLimits = activeUnexpiredLimits.filter(isProviderScopedWindow);
