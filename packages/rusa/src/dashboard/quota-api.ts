@@ -554,7 +554,8 @@ function withEstimates(
   const dropped = (key: string): QuotaWindowDto | null => {
     const readings = lanes.get(key) ?? [];
     const last = readings.reduce<QuotaHistorySource | undefined>(
-      (newest, r) => (!newest || Date.parse(r.observedAt) > Date.parse(newest.observedAt) ? r : newest),
+      (newest, r) =>
+        !newest || Date.parse(r.observedAt) > Date.parse(newest.observedAt) ? r : newest,
       undefined
     );
     if (!last) return null;

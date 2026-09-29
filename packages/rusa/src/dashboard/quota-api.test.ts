@@ -1472,7 +1472,9 @@ describe("dead-reckoned lane estimates (#759)", () => {
     provider: "claude",
     status: "available",
     scrapedAt,
-    limits: [{ label: "Current week (all models)", kind: "weekly", percentLeft: 60, resetAtIso: RESET }],
+    limits: [
+      { label: "Current week (all models)", kind: "weekly", percentLeft: 60, resetAtIso: RESET },
+    ],
   });
   const snapshotAt = (
     nowIso: string,
@@ -1605,10 +1607,11 @@ describe("dead-reckoned lane estimates (#759)", () => {
   });
 
   it("keeps estimating inside the window however old the last reading is", async () => {
-    const snapshot = await snapshotAt(at("12:00", "2026-09-30"), providerOnly(at("11:00", "2026-09-30")), [
-      fablePoint(at("10:00"), 80),
-      fablePoint(at("12:00"), 78),
-    ]);
+    const snapshot = await snapshotAt(
+      at("12:00", "2026-09-30"),
+      providerOnly(at("11:00", "2026-09-30")),
+      [fablePoint(at("10:00"), 80), fablePoint(at("12:00"), 78)]
+    );
 
     // One point an hour for 48 hours.
     expect(snapshot.providers[0].modelWindows).toEqual([
@@ -1621,11 +1624,30 @@ describe("dead-reckoned lane estimates (#759)", () => {
     const store = new SharedQuotaStore(join(root, "quota.db"));
     try {
       const record = (scrapedAt: string, limits: ProviderQuotaSnapshot["limits"]) => {
-        const state: ProviderQuotaSnapshot = { provider: "claude", status: "available", scrapedAt, limits };
-        store.recordParsed(store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" }), state, state);
+        const state: ProviderQuotaSnapshot = {
+          provider: "claude",
+          status: "available",
+          scrapedAt,
+          limits,
+        };
+        store.recordParsed(
+          store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "raw" }),
+          state,
+          state
+        );
       };
-      const session = { label: "Current session", kind: "session" as const, percentLeft: 90, resetAtIso: at("15:00") };
-      const weekly = (percentLeft: number) => ({ label: "Weekly", kind: "weekly" as const, percentLeft, resetAtIso: RESET });
+      const session = {
+        label: "Current session",
+        kind: "session" as const,
+        percentLeft: 90,
+        resetAtIso: at("15:00"),
+      };
+      const weekly = (percentLeft: number) => ({
+        label: "Weekly",
+        kind: "weekly" as const,
+        percentLeft,
+        resetAtIso: RESET,
+      });
       record(at("10:00"), [session, weekly(80)]);
       record(at("12:00"), [session, weekly(70)]);
       // The newest scrape missed the weekly panel.
@@ -1640,7 +1662,8 @@ describe("dead-reckoned lane estimates (#759)", () => {
       const before = counts();
 
       const snapshot = await buildQuotaSnapshot({
-        getQuota: async () => store.getLatestSnapshot("claude") ?? { provider: "claude", status: "unknown" },
+        getQuota: async () =>
+          store.getLatestSnapshot("claude") ?? { provider: "claude", status: "unknown" },
         providers: ["claude"],
         now: () => Date.parse(at("13:30")),
         listHistory: (provider, sinceIso) => store.listHistorySince(provider, sinceIso),
@@ -1653,7 +1676,9 @@ describe("dead-reckoned lane estimates (#759)", () => {
       );
       expect(counts()).toEqual(before);
       expect(
-        store.db.prepare("SELECT count(*) AS n FROM quota_observations WHERE percent_left = 62.5").get()
+        store.db
+          .prepare("SELECT count(*) AS n FROM quota_observations WHERE percent_left = 62.5")
+          .get()
       ).toEqual({ n: 0 });
     } finally {
       store.close();

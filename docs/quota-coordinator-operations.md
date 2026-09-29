@@ -279,6 +279,43 @@ carry no model windows, so a provider in manual mode dead-reckons its model
 lanes the same way. When the coordinator itself stops collecting, both lanes
 age together and widen to the ceiling as usual.
 
+### Dashboard estimates for missing readings (#759)
+
+When a lane has no fresh reading, the dashboard quota API shows an estimate
+instead of an unknown value. This covers a lane that the newest scrape left
+out, a reading older than the provider's stale threshold, and a window whose
+reset has passed. It applies to every provider-wide and model-scoped lane.
+
+The estimate starts from the lane's last real reading and continues at the
+consumption pace between the first and last readings of the current window.
+That window uses the same cycle boundary the controller applies. The window is
+marked `estimated: true`, and its `scrapedAt` is the time of the last real
+reading. The estimate is computed on each read and never stored, so no
+observation, controller history or pacing evidence ever contains it.
+
+After the window resets, the new window starts at 100% and is drawn down at the
+previous pace. It shows no reset time, because no reading of the new window has
+come in. Some lanes get no estimate and stay unknown:
+
+- a lane with fewer than two readings in its window;
+- a lane whose window has ended and whose last reading is more than two hours
+  old;
+- a lane with no reading within the three-day history window.
+
+Once a lane's last real reading is more than two hours old, its ring shows a
+yellow warning triangle.
+
+Each `rusa start` process that has a coordinator configured compares
+consecutive scrapes in the history it refreshes. A scrape is the set of
+observations that share one five-minute observation slot. If a window appears
+in one scrape and is missing from the next, the process sends one responsive
+`system.quota_window_missed` alarm to root on `system:events`. The alarm is not
+repeated while the gap lasts. After the window reappears, the next gap raises
+a new alarm. The first history a process reads is a silent baseline, so a
+restart does not re-raise a gap that was already open. Switching a provider to
+manual readings, which carry no model windows, raises this alarm once for each
+of its model lanes.
+
 Deploy and rollback follow the v2 order above, with one difference. Opening the
 database with a v3 build rebuilds `quota_observations` once, adding
 `model_scope`. Every existing row is kept, with its controller memory, as

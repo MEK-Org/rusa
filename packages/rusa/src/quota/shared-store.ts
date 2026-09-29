@@ -85,6 +85,7 @@ function elapsedActuatorResponse(
     slew: QUOTA_MAX_SLEW_SECONDS * (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS),
   };
 }
+
 export { QUOTA_REFILL_EPSILON_POINTS } from "./quota-cycle.js";
 
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {

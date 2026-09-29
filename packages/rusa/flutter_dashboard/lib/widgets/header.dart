@@ -878,10 +878,20 @@ class _ProviderQuotaRing extends StatelessWidget {
   Widget build(BuildContext context) {
     final now = DateTime.now();
     final tooltipParts = [
-      quotaWindowTooltip(weeklyWindow, fallbackLabel: 'Weekly', now: now),
+      _withEstimateNote(
+        quotaWindowTooltip(weeklyWindow, fallbackLabel: 'Weekly', now: now),
+        weeklyWindow,
+      ),
       if (sessionWindow != null)
-        quotaWindowTooltip(sessionWindow, fallbackLabel: 'Session', now: now),
+        _withEstimateNote(
+          quotaWindowTooltip(sessionWindow, fallbackLabel: 'Session', now: now),
+          sessionWindow,
+        ),
     ];
+    final staleFor = _staleReadingAge([
+      weeklyWindow,
+      if (sessionWindow != null) sessionWindow,
+    ], now);
     // Ground-truth "as of" scrape stamp (ISSUE_NUM ask 5) — the same instant rides
     // every window on this provider, so either one supplies it.
     final asOf = _asOfLine(
@@ -895,6 +905,9 @@ class _ProviderQuotaRing extends StatelessWidget {
       tooltipParts.join('\n\n'),
       if (showThrottle && provider.throttle != null)
         quotaThrottleTooltip(provider.throttle!),
+      if (staleFor != null)
+        'Warning: no real reading for ${_formatStaleAge(staleFor)}; '
+            'the ring is estimated from the last one',
       ?asOf,
     ].join('\n');
     return Tooltip(
@@ -934,6 +947,17 @@ class _ProviderQuotaRing extends StatelessWidget {
                         backgroundColor: MeshColors.border,
                       ),
                     ),
+                  if (staleFor != null)
+                    const Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: Icon(
+                        Icons.warning_rounded,
+                        key: ValueKey('quota-ring-stale-warning'),
+                        size: 10,
+                        color: MeshColors.quotaStaleWarning,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -959,12 +983,65 @@ class _ProviderQuotaRing extends StatelessWidget {
 }
 
 /// The ring's fill fraction (quota remaining), or 0 (empty, grey) when the
-/// window is missing, past its reset, or its reading isn't known yet.
+/// window is missing or its reading isn't known yet. A window past its reset
+/// reads approximately full while its last reading is recent — the window
+/// rolled over, and the next one starts full (#759) — and empty only once that
+/// reading is also more than [kQuotaReadingStaleAfter] old.
 double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
   final used = window?.usedPercent;
   if (window == null || used == null || !window.isKnown) return 0.0;
-  if (now != null && window.isPastReset(now)) return 0.0;
+  if (now != null && window.isPastReset(now)) {
+    return _rolledOverRecently(window, now) ? 1.0 : 0.0;
+  }
   return (100 - used.clamp(0, 100)) / 100;
+}
+
+/// How long a lane may go without a real reading before its ring carries the
+/// yellow warning triangle, and how long a window that has ended still shows
+/// its rollover estimate (#759). The server's estimate holds for the same span.
+const Duration kQuotaReadingStaleAfter = Duration(hours: 2);
+
+/// How long ago [window]'s last real reading was taken, or null when it never
+/// had one or the stamp can't be parsed.
+Duration? _readingAge(QuotaWindowDto? window, DateTime now) {
+  final scrapedText = window?.scrapedAt;
+  if (window == null || !window.isKnown || scrapedText == null) return null;
+  final scraped = DateTime.tryParse(scrapedText);
+  return scraped == null ? null : now.difference(scraped);
+}
+
+/// A window whose reset has passed while its last reading is still recent: the
+/// window rolled over and no reading of the new one has arrived yet.
+bool _rolledOverRecently(QuotaWindowDto window, DateTime now) {
+  final age = _readingAge(window, now);
+  return age != null && age <= kQuotaReadingStaleAfter;
+}
+
+/// The age of the oldest reading behind a ring still showing a value, when it
+/// is more than [kQuotaReadingStaleAfter] old; null while every one is recent.
+Duration? _staleReadingAge(List<QuotaWindowDto?> windows, DateTime now) {
+  Duration? oldest;
+  for (final window in windows) {
+    if (window == null || _ringValue(window, now: now) == 0.0) continue;
+    final age = _readingAge(window, now);
+    if (age == null || age <= kQuotaReadingStaleAfter) continue;
+    if (oldest == null || age > oldest) oldest = age;
+  }
+  return oldest;
+}
+
+String _formatStaleAge(Duration age) =>
+    age.inHours >= 24 ? '${age.inDays}d' : '${age.inHours}h';
+
+/// Appends the estimate marking to a window's tooltip text when the server
+/// dead-reckoned its value rather than reading it (#759).
+String _withEstimateNote(String text, QuotaWindowDto? window) {
+  if (window == null || !window.estimated) return text;
+  final scraped = DateTime.tryParse(window.scrapedAt ?? '');
+  final at = scraped == null
+      ? ''
+      : ' at ${DateFormat('HH:mm').format(scraped.toLocal())}';
+  return '$text\nestimate: extended from the last real reading$at';
 }
 
 /// Self-explaining, multi-line tooltip text for one window (ISSUE_NUM ask 1 + ask
@@ -1191,6 +1268,12 @@ const double _kPaceBandPct = 15;
 /// provider CLIs report free-form reset text with no reliable epoch to
 /// parse) — never crashes, never leaves a ring uncolored.
 Color quotaScheduleColor(QuotaWindowDto? window, {required DateTime now}) {
+  if (window != null &&
+      window.isKnown &&
+      window.isPastReset(now) &&
+      _rolledOverRecently(window, now)) {
+    return _legacyColorForRemaining(100);
+  }
   final pos = _schedulePosition(window, now);
   if (pos == null) return MeshColors.textMuted;
   final delta = pos.delta;

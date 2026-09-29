@@ -83,10 +83,10 @@ describe("MissedQuotaWindowDetector (#759)", () => {
   it("takes the first history it sees as a silent baseline", () => {
     const detector = new MissedQuotaWindowDetector();
     // A gap already open before this process started is not raised on restart.
+    expect(detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15))])).toEqual([]);
     expect(
-      detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15))])
+      detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15)), weekly(at(30))])
     ).toEqual([]);
-    expect(detector.observe("claude", [weekly(at(0)), fable(at(0)), weekly(at(15)), weekly(at(30))])).toEqual([]);
   });
 
   it("reads windows landing in one observation slot as one scrape", () => {

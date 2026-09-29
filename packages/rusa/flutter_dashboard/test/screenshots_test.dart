@@ -308,6 +308,93 @@ void main() {
     },
   );
 
+  testWidgets(
+    'renders a missed Fable reading before and after dead reckoning (#759)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now().toUtc();
+        // Before: the scrape missed the Fable panel, so the API carried no
+        // Fable window and its ring read unknown.
+        // After: the API dead-reckons it from the last reading, three hours
+        // old here, so the ring also carries the warning triangle.
+        final estimated = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Current week (Fable)',
+          usedPercent: 81,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+          resetAtIso: now.add(const Duration(days: 2)).toIso8601String(),
+          scrapedAt: now
+              .subtract(const Duration(hours: 3, minutes: 10))
+              .toIso8601String(),
+          modelIds: const ['claude-fable-5-1'],
+          estimated: true,
+        );
+        await tester.binding.setSurfaceSize(const Size(1200, 260));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        Future<void> pumpHeader(QuotaSnapshotDto quota) async {
+          final api = FakeApi()
+            ..threadsResult = _seedThreads()
+            ..quotaResult = quota;
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          await store.refreshQuota();
+          addTearDown(store.dispose);
+          await tester.pumpWidget(
+            RepaintBoundary(
+              key: key,
+              child: MaterialApp(
+                debugShowCheckedModeBanner: false,
+                theme: buildMeshTheme(),
+                home: Scaffold(
+                  backgroundColor: MeshColors.bgPrimary,
+                  body: Align(
+                    alignment: Alignment.topCenter,
+                    child: MeshHeader(
+                      store: store,
+                      selected: DashboardView.overview,
+                      onSelect: (_) {},
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 250));
+        }
+
+        await pumpHeader(_seedFableQuota(fableWindows: const []));
+        await captureBoundary(key, '$_outDir/header_quota_missed_before.png');
+
+        await pumpHeader(_seedFableQuota(fableWindows: [estimated]));
+        expect(
+          find.byKey(const ValueKey('quota-ring-stale-warning')),
+          findsOneWidget,
+        );
+        await captureBoundary(key, '$_outDir/header_quota_missed_after.png');
+
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Fable'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('no real reading for 3h'), findsOneWidget);
+        await captureBoundary(
+          key,
+          '$_outDir/header_quota_missed_after_tooltip.png',
+        );
+      });
+    },
+  );
+
   testWidgets('renders the avatar circle/size strip (26 / 52 / 91 px)', (
     tester,
   ) async {
@@ -478,7 +565,19 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
 
 /// Claude with a Fable weekly allocation beside its provider-wide week (#752),
 /// plus Codex. Reset and scrape instants are null for a reproducible shot.
-QuotaSnapshotDto _seedFableQuota() {
+QuotaSnapshotDto _seedFableQuota({
+  List<QuotaWindowDto> fableWindows = const [
+    QuotaWindowDto(
+      id: 'weekly',
+      label: 'Current week (Fable)',
+      usedPercent: 74,
+      status: 'available',
+      headline: true,
+      windowMs: 604800000,
+      modelIds: ['claude-fable-5-1'],
+    ),
+  ],
+}) {
   final base = _seedQuota();
   final claude = base.providers.first;
   return QuotaSnapshotDto(
@@ -491,17 +590,7 @@ QuotaSnapshotDto _seedFableQuota() {
         tier: null,
         message: null,
         windows: claude.windows,
-        modelWindows: const [
-          QuotaWindowDto(
-            id: 'weekly',
-            label: 'Current week (Fable)',
-            usedPercent: 74,
-            status: 'available',
-            headline: true,
-            windowMs: 604800000,
-            modelIds: ['claude-fable-5-1'],
-          ),
-        ],
+        modelWindows: fableWindows,
       ),
       ...base.providers.skip(1),
     ],

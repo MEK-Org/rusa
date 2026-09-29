@@ -26,7 +26,9 @@ export interface LaneEstimate {
 
 /** The identity a lane's readings share across scrapes, from scope, models, and window kind. */
 export function quotaLaneKey(scope: "provider" | "model", models: readonly string[], kind: string) {
-  return scope === "provider" ? `provider:${kind}` : `model:${[...models].sort().join(",")}:${kind}`;
+  return scope === "provider"
+    ? `provider:${kind}`
+    : `model:${[...models].sort().join(",")}:${kind}`;
 }
 
 /**
