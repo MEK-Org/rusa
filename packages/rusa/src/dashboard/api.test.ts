@@ -4296,6 +4296,59 @@ describe("handleMeshApiRequest", () => {
         expect(data.obligation.status).toBe("done");
       });
 
+      it("tells open dashboards the status changed, without the note (#771)", async () => {
+        obligations.create({ title: "task-1", id: "task-1", ownerId: "actor-1" });
+        const recordEvent = vi.fn();
+        const meshDeps: DashboardDataDeps = {
+          ...deps,
+          mesh: { recordEvent } as unknown as ActorMesh,
+        };
+
+        const { res } = await call(
+          meshDeps,
+          "POST",
+          "/api/mesh/obligations/task-1/status",
+          JSON.stringify({ status: "cancelled", note: "superseded by task-2" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(res.statusCode).toBe(200);
+        expect(recordEvent.mock.calls).toEqual([
+          [
+            {
+              kind: "obligation_status_changed",
+              actorId: LOCAL_USER,
+              detail: "task-1",
+              payload: JSON.stringify({ status: "cancelled" }),
+            },
+          ],
+        ]);
+        expect(JSON.stringify(recordEvent.mock.calls)).not.toContain("superseded");
+      });
+
+      it("keeps a committed transition a 200 when the event sink fails", async () => {
+        obligations.create({ title: "task-1", id: "task-1", ownerId: "actor-1" });
+        const meshDeps: DashboardDataDeps = {
+          ...deps,
+          mesh: {
+            recordEvent: () => {
+              throw new Error("event store unavailable");
+            },
+          } as unknown as ActorMesh,
+        };
+
+        const { res } = await call(
+          meshDeps,
+          "POST",
+          "/api/mesh/obligations/task-1/status",
+          JSON.stringify({ status: "done" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(res.statusCode).toBe(200);
+        expect(obligations.require("task-1").status).toBe("done");
+      });
+
       it("404s when obligation not found", async () => {
         const { res } = await call(
           deps,
