@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -597,6 +599,186 @@ void main() {
         expect(api.statusCalls, isEmpty);
       },
     );
+
+    group('Command/Ctrl+Enter submits the status dialogs (#768)', () {
+      // The platform's submit modifier: Command on Apple, Ctrl elsewhere.
+      LogicalKeyboardKey submitModifier() =>
+          defaultTargetPlatform == TargetPlatform.macOS
+              ? LogicalKeyboardKey.metaLeft
+              : LogicalKeyboardKey.controlLeft;
+
+      /// Whether the framework handled [key]; an unhandled key goes on to the
+      /// platform's text input.
+      Future<bool> pressWith(
+        WidgetTester tester,
+        LogicalKeyboardKey modifier,
+        LogicalKeyboardKey key,
+      ) async {
+        await tester.sendKeyDownEvent(modifier);
+        final handled = await tester.sendKeyEvent(key);
+        await tester.sendKeyUpEvent(modifier);
+        return handled;
+      }
+
+      Future<void> openDialog(WidgetTester tester, String tooltip) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+        api.obligationsResult = [
+          makeObligation('ob-key-1', intent: 'Shortcut Target', status: 'ready'),
+        ];
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Shortcut Target'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip(tooltip));
+        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsOneWidget);
+      }
+
+      Finder noteField() => find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.byType(TextField),
+          );
+
+      for (final (tooltip, status) in [
+        ('Mark Done', 'done'),
+        ('Cancel Obligation', 'cancelled'),
+      ]) {
+        testWidgets(
+          '$tooltip: shortcut submits the typed note; plain Enter stays a newline',
+          (tester) async {
+            await openDialog(tester, tooltip);
+            await tester.enterText(noteField(), 'Shipped behind the flag.');
+
+            // The test harness has no platform text input to type the newline.
+            // Plain Enter left unhandled by the framework is what the platform
+            // then inserts into the field; a handled one would never reach it.
+            expect(await tester.sendKeyEvent(LogicalKeyboardKey.enter), isFalse);
+            await tester.pumpAndSettle();
+            expect(find.byType(AlertDialog), findsOneWidget);
+            expect(api.statusCalls, isEmpty);
+            // The newline the platform inserts, standing in for it.
+            const multiline = 'Shipped behind the flag.\nFlag removal tracked separately.';
+            tester.testTextInput.updateEditingValue(
+              const TextEditingValue(
+                text: multiline,
+                selection: TextSelection.collapsed(offset: multiline.length),
+              ),
+            );
+            await tester.pump();
+
+            expect(
+              await pressWith(tester, submitModifier(), LogicalKeyboardKey.enter),
+              isTrue,
+            );
+            await tester.pumpAndSettle();
+
+            expect(find.byType(AlertDialog), findsNothing);
+            expect(api.statusCalls.single.id, 'ob-key-1');
+            expect(api.statusCalls.single.status, status);
+            expect(api.statusCalls.single.note, multiline);
+          },
+          variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+        );
+
+        testWidgets(
+          '$tooltip: Ctrl+Enter submits off Apple platforms',
+          (tester) async {
+            await openDialog(tester, tooltip);
+            await pressWith(tester, submitModifier(), LogicalKeyboardKey.enter);
+            await tester.pumpAndSettle();
+
+            expect(find.byType(AlertDialog), findsNothing);
+            expect(api.statusCalls.single.status, status);
+            expect(api.statusCalls.single.note, isNull);
+          },
+          variant: const TargetPlatformVariant(
+            {TargetPlatform.linux, TargetPlatform.windows},
+          ),
+        );
+      }
+
+      testWidgets(
+        'the other platform\'s modifier does not submit',
+        (tester) async {
+          await openDialog(tester, 'Mark Done');
+          final wrong = defaultTargetPlatform == TargetPlatform.macOS
+              ? LogicalKeyboardKey.controlLeft
+              : LogicalKeyboardKey.metaLeft;
+          await pressWith(tester, wrong, LogicalKeyboardKey.enter);
+          await tester.pumpAndSettle();
+
+          expect(find.byType(AlertDialog), findsOneWidget);
+          expect(api.statusCalls, isEmpty);
+        },
+        variant: const TargetPlatformVariant(
+          {TargetPlatform.macOS, TargetPlatform.linux},
+        ),
+      );
+
+      testWidgets(
+        'a held or doubled shortcut submits once and leaves the page in place',
+        (tester) async {
+          await openDialog(tester, 'Cancel Obligation');
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyRepeatEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.enter);
+          // A second press lands while the dialog is still animating out.
+          await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pumpAndSettle();
+
+          expect(api.statusCalls.length, 1);
+          expect(find.byType(AlertDialog), findsNothing);
+          // The route under the dialog was not popped by the second press.
+          expect(find.text('WORK QUEUE'), findsOneWidget);
+        },
+        variant: TargetPlatformVariant.only(TargetPlatform.linux),
+      );
+
+      testWidgets(
+        'does not submit while the IME is composing',
+        (tester) async {
+          await openDialog(tester, 'Mark Done');
+          await tester.showKeyboard(noteField());
+          tester.testTextInput.updateEditingValue(
+            const TextEditingValue(
+              text: 'かんじ',
+              selection: TextSelection.collapsed(offset: 3),
+              composing: TextRange(start: 0, end: 3),
+            ),
+          );
+          await tester.pump();
+
+          await pressWith(tester, LogicalKeyboardKey.controlLeft, LogicalKeyboardKey.enter);
+          await tester.pumpAndSettle();
+          expect(find.byType(AlertDialog), findsOneWidget);
+          expect(api.statusCalls, isEmpty);
+
+          // Composition committed: the shortcut submits the settled text.
+          tester.testTextInput.updateEditingValue(
+            const TextEditingValue(
+              text: '漢字',
+              selection: TextSelection.collapsed(offset: 2),
+            ),
+          );
+          await tester.pump();
+          await pressWith(tester, LogicalKeyboardKey.controlLeft, LogicalKeyboardKey.enter);
+          await tester.pumpAndSettle();
+          expect(api.statusCalls.single.note, '漢字');
+        },
+        variant: TargetPlatformVariant.only(TargetPlatform.linux),
+      );
+    });
 
 
     testWidgets('shows why a terminal obligation ended', (tester) async {
