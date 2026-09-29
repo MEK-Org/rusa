@@ -1877,9 +1877,10 @@ async function composeStart(
     }
   };
 
-  // A window one scrape carried and the next did not is raised to root once
-  // per gap (#759): the dashboard keeps drawing it from an estimate, so this
-  // is what says the reading is missing. The alarm is bound once the mesh exists.
+  // A window one scrape carried and the next did not is raised to this
+  // instance's root once per gap (#759): the dashboard keeps drawing it from an
+  // estimate, so this is what says the reading is missing. Instances sharing a
+  // coordinator each tell their own root. The alarm is bound once the mesh exists.
   const missedQuotaWindows = new MissedQuotaWindowDetector();
   let raiseQuotaWindowMissedAlarm: ((missed: MissedQuotaWindow) => void) | null = null;
   let historyRefreshInFlight = false;
@@ -4504,7 +4505,10 @@ async function composeStart(
           sourceType: "timer",
           rawResource: "system:events",
           rawPayload: { type: "system.quota_window_missed", ...missed, message },
-          priority: "responsive",
+          // Normal, not responsive: the ring keeps its estimate, a single
+          // missed panel often returns on the next scrape, and nothing here
+          // needs root to drop what it is doing.
+          priority: "normal",
           eventSummary: message,
         }),
       message,

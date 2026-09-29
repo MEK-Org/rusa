@@ -983,22 +983,20 @@ class _ProviderQuotaRing extends StatelessWidget {
 }
 
 /// The ring's fill fraction (quota remaining), or 0 (empty, grey) when the
-/// window is missing or its reading isn't known yet. A window past its reset
-/// reads approximately full while its last reading is recent — the window
-/// rolled over, and the next one starts full (#759) — and empty only once that
-/// reading is also more than [kQuotaReadingStaleAfter] old.
+/// window is missing, past its reset, or its reading isn't known yet. The
+/// server estimates the window after a reset (#759), and that estimate carries
+/// no reset time, so a window still past its reset here is one it could not
+/// estimate.
 double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
   final used = window?.usedPercent;
   if (window == null || used == null || !window.isKnown) return 0.0;
-  if (now != null && window.isPastReset(now)) {
-    return _rolledOverRecently(window, now) ? 1.0 : 0.0;
-  }
+  if (now != null && window.isPastReset(now)) return 0.0;
   return (100 - used.clamp(0, 100)) / 100;
 }
 
 /// How long a lane may go without a real reading before its ring carries the
-/// yellow warning triangle, and how long a window that has ended still shows
-/// its rollover estimate (#759). The server's estimate holds for the same span.
+/// yellow warning triangle (#759). The server's rollover estimate uses the
+/// same span.
 const Duration kQuotaReadingStaleAfter = Duration(hours: 2);
 
 /// How long ago [window]'s last real reading was taken, or null when it never
@@ -1008,13 +1006,6 @@ Duration? _readingAge(QuotaWindowDto? window, DateTime now) {
   if (window == null || !window.isKnown || scrapedText == null) return null;
   final scraped = DateTime.tryParse(scrapedText);
   return scraped == null ? null : now.difference(scraped);
-}
-
-/// A window whose reset has passed while its last reading is still recent: the
-/// window rolled over and no reading of the new one has arrived yet.
-bool _rolledOverRecently(QuotaWindowDto window, DateTime now) {
-  final age = _readingAge(window, now);
-  return age != null && age <= kQuotaReadingStaleAfter;
 }
 
 /// The age of the oldest reading behind a ring still showing a value, when it
@@ -1268,12 +1259,6 @@ const double _kPaceBandPct = 15;
 /// provider CLIs report free-form reset text with no reliable epoch to
 /// parse) — never crashes, never leaves a ring uncolored.
 Color quotaScheduleColor(QuotaWindowDto? window, {required DateTime now}) {
-  if (window != null &&
-      window.isKnown &&
-      window.isPastReset(now) &&
-      _rolledOverRecently(window, now)) {
-    return _legacyColorForRemaining(100);
-  }
   final pos = _schedulePosition(window, now);
   if (pos == null) return MeshColors.textMuted;
   final delta = pos.delta;

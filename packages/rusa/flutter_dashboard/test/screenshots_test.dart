@@ -391,6 +391,49 @@ void main() {
           key,
           '$_outDir/header_quota_missed_after_tooltip.png',
         );
+
+        // Rollover: the window reset 40 minutes ago with no reading of the new
+        // one yet, so the API estimates it approximately full, with no reset
+        // time, from the last reading of the old window 70 minutes ago.
+        final rolledOver = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Current week (Fable)',
+          usedPercent: 3,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+          scrapedAt: now
+              .subtract(const Duration(minutes: 70))
+              .toIso8601String(),
+          modelIds: const ['claude-fable-5-1'],
+          estimated: true,
+        );
+        Tooltip.dismissAllToolTips();
+        await pumpHeader(_seedFableQuota(fableWindows: [rolledOver]));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          find.byKey(const ValueKey('quota-ring-stale-warning')),
+          findsNothing,
+        );
+        await captureBoundary(key, '$_outDir/header_quota_rollover.png');
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Fable'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          find.textContaining('extended from the last real reading'),
+          findsOneWidget,
+        );
+        await captureBoundary(
+          key,
+          '$_outDir/header_quota_rollover_tooltip.png',
+        );
       });
     },
   );

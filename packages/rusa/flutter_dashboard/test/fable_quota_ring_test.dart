@@ -542,13 +542,14 @@ void main() {
       });
     });
 
-    testWidgets('empties the ring only after window end plus two hours', (
+    testWidgets('leaves a window it cannot estimate empty past its reset', (
       tester,
     ) async {
       await tester.runAsync(() async {
         final now = DateTime.now();
-        // The window ended half an hour ago; its last reading is 90 minutes
-        // old, so the rolled-over window still reads approximately full.
+        // The server estimates a rolled-over window with no reset time; one
+        // still past its reset here is one it had nothing to estimate from, so
+        // it reads empty however recent its reading, and carries no warning.
         var store = await pumpFable(
           tester,
           _fableWeekly(
@@ -557,21 +558,8 @@ void main() {
             scrapedAgo: const Duration(minutes: 90),
           ),
         );
-        expect(_outerRingValue(tester, 'Fable'), 1.0);
-        expect(_tooltipOf(tester, 'Fable'), contains('estimated ~100%'));
-        await store.dispose();
-
-        // Same window end, with the reading past two hours: now it is empty,
-        // and an empty ring carries no warning to go with it.
-        store = await pumpFable(
-          tester,
-          _fableWeekly(
-            now: now,
-            resetIn: const Duration(minutes: -30),
-            scrapedAgo: const Duration(hours: 2, minutes: 30),
-          ),
-        );
         expect(_outerRingValue(tester, 'Fable'), 0.0);
+        expect(_tooltipOf(tester, 'Fable'), contains('estimated ~100%'));
         expect(_staleWarning('Fable'), findsNothing);
         await store.dispose();
 

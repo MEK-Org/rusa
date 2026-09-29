@@ -510,7 +510,14 @@ function latestStateFromHistory(
  * history can still be dead-reckoned. A window is fresh when it is in the
  * newest reading, that reading is no older than the lane's stale threshold,
  * and its window has not reset. A window with nothing to estimate from keeps
- * what it showed before. Nothing here is written anywhere.
+ * what it showed before. A dropped lane is estimated only until its last-seen
+ * window resets, never into a next window no scrape has shown: that is also
+ * when the controller retires a dropped model lane (#588). Nothing here is
+ * written anywhere.
+ *
+ * Window ids and history kinds key the same lanes: both are the closed
+ * `QuotaWindowKind` set, validated where a scrape is parsed and where the
+ * coordinator publishes it, so the store's `normalizeKind` never changes one.
  */
 function withEstimates(
   dto: ProviderQuotaDto,
@@ -525,7 +532,7 @@ function withEstimates(
     if (lane) lane.push(record);
     else lanes.set(key, [record]);
   }
-  const estimate = <W extends QuotaWindowDto>(window: W, key: string): W => {
+  const estimate = <W extends QuotaWindowDto>(window: W, key: string, rollover = true): W => {
     const scrapedMs = window.scrapedAt === null ? Number.NaN : Date.parse(window.scrapedAt);
     const resetMs = window.resetAtIso === null ? Number.NaN : Date.parse(window.resetAtIso);
     const fresh =
@@ -540,7 +547,7 @@ function withEstimates(
         resetAtIso: window.resetAtIso,
       });
     }
-    const reckoned = estimateLane(readings, window.windowMs, nowMs);
+    const reckoned = estimateLane(readings, window.windowMs, nowMs, { rollover });
     if (!reckoned) return window;
     return {
       ...window,
@@ -570,7 +577,7 @@ function withEstimates(
       scrapedAt: last.observedAt,
       estimated: false,
     };
-    const reckoned = estimate(window, key);
+    const reckoned = estimate(window, key, false);
     return reckoned.estimated ? reckoned : null;
   };
 

@@ -294,12 +294,15 @@ reading. The estimate is computed on each read and never stored, so no
 observation, controller history or pacing evidence ever contains it.
 
 After the window resets, the new window starts at 100% and is drawn down at the
-previous pace. It shows no reset time, because no reading of the new window has
-come in. Some lanes get no estimate and stay unknown:
+previous pace until a reading arrives or the new window would itself have ended.
+It shows no reset time, because no reading of the new window has come in. Some
+lanes get no estimate and stay unknown:
 
 - a lane with fewer than two readings in its window;
-- a lane whose window has ended and whose last reading is more than two hours
-  old;
+- a lane whose window ended more than two hours after its last reading;
+- a lane the newest scrape dropped, once its last-seen window has reset. This
+  is the same point at which the controller retires a dropped model lane
+  (#588), so a retired lane is never drawn as a fresh window;
 - a lane with no reading within the three-day history window.
 
 Once a lane's last real reading is more than two hours old, its ring shows a
@@ -308,8 +311,9 @@ yellow warning triangle.
 Each `rusa start` process that has a coordinator configured compares
 consecutive scrapes in the history it refreshes. A scrape is the set of
 observations that share one five-minute observation slot. If a window appears
-in one scrape and is missing from the next, the process sends one responsive
-`system.quota_window_missed` alarm to root on `system:events`. The alarm is not
+in one scrape and is missing from the next, the process sends one normal-priority
+`system.quota_window_missed` alarm to its own root on `system:events`. Instances
+that share a coordinator each tell their own root once. The alarm is not
 repeated while the gap lasts. After the window reappears, the next gap raises
 a new alarm. The first history a process reads is a silent baseline, so a
 restart does not re-raise a gap that was already open. Switching a provider to

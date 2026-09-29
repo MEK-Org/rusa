@@ -1579,13 +1579,37 @@ describe("dead-reckoned lane estimates (#759)", () => {
     expect(snapshot.providers[0].modelWindows).toEqual([]);
   });
 
+  /** A stalled scrape that still carries the Fable weekly, as last read at `scrapedAt`. */
+  const withFable = (
+    scrapedAt: string,
+    percentLeft: number,
+    resetAtIso: string
+  ): ProviderQuotaSnapshot => ({
+    ...providerOnly(scrapedAt),
+    limits: [
+      ...(providerOnly(scrapedAt).limits ?? []),
+      {
+        label: "Current week (Fable)",
+        kind: "weekly",
+        scope: { provider: "claude", models: FABLE },
+        percentLeft,
+        resetAtIso,
+      },
+    ],
+  });
+  const rolloverHistory = [
+    fablePoint(at("11:30"), 40, at("13:00")),
+    fablePoint(at("12:30"), 30, at("13:00")),
+  ];
+
   it("shows an approximately full estimate right after the window rolls over", async () => {
     // Ten points an hour; the window reset at 13:00 with the last reading at
     // 12:30, so at 13:30 the new window is estimated at 100 - 10 x 0.5 = 95.
-    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:15")), [
-      fablePoint(at("11:30"), 40, at("13:00")),
-      fablePoint(at("12:30"), 30, at("13:00")),
-    ]);
+    const snapshot = await snapshotAt(
+      at("13:30"),
+      withFable(at("12:30"), 30, at("13:00")),
+      rolloverHistory
+    );
 
     expect(snapshot.providers[0].modelWindows).toEqual([
       expect.objectContaining({
@@ -1597,11 +1621,61 @@ describe("dead-reckoned lane estimates (#759)", () => {
     ]);
   });
 
-  it("returns no value past window end once the last reading is over two hours old", async () => {
-    const snapshot = await snapshotAt(at("14:31"), providerOnly(at("14:00")), [
-      fablePoint(at("11:30"), 40, at("13:00")),
-      fablePoint(at("12:30"), 30, at("13:00")),
+  it("measures the two-hour hold at the reset, not at read time", async () => {
+    // The window ended 30 minutes after its last reading, so the new window is
+    // still estimated at 16:00, three and a half hours after that reading.
+    const snapshot = await snapshotAt(
+      at("16:00"),
+      withFable(at("12:30"), 30, at("13:00")),
+      rolloverHistory
+    );
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 30, resetAtIso: null, estimated: true }),
     ]);
+  });
+
+  it("estimates no next window when the last reading was over two hours old at the reset", async () => {
+    const snapshot = await snapshotAt(at("13:10"), withFable(at("10:30"), 30, at("13:00")), [
+      fablePoint(at("10:00"), 40, at("13:00")),
+      fablePoint(at("10:30"), 30, at("13:00")),
+    ]);
+
+    // The ended window is passed through as read, for the ring to show as reset.
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 70, resetAtIso: at("13:00"), estimated: false }),
+    ]);
+  });
+
+  it("stops the rollover estimate where the next window would end", async () => {
+    const session = (percentLeft: number, observedAt: string) =>
+      historyPoint({
+        kind: "session",
+        label: "Session",
+        observedAt,
+        percentLeft,
+        resetAtIso: at("13:00"),
+      });
+    const state = (scrapedAt: string): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: [{ label: "Session", kind: "session", percentLeft: 30, resetAtIso: at("13:00") }],
+    });
+    const history = [session(40, at("11:30")), session(30, at("12:30"))];
+
+    const before = await snapshotAt(at("17:59"), state(at("12:30")), history);
+    expect(before.providers[0].windows).toEqual([
+      expect.objectContaining({ id: "session", resetAtIso: null, estimated: true }),
+    ]);
+    const after = await snapshotAt(at("18:00"), state(at("12:30")), history);
+    expect(after.providers[0].windows).toEqual([
+      expect.objectContaining({ id: "session", resetAtIso: at("13:00"), estimated: false }),
+    ]);
+  });
+
+  it("estimates a dropped lane only until its window resets, when #588 retires it", async () => {
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:15")), rolloverHistory);
 
     expect(snapshot.providers[0].modelWindows).toEqual([]);
   });

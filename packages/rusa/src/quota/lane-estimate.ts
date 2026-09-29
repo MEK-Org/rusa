@@ -1,10 +1,12 @@
 import { quotaCycleChanged } from "./quota-cycle.js";
 
 /**
- * How long after a lane's last real reading a window that has ended still
- * shows its rollover estimate (#759). Past this, a window whose reset has
- * passed reads unknown rather than guessing across a gap the scrapes cannot
- * explain. The dashboard's two-hour warning triangle uses the same span.
+ * How recent a lane's last real reading must be when its window ends for the
+ * next window to be estimated (#759): "if at the end of the quota period it has
+ * been more than two hours since a reading, only then stop showing a value".
+ * A window that ends with an older reading reads unknown rather than guessing
+ * across a gap the scrapes cannot explain. The dashboard's warning triangle
+ * uses the same span.
  */
 export const LANE_ESTIMATE_ROLLOVER_HOLD_MS = 2 * 60 * 60 * 1000;
 
@@ -37,8 +39,10 @@ export function quotaLaneKey(scope: "provider" | "model", models: readonly strin
  * boundary the pacing controller would also see (`quotaCycleChanged`) —
  * establish a consumption pace from the first to the last of them, and the
  * last reading is carried forward at that pace. Once the window has reset, the
- * new window starts full and is drawn down at the same pace, for up to
- * {@link LANE_ESTIMATE_ROLLOVER_HOLD_MS} after the last reading.
+ * new window starts full and is drawn down at the same pace until a reading
+ * arrives or that window, too, would have ended — provided the last reading was
+ * no more than {@link LANE_ESTIMATE_ROLLOVER_HOLD_MS} old when the old window
+ * ended. With `rollover: false` the estimate stops at the reset instead.
  *
  * Null when there is nothing honest to extend: fewer than two readings in the
  * window, no known reset to bound it, or a window that ended more than the
@@ -47,7 +51,8 @@ export function quotaLaneKey(scope: "provider" | "model", models: readonly strin
 export function estimateLane(
   readings: readonly LaneReading[],
   windowMs: number,
-  nowMs: number
+  nowMs: number,
+  { rollover = true }: { rollover?: boolean } = {}
 ): LaneEstimate | null {
   const ordered = readings
     .filter((reading) => Number.isFinite(Date.parse(reading.observedAt)))
@@ -73,7 +78,8 @@ export function estimateLane(
       lastReadingAt: last.observedAt,
     };
   }
-  if (nowMs - lastMs > LANE_ESTIMATE_ROLLOVER_HOLD_MS) return null;
+  if (!rollover || resetMs - lastMs > LANE_ESTIMATE_ROLLOVER_HOLD_MS) return null;
+  if (nowMs >= resetMs + windowMs) return null;
   return {
     percentLeft: clamp(100 - pacePerMs * (nowMs - resetMs)),
     resetAtIso: null,
