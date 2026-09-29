@@ -522,6 +522,59 @@ describe("SharedQuotaStore canonical observations", () => {
       store.close();
     }
   });
+
+  it("records no new-slot observation for a carried provider window", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-provider-age-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalObservedAt = "2030-01-01T00:00:00.000Z";
+    const carriedScrapeAt = "2030-01-01T00:30:00.000Z";
+    const providerWindow = {
+      label: "Current week (all models)",
+      kind: "weekly" as const,
+      percentLeft: 80,
+      resetAtIso: "2030-01-08T00:00:00.000Z",
+      scope: { provider: "claude" },
+    };
+    const fresh: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: originalObservedAt,
+      limits: [providerWindow],
+    };
+    // The next scrape's extraction failed; the provider window is carried
+    // across it and is not a second reading showing no consumption.
+    const carried: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: carriedScrapeAt,
+      limits: [{ ...providerWindow, scrapedAt: originalObservedAt }],
+    };
+    try {
+      const firstId = store.recordRaw({
+        provider: "claude",
+        scrapedAt: originalObservedAt,
+        rawOutput: "synthetic fresh scrape",
+      });
+      store.recordParsed(firstId, fresh, fresh);
+      const secondId = store.recordRaw({
+        provider: "claude",
+        scrapedAt: carriedScrapeAt,
+        rawOutput: "synthetic failed extraction",
+      });
+      store.recordParsed(secondId, carried, carried);
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT observed_at AS observedAt, percent_left AS percentLeft FROM quota_observations"
+          )
+          .all()
+      ).toEqual([{ observedAt: originalObservedAt, percentLeft: 80 }]);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("SharedQuotaStore persisted controller", () => {

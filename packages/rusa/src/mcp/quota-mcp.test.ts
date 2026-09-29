@@ -16,6 +16,7 @@ vi.mock("@google/genai", () => ({
       generateContent: (args: unknown) => mockGenerateContent(args),
     };
   },
+  FinishReason: { STOP: "STOP", MAX_TOKENS: "MAX_TOKENS" },
   Type: {
     OBJECT: "OBJECT",
     STRING: "STRING",
@@ -1543,13 +1544,13 @@ describe("quota MCP server", () => {
       infoSpy.mockRestore();
     });
 
-    it("truncation detection: partial JSON / size limit triggers retry and escalation (#763)", async () => {
+    it("truncation detection: unterminated JSON without a finish reason triggers retry and escalation (#763)", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
 
       mockGenerateContent
         .mockResolvedValueOnce({
-          text: () => `   ${"x".repeat(65 * 1024)}`,
+          text: () => '{"status":"available","windows":[{"label":"Current session","kind":"sess',
         })
         .mockResolvedValueOnce({
           text: () =>
@@ -1577,24 +1578,11 @@ describe("quota MCP server", () => {
       );
       expect(parsed.status).toBe("available");
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Quota parse failed: extraction response exceeded size bound")
+        expect.stringContaining("Quota parse failed: invalid JSON output")
       );
 
       warnSpy.mockRestore();
       infoSpy.mockRestore();
-    });
-
-    it("enforces QUOTA_EXTRACTION_MAX_OUTPUT_TOKENS = 4096 on generation calls (#763)", async () => {
-      mockGenerateContent.mockResolvedValue({
-        text: () => JSON.stringify({ status: "available", windows: [] }),
-      });
-
-      await parseClaudeQuota("Claude output here", "test-key");
-
-      const callArgs = mockGenerateContent.mock.calls[0][0] as {
-        config?: { maxOutputTokens?: number };
-      };
-      expect(callArgs.config?.maxOutputTokens).toBe(4096);
     });
 
     it("keeps only the provider window from a Codex panel containing named-model limits", async () => {

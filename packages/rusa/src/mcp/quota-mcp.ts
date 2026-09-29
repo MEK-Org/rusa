@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { Type } from "@google/genai";
+import { FinishReason, Type } from "@google/genai";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
@@ -114,16 +114,6 @@ export interface QuotaLimit {
    */
   scrapedAt?: string;
 }
-
-/**
- * Bounded output token limit for quota extraction responses (#763).
- * Quota extraction JSON schemas require a few hundred tokens; 4096 tokens
- * bounds the output well below 64 KiB while allowing complex multi-window parses.
- */
-export const QUOTA_EXTRACTION_MAX_OUTPUT_TOKENS = 4096;
-
-/** Maximum allowed byte length for quota extraction text before rejecting as truncated/runaway (#763). */
-export const QUOTA_EXTRACTION_MAX_BYTES = 64 * 1024;
 
 export interface ProviderQuotaSnapshot {
   provider: string;
@@ -602,7 +592,6 @@ async function parseQuotaWithLlm(
         // Quota parsing is extraction, not creative generation. A fixed
         // temperature keeps a repeated scrape from changing its window set.
         temperature: 0,
-        maxOutputTokens: QUOTA_EXTRACTION_MAX_OUTPUT_TOKENS,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -613,26 +602,16 @@ async function parseQuotaWithLlm(
       },
     });
 
-    const responseWithFinishReason = response as {
-      finishReason?: string;
-      candidates?: Array<{ finishReason?: string }>;
-    };
-    const finishReason =
-      responseWithFinishReason.candidates?.[0]?.finishReason ??
-      responseWithFinishReason.finishReason;
-    if (finishReason === "MAX_TOKENS") {
+    // A response cut off at the model's output limit is incomplete; fail the
+    // attempt with that cause so the stronger-model retry logs why (#763).
+    const finishReason = response.candidates?.[0]?.finishReason;
+    if (finishReason === FinishReason.MAX_TOKENS) {
       throw new Error(
         `Quota parse failed: response truncated by model output token limit (finishReason: ${finishReason})`
       );
     }
 
     const text = await extractGeminiText(response);
-    const textBytes = Buffer.byteLength(text, "utf8");
-    if (textBytes >= QUOTA_EXTRACTION_MAX_BYTES) {
-      throw new Error(
-        `Quota parse failed: extraction response exceeded size bound (${textBytes} bytes)`
-      );
-    }
 
     let parsed: unknown;
     try {
