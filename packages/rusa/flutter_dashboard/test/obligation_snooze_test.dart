@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
 
 import 'fakes.dart';
@@ -29,20 +30,13 @@ void main() {
     expect(plain.toJson().containsKey('snoozedUntil'), isFalse);
   });
 
-  test('snoozeLabel reads as a deliberate deferral and names parent blocking', () {
+  test('snoozeLabel uses the operator wording with the snooze deadline', () {
     final until = DateTime.now()
         .toUtc()
         .add(const Duration(hours: 3))
         .toIso8601String();
-    final root = makeObligation('ob-root', snoozedUntil: until);
-    final child = makeObligation(
-      'ob-child',
-      parentId: 'ob-root',
-      snoozedUntil: until,
-    );
-    expect(snoozeLabel(root), startsWith('Intentionally deferred until '));
-    expect(snoozeLabel(root), isNot(contains('still blocks its parent')));
-    expect(snoozeLabel(child), endsWith('; still blocks its parent'));
+    final ob = makeObligation('ob-root', snoozedUntil: until);
+    expect(snoozeLabel(ob), 'This issue is snoozed until ${formatTs(until)}');
   });
 
   test('ObligationDto considers a snoozed obligation as waiting', () {
@@ -144,7 +138,11 @@ void main() {
       expect(find.text('Waiting Obligations'), findsOneWidget);
       expect(find.text('2 waiting'), findsOneWidget);
 
-      expect(find.textContaining('Intentionally deferred until'), findsOneWidget);
+      expect(find.text('Snoozed:'), findsOneWidget);
+      expect(
+        find.textContaining('This issue is snoozed until '),
+        findsOneWidget,
+      );
       expect(
         find.textContaining('Approve release notes'),
         findsWidgets,

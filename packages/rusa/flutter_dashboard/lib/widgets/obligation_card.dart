@@ -272,22 +272,41 @@ class ObligationRow extends StatelessWidget {
                 ],
               ),
             ],
+            // Styled like the blocked panel below, in yellow rather than red:
+            // a snooze is the owner's choice, not a stall.
             if (obligation.isSnoozed) ...[
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  const Icon(Icons.snooze, size: 13, color: MeshColors.textMuted),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1B0F),
+                  border: const Border(
+                    left: BorderSide(color: Color(0xFFEAB308), width: 3),
+                  ),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Snoozed:',
+                      style: TextStyle(
+                        color: Color(0xFFFDE047),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
                       snoozeLabel(obligation),
                       style: const TextStyle(
-                        color: MeshColors.textMuted,
+                        color: Color(0xFFFEF9C3),
                         fontSize: 11.5,
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ],
             if (hasTerminalNote) ...[
@@ -375,15 +394,10 @@ class ObligationRow extends StatelessWidget {
   }
 }
 
-/// The owner's deferral, phrased as a choice rather than a stall: a snoozed
-/// obligation keeps its status, so it still blocks its parent and dependents
-/// even though nobody is being asked to act on it until the deadline.
-String snoozeLabel(ObligationDto obligation) {
-  final until = obligation.snoozedUntil!;
-  final blocks = obligation.parentId != null ? '; still blocks its parent' : '';
-  return 'Intentionally deferred until ${formatTs(until)} '
-      '(${formatReturnsIn(until)})$blocks';
-}
+/// The body of the card's yellow Snoozed panel, worded as the operator asked
+/// on #723.
+String snoozeLabel(ObligationDto obligation) =>
+    'This issue is snoozed until ${formatTs(obligation.snoozedUntil!)}';
 
 /// Who last said where this obligation stands, and when — `handle · timestamp`.
 ///
