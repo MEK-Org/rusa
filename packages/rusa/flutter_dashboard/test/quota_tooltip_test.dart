@@ -131,7 +131,9 @@ void main() {
       );
 
       expect(find.text('Fable'), findsOneWidget);
-      expect(find.textContaining('Current week (Fable):'), findsOneWidget);
+      // The title already names the model; the row says which window.
+      expect(find.textContaining(RegExp(r'^Weekly: .*\(26% / ')), findsOneWidget);
+      expect(find.textContaining('(Fable)'), findsNothing);
       expect(find.textContaining('Resets in 5 days'), findsOneWidget);
       expect(find.textContaining('Last Read: 5 minutes ago'), findsOneWidget);
       // Pacing row must be omitted when showThrottle is false
@@ -332,7 +334,9 @@ void main() {
       now: now,
     );
 
-    test('names the hottest bucket driving pacing', () {
+    // Matt's #764 review: the hottest bucket's error is its window row's
+    // headroom negated (`Session: -1` is "1.0 points over pace").
+    test('leaves the hottest bucket to its window row', () {
       expect(
         quotaPacingDiagnostics(
           const QuotaThrottleDto(
@@ -355,11 +359,12 @@ void main() {
             ],
           ),
         ),
-        ['Hottest bucket claude:weekly: 20.0 points over pace'],
+        isEmpty,
       );
     });
 
-    test('explains scrape freshness mode when fresh', () {
+    // Freshness restates Last Read: its age, with the stale suffixes.
+    test('leaves a fresh reading to Last Read', () {
       expect(
         quotaPacingDiagnostics(
           const QuotaThrottleDto(
@@ -370,11 +375,11 @@ void main() {
             freshness: QuotaFreshnessDto(mode: 'scrape'),
           ),
         ),
-        ['Freshness (scrape): fresh'],
+        isEmpty,
       );
     });
 
-    test('explains a stale reading', () {
+    test('leaves a stale reading to Last Read', () {
       expect(
         quotaPacingDiagnostics(
           const QuotaThrottleDto(
@@ -385,12 +390,12 @@ void main() {
             freshness: QuotaFreshnessDto(mode: 'scrape', stale: true),
           ),
         ),
-        ['Freshness (scrape): overdue (stale reading)'],
+        isEmpty,
       );
     });
 
     test(
-      'explains reset-waiting, the hard-stale fail-safe cap and the configured maximum',
+      'explains the configured maximum, leaving reset-waiting to the window row',
       () {
         expect(
           quotaPacingDiagnostics(
@@ -408,11 +413,7 @@ void main() {
               ),
             ),
           ),
-          [
-            'Freshness (manual): window reset; awaiting fresh reading (estimated)',
-            'Freshness (manual): overdue (hard-stale, fail-safe cap applied)',
-            'Limited to the configured maximum interval',
-          ],
+          ['Limited to the configured maximum interval'],
         );
       },
     );
@@ -469,12 +470,7 @@ void main() {
       );
       await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
-      expect(
-        find.text(
-          'Freshness (manual): overdue (hard-stale, fail-safe cap applied)',
-        ),
-        findsOneWidget,
-      );
+      expect(find.textContaining('Freshness'), findsNothing);
       expect(
         find.text('Limited to the configured maximum interval'),
         findsOneWidget,
@@ -485,9 +481,8 @@ void main() {
         '\n'
         'Weekly: +58 (87% / 29%) - Resets in 2 days\n'
         'Pacing: every 10 hours\n'
-        'Last Read: 30 minutes ago [overdue: hard-stale]\n'
+        'Last Read (manual): 30 minutes ago [overdue: hard-stale, fail-safe cap applied]\n'
         '\n'
-        'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
         'Limited to the configured maximum interval',
       );
     });

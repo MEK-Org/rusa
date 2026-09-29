@@ -108,54 +108,28 @@ int? remainingMs(QuotaWindowDto window, DateTime now) {
   return reset.difference(now).inMilliseconds;
 }
 
-/// The control loop's own explanation of its pacing decision beyond the
-/// interval: freshness mode and state, expired-window recovery, the hottest
-/// bucket, and the configured-maximum cap. Carried over from the legacy text
-/// tooltip so a slow provider stays distinguishable from a busy mesh.
-List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) {
-  final lines = <String>[];
-  final f = throttle.freshness;
-  if (f != null) {
-    final modeLabel = f.mode == 'manual' ? 'manual' : 'scrape';
-    const hardStale = 'overdue (hard-stale, fail-safe cap applied)';
-    if (f.resetWaiting) {
-      lines.add(
-        'Freshness ($modeLabel): window reset; awaiting fresh reading (estimated)',
-      );
-      if (f.hardStale) lines.add('Freshness ($modeLabel): $hardStale');
-    } else if (f.hardStale) {
-      lines.add('Freshness ($modeLabel): $hardStale');
-    } else if (f.stale) {
-      lines.add('Freshness ($modeLabel): overdue (stale reading)');
-    } else {
-      lines.add('Freshness ($modeLabel): fresh');
-    }
-  }
-  if (throttle.expired) {
-    lines.add(
-      'Previous quota window expired; returning to the configured interval',
-    );
-  } else if (throttle.buckets.isNotEmpty) {
-    final hottest = throttle.buckets.reduce(
-      (a, b) => a.error >= b.error ? a : b,
-    );
-    lines.add(
-      'Hottest bucket ${hottest.key}: ${hottest.error.toStringAsFixed(1)} points over pace',
-    );
-  }
-  if (throttle.capped) {
-    lines.add('Limited to the configured maximum interval');
-  }
-  return lines;
-}
+/// The control loop's own explanation of its pacing decision that no other
+/// row carries: expired-window recovery and the configured-maximum cap.
+/// Carried over from the legacy text tooltip so a slow provider stays
+/// distinguishable from a busy mesh. The legacy freshness and hottest-bucket
+/// lines are not repeated (#764 review): Last Read carries the reading's age,
+/// staleness and mode, a window row carries a reset still awaiting its read,
+/// and a bucket's error is its window row's headroom negated.
+List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) => [
+  if (throttle.expired)
+    'Previous quota window expired; returning to the configured interval',
+  if (throttle.capped) 'Limited to the configured maximum interval',
+];
 
 /// A structured widget replacing the plain-text quota ring tooltip (#760).
 ///
 /// Displays:
 /// - Provider heading (e.g. "Claude")
-/// - One row per quota window: `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
+/// - One row per quota window, named for its kind (`Weekly`, `Session`) since
+///   the heading already names the provider or model:
+///   `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
 /// - Pacing row: `Pacing: every $interval` (omitted when [showThrottle] is false)
-/// - Last read row: `Last Read: $age`
+/// - Last read row: `Last Read: $age`, marked when stale or manually entered
 /// - Secondary pacing diagnostics ([quotaPacingDiagnostics]), when pacing is shown
 class QuotaTooltip extends StatelessWidget {
   const QuotaTooltip({
@@ -178,13 +152,13 @@ class QuotaTooltip extends StatelessWidget {
   List<String> _buildWindowRows(DateTime currentTime) {
     final rows = <String>[];
     for (final window in windows) {
-      final label = window.label.isNotEmpty
-          ? window.label
-          : (window.id == 'weekly'
-                ? 'Weekly'
-                : (window.id == 'session' || window.id == 'five_hour'
-                      ? 'Session'
-                      : window.id));
+      final label = switch (window.id) {
+        'weekly' => 'Weekly',
+        'session' => 'Session',
+        _ when window.label.isNotEmpty => window.label,
+        'five_hour' => 'Session',
+        _ => window.id,
+      };
 
       if (!window.isKnown || window.usedPercent == null) {
         rows.add('$label: n/a');
@@ -266,15 +240,16 @@ class QuotaTooltip extends StatelessWidget {
     final age = currentTime.difference(scraped);
     final ageText = formatLastReadAge(age);
     final freshness = throttle?.freshness;
+    final row = freshness?.mode == 'manual'
+        ? 'Last Read (manual): $ageText'
+        : 'Last Read: $ageText';
     if (freshness != null) {
       if (freshness.hardStale) {
-        return 'Last Read: $ageText [overdue: hard-stale]';
+        return '$row [overdue: hard-stale, fail-safe cap applied]';
       }
-      if (freshness.stale) {
-        return 'Last Read: $ageText [overdue: stale]';
-      }
+      if (freshness.stale) return '$row [overdue: stale]';
     }
-    return 'Last Read: $ageText';
+    return row;
   }
 
   /// Plain-text representation of this tooltip for screen readers and tests.

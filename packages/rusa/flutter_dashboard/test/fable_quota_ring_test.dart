@@ -171,13 +171,16 @@ void main() {
 
         final claudeTip = _tooltipOf(tester, 'Claude');
         final fableTip = _tooltipOf(tester, 'Fable');
-        expect(claudeTip, contains('Current week (all models)'));
+        expect(claudeTip, contains('Weekly: '));
+        expect(claudeTip, contains('Session: '));
         expect(claudeTip, contains('60%'));
         expect(claudeTip, isNot(contains('Fable')));
-        expect(fableTip, contains('Current week (Fable)'));
+        expect(fableTip, startsWith('Fable\n'));
+        expect(fableTip, contains('Weekly: '));
+        expect(fableTip, isNot(contains('(Fable)')));
         expect(fableTip, contains('25%'));
         expect(fableTip, contains('Resets in'));
-        expect(fableTip, contains('Last Read:'));
+        expect(fableTip, contains('Last Read: 5 minutes ago'));
         expect(fableTip, isNot(contains('all models')));
 
         // The label is styled like every other ring label (#758); semantics

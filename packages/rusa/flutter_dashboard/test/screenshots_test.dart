@@ -302,7 +302,8 @@ void main() {
             .ensureTooltipVisible();
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
-        expect(find.textContaining('Current week (Fable)'), findsOneWidget);
+        expect(find.textContaining('Weekly: '), findsOneWidget);
+        expect(find.textContaining('Last Read: 30 minutes ago'), findsOneWidget);
         await captureBoundary(key, '$_outDir/header_quota_fable_tooltip.png');
       });
     },
@@ -422,7 +423,8 @@ void main() {
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
         expect(find.textContaining('Weekly:'), findsOneWidget);
-        expect(find.text('Freshness (scrape): fresh'), findsOneWidget);
+        expect(find.textContaining('Freshness'), findsNothing);
+        expect(find.textContaining('Hottest bucket'), findsNothing);
         await captureBoundary(key, '$_outDir/header_quota_claude_tooltip.png');
       });
     },
@@ -597,9 +599,11 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
 );
 
 /// Claude with a Fable weekly allocation beside its provider-wide week (#752),
-/// plus Codex. Reset and scrape instants are null for a reproducible shot.
+/// plus Codex. The Fable window carries the provider's reset and scrape
+/// instants, as the server sends them, relative to the capture time.
 QuotaSnapshotDto _seedFableQuota() {
   final base = _seedQuota();
+  final now = DateTime.now().toUtc();
   final claude = base.providers.first;
   return QuotaSnapshotDto(
     generatedAt: base.generatedAt,
@@ -611,7 +615,8 @@ QuotaSnapshotDto _seedFableQuota() {
         tier: null,
         message: null,
         windows: claude.windows,
-        modelWindows: const [
+        scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+        modelWindows: [
           QuotaWindowDto(
             id: 'weekly',
             label: 'Current week (Fable)',
@@ -619,7 +624,13 @@ QuotaSnapshotDto _seedFableQuota() {
             status: 'available',
             headline: true,
             windowMs: 604800000,
-            modelIds: ['claude-fable-5-1'],
+            resetAtIso: now
+                .add(const Duration(days: 3, hours: 4))
+                .toIso8601String(),
+            scrapedAt: now
+                .subtract(const Duration(minutes: 30))
+                .toIso8601String(),
+            modelIds: const ['claude-fable-5-1'],
           ),
         ],
       ),
