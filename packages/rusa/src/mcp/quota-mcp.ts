@@ -215,7 +215,14 @@ interface LlmQuotaWindow {
    * boundary; `normalizeQuotaWindowKind` validates it.
    */
   kind?: QuotaWindowKind;
-  usedPercent?: number;
+  /**
+   * The printed percentage number, copied as text (e.g. "43", "57.5"), and
+   * whether the source labels it used or left. Code does the `100 - N`
+   * conversion: asked to compute or preserve precision on a numeric field,
+   * the model could emit `43.000…` until the output-token cap (#775).
+   */
+  percentText?: string;
+  percentBasis?: "used" | "left";
   resetAtIso?: string;
   resetInIso?: string;
   placeholder?: boolean;
@@ -271,14 +278,20 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "current-session window; 'five_hour' for a 5-hour rolling window (e.g. codex '5h'); " +
         "'weekly' for a 7-day/weekly window; 'other' for anything that doesn't fit those.",
     },
-    usedPercent: {
-      type: Type.NUMBER,
+    percentText: {
+      type: Type.STRING,
       description:
-        "Percentage of this window's quota used, 0-100. Copy the source number, or convert it " +
-        "when the source says left/remaining, exactly and preserve every printed decimal place. " +
-        "Use numeric text, never the apparent length of a progress bar. For example, 100% left " +
-        "is usedPercent 0 exactly, never an approximation such as 0.0001. " +
+        "The printed percentage number for this window, 0-100, copied from the source text " +
+        "without the % sign, e.g. '43' or '57.5'. Do not convert it: say whether it is used or " +
+        "left in percentBasis. Use numeric text, never the apparent length of a progress bar. " +
         "Omit when placeholder is true.",
+    },
+    percentBasis: {
+      type: Type.STRING,
+      enum: ["used", "left"],
+      description:
+        "'used' when the source reports percentText as used; 'left' when it reports it as " +
+        "left or remaining. Omit when placeholder is true.",
     },
     resetAtIso: {
       type: Type.STRING,
@@ -439,6 +452,21 @@ function resolveResetAtIso(
   return undefined;
 }
 
+/** Output-token ceiling for one quota extraction attempt (#775). */
+const QUOTA_PARSE_MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * Read the model's copied percentage text ("43", "57.5", "43%") as a number
+ * in 0-100. Anything else, such as a digit run with no bound, is undefined.
+ */
+function parsePrintedPercent(text: string | undefined): number | undefined {
+  if (typeof text !== "string") return undefined;
+  const match = /^(\d{1,3}(?:\.\d+)?)\s*%?$/.exec(text.trim());
+  if (!match?.[1]) return undefined;
+  const value = Number(match[1]);
+  return value <= 100 ? value : undefined;
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -497,7 +525,7 @@ async function parseQuotaWithLlm(
           "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
           "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
           "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
-          "Codex percentages say LEFT. Convert the printed N% left to usedPercent = 100 - N exactly. " +
+          "Codex percentages say LEFT: copy the printed N% left as percentText N with percentBasis 'left'. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted' only when that message applies to the provider-wide quota; extract provider-wide percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
@@ -511,18 +539,18 @@ async function parseQuotaWithLlm(
             "Five Hour Limit window. " +
             "The shared GEMINI MODELS section is provider-wide: emit its rows with no `models`; they alone determine status. " +
             "Every other named model or model-group section is model-specific: emit its rows with `models` set to the matching IDs from the configured model list (sections matching nothing configured are omitted entirely), and never use them to determine status. " +
-            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage, preserve all its decimals, and ignore the apparent progress-bar length. " +
-            "'usedPercent' must still be the USED percentage, so emit usedPercent = 100 - N exactly " +
-            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → usedPercent 100; '3% remaining' → usedPercent 97; '48% remaining' → usedPercent 52). " +
+            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage and ignore the apparent progress-bar length. " +
+            "Copy the printed remaining number N as percentText N with percentBasis 'left' " +
+            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → percentText '0.00'; '3% remaining' → percentText '3'; '48% remaining' → percentText '48'). " +
             "A window showing 'Quota available' with a full (100%) bar is fully available: " +
-            "emit usedPercent 0. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
-            "emit this window with usedPercent 100 (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
+            "emit percentText '100' with percentBasis 'left'. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
+            "emit this window with percentText '0' and percentBasis 'left' (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
             "Emit the GEMINI MODELS Weekly Limit and Five Hour Limit at top level in `windows`, each with no `models`. " +
             "If weekly limit is at 100% used (0% remaining), status is 'exhausted'.\n"
           : "For Kimi: the interactive /usage panel shows Kimi Code platform quota, commonly including 5h/five-hour and weekly windows. " +
-            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N exactly for 'used'; for 'left/remaining', emit usedPercent = 100 - N exactly " +
-            "(e.g. '63% used' → usedPercent 63; '0% left' → usedPercent 100; '88% left' → usedPercent 12). " +
-            "Always use the numeric percentage text and preserve its decimals; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
+            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N as percentText, with percentBasis 'used' for 'used' and 'left' for 'left/remaining' " +
+            "(e.g. '63% used' → percentText '63', percentBasis 'used'; '0% left' → percentText '0', percentBasis 'left'). " +
+            "Always use the numeric percentage text; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
             "Every named-model or model-group limit is model-specific: emit it with `models` set to the matching IDs from the configured model list (rows matching nothing configured are omitted entirely), and never use it to determine status. " +
             "Extract every visible provider-wide quota window and set kind " +
             "to 'five_hour', 'weekly', 'session', or 'other'. If any provider window is 100% used (0% left), status is 'exhausted'. " +
@@ -558,7 +586,7 @@ async function parseQuotaWithLlm(
     "GROUNDING REQUIREMENT: You MUST ONLY report windows and statuses that are physically printed in the provided output. " +
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
     "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
-    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text, preserve all printed decimal precision, and never infer a value from progress-bar artwork. If the source reports USED, copy it exactly. If it reports LEFT or REMAINING, calculate usedPercent = 100 - N exactly.\n" +
+    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text and never infer a value from progress-bar artwork. Copy the printed number N into percentText and never compute a new number: set percentBasis 'used' if the source reports USED, or 'left' if it reports LEFT or REMAINING. The precision of all numbers should be limited to at most 3 decimal places.\n" +
     providerClause +
     configuredModelClause +
     describeLocalNow(generatedAtMs) +
@@ -592,6 +620,10 @@ async function parseQuotaWithLlm(
         // Quota parsing is extraction, not creative generation. A fixed
         // temperature keeps a repeated scrape from changing its window set.
         temperature: 0,
+        // A complete reply is a few hundred tokens. The cap makes a runaway
+        // reply fail in seconds, so the stronger-model retry fires at once
+        // instead of after minutes of output (#775).
+        maxOutputTokens: QUOTA_PARSE_MAX_OUTPUT_TOKENS,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -669,22 +701,22 @@ async function parseQuotaWithLlm(
       const hasExplicitModelScope = w.models !== undefined;
       const canonicalModels = resolveWindowModels(rawModels, configuredModelRefs(configuredModels));
       if (hasExplicitModelScope && canonicalModels.length === 0) continue;
-      const usedPercent = w.usedPercent;
-      if (
-        typeof usedPercent !== "number" ||
-        !Number.isFinite(usedPercent) ||
-        usedPercent < 0 ||
-        usedPercent > 100
-      ) {
+      const printedPercent = parsePrintedPercent(w.percentText);
+      if (printedPercent === undefined) {
         throw new Error(
-          `Quota parse failed: window '${w.label}' has invalid usedPercent ${String(w.usedPercent)}`
+          `Quota parse failed: window '${w.label}' has invalid percentText ${JSON.stringify(w.percentText)}`
+        );
+      }
+      if (w.percentBasis !== "used" && w.percentBasis !== "left") {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid percentBasis ${JSON.stringify(w.percentBasis)}`
         );
       }
       const kind = normalizeQuotaWindowKind(w.kind);
       if (!kind) {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
-      const percentLeft = 100 - usedPercent;
+      const percentLeft = w.percentBasis === "left" ? printedPercent : 100 - printedPercent;
       // A duration the model did emit but that is not ISO-8601 is a bad read,
       // not a missing one: fail here so the stronger-model retry sees it,
       // rather than letting it degrade into "no reset" and, for a 100%-left
