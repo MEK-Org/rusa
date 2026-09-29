@@ -36,7 +36,11 @@ void main() {
         .add(const Duration(hours: 3))
         .toIso8601String();
     final ob = makeObligation('ob-root', snoozedUntil: until);
-    expect(snoozeLabel(ob), 'This issue is snoozed until ${formatTs(until)}');
+    expect(
+      snoozeLabel(ob),
+      'This obligation is snoozed until ${formatTs(until)} '
+      '(${formatReturnsIn(until)})',
+    );
   });
 
   test('ObligationDto considers a snoozed obligation as waiting', () {
@@ -140,7 +144,7 @@ void main() {
 
       expect(find.text('Snoozed:'), findsOneWidget);
       expect(
-        find.textContaining('This issue is snoozed until '),
+        find.textContaining('This obligation is snoozed until '),
         findsOneWidget,
       );
       expect(

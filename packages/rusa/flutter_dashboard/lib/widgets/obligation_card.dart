@@ -396,8 +396,11 @@ class ObligationRow extends StatelessWidget {
 
 /// The body of the card's yellow Snoozed panel, worded as the operator asked
 /// on #723.
-String snoozeLabel(ObligationDto obligation) =>
-    'This issue is snoozed until ${formatTs(obligation.snoozedUntil!)}';
+String snoozeLabel(ObligationDto obligation) {
+  final until = obligation.snoozedUntil!;
+  return 'This obligation is snoozed until ${formatTs(until)} '
+      '(${formatReturnsIn(until)})';
+}
 
 /// Who last said where this obligation stands, and when — `handle · timestamp`.
 ///
