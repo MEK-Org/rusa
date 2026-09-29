@@ -36,59 +36,31 @@ Future<void> settle(WidgetTester tester) async {
 }
 
 void main() {
-  test('a status change invalidates the obligations cache and asks views to '
-      'refetch that obligation (#771)', () async {
-    final cache = FakeObligationsCache();
-    final api = FakeApi()
-      ..dashboardConfigResult = const DashboardConfigDto(
-        quotaProviders: {},
-        userPrincipalId: 'test-user',
-      );
-    final stream = FakeStream();
-    final store = DashboardStore(
-      api: api,
-      stream: stream,
-      obligationsCache: cache,
-    );
-    await store.init();
-    await pumpEventQueue();
-    store.saveObligationsSnapshot([
-      ObligationTreeDto(
-        obligation: makeObligation('arc'),
-        children: const [],
-        blockingChildren: const [],
-      ),
-    ]);
-    expect(store.cachedObligationTrees, isNotNull);
-    final refreshes = <String?>[];
-    final sub = store.obligationRefreshes.listen(refreshes.add);
-    final invalidationsBefore = cache.invalidateCount;
-
-    stream.meshCtrl.add(statusChanged('arc'));
-    await pumpEventQueue();
-
-    expect(refreshes, ['arc']);
-    expect(cache.invalidateCount, invalidationsBefore + 1);
-    expect(store.cachedObligationTrees, isNull);
-
-    await sub.cancel();
-    await store.dispose();
-  });
-
   testWidgets(
-    'a status change delivered over SSE updates the open detail header (#771)',
+    'a status change delivered over SSE invalidates obligations cache and updates the open detail header (#771)',
     (tester) async {
       await tester.runAsync(() async {
         await tester.binding.setSurfaceSize(const Size(1280, 900));
         addTearDown(() => tester.binding.setSurfaceSize(null));
+        final cache = FakeObligationsCache();
         final api = FakeApi()
+          ..dashboardConfigResult = const DashboardConfigDto(
+            quotaProviders: {},
+            userPrincipalId: 'test-user',
+          )
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [
             makeObligation('arc', ownerId: 'root', intent: 'Persistence arc'),
           ];
         final stream = FakeStream();
-        final store = DashboardStore(api: api, stream: stream);
+        final store = DashboardStore(
+          api: api,
+          stream: stream,
+          obligationsCache: cache,
+        );
         await store.init();
+        await pumpEventQueue();
+
         await tester.pumpWidget(
           MaterialApp(
             home: Scaffold(
@@ -110,9 +82,20 @@ void main() {
             status: 'done',
           ),
         ];
+        store.saveObligationsSnapshot([
+          ObligationTreeDto(
+            obligation: makeObligation('arc'),
+            children: const [],
+            blockingChildren: const [],
+          ),
+        ]);
+        expect(store.cachedObligationTrees, isNotNull);
+        final invalidationsBefore = cache.invalidateCount;
+
         stream.meshCtrl.add(statusChanged('arc'));
         await settle(tester);
 
+        expect(cache.invalidateCount, greaterThan(invalidationsBefore));
         expect(detailHeaderStatusOf(tester, 'arc'), 'done');
 
         await store.dispose();

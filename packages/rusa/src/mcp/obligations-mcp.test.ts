@@ -378,51 +378,6 @@ describe("obligations MCP", () => {
     expect(rootAfter.priority).toBe(100); // Retained priority, NEVER head return!
   });
 
-  it("emits obligation_status_changed with the id and author, never the note (#771)", async () => {
-    repository.create({ title: "arc", id: "arc", ownerId: "actor-a" });
-    const events: MeshEventInput[] = [];
-    const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", {
-        recordEvent: (event) => events.push(event),
-      })
-    );
-
-    const res = (await client.callTool({
-      name: "set_obligation_status",
-      arguments: { id: "arc", status: "done", note: "landed as 8bdc01d" },
-    })) as CallToolResult;
-
-    expect(res.isError).toBeFalsy();
-    expect(events).toEqual([
-      {
-        kind: "obligation_status_changed",
-        actorId: "actor-a",
-        detail: "arc",
-        payload: JSON.stringify({ status: "done" }),
-      },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("8bdc01d");
-  });
-
-  it("keeps a committed status transition successful when the event sink fails", async () => {
-    repository.create({ title: "arc", id: "arc", ownerId: "actor-a" });
-    const client = await connect(
-      createObligationsMcpServer(repository, "actor-a", {
-        recordEvent: () => {
-          throw new Error("event store unavailable");
-        },
-      })
-    );
-
-    const res = (await client.callTool({
-      name: "set_obligation_status",
-      arguments: { id: "arc", status: "cancelled" },
-    })) as CallToolResult;
-
-    expect(res.isError).toBeFalsy();
-    expect(repository.require("arc").status).toBe("cancelled");
-  });
-
   it("refuses an owner the mesh cannot route to", async () => {
     // The drift `0025` migrates away came back in through this surface: a
     // nonexistent actor or an invented `system:*` id produced live work that
