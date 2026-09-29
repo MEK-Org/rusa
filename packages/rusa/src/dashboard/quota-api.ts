@@ -467,7 +467,23 @@ function latestStateFromHistory(
     .map((point) => point.observedAt)
     .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
   if (!latestObservedAt) return null;
-  const latest = eligible.filter((point) => point.observedAt === latestObservedAt);
+  // Carried windows keep their original observation time (#763), so one read
+  // can leave windows at different ages. Keep the newest point per window; an
+  // older window survives only while its known reset is still ahead, the same
+  // rule the live bad-read carry applies.
+  const newestPerWindow = new Map<string, QuotaHistorySource>();
+  for (const point of eligible) {
+    const key = [point.scope, point.kind, point.label, ...(point.models ?? [])].join("\u0000");
+    const current = newestPerWindow.get(key);
+    if (!current || Date.parse(point.observedAt) > Date.parse(current.observedAt)) {
+      newestPerWindow.set(key, point);
+    }
+  }
+  const latest = [...newestPerWindow.values()].filter((point) => {
+    if (point.observedAt === latestObservedAt) return true;
+    const resetMs = point.resetAtIso === null ? Number.NaN : Date.parse(point.resetAtIso);
+    return Number.isFinite(resetMs) && resetMs > nowMs;
+  });
   const providerPoints = latest.filter((point) => point.scope === "provider");
   const status =
     providerPoints.length === 0

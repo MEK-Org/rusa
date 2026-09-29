@@ -602,6 +602,53 @@ describe("dashboard quota snapshot", () => {
       ]);
     });
 
+    it("history fallback keeps an older unexpired Fable point beside a newer provider point", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["claude-fable-5-1"],
+            label: "Current week (Fable)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          // An expired older window is not revived.
+          historyPoint({
+            scope: "model",
+            models: ["claude-sonnet-5"],
+            label: "Current week (Sonnet)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 50,
+            resetAtIso: "2026-09-28T12:00:00.000Z",
+          }),
+          historyPoint({
+            label: "Current week (all models)",
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("available");
+      expect(claude.windows).toEqual([
+        expect.objectContaining({ usedPercent: 40, scrapedAt: "2026-09-28T14:00:00.000Z" }),
+      ]);
+      expect(claude.modelWindows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          usedPercent: 75,
+          modelIds: ["claude-fable-5-1"],
+          scrapedAt: "2026-09-28T11:00:00.000Z",
+        }),
+      ]);
+    });
+
     it("passes limit.scrapedAt through to modelWindows and provider windows", async () => {
       const snapshot = await buildQuotaSnapshot({
         getQuota: async () => ({
