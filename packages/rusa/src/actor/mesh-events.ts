@@ -205,6 +205,12 @@ export type MeshEventKind =
   // standing is read from the obligation; this says only that it moved, by
   // whom, and whether the current-standing field was cleared.
   | "obligation_checkpoint_set"
+  // An obligation was closed as done or cancelled (#771). Like the checkpoint
+  // event above, `actorId` = the author of the transition (an actor or a
+  // dashboard principal), `detail` = the obligation id, and `payload` =
+  // { status }. It carries no note or resolution ref: it tells open views to
+  // refetch, and the obligation remains the record of why it closed.
+  | "obligation_status_changed"
   // A granted email-send tool successfully sent via Gmail. `actorId` is the
   // sender; `detail` is the To recipient; payload contains To and Cc only.
   | "email_sent"

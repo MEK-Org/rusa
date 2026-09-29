@@ -778,7 +778,14 @@ class _DetailViewState extends State<_DetailView> {
 
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
-  VoidCallback? get onMutated => widget.onMutated;
+
+  /// A write made from this pane also refetches the pane, so its header shows
+  /// the new status without waiting for the server's event to round-trip
+  /// (#771). The Work tab's own callback still reloads the tree.
+  VoidCallback get onMutated => () {
+    if (mounted) _refresh();
+    widget.onMutated?.call();
+  };
   void Function(String url) get openLink => widget.openLink;
 
   @override
@@ -1462,7 +1469,7 @@ class _DetailViewState extends State<_DetailView> {
                                 nextId: nextId,
                               ),
                             );
-                            onMutated?.call();
+                            onMutated();
                           } catch (err) {
                             if (innerContext.mounted) {
                               ScaffoldMessenger.of(innerContext).showSnackBar(
@@ -1489,7 +1496,7 @@ class _DetailViewState extends State<_DetailView> {
                                 nextId: nextId,
                               ),
                             );
-                            onMutated?.call();
+                            onMutated();
                           } catch (err) {
                             if (innerContext.mounted) {
                               ScaffoldMessenger.of(innerContext).showSnackBar(
