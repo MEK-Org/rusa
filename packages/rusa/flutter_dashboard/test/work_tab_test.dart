@@ -1574,7 +1574,7 @@ void main() {
           scope: 'http://localhost:4040',
           principalId: 'test-user',
           trees: [cachedTree],
-          now: DateTime.utc(2026, 9, 22, 12),
+          now: DateTime.timestamp(),
         );
         final serverOb = makeObligation(
           'server-ob-1',
@@ -1718,14 +1718,14 @@ void main() {
             scope: 'http://localhost:4040',
             principalId: 'user-alice',
             trees: [aliceTree],
-            now: DateTime.utc(2026, 9, 22, 12),
+            now: DateTime.timestamp(),
           ),
         )..save(
           PersistedObligationsSnapshot.capture(
             scope: 'http://localhost:4040',
             principalId: 'user-bob',
             trees: [bobTree],
-            now: DateTime.utc(2026, 9, 22, 12),
+            now: DateTime.timestamp(),
           ),
         );
         final store = DashboardStore(
@@ -1785,7 +1785,7 @@ void main() {
           scope: 'http://localhost:4040',
           principalId: 'test-user',
           trees: [cachedTree],
-          now: DateTime.utc(2026, 9, 22, 12),
+          now: DateTime.timestamp(),
         );
         final cache = FakeObligationsCache(snapshot);
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
@@ -1904,7 +1904,7 @@ void main() {
           scope: 'http://localhost:4040',
           principalId: 'test-user',
           trees: [cachedTree],
-          now: DateTime.utc(2026, 9, 22, 12),
+          now: DateTime.timestamp(),
         );
         final cache = FakeObligationsCache(snapshot);
         final api = FakeApi(base: Uri.parse('http://localhost:4040'))
