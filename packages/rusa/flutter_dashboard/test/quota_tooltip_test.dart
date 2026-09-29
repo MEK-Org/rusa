@@ -124,12 +124,20 @@ void main() {
     testWidgets('renders unknown lane with truthful n/a indicators', (
       tester,
     ) async {
+      const unknownWeekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: null,
+        status: 'unknown',
+        headline: false,
+      );
+
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
             body: QuotaTooltip(
               providerName: 'Unknown',
-              windows: const [],
+              windows: const [unknownWeekly],
               throttle: null,
               scrapedAt: null,
               showThrottle: true,
@@ -176,9 +184,52 @@ void main() {
 
       expect(find.text('Codex'), findsOneWidget);
       expect(find.textContaining('window reset at'), findsOneWidget);
-      expect(find.textContaining('no fresh read since'), findsOneWidget);
+      expect(
+        find.textContaining(
+          'no fresh read since (awaiting fresh read, estimated ~100% remaining)',
+        ),
+        findsOneWidget,
+      );
       expect(find.textContaining('50%'), findsNothing);
     });
+
+    testWidgets(
+      'formats resetAtIso gracefully when windowMs <= 0 without raw ISO string',
+      (tester) async {
+        final windowNoMs = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Weekly',
+          usedPercent: 40,
+          status: 'available',
+          headline: true,
+          windowMs: 0,
+          resetAtIso: now.add(const Duration(hours: 3)).toIso8601String(),
+          scrapedAt: now.subtract(const Duration(minutes: 10)).toIso8601String(),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: QuotaTooltip(
+                providerName: 'Claude',
+                windows: [windowNoMs],
+                throttle: null,
+                scrapedAt: now.subtract(const Duration(minutes: 10)).toIso8601String(),
+                showThrottle: false,
+                now: now,
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('Claude'), findsOneWidget);
+        expect(
+          find.textContaining('Weekly: 60% remaining - Resets in 3 hours'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('.000Z'), findsNothing);
+      },
+    );
 
     testWidgets('adapts to narrow screens without overflow', (tester) async {
       const weeklyRemainingMs = 48 * 3600 * 1000;

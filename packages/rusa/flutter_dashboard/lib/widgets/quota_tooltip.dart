@@ -58,16 +58,54 @@ String formatLastReadAge(Duration age) {
   return '$d ${d == 1 ? 'day' : 'days'} ago';
 }
 
-class _WindowRowData {
-  const _WindowRowData({
-    required this.window,
-    required this.text,
-    this.isEstimate = false,
+/// A window's burn-down position at [now]: quota remaining vs. time remaining
+/// in its window, shared by the ring color and the tooltip text so they never
+/// disagree. `timeRemainingPct`/`remainingMs`/`delta` are null when
+/// `resetAt`/`windowMs` aren't enough to place `now` inside the window
+/// (missing, unparseable, or a zero-length window).
+class SchedulePosition {
+  const SchedulePosition({
+    required this.quotaRemainingPct,
+    required this.timeRemainingPct,
+    required this.remainingMs,
   });
 
-  final QuotaWindowDto window;
-  final String text;
-  final bool isEstimate;
+  final double quotaRemainingPct;
+  final double? timeRemainingPct;
+
+  /// Raw (unclamped) milliseconds until `resetAt`.
+  final int? remainingMs;
+
+  double? get delta =>
+      timeRemainingPct == null ? null : quotaRemainingPct - timeRemainingPct!;
+}
+
+/// Slices a window into quota remaining and time remaining at [now].
+SchedulePosition? schedulePosition(QuotaWindowDto? window, DateTime now) {
+  final used = window?.usedPercent;
+  if (window == null || used == null || !window.isKnown) return null;
+  if (window.isPastReset(now)) return null;
+  final remaining = remainingMs(window, now);
+  if (remaining != null && remaining <= 0) return null;
+  return SchedulePosition(
+    quotaRemainingPct: (100 - used).clamp(0, 100).toDouble(),
+    timeRemainingPct: remaining == null
+        ? null
+        : (remaining / window.windowMs * 100).clamp(0, 100).toDouble(),
+    remainingMs: remaining,
+  );
+}
+
+/// Milliseconds until `resetAtIso`, or null when `windowMs`/the
+/// reset text aren't enough to place `now` inside the window (missing,
+/// unparseable, or a zero-length window).
+int? remainingMs(QuotaWindowDto window, DateTime now) {
+  if (window.windowMs <= 0) return null;
+  final resetText = window.resetAtIso;
+  if (resetText == null) return null;
+  final reset = DateTime.tryParse(resetText);
+  if (reset == null) return null;
+  return reset.difference(now).inMilliseconds;
 }
 
 /// A structured widget replacing the plain-text quota ring tooltip (#760).
@@ -85,7 +123,6 @@ class QuotaTooltip extends StatelessWidget {
     this.throttle,
     this.scrapedAt,
     this.showThrottle = true,
-    this.isEstimated,
     this.now,
   });
 
@@ -94,26 +131,10 @@ class QuotaTooltip extends StatelessWidget {
   final QuotaThrottleDto? throttle;
   final String? scrapedAt;
   final bool showThrottle;
-  final bool Function(QuotaWindowDto)? isEstimated;
   final DateTime? now;
 
-  List<_WindowRowData> _buildWindowRows(DateTime currentTime) {
-    if (windows.isEmpty) {
-      return const [
-        _WindowRowData(
-          window: QuotaWindowDto(
-            id: 'weekly',
-            label: 'Weekly',
-            usedPercent: null,
-            status: 'unknown',
-            headline: false,
-          ),
-          text: 'Weekly: n/a',
-        ),
-      ];
-    }
-
-    final rows = <_WindowRowData>[];
+  List<String> _buildWindowRows(DateTime currentTime) {
+    final rows = <String>[];
     for (final window in windows) {
       final label = window.label.isNotEmpty
           ? window.label
@@ -123,14 +144,8 @@ class QuotaTooltip extends StatelessWidget {
                   ? 'Session'
                   : window.id));
 
-      final estimate = isEstimated != null && isEstimated!(window);
-
       if (!window.isKnown || window.usedPercent == null) {
-        rows.add(_WindowRowData(
-          window: window,
-          text: '$label: n/a',
-          isEstimate: estimate,
-        ));
+        rows.add('$label: n/a');
         continue;
       }
 
@@ -140,49 +155,50 @@ class QuotaTooltip extends StatelessWidget {
         final resetStr = reset != null
             ? DateFormat('EEE h:mm a').format(reset.toLocal())
             : (resetText ?? '');
-        rows.add(_WindowRowData(
-          window: window,
-          text: '$label: window reset at $resetStr; no fresh read since',
-          isEstimate: estimate,
-        ));
+        rows.add(
+          '$label: window reset at $resetStr; no fresh read since (awaiting fresh read, estimated ~100% remaining)',
+        );
         continue;
       }
 
+      final pos = schedulePosition(window, currentTime);
       final quotaRemaining = (100 - (window.usedPercent ?? 0)).clamp(0, 100).round();
       final resetText = window.resetAtIso;
       final reset = resetText != null ? DateTime.tryParse(resetText) : null;
 
-      if (reset != null && window.windowMs > 0) {
-        final remainingMs = reset.difference(currentTime).inMilliseconds;
-        if (remainingMs > 0) {
-          final timeRemaining =
-              (remainingMs / window.windowMs * 100).clamp(0, 100).round();
-          final margin = quotaRemaining - timeRemaining;
-          final marginStr = margin >= 0 ? '+$margin' : '$margin';
-          final resetDuration =
-              formatRelativeResetDuration(Duration(milliseconds: remainingMs));
-          rows.add(_WindowRowData(
-            window: window,
-            text:
-                '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration',
-            isEstimate: estimate,
-          ));
-          continue;
-        }
+      if (pos != null && pos.timeRemainingPct != null && pos.remainingMs != null) {
+        final timeRemaining = pos.timeRemainingPct!.round();
+        final margin = quotaRemaining - timeRemaining;
+        final marginStr = margin >= 0 ? '+$margin' : '$margin';
+        final resetDuration =
+            formatRelativeResetDuration(Duration(milliseconds: pos.remainingMs!));
+        rows.add(
+          '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration',
+        );
+        continue;
       }
 
-      if (resetText != null) {
-        rows.add(_WindowRowData(
-          window: window,
-          text: '$label: $quotaRemaining% remaining - Resets $resetText',
-          isEstimate: estimate,
-        ));
+      if (reset != null) {
+        if (reset.isAfter(currentTime)) {
+          final resetDuration =
+              formatRelativeResetDuration(reset.difference(currentTime));
+          rows.add(
+            '$label: $quotaRemaining% remaining - Resets in $resetDuration',
+          );
+        } else {
+          final resetStr = DateFormat('EEE h:mm a').format(reset.toLocal());
+          rows.add(
+            '$label: $quotaRemaining% remaining - resets $resetStr',
+          );
+        }
+      } else if (resetText != null) {
+        rows.add(
+          '$label: $quotaRemaining% remaining - resets $resetText',
+        );
       } else {
-        rows.add(_WindowRowData(
-          window: window,
-          text: '$label: $quotaRemaining% remaining',
-          isEstimate: estimate,
-        ));
+        rows.add(
+          '$label: $quotaRemaining% remaining',
+        );
       }
     }
     return rows;
@@ -219,8 +235,8 @@ class QuotaTooltip extends StatelessWidget {
     final currentTime = at ?? now ?? DateTime.now();
     final lines = <String>[providerName, ''];
     final rows = _buildWindowRows(currentTime);
-    for (final r in rows) {
-      lines.add(r.text);
+    for (final text in rows) {
+      lines.add(text);
     }
     final pacing = _buildPacingText();
     if (pacing != null) {
@@ -251,9 +267,9 @@ class QuotaTooltip extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
-          for (final row in windowRows) ...[
+          for (final text in windowRows) ...[
             Text(
-              row.text,
+              text,
               style: const TextStyle(fontSize: 12),
             ),
             const SizedBox(height: 2),

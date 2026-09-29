@@ -308,6 +308,109 @@ void main() {
     },
   );
 
+  testWidgets(
+    'renders the header quota Claude tooltip with operator layout (#760)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        const weeklyRemainingMs = 48 * 3600 * 1000;
+        final weeklyWindowMs = (weeklyRemainingMs / 0.79).round();
+        const sessionRemainingMs = 25 * 60 * 1000;
+        final sessionWindowMs = (sessionRemainingMs / 0.06).round();
+
+        final claude = ProviderQuotaDto(
+          provider: 'claude',
+          status: 'available',
+          usedPercent: 13,
+          tier: null,
+          message: null,
+          scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+          throttle: QuotaThrottleDto(
+            intervalSeconds: 600,
+            expired: false,
+            capped: false,
+            buckets: const [],
+            updatedAt: now.toIso8601String(),
+          ),
+          windows: [
+            QuotaWindowDto(
+              id: 'weekly',
+              label: 'Weekly',
+              usedPercent: 13,
+              status: 'available',
+              headline: true,
+              windowMs: weeklyWindowMs,
+              resetAtIso: now.add(const Duration(days: 2)).toIso8601String(),
+              scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+            ),
+            QuotaWindowDto(
+              id: 'session',
+              label: 'Session',
+              usedPercent: 95,
+              status: 'available',
+              headline: false,
+              windowMs: sessionWindowMs,
+              resetAtIso: now.add(const Duration(minutes: 25)).toIso8601String(),
+              scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+            ),
+          ],
+        );
+
+        final api = FakeApi()
+          ..threadsResult = _seedThreads()
+          ..quotaResult = QuotaSnapshotDto(
+            generatedAt: now.toIso8601String(),
+            providers: [claude],
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await store.refreshQuota();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1200, 240));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: Align(
+                  alignment: Alignment.topCenter,
+                  child: MeshHeader(
+                    store: store,
+                    selected: DashboardView.overview,
+                    onSelect: (_) {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        expect(find.text('Claude'), findsOneWidget);
+
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Claude'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('Weekly:'), findsOneWidget);
+        await captureBoundary(key, '$_outDir/header_quota_claude_tooltip.png');
+      });
+    },
+  );
+
   testWidgets('renders the avatar circle/size strip (26 / 52 / 91 px)', (
     tester,
   ) async {

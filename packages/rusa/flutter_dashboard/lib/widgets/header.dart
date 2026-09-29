@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 
 import '../breakpoints.dart';
 import '../models.dart';
@@ -879,43 +878,26 @@ class _ProviderQuotaRing extends StatelessWidget {
   Widget build(BuildContext context) {
     final now = DateTime.now();
     final name = label ?? _providerLabel(provider.provider);
-    final List<QuotaWindowDto> windows;
-    if (label != null) {
-      windows = [
-        weeklyWindow ??
-            const QuotaWindowDto(
-              id: 'weekly',
-              label: 'Weekly',
-              usedPercent: null,
-              status: 'unknown',
-              headline: false,
-            ),
-        ?sessionWindow,
-      ];
-    } else {
-      final seenIds = <String>{};
-      windows = <QuotaWindowDto>[
-        weeklyWindow ??
-            const QuotaWindowDto(
-              id: 'weekly',
-              label: 'Weekly',
-              usedPercent: null,
-              status: 'unknown',
-              headline: false,
-            ),
-        ?sessionWindow,
-      ];
-      seenIds.add('weekly');
-      if (weeklyWindow != null) {
-        seenIds.add(weeklyWindow!.id);
-      }
-      if (sessionWindow != null) {
-        seenIds.add(sessionWindow!.id);
-      }
+    final windows = <QuotaWindowDto>[
+      weeklyWindow ??
+          const QuotaWindowDto(
+            id: 'weekly',
+            label: 'Weekly',
+            usedPercent: null,
+            status: 'unknown',
+            headline: false,
+          ),
+      ?sessionWindow,
+    ];
+    if (label == null) {
+      final seenIds = {
+        'weekly',
+        if (weeklyWindow != null) weeklyWindow!.id,
+        if (sessionWindow != null) sessionWindow!.id,
+      };
       for (final w in provider.windows) {
-        if (!seenIds.contains(w.id)) {
+        if (seenIds.add(w.id)) {
           windows.add(w);
-          seenIds.add(w.id);
         }
       }
     }
@@ -1001,169 +983,6 @@ double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
   return (100 - used.clamp(0, 100)) / 100;
 }
 
-/// Self-explaining, multi-line tooltip text for one window (ISSUE_NUM ask 1 + ask
-/// 3): quota remaining AND time remaining (both count down, battery
-/// metaphor — ask 2) with a pace verdict, then the window's own expiry
-/// ("resets ..."), then an unambiguous rate-based projection so the verdict
-/// is never a bare adjective. When a window is past its reset (resetAtIso < now),
-/// honestly reports that the window has reset without a fresh reading instead of
-/// showing the pre-reset percentage (issue #9). Falls back to a quota-only
-/// phrasing (plus the raw reset text, when there is one) when the window's
-/// schedule position can't be resolved to an absolute instant (see [_schedulePosition]) —
-/// several provider CLIs report free-form reset text with no reliable epoch.
-String quotaWindowTooltip(
-  QuotaWindowDto? window, {
-  required String fallbackLabel,
-  required DateTime now,
-}) {
-  final label = (window?.label != null && window!.label.isNotEmpty)
-      ? window.label
-      : fallbackLabel;
-  if (window == null) return '$label: n/a';
-  if (window.isPastReset(now)) {
-    final reset = DateTime.tryParse(window.resetAtIso!);
-    final resetStr = reset != null
-        ? DateFormat('EEE h:mm a').format(reset.toLocal())
-        : window.resetAtIso!;
-    return '$label: window reset at $resetStr; no fresh read since (awaiting fresh read, estimated ~100% remaining)';
-  }
-  final pos = _schedulePosition(window, now);
-  if (pos == null) {
-    // Belt-and-braces fallback: reachable if window has no known usedPercent
-    // or sits precisely at the millisecond tick where remainingMs <= 0.
-    // Windows with unparseable/missing reset text produce pos != null with
-    // timeRemainingPct == null, handled below.
-    if (!window.isKnown) return '$label: n/a';
-    final reset = _resetLine(window);
-    final remaining = (100 - (window.usedPercent ?? 0)).clamp(0, 100).round();
-    return reset == null
-        ? '$label: $remaining% remaining'
-        : '$label: $remaining% remaining\n$reset';
-  }
-  final remaining = pos.quotaRemainingPct.round();
-  final timeRemainingPct = pos.timeRemainingPct;
-  if (timeRemainingPct == null) {
-    final reset = _resetLine(window);
-    return reset == null
-        ? '$label: $remaining% remaining'
-        : '$label: $remaining% remaining\n$reset';
-  }
-  final lines = <String>[
-    '$label: $remaining% quota remaining, ${timeRemainingPct.round()}% time remaining '
-        '(${_paceVerdict(pos.delta!)})',
-  ];
-  final reset = _resetLine(window);
-  if (reset != null) lines.add(reset);
-  final projection = _projection(pos, window, now);
-  if (projection != null) lines.add(projection);
-  return lines.join('\n');
-}
-
-/// Ratified 3-term pace wording (Operator, ISSUE_NUM): "burning fast" (meaningfully
-/// behind schedule), "on pace" (within a neutral band either side of dead-on),
-/// "burning slow" (meaningfully ahead) — replaces the old 2-term "behind
-/// pace"/"well behind" wording. Shared by the ring color
-/// ([quotaScheduleColor]) and this tooltip text so they never disagree.
-String _paceVerdict(double delta) {
-  if (delta <= -_kPaceBandPct) return 'burning fast';
-  if (delta >= _kPaceBandPct) return 'burning slow';
-  return 'on pace';
-}
-
-/// "resets Thu 3:50 PM" — the window's own expiry (ISSUE_NUM ask 1).
-/// Provider reset instants stay UTC internally and are converted to the
-/// viewer's local timezone only for presentation. Null when there's
-/// no reset text to show at all.
-String? _resetLine(QuotaWindowDto window) {
-  final resetText = window.resetAtIso;
-  if (resetText == null) return null;
-  final reset = DateTime.tryParse(resetText);
-  if (reset == null) return 'resets $resetText';
-  return 'resets ${DateFormat('EEE h:mm a').format(reset.toLocal())}';
-}
-
-/// Explain the control loop's current pacing decision in the same tooltip as
-/// the quota rings, so a slow provider is distinguishable from a busy mesh.
-String quotaThrottleTooltip(QuotaThrottleDto throttle) {
-  final lines = [
-    'Normal launch pacing: one start every '
-        '${_formatInterval(throttle.intervalSeconds)}',
-  ];
-  if (throttle.freshness != null) {
-    final f = throttle.freshness!;
-    final modeLabel = f.mode == 'manual' ? 'manual' : 'scrape';
-    if (f.resetWaiting) {
-      lines.add('Freshness ($modeLabel): window reset; awaiting fresh reading (estimated)');
-      if (f.hardStale) {
-        lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
-      }
-    } else if (f.hardStale) {
-      lines.add('Freshness ($modeLabel): overdue (hard-stale, fail-safe cap applied)');
-    } else if (f.stale) {
-      lines.add('Freshness ($modeLabel): overdue (stale reading)');
-    } else {
-      lines.add('Freshness ($modeLabel): fresh');
-    }
-  }
-  if (throttle.expired) {
-    lines.add(
-      'previous quota window expired; returning to the configured interval',
-    );
-  } else if (throttle.buckets.isNotEmpty) {
-    final hottest = throttle.buckets.reduce(
-      (a, b) => a.error >= b.error ? a : b,
-    );
-    lines.add(
-      'hottest bucket ${hottest.key}: ${hottest.error.toStringAsFixed(1)} points over pace',
-    );
-  }
-  if (throttle.capped) {
-    lines.add('limited to the configured maximum interval');
-  }
-  return lines.join('\n');
-}
-
-String _formatInterval(double seconds) {
-  if (seconds < 60) return '${seconds.toStringAsFixed(1)}s';
-  if (seconds < 3600) return '${(seconds / 60).toStringAsFixed(1)}m';
-  return '${(seconds / 3600).toStringAsFixed(1)}h';
-}
-
-/// An unambiguous rate-based read alongside the pace verdict (ISSUE_NUM ask 3):
-/// extrapolates the observed burn rate (`usedPercent` over elapsed window
-/// time) forward. When that rate would exhaust the window's quota before
-/// `resetAt`, says so with a projected empty date; otherwise projects how
-/// much would be left at reset. Falls back to a simple quota-only phrasing
-/// when there isn't enough signal to extrapolate a rate (no elapsed time yet,
-/// or the reset instant places the window's remaining time outside anything
-/// the window duration can explain — e.g. a degenerate/placeholder reading).
-String? _projection(
-  _SchedulePosition pos,
-  QuotaWindowDto window,
-  DateTime now,
-) {
-  final remainingMs = pos.remainingMs;
-  final used = window.usedPercent;
-  if (remainingMs == null || used == null || used <= 0) {
-    return '~${pos.quotaRemainingPct.round()}% left at reset';
-  }
-  final elapsedMs = window.windowMs - remainingMs;
-  if (elapsedMs <= 0) {
-    return '~${pos.quotaRemainingPct.round()}% left at reset';
-  }
-  final ratePerMs = used / elapsedMs;
-  final emptyInMs = pos.quotaRemainingPct / ratePerMs;
-  if (emptyInMs < remainingMs) {
-    final emptyAt = now.add(Duration(milliseconds: emptyInMs.round()));
-    final resetAt = now.add(Duration(milliseconds: remainingMs));
-    return 'at this rate: empty ~${DateFormat('EEE').format(emptyAt)} '
-        '(resets ${DateFormat('EEE').format(resetAt)})';
-  }
-  final projectedUsedAtReset = used + ratePerMs * remainingMs;
-  final leftAtReset = (100 - projectedUsedAtReset).clamp(0, 100);
-  return '~${leftAtReset.round()}% left at reset';
-}
-
 String _providerLabel(String provider) => switch (provider) {
   'agy' => 'Agy',
   'codex' => 'Codex',
@@ -1173,10 +992,9 @@ String _providerLabel(String provider) => switch (provider) {
 };
 
 /// Symmetric band either side of dead-on-pace (delta == 0) that reads as "on
-/// pace" (amber); outside it the ring/tooltip read "burning fast" (red, quota
+/// pace" (amber); outside it the ring reads "burning fast" (red, quota
 /// draining faster than the schedule) or "burning slow" (green, draining
-/// slower). Ratified 3-term wording (Operator, ISSUE_NUM) — tuned for legibility, not
-/// a correctness threshold .
+/// slower).
 const double _kPaceBandPct = 15;
 
 /// Colors a ring by how far ahead or behind schedule its burn-down is —
@@ -1184,72 +1002,17 @@ const double _kPaceBandPct = 15;
 /// duration is left before `resetAt`) — rather than by raw quota remaining.
 /// Only meaningfully ahead of pace (delta >= 15) reads green; meaningfully
 /// behind (delta <= -15) reads red; the neutral band between reads amber
-/// ("on pace"), matching [_paceVerdict]'s wording exactly so the ring and its
-/// tooltip never disagree. Falls back to a quota-only threshold when the
-/// window's reset time can't be resolved to an absolute instant (several
-/// provider CLIs report free-form reset text with no reliable epoch to
-/// parse) — never crashes, never leaves a ring uncolored.
+/// ("on pace"), matching QuotaTooltip's schedulePosition derivation so the ring
+/// and its tooltip never disagree. Falls back to a quota-only threshold when the
+/// window's reset time can't be resolved to an absolute instant.
 Color quotaScheduleColor(QuotaWindowDto? window, {required DateTime now}) {
-  final pos = _schedulePosition(window, now);
+  final pos = schedulePosition(window, now);
   if (pos == null) return MeshColors.textMuted;
   final delta = pos.delta;
   if (delta == null) return _legacyColorForRemaining(pos.quotaRemainingPct);
   if (delta <= -_kPaceBandPct) return MeshColors.statusHalted;
   if (delta >= _kPaceBandPct) return MeshColors.statusActive;
   return MeshColors.statusIdle;
-}
-
-/// A window's burn-down position at [now]: quota remaining vs. time remaining
-/// in its window, shared by the ring color and the tooltip text so they never
-/// disagree. `timeRemainingPct`/`remainingMs`/`delta` are null when
-/// `resetAt`/`windowMs` aren't enough to place `now` inside the window
-/// (missing, unparseable, or a zero-length window) — several provider CLIs
-/// report free-form reset text with no reliable epoch to parse.
-class _SchedulePosition {
-  const _SchedulePosition({
-    required this.quotaRemainingPct,
-    required this.timeRemainingPct,
-    required this.remainingMs,
-  });
-
-  final double quotaRemainingPct;
-  final double? timeRemainingPct;
-
-  /// Raw (unclamped) milliseconds until `resetAt` — kept separate from the
-  /// clamped `timeRemainingPct` so the burn-rate projection ([_projection])
-  /// can do its own elapsed/remaining math without re-deriving it from a
-  /// percentage.
-  final int? remainingMs;
-
-  double? get delta =>
-      timeRemainingPct == null ? null : quotaRemainingPct - timeRemainingPct!;
-}
-
-_SchedulePosition? _schedulePosition(QuotaWindowDto? window, DateTime now) {
-  final used = window?.usedPercent;
-  if (window == null || used == null || !window.isKnown) return null;
-  if (window.isPastReset(now)) return null;
-  final remainingMs = _remainingMs(window, now);
-  if (remainingMs != null && remainingMs <= 0) return null;
-  return _SchedulePosition(
-    quotaRemainingPct: (100 - used).clamp(0, 100).toDouble(),
-    timeRemainingPct: remainingMs == null
-        ? null
-        : (remainingMs / window.windowMs * 100).clamp(0, 100).toDouble(),
-    remainingMs: remainingMs,
-  );
-}
-
-/// Milliseconds until `resetAtIso`, or null when `windowMs`/the
-/// reset text aren't enough to place `now` inside the window (missing,
-/// unparseable, or a zero-length window).
-int? _remainingMs(QuotaWindowDto window, DateTime now) {
-  if (window.windowMs <= 0) return null;
-  final resetText = window.resetAtIso;
-  if (resetText == null) return null;
-  final reset = DateTime.tryParse(resetText);
-  if (reset == null) return null;
-  return reset.difference(now).inMilliseconds;
 }
 
 Color _legacyColorForRemaining(double remainingPercent) {
