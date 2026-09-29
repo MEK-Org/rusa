@@ -1454,9 +1454,8 @@ export class SharedQuotaStore {
     storedProvider: string | undefined,
     opts: { acceptModelScope: boolean }
   ): void {
-    const observedAt = state.scrapedAt ?? storedObservedAt;
-    const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
-    if (!observedAt || !Number.isFinite(observedMs)) return;
+    const fallbackObservedAt = state.scrapedAt ?? storedObservedAt;
+    if (!fallbackObservedAt || !Number.isFinite(Date.parse(fallbackObservedAt))) return;
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
     const observed = (result: QuotaObservationResult): void => {
       this.metrics.counter(QUOTA_SERVICE_METRICS.observationsTotal, { provider, result });
@@ -1484,6 +1483,16 @@ export class SharedQuotaStore {
         continue;
       }
       seenLanes.add(lane);
+      // A Claude window stamped with its own read time (the bad-read carry,
+      // #763) is old evidence, not a second observation at this scrape's
+      // time. Persist that timestamp so dashboard age, history, and controller
+      // ingestion cannot mistake it for a new read. Other providers keep the
+      // scrape time, as before.
+      const observedAt =
+        provider === "claude" && limit.scrapedAt && Number.isFinite(Date.parse(limit.scrapedAt))
+          ? limit.scrapedAt
+          : fallbackObservedAt;
+      const observedMs = Date.parse(observedAt);
       const candidate: StoredObservation = {
         provider,
         modelScope,

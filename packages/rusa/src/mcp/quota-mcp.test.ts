@@ -16,6 +16,7 @@ vi.mock("@google/genai", () => ({
       generateContent: (args: unknown) => mockGenerateContent(args),
     };
   },
+  FinishReason: { STOP: "STOP", MAX_TOKENS: "MAX_TOKENS" },
   Type: {
     OBJECT: "OBJECT",
     STRING: "STRING",
@@ -1455,6 +1456,135 @@ describe("quota MCP server", () => {
       errorSpy.mockRestore();
     });
 
+    it("truncation detection: candidate finishReason MAX_TOKENS triggers escalation from gemini-3.5-flash-lite to gemini-3.8-flash (#763)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          candidates: [
+            {
+              finishReason: "MAX_TOKENS",
+              content: {
+                parts: [
+                  { text: '{"status":"available","windows":[{"label":"Current week (all models)"' },
+                ],
+              },
+            },
+          ],
+          text: () => '{"status":"available","windows":[{"label":"Current week (all models)"',
+        })
+        .mockResolvedValueOnce({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      status: "available",
+                      windows: [
+                        {
+                          label: "Current week (all models)",
+                          kind: "weekly",
+                          usedPercent: 40,
+                          resetAtIso: "2026-10-05T03:00:00.000Z",
+                          scope: "provider",
+                        },
+                      ],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Current week (all models)",
+                  kind: "weekly",
+                  usedPercent: 40,
+                  resetAtIso: "2026-10-05T03:00:00.000Z",
+                  scope: "provider",
+                },
+              ],
+            }),
+        });
+
+      const parsed = await parseClaudeQuota("Weekly usage: 40%", "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect((mockGenerateContent.mock.calls[0][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash-lite"
+      );
+      expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+        "gemini-3.8-flash"
+      );
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toEqual([
+        {
+          label: "Current week (all models)",
+          kind: "weekly",
+          percentLeft: 60,
+          resetAtIso: "2026-10-05T03:00:00.000Z",
+          scope: { provider: "claude" },
+        },
+      ]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "[quota-mcp] [claude] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: Quota parse failed: response truncated by model output token limit (finishReason: MAX_TOKENS) — escalating attempt 2 to gemini-3.8-flash"
+        )
+      );
+      expect(infoSpy).toHaveBeenCalledWith(
+        "[quota-mcp] [claude] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded"
+      );
+
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    });
+
+    it("truncation detection: unterminated JSON without a finish reason triggers retry and escalation (#763)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () => '{"status":"available","windows":[{"label":"Current session","kind":"sess',
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Current session",
+                  kind: "session",
+                  usedPercent: 10,
+                  resetAtIso: "2026-10-05T03:00:00.000Z",
+                  scope: "provider",
+                },
+              ],
+            }),
+        });
+
+      const parsed = await parseClaudeQuota("Session: 10%", "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect((mockGenerateContent.mock.calls[0][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash-lite"
+      );
+      expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+        "gemini-3.8-flash"
+      );
+      expect(parsed.status).toBe("available");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Quota parse failed: invalid JSON output")
+      );
+
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    });
+
     it("keeps only the provider window from a Codex panel containing named-model limits", async () => {
       // The provider has no 5h row in this valid panel. A named reserve precedes
       // its weekly row and a named-model section follows it; neither belongs in
@@ -2807,6 +2937,99 @@ describe("quota MCP server", () => {
         });
       });
 
+      it("preserves a last-good Fable window through two truncated attempts, then replaces it on recovery (#763)", async () => {
+        const originalObservedAt = "2030-01-01T00:00:00.000Z";
+        let nowMs = Date.parse("2030-01-01T00:30:00.000Z");
+        mockGenerateContent.mockReset();
+        mockGenerateContent
+          .mockResolvedValueOnce({ candidates: [{ finishReason: "MAX_TOKENS" }] })
+          .mockResolvedValueOnce({ candidates: [{ finishReason: "MAX_TOKENS" }] })
+          .mockResolvedValueOnce({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Current week (all models)",
+                    kind: "weekly",
+                    usedPercent: 35,
+                    resetAtIso: "2030-01-08T00:00:00.000Z",
+                    scope: "provider",
+                  },
+                  {
+                    label: "Current week (Fable)",
+                    kind: "weekly",
+                    usedPercent: 45,
+                    resetAtIso: "2030-01-08T00:00:00.000Z",
+                    scope: "provider",
+                    models: ["claude-fable-5-1"],
+                  },
+                ],
+              }),
+          });
+
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          resolveProvider: mockResolveProvider,
+          modelCatalogFor: () => [
+            { identifier: "claude-fable-5-1", displayLabel: "Fable", passable: true },
+          ],
+          now: () => nowMs,
+          ttlMs: 0,
+        });
+        service.hydrate("claude", {
+          provider: "claude",
+          status: "available",
+          scrapedAt: originalObservedAt,
+          limits: [
+            {
+              label: "Current week (all models)",
+              kind: "weekly",
+              percentLeft: 70,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: { provider: "claude" },
+            },
+            {
+              label: "Current week (Fable)",
+              kind: "weekly",
+              percentLeft: 75,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+              scope: { provider: "claude", models: ["claude-fable-5-1"] },
+            },
+          ],
+        });
+
+        const carried = await service.getQuota("claude");
+        expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+        expect(carried.status).toBe("available");
+        expect(carried.limits).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              label: "Current week (Fable)",
+              percentLeft: 75,
+              scrapedAt: originalObservedAt,
+              scope: { provider: "claude", models: ["claude-fable-5-1"] },
+            }),
+          ])
+        );
+
+        nowMs = Date.parse("2030-01-01T01:00:00.000Z");
+        const recovered = await service.getQuota("claude");
+        expect(mockGenerateContent).toHaveBeenCalledTimes(3);
+        expect(recovered.status).toBe("available");
+        expect(recovered.scrapedAt).toBe("2030-01-01T01:00:00.000Z");
+        expect(recovered.limits).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              label: "Current week (Fable)",
+              percentLeft: 55,
+              scope: { provider: "claude", models: ["claude-fable-5-1"] },
+            }),
+          ])
+        );
+      });
+
       it("persists a malformed current Codex parse as unknown and fails closed without limits when prior reading has expired", async () => {
         const priorPanel = "synthetic expired prior Codex provider panel";
         const malformedPanel = "synthetic malformed current Codex provider panel";
@@ -3722,13 +3945,61 @@ describe("quota MCP server", () => {
           ],
         };
 
-        expect(
-          inferQuotaState(
-            { provider: "claude", status: "unknown", scrapedAt: t1Iso, limits: [] },
-            previousState,
+        const result = inferQuotaState(
+          { provider: "claude", status: "unknown", scrapedAt: t1Iso, limits: [] },
+          previousState,
+          t1Iso
+        );
+        expect(result.status).toBe("unknown");
+        expect(result.limits).toEqual([
+          {
+            label: "Fable weekly",
+            kind: "weekly",
+            percentLeft: 80,
+            resetAtIso: "2026-08-27T10:00:00.000Z",
+            scope: { provider: "claude", models: ["claude-fable"] },
+            scrapedAt: t0Iso,
+          },
+        ]);
+        expect(result.explanations).toEqual([
+          expect.objectContaining({
+            rule: "carried_forward_bad_read",
+            window: "Fable weekly",
+          }),
+        ]);
+      });
+
+      it("carried_forward_bad_read: carries only provider windows for providers other than Claude", () => {
+        const t0Iso = "2026-08-20T10:00:00.000Z";
+        const t1Iso = "2026-08-20T12:00:00.000Z";
+        const resetAtIso = "2026-08-27T10:00:00.000Z";
+        for (const provider of ["codex", "agy", "kimi"]) {
+          const result = inferQuotaState(
+            { provider, status: "unknown", scrapedAt: t1Iso, limits: [] },
+            {
+              provider,
+              status: "available",
+              scrapedAt: t0Iso,
+              limits: [
+                { label: "Weekly", kind: "weekly", percentLeft: 60, resetAtIso },
+                {
+                  label: "Model weekly",
+                  kind: "weekly",
+                  percentLeft: 80,
+                  resetAtIso,
+                  scope: { provider, models: ["some-model"] },
+                },
+              ],
+            },
             t1Iso
-          )
-        ).toMatchObject({ status: "unknown", limits: [] });
+          );
+          expect(result.status).toBe("available");
+          // No per-window scrapedAt: the carried window keeps taking the bad
+          // read's time, as before #763.
+          expect(result.limits).toEqual([
+            { label: "Weekly", kind: "weekly", percentLeft: 60, resetAtIso },
+          ]);
+        }
       });
 
       it("carried_forward_bad_read: carries forward unexpired resetAtIso when subsequent parse misses reset timestamp for an active window ", () => {

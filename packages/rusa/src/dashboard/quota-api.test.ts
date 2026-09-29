@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import { inferQuotaState, type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
 import type { CodingProvider } from "../providers/types.js";
 import {
   buildQuotaHistory,
@@ -569,6 +569,295 @@ describe("dashboard quota snapshot", () => {
           scrapedAt: "2026-09-28T13:00:00.000Z",
         }),
       ]);
+    });
+
+    it("model-only history fallback preserves model window with original scrapedAt without promoting provider status", async () => {
+      const now = Date.parse("2026-09-28T14:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["claude-fable-5-1"],
+            label: "Current week (Fable)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("unknown");
+      expect(claude.windows).toEqual([]);
+      expect(claude.usedPercent).toBeNull();
+      expect(claude.modelWindows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          usedPercent: 75,
+          modelIds: ["claude-fable-5-1"],
+          scrapedAt: "2026-09-28T11:00:00.000Z",
+        }),
+      ]);
+    });
+
+    it("history fallback keeps an older unexpired Fable point beside a newer provider point", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["claude-fable-5-1"],
+            label: "Current week (Fable)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          // An expired older window is not revived.
+          historyPoint({
+            scope: "model",
+            models: ["claude-sonnet-5"],
+            label: "Current week (Sonnet)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 50,
+            resetAtIso: "2026-09-28T12:00:00.000Z",
+          }),
+          historyPoint({
+            label: "Current week (all models)",
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("available");
+      expect(claude.windows).toEqual([
+        expect.objectContaining({ usedPercent: 40, scrapedAt: "2026-09-28T14:00:00.000Z" }),
+      ]);
+      expect(claude.modelWindows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          usedPercent: 75,
+          modelIds: ["claude-fable-5-1"],
+          scrapedAt: "2026-09-28T11:00:00.000Z",
+        }),
+      ]);
+    });
+
+    it("history fallback keeps older model points for Claude only", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "codex", status: "unknown" }),
+        providers: ["codex"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["gpt-spark"],
+            label: "Spark weekly",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          historyPoint({
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+          }),
+        ],
+      });
+      const codex = snapshot.providers[0];
+
+      expect(codex.status).toBe("available");
+      expect(codex.modelWindows ?? []).toEqual([]);
+    });
+
+    it("history fallback for other providers reads only the newest scrape, as before #763", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const resetAtIso = "2026-10-01T00:00:00.000Z";
+      const fallback = (listHistory: QuotaApiDeps["listHistory"]) =>
+        buildQuotaSnapshot({
+          getQuota: async () => ({ provider: "codex", status: "unknown" }),
+          providers: ["codex"],
+          now: () => now,
+          listHistory,
+        }).then((snapshot) => snapshot.providers[0]);
+
+      // An older provider window is not revived beside a newer scrape.
+      const olderProvider = await fallback(() => [
+        historyPoint({ observedAt: "2026-09-28T11:00:00.000Z", percentLeft: 25, resetAtIso }),
+        historyPoint({
+          kind: "five_hour",
+          label: "5h",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 60,
+          resetAtIso,
+        }),
+      ]);
+      expect(olderProvider.windows.map((w) => w.label)).toEqual(["5h"]);
+
+      // A newest scrape with only model points still reads available.
+      const modelOnly = await fallback(() => [
+        historyPoint({
+          scope: "model",
+          models: ["gpt-spark"],
+          label: "Spark weekly",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 60,
+        }),
+      ]);
+      expect(modelOnly.status).toBe("available");
+
+      // An exhausted model window still reads exhausted.
+      const exhaustedModel = await fallback(() => [
+        historyPoint({ observedAt: "2026-09-28T14:00:00.000Z", percentLeft: 60 }),
+        historyPoint({
+          scope: "model",
+          models: ["gpt-spark"],
+          label: "Spark weekly",
+          observedAt: "2026-09-28T14:00:00.000Z",
+          percentLeft: 0,
+        }),
+      ]);
+      expect(exhaustedModel.status).toBe("exhausted");
+    });
+
+    it("dates a carried provider window at its original read for Claude only", async () => {
+      const t0 = "2026-09-28T11:00:00.000Z";
+      const t1 = "2026-09-28T14:00:00.000Z";
+      const resetAtIso = "2026-10-01T00:00:00.000Z";
+      for (const [provider, expected] of [
+        ["claude", t0],
+        ["codex", t1],
+        ["agy", t1],
+        ["kimi", t1],
+      ] as const) {
+        const carried = inferQuotaState(
+          { provider, status: "unknown", scrapedAt: t1, limits: [] },
+          {
+            provider,
+            status: "available",
+            scrapedAt: t0,
+            limits: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                percentLeft: 60,
+                resetAtIso,
+                scope: "provider",
+              },
+            ],
+          },
+          t1
+        );
+        const snapshot = await buildQuotaSnapshot({
+          getQuota: async () => carried,
+          providers: [provider],
+          now: () => Date.parse(t1),
+        });
+        expect(snapshot.providers[0].windows.map((w) => w.scrapedAt)).toEqual([expected]);
+      }
+    });
+
+    it("history fallback treats one lane read under two labels as a single window", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            label: "Current week (all models)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 0,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          historyPoint({
+            label: "Weekly (all models)",
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("available");
+      expect(claude.windows).toEqual([
+        expect.objectContaining({ usedPercent: 40, scrapedAt: "2026-09-28T14:00:00.000Z" }),
+      ]);
+    });
+
+    it("passes limit.scrapedAt through to modelWindows and provider windows", async () => {
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({
+          provider: "claude",
+          status: "available",
+          scrapedAt: "2026-09-28T14:00:00.000Z",
+          limits: [
+            {
+              label: "Current week (all models)",
+              kind: "weekly",
+              percentLeft: 60,
+              scope: "provider",
+              scrapedAt: "2026-09-28T14:00:00.000Z",
+            },
+            {
+              label: "Current week (Fable)",
+              kind: "weekly",
+              percentLeft: 25,
+              scope: { provider: "claude", models: ["claude-fable-5-1"] },
+              scrapedAt: "2026-09-28T11:00:00.000Z",
+            },
+          ],
+        }),
+        providers: ["claude"],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.windows[0].scrapedAt).toBe("2026-09-28T14:00:00.000Z");
+      expect(claude.modelWindows[0].scrapedAt).toBe("2026-09-28T11:00:00.000Z");
+    });
+
+    it.each([
+      "codex",
+      "agy",
+      "kimi",
+    ] as const)("ignores a per-limit scrapedAt for %s, as before #763", async (provider) => {
+      const scrapeAt = "2026-09-28T14:00:00.000Z";
+      const perLimitAt = "2026-09-28T11:00:00.000Z";
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({
+          provider,
+          status: "available",
+          scrapedAt: scrapeAt,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 60,
+              scope: "provider",
+              scrapedAt: perLimitAt,
+            },
+            {
+              label: "Weekly (model)",
+              kind: "weekly",
+              percentLeft: 25,
+              scope: { provider, models: [`${provider}-model`] },
+              scrapedAt: perLimitAt,
+            },
+          ],
+        }),
+        providers: [provider],
+      });
+      const dto = snapshot.providers[0];
+
+      expect(dto.windows.map((w) => w.scrapedAt)).toEqual([scrapeAt]);
+      expect(dto.modelWindows.map((w) => w.scrapedAt)).toEqual([scrapeAt]);
     });
   });
 

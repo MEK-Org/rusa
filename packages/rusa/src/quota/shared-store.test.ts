@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ProviderQuotaSnapshot, QuotaService, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import {
+  inferQuotaState,
+  type ProviderQuotaSnapshot,
+  type QuotaService,
+  type QuotaWindowKind,
+} from "../mcp/quota-mcp.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import { QuotaCollectionLoop } from "./coordinator-collection.js";
 import { QuotaCoordinatorService } from "./coordinator-service.js";
@@ -466,6 +471,203 @@ describe("SharedQuotaStore canonical observations", () => {
       store.recordParsed(id, state, state);
       expect(store.listCanonicalSince("claude", "2029-01-01T00:00:00.000Z")).toMatchObject([
         { label: "Current week (all models)", percentLeft: 80 },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps a carried model window at its original observation time", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-model-age-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalModelObservedAt = "2030-01-01T00:00:00.000Z";
+    const currentScrapeAt = "2030-01-01T00:30:00.000Z";
+    const state: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: currentScrapeAt,
+      limits: [
+        {
+          label: "Current week (all models)",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: { provider: "claude" },
+        },
+        {
+          label: "Current week (Fable)",
+          kind: "weekly",
+          percentLeft: 75,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: { provider: "claude", models: ["claude-fable"] },
+          // This is evidence carried across a failed extraction, not a fresh
+          // Fable observation from the scrape recorded above.
+          scrapedAt: originalModelObservedAt,
+        },
+      ],
+    };
+    try {
+      const id = store.recordRaw({
+        provider: "claude",
+        scrapedAt: currentScrapeAt,
+        rawOutput: "synthetic current scrape",
+      });
+      store.recordParsed(id, state, state);
+
+      expect(
+        store.db
+          .prepare("SELECT label, observed_at AS observedAt FROM quota_observations ORDER BY label")
+          .all()
+      ).toEqual([
+        { label: "Current week (Fable)", observedAt: originalModelObservedAt },
+        { label: "Current week (all models)", observedAt: currentScrapeAt },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("records no new-slot observation for a carried provider window", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-provider-age-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalObservedAt = "2030-01-01T00:00:00.000Z";
+    const carriedScrapeAt = "2030-01-01T00:30:00.000Z";
+    const providerWindow = {
+      label: "Current week (all models)",
+      kind: "weekly" as const,
+      percentLeft: 80,
+      resetAtIso: "2030-01-08T00:00:00.000Z",
+      scope: { provider: "claude" },
+    };
+    const fresh: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: originalObservedAt,
+      limits: [providerWindow],
+    };
+    // The next scrape's extraction failed; the provider window is carried
+    // across it and is not a second reading showing no consumption.
+    const carried: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: carriedScrapeAt,
+      limits: [{ ...providerWindow, scrapedAt: originalObservedAt }],
+    };
+    try {
+      const firstId = store.recordRaw({
+        provider: "claude",
+        scrapedAt: originalObservedAt,
+        rawOutput: "synthetic fresh scrape",
+      });
+      store.recordParsed(firstId, fresh, fresh);
+      const secondId = store.recordRaw({
+        provider: "claude",
+        scrapedAt: carriedScrapeAt,
+        rawOutput: "synthetic failed extraction",
+      });
+      store.recordParsed(secondId, carried, carried);
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT observed_at AS observedAt, percent_left AS percentLeft FROM quota_observations"
+          )
+          .all()
+      ).toEqual([{ observedAt: originalObservedAt, percentLeft: 80 }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("records another provider's window at the scrape time even with a per-limit scrapedAt", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-codex-limit-time-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const perLimitAt = "2030-01-01T00:00:00.000Z";
+    const scrapeAt = "2030-01-01T00:30:00.000Z";
+    const state: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "available",
+      scrapedAt: scrapeAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: "provider",
+          scrapedAt: perLimitAt,
+        },
+      ],
+    };
+    try {
+      const id = store.recordRaw({
+        provider: "codex",
+        scrapedAt: scrapeAt,
+        rawOutput: "synthetic scrape",
+      });
+      store.recordParsed(id, state, state);
+
+      expect(
+        store.db.prepare("SELECT observed_at AS observedAt FROM quota_observations").all()
+      ).toEqual([{ observedAt: scrapeAt }]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("still records another provider's carried window at the bad read's time", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-codex-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalObservedAt = "2030-01-01T00:00:00.000Z";
+    const badReadAt = "2030-01-01T00:30:00.000Z";
+    const fresh: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "available",
+      scrapedAt: originalObservedAt,
+      limits: [
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: "provider",
+        },
+      ],
+    };
+    const badRead: ProviderQuotaSnapshot = {
+      provider: "codex",
+      status: "unknown",
+      scrapedAt: badReadAt,
+      limits: [],
+    };
+    const carried = inferQuotaState(badRead, fresh, badReadAt);
+    try {
+      const firstId = store.recordRaw({
+        provider: "codex",
+        scrapedAt: originalObservedAt,
+        rawOutput: "synthetic fresh scrape",
+      });
+      store.recordParsed(firstId, fresh, fresh);
+      const secondId = store.recordRaw({
+        provider: "codex",
+        scrapedAt: badReadAt,
+        rawOutput: "synthetic failed extraction",
+      });
+      store.recordParsed(secondId, badRead, carried);
+
+      expect(
+        store.db
+          .prepare(
+            "SELECT observed_at AS observedAt, percent_left AS percentLeft FROM quota_observations ORDER BY observed_at"
+          )
+          .all()
+      ).toEqual([
+        { observedAt: originalObservedAt, percentLeft: 80 },
+        { observedAt: badReadAt, percentLeft: 80 },
       ]);
     } finally {
       store.close();
