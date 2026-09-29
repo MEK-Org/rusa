@@ -13,7 +13,9 @@ import {
   HISTORY_WINDOW_MS,
   isValidHistoryRecord,
   isValidQuotaPayload,
+  isValidScrapeOutcome,
   type PublishedHistoryRecord,
+  type PublishedScrapeOutcome,
   type PublishedThrottleColdResponse,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleProviderStatus,
@@ -241,6 +243,8 @@ export class QuotaCoordinatorClient {
   private lastSuccessfulReadMs: Map<string, number> = new Map();
   private lastPublishedStatuses: Map<string, PublishedThrottleProviderStatus> = new Map();
   private historyCache: Map<string, readonly PublishedHistoryRecord[]> = new Map();
+  /** Scrape outcomes from the same reads as `historyCache`; empty from a minor-2 service. */
+  private scrapeOutcomeCache: Map<string, readonly PublishedScrapeOutcome[]> = new Map();
   private historyReadsInFlight: Map<string, Promise<readonly PublishedHistoryRecord[] | null>> =
     new Map();
   /** Providers whose most recent history read failed; their cache may be absent or last-good. */
@@ -512,6 +516,15 @@ export class QuotaCoordinatorClient {
   }
 
   /**
+   * The scrape outcomes the last successful history read carried (#759),
+   * including scrapes that left no history row. Empty before a read, and from
+   * a service older than protocol minor 3, which leaves detection row-only.
+   */
+  getCachedScrapeOutcomes(provider: string): readonly PublishedScrapeOutcome[] {
+    return this.scrapeOutcomeCache.get(provider) ?? [];
+  }
+
+  /**
    * Dashboard read-through (#707): when a provider has never had a successful
    * history read, or its most recent read failed, read it now so the caller
    * serves what the coordinator has rather than waiting for the next periodic
@@ -644,8 +657,20 @@ export class QuotaCoordinatorClient {
               }
             }
 
+            // Absent from a minor-2 service; present but malformed fails the
+            // read like a bad record does.
+            const scrapes = (parsed as { scrapes?: unknown }).scrapes;
+            if (
+              scrapes !== undefined &&
+              (!Array.isArray(scrapes) || !scrapes.every((s) => isValidScrapeOutcome(s)))
+            ) {
+              fail(new Error("Invalid history scrape outcome shape"));
+              return;
+            }
+
             const validRecords = records as PublishedHistoryRecord[];
             this.historyCache.set(provider, validRecords);
+            this.scrapeOutcomeCache.set(provider, (scrapes as PublishedScrapeOutcome[]) ?? []);
             finish(validRecords);
           });
         }

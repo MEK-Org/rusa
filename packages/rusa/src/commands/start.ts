@@ -1894,7 +1894,9 @@ async function composeStart(
       );
       reads.forEach((read, index) => {
         if (read.status !== "fulfilled" || read.value === null) return;
-        for (const missed of missedQuotaWindows.observe(quotaProviders[index], read.value)) {
+        const provider = quotaProviders[index];
+        const scrapes = quotaCoordinatorClient.getCachedScrapeOutcomes(provider);
+        for (const missed of missedQuotaWindows.observe(provider, read.value, scrapes)) {
           log.info("quota_window_missed", { ...missed });
           raiseQuotaWindowMissedAlarm?.(missed);
         }
@@ -4495,8 +4497,11 @@ async function composeStart(
   }
 
   raiseQuotaWindowMissedAlarm = (missed) => {
+    const scrape = missed.scrapeFailed
+      ? "quota scrape failed to parse, so it no longer shows"
+      : "quota scrape no longer shows";
     const message =
-      `Quota window missed: the latest ${missed.provider} quota scrape no longer shows ` +
+      `Quota window missed: the latest ${missed.provider} ${scrape} ` +
       `"${missed.label}", last read at ${missed.lastReadingAt}. The dashboard ring now shows ` +
       "an estimate from that reading; check the scrapes to see why the window dropped out.";
     void deliverHostAlarm({

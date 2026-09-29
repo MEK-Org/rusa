@@ -1,4 +1,4 @@
-import type { PublishedHistoryRecord } from "./coordinator-protocol.js";
+import type { PublishedHistoryRecord, PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { quotaLaneKey } from "./lane-estimate.js";
 import { QUOTA_OBSERVATION_SLOT_MS } from "./quota-cycle.js";
 
@@ -11,6 +11,8 @@ export interface MissedQuotaWindow {
   lastReadingAt: string;
   /** When the scrape that dropped it was observed. */
   missedAt: string;
+  /** Whether that scrape's output failed to parse, rather than parsing without the window. */
+  scrapeFailed: boolean;
 }
 
 interface ScrapeLanes {
@@ -18,6 +20,7 @@ interface ScrapeLanes {
   /** The newest scrape stamp in the slot, and the windows that scrape carried. */
   observedAt: string;
   observedMs: number;
+  failed: boolean;
   lanes: Map<string, PublishedHistoryRecord>;
   /** Windows an earlier scrape in the same slot carried and its newest scrape did not. */
   dropped: Map<string, PublishedHistoryRecord>;
@@ -41,14 +44,19 @@ interface ScrapeLanes {
  * snapshot with that one stamp, and keeps one row per window per observation
  * slot, the later scrape overwriting. So a slot's rows stamped before its
  * newest stamp are windows an earlier scrape in that slot carried and the
- * newest one dropped. A scrape that published no window at all leaves no row,
- * and so no gap to find here.
+ * newest one dropped. A scrape that parsed to no window, or failed to parse,
+ * leaves no row; the scrape outcomes carry its stamp, so it is a scrape with no
+ * windows and drops every window the scrape before it had.
  */
 export class MissedQuotaWindowDetector {
   private readonly lastScrape = new Map<string, ScrapeLanes>();
 
-  observe(provider: string, records: readonly PublishedHistoryRecord[]): MissedQuotaWindow[] {
-    const scrapes = groupByScrape(records);
+  observe(
+    provider: string,
+    records: readonly PublishedHistoryRecord[],
+    scrapeOutcomes: readonly PublishedScrapeOutcome[] = []
+  ): MissedQuotaWindow[] {
+    const scrapes = groupByScrape(records, scrapeOutcomes);
     if (scrapes.length === 0) return [];
     let previous = this.lastScrape.get(provider);
     const missed: MissedQuotaWindow[] = [];
@@ -75,6 +83,7 @@ export class MissedQuotaWindowDetector {
           label: record.label,
           lastReadingAt: record.observedAt,
           missedAt: scrape.observedAt,
+          scrapeFailed: scrape.failed,
         });
       }
       previous = scrape;
@@ -84,22 +93,53 @@ export class MissedQuotaWindowDetector {
   }
 }
 
-function groupByScrape(records: readonly PublishedHistoryRecord[]): ScrapeLanes[] {
+function groupByScrape(
+  records: readonly PublishedHistoryRecord[],
+  scrapeOutcomes: readonly PublishedScrapeOutcome[]
+): ScrapeLanes[] {
+  const slotOf = (ms: number) => Math.floor(ms / QUOTA_OBSERVATION_SLOT_MS);
   const bySlot = new Map<number, PublishedHistoryRecord[]>();
   for (const record of records) {
     const observedMs = Date.parse(record.observedAt);
     if (!Number.isFinite(observedMs)) continue;
-    const slot = Math.floor(observedMs / QUOTA_OBSERVATION_SLOT_MS);
+    const slot = slotOf(observedMs);
     const rows = bySlot.get(slot);
     if (rows) rows.push(record);
     else bySlot.set(slot, [record]);
   }
+  // The newest finished scrape in each slot, whether or not it wrote a row.
+  const newestOutcome = new Map<number, { observedAt: string; ms: number; failed: boolean }>();
+  for (const scrape of scrapeOutcomes) {
+    const ms = Date.parse(scrape.observedAt);
+    if (!Number.isFinite(ms)) continue;
+    const slot = slotOf(ms);
+    const current = newestOutcome.get(slot);
+    if (current && current.ms > ms) continue;
+    newestOutcome.set(slot, {
+      observedAt: scrape.observedAt,
+      ms,
+      failed: scrape.outcome === "failed",
+    });
+    if (!bySlot.has(slot)) bySlot.set(slot, []);
+  }
   return [...bySlot]
     .map(([slot, rows]) => {
-      const newest = rows.reduce((a, b) =>
-        Date.parse(b.observedAt) > Date.parse(a.observedAt) ? b : a
-      );
-      const observedMs = Date.parse(newest.observedAt);
+      let observedAt = "";
+      let observedMs = Number.NEGATIVE_INFINITY;
+      for (const record of rows) {
+        const ms = Date.parse(record.observedAt);
+        if (ms > observedMs) {
+          observedMs = ms;
+          observedAt = record.observedAt;
+        }
+      }
+      const outcome = newestOutcome.get(slot);
+      let failed = false;
+      if (outcome && outcome.ms >= observedMs) {
+        observedMs = outcome.ms;
+        observedAt = outcome.observedAt;
+        failed = outcome.failed;
+      }
       const lanes = new Map<string, PublishedHistoryRecord>();
       const dropped = new Map<string, PublishedHistoryRecord>();
       for (const record of rows) {
@@ -108,7 +148,7 @@ function groupByScrape(records: readonly PublishedHistoryRecord[]): ScrapeLanes[
         else dropped.set(lane, record);
       }
       for (const lane of lanes.keys()) dropped.delete(lane);
-      return { slot, observedAt: newest.observedAt, observedMs, lanes, dropped };
+      return { slot, observedAt, observedMs, failed, lanes, dropped };
     })
     .sort((a, b) => a.slot - b.slot);
 }

@@ -313,8 +313,11 @@ consecutive scrapes in the history it refreshes. A scrape is the set of
 observations that share one `observedAt` stamp, which the store writes on every
 row of one snapshot. The store keeps one row per window per five-minute slot, so
 when two scrapes land in one slot, a row still stamped with the earlier scrape
-is a window the later one dropped. A scrape that published no window at all
-leaves no row, so it raises no alarm. If a window appears
+is a window the later one dropped. A scrape that parsed to no window, or whose
+output failed to parse, leaves no row. `/v1/history` therefore also lists each
+finished scrape's time and whether it parsed (protocol minor 3), and such a
+scrape counts as one with no windows. A scrape still being parsed is not listed.
+Against a minor-2 coordinator the detection falls back to rows only. If a window appears
 in one scrape and is missing from the next, the process sends one normal-priority
 `system.quota_window_missed` alarm to its own root on `system:events`. Instances
 that share a coordinator each tell their own root once. The alarm is not

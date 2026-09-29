@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { PublishedHistoryRecord } from "./coordinator-protocol.js";
+import type { PublishedHistoryRecord, PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { MissedQuotaWindowDetector } from "./missed-windows.js";
 
 function weekly(observedAt: string, percentLeft = 80): PublishedHistoryRecord {
@@ -30,6 +30,8 @@ function fable(observedAt: string, percentLeft = 60): PublishedHistoryRecord {
 }
 
 const at = (minute: number) => new Date(Date.UTC(2026, 8, 29, 12, minute)).toISOString();
+const parsed = (observedAt: string): PublishedScrapeOutcome => ({ observedAt, outcome: "parsed" });
+const failed = (observedAt: string): PublishedScrapeOutcome => ({ observedAt, outcome: "failed" });
 
 describe("MissedQuotaWindowDetector (#759)", () => {
   it("raises a window absent from the next scrape once per gap, not on every later scrape", () => {
@@ -45,6 +47,7 @@ describe("MissedQuotaWindowDetector (#759)", () => {
         label: "Current week (Fable)",
         lastReadingAt: at(0),
         missedAt: at(15),
+        scrapeFailed: false,
       },
     ]);
 
@@ -128,5 +131,93 @@ describe("MissedQuotaWindowDetector (#759)", () => {
     expect(detector.observe("codex", [weekly(at(0)), weekly(at(15))])).toEqual([]);
     expect(detector.observe("claude", [])).toEqual([]);
     expect(detector.observe("claude", [weekly(at(0)), fable(at(0))])).toEqual([]);
+  });
+
+  describe("a scrape that left no window row", () => {
+    it("drops every window the scrape before it had, once", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0)), fable(at(0))];
+      const scrapes = [parsed(at(0))];
+      expect(detector.observe("claude", history, scrapes)).toEqual([]);
+
+      scrapes.push(parsed(at(15)));
+      expect(detector.observe("claude", history, scrapes)).toEqual([
+        {
+          provider: "claude",
+          lane: "provider:weekly",
+          label: "Current week (all models)",
+          lastReadingAt: at(0),
+          missedAt: at(15),
+          scrapeFailed: false,
+        },
+        expect.objectContaining({
+          lane: "model:claude-fable-5-1:weekly",
+          lastReadingAt: at(0),
+          missedAt: at(15),
+          scrapeFailed: false,
+        }),
+      ]);
+
+      // A second empty scrape keeps the gap open without raising it again.
+      scrapes.push(parsed(at(30)));
+      expect(detector.observe("claude", history, scrapes)).toEqual([]);
+    });
+
+    it("counts a scrape that failed to parse, and says so", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0))];
+      detector.observe("claude", history, [parsed(at(0))]);
+      expect(detector.observe("claude", history, [parsed(at(0)), failed(at(15))])).toEqual([
+        expect.objectContaining({
+          lane: "provider:weekly",
+          lastReadingAt: at(0),
+          missedAt: at(15),
+          scrapeFailed: true,
+        }),
+      ]);
+    });
+
+    it("re-arms once the windows return", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0))];
+      const scrapes = [parsed(at(0))];
+      detector.observe("claude", history, scrapes);
+      scrapes.push(failed(at(15)));
+      expect(detector.observe("claude", history, scrapes)).toHaveLength(1);
+      history.push(weekly(at(30)));
+      scrapes.push(parsed(at(30)));
+      expect(detector.observe("claude", history, scrapes)).toEqual([]);
+      scrapes.push(parsed(at(45)));
+      expect(detector.observe("claude", history, scrapes)).toEqual([
+        expect.objectContaining({ lastReadingAt: at(30), missedAt: at(45) }),
+      ]);
+    });
+
+    it("finds an empty scrape later in the same slot as a full one", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0)), fable(at(0))];
+      detector.observe("claude", history, [parsed(at(0))]);
+      expect(detector.observe("claude", history, [parsed(at(0)), parsed(at(2))])).toEqual([
+        expect.objectContaining({ lane: "provider:weekly", missedAt: at(2) }),
+        expect.objectContaining({ lane: "model:claude-fable-5-1:weekly", missedAt: at(2) }),
+      ]);
+    });
+
+    it("takes an empty newest scrape as a silent baseline", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0))];
+      expect(detector.observe("claude", history, [parsed(at(0)), failed(at(15))])).toEqual([]);
+      expect(
+        detector.observe("claude", history, [parsed(at(0)), failed(at(15)), failed(at(30))])
+      ).toEqual([]);
+    });
+
+    it("leaves a scrape that wrote rows as it was", () => {
+      const detector = new MissedQuotaWindowDetector();
+      const history = [weekly(at(0)), fable(at(0))];
+      detector.observe("claude", history, [parsed(at(0))]);
+      history.push(weekly(at(15)), fable(at(15)));
+      expect(detector.observe("claude", history, [parsed(at(0)), parsed(at(15))])).toEqual([]);
+    });
   });
 });

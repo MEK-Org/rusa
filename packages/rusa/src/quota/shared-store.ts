@@ -13,6 +13,7 @@ import {
   type QuotaMetrics,
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
+import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { parseParsedState, serializeParsedState } from "./parsed-state.js";
 import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
 import {
@@ -956,6 +957,27 @@ export class SharedQuotaStore {
         ? [{ scope: "provider" as const, ...row }]
         : [{ scope: "model" as const, models, ...row }];
     });
+  }
+
+  /**
+   * Every finished scrape since `sinceIso`, parsed or failed, by stamp (#759).
+   * A scrape that parsed to no window, or failed to parse, writes no
+   * observation, so this is the only record that it happened. A row still
+   * being parsed (neither column set) is left out until it finishes; no raw
+   * output leaves the store.
+   */
+  listScrapeOutcomesSince(provider: string, sinceIso: string): PublishedScrapeOutcome[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT scraped_at AS observedAt, parse_error IS NOT NULL AS failed
+           FROM quota_scrapes
+           WHERE provider = ? AND scraped_at >= ?
+             AND (parsed_state IS NOT NULL OR parse_error IS NOT NULL)
+           ORDER BY scraped_at ASC, rowid ASC`
+        )
+        .all(provider, sinceIso) as Array<{ observedAt: string; failed: 0 | 1 }>
+    ).map(({ observedAt, failed }) => ({ observedAt, outcome: failed ? "failed" : "parsed" }));
   }
 
   getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {

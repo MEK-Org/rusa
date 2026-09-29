@@ -985,7 +985,10 @@ it is why the cold answer above is a shape rather than an error.
 #### `GET /v1/history?provider=&since=`
 
 The reasoned-observation history the dashboard already joins for its quota view,
-returning what `listHistorySince` returns (`shared-store.ts:380`).
+returning what `listHistorySince` returns (`shared-store.ts:380`). Since
+protocol minor 3 the response also carries `scrapes`: each finished scrape's
+`observedAt` and `outcome` (`parsed` or `failed`), with no raw output, so a
+reader can see a scrape that wrote no window row (#759).
 
 This endpoint exists for a compatibility reason rather than a design one, and it
 is worth naming: §8.2 takes `quota.databasePath` away from instances, and the
