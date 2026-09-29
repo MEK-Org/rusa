@@ -333,6 +333,108 @@ describe("quota MCP server", () => {
       ]);
     });
 
+    describe("failed-attempt diagnostics (#774)", () => {
+      const goodReply = {
+        candidates: [{ finishReason: "STOP" }],
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [{ label: "Weekly", kind: "weekly", usedPercent: "40", resetInIso: "PT70H" }],
+          }),
+      };
+
+      beforeEach(() => {
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        vi.spyOn(console, "info").mockImplementation(() => {});
+        vi.spyOn(console, "error").mockImplementation(() => {});
+      });
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      it("keeps a bounded head of a runaway reply when the retry rescues the cycle", async () => {
+        const runaway = `{"status":"available","windows":[{"usedPercent":"43.${"0".repeat(20_000)}`;
+        mockGenerateContent
+          .mockResolvedValueOnce({
+            candidates: [{ finishReason: "MAX_TOKENS" }],
+            text: () => runaway,
+          })
+          .mockResolvedValueOnce(goodReply);
+
+        const parsed = await parseClaudeQuota("Weekly usage: 40%", "test-key");
+
+        expect(parsed.status).toBe("available");
+        expect(parsed.extractionFailures).toEqual([
+          {
+            attempt: 1,
+            model: "gemini-3.5-flash-lite",
+            elapsedMs: expect.any(Number),
+            error:
+              "Quota parse failed: response truncated by model output token limit (finishReason: MAX_TOKENS)",
+            finishReason: "MAX_TOKENS",
+            responseHead: runaway.slice(0, 400),
+            responseLength: runaway.length,
+          },
+        ]);
+      });
+
+      it("records both attempts, including a transport error with no response, when the cycle fails", async () => {
+        const unterminated = '{"status":"available","windows":[{"label":"Weekly"';
+        mockGenerateContent.mockRejectedValueOnce(new Error("fetch failed")).mockResolvedValueOnce({
+          candidates: [{ finishReason: "STOP" }],
+          text: () => unterminated,
+        });
+
+        const parsed = await parseClaudeQuota("Weekly usage: 40%", "test-key");
+
+        expect(parsed.status).toBe("unknown");
+        const [transport, badJson] = parsed.extractionFailures ?? [];
+        expect(parsed.extractionFailures).toHaveLength(2);
+        expect(transport).toEqual({
+          attempt: 1,
+          model: "gemini-3.5-flash-lite",
+          elapsedMs: expect.any(Number),
+          error: "fetch failed",
+        });
+        expect(badJson).toMatchObject({
+          attempt: 2,
+          model: "gemini-3.8-flash",
+          finishReason: "STOP",
+          responseHead: unterminated,
+          responseLength: unterminated.length,
+        });
+        expect(badJson?.error).toMatch(/^Quota parse failed: invalid JSON output/);
+      });
+
+      it("caps the kept failure message", async () => {
+        const hugeStatus = {
+          text: () => JSON.stringify({ status: "x".repeat(5_000), windows: [] }),
+        };
+        mockGenerateContent.mockResolvedValueOnce(hugeStatus).mockResolvedValueOnce(hugeStatus);
+
+        const parsed = await parseClaudeQuota("Weekly usage: 40%", "test-key");
+
+        const failures = parsed.extractionFailures ?? [];
+        expect(failures).toHaveLength(2);
+        for (const failure of failures) {
+          expect(failure.error).toHaveLength(300);
+          expect(failure.error.startsWith("Quota parse failed: invalid status 'xxx")).toBe(true);
+          expect(failure.responseHead).toHaveLength(400);
+          expect(failure.finishReason).toBeUndefined();
+        }
+      });
+
+      it("adds nothing when the first attempt succeeds", async () => {
+        mockGenerateContent.mockResolvedValueOnce(goodReply);
+
+        const parsed = await parseClaudeQuota("Weekly usage: 40%", "test-key");
+
+        expect(parsed.status).toBe("available");
+        expect(parsed).not.toHaveProperty("extractionFailures");
+      });
+    });
+
     describe("runaway percentage output (#775)", () => {
       function lastCallConfig(): {
         maxOutputTokens?: number;
@@ -3158,6 +3260,12 @@ describe("quota MCP server", () => {
         const carried = await service.getQuota("claude");
         expect(mockGenerateContent).toHaveBeenCalledTimes(2);
         expect(carried.status).toBe("available");
+        // The failed cycle carries the old windows and its own attempt
+        // diagnostics; the recovered cycle below drops them (#774).
+        expect(carried.extractionFailures?.map((f) => [f.attempt, f.finishReason])).toEqual([
+          [1, "MAX_TOKENS"],
+          [2, "MAX_TOKENS"],
+        ]);
         expect(carried.limits).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -3174,6 +3282,7 @@ describe("quota MCP server", () => {
         expect(mockGenerateContent).toHaveBeenCalledTimes(3);
         expect(recovered.status).toBe("available");
         expect(recovered.scrapedAt).toBe("2030-01-01T01:00:00.000Z");
+        expect(recovered).not.toHaveProperty("extractionFailures");
         expect(recovered.limits).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
