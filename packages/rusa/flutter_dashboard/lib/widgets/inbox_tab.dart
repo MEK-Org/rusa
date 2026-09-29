@@ -72,7 +72,9 @@ class _InboxTabState extends State<InboxTab> {
     final waitingObligations = obligationPage.obligations
         .where((o) => o.isWaiting)
         .toList();
-    final scheduledObligations = scheduledPage.obligations.toList()
+    final scheduledObligations = scheduledPage.obligations
+        .where((o) => o.isScheduled)
+        .toList()
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
 
     // Fetch blockers for waiting obligations

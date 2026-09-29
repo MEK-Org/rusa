@@ -1921,11 +1921,11 @@ class ObligationDto {
     return rest.isEmpty ? null : rest;
   }
 
-  bool get isReady => status == 'ready';
-  bool get isWaiting => status == 'waiting';
+  bool get isReady => status == 'ready' && !isSnoozed;
+  bool get isWaiting => (status == 'waiting' || isSnoozed) && !isTerminal;
   bool get isDone => status == 'done';
   bool get isCancelled => status == 'cancelled';
-  bool get isScheduled => status == 'scheduled';
+  bool get isScheduled => status == 'scheduled' && !isSnoozed;
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
   bool get isSnoozed => snoozedUntil != null;
@@ -1938,10 +1938,14 @@ class ObligationDto {
   /// run is being worked right now. Terminal, scheduled, and waiting
   /// statuses represent durable lifecycle states (completed, cancelled,
   /// scheduled for future execution, or waiting on dependencies/blockers)
-  /// that are not overridden by a run focus.
+  /// that are not overridden by a run focus. A snoozed obligation is
+  /// considered in status waiting (intentionally deferred until its deadline).
   ObligationPresentationState presentationState({
     required bool activelyWorked,
   }) {
+    if (isSnoozed) {
+      return ObligationPresentationState.waiting;
+    }
     final base = ObligationPresentationState.fromStatus(status);
     if (activelyWorked && base == ObligationPresentationState.ready) {
       return ObligationPresentationState.active;

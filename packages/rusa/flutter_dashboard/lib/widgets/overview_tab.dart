@@ -73,6 +73,8 @@ class _OverviewTabState extends State<OverviewTab> {
     final ready = owned.where((o) => o.isReady).toList();
     final waiting = owned.where((o) => o.isWaiting).toList();
     final scheduled = merge(results.skip(ownerIds.length))
+        .where((o) => o.isScheduled)
+        .toList()
       ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
     final blockers = await Future.wait(
       waiting.map((o) => api.fetchObligationDetail(o.id)),

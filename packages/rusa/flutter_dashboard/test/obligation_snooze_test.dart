@@ -45,17 +45,68 @@ void main() {
     expect(snoozeLabel(child), endsWith('; still blocks its parent'));
   });
 
+  test('ObligationDto considers a snoozed obligation as waiting', () {
+    final snoozed = makeObligation(
+      'ob-snoozed',
+      status: 'ready',
+      snoozedUntil: '2026-09-30T00:00:00.000Z',
+    );
+    expect(snoozed.isReady, isFalse);
+    expect(snoozed.isWaiting, isTrue);
+    expect(snoozed.isScheduled, isFalse);
+    expect(
+      snoozed.presentationState(activelyWorked: false),
+      ObligationPresentationState.waiting,
+    );
+    expect(
+      snoozed.presentationState(activelyWorked: true),
+      ObligationPresentationState.waiting,
+    );
+
+    final snoozedScheduled = makeObligation(
+      'ob-snoozed-sched',
+      status: 'scheduled',
+      snoozedUntil: '2026-09-30T00:00:00.000Z',
+    );
+    expect(snoozedScheduled.isReady, isFalse);
+    expect(snoozedScheduled.isWaiting, isTrue);
+    expect(snoozedScheduled.isScheduled, isFalse);
+    expect(
+      snoozedScheduled.presentationState(activelyWorked: false),
+      ObligationPresentationState.waiting,
+    );
+
+    final plainReady = makeObligation('ob-ready', status: 'ready');
+    expect(plainReady.isReady, isTrue);
+    expect(plainReady.isWaiting, isFalse);
+    expect(
+      plainReady.presentationState(activelyWorked: false),
+      ObligationPresentationState.ready,
+    );
+    expect(
+      plainReady.presentationState(activelyWorked: true),
+      ObligationPresentationState.active,
+    );
+  });
+
   testWidgets(
-    'Inbox shows a snoozed row as deferred and a snoozed blocker with its deadline',
+    'Inbox moves a snoozed obligation down to the waiting obligations section',
     (tester) async {
       final until = DateTime.now()
           .toUtc()
           .add(const Duration(days: 2))
           .toIso8601String();
+      final activeReady = makeObligation(
+        'ob-active-ready',
+        ownerId: 'actor-a',
+        intent: 'Active ready work',
+        status: 'ready',
+      );
       final snoozedReady = makeObligation(
         'ob-snoozed',
         ownerId: 'actor-a',
         intent: 'Deferred review',
+        status: 'ready',
         snoozedUntil: until,
       );
       final parent = makeObligation(
@@ -73,7 +124,7 @@ void main() {
       );
 
       final api = FakeApi()
-        ..obligationsResult = [snoozedReady, parent, snoozedChild]
+        ..obligationsResult = [activeReady, snoozedReady, parent, snoozedChild]
         ..inboxResultsByStatus['unhandled'] = {'entries': []}
         ..inboxResultsByStatus['handled'] = {'entries': []};
       final store = DashboardStore(
@@ -84,6 +135,14 @@ void main() {
       );
 
       await pumpInbox(tester, store);
+
+      // Ready Obligations section has only the active ready work.
+      expect(find.text('Ready Obligations'), findsOneWidget);
+      expect(find.text('1 ready'), findsOneWidget);
+
+      // Waiting Obligations section includes both the snoozed obligation and the parent.
+      expect(find.text('Waiting Obligations'), findsOneWidget);
+      expect(find.text('2 waiting'), findsOneWidget);
 
       expect(find.textContaining('Intentionally deferred until'), findsOneWidget);
       expect(
