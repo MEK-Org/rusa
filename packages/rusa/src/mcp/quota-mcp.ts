@@ -916,6 +916,14 @@ export async function parseKimiQuota(
 }
 
 /**
+ * Whether a bad read may carry this previous window forward. Model-scoped
+ * windows carry only for Claude, whose Fable window #763 asked to keep.
+ */
+function carriesBadReadWindow(provider: string, limit: QuotaLimit): boolean {
+  return isProviderScopedWindow(limit) || provider === "claude";
+}
+
+/**
  * Derive effective/inferred quota state from raw parser output .
  *
  * Rules:
@@ -952,12 +960,14 @@ export function inferQuotaState(
   // Step 1: Bad read full-fallback (Rule: carried_forward_bad_read)
   // If the whole current parse returned status unknown or empty limits (bad read),
   // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso (#763).
-  // Model-scoped windows (e.g. Fable) are preserved with their original observed time and provenance.
+  // Claude's model-scoped windows (e.g. Fable) are preserved with their original observed time
+  // and provenance; other providers carry provider-scoped windows only.
   // Provider availability is derived strictly from provider-scoped windows: model-only readings
   // must never promote provider status to available/exhausted.
   if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
     const activeUnexpiredLimits = prevState.limits
       .filter((limit) => {
+        if (!carriesBadReadWindow(rawState.provider, limit)) return false;
         if (!limit.resetAtIso) return false;
         const resetMs = Date.parse(limit.resetAtIso);
         if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
@@ -1170,6 +1180,7 @@ export class QuotaService {
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
+            carriesBadReadWindow(provider, l) &&
             l.resetAtIso &&
             Date.parse(l.resetAtIso) > Date.parse(scrapedAt) &&
             !prevState.explanations?.some(

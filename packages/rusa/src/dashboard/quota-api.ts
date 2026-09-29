@@ -470,8 +470,9 @@ function latestStateFromHistory(
   // Carried windows keep their original observation time (#763), so one read
   // can leave windows at different ages. Keep the newest point per window; an
   // older window survives only while its known reset is still ahead, the same
-  // rule the live bad-read carry applies. Window identity matches the store's
-  // lane (scope, kind, models); labels vary run to run and are not identity.
+  // rule the live bad-read carry applies (model windows for Claude only).
+  // Window identity matches the store's lane (scope, kind, models); labels
+  // vary run to run and are not identity.
   const newestPerWindow = new Map<string, QuotaHistorySource>();
   for (const point of eligible) {
     const key = [point.scope, point.kind, ...[...(point.models ?? [])].sort()].join("\u0000");
@@ -482,6 +483,7 @@ function latestStateFromHistory(
   }
   const latest = [...newestPerWindow.values()].filter((point) => {
     if (point.observedAt === latestObservedAt) return true;
+    if (point.scope !== "provider" && provider !== "claude") return false;
     const resetMs = point.resetAtIso === null ? Number.NaN : Date.parse(point.resetAtIso);
     return Number.isFinite(resetMs) && resetMs > nowMs;
   });

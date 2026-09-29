@@ -2933,13 +2933,7 @@ describe("quota MCP server", () => {
 
         await expect(service.getQuota("codex")).resolves.toMatchObject({
           status: "unknown",
-          limits: [
-            expect.objectContaining({
-              label: "Spark weekly",
-              scope: { provider: "codex", models: ["gpt-spark"] },
-              scrapedAt: "2030-01-01T00:00:00.000Z",
-            }),
-          ],
+          limits: undefined,
         });
       });
 
@@ -3973,6 +3967,35 @@ describe("quota MCP server", () => {
             window: "Fable weekly",
           }),
         ]);
+      });
+
+      it("carried_forward_bad_read: carries only provider windows for providers other than Claude", () => {
+        const t0Iso = "2026-08-20T10:00:00.000Z";
+        const t1Iso = "2026-08-20T12:00:00.000Z";
+        const resetAtIso = "2026-08-27T10:00:00.000Z";
+        for (const provider of ["codex", "agy", "kimi"]) {
+          const result = inferQuotaState(
+            { provider, status: "unknown", scrapedAt: t1Iso, limits: [] },
+            {
+              provider,
+              status: "available",
+              scrapedAt: t0Iso,
+              limits: [
+                { label: "Weekly", kind: "weekly", percentLeft: 60, resetAtIso },
+                {
+                  label: "Model weekly",
+                  kind: "weekly",
+                  percentLeft: 80,
+                  resetAtIso,
+                  scope: { provider, models: ["some-model"] },
+                },
+              ],
+            },
+            t1Iso
+          );
+          expect(result.status).toBe("available");
+          expect(result.limits?.map((l) => l.label)).toEqual(["Weekly"]);
+        }
       });
 
       it("carried_forward_bad_read: carries forward unexpired resetAtIso when subsequent parse misses reset timestamp for an active window ", () => {

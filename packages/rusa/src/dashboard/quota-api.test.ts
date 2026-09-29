@@ -649,6 +649,33 @@ describe("dashboard quota snapshot", () => {
       ]);
     });
 
+    it("history fallback keeps older model points for Claude only", async () => {
+      const now = Date.parse("2026-09-28T15:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "codex", status: "unknown" }),
+        providers: ["codex"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["gpt-spark"],
+            label: "Spark weekly",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+            resetAtIso: "2026-10-01T00:00:00.000Z",
+          }),
+          historyPoint({
+            observedAt: "2026-09-28T14:00:00.000Z",
+            percentLeft: 60,
+          }),
+        ],
+      });
+      const codex = snapshot.providers[0];
+
+      expect(codex.status).toBe("available");
+      expect(codex.modelWindows ?? []).toEqual([]);
+    });
+
     it("history fallback treats one lane read under two labels as a single window", async () => {
       const now = Date.parse("2026-09-28T15:00:00.000Z");
       const snapshot = await buildQuotaSnapshot({
