@@ -4,7 +4,7 @@ import { Actor } from "../../actor/actor.js";
 import { ActorMesh } from "../../actor/actor-mesh.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
-import type { InboxEntry } from "../../repositories/inbox-repository.js";
+import type { InboxEntry, InboxPayload } from "../../repositories/inbox-repository.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
@@ -528,5 +528,107 @@ describe("SqliteInboxRepository", () => {
       ).handled_at
     ).toBe("2026-07-13T12:00:00.000Z");
     vi.useRealTimers();
+  });
+
+  describe("replaceEntries (#748)", () => {
+    const entry = (id: string, actorId = "actor-a") => ({
+      id,
+      actorId,
+      source: "chat",
+      payload: { type: "message.created" },
+    });
+
+    it("atomically marks entries handled with audit note and appends replacements", () => {
+      store.append([entry("orig-1"), entry("orig-2")]);
+      const appendedListener = vi.fn();
+      store.onItemsAppended(appendedListener);
+
+      const result = store.replaceEntries("actor-a", ["orig-1"], "released for re-handling", [
+        entry("orig-1-replacement"),
+      ]);
+
+      expect(result.handled).toEqual([
+        {
+          id: "orig-1",
+          handledAt: new Date("2026-07-13T12:00:00.000Z"),
+          alreadyHandled: false,
+        },
+      ]);
+      expect(result.replacements).toHaveLength(1);
+      expect(result.replacements[0].id).toBe("orig-1-replacement");
+
+      // Original is handled with note
+      const orig = store.read("actor-a", "orig-1");
+      expect(orig?.handledAt).toEqual(new Date("2026-07-13T12:00:00.000Z"));
+      expect(orig?.handledNote).toBe("released for re-handling");
+
+      // Untouched entry remains unhandled
+      expect(store.read("actor-a", "orig-2")?.handledAt).toBeNull();
+
+      // Replacement is inserted and unhandled
+      const repl = store.read("actor-a", "orig-1-replacement");
+      expect(repl?.handledAt).toBeNull();
+      expect(repl?.seenAt).toBeNull();
+
+      // Advisory notification received the inserted replacement
+      expect(appendedListener).toHaveBeenCalledTimes(1);
+      expect(appendedListener).toHaveBeenCalledWith(result.replacements);
+    });
+
+    it("rolls back the handled mark when a replacement insert conflicts inside the transaction", () => {
+      store.append([entry("orig-1"), entry("orig-2")]);
+      const appendedListener = vi.fn();
+      store.onItemsAppended(appendedListener);
+
+      // Reusing an existing id passes validation, so the UPDATE runs inside the
+      // transaction before ON CONFLICT DO NOTHING inserts 0 rows and throws.
+      expect(() =>
+        store.replaceEntries("actor-a", ["orig-1"], "released for re-handling", [entry("orig-2")])
+      ).toThrow("failed to insert all replacement inbox entries");
+
+      const orig = store.read("actor-a", "orig-1");
+      expect(orig?.handledAt).toBeNull();
+      expect(orig?.handledNote).toBeNull();
+      expect(store.read("actor-a", "orig-2")?.handledAt).toBeNull();
+      expect(appendedListener).not.toHaveBeenCalled();
+    });
+
+    it("rejects an invalid replacement payload before touching the originals", () => {
+      store.append([entry("orig-1")]);
+      const appendedListener = vi.fn();
+      store.onItemsAppended(appendedListener);
+
+      // Payload validation runs before the transaction opens.
+      expect(() =>
+        store.replaceEntries("actor-a", ["orig-1"], "released for re-handling", [
+          {
+            actorId: "actor-a",
+            source: "chat",
+            payload: "invalid-not-an-object" as unknown as InboxPayload,
+          },
+        ])
+      ).toThrow(/inbox payload must be an object/i);
+
+      // The original entry was NOT marked handled — it remains unhandled
+      const orig = store.read("actor-a", "orig-1");
+      expect(orig?.handledAt).toBeNull();
+      expect(orig?.handledNote).toBeNull();
+
+      // No listeners were called
+      expect(appendedListener).not.toHaveBeenCalled();
+    });
+
+    it("rejects when target entry is not found and rolls back any insertions", () => {
+      store.append([entry("orig-1")]);
+      const appendedListener = vi.fn();
+      store.onItemsAppended(appendedListener);
+
+      expect(() =>
+        store.replaceEntries("actor-a", ["non-existent-id"], "released", [entry("repl-1")])
+      ).toThrow("inbox entry not found");
+
+      expect(store.read("actor-a", "repl-1")).toBeNull();
+      expect(appendedListener).not.toHaveBeenCalled();
+    });
   });
 });

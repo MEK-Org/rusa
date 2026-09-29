@@ -673,6 +673,90 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
+    "release_selection_lock",
+    {
+      title: "Release inbox selection lock for a child thread",
+      description:
+        "Release the selection lock on exhausted inbox entries for a child thread after " +
+        "investigating why recovery exhausted. This marks the exhausted entries handled " +
+        "and appends fresh replacement entries so the work returns to ordinary unhandled " +
+        "work for the child. Available only to the child's parent, and scoped exclusively " +
+        "to unhandled entries that exhausted bounded recovery.",
+      inputSchema: {
+        thread_id: z
+          .string()
+          .min(1)
+          .describe("The child thread whose exhausted inbox entries are being released."),
+        entry_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .describe("The exhausted inbox entry IDs to release."),
+        note: z
+          .string()
+          .trim()
+          .min(1, {
+            error:
+              "note cannot be empty — explain why these inbox items are being released for re-handling.",
+          })
+          .max(2_000)
+          .describe("An explanation of why this inbox item is being released for re-handling."),
+      },
+    },
+    async ({ thread_id, entry_ids, note }) => {
+      try {
+        const result = mesh.releaseChildInboxSelectionLock(selfId, thread_id, entry_ids, note);
+        options?.onWrite?.();
+        return toolOk(result);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "mark_exhausted_inbox_handled",
+    {
+      title: "Mark exhausted child inbox entries handled",
+      description:
+        "Mark exhausted inbox entries handled on behalf of a child thread with an audit note, " +
+        "after investigating and confirming the work was in fact dealt with. Available only to " +
+        "the child's parent, and scoped exclusively to entries that exhausted bounded recovery.",
+      inputSchema: {
+        thread_id: z
+          .string()
+          .min(1)
+          .describe("The child thread whose exhausted inbox entries are being marked handled."),
+        entry_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .describe("The exhausted inbox entry IDs to mark handled."),
+        note: z
+          .string()
+          .trim()
+          .min(1, {
+            error:
+              "note cannot be empty — explain how this inbox item was handled or why no action was needed.",
+          })
+          .max(2_000)
+          .describe(
+            "An explanation of how this inbox item was handled or why no action was needed."
+          ),
+      },
+    },
+    async ({ thread_id, entry_ids, note }) => {
+      try {
+        const result = mesh.markChildInboxHandled(selfId, thread_id, entry_ids, note);
+        options?.onWrite?.();
+        return toolOk(result);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
     "delegate_event_source",
     {
       title: "Delegate event source to an actor",
@@ -744,7 +828,7 @@ export function createAgentExecMcpServer(
     {
       title: "Set an event source's configuration",
       description:
-        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, and null restores its built-in default.",
+        "Replace the configuration object on an event source whose active exact ownership row is yours, or pass null to clear it. Configuration does not materialize a source or change routing: use exact-source delegation or reclaim to establish the row first. A live obligation claim does not grant access to another row's configuration. Consumer-specific keys apply from the next event; Google Chat wake mode uses { version: 1, chatWakeMode: 'mentions' | 'all' }, check-suite completion delivery uses { version: 1, checkSuiteCompletionMode: 'failures-only' | 'all-outcomes' }, and null restores built-in defaults.",
       inputSchema: {
         ...eventResourceInputSchema,
         config: z

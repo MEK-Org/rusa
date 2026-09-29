@@ -149,6 +149,7 @@ function setup(
      * id order to differ from spawn order has to name the ids itself.
      */
     idgen?: () => string;
+    completedFocusEntryCounts?: ActorMeshOptions["completedFocusEntryCounts"];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -170,6 +171,7 @@ function setup(
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      eventSourceConfigFor: (resource) => eventSourceOwners.getConfig(resource),
       findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
     },
@@ -198,6 +200,7 @@ function setup(
     eventSourceSubscriptions,
     eventManager,
     inboxStore,
+    completedFocusEntryCounts: opts.completedFocusEntryCounts,
     experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
@@ -682,7 +685,9 @@ describe("agent-execution MCP server", () => {
         "list_pending_messages",
         "list_subscriptions",
         "list_threads",
+        "mark_exhausted_inbox_handled",
         "reclaim_event_source",
+        "release_selection_lock",
         "reparent_thread",
         "retire_thread",
         "revive_thread",
@@ -953,7 +958,9 @@ describe("agent-execution MCP server", () => {
         "list_followers",
         "list_pending_messages",
         "list_threads",
+        "mark_exhausted_inbox_handled",
         "reclaim_event_source",
+        "release_selection_lock",
         "retire_thread",
         "revoke_capability",
         "send_message",
@@ -4701,5 +4708,166 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       tool?.inputSchema as { properties?: Record<string, { description?: string }> }
     )?.properties?.experiment;
     expect(experimentProp?.description).toMatch(/unregistered/i);
+  });
+
+  describe("exhausted inbox escalation tools (#748)", () => {
+    it("releases selection lock via release_selection_lock tool", async () => {
+      const countsMap = new Map([["item-1", 2]]);
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+      ]);
+
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+      const res = (await parentClient.callTool({
+        name: "release_selection_lock",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["item-1"],
+          note: "releasing for retry",
+        },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      const data = dataOf(res) as { released: string[]; replacements: string[] };
+      expect(data.released).toEqual(["item-1"]);
+      expect(data.replacements).toHaveLength(1);
+
+      const entry1 = inboxStore.read(child, "item-1");
+      expect(entry1?.handledAt).not.toBeNull();
+      expect(entry1?.handledNote).toBe(
+        `Released by parent (${parent}) for re-handling: releasing for retry`
+      );
+
+      const replacement = inboxStore.read(child, data.replacements[0]);
+      expect(replacement?.handledAt).toBeNull();
+      expect(replacement?.source).toBe("mesh:parent");
+      expect(replacement?.payload).toEqual({
+        type: "mesh.message",
+        messageId: "m1",
+        fromId: parent,
+      });
+    });
+
+    it("marks exhausted child entries handled with note via mark_exhausted_inbox_handled", async () => {
+      const countsMap = new Map([["item-1", 2]]);
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      inboxStore.append([
+        {
+          id: "item-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+        {
+          id: "item-2",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m2", fromId: parent },
+        },
+      ]);
+
+      const parentClient = await connect(createAgentExecMcpServer(mesh, parent, parent));
+
+      const res1 = (await parentClient.callTool({
+        name: "mark_exhausted_inbox_handled",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["item-1"],
+          note: "cleared after review",
+        },
+      })) as CallToolResult;
+
+      expect(res1.isError).toBeFalsy();
+      const data1 = dataOf(res1) as { handled: Array<{ id: string; handledAt: string }> };
+      expect(data1.handled).toHaveLength(1);
+      expect(data1.handled[0].id).toBe("item-1");
+
+      const entry1 = inboxStore.read(child, "item-1");
+      expect(entry1?.handledAt).not.toBeNull();
+      expect(entry1?.handledNote).toBe(
+        `Marked handled by parent (${parent}): cleared after review`
+      );
+      expect(inboxStore.read(child, "item-2")?.handledAt).toBeNull();
+    });
+
+    it("translates mesh authority errors to tool errors at MCP boundary", async () => {
+      const countsMap = new Map([["exhausted-1", 2]]);
+
+      const { mesh, inboxStore } = setup({
+        completedFocusEntryCounts: () => countsMap,
+      });
+
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const stranger = mesh.spawn({
+        charter: "stranger",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      inboxStore.append([
+        {
+          id: "exhausted-1",
+          actorId: child,
+          source: "mesh:parent",
+          payload: { type: "mesh.message", messageId: "m1", fromId: parent },
+        },
+      ]);
+
+      const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, stranger));
+
+      const strangerClear = (await strangerClient.callTool({
+        name: "release_selection_lock",
+        arguments: {
+          thread_id: child,
+          entry_ids: ["exhausted-1"],
+          note: "unauthorized release",
+        },
+      })) as CallToolResult;
+      expect(strangerClear.isError).toBe(true);
+      expect(JSON.stringify(strangerClear.content)).toMatch(/Only the parent thread/i);
+    });
   });
 });

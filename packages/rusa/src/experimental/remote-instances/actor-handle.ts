@@ -167,6 +167,8 @@ export class ActorHandle implements MeshActor {
    * and concurrency; a replacement admission re-enters both at the tail.
    */
   private retainedAdmission: { requestId: number; runId: string } | undefined;
+  /** A ticket dropped during a transport gap still owes its work a wake (#613). */
+  private redispatchOwed = false;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -295,6 +297,8 @@ export class ActorHandle implements MeshActor {
     });
     // An unhalt during the gap asked for a replay this channel can now carry.
     if (this.resumeCancelledPending) this.deliverResumeCancelled();
+    // A ticket dropped during the gap: this channel can carry its work's wake.
+    if (this.redispatchOwed) this.redispatchDroppedWork();
   }
 
   get isRunning(): boolean {
@@ -699,6 +703,39 @@ export class ActorHandle implements MeshActor {
     });
   }
 
+  /**
+   * Give up a retained ticket the follower did not reclaim. Its run is booked
+   * as never started, but the durable work it was admitted for is still
+   * unhandled and no delivery is coming to wake it, so ask the mesh to
+   * reconcile this actor's inbox, which re-derives existence and priority
+   * there (#613). Each drop needs a fresh transport loss to have retained the
+   * ticket, so this cannot cycle.
+   */
+  private async dropRetainedAdmission(): Promise<void> {
+    if (!this.retainedAdmission) return;
+    await this.cancelRetainedAdmission();
+    // The disconnected channel's ready is rejected, so a wake now would be
+    // dropped; attachHost delivers it on the channel that replaces this one.
+    if (this.closed) {
+      this.redispatchOwed = true;
+      return;
+    }
+    this.redispatchDroppedWork();
+  }
+
+  private redispatchDroppedWork(): void {
+    this.redispatchOwed = false;
+    try {
+      this.opts.context.mesh.reconcileActorInbox(this.id);
+    } catch (error) {
+      // A missed nudge over durable state; boot reconciliation still lists it.
+      this.log.warn("remote_redispatch_failed", {
+        actorId: this.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private enqueueReceive(message: ActorEvent): void {
     const run = () => {
       try {
@@ -913,7 +950,7 @@ export class ActorHandle implements MeshActor {
         // The first report after a reattach is the deadline for claiming a
         // retained ticket: whatever the follower holds now, it is not the run
         // that ticket was reserved for.
-        if (reattachReport) return this.cancelRetainedAdmission();
+        if (reattachReport) return this.dropRetainedAdmission();
         break;
       }
       case "preempted":
@@ -1209,7 +1246,7 @@ export class ActorHandle implements MeshActor {
                   // pacing released it into a dead channel) ends the run it held:
                   // nothing else is left to report that run's outcome.
                   if (this.retainedAdmission?.requestId === requestId) {
-                    void this.cancelRetainedAdmission();
+                    void this.dropRetainedAdmission();
                   }
                 });
               })();

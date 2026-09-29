@@ -1181,6 +1181,14 @@ class ChatPage {
   );
 }
 
+/// Fable's canonical IDs, as the Claude model catalog lists them and quota
+/// scopes record them (#728, #752).
+const kFableModelIds = {'claude-fable-5', 'claude-fable-5-1'};
+
+/// True when [modelIds] names Fable and nothing else.
+bool isFableModelScope(List<String> modelIds) =>
+    modelIds.isNotEmpty && modelIds.every(kFableModelIds.contains);
+
 /// One quota window from `GET /api/quota`.
 class QuotaWindowDto {
   const QuotaWindowDto({
@@ -1192,6 +1200,7 @@ class QuotaWindowDto {
     this.resetAtIso,
     this.windowMs = 0,
     this.scrapedAt,
+    this.modelIds = const [],
   });
 
   final String id;
@@ -1199,6 +1208,10 @@ class QuotaWindowDto {
   final double? usedPercent;
   final String status;
   final bool headline;
+
+  /// Canonical model IDs of a model-scoped window (#752); empty for the
+  /// provider's own windows.
+  final List<String> modelIds;
 
   /// Normalized absolute ISO-8601 instant for reset , when the
   /// backend's LLM parse could resolve or infer one.
@@ -1237,6 +1250,9 @@ class QuotaWindowDto {
     resetAtIso: j['resetAtIso'] as String?,
     windowMs: (j['windowMs'] as num?)?.toInt() ?? 0,
     scrapedAt: j['scrapedAt'] as String?,
+    modelIds: (j['modelIds'] as List<dynamic>? ?? const [])
+        .whereType<String>()
+        .toList(),
   );
 
   /// Inverse of [fromJson] — used to persist the last-known snapshot to
@@ -1252,6 +1268,7 @@ class QuotaWindowDto {
     'resetAtIso': resetAtIso,
     'windowMs': windowMs,
     'scrapedAt': scrapedAt,
+    if (modelIds.isNotEmpty) 'modelIds': modelIds,
   };
 }
 
@@ -1376,6 +1393,7 @@ class ProviderQuotaDto {
     required this.tier,
     required this.message,
     required this.windows,
+    this.modelWindows = const [],
     this.scrapedAt,
     this.throttle,
   });
@@ -1386,6 +1404,10 @@ class ProviderQuotaDto {
   final String? tier;
   final String? message;
   final List<QuotaWindowDto> windows;
+
+  /// Model-scoped windows (#752), kept apart from [windows] so a model's
+  /// allocation is never read as the provider's own.
+  final List<QuotaWindowDto> modelWindows;
 
   /// Same `scrapedAt` pass-through as `QuotaWindowDto`, mirrored at the
   /// provider level (ISSUE_NUM, ask 5).
@@ -1410,6 +1432,9 @@ class ProviderQuotaDto {
     windows: (j['windows'] as List<dynamic>? ?? const [])
         .map((e) => QuotaWindowDto.fromJson(e as Map<String, dynamic>))
         .toList(),
+    modelWindows: (j['modelWindows'] as List<dynamic>? ?? const [])
+        .map((e) => QuotaWindowDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
     scrapedAt: j['scrapedAt'] as String?,
     throttle: j['throttle'] is Map<String, dynamic>
         ? QuotaThrottleDto.fromJson(j['throttle'] as Map<String, dynamic>)
@@ -1423,6 +1448,7 @@ class ProviderQuotaDto {
     'tier': tier,
     'message': message,
     'windows': windows.map((w) => w.toJson()).toList(),
+    'modelWindows': modelWindows.map((w) => w.toJson()).toList(),
     'scrapedAt': scrapedAt,
     'throttle': throttle?.toJson(),
   };

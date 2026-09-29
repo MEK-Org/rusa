@@ -58,12 +58,19 @@ items. Use each candidate's identifiers to read its content from the source plus
 enough surrounding context to understand it. Do not infer content from metadata.
 After resolving candidates, coalesce related items, prioritize them, and choose a
 bounded work group with \`inbox.select\`. Pay attention to any \`hint\` returned on
-selected entries for channel-specific reply expectations or threading rules. Mark
-an entry handled only after you have actually dealt with it; \`mark_handled\`
-accepts only entries selected in this run. Leave deferred work unhandled. A
-successful provider return gets at most one durable recovery for selected,
-still-unhandled work; after that it remains visible as Needs attention until
-the operator handles it. Listed-but-unselected work does not consume or gain a
+selected entries for channel-specific reply expectations or threading rules.
+Act on each selected entry, then mark it handled in the same run with a note
+saying what you did. Handled means the notification was dealt with, not that the
+underlying issue or PR is finished; an inbox entry is not a timer for slow work.
+When CI, a build, a review, or another slow dependency still needs checking,
+schedule a follow-up wake for that check with a future \`deliver_at\` message to
+yourself (replies from actors you messaged still wake you on their own). For a
+PR awaiting CI or review: push and reply (act) → \`mark_handled\` with a note
+naming the pushed head → schedule a wake to check that head's Checks and review.
+\`mark_handled\` accepts only entries selected in this run. Leave deferred work
+unhandled. A successful provider return gets at most one durable recovery for
+selected, still-unhandled work; after that it remains visible as Needs attention
+until the operator handles it. Listed-but-unselected work does not consume or gain a
 recovery attempt.`;
 
 /**

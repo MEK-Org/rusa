@@ -76,6 +76,16 @@ export interface QuotaWindowDto {
   scrapedAt: string | null;
 }
 
+/**
+ * A model-scoped window (#752), e.g. Claude's "Current week (Fable)". Carried
+ * apart from the provider's own `windows` so no consumer can read a model's
+ * allocation as the provider-wide one; `modelIds` is the scope's canonical
+ * configured model IDs, never inferred from the display label.
+ */
+export interface QuotaModelWindowDto extends QuotaWindowDto {
+  modelIds: string[];
+}
+
 export interface ProviderQuotaDto {
   provider: SupportedProvider;
   status: "available" | "exhausted" | "unknown" | "unsupported";
@@ -85,6 +95,8 @@ export interface ProviderQuotaDto {
   message: string | null;
   /** Flat provider quota windows. */
   windows: QuotaWindowDto[];
+  /** Model-scoped windows with a known model identity, in snapshot order. */
+  modelWindows: QuotaModelWindowDto[];
   /** Same `scrapedAt` pass-through as `QuotaWindowDto`, mirrored at the provider level. */
   scrapedAt: string | null;
   /** Latest closed-loop throttle decision, or null when quota throttling is disabled/unavailable. */
@@ -268,6 +280,34 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
   return [];
 }
 
+/**
+ * The snapshot's model-scoped windows that name their models. A legacy
+ * `"model"` row names none, so it cannot be attributed to any model and is
+ * dropped here as it is from the provider's own windows.
+ */
+function modelWindowsFor(state: ProviderQuotaSnapshot): QuotaModelWindowDto[] {
+  const scrapedAt = state.scrapedAt ?? null;
+  return (state.limits ?? []).flatMap((limit) => {
+    const modelIds =
+      typeof limit.scope === "object" && limit.scope !== null ? (limit.scope.models ?? []) : [];
+    if (modelIds.length === 0) return [];
+    const { id, isWeekly } = windowIdentity(limit.kind);
+    return [
+      {
+        id,
+        label: limit.label,
+        usedPercent: 100 - limit.percentLeft,
+        status: limit.percentLeft <= 0 ? "exhausted" : "available",
+        resetAtIso: limit.resetAtIso ?? null,
+        headline: isWeekly,
+        windowMs: windowMsFor(id),
+        scrapedAt,
+        modelIds: [...modelIds],
+      },
+    ];
+  });
+}
+
 function toProviderDto(
   provider: SupportedProvider,
   state: ProviderQuotaSnapshot,
@@ -290,6 +330,7 @@ function toProviderDto(
     tier: null,
     message: state.message ?? null,
     windows,
+    modelWindows: modelWindowsFor(state),
     scrapedAt: state.scrapedAt ?? null,
     throttle,
   };
@@ -433,7 +474,12 @@ function latestStateFromHistory(
     limits: latest.map((point) => ({
       label: point.label,
       kind: point.kind as "session" | "five_hour" | "weekly" | "other",
-      scope: point.scope,
+      // Model rows keep their canonical IDs so the fallback serves the same
+      // model windows a live read would (#752).
+      scope:
+        point.scope === "model" && point.models && point.models.length > 0
+          ? { provider, models: [...point.models] }
+          : point.scope,
       percentLeft: point.percentLeft,
       resetAtIso: point.resetAtIso ?? undefined,
     })),

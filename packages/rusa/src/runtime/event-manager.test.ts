@@ -113,6 +113,10 @@ class FakeInboxStore implements InboxRepository {
   markHandled(): MarkHandledResult[] {
     return [];
   }
+
+  replaceEntries(): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
+    return { handled: [], replacements: [] };
+  }
 }
 
 function createRoutingKernel(opts: {
@@ -128,6 +132,7 @@ function createRoutingKernel(opts: {
       isLive: opts.isLive ?? (() => true),
       activeDelegationsFor: (resource) => opts.owners.activeForResource(resource),
       directSubscribersFor: (resource) => opts.subscriptions.subscribersOf(resource),
+      eventSourceConfigFor: (resource) => opts.owners.getConfig(resource),
       findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: opts.resolveActor,
     },
@@ -149,6 +154,7 @@ describe("EventManager", () => {
     const inbox = new FakeInboxStore();
     const resolver: EventRoutingKernel = {
       resolveOwner: unusedLadder,
+      allOutcomesCheckSuiteOwners: () => [],
       resolveRecipients: () => ({ directed: false, ownerIds: ["root"], subscriberIds: [] }),
     };
     const manager = new EventManager({ inboxStore: inbox, resolver });
@@ -170,6 +176,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-gh"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -211,6 +218,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-pr"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -241,6 +249,7 @@ describe("EventManager", () => {
         inboxStore: inbox,
         resolver: {
           resolveOwner: unusedLadder,
+          allOutcomesCheckSuiteOwners: () => [],
           resolveRecipients: () => {
             resolved = true;
             return { directed: false, ownerIds: ["actor-ci"], subscriberIds: [] };
@@ -265,10 +274,271 @@ describe("EventManager", () => {
       expect(inbox.entries).toEqual([]);
     });
 
+    it("quietly drops a completed quiet check suite even when repository cannot be resolved", async () => {
+      const inbox = new FakeInboxStore();
+      const logs: string[] = [];
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: {
+          resolveOwner: unusedLadder,
+          allOutcomesCheckSuiteOwners: () => [],
+          resolveRecipients: unusedLadder,
+        },
+        log: (msg) => logs.push(msg),
+      });
+
+      const { entries } = await em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            check_suite: { id: 1, conclusion: "success" },
+          },
+        },
+      });
+
+      expect(entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+      expect(logs.some((msg) => msg.includes("non-actionable check suite dropped"))).toBe(true);
+    });
+
+    it("delivers a green suite only to an opted-in covering source owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      owners.setConfig(
+        pullRequest,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "failures-only" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        idempotencyKey: "green-suite-on-coder-pr",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 746, conclusion: "success", pull_requests: [{ number: 746 }] },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual([]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
+      expect(inbox.entries[0]?.payload.deliveryRole).toBe("subscriber");
+      expect(inbox.list("coder").entries).toEqual([]);
+    });
+
+    it("uses the opt-in for branch fallback once, then restores the quiet default when cleared", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+      const greenBranchSuite: RawIntegrationEvent = {
+        sourceType: "github",
+        idempotencyKey: "green-branch-suite",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 747, conclusion: "success", head_branch: "staging" },
+          },
+        },
+      };
+
+      expect(
+        manager.handleExternalEvent(greenBranchSuite).entries.map((entry) => entry.actorId)
+      ).toEqual(["steward"]);
+      expect(manager.handleExternalEvent(greenBranchSuite).entries).toEqual([]);
+
+      owners.setConfig(repository, null);
+      const afterClear = manager.handleExternalEvent({
+        ...greenBranchSuite,
+        idempotencyKey: "green-branch-suite-after-clear",
+      });
+      expect(afterClear.entries).toEqual([]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
+    });
+
+    it("preserves normal red routing and adds one advisory copy for an opted-in repo owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 746, conclusion: "failure", pull_requests: [{ number: 746 }] },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["coder"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder", "steward"]);
+      expect(inbox.entries[0]?.payload.deliveryRole).toBe("owner");
+      expect(inbox.entries[1]?.payload.deliveryRole).toBe("subscriber");
+      expect(inbox.list("coder").entries).toHaveLength(1);
+      expect(inbox.list("steward").entries).toHaveLength(1);
+    });
+
+    it("preserves normal unknown routing and adds one advisory copy for an opted-in repo owner", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: {
+              id: 747,
+              conclusion: "future_provider_conclusion",
+              pull_requests: [{ number: 746 }],
+            },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["coder"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["coder", "steward"]);
+      expect(inbox.entries.map((entry) => entry.payload.deliveryRole)).toEqual([
+        "owner",
+        "subscriber",
+      ]);
+    });
+
+    it("delivers a red suite once to an opted-in owner that is already accountable", async () => {
+      const inbox = new FakeInboxStore();
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const manager = new EventManager({
+        inboxStore: inbox,
+        resolver: createRoutingKernel({ owners, subscriptions }),
+      });
+
+      const delivery = manager.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 748, conclusion: "failure", head_branch: "staging" },
+          },
+        },
+      });
+
+      expect(delivery.ownerIds).toEqual(["steward"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["steward"]);
+      expect(inbox.entries[0]?.payload.deliveryRole).toBe("owner");
+    });
+
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-chat"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -303,6 +573,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-timer"],
@@ -332,6 +603,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-timer"],
@@ -359,6 +631,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-timer"],
@@ -393,6 +666,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-custom"],
@@ -418,6 +692,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-ci"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -463,6 +738,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-actor"],
@@ -486,6 +762,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-actor"],
@@ -508,6 +785,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: [], subscriberIds: ["sub-1"] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -526,6 +804,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-both"],
@@ -550,6 +829,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({ directed: false, ownerIds: [], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -713,6 +993,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-idemp"],
@@ -743,6 +1024,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-quiet"],
@@ -768,6 +1050,61 @@ describe("EventManager", () => {
   });
 
   describe("HierarchicalEventSourceResolver", () => {
+    it("walks ancestors and returns live unique owners of all-outcomes sources", () => {
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      const pullRequest = `${repository}/pulls/746`;
+      owners.subscribe({
+        resource: repository,
+        actorId: "steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "coder",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      owners.setConfig(
+        pullRequest,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "failures-only" })
+      );
+      const resolver = createRoutingKernel({ owners, subscriptions });
+
+      expect(resolver.allOutcomesCheckSuiteOwners(pullRequest)).toEqual(["steward"]);
+      expect(resolver.allOutcomesCheckSuiteOwners(repository)).toEqual(["steward"]);
+      expect(resolver.allOutcomesCheckSuiteOwners("github:MEK-Org/other-repo")).toEqual([]);
+    });
+
+    it("filters out non-live source owners from allOutcomesCheckSuiteOwners", () => {
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const repository = "github:MEK-Org/rusa";
+      owners.subscribe({
+        resource: repository,
+        actorId: "dead-steward",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-28T00:00:00Z",
+      });
+      owners.setConfig(
+        repository,
+        JSON.stringify({ version: 1, checkSuiteCompletionMode: "all-outcomes" })
+      );
+      const resolver = createRoutingKernel({
+        owners,
+        subscriptions,
+        isLive: (id) => id !== "dead-steward",
+      });
+
+      expect(resolver.allOutcomesCheckSuiteOwners(repository)).toEqual([]);
+    });
+
     it("keeps issue-only obligation governance inside the shared kernel", () => {
       const owners = new InMemoryEventSourceOwnerStore();
       const subscriptions = new InMemoryEventSourceSubscriptionStore();
@@ -1025,6 +1362,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-self"],
@@ -1050,6 +1388,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-1"],
@@ -1204,6 +1543,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1", "owner-2"],
@@ -1237,6 +1577,7 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1"],
@@ -1265,6 +1606,7 @@ describe("EventManager", () => {
       const inbox = new StrayingInboxStore();
       const resolver: EventRoutingKernel = {
         resolveOwner: unusedLadder,
+        allOutcomesCheckSuiteOwners: () => [],
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1"],

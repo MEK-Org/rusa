@@ -135,6 +135,18 @@ export interface InboxRepository {
     handledNote?: string
   ): MarkHandledResult[];
   /**
+   * Atomically mark exhausted entries handled with an attributed audit note
+   * and insert replacement entries for re-handling in a single atomic transaction.
+   * If insertion fails, the original entries remain unhandled and no rows are modified.
+   */
+  replaceEntries(
+    actorId: string,
+    entryIds: string[],
+    handledNote: string,
+    replacements: InboxAppendInput[],
+    at?: Date
+  ): { handled: MarkHandledResult[]; replacements: InboxEntry[] };
+  /**
    * Activity-feed projection of individual durable handled rows, newest first.
    * A handled timestamp or note is not a durable batch identity, so callers
    * receive each item separately rather than a guessed coalesced group.
@@ -200,6 +212,15 @@ export class EmptyInboxRepository implements InboxRepository {
     _handledNote?: string
   ): MarkHandledResult[] {
     return [];
+  }
+  replaceEntries(
+    _actorId: string,
+    _entryIds: string[],
+    _handledNote: string,
+    _replacements: InboxAppendInput[],
+    _at?: Date
+  ): { handled: MarkHandledResult[]; replacements: InboxEntry[] } {
+    return { handled: [], replacements: [] };
   }
   listRecentHandledEntries(_limit = 50): InboxEntry[] {
     return [];

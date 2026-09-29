@@ -2377,6 +2377,7 @@ async function composeStart(
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      eventSourceConfigFor: (resource) => eventSourceOwners.getConfig(resource),
       findLiveObligationByExternalRef: (ref) =>
         getRepositories().obligations.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
@@ -3113,7 +3114,6 @@ async function composeStart(
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         let localActor: Actor | undefined;
         const actorOptions: ActorOptions = {
           id,
@@ -3237,6 +3237,7 @@ async function composeStart(
           actorOptions,
           driver: createWorkerActor ? (options) => createWorkerActor(ctx, options) : undefined,
         });
+        addRunLifecycleListeners(ctx.lifecycle, id, modelConfigPool[0]);
         if (actor instanceof Actor) localActor = actor;
         liveWorkerMcp.set(id, workerMcp);
         return actor;

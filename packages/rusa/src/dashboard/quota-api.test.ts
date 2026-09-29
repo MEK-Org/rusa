@@ -452,6 +452,126 @@ describe("dashboard quota snapshot", () => {
     expect(codex?.usedPercent).toBe(7);
   });
 
+  describe("model-scoped windows (#752)", () => {
+    const claudeWithFable: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: "2026-09-28T13:00:00.000Z",
+      limits: [
+        {
+          label: "Current session",
+          kind: "session",
+          percentLeft: 80,
+          scope: { provider: "claude" },
+        },
+        {
+          label: "Current week (all models)",
+          kind: "weekly",
+          percentLeft: 60,
+          resetAtIso: "2026-10-01T18:00:00.000Z",
+          scope: { provider: "claude" },
+        },
+        {
+          label: "Current week (Fable)",
+          kind: "weekly",
+          percentLeft: 25,
+          resetAtIso: "2026-10-02T09:00:00.000Z",
+          scope: { provider: "claude", models: ["claude-fable-5-1"] },
+        },
+      ],
+    };
+
+    it("serves the model's weekly separately from the provider's own windows", async () => {
+      const { deps } = fakeDeps({ claude: claudeWithFable });
+      const snapshot = await buildQuotaSnapshot({ ...deps, providers: ["claude"] });
+      const claude = snapshot.providers[0];
+
+      expect(claude.windows.map((w) => w.label)).toEqual([
+        "Current session",
+        "Current week (all models)",
+      ]);
+      expect(claude.usedPercent).toBe(40);
+      expect(claude.modelWindows).toEqual([
+        {
+          id: "weekly",
+          label: "Current week (Fable)",
+          usedPercent: 75,
+          status: "available",
+          resetAtIso: "2026-10-02T09:00:00.000Z",
+          headline: true,
+          windowMs: WEEK_MS,
+          scrapedAt: "2026-09-28T13:00:00.000Z",
+          modelIds: ["claude-fable-5-1"],
+        },
+      ]);
+    });
+
+    it("never substitutes the model's weekly for a missing provider weekly", async () => {
+      const { deps } = fakeDeps({
+        claude: {
+          ...claudeWithFable,
+          limits: claudeWithFable.limits?.filter(
+            (limit) => limit.label !== "Current week (all models)"
+          ),
+        },
+      });
+      const snapshot = await buildQuotaSnapshot({ ...deps, providers: ["claude"] });
+      const claude = snapshot.providers[0];
+
+      expect(claude.windows.map((w) => w.id)).toEqual(["session"]);
+      expect(claude.usedPercent).toBeNull();
+      expect(claude.modelWindows.map((w) => w.usedPercent)).toEqual([75]);
+    });
+
+    it("serves no model window when the snapshot has none", async () => {
+      const { deps } = fakeDeps({ claude: claudeState });
+      const snapshot = await buildQuotaSnapshot({ ...deps, providers: ["claude"] });
+
+      expect(snapshot.providers[0].modelWindows).toEqual([]);
+    });
+
+    it("drops a model row that carries no model identity", async () => {
+      const { deps } = fakeDeps({ codex: codexReservePanelState });
+      const snapshot = await buildQuotaSnapshot({ ...deps, providers: ["codex"] });
+
+      expect(snapshot.providers[0].modelWindows).toEqual([]);
+    });
+
+    it("keeps model identity on the durable fallback path", async () => {
+      const now = Date.parse("2026-09-28T14:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            label: "Current week (all models)",
+            observedAt: "2026-09-28T13:00:00.000Z",
+            percentLeft: 60,
+          }),
+          historyPoint({
+            scope: "model",
+            models: ["claude-fable-5-1"],
+            label: "Current week (Fable)",
+            observedAt: "2026-09-28T13:00:00.000Z",
+            percentLeft: 25,
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.windows.map((w) => w.usedPercent)).toEqual([40]);
+      expect(claude.modelWindows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          usedPercent: 75,
+          modelIds: ["claude-fable-5-1"],
+          scrapedAt: "2026-09-28T13:00:00.000Z",
+        }),
+      ]);
+    });
+  });
+
   it("codex: reports the provider's own weekly, not a model reserve at 100% left (#249)", async () => {
     const { deps } = fakeDeps({ codex: codexReservePanelState });
     const snapshot = await buildQuotaSnapshot(deps);

@@ -772,7 +772,10 @@ done
     // Scoping to this probe's own socket also keeps a shared box's other runs
     // from being read as our orphans.
     const serversFor = (sock: string) =>
-      execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
+      execFileSync("ps", ["-eo", "pid=,args="], {
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+      })
         .split("\n")
         .filter((line) => line.includes(`-S ${sock} new-session`));
     // A dead server is only a proxy for what #84 actually exhausted: the

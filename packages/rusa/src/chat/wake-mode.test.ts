@@ -56,6 +56,7 @@ describe("chat wake mode (#692)", () => {
       "not JSON",
       '{"version":2,"chatWakeMode":"all"}',
       '{"version":1,"chatWakeMode":"bad"}',
+      '{"version":1,"chatWakeMode":"all","checkSuiteCompletionMode":"invalid"}',
     ]) {
       expect(chatWakeModeFromConfig(raw)).toBeUndefined();
     }
