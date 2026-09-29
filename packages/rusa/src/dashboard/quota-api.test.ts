@@ -570,6 +570,68 @@ describe("dashboard quota snapshot", () => {
         }),
       ]);
     });
+
+    it("model-only history fallback preserves model window with original scrapedAt without promoting provider status", async () => {
+      const now = Date.parse("2026-09-28T14:00:00.000Z");
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "claude", status: "unknown" }),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            scope: "model",
+            models: ["claude-fable-5-1"],
+            label: "Current week (Fable)",
+            observedAt: "2026-09-28T11:00:00.000Z",
+            percentLeft: 25,
+          }),
+        ],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.status).toBe("unknown");
+      expect(claude.windows).toEqual([]);
+      expect(claude.usedPercent).toBeNull();
+      expect(claude.modelWindows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          usedPercent: 75,
+          modelIds: ["claude-fable-5-1"],
+          scrapedAt: "2026-09-28T11:00:00.000Z",
+        }),
+      ]);
+    });
+
+    it("passes limit.scrapedAt through to modelWindows and provider windows", async () => {
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({
+          provider: "claude",
+          status: "available",
+          scrapedAt: "2026-09-28T14:00:00.000Z",
+          limits: [
+            {
+              label: "Current week (all models)",
+              kind: "weekly",
+              percentLeft: 60,
+              scope: "provider",
+              scrapedAt: "2026-09-28T14:00:00.000Z",
+            },
+            {
+              label: "Current week (Fable)",
+              kind: "weekly",
+              percentLeft: 25,
+              scope: { provider: "claude", models: ["claude-fable-5-1"] },
+              scrapedAt: "2026-09-28T11:00:00.000Z",
+            },
+          ],
+        }),
+        providers: ["claude"],
+      });
+      const claude = snapshot.providers[0];
+
+      expect(claude.windows[0].scrapedAt).toBe("2026-09-28T14:00:00.000Z");
+      expect(claude.modelWindows[0].scrapedAt).toBe("2026-09-28T11:00:00.000Z");
+    });
   });
 
   it("codex: reports the provider's own weekly, not a model reserve at 100% left (#249)", async () => {

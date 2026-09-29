@@ -207,7 +207,7 @@ function claudeWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         resetAtIso: limit.resetAtIso ?? null,
         headline: isWeekly,
         windowMs: windowMsFor(id),
-        scrapedAt,
+        scrapedAt: limit.scrapedAt ?? scrapedAt,
       };
     });
   }
@@ -231,7 +231,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         resetAtIso: limit.resetAtIso ?? null,
         headline: isWeekly,
         windowMs: windowMsFor(id),
-        scrapedAt,
+        scrapedAt: limit.scrapedAt ?? scrapedAt,
       };
     });
   }
@@ -252,12 +252,13 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
     resetAtIso: limit.resetAtIso ?? null,
     headline: limit.kind === "weekly",
     windowMs: windowMsFor(limit.kind ?? "other"),
-    scrapedAt,
+    scrapedAt: limit.scrapedAt ?? scrapedAt,
   }));
 }
 
 function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
   if (state.limits && state.limits.length > 0) {
+    const scrapedAt = state.scrapedAt ?? null;
     return state.limits.map((limit) => {
       // ISSUE_NUM: see claudeWindows above — key off `kind`, not label.
       const { id, isWeekly } = windowIdentity(limit.kind);
@@ -270,7 +271,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
-        scrapedAt: state.scrapedAt ?? null,
+        scrapedAt: limit.scrapedAt ?? scrapedAt,
       };
     });
   }
@@ -301,7 +302,7 @@ function modelWindowsFor(state: ProviderQuotaSnapshot): QuotaModelWindowDto[] {
         resetAtIso: limit.resetAtIso ?? null,
         headline: isWeekly,
         windowMs: windowMsFor(id),
-        scrapedAt,
+        scrapedAt: limit.scrapedAt ?? scrapedAt,
         modelIds: [...modelIds],
       },
     ];
@@ -467,9 +468,16 @@ function latestStateFromHistory(
     .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
   if (!latestObservedAt) return null;
   const latest = eligible.filter((point) => point.observedAt === latestObservedAt);
+  const providerPoints = latest.filter((point) => point.scope === "provider");
+  const status =
+    providerPoints.length === 0
+      ? "unknown"
+      : providerPoints.some((point) => point.percentLeft <= 0)
+        ? "exhausted"
+        : "available";
   return {
     provider,
-    status: latest.some((point) => point.percentLeft <= 0) ? "exhausted" : "available",
+    status,
     scrapedAt: latestObservedAt,
     limits: latest.map((point) => ({
       label: point.label,
@@ -482,6 +490,7 @@ function latestStateFromHistory(
           : point.scope,
       percentLeft: point.percentLeft,
       resetAtIso: point.resetAtIso ?? undefined,
+      scrapedAt: point.observedAt,
     })),
   };
 }

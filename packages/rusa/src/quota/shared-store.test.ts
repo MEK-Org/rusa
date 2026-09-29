@@ -471,6 +471,57 @@ describe("SharedQuotaStore canonical observations", () => {
       store.close();
     }
   });
+
+  it("keeps a carried model window at its original observation time", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-carried-model-age-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const originalModelObservedAt = "2030-01-01T00:00:00.000Z";
+    const currentScrapeAt = "2030-01-01T00:30:00.000Z";
+    const state: ProviderQuotaSnapshot = {
+      provider: "claude",
+      status: "available",
+      scrapedAt: currentScrapeAt,
+      limits: [
+        {
+          label: "Current week (all models)",
+          kind: "weekly",
+          percentLeft: 80,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: { provider: "claude" },
+        },
+        {
+          label: "Current week (Fable)",
+          kind: "weekly",
+          percentLeft: 75,
+          resetAtIso: "2030-01-08T00:00:00.000Z",
+          scope: { provider: "claude", models: ["claude-fable"] },
+          // This is evidence carried across a failed extraction, not a fresh
+          // Fable observation from the scrape recorded above.
+          scrapedAt: originalModelObservedAt,
+        },
+      ],
+    };
+    try {
+      const id = store.recordRaw({
+        provider: "claude",
+        scrapedAt: currentScrapeAt,
+        rawOutput: "synthetic current scrape",
+      });
+      store.recordParsed(id, state, state);
+
+      expect(
+        store.db
+          .prepare("SELECT label, observed_at AS observedAt FROM quota_observations ORDER BY label")
+          .all()
+      ).toEqual([
+        { label: "Current week (Fable)", observedAt: originalModelObservedAt },
+        { label: "Current week (all models)", observedAt: currentScrapeAt },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("SharedQuotaStore persisted controller", () => {

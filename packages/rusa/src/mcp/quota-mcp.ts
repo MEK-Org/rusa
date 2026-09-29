@@ -106,7 +106,24 @@ export interface QuotaLimit {
    * of configured models the window applies to. Absent reads as provider-wide.
    */
   scope?: QuotaWindowScope | LegacyQuotaWindowScope;
+  /**
+   * ISO-8601 instant when this specific reading was originally scraped.
+   * Preserved when an individual window is carried forward from a previous
+   * scrape (e.g. across a bad read or extraction failure), so downstream consumers
+   * can observe the true age of carried model or provider readings (#763).
+   */
+  scrapedAt?: string;
 }
+
+/**
+ * Bounded output token limit for quota extraction responses (#763).
+ * Quota extraction JSON schemas require a few hundred tokens; 4096 tokens
+ * bounds the output well below 64 KiB while allowing complex multi-window parses.
+ */
+export const QUOTA_EXTRACTION_MAX_OUTPUT_TOKENS = 4096;
+
+/** Maximum allowed byte length for quota extraction text before rejecting as truncated/runaway (#763). */
+export const QUOTA_EXTRACTION_MAX_BYTES = 64 * 1024;
 
 export interface ProviderQuotaSnapshot {
   provider: string;
@@ -585,6 +602,7 @@ async function parseQuotaWithLlm(
         // Quota parsing is extraction, not creative generation. A fixed
         // temperature keeps a repeated scrape from changing its window set.
         temperature: 0,
+        maxOutputTokens: QUOTA_EXTRACTION_MAX_OUTPUT_TOKENS,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -595,18 +613,53 @@ async function parseQuotaWithLlm(
       },
     });
 
-    const text = await extractGeminiText(response);
-    const parsed = JSON.parse(text);
+    const responseWithFinishReason = response as {
+      finishReason?: string;
+      candidates?: Array<{ finishReason?: string }>;
+    };
+    const finishReason =
+      responseWithFinishReason.candidates?.[0]?.finishReason ??
+      responseWithFinishReason.finishReason;
+    if (finishReason === "MAX_TOKENS") {
+      throw new Error(
+        `Quota parse failed: response truncated by model output token limit (finishReason: ${finishReason})`
+      );
+    }
 
-    if (!Array.isArray(parsed.windows)) {
+    const text = await extractGeminiText(response);
+    const textBytes = Buffer.byteLength(text, "utf8");
+    if (textBytes >= QUOTA_EXTRACTION_MAX_BYTES) {
+      throw new Error(
+        `Quota parse failed: extraction response exceeded size bound (${textBytes} bytes)`
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (parseErr) {
+      throw new Error(
+        `Quota parse failed: invalid JSON output: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`
+      );
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Quota parse failed: response is not an object");
+    }
+    const parsedObj = parsed as { windows?: unknown; status?: unknown };
+    if (!Array.isArray(parsedObj.windows)) {
       throw new Error("Quota parse failed: response omitted the required windows array");
     }
-    if (!(["available", "exhausted", "unknown"] as const).includes(parsed.status)) {
-      throw new Error(`Quota parse failed: invalid status '${String(parsed.status)}'`);
+    if (
+      !(["available", "exhausted", "unknown"] as const).includes(
+        parsedObj.status as "available" | "exhausted" | "unknown"
+      )
+    ) {
+      throw new Error(`Quota parse failed: invalid status '${String(parsedObj.status)}'`);
     }
 
     const limits: QuotaLimit[] = [];
-    for (const rawWindow of parsed.windows) {
+    for (const rawWindow of parsedObj.windows) {
       if (!rawWindow || typeof rawWindow !== "object") {
         throw new Error("Quota parse failed: window is not an object");
       }
@@ -715,7 +768,7 @@ async function parseQuotaWithLlm(
           `'${duplicatedKind[0]}' windows — a model-specific block was read as provider-wide`
       );
     }
-    if (providerWindows.length === 0 && parsed.status === "available") {
+    if (providerWindows.length === 0 && parsedObj.status === "available") {
       throw new Error(
         `Quota parse failed: ${provider} status is available but no provider window was returned`
       );
@@ -726,7 +779,7 @@ async function parseQuotaWithLlm(
     // model's summary says available. The inverse could be a partial panel
     // whose exhausted row was omitted, so send that disagreement through the
     // existing stronger-model retry rather than downgrade exhaustion.
-    if (parsed.status === "exhausted" && providerWindows.length > 0 && !hasExhaustedWindow) {
+    if (parsedObj.status === "exhausted" && providerWindows.length > 0 && !hasExhaustedWindow) {
       throw new Error(
         "Quota parse failed: status 'exhausted' disagrees with available provider windows"
       );
@@ -734,8 +787,8 @@ async function parseQuotaWithLlm(
 
     const status = hasExhaustedWindow
       ? "exhausted"
-      : parsed.status === "unknown" || providerWindows.length === 0
-        ? parsed.status === "exhausted"
+      : parsedObj.status === "unknown" || providerWindows.length === 0
+        ? parsedObj.status === "exhausted"
           ? "exhausted"
           : "unknown"
         : "available";
@@ -919,19 +972,32 @@ export function inferQuotaState(
 
   // Step 1: Bad read full-fallback (Rule: carried_forward_bad_read)
   // If the whole current parse returned status unknown or empty limits (bad read),
-  // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso.
+  // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso (#763).
+  // Model-scoped windows (e.g. Fable) are preserved with their original observed time and provenance.
+  // Provider availability is derived strictly from provider-scoped windows: model-only readings
+  // must never promote provider status to available/exhausted.
   if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
-    const activeUnexpiredLimits = prevState.limits.filter((limit) => {
-      if (!isProviderScopedWindow(limit)) return false;
-      if (!limit.resetAtIso) return false;
-      const resetMs = Date.parse(limit.resetAtIso);
-      if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
-      return !isAssumedReset(prevState, limit.label);
-    });
+    const activeUnexpiredLimits = prevState.limits
+      .filter((limit) => {
+        if (!limit.resetAtIso) return false;
+        const resetMs = Date.parse(limit.resetAtIso);
+        if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
+        return !isAssumedReset(prevState, limit.label);
+      })
+      .map((limit) => ({
+        ...limit,
+        scrapedAt: limit.scrapedAt ?? prevState.scrapedAt,
+      }));
 
     if (activeUnexpiredLimits.length > 0) {
-      status = prevState.status;
-      limits = activeUnexpiredLimits.map((l) => ({ ...l }));
+      const activeProviderLimits = activeUnexpiredLimits.filter(isProviderScopedWindow);
+      if (activeProviderLimits.length > 0) {
+        status = prevState.status;
+      } else {
+        // Model-only limits must never promote provider status into available/exhausted (#763).
+        status = "unknown";
+      }
+      limits = activeUnexpiredLimits;
       message = rawState.message ?? prevState.message;
       for (const limit of limits) {
         explanations.push({
@@ -1125,7 +1191,6 @@ export class QuotaService {
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
-            isProviderScopedWindow(l) &&
             l.resetAtIso &&
             Date.parse(l.resetAtIso) > Date.parse(scrapedAt) &&
             !prevState.explanations?.some(

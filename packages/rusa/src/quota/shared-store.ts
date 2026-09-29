@@ -1454,9 +1454,7 @@ export class SharedQuotaStore {
     storedProvider: string | undefined,
     opts: { acceptModelScope: boolean }
   ): void {
-    const observedAt = state.scrapedAt ?? storedObservedAt;
-    const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
-    if (!observedAt || !Number.isFinite(observedMs)) return;
+    const fallbackObservedAt = state.scrapedAt ?? storedObservedAt;
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
     const observed = (result: QuotaObservationResult): void => {
       this.metrics.counter(QUOTA_SERVICE_METRICS.observationsTotal, { provider, result });
@@ -1484,6 +1482,15 @@ export class SharedQuotaStore {
         continue;
       }
       seenLanes.add(lane);
+      // A carried window is still old evidence, not a second observation at
+      // this scrape's time. Persist its own timestamp so dashboard age,
+      // history, and controller ingestion cannot mistake it for a new read.
+      const observedAt = limit.scrapedAt ?? fallbackObservedAt;
+      const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+      if (!observedAt || !Number.isFinite(observedMs)) {
+        observed("rejected");
+        continue;
+      }
       const candidate: StoredObservation = {
         provider,
         modelScope,
