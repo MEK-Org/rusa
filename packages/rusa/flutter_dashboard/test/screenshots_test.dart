@@ -324,13 +324,23 @@ void main() {
           usedPercent: 13,
           tier: null,
           message: null,
-          scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+          scrapedAt: now
+              .subtract(const Duration(minutes: 30))
+              .toIso8601String(),
           throttle: QuotaThrottleDto(
             intervalSeconds: 600,
             expired: false,
             capped: false,
-            buckets: const [],
+            buckets: const [
+              QuotaThrottleBucketDto(
+                key: 'claude:session',
+                error: 1,
+                percentLeft: 5,
+                timeRemainingPct: 6,
+              ),
+            ],
             updatedAt: now.toIso8601String(),
+            freshness: const QuotaFreshnessDto(mode: 'scrape'),
           ),
           windows: [
             QuotaWindowDto(
@@ -341,7 +351,9 @@ void main() {
               headline: true,
               windowMs: weeklyWindowMs,
               resetAtIso: now.add(const Duration(days: 2)).toIso8601String(),
-              scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+              scrapedAt: now
+                  .subtract(const Duration(minutes: 30))
+                  .toIso8601String(),
             ),
             QuotaWindowDto(
               id: 'session',
@@ -350,8 +362,12 @@ void main() {
               status: 'available',
               headline: false,
               windowMs: sessionWindowMs,
-              resetAtIso: now.add(const Duration(minutes: 25)).toIso8601String(),
-              scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+              resetAtIso: now
+                  .add(const Duration(minutes: 25))
+                  .toIso8601String(),
+              scrapedAt: now
+                  .subtract(const Duration(minutes: 30))
+                  .toIso8601String(),
             ),
           ],
         );
@@ -406,6 +422,7 @@ void main() {
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
         expect(find.textContaining('Weekly:'), findsOneWidget);
+        expect(find.text('Freshness (scrape): fresh'), findsOneWidget);
         await captureBoundary(key, '$_outDir/header_quota_claude_tooltip.png');
       });
     },

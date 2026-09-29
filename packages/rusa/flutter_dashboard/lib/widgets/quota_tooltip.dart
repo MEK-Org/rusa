@@ -108,6 +108,47 @@ int? remainingMs(QuotaWindowDto window, DateTime now) {
   return reset.difference(now).inMilliseconds;
 }
 
+/// The control loop's own explanation of its pacing decision beyond the
+/// interval: freshness mode and state, expired-window recovery, the hottest
+/// bucket, and the configured-maximum cap. Carried over from the legacy text
+/// tooltip so a slow provider stays distinguishable from a busy mesh.
+List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) {
+  final lines = <String>[];
+  final f = throttle.freshness;
+  if (f != null) {
+    final modeLabel = f.mode == 'manual' ? 'manual' : 'scrape';
+    const hardStale = 'overdue (hard-stale, fail-safe cap applied)';
+    if (f.resetWaiting) {
+      lines.add(
+        'Freshness ($modeLabel): window reset; awaiting fresh reading (estimated)',
+      );
+      if (f.hardStale) lines.add('Freshness ($modeLabel): $hardStale');
+    } else if (f.hardStale) {
+      lines.add('Freshness ($modeLabel): $hardStale');
+    } else if (f.stale) {
+      lines.add('Freshness ($modeLabel): overdue (stale reading)');
+    } else {
+      lines.add('Freshness ($modeLabel): fresh');
+    }
+  }
+  if (throttle.expired) {
+    lines.add(
+      'Previous quota window expired; returning to the configured interval',
+    );
+  } else if (throttle.buckets.isNotEmpty) {
+    final hottest = throttle.buckets.reduce(
+      (a, b) => a.error >= b.error ? a : b,
+    );
+    lines.add(
+      'Hottest bucket ${hottest.key}: ${hottest.error.toStringAsFixed(1)} points over pace',
+    );
+  }
+  if (throttle.capped) {
+    lines.add('Limited to the configured maximum interval');
+  }
+  return lines;
+}
+
 /// A structured widget replacing the plain-text quota ring tooltip (#760).
 ///
 /// Displays:
@@ -115,6 +156,7 @@ int? remainingMs(QuotaWindowDto window, DateTime now) {
 /// - One row per quota window: `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
 /// - Pacing row: `Pacing: every $interval` (omitted when [showThrottle] is false)
 /// - Last read row: `Last Read: $age`
+/// - Secondary pacing diagnostics ([quotaPacingDiagnostics]), when pacing is shown
 class QuotaTooltip extends StatelessWidget {
   const QuotaTooltip({
     super.key,
@@ -139,10 +181,10 @@ class QuotaTooltip extends StatelessWidget {
       final label = window.label.isNotEmpty
           ? window.label
           : (window.id == 'weekly'
-              ? 'Weekly'
-              : (window.id == 'session' || window.id == 'five_hour'
-                  ? 'Session'
-                  : window.id));
+                ? 'Weekly'
+                : (window.id == 'session' || window.id == 'five_hour'
+                      ? 'Session'
+                      : window.id));
 
       if (!window.isKnown || window.usedPercent == null) {
         rows.add('$label: n/a');
@@ -162,16 +204,21 @@ class QuotaTooltip extends StatelessWidget {
       }
 
       final pos = schedulePosition(window, currentTime);
-      final quotaRemaining = (100 - (window.usedPercent ?? 0)).clamp(0, 100).round();
+      final quotaRemaining = (100 - (window.usedPercent ?? 0))
+          .clamp(0, 100)
+          .round();
       final resetText = window.resetAtIso;
       final reset = resetText != null ? DateTime.tryParse(resetText) : null;
 
-      if (pos != null && pos.timeRemainingPct != null && pos.remainingMs != null) {
+      if (pos != null &&
+          pos.timeRemainingPct != null &&
+          pos.remainingMs != null) {
         final timeRemaining = pos.timeRemainingPct!.round();
         final margin = quotaRemaining - timeRemaining;
         final marginStr = margin >= 0 ? '+$margin' : '$margin';
-        final resetDuration =
-            formatRelativeResetDuration(Duration(milliseconds: pos.remainingMs!));
+        final resetDuration = formatRelativeResetDuration(
+          Duration(milliseconds: pos.remainingMs!),
+        );
         rows.add(
           '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration',
         );
@@ -180,25 +227,20 @@ class QuotaTooltip extends StatelessWidget {
 
       if (reset != null) {
         if (reset.isAfter(currentTime)) {
-          final resetDuration =
-              formatRelativeResetDuration(reset.difference(currentTime));
+          final resetDuration = formatRelativeResetDuration(
+            reset.difference(currentTime),
+          );
           rows.add(
             '$label: $quotaRemaining% remaining - Resets in $resetDuration',
           );
         } else {
           final resetStr = DateFormat('EEE h:mm a').format(reset.toLocal());
-          rows.add(
-            '$label: $quotaRemaining% remaining - resets $resetStr',
-          );
+          rows.add('$label: $quotaRemaining% remaining - resets $resetStr');
         }
       } else if (resetText != null) {
-        rows.add(
-          '$label: $quotaRemaining% remaining - resets $resetText',
-        );
+        rows.add('$label: $quotaRemaining% remaining - resets $resetText');
       } else {
-        rows.add(
-          '$label: $quotaRemaining% remaining',
-        );
+        rows.add('$label: $quotaRemaining% remaining');
       }
     }
     return rows;
@@ -210,6 +252,11 @@ class QuotaTooltip extends StatelessWidget {
       return 'Pacing: every ${formatPacingInterval(throttle!.intervalSeconds)}';
     }
     return 'Pacing: n/a';
+  }
+
+  List<String> _buildDiagnostics() {
+    if (!showThrottle || throttle == null) return const [];
+    return quotaPacingDiagnostics(throttle!);
   }
 
   String _buildLastReadText(DateTime currentTime) {
@@ -243,6 +290,12 @@ class QuotaTooltip extends StatelessWidget {
       lines.add(pacing);
     }
     lines.add(_buildLastReadText(currentTime));
+    final diagnostics = _buildDiagnostics();
+    if (diagnostics.isNotEmpty) {
+      lines
+        ..add('')
+        ..addAll(diagnostics);
+    }
     return lines.join('\n');
   }
 
@@ -252,6 +305,11 @@ class QuotaTooltip extends StatelessWidget {
     final windowRows = _buildWindowRows(currentTime);
     final pacingText = _buildPacingText();
     final lastReadText = _buildLastReadText(currentTime);
+    final diagnostics = _buildDiagnostics();
+    final diagnosticStyle = TextStyle(
+      fontSize: 11,
+      color: DefaultTextStyle.of(context).style.color?.withValues(alpha: 0.75),
+    );
 
     return Container(
       constraints: const BoxConstraints(maxWidth: 360),
@@ -261,30 +319,22 @@ class QuotaTooltip extends StatelessWidget {
         children: [
           Text(
             providerName,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-            ),
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 6),
           for (final text in windowRows) ...[
-            Text(
-              text,
-              style: const TextStyle(fontSize: 12),
-            ),
+            Text(text, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 2),
           ],
           if (pacingText != null) ...[
-            Text(
-              pacingText,
-              style: const TextStyle(fontSize: 12),
-            ),
+            Text(pacingText, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 2),
           ],
-          Text(
-            lastReadText,
-            style: const TextStyle(fontSize: 12),
-          ),
+          Text(lastReadText, style: const TextStyle(fontSize: 12)),
+          if (diagnostics.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            for (final text in diagnostics) Text(text, style: diagnosticStyle),
+          ],
         ],
       ),
     );
