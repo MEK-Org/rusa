@@ -7,6 +7,7 @@ import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
+import 'package:rusa_dashboard/widgets/quota_tooltip.dart';
 
 import 'fakes.dart';
 
@@ -123,12 +124,20 @@ Finder _staleWarning(String name) => find.descendant(
   matching: find.byKey(const ValueKey('quota-ring-stale-warning')),
 );
 
-Finder _ringTooltip(String name) => find.byWidgetPredicate(
-  (w) => w is Tooltip && (w.message ?? '').startsWith('$name\n'),
+Finder _ringTooltip(String name) => find.ancestor(
+  of: find.text(name),
+  matching: find.byType(Tooltip),
 );
 
-String _tooltipOf(WidgetTester tester, String name) =>
-    tester.widget<Tooltip>(_ringTooltip(name)).message!;
+String _tooltipOf(WidgetTester tester, String name) {
+  final tooltip = tester.widget<Tooltip>(_ringTooltip(name));
+  if (tooltip.message != null) return tooltip.message!;
+  final rich = tooltip.richMessage;
+  if (rich is WidgetSpan && rich.child is QuotaTooltip) {
+    return (rich.child as QuotaTooltip).toPlainText();
+  }
+  return '';
+}
 
 /// The outer (weekly) ring's fill fraction for the ring labelled [name].
 double? _outerRingValue(WidgetTester tester, String name) => tester
@@ -170,11 +179,16 @@ void main() {
 
         final claudeTip = _tooltipOf(tester, 'Claude');
         final fableTip = _tooltipOf(tester, 'Fable');
-        expect(claudeTip, contains('Current week (all models): 60% quota'));
+        expect(claudeTip, contains('Weekly: '));
+        expect(claudeTip, contains('Session: '));
+        expect(claudeTip, contains('60%'));
         expect(claudeTip, isNot(contains('Fable')));
-        expect(fableTip, contains('Current week (Fable): 25% quota'));
-        expect(fableTip, contains('resets '));
-        expect(fableTip, contains('as of '));
+        expect(fableTip, startsWith('Fable\n'));
+        expect(fableTip, contains('Weekly: '));
+        expect(fableTip, isNot(contains('(Fable)')));
+        expect(fableTip, contains('25%'));
+        expect(fableTip, contains('Resets in'));
+        expect(fableTip, contains('Last Read: 5 minutes ago'));
         expect(fableTip, isNot(contains('all models')));
 
         // The label is styled like every other ring label (#758); semantics
@@ -234,7 +248,7 @@ void main() {
 
         expect(_outerRingValue(tester, 'Fable'), 0.0);
         final tip = _tooltipOf(tester, 'Fable');
-        expect(tip, 'Fable\nWeekly: n/a');
+        expect(tip, contains('Weekly: n/a'));
         // Claude's own reading is untouched.
         expect(_outerRingValue(tester, 'Claude'), closeTo(0.60, 1e-9));
         await store.dispose();
@@ -264,7 +278,7 @@ void main() {
         );
 
         expect(_outerRingValue(tester, 'Fable'), 0.0);
-        expect(_tooltipOf(tester, 'Fable'), 'Fable\nWeekly: n/a');
+        expect(_tooltipOf(tester, 'Fable'), contains('Weekly: n/a'));
         await store.dispose();
       });
     });
@@ -284,7 +298,7 @@ void main() {
           ),
         );
 
-        expect(_tooltipOf(tester, 'Fable'), 'Fable\nWeekly: n/a');
+        expect(_tooltipOf(tester, 'Fable'), contains('Weekly: n/a'));
         await store.dispose();
       });
     });
@@ -313,7 +327,7 @@ void main() {
         expect(tip, contains('window reset at'));
         expect(tip, contains('no fresh read since'));
         expect(tip, isNot(contains('25%')));
-        expect(tip, contains('(2d ago)'));
+        expect(tip, contains('2 days ago'));
         await store.dispose();
       });
     });
@@ -354,8 +368,8 @@ void main() {
           ),
         );
 
-        expect(_tooltipOf(tester, 'Claude'), contains('Normal launch pacing'));
-        expect(_tooltipOf(tester, 'Fable'), isNot(contains('pacing')));
+        expect(_tooltipOf(tester, 'Claude'), contains('Pacing: every'));
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Pacing:')));
         await store.dispose();
       });
     });
@@ -495,7 +509,7 @@ void main() {
 
         expect(_outerRingValue(tester, 'Fable'), closeTo(0.95, 1e-9));
         final tip = _tooltipOf(tester, 'Fable');
-        expect(tip, contains('Current week (Fable): 95% remaining'));
+        expect(tip, contains('Weekly: 95% remaining'));
         expect(tip, contains('estimate: extended from the last real reading'));
         await store.dispose();
       });

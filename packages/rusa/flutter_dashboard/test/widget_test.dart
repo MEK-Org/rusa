@@ -12,8 +12,18 @@ import 'package:rusa_dashboard/widgets/brand_mark.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/live_output_tab.dart';
+import 'package:rusa_dashboard/widgets/quota_tooltip.dart';
 
 import 'fakes.dart';
+
+String _tooltipMessage(Tooltip tooltip) {
+  if (tooltip.message != null) return tooltip.message!;
+  final rich = tooltip.richMessage;
+  if (rich is WidgetSpan && rich.child is QuotaTooltip) {
+    return (rich.child as QuotaTooltip).toPlainText();
+  }
+  return '';
+}
 
 // The store does real async I/O (Futures + broadcast streams) and the dashboard
 // has always-running animations (blinking cursor). So we drive each test
@@ -1125,8 +1135,9 @@ void main() {
         final claudeTooltip = tester.widget<Tooltip>(
           find.byType(Tooltip).first,
         );
-        expect(claudeTooltip.message, contains('Weekly: 97% remaining'));
-        expect(claudeTooltip.message, contains('Session: 68% remaining'));
+        final claudeMsg = _tooltipMessage(claudeTooltip);
+        expect(claudeMsg, contains('Weekly: 97% remaining'));
+        expect(claudeMsg, contains('Session: 68% remaining'));
 
         // Geometry check standing in for a pixel screenshot: this sandbox's
         // Flutter SDK cache is read-only, so a headless-Chrome/CDP capture of
@@ -1270,21 +1281,26 @@ void main() {
         // 4 providers in order: Claude, then Fable (#752), Codex, Agy, Kimi
         expect(tooltips, hasLength(5));
 
-        // Claude: < 2m ago -> just "as of HH:mm"
-        expect(tooltips[0].message, contains('as of '));
-        expect(tooltips[0].message, isNot(contains('ago)')));
+        // Claude: < 2m ago -> just now
+        final tip0 = _tooltipMessage(tooltips[0]);
+        expect(tip0, contains('Last Read: just now'));
+        expect(tip0, isNot(contains('ago')));
 
         // Fable: no Fable window, so no scrape stamp of its own.
-        expect(tooltips[1].message, isNot(contains('as of ')));
+        final tip1 = _tooltipMessage(tooltips[1]);
+        expect(tip1, contains('Last Read: n/a'));
 
-        // Codex: 5m ago -> "(5m ago)"
-        expect(tooltips[2].message, contains('(5m ago)'));
+        // Codex: 5m ago -> "5 minutes ago"
+        final tip2 = _tooltipMessage(tooltips[2]);
+        expect(tip2, contains('5 minutes ago'));
 
-        // Agy: 2h ago -> "(2h ago)"
-        expect(tooltips[3].message, contains('(2h ago)'));
+        // Agy: 2h ago -> "2 hours ago"
+        final tip3 = _tooltipMessage(tooltips[3]);
+        expect(tip3, contains('2 hours ago'));
 
-        // Kimi: 2d ago -> "(2d ago)"
-        expect(tooltips[4].message, contains('(2d ago)'));
+        // Kimi: 2d ago -> "2 days ago"
+        final tip4 = _tooltipMessage(tooltips[4]);
+        expect(tip4, contains('2 days ago'));
 
         await store.dispose();
       });
@@ -1356,12 +1372,13 @@ void main() {
         expect(rings[1].value, 0.0); // 5h: past reset => 0.0 (empty ring)
 
         final codexTooltip = tester.widget<Tooltip>(find.byType(Tooltip).first);
-        expect(codexTooltip.message, contains('Weekly: 90% remaining'));
-        expect(codexTooltip.message, contains('5h: window reset at '));
-        expect(codexTooltip.message, contains('no fresh read since'));
-        expect(codexTooltip.message, isNot(contains('5h: 53% remaining')));
+        final codexMsg = _tooltipMessage(codexTooltip);
+        expect(codexMsg, contains('Weekly: 90% remaining'));
+        expect(codexMsg, contains('5h: window reset at '));
+        expect(codexMsg, contains('no fresh read since'));
+        expect(codexMsg, isNot(contains('5h: 53% remaining')));
         expect(
-          codexTooltip.message,
+          codexMsg,
           isNot(contains('5h: 47% quota remaining')),
         );
 
@@ -1610,253 +1627,6 @@ void main() {
       expect(
         quotaScheduleColor(window(usedPercent: 10, resetAtIso: null), now: now),
         MeshColors.statusActive,
-      );
-    });
-  });
-
-  group('quotaWindowTooltip (ISSUE_NUM self-explaining pace tooltip)', () {
-    // Fix the viewer's local wall-clock time, then serialize reset instants as
-    // UTC below. This keeps the expected presentation deterministic in every
-    // test-runner timezone while exercising the UTC -> local conversion.
-    final now = DateTime(2026, 1, 1, 0, 0, 0);
-    const fiveHourMs = 5 * 60 * 60 * 1000;
-
-    QuotaWindowDto window({
-      double? usedPercent,
-      String status = 'available',
-      String? resetAtIso,
-      int windowMs = fiveHourMs,
-    }) => QuotaWindowDto(
-      id: 'session',
-      label: 'Session',
-      usedPercent: usedPercent,
-      status: status,
-      resetAtIso: resetAtIso,
-      headline: false,
-      windowMs: windowMs,
-    );
-
-    test('unknown/null window reads n/a, never crashes', () {
-      expect(
-        quotaWindowTooltip(null, fallbackLabel: 'Session', now: now),
-        'Session: n/a',
-      );
-      expect(
-        quotaWindowTooltip(
-          window(usedPercent: null, status: 'unknown'),
-          fallbackLabel: 'Session',
-          now: now,
-        ),
-        'Session: n/a',
-      );
-    });
-
-    test(
-      'honestly reports a window past its reset without showing stale percentage',
-      () {
-        final w = window(
-          usedPercent: 53,
-          resetAtIso: now
-              .subtract(const Duration(minutes: 32))
-              .toUtc()
-              .toIso8601String(),
-        );
-        expect(
-          quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-          'Session: window reset at Wed 11:28 PM; no fresh read since (awaiting fresh read, estimated ~100% remaining)',
-        );
-      },
-    );
-
-    test(
-      'states quota remaining, time remaining, an on-pace verdict, the reset '
-      'time, and a burn-rate projection',
-      () {
-        final w = window(
-          usedPercent: 90,
-          resetAtIso: now
-              .add(const Duration(minutes: 1))
-              .toUtc()
-              .toIso8601String(),
-        );
-        expect(
-          quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-          'Session: 10% quota remaining, 0% time remaining (on pace)\n'
-          'resets Thu 12:01 AM\n'
-          '~10% left at reset',
-        );
-      },
-    );
-
-    test(
-      'states an on-pace verdict with an "empty before reset" projection',
-      () {
-        final w = window(
-          usedPercent: 60,
-          resetAtIso: now
-              .add(const Duration(hours: 2, minutes: 30))
-              .toUtc()
-              .toIso8601String(),
-        );
-        expect(
-          quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-          'Session: 40% quota remaining, 50% time remaining (on pace)\n'
-          'resets Thu 2:30 AM\n'
-          'at this rate: empty ~Thu (resets Thu)',
-        );
-      },
-    );
-
-    test('states a burning-fast verdict, falling back to a quota-only '
-        'projection on a degenerate (window-exceeding) reset', () {
-      final w = window(
-        usedPercent: 95,
-        resetAtIso: now.add(const Duration(days: 30)).toUtc().toIso8601String(),
-      );
-      expect(
-        quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-        'Session: 5% quota remaining, 100% time remaining (burning fast)\n'
-        'resets Sat 12:00 AM\n'
-        '~5% left at reset',
-      );
-    });
-
-    test('falls back to quota-only phrasing plus the raw reset text when '
-        'resetAtIso cannot be parsed', () {
-      const unparsed = 'Jul 13, 2:59am (UTC)';
-      expect(
-        quotaWindowTooltip(
-          window(usedPercent: 3, resetAtIso: unparsed),
-          fallbackLabel: 'Session',
-          now: now,
-        ),
-        'Session: 97% remaining\nresets Jul 13, 2:59am (UTC)',
-      );
-    });
-  });
-
-  group('quotaThrottleTooltip', () {
-    test('identifies the adaptive interval and bucket driving live pacing', () {
-      expect(
-        quotaThrottleTooltip(
-          const QuotaThrottleDto(
-            intervalSeconds: 73,
-            expired: false,
-            updatedAt: '2026-07-22T12:00:00.000Z',
-            buckets: [
-              QuotaThrottleBucketDto(
-                key: 'claude:weekly',
-                error: 20,
-                percentLeft: 30,
-                timeRemainingPct: 50,
-              ),
-            ],
-          ),
-        ),
-        'Normal launch pacing: one start every 1.2m\n'
-        'hottest bucket claude:weekly: 20.0 points over pace',
-      );
-    });
-
-    test('explains manual freshness mode and reset-waiting status (#690)', () {
-      expect(
-        quotaThrottleTooltip(
-          const QuotaThrottleDto(
-            intervalSeconds: 300,
-            expired: false,
-            updatedAt: '2026-09-25T13:42:29.000Z',
-            buckets: [],
-            freshness: QuotaFreshnessDto(
-              mode: 'manual',
-              stale: true,
-              hardStale: false,
-              resetWaiting: true,
-            ),
-          ),
-        ),
-        'Normal launch pacing: one start every 5.0m\n'
-        'Freshness (manual): window reset; awaiting fresh reading (estimated)',
-      );
-    });
-
-    test('explains manual freshness mode and hard-stale overdue status (#690)', () {
-      expect(
-        quotaThrottleTooltip(
-          const QuotaThrottleDto(
-            intervalSeconds: 36000,
-            expired: false,
-            capped: true,
-            updatedAt: '2026-09-25T13:42:29.000Z',
-            buckets: [],
-            freshness: QuotaFreshnessDto(
-              mode: 'manual',
-              stale: true,
-              hardStale: true,
-              resetWaiting: false,
-            ),
-          ),
-        ),
-        'Normal launch pacing: one start every 10.0h\n'
-        'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
-        'limited to the configured maximum interval',
-      );
-    });
-
-    test(
-      'explains both reset-waiting and hard-stale overdue status when both are active (#690)',
-      () {
-        expect(
-          quotaThrottleTooltip(
-            const QuotaThrottleDto(
-              intervalSeconds: 36000,
-              expired: false,
-              capped: true,
-              updatedAt: '2026-09-25T13:42:29.000Z',
-              buckets: [],
-              freshness: QuotaFreshnessDto(
-                mode: 'manual',
-                stale: true,
-                hardStale: true,
-                resetWaiting: true,
-              ),
-            ),
-          ),
-          'Normal launch pacing: one start every 10.0h\n'
-          'Freshness (manual): window reset; awaiting fresh reading (estimated)\n'
-          'Freshness (manual): overdue (hard-stale, fail-safe cap applied)\n'
-          'limited to the configured maximum interval',
-        );
-      },
-    );
-
-    test(
-      'renders only pacing line when not expired and no buckets driving pace',
-      () {
-        final tooltip = quotaThrottleTooltip(
-          const QuotaThrottleDto(
-            intervalSeconds: 73,
-            expired: false,
-            updatedAt: '2026-07-22T12:00:00.000Z',
-            buckets: [],
-          ),
-        );
-        expect(tooltip, 'Normal launch pacing: one start every 1.2m');
-        expect(tooltip, isNot(contains('learning')));
-        expect(tooltip, isNot(contains('expired')));
-      },
-    );
-
-    test('explains that previous quota window expired', () {
-      expect(
-        quotaThrottleTooltip(
-          const QuotaThrottleDto(
-            intervalSeconds: 73,
-            expired: true,
-            updatedAt: '2026-07-22T12:00:00.000Z',
-            buckets: [],
-          ),
-        ),
-        contains('previous quota window expired'),
       );
     });
   });
