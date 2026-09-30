@@ -262,6 +262,16 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  /// The server Chat Room roster (#663), root first.
+  List<String> chatRoomParticipants = const ['root'];
+  int chatRoomCallCount = 0;
+
+  @override
+  Future<List<String>> fetchChatRoom() async {
+    chatRoomCallCount++;
+    return chatRoomParticipants;
+  }
+
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
 

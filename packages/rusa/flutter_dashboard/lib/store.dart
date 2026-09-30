@@ -369,10 +369,10 @@ class DashboardStore {
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
   // The V1 Chat Room is dashboard-global rather than tied to the actor-detail
-  // selection. It starts with root once the authoritative thread snapshot is
-  // available and stays in-memory for this dashboard session; no mesh data or
-  // schema is repurposed for a UI-only room roster.
-  final _chatRoomParticipants = BehaviorSubject<Set<String>>.seeded(const {});
+  // selection. Its roster is mesh state that only root changes (#663), so
+  // every dashboard renders the server's list and none can edit it locally.
+  // Empty until the first fetch lands.
+  final _chatRoomParticipants = BehaviorSubject<List<String>>.seeded(const []);
 
   /// Ticks whenever any actor's avatar state changes so `ActorAvatar` /
   /// `AvatarLightbox` rebuild and read [avatarVersion] / [isAvatarGenerating].
@@ -437,7 +437,7 @@ class DashboardStore {
       _dashboardConfig.stream;
   ValueStream<String?> get error => _error.stream;
   ValueStream<bool> get walkieActive => _walkieActive.stream;
-  ValueStream<Set<String>> get chatRoomParticipants =>
+  ValueStream<List<String>> get chatRoomParticipants =>
       _chatRoomParticipants.stream;
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
 
@@ -496,16 +496,24 @@ class DashboardStore {
     }
   }
 
-  /// Add one live actor to the dashboard-global Chat Room. Membership is
-  /// intentionally local to this dashboard session; the room subscribes to
-  /// existing voice presence/backlog routes and does not create a new durable
-  /// server-side conversation model.
-  void addChatRoomParticipant(String actorId) {
-    final actor = _actorStates.value.actors[actorId];
-    if (actor == null || actor.thread.isRetired) return;
+  /// Fetch the mesh-wide Chat Room roster. A changed roster also re-syncs the
+  /// threads: adding an actor can assign it a distinct voice, and its tile
+  /// should show that voice rather than the one it had before it joined.
+  Future<void> refreshChatRoom() async {
+    final List<String> ids;
+    try {
+      ids = await _api.fetchChatRoom();
+    } catch (_) {
+      return;
+    }
+    if (_chatRoomParticipants.isClosed) return;
     final current = _chatRoomParticipants.value;
-    if (current.contains(actorId)) return;
-    _chatRoomParticipants.add({...current, actorId});
+    if (ids.length == current.length &&
+        Iterable<int>.generate(ids.length).every((i) => ids[i] == current[i])) {
+      return;
+    }
+    _chatRoomParticipants.add(List.unmodifiable(ids));
+    if (current.isNotEmpty) unawaited(refreshThreads());
   }
 
   void setFocusedObligationId(String? id) {
@@ -711,15 +719,6 @@ class DashboardStore {
         actors: updatedActors,
       ),
     );
-    final currentRoom = _chatRoomParticipants.value;
-    final nextRoom = currentRoom
-        .where((id) => updatedActors[id]?.thread.isRetired == false)
-        .toSet();
-    if (updatedActors['root']?.thread.isRetired == false) nextRoom.add('root');
-    if (nextRoom.length != currentRoom.length ||
-        !nextRoom.containsAll(currentRoom)) {
-      _chatRoomParticipants.add(nextRoom);
-    }
     _updateQueuePacingPoll();
   }
 

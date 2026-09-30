@@ -47,6 +47,7 @@ import { obligationResponsive } from "./0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "./0050_drop_obligation_ready_heads.js";
 import { eventSourceConfig } from "./0051_event_source_config.js";
 import { obligationSnooze } from "./0052_obligation_snooze.js";
+import { chatRoomParticipants } from "./0053_chat_room_participants.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -106,4 +107,5 @@ export const migrations: Migration[] = [
   dropObligationReadyHeads,
   eventSourceConfig,
   obligationSnooze,
+  chatRoomParticipants,
 ];

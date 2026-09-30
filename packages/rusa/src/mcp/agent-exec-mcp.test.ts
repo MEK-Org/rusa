@@ -21,6 +21,7 @@ import {
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
+  ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "../actor/administrative-capabilities.js";
 import {
@@ -43,6 +44,7 @@ import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-sc
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import type { ChatRoomMember } from "../db/repositories/chat-room-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
@@ -58,6 +60,9 @@ import {
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import { ChatRoomService } from "../voice/chat-room.js";
+import { buildSupportedVoiceCatalog } from "../voice/voice-catalog.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -278,6 +283,11 @@ const MANAGEMENT_TOOLS: Record<string, readonly string[]> = {
     "reparent_thread",
     "list_subscriptions",
   ],
+  [ROOM_ADMIN_CAPABILITY]: [
+    "list_room_participants",
+    "add_room_participant",
+    "remove_room_participant",
+  ],
 };
 const ALL_MANAGEMENT_TOOLS = Object.values(MANAGEMENT_TOOLS).flat();
 
@@ -294,6 +304,13 @@ describe("administrative capability gating of management tools (#549)", () => {
       modelClasses,
       validateModelClass: (input: ModelConfigInput) =>
         validateModelConfigPool(config, input, { portable: true }),
+      chatRoom: {
+        participants: () => [],
+        add: () => {
+          throw new Error("unused");
+        },
+        remove: () => false,
+      },
     };
   }
 
@@ -422,6 +439,81 @@ describe("administrative capability gating of management tools (#549)", () => {
     })) as CallToolResult;
     expect(after.isError).toBe(true);
     expect(dataOf(after)).toMatch(/experiment-admin/);
+  });
+
+  it("lets the seeded configured actor manage the Chat Room and hides it from a child (#663)", async () => {
+    const { mesh, registry } = setup();
+    registry.upsert({
+      id: "worker-a",
+      charter: "worker",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const members: ChatRoomMember[] = [];
+    const chatRoom = new ChatRoomService({
+      store: {
+        list: () => [...members],
+        has: (id) => members.some((m) => m.actorId === id),
+        add: (member) => members.push(member) > 0,
+        remove: (id) => {
+          const index = members.findIndex((m) => m.actorId === id);
+          if (index < 0) return false;
+          members.splice(index, 1);
+          return true;
+        },
+        transaction: (fn) => fn(),
+      },
+      actors: registry,
+      rootId: "root",
+      voices: () => buildSupportedVoiceCatalog(),
+      defaultVoice: googleVoiceConfig("Laomedeia"),
+      isHumanPrincipal: () => false,
+    });
+
+    const child = await connect(
+      createAgentExecMcpServer(mesh, "worker-a", "root", undefined, { chatRoom })
+    );
+    const childTools = (await child.listTools()).tools.map((t) => t.name);
+    expect(childTools).not.toContain("add_room_participant");
+
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, { chatRoom })
+    );
+    const added = (await root.callTool({
+      name: "add_room_participant",
+      arguments: { actor_id: "worker-a" },
+    })) as CallToolResult;
+    expect(added.isError).toBeFalsy();
+    // Root and worker-a both follow the default voice, so worker-a is reassigned.
+    expect(dataOf(added)).toEqual({
+      actor_id: "worker-a",
+      added: true,
+      voice: "Achernar",
+      replaced_voice: "Laomedeia",
+    });
+    expect(registry.get("worker-a")?.voiceConfig).toEqual(googleVoiceConfig("Achernar"));
+
+    const listed = (await root.callTool({
+      name: "list_room_participants",
+      arguments: {},
+    })) as CallToolResult;
+    expect((dataOf(listed) as { actor_id: string }[]).map((p) => p.actor_id)).toEqual([
+      "root",
+      "worker-a",
+    ]);
+
+    const parent = (await root.callTool({
+      name: "add_room_participant",
+      arguments: { actor_id: "parent" },
+    })) as CallToolResult;
+    expect(parent.isError).toBe(true);
+
+    const removed = (await root.callTool({
+      name: "remove_room_participant",
+      arguments: { actor_id: "worker-a" },
+    })) as CallToolResult;
+    expect(dataOf(removed)).toEqual({ actor_id: "worker-a", removed: true });
   });
 
   /** A steward under root with one child, and a sibling outside the steward's subtree. */

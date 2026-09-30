@@ -42,9 +42,8 @@ void main() {
         stream: FakeStream(),
         walkie: walkie.deps,
       );
+      api.chatRoomParticipants = _actorIds;
       await store.refreshThreads();
-      store.addChatRoomParticipant('actor-b');
-      store.addChatRoomParticipant('actor-c');
       addTearDown(store.dispose);
 
       final key = GlobalKey();
@@ -117,9 +116,8 @@ void main() {
         stream: FakeStream(),
         walkie: walkie.deps,
       );
+      api.chatRoomParticipants = _actorIds;
       await store.refreshThreads();
-      store.addChatRoomParticipant('actor-b');
-      store.addChatRoomParticipant('actor-c');
       addTearDown(store.dispose);
 
       final key = GlobalKey();

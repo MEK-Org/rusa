@@ -304,7 +304,11 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
+import { ChatRoomService } from "../voice/chat-room.js";
+import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
+import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
@@ -2425,6 +2429,20 @@ async function composeStart(
   const supportedVoiceCatalog = buildSupportedVoiceCatalog(credentialValidSupportedVoices, {
     availableProviders: availableVoiceProviders,
   });
+  // The mesh-wide Chat Room roster (#663): read by every dashboard, changed
+  // only through the root-seeded `room-admin` tools. An actor without a stored
+  // voice speaks with the instance default, so that is what collisions compare.
+  const chatRoom = new ChatRoomService({
+    store: getRepositories().chatRoom,
+    actors,
+    rootId,
+    voices: () => supportedVoiceCatalog,
+    defaultVoice: googleVoiceConfig(
+      canonicalSupportedVoiceName(config.voice?.voiceName ?? DEFAULT_VOICE_NAME) ??
+        DEFAULT_VOICE_NAME
+    ),
+    isHumanPrincipal: (id) => getRepositories().principals.getUser(id) !== undefined,
+  });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
   // for the root, which has no parent — to the statically configured error chat.
@@ -2752,7 +2770,8 @@ async function composeStart(
     // #549: the administrative capabilities gate the management tools on the
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
-    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`)
+    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
+    // `room-admin`)
     // are stripped by the mesh: it never grants one, and only the seed below
     // creates their rows.
     grantableCapabilities: new Set([
@@ -2981,6 +3000,7 @@ async function composeStart(
             validateModelClass: (input) =>
               validateModelConfigPool(config, input, { portable: true }),
             getFollowers: () => (followerHub ? followerHub.list() : []),
+            chatRoom,
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -3418,6 +3438,7 @@ async function composeStart(
         mesh.markUnkillable(rootId);
       },
       getFollowers: () => (followerHub ? followerHub.list() : []),
+      chatRoom,
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
@@ -4056,6 +4077,7 @@ async function composeStart(
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
+          chatRoom,
           getFollowers: () => (followerHub ? followerHub.list() : []),
           updateFollower: (id, opts) => {
             if (!followerHub) throw new Error("Follower gateway not enabled");

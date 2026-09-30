@@ -60,13 +60,18 @@ void main() {
     final rootBounds = tester.getRect(
       find.byKey(const ValueKey('chat-room-avatar-root')),
     );
-    expect(rootBounds.size, roomBounds.size);
+    // Within layout rounding: the two-line header leaves a fractional height.
+    expect(rootBounds.width, moreOrLessEquals(roomBounds.width, epsilon: 0.01));
+    expect(
+      rootBounds.height,
+      moreOrLessEquals(roomBounds.height, epsilon: 0.01),
+    );
   });
 
   testWidgets('idle voice labels meet WCAG AA contrast on the tile', (
     tester,
   ) async {
-    store.addChatRoomParticipant('actor-b');
+    api.chatRoomParticipants = ['root', 'actor-b'];
     await pumpRoom(tester);
 
     // Both the selected tile and the unselected idle tile.
@@ -78,15 +83,26 @@ void main() {
   });
 
   testWidgets(
-    'adds a second actor and makes each avatar a tap-to-record control',
+    'shows the server roster read-only and follows it as root changes it',
     (tester) async {
       await pumpRoom(tester);
 
-      await tester.tap(find.byKey(const ValueKey('chat-room-add')));
-      await tester.pumpAndSettle();
-      final actorOption = find.text('actor-b-handle');
-      await tester.tap(actorOption);
-      await tester.pumpAndSettle();
+      // Membership is mesh state: the page offers no add control of its own.
+      expect(find.byKey(const ValueKey('chat-room-add')), findsNothing);
+      expect(find.byIcon(Icons.person_add_alt_1), findsNothing);
+      expect(
+        find.byKey(const ValueKey('chat-room-membership')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+        findsNothing,
+      );
+
+      // Root adds actor-b on the server; the next roster poll shows it.
+      api.chatRoomParticipants = ['root', 'actor-b'];
+      await tester.pump(const Duration(seconds: 10));
+      await tester.pump();
 
       expect(
         find.byKey(const ValueKey('chat-room-avatar-root')),
@@ -96,7 +112,6 @@ void main() {
         find.byKey(const ValueKey('chat-room-avatar-actor-b')),
         findsOneWidget,
       );
-      expect(find.text('Voice: Kore'), findsOneWidget);
       final grid = tester.widget<GridView>(
         find.byKey(const ValueKey('chat-room-grid')),
       );
@@ -116,6 +131,41 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('chat-room-cancel')));
       await tester.pump();
       expect(api.memoSends, isEmpty);
+
+      // Root removes actor-b; the room drops it on the next poll.
+      api.chatRoomParticipants = ['root'];
+      await tester.pump(const Duration(seconds: 10));
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('chat-room-avatar-actor-b')),
+        findsNothing,
+      );
+    },
+  );
+
+  testWidgets(
+    'shows the distinct voice the server assigned when an actor joins',
+    (tester) async {
+      // actor-b starts on root's voice; joining the room reassigns it.
+      api.threadsResult = [
+        makeThread('root', voiceName: 'Puck'),
+        makeThread('actor-b', voiceName: 'Puck'),
+      ];
+      await store.refreshThreads();
+      await pumpRoom(tester);
+
+      api
+        ..chatRoomParticipants = ['root', 'actor-b']
+        ..threadsResult = [
+          makeThread('root', voiceName: 'Puck'),
+          makeThread('actor-b', voiceName: 'Achernar'),
+        ];
+      await tester.pump(const Duration(seconds: 10));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Voice: Puck'), findsOneWidget);
+      expect(find.text('Voice: Achernar'), findsOneWidget);
     },
   );
 }

@@ -14,10 +14,19 @@ import 'avatar.dart';
 /// The dashboard-global V1 Chat Room. It intentionally does not reuse the
 /// selected actor's chat pane: the room owns one multi-actor receive queue,
 /// while the existing single-actor walkie keeps its leased-session behavior.
+///
+/// Membership is read-only here. Root adds and removes participants on the
+/// server (#663), and the tab re-reads that roster while it is open so every
+/// dashboard shows the same room.
 class ChatRoomTab extends StatefulWidget {
-  const ChatRoomTab({super.key, required this.store});
+  const ChatRoomTab({
+    super.key,
+    required this.store,
+    this.rosterPollInterval = const Duration(seconds: 10),
+  });
 
   final DashboardStore store;
+  final Duration rosterPollInterval;
 
   @override
   State<ChatRoomTab> createState() => _ChatRoomTabState();
@@ -25,31 +34,47 @@ class ChatRoomTab extends StatefulWidget {
 
 class _ChatRoomTabState extends State<ChatRoomTab> {
   ChatRoomController? _controller;
-  StreamSubscription<Set<String>>? _participantsSub;
+  StreamSubscription<void>? _participantsSub;
+  Timer? _rosterPoll;
 
   @override
   void initState() {
     super.initState();
-    _participantsSub = widget.store.chatRoomParticipants.listen(
-      _syncParticipants,
-    );
-    _syncParticipants(widget.store.chatRoomParticipants.value);
+    _watch();
   }
 
   @override
   void didUpdateWidget(ChatRoomTab oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.store == widget.store) return;
-    _participantsSub?.cancel();
-    unawaited(_controller?.dispose() ?? Future<void>.value());
-    _controller = null;
-    _participantsSub = widget.store.chatRoomParticipants.listen(
-      _syncParticipants,
-    );
-    _syncParticipants(widget.store.chatRoomParticipants.value);
+    if (oldWidget.store == widget.store &&
+        oldWidget.rosterPollInterval == widget.rosterPollInterval) {
+      return;
+    }
+    if (oldWidget.store != widget.store) {
+      unawaited(_controller?.dispose() ?? Future<void>.value());
+      _controller = null;
+    }
+    _watch();
   }
 
-  void _syncParticipants(Set<String> participantIds) {
+  /// Follows the server roster, and the thread list that says which of its
+  /// actors are live; the roster can land before the threads do.
+  void _watch() {
+    _participantsSub?.cancel();
+    _rosterPoll?.cancel();
+    _participantsSub = Rx.combineLatest2(
+      widget.store.chatRoomParticipants,
+      widget.store.actorStates,
+      (_, _) {},
+    ).listen((_) => _syncParticipants(widget.store.chatRoomParticipants.value));
+    unawaited(widget.store.refreshChatRoom());
+    _rosterPoll = Timer.periodic(
+      widget.rosterPollInterval,
+      (_) => unawaited(widget.store.refreshChatRoom()),
+    );
+  }
+
+  void _syncParticipants(List<String> participantIds) {
     final valid = participantIds.where((id) {
       final actor = widget.store.actor(id);
       return actor != null && !actor.thread.isRetired;
@@ -74,6 +99,7 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
   @override
   void dispose() {
     _participantsSub?.cancel();
+    _rosterPoll?.cancel();
     unawaited(_controller?.dispose() ?? Future<void>.value());
     super.dispose();
   }
@@ -137,10 +163,8 @@ class _ChatRoomTabState extends State<ChatRoomTab> {
             children: [
               _RoomHeader(
                 controller: controller,
-                store: widget.store,
                 queueDepth: queueDepth,
                 nowPlaying: nowPlaying,
-                participantIds: participantIds,
               ),
               const SizedBox(height: 12),
               _StatusBanner(
@@ -215,17 +239,13 @@ String _roomStatus({
 class _RoomHeader extends StatelessWidget {
   const _RoomHeader({
     required this.controller,
-    required this.store,
     required this.queueDepth,
     required this.nowPlaying,
-    required this.participantIds,
   });
 
   final ChatRoomController controller;
-  final DashboardStore store;
   final int queueDepth;
   final VoiceAnnouncement? nowPlaying;
-  final List<String> participantIds;
 
   @override
   Widget build(BuildContext context) {
@@ -241,13 +261,26 @@ class _RoomHeader extends StatelessWidget {
         const Icon(Icons.forum_outlined, color: MeshColors.accent),
         const SizedBox(width: 8),
         const Expanded(
-          child: Text(
-            'CHAT ROOM',
-            style: TextStyle(
-              color: MeshColors.textPrimary,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 1.2,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'CHAT ROOM',
+                style: TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              // Membership is mesh state; this page only reads it (#663).
+              Text(
+                'Root adds and removes participants',
+                key: ValueKey('chat-room-membership'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
+              ),
+            ],
           ),
         ),
         if (nowPlaying != null)
@@ -268,74 +301,7 @@ class _RoomHeader extends StatelessWidget {
           label,
           style: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
         ),
-        IconButton(
-          key: const ValueKey('chat-room-add'),
-          tooltip: 'Add actor to Chat Room',
-          onPressed: () => _chooseParticipant(context),
-          icon: const Icon(Icons.person_add_alt_1, color: MeshColors.accent),
-        ),
       ],
-    );
-  }
-
-  Future<void> _chooseParticipant(BuildContext context) async {
-    final actors =
-        store.actorStates.value.actors.values
-            .map((state) => state.thread)
-            .where(
-              (actor) => !actor.isRetired && !participantIds.contains(actor.id),
-            )
-            .toList()
-          ..sort((a, b) => a.handle.compareTo(b.handle));
-    await showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: MeshColors.bgSecondary,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-          child: actors.isEmpty
-              ? const Text(
-                  'All live actors are already in the room.',
-                  style: TextStyle(color: MeshColors.textMuted),
-                )
-              : ListView(
-                  shrinkWrap: true,
-                  children: [
-                    const Text(
-                      'Add actor to Chat Room',
-                      style: TextStyle(
-                        color: MeshColors.textPrimary,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    for (final actor in actors)
-                      ListTile(
-                        leading: AbsorbPointer(
-                          child: ActorAvatar(
-                            id: actor.id,
-                            size: 34,
-                            store: store,
-                          ),
-                        ),
-                        title: Text(
-                          actor.handle,
-                          style: const TextStyle(color: MeshColors.textPrimary),
-                        ),
-                        subtitle: Text(
-                          _voiceLabel(actor),
-                          style: const TextStyle(color: MeshColors.textMuted),
-                        ),
-                        onTap: () {
-                          store.addChatRoomParticipant(actor.id);
-                          Navigator.of(context).pop();
-                        },
-                      ),
-                  ],
-                ),
-        ),
-      ),
     );
   }
 }

@@ -41,6 +41,15 @@ export const MODEL_ADMIN_CAPABILITY = "model-admin";
 export const ACTOR_ADMIN_CAPABILITY = "actor-admin";
 
 /**
+ * Manage membership of the one mesh-wide voice Chat Room (#663): add or remove
+ * participants, and give an added actor an unused voice when its own collides.
+ * The room has no subtree to scope to, so this is host-global like the
+ * model-class registry: seeded once to the configured actor and never granted
+ * through the mesh, which is what keeps room membership root-managed.
+ */
+export const ROOM_ADMIN_CAPABILITY = "room-admin";
+
+/**
  * The capabilities administered on the agent-execution endpoint itself. They
  * mount no server of their own; the mesh consults them for authority and the
  * endpoint registers the matching management tools for a holder.
@@ -50,6 +59,7 @@ export const ADMINISTRATIVE_CAPABILITIES: ReadonlySet<string> = new Set([
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
   ACTOR_ADMIN_CAPABILITY,
+  ROOM_ADMIN_CAPABILITY,
 ]);
 
 /**
@@ -64,8 +74,8 @@ export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
 
 /**
  * Capabilities that act on the whole host rather than on a subtree of actors:
- * restarting or relinking the daemon, and editing the mesh-global model-class
- * registry. The subtree boundary that bounds every other delegation cannot
+ * restarting or relinking the daemon, editing the mesh-global model-class
+ * registry, and managing the mesh-wide Chat Room roster. The subtree boundary that bounds every other delegation cannot
  * bound these, so the mesh never grants one — not downward, and not to the
  * grantor itself, which is the path by which a delegated `capability-admin`
  * holder would otherwise widen into host authority. Only the bootstrap seed
@@ -74,6 +84,7 @@ export const HOST_MAINTENANCE_CAPABILITIES: ReadonlySet<string> = new Set([
  */
 export const HOST_GLOBAL_CAPABILITIES: ReadonlySet<string> = new Set([
   MODEL_ADMIN_CAPABILITY,
+  ROOM_ADMIN_CAPABILITY,
   ...HOST_MAINTENANCE_CAPABILITIES,
 ]);
 

@@ -83,11 +83,19 @@ Keys stay on the host and are included in log secret redaction.
 
 ## Chat Room
 
-The dashboard's top-level **Chat Room** starts with the root actor and lets the
-operator add other live actors. It is separate from the single-actor walkie
-screen: the room listens to the existing multi-actor voice presence and
-backlog routes, while the single-actor screen retains its leased-session
-behavior.
+The dashboard's top-level **Chat Room** is one mesh-wide room. Root is always
+a participant. Its roster is stored in `mesh.db`, so every dashboard, and a
+reload, shows the same room. Only the actor holding the host-global
+`room-admin` capability (the configured root, seeded at boot) changes it, with
+the `add_room_participant`, `remove_room_participant` and
+`list_room_participants` mesh tools. Human principals and aliases such as
+`root` or `parent` cannot be added. The dashboard reads the roster from
+`GET /api/mesh/chat-room`, re-reading it every 10 seconds while the room is
+open, and has no add or remove control of its own.
+
+The room is separate from the single-actor walkie screen: it listens to the
+existing multi-actor voice presence and backlog routes, while the single-actor
+screen retains its leased-session behavior.
 
 An avatar is a tap-to-record/tap-to-send control. The first tap captures that
 avatar as the recipient; tapping a different avatar while recording cannot
@@ -97,9 +105,13 @@ one FIFO queue, so only one voice plays at a time. Starting a recording pauses
 the current reply without acknowledging it; after send or cancel, that reply
 resumes before later queued replies. The speaking actor has a highlighted ring.
 
-Each room tile names the actor's configured voice. Configure participants with
-different entries from **Info → Voice** when listening by ear must distinguish
-speakers; the saved per-actor voice remains the source used for TTS.
+Adding a participant keeps the room's voices distinct. When root adds an actor
+whose voice another participant already uses (including two actors that both
+fall back to the instance default), the actor is given the first unused voice
+from the supported catalog, saved as its ordinary per-actor voice setting. The
+add result reports the voice it assigned and the one it replaced. Removing an
+actor leaves its voice as it is. Each room tile names the actor's voice. A voice
+changed later from **Info → Voice** is not re-checked against the room.
 
 The adapters use ElevenLabs' [transcription API](https://elevenlabs.io/docs/api-reference/speech-to-text/convert)
 and [speech API](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).

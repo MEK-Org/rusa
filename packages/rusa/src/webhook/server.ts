@@ -165,6 +165,7 @@ export interface DashboardMeshRefs {
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
   supportedVoices?: DashboardDataDeps["supportedVoices"];
+  chatRoom?: DashboardDataDeps["chatRoom"];
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   slackClient?: DashboardDataDeps["slackClient"];
@@ -617,6 +618,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           geminiApiKey: options.mesh.geminiApiKey,
           avatarGeneration,
           supportedVoices: options.mesh.supportedVoices,
+          chatRoom: options.mesh.chatRoom,
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           slackClient: options.mesh.slackClient,
