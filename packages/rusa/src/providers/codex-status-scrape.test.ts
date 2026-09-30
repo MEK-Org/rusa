@@ -62,6 +62,7 @@ import {
   isProcessReferencingHome,
   scrapeCodexStatus,
   setCodexScrapeLogger,
+  supportsNoDaemon,
   type TmuxScriptTiming,
 } from "./codex-status-scrape.js";
 
@@ -119,6 +120,14 @@ describe("codex-status-scrape", () => {
       expect(script).not.toContain("--disable daemon_auto_start");
     });
 
+    it("omits --no-daemon for a CLI whose help does not advertise it", () => {
+      const script = buildTmuxScript("codex", "/tmp/test.sock", {}, false);
+      expect(script).toContain('tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 "codex"');
+      expect(script).not.toContain(
+        'tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 "codex" --no-daemon'
+      );
+    });
+
     it("retries /status within a bounded budget when only the refresh placeholder renders", () => {
       const script = buildTmuxScript("codex", "/tmp/test.sock");
 
@@ -137,6 +146,37 @@ describe("codex-status-scrape", () => {
 
       // AUTH-SAFETY: every retry is still /status, never /usage.
       expect(script).not.toContain("/usage");
+    });
+  });
+
+  describe("--no-daemon capability detection (issue #779)", () => {
+    it("caches a supported CLI help result", () => {
+      spawnSyncMock.mockReturnValue({
+        status: 0,
+        stdout: "Usage: codex\n  --no-daemon\n",
+        stderr: "",
+      });
+
+      expect(supportsNoDaemon("codex-with-daemon-test")).toBe(true);
+      expect(supportsNoDaemon("codex-with-daemon-test")).toBe(true);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(1);
+      expect(spawnSyncMock).toHaveBeenCalledWith("codex-with-daemon-test", ["--help"], {
+        encoding: "utf8",
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    });
+
+    it("does not use the flag when a CLI help result lacks it", () => {
+      spawnSyncMock.mockReturnValue({ status: 0, stdout: "Usage: codex\n", stderr: "" });
+      expect(supportsNoDaemon("codex-without-daemon-test")).toBe(false);
+    });
+
+    it("does not cache an unsuccessful capability probe", () => {
+      spawnSyncMock.mockReturnValue({ status: 2, stdout: "", stderr: "unknown option" });
+      expect(supportsNoDaemon("codex-failed-help-test")).toBe(false);
+      expect(supportsNoDaemon("codex-failed-help-test")).toBe(false);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -349,6 +389,36 @@ describe("codex-status-scrape", () => {
       });
 
       expect(output).toBe("rendered 5h limit: 99% left\n");
+    });
+
+    it("launches an older CLI without --no-daemon when its help lacks that flag", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnSyncMock.mockImplementation((command: unknown) => {
+        if (command === "codex-0.144.4-test") {
+          return { status: 0, stdout: "Usage: codex\n", stderr: "" };
+        }
+      });
+      spawnMock.mockImplementation((_command, _args) => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      await scrapeCodexStatus({
+        actorDir: "/tmp/actor",
+        cliCommand: "codex-0.144.4-test",
+        codexConfigDir: "/tmp/codex-config",
+      });
+
+      const script = String(spawnMock.mock.calls[0]?.[1]?.[1]);
+      expect(script).toContain('new-session -d -s "$S" -x 120 -y 50 "codex-0.144.4-test"');
+      expect(script).not.toContain('"codex-0.144.4-test" --no-daemon');
     });
 
     it("symlinks the host auth.json into the isolated codex home when it exists", async () => {

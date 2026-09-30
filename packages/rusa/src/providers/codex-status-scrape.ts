@@ -82,11 +82,42 @@ export interface TmuxScriptTiming {
   bannerTries?: number;
 }
 
+const noDaemonSupportByCliCommand = new Map<string, boolean>();
+
+/**
+ * Determine once per configured binary whether its interactive TUI accepts
+ * `--no-daemon`. Codex 0.158+ needs the flag to avoid starting a managed
+ * app-server, while the quickstart image's 0.144.4 CLI rejects it outright.
+ * A failed capability probe is deliberately treated as unsupported: the
+ * regular scrape will then report its own launch failure rather than making a
+ * second, unbounded best-effort probe part of the quota-read path.
+ */
+export function supportsNoDaemon(cliCommand: string): boolean {
+  const cached = noDaemonSupportByCliCommand.get(cliCommand);
+  if (cached !== undefined) return cached;
+
+  try {
+    const help = spawnSync(cliCommand, ["--help"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (help.error || help.status !== 0) return false;
+
+    const supported = `${help.stdout ?? ""}\n${help.stderr ?? ""}`.includes("--no-daemon");
+    noDaemonSupportByCliCommand.set(cliCommand, supported);
+    return supported;
+  } catch {
+    return false;
+  }
+}
+
 /** tmux orchestration: launch codex, send /status, capture the rendered panel. */
 export function buildTmuxScript(
   cliCommand: string,
   sockPath: string,
-  timing: TmuxScriptTiming = {}
+  timing: TmuxScriptTiming = {},
+  useNoDaemon = true
 ): string {
   const budgetS = timing.budgetS ?? 80;
   const attemptSecs = timing.attemptSecs ?? 10;
@@ -118,10 +149,11 @@ export function buildTmuxScript(
     // capturing + reaping tmux before Node's timer fires.
     `BUDGET_S=${budgetS}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    // Start Codex without connecting to a background app-server daemon,
-    // preventing Codex 0.158+ from leaking background daemons and replicated
-    // ~430MB package trees per probe run (issue #779).
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)} --no-daemon`,
+    // Codex 0.158+ needs --no-daemon to avoid leaking a managed app-server;
+    // older supported CLIs (including quickstart's 0.144.4) reject that flag.
+    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${
+      useNoDaemon ? " --no-daemon" : ""
+    }`,
     // Wait for the codex banner (TUI ready), polling ~0.5s per try.
     `for i in $(seq 1 ${bannerTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -306,12 +338,13 @@ export function detectProcessesReferencingHome(codexHome: string): number[] {
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
+  const useNoDaemon = supportsNoDaemon(cliCommand);
   mkdirSync(opts.actorDir, { recursive: true });
 
   const hostCodexDir = opts.codexConfigDir ?? join(homedir(), ".codex");
   const codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir);
   const sock = join(codexHome, "status-tmux.sock");
-  const script = buildTmuxScript(cliCommand, sock);
+  const script = buildTmuxScript(cliCommand, sock, {}, useNoDaemon);
 
   // The bash script launches a DETACHED tmux server (`new-session -d`) that
   // double-forks away from bash's process group — so killing the bash shell (on
