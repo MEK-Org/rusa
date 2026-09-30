@@ -72,8 +72,11 @@ canonical file changes, which is what `codex login` on the host does.
      workers.
    - Find interactive `codex` sessions on the host (`pgrep -a codex`). Close
      them, or accept that they refresh on their own.
-   - Nested E2E daemons read `~/.codex` read-only and do not take the broker
-     lock. Keep them off the canary host, or pause them.
+   - Nested E2E daemons are not brokered yet. The E2E instance gets the host
+     `~/.codex` bound read-only, so its workers can read the canonical refresh
+     token and refresh upstream without taking the broker lock. That spends the
+     token without persisting the rotation. Keep E2E instances off a brokered
+     host until they are brokered too.
 2. **Canary.** Set `providers.codex.authBroker: true` on staging only and
    restart it. Check `codex_auth_rotated` and the absence of
    `codex_auth_login_rejected` over at least one access-token lifetime. Then
