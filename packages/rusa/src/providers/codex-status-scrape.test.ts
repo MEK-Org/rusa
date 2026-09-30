@@ -152,17 +152,25 @@ describe("codex-status-scrape", () => {
   describe("--no-daemon capability detection (issue #779)", () => {
     const probeEnv = { CODEX_HOME: "/tmp/isolated-codex-home" };
 
-    it("caches a supported CLI help result", () => {
-      spawnSyncMock.mockReturnValue({
-        status: 0,
-        stdout: "Usage: codex\n  --no-daemon\n",
-        stderr: "",
-      });
+    it("picks up an in-place CLI upgrade between probes", () => {
+      spawnSyncMock
+        .mockReturnValueOnce({ status: 0, stdout: "Usage: codex\n", stderr: "" })
+        .mockReturnValueOnce({
+          status: 0,
+          stdout: "Usage: codex\n  --no-daemon\n",
+          stderr: "",
+        });
 
-      expect(supportsNoDaemon("codex-with-daemon-test", probeEnv)).toBe(true);
-      expect(supportsNoDaemon("codex-with-daemon-test", probeEnv)).toBe(true);
-      expect(spawnSyncMock).toHaveBeenCalledTimes(1);
-      expect(spawnSyncMock).toHaveBeenCalledWith("codex-with-daemon-test", ["--help"], {
+      expect(supportsNoDaemon("codex-upgrade-test", probeEnv)).toBe(false);
+      expect(supportsNoDaemon("codex-upgrade-test", probeEnv)).toBe(true);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+      expect(spawnSyncMock).toHaveBeenNthCalledWith(1, "codex-upgrade-test", ["--help"], {
+        encoding: "utf8",
+        env: probeEnv,
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(spawnSyncMock).toHaveBeenNthCalledWith(2, "codex-upgrade-test", ["--help"], {
         encoding: "utf8",
         env: probeEnv,
         timeout: 5_000,
@@ -175,11 +183,10 @@ describe("codex-status-scrape", () => {
       expect(supportsNoDaemon("codex-without-daemon-test", probeEnv)).toBe(false);
     });
 
-    it("does not cache an unsuccessful capability probe", () => {
+    it("falls back when the bounded capability probe fails", () => {
       spawnSyncMock.mockReturnValue({ status: 2, stdout: "", stderr: "unknown option" });
       expect(supportsNoDaemon("codex-failed-help-test", probeEnv)).toBe(false);
-      expect(supportsNoDaemon("codex-failed-help-test", probeEnv)).toBe(false);
-      expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -82,8 +82,6 @@ export interface TmuxScriptTiming {
   bannerTries?: number;
 }
 
-const noDaemonSupportByCliCommand = new Map<string, boolean>();
-
 /**
  * Environment for every Codex process the scrape starts. `CODEX_HOME` is always
  * pinned to the isolated throwaway home: an inherited `CODEX_HOME` can name a
@@ -95,17 +93,16 @@ function codexProbeEnv(codexHome: string): NodeJS.ProcessEnv {
 }
 
 /**
- * Determine once per configured binary whether its interactive TUI accepts
- * `--no-daemon`. Codex 0.158+ needs the flag to avoid starting a managed
- * app-server, while the quickstart image's 0.144.4 CLI rejects it outright.
- * A failed capability probe is deliberately treated as unsupported: the
- * regular scrape will then report its own launch failure rather than making a
- * second, unbounded best-effort probe part of the quota-read path.
+ * Determine whether the interactive TUI currently accepts `--no-daemon`.
+ * Codex 0.158+ needs the flag to avoid starting a managed app-server, while
+ * the quickstart image's 0.144.4 CLI rejects it outright. Probe for every
+ * scrape rather than caching the result: an in-place CLI upgrade must take
+ * effect without restarting the coordinator. A failed capability probe is
+ * deliberately treated as unsupported: the regular scrape will then report
+ * its own launch failure rather than making a second, unbounded best-effort
+ * probe part of the quota-read path.
  */
 export function supportsNoDaemon(cliCommand: string, env: NodeJS.ProcessEnv): boolean {
-  const cached = noDaemonSupportByCliCommand.get(cliCommand);
-  if (cached !== undefined) return cached;
-
   try {
     const help = spawnSync(cliCommand, ["--help"], {
       encoding: "utf8",
@@ -115,9 +112,7 @@ export function supportsNoDaemon(cliCommand: string, env: NodeJS.ProcessEnv): bo
     });
     if (help.error || help.status !== 0) return false;
 
-    const supported = `${help.stdout ?? ""}\n${help.stderr ?? ""}`.includes("--no-daemon");
-    noDaemonSupportByCliCommand.set(cliCommand, supported);
-    return supported;
+    return `${help.stdout ?? ""}\n${help.stderr ?? ""}`.includes("--no-daemon");
   } catch {
     return false;
   }
