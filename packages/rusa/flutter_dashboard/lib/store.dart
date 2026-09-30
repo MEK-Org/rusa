@@ -368,6 +368,11 @@ class DashboardStore {
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
+  // The V1 Chat Room is dashboard-global rather than tied to the actor-detail
+  // selection. It starts with root once the authoritative thread snapshot is
+  // available and stays in-memory for this dashboard session; no mesh data or
+  // schema is repurposed for a UI-only room roster.
+  final _chatRoomParticipants = BehaviorSubject<Set<String>>.seeded(const {});
 
   /// Ticks whenever any actor's avatar state changes so `ActorAvatar` /
   /// `AvatarLightbox` rebuild and read [avatarVersion] / [isAvatarGenerating].
@@ -432,6 +437,8 @@ class DashboardStore {
       _dashboardConfig.stream;
   ValueStream<String?> get error => _error.stream;
   ValueStream<bool> get walkieActive => _walkieActive.stream;
+  ValueStream<Set<String>> get chatRoomParticipants =>
+      _chatRoomParticipants.stream;
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
 
   /// Cache-busting version for one actor's avatar URL (0 = never changed).
@@ -487,6 +494,18 @@ class DashboardStore {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
     }
+  }
+
+  /// Add one live actor to the dashboard-global Chat Room. Membership is
+  /// intentionally local to this dashboard session; the room subscribes to
+  /// existing voice presence/backlog routes and does not create a new durable
+  /// server-side conversation model.
+  void addChatRoomParticipant(String actorId) {
+    final actor = _actorStates.value.actors[actorId];
+    if (actor == null || actor.thread.isRetired) return;
+    final current = _chatRoomParticipants.value;
+    if (current.contains(actorId)) return;
+    _chatRoomParticipants.add({...current, actorId});
   }
 
   void setFocusedObligationId(String? id) {
@@ -692,6 +711,15 @@ class DashboardStore {
         actors: updatedActors,
       ),
     );
+    final currentRoom = _chatRoomParticipants.value;
+    final nextRoom = currentRoom
+        .where((id) => updatedActors[id]?.thread.isRetired == false)
+        .toSet();
+    if (updatedActors['root']?.thread.isRetired == false) nextRoom.add('root');
+    if (nextRoom.length != currentRoom.length ||
+        !nextRoom.containsAll(currentRoom)) {
+      _chatRoomParticipants.add(nextRoom);
+    }
     _updateQueuePacingPoll();
   }
 
@@ -1896,6 +1924,7 @@ class DashboardStore {
       _error.close(),
       _collapsed.close(),
       _walkieActive.close(),
+      _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
     ]);
   }

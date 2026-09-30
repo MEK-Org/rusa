@@ -4,6 +4,7 @@ import 'widgets/header.dart';
 DashboardView? parseDashboardView(Uri uri) {
   final cleanPath = uri.path.replaceFirst(RegExp(r'/+$'), '');
   if (cleanPath.startsWith('/actors')) return DashboardView.actors;
+  if (cleanPath == '/chat-room') return DashboardView.chatRoom;
   if (cleanPath == '/understanding') return DashboardView.understanding;
   if (cleanPath == '/reports') return DashboardView.reports;
   if (cleanPath.startsWith('/work')) return DashboardView.work;
@@ -44,7 +45,7 @@ Uri buildDashboardUri(
   final queryParams = Map<String, String>.from(baseUri.queryParameters);
   queryParams.remove('obligation');
 
-  var newPath = '/${view.name}';
+  var newPath = view == DashboardView.chatRoom ? '/chat-room' : '/${view.name}';
   if (view == DashboardView.work && focusedObligationId != null) {
     newPath = '/work/$focusedObligationId';
   } else if (view == DashboardView.actors && focusedActorId != null) {

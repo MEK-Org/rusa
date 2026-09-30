@@ -81,5 +81,25 @@ The actor voice API also accepts `PATCH /api/mesh/actors/<actorId>/voice`:
 Send `{"voiceConfig":null}` to restore the Google instance default.
 Keys stay on the host and are included in log secret redaction.
 
+## Chat Room
+
+The dashboard's top-level **Chat Room** starts with the root actor and lets the
+operator add other live actors. It is separate from the single-actor walkie
+screen: the room listens to the existing multi-actor voice presence and
+backlog routes, while the single-actor screen retains its leased-session
+behavior.
+
+An avatar is a tap-to-record/tap-to-send control. The first tap captures that
+avatar as the recipient; tapping a different avatar while recording cannot
+redirect the clip. Tap the captured avatar again to send it, or use **Cancel
+recording** to discard it. Incoming replies from every room participant join
+one FIFO queue, so only one voice plays at a time. Starting a recording pauses
+the current reply without acknowledging it; after send or cancel, that reply
+resumes before later queued replies. The speaking actor has a highlighted ring.
+
+Each room tile names the actor's configured voice. Configure participants with
+different entries from **Info → Voice** when listening by ear must distinguish
+speakers; the saved per-actor voice remains the source used for TTS.
+
 The adapters use ElevenLabs' [transcription API](https://elevenlabs.io/docs/api-reference/speech-to-text/convert)
 and [speech API](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).

@@ -260,12 +260,14 @@ class WebVoiceStream implements VoiceStreamSource {
   Stream<VoiceSessionControl> get controls => _controls.stream;
 
   @override
-  void connect(List<String> actors, String sessionId) {
+  void connect(List<String> actors, String? sessionId) {
     _es?.close();
     final qs = Uri.encodeQueryComponent(actors.join(','));
-    final session = Uri.encodeQueryComponent(sessionId);
+    final session = sessionId == null
+        ? ''
+        : '&sessionId=${Uri.encodeQueryComponent(sessionId)}';
     final es = SessionEventSource(
-      '/api/mesh/voice/stream?actors=$qs&sessionId=$session',
+      '/api/mesh/voice/stream?actors=$qs$session',
       _session,
     );
     es.addEventListener(

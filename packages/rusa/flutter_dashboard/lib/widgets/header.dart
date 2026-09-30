@@ -11,7 +11,7 @@ import 'brand_mark.dart';
 import 'quota_tooltip.dart';
 
 /// The top-level dashboard views the header nav switches between.
-enum DashboardView { overview, actors, understanding, reports, work }
+enum DashboardView { overview, actors, chatRoom, understanding, reports, work }
 
 /// One top-level destination the navigation offers. The desktop header renders
 /// these inline and the phone drawer renders them as rows, from this one list —
@@ -58,6 +58,11 @@ const List<DashboardDestination> kDashboardDestinations = [
     label: 'Actors',
     view: DashboardView.actors,
     icon: Icons.account_tree_outlined,
+  ),
+  DashboardDestination(
+    label: 'Chat Room',
+    view: DashboardView.chatRoom,
+    icon: Icons.forum_outlined,
   ),
   DashboardDestination(
     label: 'Work',

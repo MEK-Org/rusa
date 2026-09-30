@@ -73,8 +73,10 @@ abstract interface class VoiceStreamSource {
   Stream<VoiceStreamStatus> get status;
   Stream<VoiceSessionControl> get controls;
 
-  /// Open the stream for [actors] (≥1 required by the server).
-  void connect(List<String> actors, String sessionId);
+  /// Open the stream for [actors] (≥1 required by the server). A non-null
+  /// [sessionId] opts into the existing single-actor leased-walkie authority;
+  /// a room has presence for several actors but deliberately owns no lease.
+  void connect(List<String> actors, String? sessionId);
 
   /// Close the connection (drops walkie presence) and the streams.
   void dispose();

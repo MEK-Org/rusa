@@ -1332,7 +1332,7 @@ class FakeVoiceStream implements VoiceStreamSource {
   final framesCtrl = StreamController<VoiceAnnouncement>.broadcast();
   final statusCtrl = StreamController<VoiceStreamStatus>.broadcast();
   final controlsCtrl = StreamController<VoiceSessionControl>.broadcast();
-  final connectCalls = <({List<String> actors, String sessionId})>[];
+  final connectCalls = <({List<String> actors, String? sessionId})>[];
   bool disposed = false;
 
   @override
@@ -1343,7 +1343,7 @@ class FakeVoiceStream implements VoiceStreamSource {
   Stream<VoiceSessionControl> get controls => controlsCtrl.stream;
 
   @override
-  void connect(List<String> actors, String sessionId) =>
+  void connect(List<String> actors, String? sessionId) =>
       connectCalls.add((actors: actors, sessionId: sessionId));
 
   @override
