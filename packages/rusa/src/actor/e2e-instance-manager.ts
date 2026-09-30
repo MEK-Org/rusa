@@ -569,7 +569,7 @@ export class E2EInstanceManager {
             try {
               return codexAuthBrokerConfigured(loadConfig(dirname(configSource)));
             } catch {
-              return false;
+              return true;
             }
           })()));
 

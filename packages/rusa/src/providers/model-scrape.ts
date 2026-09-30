@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RusaConfig } from "../config/types.js";
@@ -359,7 +359,6 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
     killTmux();
     lease?.revoke();
     if (brokeredHome) {
-      keepRewrittenModelsCache(brokeredHome, hostCodexDir);
       rmSync(brokeredHome, { recursive: true, force: true });
     }
     try {
@@ -441,24 +440,6 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
     });
   } finally {
     cleanup();
-  }
-}
-
-/**
- * A brokered probe's home symlinks the host models cache; if Codex replaced the
- * link with a fresh file instead of writing through it, the fresh cache would
- * vanish with the throwaway home. Put it back so the next refresh can take the
- * cheap path. Best effort.
- */
-function keepRewrittenModelsCache(brokeredHome: string, hostCodexDir: string): void {
-  const rewritten = join(brokeredHome, "models_cache.json");
-  try {
-    if (!lstatSync(rewritten).isFile()) return;
-    const staged = join(hostCodexDir, `.models_cache.json.rusa-${process.pid}.tmp`);
-    copyFileSync(rewritten, staged);
-    renameSync(staged, join(hostCodexDir, "models_cache.json"));
-  } catch {
-    /* absent, or written through the symlink already */
   }
 }
 

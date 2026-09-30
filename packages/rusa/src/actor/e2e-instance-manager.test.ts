@@ -1459,6 +1459,27 @@ describe("E2EInstanceManager", () => {
     ).toBe(false);
     expect(existsSync(join(runtimeHome, ".codex"))).toBe(false);
   });
+
+  it("fails closed and binds no Codex login when base config loading throws a configuration error", () => {
+    writeFileSync(join(mcHome, "config.yaml"), ": invalid: yaml: [");
+
+    const subject = manager();
+    const args = (
+      subject as unknown as {
+        buildBwrapArgs(
+          worktree: string,
+          root: string,
+          resume: boolean,
+          socketDir?: string
+        ): string[];
+      }
+    ).buildBwrapArgs(actorWorktree, join(root, "run-1"), false, join(root, "socket"));
+
+    expect(
+      args.some((arg, index) => arg === "--ro-bind" && args[index + 1] === join(root, ".codex"))
+    ).toBe(false);
+    expect(args.join(" ")).not.toContain(".codex");
+  });
 });
 
 describe.skipIf(!BWRAP_CAPABLE)(

@@ -76,13 +76,19 @@ canonical file changes, which is what `codex login` on the host does.
      workers.
    - Find interactive `codex` sessions on the host (`pgrep -a codex`). Close
      them, or accept that they refresh on their own.
-   - Nested E2E daemons fail closed for Codex when `authBroker: true`: the E2E
-     instance manager binds no Codex login, preventing nested workers from
-     reading or racing the canonical refresh token.
+   - Nested E2E daemons fail closed for Codex when `authBroker: true` (or on
+     configuration read error): the E2E instance manager binds no Codex login,
+     preventing nested workers from reading or racing the canonical refresh token.
 2. **Canary.** Set `providers.codex.authBroker: true` on staging only and
-   restart it. Check `codex_auth_rotated` and the absence of
-   `codex_auth_login_rejected` over at least one access-token lifetime. Then
-   enable it on prod the same way.
+   restart it. On a host where prod and staging daemons share the same
+   `~/.codex` login, prod Codex launches must be paused (or prod is not running
+   active Codex workers) during the canary window (at least one access-token
+   lifetime, approximately 1 hour), ensuring no unbrokered process attempts an
+   upstream refresh while staging exercises the broker.
+   Check `codex_auth_rotated` and the absence of `codex_auth_login_rejected`
+   over that lifetime. Verify that the `/status` quota probe and `/model` probe
+   return real readings (not unknown) through the broker. Then enable
+   `authBroker: true` on prod the same way.
 3. The flag defaults to off until the canary completes.
 
 ## Rollback
