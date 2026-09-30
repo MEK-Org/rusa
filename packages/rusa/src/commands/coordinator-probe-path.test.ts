@@ -34,11 +34,17 @@ const FAKE_TMUX = [
   'case "$sub" in',
   "  kill-server) exit 0 ;;",
   "  new-session)",
-  // The command to run in the session is the last argument; walking "$@" reads it
-  // without a ${...} expansion. Resolving it is exactly what the real tmux does,
-  // and exactly what failed in #525.
+  // The command binary is the first argument after tmux options (-d -s <name> -x <w> -y <h>).
+  // Any arguments after the binary are flags passed to that command (e.g. --no-daemon).
+  "    shift 3",
   '    cli=""',
-  '    for a in "$@"; do cli="$a"; done',
+  "    while [ $# -gt 0 ]; do",
+  '      case "$1" in',
+  "        -d) shift ;;",
+  "        -s|-x|-y) shift 2 ;;",
+  '        *) cli="$1"; break ;;',
+  "      esac",
+  "    done",
   '    if command -v "$cli" >/dev/null 2>&1; then',
   '      command -v "$cli" > "$STATE/resolved"',
   "    else",

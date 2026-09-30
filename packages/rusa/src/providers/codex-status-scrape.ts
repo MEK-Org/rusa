@@ -4,13 +4,25 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createLogger, type Logger } from "../observability/logger.js";
+
+let _scrapeLogger: Logger | undefined;
+export function setCodexScrapeLogger(logger: Logger | undefined): void {
+  _scrapeLogger = logger;
+}
+function scrapeLog(): Logger {
+  _scrapeLogger ??= createLogger({ context: { component: "codex-status-scrape" } });
+  return _scrapeLogger;
+}
 
 /**
  * Host-side PTY scrape of codex's interactive `/status` panel .
@@ -106,7 +118,10 @@ export function buildTmuxScript(
     // capturing + reaping tmux before Node's timer fires.
     `BUDGET_S=${budgetS}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}`,
+    // Start Codex without connecting to a background app-server daemon and with
+    // daemon auto-start disabled, preventing Codex 0.158+ from leaking background
+    // daemons and replicated ~430MB package trees per probe run (issue #779).
+    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)} --no-daemon --disable daemon_auto_start`,
     // Wait for the codex banner (TUI ready), polling ~0.5s per try.
     `for i in $(seq 1 ${bannerTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -245,7 +260,77 @@ function stderrTail(chunks: readonly string[]): string {
   return `: ${text.length > 300 ? `\u2026${text.slice(-300)}` : text}`;
 }
 
+/**
+ * Test whether a process appears to reference a specific isolated CODEX_HOME
+ * either through its command line arguments or its current working directory.
+ */
+export function isProcessReferencingHome(pid: number, codexHome: string): boolean {
+  if (pid <= 1 || pid === process.pid || pid === process.ppid) return false;
+  try {
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    if (cmd.includes(codexHome)) return true;
+  } catch {
+    // Process exited or unreadable
+  }
+  try {
+    const cwd = readlinkSync(`/proc/${pid}/cwd`);
+    if (cwd === codexHome || cwd.startsWith(`${codexHome}/`)) return true;
+  } catch {
+    // Process exited or unreadable
+  }
+  return false;
+}
+
+/**
+ * Reap any orphaned processes referencing the throwaway CODEX_HOME before directory
+ * removal (e.g. reparented daemons or child processes). Returns the count reaped.
+ */
+export function reapProcessesReferencingHome(codexHome: string): number {
+  if (!codexHome) return 0;
+  let reaped = 0;
+  try {
+    const entries = readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (isProcessReferencingHome(pid, codexHome)) {
+        try {
+          process.kill(pid, "SIGKILL");
+          reaped++;
+        } catch {
+          // Already gone
+        }
+      }
+    }
+  } catch {
+    // /proc unreadable (non-Linux or sandboxed)
+  }
+  return reaped;
+}
+
+/**
+ * Sweep guard to detect accumulation of stale /tmp/rusa-codex-status-* homes (issue #779).
+ * Emits a bounded diagnostic warning if leaked count exceeds threshold. Returns the count.
+ */
+export function warnIfLeakedHomesExceed(threshold = 5, tmpDir = tmpdir()): number {
+  try {
+    const entries = readdirSync(tmpDir);
+    const leaked = entries.filter((e) => e.startsWith("rusa-codex-status-"));
+    if (leaked.length > threshold) {
+      scrapeLog().warn("leaked_codex_homes", {
+        count: leaked.length,
+        threshold,
+        tmpDir,
+      });
+    }
+    return leaked.length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
+  warnIfLeakedHomesExceed();
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
@@ -271,6 +356,13 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
   const cleanup = () => {
     killTmux();
+    const reaped = reapProcessesReferencingHome(codexHome);
+    if (reaped > 0) {
+      scrapeLog().warn("reaped_orphaned_processes", {
+        count: reaped,
+        codexHome,
+      });
+    }
     try {
       assertSharedAuthSymlink(codexHome, hostCodexDir);
     } catch {

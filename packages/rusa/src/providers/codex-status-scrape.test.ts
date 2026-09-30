@@ -17,6 +17,9 @@ const writeFileSyncMock = vi.fn();
 const rmSyncMock = vi.fn();
 const mkdirSyncMock = vi.fn();
 const symlinkSyncMock = vi.fn();
+const readFileSyncMock = vi.fn();
+const readdirSyncMock = vi.fn();
+const readlinkSyncMock = vi.fn();
 
 vi.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => spawnMock(...args),
@@ -35,7 +38,9 @@ vi.mock("node:fs", () => ({
   rmSync: (...args: unknown[]) => rmSyncMock(...args),
   mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
   symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
-  readFileSync: vi.fn().mockReturnValue(""),
+  readFileSync: (...args: unknown[]) => readFileSyncMock(...args),
+  readdirSync: (...args: unknown[]) => readdirSyncMock(...args),
+  readlinkSync: (...args: unknown[]) => readlinkSyncMock(...args),
   default: {
     mkdtempSync: (...args: unknown[]) => mkdtempSyncMock(...args),
     existsSync: (...args: unknown[]) => existsSyncMock(...args),
@@ -44,14 +49,21 @@ vi.mock("node:fs", () => ({
     rmSync: (...args: unknown[]) => rmSyncMock(...args),
     mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
     symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
-    readFileSync: vi.fn().mockReturnValue(""),
+    readFileSync: (...args: unknown[]) => readFileSyncMock(...args),
+    readdirSync: (...args: unknown[]) => readdirSyncMock(...args),
+    readlinkSync: (...args: unknown[]) => readlinkSyncMock(...args),
   },
 }));
 
+import type { Logger } from "../observability/logger.js";
 import {
   buildTmuxScript,
+  isProcessReferencingHome,
+  reapProcessesReferencingHome,
   scrapeCodexStatus,
+  setCodexScrapeLogger,
   type TmuxScriptTiming,
+  warnIfLeakedHomesExceed,
 } from "./codex-status-scrape.js";
 
 describe("codex-status-scrape", () => {
@@ -60,6 +72,9 @@ describe("codex-status-scrape", () => {
     mkdtempSyncMock.mockReturnValue("/tmp/test-codex-home");
     existsSyncMock.mockReturnValue(false);
     lstatSyncMock.mockReturnValue({ isSymbolicLink: () => true });
+    readFileSyncMock.mockReturnValue("");
+    readdirSyncMock.mockReturnValue([]);
+    readlinkSyncMock.mockReturnValue("");
   });
 
   describe("buildTmuxScript", () => {
@@ -97,6 +112,12 @@ describe("codex-status-scrape", () => {
       );
       expect(errorBranch).toContain("exit 1");
       expect(errorBranch).not.toContain("capture-pane");
+    });
+
+    it("disables daemon auto-start and runs without background daemon (issue #779)", () => {
+      const script = buildTmuxScript("codex", "/tmp/test.sock");
+      expect(script).toContain("--no-daemon");
+      expect(script).toContain("--disable daemon_auto_start");
     });
 
     it("retries /status within a bounded budget when only the refresh placeholder renders", () => {
@@ -357,6 +378,160 @@ describe("codex-status-scrape", () => {
         expect.stringContaining("/tmp/codex-config/auth.json"),
         "/tmp/test-codex-home/auth.json"
       );
+    });
+
+    it("reaps orphaned processes referencing codexHome during cleanup", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      readdirSyncMock.mockReturnValue(["99999"]);
+      readFileSyncMock.mockReturnValue("/tmp/test-codex-home/app-server --managed-daemon");
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+      const logs: { event: string; fields?: Record<string, unknown> }[] = [];
+      const testLogger = {
+        warn: (event: string, fields?: Record<string, unknown>) => {
+          logs.push({ event, fields });
+        },
+      } as unknown as Logger;
+      setCodexScrapeLogger(testLogger);
+
+      try {
+        await scrapeCodexStatus({
+          actorDir: "/tmp/actor",
+          codexConfigDir: "/tmp/codex-config",
+        });
+
+        expect(killSpy).toHaveBeenCalledWith(99999, "SIGKILL");
+        expect(
+          logs.some((l) => l.event === "reaped_orphaned_processes" && l.fields?.count === 1)
+        ).toBe(true);
+        expect(rmSyncMock).toHaveBeenCalledWith("/tmp/test-codex-home", {
+          recursive: true,
+          force: true,
+        });
+      } finally {
+        killSpy.mockRestore();
+        setCodexScrapeLogger(undefined);
+      }
+    });
+  });
+
+  describe("process detection and reaping (issue #779)", () => {
+    it("isProcessReferencingHome ignores system and current/parent processes", () => {
+      expect(isProcessReferencingHome(0, "/tmp/home")).toBe(false);
+      expect(isProcessReferencingHome(1, "/tmp/home")).toBe(false);
+      expect(isProcessReferencingHome(process.pid, "/tmp/home")).toBe(false);
+      expect(isProcessReferencingHome(process.ppid, "/tmp/home")).toBe(false);
+    });
+
+    it("isProcessReferencingHome detects match in /proc/[pid]/cmdline", () => {
+      readFileSyncMock.mockReturnValue("codex --listen unix:///tmp/home/app.sock");
+      expect(isProcessReferencingHome(54321, "/tmp/home")).toBe(true);
+    });
+
+    it("isProcessReferencingHome detects match in /proc/[pid]/cwd", () => {
+      readFileSyncMock.mockReturnValue("codex");
+      readlinkSyncMock.mockReturnValue("/tmp/home/subpath");
+      expect(isProcessReferencingHome(54321, "/tmp/home")).toBe(true);
+    });
+
+    it("isProcessReferencingHome returns false on read error", () => {
+      readFileSyncMock.mockImplementation(() => {
+        throw new Error("ENOENT");
+      });
+      readlinkSyncMock.mockImplementation(() => {
+        throw new Error("ENOENT");
+      });
+      expect(isProcessReferencingHome(54321, "/tmp/home")).toBe(false);
+    });
+
+    it("reapProcessesReferencingHome kills matching processes and counts them", () => {
+      readdirSyncMock.mockReturnValue(["100", "200", "not-a-pid"]);
+      readFileSyncMock.mockImplementation((p: unknown) => {
+        if (String(p).includes("/100/cmdline")) return "app-server /tmp/target-home";
+        return "unrelated-process";
+      });
+      readlinkSyncMock.mockReturnValue("/other/dir");
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+      try {
+        const reaped = reapProcessesReferencingHome("/tmp/target-home");
+        expect(reaped).toBe(1);
+        expect(killSpy).toHaveBeenCalledWith(100, "SIGKILL");
+        expect(killSpy).not.toHaveBeenCalledWith(200, expect.anything());
+      } finally {
+        killSpy.mockRestore();
+      }
+    });
+
+    it("reapProcessesReferencingHome returns 0 for empty home or unreadable /proc", () => {
+      expect(reapProcessesReferencingHome("")).toBe(0);
+      readdirSyncMock.mockImplementation(() => {
+        throw new Error("EACCES");
+      });
+      expect(reapProcessesReferencingHome("/tmp/home")).toBe(0);
+    });
+  });
+
+  describe("warnIfLeakedHomesExceed (issue #779 sweep guard)", () => {
+    it("warns when leaked homes exceed threshold", () => {
+      const logs: { event: string; fields?: Record<string, unknown> }[] = [];
+      const testLogger = {
+        warn: (event: string, fields?: Record<string, unknown>) => {
+          logs.push({ event, fields });
+        },
+      } as unknown as Logger;
+      setCodexScrapeLogger(testLogger);
+      readdirSyncMock.mockReturnValue([
+        "rusa-codex-status-1",
+        "rusa-codex-status-2",
+        "rusa-codex-status-3",
+        "other-file",
+      ]);
+
+      try {
+        const count = warnIfLeakedHomesExceed(2, "/tmp");
+        expect(count).toBe(3);
+        expect(logs).toHaveLength(1);
+        expect(logs[0]?.event).toBe("leaked_codex_homes");
+        expect(logs[0]?.fields).toMatchObject({
+          count: 3,
+          threshold: 2,
+          tmpDir: "/tmp",
+        });
+      } finally {
+        setCodexScrapeLogger(undefined);
+      }
+    });
+
+    it("does not warn when leaked homes do not exceed threshold", () => {
+      const logs: { event: string; fields?: Record<string, unknown> }[] = [];
+      const testLogger = {
+        warn: (event: string, fields?: Record<string, unknown>) => {
+          logs.push({ event, fields });
+        },
+      } as unknown as Logger;
+      setCodexScrapeLogger(testLogger);
+      readdirSyncMock.mockReturnValue(["rusa-codex-status-1"]);
+
+      try {
+        const count = warnIfLeakedHomesExceed(2, "/tmp");
+        expect(count).toBe(1);
+        expect(logs).toHaveLength(0);
+      } finally {
+        setCodexScrapeLogger(undefined);
+      }
     });
   });
 });
