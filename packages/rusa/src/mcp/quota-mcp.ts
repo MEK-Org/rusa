@@ -115,6 +115,28 @@ export interface QuotaLimit {
   scrapedAt?: string;
 }
 
+/**
+ * Why one LLM quota extraction attempt failed (#774). Enough to tell a
+ * runaway digit loop from a schema miss or a transport error, without keeping
+ * the full response body.
+ */
+export interface QuotaExtractionFailure {
+  /** 1 for the first model, 2 for the stronger-model retry. */
+  attempt: number;
+  /** The extraction model the attempt ran on. */
+  model: string;
+  /** Wall-clock time from request to failure. */
+  elapsedMs: number;
+  /** The failure message, capped at QUOTA_FAILURE_ERROR_CHARS. */
+  error: string;
+  /** The API's finish reason, when a response arrived and carried one. */
+  finishReason?: string;
+  /** The first QUOTA_FAILURE_RESPONSE_HEAD_CHARS of the response text. */
+  responseHead?: string;
+  /** Total length of the response text, in UTF-16 code units. */
+  responseLength?: number;
+}
+
 export interface ProviderQuotaSnapshot {
   provider: string;
   status: "available" | "exhausted" | "unknown" | "unsupported";
@@ -144,6 +166,11 @@ export interface ProviderQuotaSnapshot {
    * snapshot is identical to the raw parser output.
    */
   explanations?: QuotaInferenceExplanation[];
+  /**
+   * The LLM extraction attempts that failed in this cycle, one entry per
+   * attempt (at most two). Absent when the first attempt succeeded (#774).
+   */
+  extractionFailures?: QuotaExtractionFailure[];
   /**
    * Coordinator freshness block (§5.5, criterion 15) when served via the coordinator service.
    * Cold coordinator answers status: "unknown" with freshness.
@@ -463,6 +490,40 @@ function resolveResetAtIso(
  */
 const QUOTA_PARSE_MAX_OUTPUT_TOKENS = 8192;
 
+/** Response text kept from a failed extraction attempt (#774). */
+const QUOTA_FAILURE_RESPONSE_HEAD_CHARS = 400;
+/** Failure message kept from a failed extraction attempt (#774). */
+const QUOTA_FAILURE_ERROR_CHARS = 300;
+
+/** What one extraction attempt saw before it succeeded or failed. */
+interface ExtractionAttemptObservation {
+  finishReason?: string;
+  text?: string;
+}
+
+function describeFailedAttempt(
+  attempt: number,
+  model: string,
+  elapsedMs: number,
+  error: unknown,
+  seen: ExtractionAttemptObservation
+): QuotaExtractionFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    attempt,
+    model,
+    elapsedMs,
+    error: message.slice(0, QUOTA_FAILURE_ERROR_CHARS),
+    ...(seen.finishReason ? { finishReason: seen.finishReason } : {}),
+    ...(seen.text !== undefined
+      ? {
+          responseHead: seen.text.slice(0, QUOTA_FAILURE_RESPONSE_HEAD_CHARS),
+          responseLength: seen.text.length,
+        }
+      : {}),
+  };
+}
+
 /**
  * Read the model's copied percentage text ("43", "57.5", "43%") as a number
  * in 0-100 with at most 4 decimal places. Anything else, including a JSON
@@ -645,7 +706,10 @@ async function parseQuotaWithLlm(
     "a stronger model, so always fill the field rather than declining because the year or " +
     "timezone was not printed.";
 
-  const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
+  const executeOnce = async (
+    modelName: string,
+    seen: ExtractionAttemptObservation
+  ): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
@@ -670,13 +734,14 @@ async function parseQuotaWithLlm(
     // A response cut off at the model's output limit is incomplete; fail the
     // attempt with that cause so the stronger-model retry logs why (#763).
     const finishReason = response.candidates?.[0]?.finishReason;
+    if (finishReason) seen.finishReason = String(finishReason);
+    const text = await extractGeminiText(response);
+    seen.text = text;
     if (finishReason === FinishReason.MAX_TOKENS) {
       throw new Error(
         `Quota parse failed: response truncated by model output token limit (finishReason: ${finishReason})`
       );
     }
-
-    const text = await extractGeminiText(response);
 
     let parsed: unknown;
     try {
@@ -835,18 +900,32 @@ async function parseQuotaWithLlm(
     };
   };
 
+  const extractionFailures: QuotaExtractionFailure[] = [];
+  const runAttempt = async (attempt: number, modelName: string) => {
+    const seen: ExtractionAttemptObservation = {};
+    const startedMs = Date.now();
+    try {
+      return await executeOnce(modelName, seen);
+    } catch (err) {
+      extractionFailures.push(
+        describeFailedAttempt(attempt, modelName, Date.now() - startedMs, err, seen)
+      );
+      throw err;
+    }
+  };
+
   try {
-    return await executeOnce("gemini-3.5-flash-lite");
+    return await runAttempt(1, "gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
       `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.8-flash`
     );
     try {
-      const result = await executeOnce("gemini-3.8-flash");
+      const result = await runAttempt(2, "gemini-3.8-flash");
       console.info(
         `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded`
       );
-      return result;
+      return { ...result, extractionFailures };
     } catch (secondErr) {
       console.error(
         `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
@@ -854,6 +933,7 @@ async function parseQuotaWithLlm(
       return {
         status: "unknown",
         message: `LLM quota parsing failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
+        extractionFailures,
       };
     }
   }
@@ -1471,6 +1551,7 @@ export class QuotaService {
         status: parsed.status || "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw: output,
         scrapedAt,
       };
@@ -1529,6 +1610,7 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
       };
@@ -1572,6 +1654,7 @@ export class QuotaService {
           status: parsed.status ?? "unknown",
           message: parsed.message,
           limits: parsed.limits,
+          ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
           raw,
           scrapedAt,
         };
@@ -1638,6 +1721,7 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
       };
