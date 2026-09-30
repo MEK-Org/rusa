@@ -85,6 +85,16 @@ export interface TmuxScriptTiming {
 const noDaemonSupportByCliCommand = new Map<string, boolean>();
 
 /**
+ * Environment for every Codex process the scrape starts. `CODEX_HOME` is always
+ * pinned to the isolated throwaway home: an inherited `CODEX_HOME` can name a
+ * live credential store (inside a Codex sandbox it is the writable host
+ * `auth.json` bind), so no spawn here may fall through to it.
+ */
+function codexProbeEnv(codexHome: string): NodeJS.ProcessEnv {
+  return { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" };
+}
+
+/**
  * Determine once per configured binary whether its interactive TUI accepts
  * `--no-daemon`. Codex 0.158+ needs the flag to avoid starting a managed
  * app-server, while the quickstart image's 0.144.4 CLI rejects it outright.
@@ -92,13 +102,14 @@ const noDaemonSupportByCliCommand = new Map<string, boolean>();
  * regular scrape will then report its own launch failure rather than making a
  * second, unbounded best-effort probe part of the quota-read path.
  */
-export function supportsNoDaemon(cliCommand: string): boolean {
+export function supportsNoDaemon(cliCommand: string, env: NodeJS.ProcessEnv): boolean {
   const cached = noDaemonSupportByCliCommand.get(cliCommand);
   if (cached !== undefined) return cached;
 
   try {
     const help = spawnSync(cliCommand, ["--help"], {
       encoding: "utf8",
+      env,
       timeout: 5_000,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -338,13 +349,12 @@ export function detectProcessesReferencingHome(codexHome: string): number[] {
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
-  const useNoDaemon = supportsNoDaemon(cliCommand);
   mkdirSync(opts.actorDir, { recursive: true });
 
   const hostCodexDir = opts.codexConfigDir ?? join(homedir(), ".codex");
   const codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir);
+  const env = codexProbeEnv(codexHome);
   const sock = join(codexHome, "status-tmux.sock");
-  const script = buildTmuxScript(cliCommand, sock, {}, useNoDaemon);
 
   // The bash script launches a DETACHED tmux server (`new-session -d`) that
   // double-forks away from bash's process group — so killing the bash shell (on
@@ -388,6 +398,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
 
   try {
+    const script = buildTmuxScript(cliCommand, sock, {}, supportsNoDaemon(cliCommand, env));
     return await new Promise<string>((resolve, reject) => {
       const chunks: string[] = [];
       const errChunks: string[] = [];
@@ -395,7 +406,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
       // signal the whole group with `process.kill(-pid, ...)`.
       const child = spawn("bash", ["-c", script], {
         cwd: opts.actorDir,
-        env: { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" },
+        env,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });

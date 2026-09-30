@@ -150,6 +150,8 @@ describe("codex-status-scrape", () => {
   });
 
   describe("--no-daemon capability detection (issue #779)", () => {
+    const probeEnv = { CODEX_HOME: "/tmp/isolated-codex-home" };
+
     it("caches a supported CLI help result", () => {
       spawnSyncMock.mockReturnValue({
         status: 0,
@@ -157,11 +159,12 @@ describe("codex-status-scrape", () => {
         stderr: "",
       });
 
-      expect(supportsNoDaemon("codex-with-daemon-test")).toBe(true);
-      expect(supportsNoDaemon("codex-with-daemon-test")).toBe(true);
+      expect(supportsNoDaemon("codex-with-daemon-test", probeEnv)).toBe(true);
+      expect(supportsNoDaemon("codex-with-daemon-test", probeEnv)).toBe(true);
       expect(spawnSyncMock).toHaveBeenCalledTimes(1);
       expect(spawnSyncMock).toHaveBeenCalledWith("codex-with-daemon-test", ["--help"], {
         encoding: "utf8",
+        env: probeEnv,
         timeout: 5_000,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -169,13 +172,13 @@ describe("codex-status-scrape", () => {
 
     it("does not use the flag when a CLI help result lacks it", () => {
       spawnSyncMock.mockReturnValue({ status: 0, stdout: "Usage: codex\n", stderr: "" });
-      expect(supportsNoDaemon("codex-without-daemon-test")).toBe(false);
+      expect(supportsNoDaemon("codex-without-daemon-test", probeEnv)).toBe(false);
     });
 
     it("does not cache an unsuccessful capability probe", () => {
       spawnSyncMock.mockReturnValue({ status: 2, stdout: "", stderr: "unknown option" });
-      expect(supportsNoDaemon("codex-failed-help-test")).toBe(false);
-      expect(supportsNoDaemon("codex-failed-help-test")).toBe(false);
+      expect(supportsNoDaemon("codex-failed-help-test", probeEnv)).toBe(false);
+      expect(supportsNoDaemon("codex-failed-help-test", probeEnv)).toBe(false);
       expect(spawnSyncMock).toHaveBeenCalledTimes(2);
     });
   });
@@ -419,6 +422,41 @@ describe("codex-status-scrape", () => {
       const script = String(spawnMock.mock.calls[0]?.[1]?.[1]);
       expect(script).toContain('new-session -d -s "$S" -x 120 -y 50 "codex-0.144.4-test"');
       expect(script).not.toContain('"codex-0.144.4-test" --no-daemon');
+    });
+
+    it("runs the capability probe in the isolated home, never an inherited CODEX_HOME (issue #781)", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnSyncMock.mockReturnValue({ status: 0, stdout: "Usage: codex\n", stderr: "" });
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      const origCodexHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = "/tmp/ambient-live-codex-home";
+      try {
+        await scrapeCodexStatus({
+          actorDir: "/tmp/actor",
+          cliCommand: "codex-env-pin-test",
+          codexConfigDir: "/tmp/codex-config",
+        });
+      } finally {
+        if (origCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = origCodexHome;
+      }
+
+      const probe = spawnSyncMock.mock.calls.find(
+        ([command, args]) => command === "codex-env-pin-test" && String(args) === "--help"
+      );
+      expect(probe?.[2]?.env?.CODEX_HOME).toBe("/tmp/test-codex-home");
+      expect(spawnMock.mock.calls[0]?.[2]?.env?.CODEX_HOME).toBe("/tmp/test-codex-home");
     });
 
     it("symlinks the host auth.json into the isolated codex home when it exists", async () => {
