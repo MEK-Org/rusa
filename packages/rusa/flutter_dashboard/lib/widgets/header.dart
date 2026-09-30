@@ -59,8 +59,11 @@ const List<DashboardDestination> kDashboardDestinations = [
     view: DashboardView.actors,
     icon: Icons.account_tree_outlined,
   ),
+  // #663's dashboard-global Chat Room. The nav label is the short "Room" so
+  // all five destinations still fit the inline nav at [kNarrowBreakpoint];
+  // the room's own controls carry the full "Chat Room" name.
   DashboardDestination(
-    label: 'Chat Room',
+    label: 'Room',
     view: DashboardView.chatRoom,
     icon: Icons.forum_outlined,
   ),
