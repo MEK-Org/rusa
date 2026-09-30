@@ -502,12 +502,20 @@ class _RoomAvatarButton extends StatelessWidget {
                   child: AspectRatio(
                     aspectRatio: 1,
                     child: Center(
-                      child: AbsorbPointer(
-                        child: ActorAvatar(
-                          id: actor.id,
-                          size: 88,
-                          store: store,
-                        ),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final size = math.min(
+                            constraints.maxWidth,
+                            constraints.maxHeight,
+                          );
+                          return AbsorbPointer(
+                            child: ActorAvatar(
+                              id: actor.id,
+                              size: size,
+                              store: store,
+                            ),
+                          );
+                        },
                       ),
                     ),
                   ),

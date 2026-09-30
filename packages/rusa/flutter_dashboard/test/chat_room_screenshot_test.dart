@@ -13,6 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
+import 'package:rusa_dashboard/widgets/header.dart';
 
 import 'fakes.dart';
 import 'screenshot_support.dart';
@@ -94,6 +95,142 @@ void main() {
         findsOneWidget,
       );
       await captureBoundary(key, '$_outDir/chat_room_three_actors.png');
+      expect(tester.takeException(), isNull);
+    });
+  });
+
+  testWidgets('renders the Chat Room recording state', (tester) async {
+    await tester.runAsync(() async {
+      HttpOverrides.global = FakeImageHttpOverrides(await portraits(_actorIds));
+      addTearDown(() => HttpOverrides.global = null);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', voiceName: 'Puck'),
+          makeThread('actor-b', voiceName: 'Kore'),
+          makeThread('actor-c', voiceName: 'Fenrir'),
+        ];
+      final walkie = FakeWalkie(api);
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        walkie: walkie.deps,
+      );
+      await store.refreshThreads();
+      store.addChatRoomParticipant('actor-b');
+      store.addChatRoomParticipant('actor-c');
+      addTearDown(store.dispose);
+
+      final key = GlobalKey();
+      await tester.binding.setSurfaceSize(const Size(1180, 820));
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: buildMeshTheme(),
+          home: Scaffold(
+            backgroundColor: MeshColors.bgPrimary,
+            body: RepaintBoundary(
+              key: key,
+              child: ChatRoomTab(store: store),
+            ),
+          ),
+        ),
+      );
+      await settleImages(tester, portraitUrls(_actorIds));
+
+      // Tap root avatar to start recording.
+      await tester.tap(find.byKey(const ValueKey('chat-room-avatar-root')));
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(find.text('Tap to send'), findsOneWidget);
+      expect(find.byKey(const ValueKey('chat-room-cancel')), findsOneWidget);
+      expect(find.text('Cancel recording'), findsOneWidget);
+      await captureBoundary(key, '$_outDir/chat_room_recording.png');
+      expect(tester.takeException(), isNull);
+    });
+  });
+
+  testWidgets('renders desktop header at narrow breakpoint before and after', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      addTearDown(store.dispose);
+
+      final beforeDestinations = kDashboardDestinations
+          .where((d) => d.view != DashboardView.chatRoom)
+          .toList();
+
+      final keyBefore = GlobalKey();
+      await tester.binding.setSurfaceSize(const Size(700, 140));
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: buildMeshTheme().copyWith(
+            visualDensity: VisualDensity.compact,
+          ),
+          home: Scaffold(
+            backgroundColor: MeshColors.bgPrimary,
+            body: RepaintBoundary(
+              key: keyBefore,
+              child: SizedBox(
+                width: 700,
+                child: MeshHeader(
+                  store: store,
+                  selected: DashboardView.overview,
+                  onSelect: (_) {},
+                  destinations: beforeDestinations,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await captureBoundary(
+        keyBefore,
+        '$_outDir/header_nav_desktop_narrow_before.png',
+      );
+
+      final keyAfter = GlobalKey();
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: buildMeshTheme().copyWith(
+            visualDensity: VisualDensity.compact,
+          ),
+          home: Scaffold(
+            backgroundColor: MeshColors.bgPrimary,
+            body: RepaintBoundary(
+              key: keyAfter,
+              child: SizedBox(
+                width: 700,
+                child: MeshHeader(
+                  store: store,
+                  selected: DashboardView.overview,
+                  onSelect: (_) {},
+                  destinations: kDashboardDestinations,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await captureBoundary(
+        keyAfter,
+        '$_outDir/header_nav_desktop_narrow_after.png',
+      );
       expect(tester.takeException(), isNull);
     });
   });

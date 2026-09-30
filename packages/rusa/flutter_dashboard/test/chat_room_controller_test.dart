@@ -60,6 +60,7 @@ void main() {
       expect(api.memoSends, hasLength(1));
       expect(api.memoSends.single.actorId, 'root');
       expect(api.memoSends.single.sessionId, isNull);
+      expect(controller.lastError.value, isNull);
     },
   );
 
@@ -126,9 +127,13 @@ void main() {
 
     await controller.tapParticipant('actor-b');
     await pumpEventQueue();
+    await controller.tapParticipant('root');
+    await pumpEventQueue();
+    expect(controller.lastError.value, isNotNull);
     await controller.cancelRecord();
     await pumpEventQueue();
 
+    expect(controller.lastError.value, isNull);
     expect(api.memoSends, isEmpty);
     expect(walkie.recorder.cancelCalls, 1);
     expect(walkie.player.playedUrls, [

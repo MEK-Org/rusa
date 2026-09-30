@@ -157,12 +157,14 @@ class MeshHeader extends StatelessWidget {
     this.onBack,
     this.pageTitle,
     this.detailActor,
+    this.destinations,
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
   });
 
   final DashboardStore store;
+  final List<DashboardDestination>? destinations;
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
@@ -339,7 +341,8 @@ class MeshHeader extends StatelessWidget {
                                       children: [
                                         SizedBox(width: compact ? 8 : 16),
                                         for (final destination
-                                            in kDashboardDestinations)
+                                            in (destinations ??
+                                                kDashboardDestinations))
                                           _NavItem(
                                             destination: destination,
                                             selected: selected,

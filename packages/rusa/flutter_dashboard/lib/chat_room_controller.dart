@@ -52,12 +52,10 @@ class ChatRoomController {
   final _recordingRecipient = BehaviorSubject<String?>.seeded(null);
   final _queueDepth = BehaviorSubject<int>.seeded(0);
   final _nowPlaying = BehaviorSubject<VoiceAnnouncement?>.seeded(null);
-  final _lastPlayed = BehaviorSubject<VoiceAnnouncement?>.seeded(null);
   final _lastError = BehaviorSubject<String?>.seeded(null);
   final BehaviorSubject<bool?> _available;
-  final _transcript = BehaviorSubject<List<WalkieEntry>>.seeded(const []);
 
-  final _queue = <_RoomQueueItem>[];
+  final _queue = <VoiceAnnouncement>[];
   final _seenIds = <String>{};
   final _streamSubs = <StreamSubscription<dynamic>>[];
   VoiceStreamSource? _stream;
@@ -78,10 +76,8 @@ class ChatRoomController {
   ValueStream<String?> get recordingRecipient => _recordingRecipient.stream;
   ValueStream<int> get queueDepth => _queueDepth.stream;
   ValueStream<VoiceAnnouncement?> get nowPlaying => _nowPlaying.stream;
-  ValueStream<VoiceAnnouncement?> get lastPlayed => _lastPlayed.stream;
   ValueStream<String?> get lastError => _lastError.stream;
   ValueStream<bool?> get available => _available.stream;
-  ValueStream<List<WalkieEntry>> get transcript => _transcript.stream;
 
   bool get isRecording => switch (_record.value.phase) {
     RecordPhase.starting ||
@@ -184,7 +180,6 @@ class ChatRoomController {
     _queueDepth.add(0);
     _nowPlaying.add(null);
     _seenIds.clear();
-    _transcript.add(const []);
     _stopRecordTimers();
     if (isRecording) {
       try {
@@ -236,6 +231,9 @@ class ChatRoomController {
       for (final frame in frames) {
         _enqueue(frame);
       }
+      if (_lastError.value?.startsWith('Backlog fetch failed') ?? false) {
+        _lastError.add(null);
+      }
     } on DashboardApiException catch (e) {
       if (e.status == 503) {
         _setAvailable(false);
@@ -257,11 +255,8 @@ class ChatRoomController {
         !_seenIds.add(frame.id)) {
       return;
     }
-    _queue.add(_RoomQueueItem(frame));
+    _queue.add(frame);
     _queueDepth.add(_queue.length);
-    _appendTranscript(
-      ActorReplyEntry(timestamp: DateTime.now(), announcement: frame),
-    );
     unawaited(_drain());
   }
 
@@ -273,29 +268,37 @@ class ChatRoomController {
         // Capturing (and the immediate send) gets a quiet room. Frames still
         // arrive and retain their FIFO position; they play after the memo ends.
         if (isRecording) break;
-        final item = _queue.removeAt(0);
+        final frame = _queue.removeAt(0);
         _queueDepth.add(_queue.length);
-        _nowPlaying.add(item.frame);
+        _nowPlaying.add(frame);
+        var played = false;
         try {
-          await _deps.player.play(item.frame.audioUrl);
+          await _deps.player.play(frame.audioUrl);
+          played = true;
         } catch (e) {
           _lastError.add('Playback failed: $e');
         }
+        if (played &&
+            (_lastError.value?.startsWith('Playback failed') ?? false)) {
+          _lastError.add(null);
+        }
         if (_disposed) return;
         if (_requeueCurrentForRecording &&
-            item.frame.id == _interruptedAnnouncementId) {
+            frame.id == _interruptedAnnouncementId) {
           _requeueCurrentForRecording = false;
           _interruptedAnnouncementId = null;
           _nowPlaying.add(null);
-          _queue.insert(0, item);
+          _queue.insert(0, frame);
           _queueDepth.add(_queue.length);
           break;
         }
         _nowPlaying.add(null);
-        _lastPlayed.add(item.frame);
         if (!_enabled.value) break;
         try {
-          await _deps.api.ackVoiceAnnouncement(item.frame.id);
+          await _deps.api.ackVoiceAnnouncement(frame.id);
+          if (_lastError.value?.startsWith('Ack failed') ?? false) {
+            _lastError.add(null);
+          }
         } catch (e) {
           if (_disposed) return;
           _lastError.add('Ack failed: $e');
@@ -340,6 +343,7 @@ class ChatRoomController {
   }
 
   Future<void> _startRecording(String actorId) async {
+    _lastError.add(null);
     _deliveredReset?.cancel();
     _recordingRecipient.add(actorId);
     _record.add(const RecordStatus(phase: RecordPhase.starting));
@@ -387,6 +391,7 @@ class ChatRoomController {
     } catch (_) {}
     if (!_disposed) {
       _recordingRecipient.add(null);
+      _lastError.add(null);
       _record.add(const RecordStatus());
       unawaited(_drain());
     }
@@ -395,6 +400,7 @@ class ChatRoomController {
   Future<void> _stopAndSend() async {
     final target = _recordingRecipient.value;
     if (target == null) return;
+    _lastError.add(null);
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
     try {
@@ -405,13 +411,6 @@ class ChatRoomController {
         mimeType: clip.mimeType,
       );
       if (_disposed) return;
-      _appendTranscript(
-        UserMemoEntry(
-          timestamp: DateTime.now(),
-          transcript: result.transcript,
-          delivered: result.delivered,
-        ),
-      );
       _recordingRecipient.add(null);
       _record.add(
         RecordStatus(
@@ -456,10 +455,6 @@ class ChatRoomController {
     }
   }
 
-  void _appendTranscript(WalkieEntry entry) {
-    if (!_disposed) _transcript.add([..._transcript.value, entry]);
-  }
-
   void _stopRecordTimers() {
     _recordTicker?.cancel();
     _recordTicker = null;
@@ -491,15 +486,8 @@ class ChatRoomController {
       _recordingRecipient.close(),
       _queueDepth.close(),
       _nowPlaying.close(),
-      _lastPlayed.close(),
       _lastError.close(),
       _available.close(),
-      _transcript.close(),
     ]);
   }
-}
-
-class _RoomQueueItem {
-  _RoomQueueItem(this.frame);
-  final VoiceAnnouncement frame;
 }
