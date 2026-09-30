@@ -119,11 +119,25 @@ export interface CodexAuthBrokerOptions {
 /** Upstream refused the canonical refresh token: the login needs `codex login`. */
 class RefreshRejected extends Error {}
 
+/** A broker failure whose message is written here and carries no token or path. */
+class BrokerFault extends Error {}
+
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 
 /** Upstream error codes reach logs only in this shape; anything else is withheld. */
 function safeErrorCode(value: unknown): string {
   return typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : "unspecified";
+}
+
+/**
+ * What a failed refresh may put in a log: the broker's own messages, else only a
+ * bounded code or error name. Native errors (fs, SQLite, fetch) name paths.
+ */
+function loggableError(err: unknown): string {
+  if (err instanceof BrokerFault) return err.message;
+  const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+  if (typeof code === "string") return safeErrorCode(code);
+  return err instanceof Error ? safeErrorCode(err.name) : "unknown";
 }
 
 /**
@@ -303,7 +317,7 @@ export class CodexAuthBroker {
     try {
       // Deliberately not tied to the request: a consumer cancelled mid-refresh
       // neither aborts the upstream call nor skips the persist.
-      const tokens = await this.refreshFor(entry);
+      const tokens = await this.refreshFor(key, entry);
       const body: Record<string, string> = { access_token: tokens.access_token ?? "" };
       if (tokens.id_token) body.id_token = tokens.id_token;
       reply(res, 200, body);
@@ -311,21 +325,26 @@ export class CodexAuthBroker {
       if (err instanceof RefreshRejected) {
         reply(res, 401, { error: "invalid_grant" });
       } else {
-        this.log.warn("codex_auth_refresh_failed", {
-          error: err instanceof Error ? err.message : "unknown",
-        });
+        this.log.warn("codex_auth_refresh_failed", { error: loggableError(err) });
         reply(res, 502, { error: "temporarily_unavailable" });
       }
     }
   }
 
-  private refreshFor(entry: LeaseEntry): Promise<CodexTokens> {
-    const run = this.chain.then(() => this.withHostLock(() => this.refreshLocked(entry)));
+  private refreshFor(key: string, entry: LeaseEntry): Promise<CodexTokens> {
+    const run = this.chain.then(() => this.withHostLock(() => this.refreshLocked(key, entry)));
     this.chain = run.catch(() => undefined);
     return run;
   }
 
-  private async refreshLocked(entry: LeaseEntry): Promise<CodexTokens> {
+  private async refreshLocked(key: string, entry: LeaseEntry): Promise<CodexTokens> {
+    // A request queued behind another refresh or the host lock may have
+    // outlived its lease. It gets nothing: no upstream call and no access
+    // material. A rotation already past this point still persists.
+    if (this.leases.get(key) !== entry || entry.expiresAt <= this.now()) {
+      if (this.leases.get(key) === entry) this.leases.delete(key);
+      throw new RefreshRejected("capability revoked or expired while queued");
+    }
     const canonical = this.readCanonical();
     const tokens = canonical.tokens ?? {};
     const access = sha256(tokens.access_token ?? "");
@@ -405,9 +424,9 @@ export class CodexAuthBroker {
         `upstream refused the refresh (${res.status} ${safeErrorCode(code)})`
       );
     }
-    if (!res.ok) throw new Error(`upstream refresh returned ${res.status}`);
+    if (!res.ok) throw new BrokerFault(`upstream refresh returned ${res.status}`);
     if (typeof body.access_token !== "string" || body.access_token.length === 0) {
-      throw new Error("upstream refresh reply had no access token");
+      throw new BrokerFault("upstream refresh reply had no access token");
     }
     return body;
   }
@@ -418,12 +437,12 @@ export class CodexAuthBroker {
       parsed = JSON.parse(readFileSync(this.canonicalPath, "utf8"));
     } catch (err) {
       const code = (err as { code?: unknown }).code;
-      throw new Error(
+      throw new BrokerFault(
         `codex auth broker cannot read the canonical auth.json (${typeof code === "string" ? code : "unparseable"}); run \`codex login\` on the host`
       );
     }
     if (!parsed || typeof parsed !== "object") {
-      throw new Error("codex auth broker: canonical auth.json is not an object");
+      throw new BrokerFault("codex auth broker: canonical auth.json is not an object");
     }
     return parsed as CodexAuthFile;
   }
@@ -445,7 +464,8 @@ export class CodexAuthBroker {
         break;
       } catch (err) {
         if ((err as { code?: unknown }).code !== "SQLITE_BUSY") throw err;
-        if (this.now() >= deadline) throw new Error("timed out waiting for the host refresh lock");
+        if (this.now() >= deadline)
+          throw new BrokerFault("timed out waiting for the host refresh lock");
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }

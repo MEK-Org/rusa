@@ -36,8 +36,21 @@ With the broker on:
   lock beside the canonical file (`rusa-auth-refresh.lock`) and re-reads the
   canonical file under it. If a consumer's access token is no longer
   canonical's, another owner has already rotated, so the broker serves
-  canonical's tokens without calling upstream. A login refreshed in the last
-  minute is also served as is. The kernel releases the lock if its holder dies.
+  canonical's tokens without calling upstream. The kernel releases the lock if
+  its holder dies.
+- **At most one rotation a minute.** A login refreshed less than
+  `minRotationIntervalMs` ago (60 s by default) is served as is, even to a
+  consumer holding canonical's current access token. A replayed capability
+  therefore cannot churn the login faster than that. The cost: if upstream
+  rejects a freshly issued access token within that minute, the broker hands
+  the same token back and the run fails (with the host `codex login` alarm)
+  instead of recovering. A 401 after the window rotates and recovers. Both
+  cases are real-driver scenarios.
+- **A request that outlives its lease gets nothing.** The broker re-checks the
+  capability after it has waited for the in-process queue and the host lock.
+  A request whose capability was revoked or expired while queued gets
+  `401 invalid_grant`, with no upstream call and no access material. A
+  rotation already past that check still persists.
 - **Rotations are durable before any reply.** A rotation is written to a temp
   file, fsynced, renamed over the canonical file, and the directory is fsynced.
   A consumer that disconnects mid-refresh does not cancel the upstream call or
@@ -49,8 +62,10 @@ With the broker on:
   enabled, the nested E2E manager binds no Codex login into the instance runtime
   home. Nested Codex workers find no credentials and fail closed, preventing
   unbrokered workers from reading canonical credentials or racing upstream refresh.
-- **Redaction.** Logs name events and sanitized upstream error codes only.
-  They never contain tokens, capabilities or file paths.
+- **Redaction.** Logs name events, the broker's own fixed messages, and
+  bounded error codes (for example `EACCES` or `SQLITE_BUSY`). A native error's
+  message, which names file paths, is never logged. Logs never contain tokens,
+  capabilities or file paths.
 
 ### Crash gap
 
@@ -70,25 +85,37 @@ canonical file changes, which is what `codex login` on the host does.
 1. **Enumerate and drain legacy consumers first.** A process outside the broker
    that refreshes the same login races the broker. Before the first brokered
    rotation on a host:
-   - Check every daemon and quota coordinator that shares the login, prod and
-     staging alike. Each must either run with `authBroker: true` or be stopped.
-     A broker-off daemon still binds the canonical file writable into its
-     workers.
+   - Every daemon and quota coordinator that shares the login, prod and staging
+     alike, must be in one of two states: running with `authBroker: true`, or
+     stopped (`rusa stop`, or stopping its service). A broker-off daemon that
+     keeps running is **not** drained, even with Codex halted:
+     - `/halt provider:codex` (or its file, `<home>/HALT`) stops that daemon
+       from *starting* Codex runs. In-flight runs finish (`halt-switch.ts`),
+       each with the canonical file bound writable.
+     - The halt does not gate the daemon's quota service, whose Codex `/status`
+       scrape runs on its own schedule, or the `/model` catalog probe, which
+       runs at startup and daily (`start.ts`). On a broker-off daemon both
+       launch Codex against the canonical login and can refresh it.
+     So stop it: halt Codex on that daemon first so no new Codex run starts,
+     wait until its in-flight Codex runs have finished (`pgrep -af codex`
+     shows none of its workers), then stop it.
    - Find interactive `codex` sessions on the host (`pgrep -a codex`). Close
      them, or accept that they refresh on their own.
    - Nested E2E daemons fail closed for Codex when `authBroker: true` (or on
      configuration read error): the E2E instance manager binds no Codex login,
      preventing nested workers from reading or racing the canonical refresh token.
 2. **Canary.** Set `providers.codex.authBroker: true` on staging only and
-   restart it. On a host where prod and staging daemons share the same
-   `~/.codex` login, prod Codex launches must be paused (or prod is not running
-   active Codex workers) during the canary window (at least one access-token
-   lifetime, approximately 1 hour), ensuring no unbrokered process attempts an
-   upstream refresh while staging exercises the broker.
-   Check `codex_auth_rotated` and the absence of `codex_auth_login_rejected`
-   over that lifetime. Verify that the `/status` quota probe and `/model` probe
-   return real readings (not unknown) through the broker. Then enable
-   `authBroker: true` on prod the same way.
+   restart it. On a host where prod and staging share the same `~/.codex`
+   login, prod stays stopped (step 1) for the canary window, at least one
+   access-token lifetime (about an hour). No unbrokered process may refresh
+   while staging exercises the broker. Over that window:
+   - Check for `codex_auth_rotated` and the absence of
+     `codex_auth_login_rejected`.
+   - Confirm that the `/status` quota probe and the `/model` probe return real
+     readings, not unknown, through the broker.
+
+   Record those results before prod changes. They are the rollout gate. Then
+   enable `authBroker: true` on prod and restart it.
 3. The flag defaults to off until the canary completes.
 
 ## Rollback
@@ -110,7 +137,8 @@ endpoint and the Responses API. None of them reads the operator's login.
 cd packages/rusa
 # Broker unit tests: strict body, forged/expired/revoked capabilities,
 # concurrency, two brokers sharing a login, a second process holding or dying
-# with the lock, refused login, interrupted refresh, disconnect mid-refresh.
+# with the lock, refused login, interrupted refresh, disconnect mid-refresh,
+# a lease revoked or expired while queued, a filesystem failure's log line.
 pnpm vitest run src/providers/codex-auth-broker.test.ts
 
 # Real driver: CodexProvider.run under bwrap against each CLI listed

@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -182,10 +183,11 @@ describe("CodexAuthBroker (fixture upstream)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  /** No log record may carry a token or capability. */
+  /** No log record may carry a token, capability or path. */
   const expectLogsRedacted = (secrets: string[]) => {
     const text = JSON.stringify(logs);
     for (const secret of [
+      home,
       "fixture-refresh-",
       "fixture-access-",
       "fixture-id-",
@@ -319,6 +321,33 @@ describe("CodexAuthBroker (fixture upstream)", () => {
     );
     expect(broker.activeLeases).toBe(0);
     expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("gives a request whose lease is revoked or expires while queued no rotation and no access", async () => {
+    let clock = 1_000_000;
+    upstream.delayMs = 300;
+    const broker = makeBroker({ now: () => clock });
+    const [inFlight, revoked, expiring] = await Promise.all([
+      broker.lease(60_000),
+      broker.lease(60_000),
+      broker.lease(1_000),
+    ]);
+    const first = refresh(inFlight.refreshUrl, refreshBody(capOf(inFlight.authJson)));
+    while (upstream.calls.length === 0) await new Promise((r) => setTimeout(r, 10));
+    // Both enter the broker's queue behind the in-flight rotation.
+    const queued = [revoked, expiring].map((l) =>
+      refresh(l.refreshUrl, refreshBody(capOf(l.authJson)))
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    revoked.revoke();
+    clock += 2_000;
+    expect((await first).json.access_token).toBe("fixture-access-1");
+    for (const res of await Promise.all(queued)) {
+      expect(res.status).toBe(401);
+      expect(res.json).toEqual({ error: "invalid_grant" });
+    }
+    expect(upstream.calls).toHaveLength(1);
+    expect(broker.activeLeases).toBe(1);
   });
 
   it("does not let a capability refreshed by one consumer be replayed into a second rotation", async () => {
@@ -495,6 +524,22 @@ describe("CodexAuthBroker (fixture upstream)", () => {
     });
     upstream.mode = "ok";
     expect((await refresh(lease.refreshUrl, refreshBody(cap))).status).toBe(200);
+  });
+
+  it("logs a filesystem failure as a bounded code, naming no path", async () => {
+    // A directory where the intent marker goes: its durable rename fails with a
+    // native error whose message names both paths.
+    mkdirSync(join(home, "rusa-auth-refresh.intent", "occupied"), { recursive: true });
+    const lease = await makeBroker().lease(60_000);
+    const res = await refresh(lease.refreshUrl, refreshBody(capOf(lease.authJson)));
+    expect(res.json).toEqual({ error: "temporarily_unavailable" });
+    expect(logs).toContainEqual({
+      level: "warn",
+      event: "codex_auth_refresh_failed",
+      fields: { error: "EISDIR" },
+    });
+    expect(upstream.calls).toHaveLength(0);
+    expectLogsRedacted([capOf(lease.authJson)]);
   });
 
   it("persists a rotation even when the consumer disconnects mid-refresh", async () => {

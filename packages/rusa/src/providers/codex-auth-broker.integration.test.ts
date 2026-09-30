@@ -249,12 +249,16 @@ describe("Codex host-owned auth broker (real driver)", () => {
         "",
       ].join("\n")
     );
+    brokerOn();
+  });
+
+  const brokerOn = (minRotationIntervalMs?: number) =>
     configureCodexAuthBroker(true, {
       codexHome: codexDir,
       upstreamUrl: `${fx.base}/oauth/token`,
       upstreamTimeoutMs: 10_000,
+      minRotationIntervalMs,
     });
-  });
 
   afterEach(async () => {
     configureCodexAuthBroker(false);
@@ -345,6 +349,41 @@ describe("Codex host-owned auth broker (real driver)", () => {
           expect(fx.turns.some((t) => t.status === 401)).toBe(true);
           expect(fx.turns.at(-1)).toEqual({ status: 200, tag: "a1" });
           expect(fx.refreshes).toHaveLength(1);
+        },
+        90_000
+      );
+
+      it.skipIf(!!missing)(
+        "expired at start, then 401 mid-run past the rotation window: a second rotation recovers",
+        async () => {
+          brokerOn(0);
+          writeCanonical(EXPIRED);
+          fx.revokeAfterToolCall = true;
+          const dir = actor("a");
+          const result = await runIn(dir);
+          expect(result.success, result.output.slice(-2000)).toBe(true);
+          expect(fx.turns.some((t) => t.status === 401 && t.tag === "a1")).toBe(true);
+          expect(fx.turns.at(-1)).toEqual({ status: 200, tag: "a2" });
+          expect(fx.refreshes).toEqual(["fixture-refresh-0", "fixture-refresh-1"]);
+          expect(canonicalRefresh()).toBe("fixture-refresh-2");
+        },
+        90_000
+      );
+
+      it.skipIf(!!missing)(
+        "expired at start, then 401 mid-run inside the rotation window: the broker serves canonical as is",
+        async () => {
+          // The default 60 s window bounds capability replay: a freshly rotated
+          // token rejected within it is handed back rather than rotated again.
+          writeCanonical(EXPIRED);
+          fx.revokeAfterToolCall = true;
+          const dir = actor("a");
+          const result = await runIn(dir);
+          expect(result.success).toBe(false);
+          expect(fx.turns.filter((t) => t.status === 200).map((t) => t.tag)).toEqual(["a1"]);
+          expect(fx.turns.some((t) => t.status === 401 && t.tag === "a1")).toBe(true);
+          expect(fx.refreshes).toEqual(["fixture-refresh-0"]);
+          expect(canonicalRefresh()).toBe("fixture-refresh-1");
         },
         90_000
       );
