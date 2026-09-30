@@ -16,6 +16,7 @@ import {
   buildActorBwrapArgs,
   buildActorBwrapCommand,
   codexRolloutStoreDir,
+  SANDBOX_CODEX_SHELL_ENV_OVERRIDE,
   teardownFlutterOverlay,
 } from "./sandbox.js";
 import { sanitizeArgvText } from "./spawn-arguments.js";
@@ -409,8 +410,10 @@ export class CodexProvider implements CodingProvider {
         : undefined;
 
     const codexCwd = opts.sandbox ? opts.sandbox.worktreePath : opts.cwd;
+    // Sandboxed: keep the CLI's shell children off the live auth bind (see
+    // SANDBOX_CODEX_SHELL_HOME). Model and MCP servers travel in the bound config.
     const configOverrides = opts.sandbox
-      ? undefined
+      ? [SANDBOX_CODEX_SHELL_ENV_OVERRIDE]
       : buildCodexConfigOverrides(opts.mcpServers ?? [], this.model, this.effort);
 
     // Build the bwrap wrapper ONCE (sandbox setup + per-actor sessions-store bind +

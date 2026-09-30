@@ -1588,6 +1588,19 @@ describe("sandbox bwrap args", () => {
 
     expect(args.join(" ")).toContain("--setenv CODEX_HOME /tmp");
     expect(args.join(" ")).not.toContain(`--bind ${join(home, ".codex")} ${join(home, ".codex")}`);
+
+    // The CLI's shell children get their own empty CODEX_HOME on the private tmpfs,
+    // outside the auth bind's directory.
+    const { SANDBOX_CODEX_SHELL_ENV_OVERRIDE, SANDBOX_CODEX_SHELL_HOME } = await import(
+      "./sandbox.js"
+    );
+    const shellHomeIndex = args.indexOf(SANDBOX_CODEX_SHELL_HOME);
+    expect(args[shellHomeIndex - 1]).toBe("--dir");
+    expect(shellHomeIndex).toBeGreaterThan(args.indexOf("--tmpfs"));
+    expect(SANDBOX_CODEX_SHELL_HOME).not.toBe("/tmp");
+    expect(SANDBOX_CODEX_SHELL_ENV_OVERRIDE).toBe(
+      `shell_environment_policy.set.CODEX_HOME="${SANDBOX_CODEX_SHELL_HOME}"`
+    );
   });
 
   it("persists codex session rollouts: binds a per-actor host-/tmp store over /tmp/sessions, after the tmpfs", async () => {

@@ -193,6 +193,23 @@ export const SANDBOX_KIMI_MCP_CONFIG_PATH = "/tmp/kimi-home/mcp.json";
 const SANDBOX_CODEX_SESSIONS_PATH = "/tmp/sessions";
 
 /**
+ * CODEX_HOME for every process the actor's Codex CLI starts from its shell tool
+ * (and everything those start in turn: test runners, fake CLIs, a nested codex).
+ * The CLI itself keeps CODEX_HOME=/tmp, where the live host auth file is bound
+ * writable; its children get this empty per-invocation tmpfs directory instead,
+ * so a child that writes `$CODEX_HOME/auth.json` writes a throwaway file. See the
+ * auth bind in {@link buildMeshActorBwrapArgs}.
+ */
+export const SANDBOX_CODEX_SHELL_HOME = "/tmp/codex-shell-home";
+
+/**
+ * Codex config override that hands {@link SANDBOX_CODEX_SHELL_HOME} to the CLI's
+ * shell children. codex.ts passes it on every sandboxed invocation; Codex applies
+ * `shell_environment_policy.set` to the environment of each command it runs.
+ */
+export const SANDBOX_CODEX_SHELL_ENV_OVERRIDE = `shell_environment_policy.set.CODEX_HOME=${JSON.stringify(SANDBOX_CODEX_SHELL_HOME)}`;
+
+/**
  * Per-actor host directory that persists a codex actor's session rollouts ACROSS
  * wakes . Lives on host `/tmp` — shadowed from every sibling by their own
  * `--tmpfs /tmp` (the ISSUE_NUM/ISSUE_NUM sibling-shadow property), so a sibling codex
@@ -973,11 +990,20 @@ function buildMeshActorBwrapArgs(o: {
     // private /tmp, and config/session state stays isolated. Codex's file auth backend
     // truncates and rewrites auth.json in place, so a file bind supports refresh without
     // granting the worker write access to the rest of the host ~/.codex directory.
+    //
+    // The bind is for the Codex CLI's own refreshes only. Every process in this sandbox
+    // shares its mounts, so the CLI's children cannot be kept from the path, but they
+    // are kept from the pointer: the CLI hands its shell children
+    // CODEX_HOME=SANDBOX_CODEX_SHELL_HOME (an empty tmpfs dir created here) through
+    // SANDBOX_CODEX_SHELL_ENV_OVERRIDE. A test or fake CLI the actor runs that writes
+    // `$CODEX_HOME/auth.json` then writes a throwaway file, not the host credential;
+    // tools that ignore CODEX_HOME fall back to ~/.codex, which is read-only here.
     const hostHome = getHostHomeDir();
     const hostAuthPath = join(hostHome, ".codex", "auth.json");
     if (existsSync(hostAuthPath)) {
       args.push("--bind", hostAuthPath, "/tmp/auth.json");
     }
+    args.push("--dir", SANDBOX_CODEX_SHELL_HOME);
 
     // Cross-wake session continuity : persist codex's session rollouts in a
     // per-actor host-/tmp dir and bind it over CODEX_HOME's sessions path. This
