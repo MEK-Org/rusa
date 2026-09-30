@@ -428,12 +428,46 @@ describe("codex-status-scrape", () => {
       { pid: 0, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "system pid 0" },
       { pid: 1, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "init pid 1" },
       { pid: process.pid, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "self pid" },
-      { pid: process.ppid, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "parent pid" },
+      {
+        pid: process.ppid,
+        home: "/tmp/home",
+        cmd: "",
+        cwd: "",
+        expected: false,
+        name: "parent pid",
+      },
       { pid: 54321, home: "", cmd: "/tmp/home", cwd: "", expected: false, name: "empty home" },
-      { pid: 54321, home: "/tmp/home", cmd: "codex --listen unix:///tmp/home/app.sock", cwd: "", expected: true, name: "cmdline match" },
-      { pid: 54321, home: "/tmp/home", cmd: "codex", cwd: "/tmp/home/subpath", expected: true, name: "cwd match" },
-      { pid: 54321, home: "/tmp/home", cmd: "unrelated", cwd: "/var/log", expected: false, name: "unrelated process" },
-    ])("isProcessReferencingHome correctly classifies $name", ({ pid, home, cmd, cwd, expected }) => {
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "codex --listen unix:///tmp/home/app.sock",
+        cwd: "",
+        expected: true,
+        name: "cmdline match",
+      },
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "codex",
+        cwd: "/tmp/home/subpath",
+        expected: true,
+        name: "cwd match",
+      },
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "unrelated",
+        cwd: "/var/log",
+        expected: false,
+        name: "unrelated process",
+      },
+    ])("isProcessReferencingHome correctly classifies $name", ({
+      pid,
+      home,
+      cmd,
+      cwd,
+      expected,
+    }) => {
       readFileSyncMock.mockReturnValue(cmd);
       readlinkSyncMock.mockReturnValue(cwd);
       expect(isProcessReferencingHome(pid, home)).toBe(expected);
