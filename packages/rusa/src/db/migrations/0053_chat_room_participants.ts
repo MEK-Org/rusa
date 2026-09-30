@@ -16,7 +16,7 @@ export const chatRoomParticipants: Migration = {
   up: (db: Database) => {
     db.exec(`
       CREATE TABLE chat_room_participants (
-        actor_id TEXT PRIMARY KEY REFERENCES actors(id) ON DELETE RESTRICT,
+        actor_id TEXT NOT NULL PRIMARY KEY REFERENCES actors(id) ON DELETE RESTRICT,
         added_by TEXT NOT NULL,
         added_at TEXT NOT NULL
       );

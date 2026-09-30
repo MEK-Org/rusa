@@ -1644,7 +1644,7 @@ export function createAgentExecMcpServer(
         if (denied) return denied;
         try {
           const result = chatRoom.add(actor_id, selfId);
-          options?.onWrite?.();
+          if (result.added) options?.onWrite?.();
           return toolOk({
             actor_id: result.actorId,
             added: result.added,
@@ -1672,7 +1672,7 @@ export function createAgentExecMcpServer(
         if (denied) return denied;
         try {
           const removed = chatRoom.remove(actor_id);
-          options?.onWrite?.();
+          if (removed) options?.onWrite?.();
           return toolOk({ actor_id, removed });
         } catch (err) {
           return toolError(err);

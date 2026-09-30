@@ -31,7 +31,7 @@ describe("0053_chat_room_participants", () => {
       pk: number;
     }>;
     expect(columns.map(({ name, notnull, pk }) => ({ name, notnull, pk }))).toEqual([
-      { name: "actor_id", notnull: 0, pk: 1 },
+      { name: "actor_id", notnull: 1, pk: 1 },
       { name: "added_by", notnull: 1, pk: 0 },
       { name: "added_at", notnull: 1, pk: 0 },
     ]);
@@ -48,6 +48,7 @@ describe("0053_chat_room_participants", () => {
     insert.run("actor-a");
     expect(() => insert.run("actor-a")).toThrow(/UNIQUE|PRIMARY KEY/);
     expect(() => insert.run("missing")).toThrow(/FOREIGN KEY/);
+    expect(() => insert.run(null)).toThrow(/NOT NULL/);
   });
 
   it("keeps an actor row from being deleted while it is a participant", () => {

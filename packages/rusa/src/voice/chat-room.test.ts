@@ -165,6 +165,7 @@ describe("ChatRoomService", () => {
     expect(room.participants()).toEqual([{ actorId: "root", addedBy: null, addedAt: null }]);
     expect(actors.get("a")?.voiceConfig).toEqual(assigned);
     expect(() => room.remove("root")).toThrow(/cannot be removed/);
+    expect(() => room.remove("parent")).toThrow(/use an actor id, not an alias/);
   });
 
   it("hides a participant once it retires", () => {

@@ -106,9 +106,8 @@ class ChatRoomController {
     if (!_disposed) _available.add(value);
   }
 
-  /// Reconcile the UI-owned room roster against the live actor snapshot. This
-  /// is intentionally not a server-side room mutation: it only reconnects the
-  /// existing presence stream with its current actor filter.
+  /// Reconcile the controller's participant list against the authoritative
+  /// server roster, reconnecting the presence stream with the active actors.
   Future<void> replaceParticipants(Iterable<String> actorIds) async {
     final next = _normalizedParticipants(actorIds);
     final current = _participants.value;

@@ -113,8 +113,11 @@ export class ChatRoomService {
   /** Returns false when the actor was not in the room. Its voice is left as-is. */
   remove(target: string): boolean {
     const id = target.trim();
-    if (id === this.deps.rootId || ALIASES.has(id.toLowerCase())) {
+    if (id === this.deps.rootId) {
       throw new Error("root is always in the Chat Room and cannot be removed");
+    }
+    if (ALIASES.has(id.toLowerCase())) {
+      throw new Error("use an actor id, not an alias");
     }
     return this.deps.store.remove(id);
   }
