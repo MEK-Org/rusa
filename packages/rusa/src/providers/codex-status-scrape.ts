@@ -118,10 +118,10 @@ export function buildTmuxScript(
     // capturing + reaping tmux before Node's timer fires.
     `BUDGET_S=${budgetS}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    // Start Codex without connecting to a background app-server daemon and with
-    // daemon auto-start disabled, preventing Codex 0.158+ from leaking background
-    // daemons and replicated ~430MB package trees per probe run (issue #779).
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)} --no-daemon --disable daemon_auto_start`,
+    // Start Codex without connecting to a background app-server daemon,
+    // preventing Codex 0.158+ from leaking background daemons and replicated
+    // ~430MB package trees per probe run (issue #779).
+    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)} --no-daemon`,
     // Wait for the codex banner (TUI ready), polling ~0.5s per try.
     `for i in $(seq 1 ${bannerTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -265,7 +265,7 @@ function stderrTail(chunks: readonly string[]): string {
  * either through its command line arguments or its current working directory.
  */
 export function isProcessReferencingHome(pid: number, codexHome: string): boolean {
-  if (pid <= 1 || pid === process.pid || pid === process.ppid) return false;
+  if (pid <= 1 || pid === process.pid || pid === process.ppid || !codexHome) return false;
   try {
     const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
     if (cmd.includes(codexHome)) return true;
@@ -282,55 +282,28 @@ export function isProcessReferencingHome(pid: number, codexHome: string): boolea
 }
 
 /**
- * Reap any orphaned processes referencing the throwaway CODEX_HOME before directory
- * removal (e.g. reparented daemons or child processes). Returns the count reaped.
+ * Detect any surviving processes referencing the throwaway CODEX_HOME before directory
+ * removal (e.g. reparented daemons or child processes). Returns matching PIDs.
  */
-export function reapProcessesReferencingHome(codexHome: string): number {
-  if (!codexHome) return 0;
-  let reaped = 0;
+export function detectProcessesReferencingHome(codexHome: string): number[] {
+  if (!codexHome) return [];
+  const matches: number[] = [];
   try {
     const entries = readdirSync("/proc");
     for (const entry of entries) {
       if (!/^\d+$/.test(entry)) continue;
       const pid = Number(entry);
       if (isProcessReferencingHome(pid, codexHome)) {
-        try {
-          process.kill(pid, "SIGKILL");
-          reaped++;
-        } catch {
-          // Already gone
-        }
+        matches.push(pid);
       }
     }
   } catch {
     // /proc unreadable (non-Linux or sandboxed)
   }
-  return reaped;
-}
-
-/**
- * Sweep guard to detect accumulation of stale /tmp/rusa-codex-status-* homes (issue #779).
- * Emits a bounded diagnostic warning if leaked count exceeds threshold. Returns the count.
- */
-export function warnIfLeakedHomesExceed(threshold = 5, tmpDir = tmpdir()): number {
-  try {
-    const entries = readdirSync(tmpDir);
-    const leaked = entries.filter((e) => e.startsWith("rusa-codex-status-"));
-    if (leaked.length > threshold) {
-      scrapeLog().warn("leaked_codex_homes", {
-        count: leaked.length,
-        threshold,
-        tmpDir,
-      });
-    }
-    return leaked.length;
-  } catch {
-    return 0;
-  }
+  return matches;
 }
 
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
-  warnIfLeakedHomesExceed();
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
@@ -356,10 +329,11 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
   const cleanup = () => {
     killTmux();
-    const reaped = reapProcessesReferencingHome(codexHome);
-    if (reaped > 0) {
-      scrapeLog().warn("reaped_orphaned_processes", {
-        count: reaped,
+    const lingering = detectProcessesReferencingHome(codexHome);
+    if (lingering.length > 0) {
+      scrapeLog().warn("lingering_codex_home_processes", {
+        count: lingering.length,
+        pids: lingering.slice(0, 10),
         codexHome,
       });
     }
