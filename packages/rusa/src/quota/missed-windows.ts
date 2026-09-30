@@ -11,7 +11,12 @@ export interface MissedQuotaWindow {
   lastReadingAt: string;
   /** When the scrape that dropped it was observed. */
   missedAt: string;
-  /** Whether that scrape's output failed to parse, rather than parsing without the window. */
+  /**
+   * Whether that scrape's output threw while parsing, rather than parsing
+   * without the window. A parser that gave up and recorded an `unknown`
+   * snapshot counts as parsed with no windows, so its alarm reads as the
+   * window no longer showing.
+   */
   scrapeFailed: boolean;
 }
 

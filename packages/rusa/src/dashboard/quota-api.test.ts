@@ -1912,6 +1912,23 @@ describe("dead-reckoned lane estimates (#759)", () => {
     expect(snapshot.providers[0].modelWindows).toEqual([]);
   });
 
+  it("starts the pace at a refill whose reset did not move, as the controller does", async () => {
+    // The 12:00 reading rose from 20% to 95% under an unchanged reset: a new
+    // cycle by the controller's rule (`quotaCycleChanged`), so the pace is
+    // five points an hour from 12:00, not the net rise since 10:00. At 13:30
+    // the missed lane reads 90 - 5 x 0.5 = 87.5.
+    const snapshot = await snapshotAt(at("13:30"), providerOnly(at("13:15")), [
+      fablePoint(at("10:00"), 30),
+      fablePoint(at("11:00"), 20),
+      fablePoint(at("12:00"), 95),
+      fablePoint(at("13:00"), 90),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 12.5, scrapedAt: at("13:00"), estimated: true }),
+    ]);
+  });
+
   /** A stalled scrape that still carries the Fable weekly, as last read at `scrapedAt`. */
   const withFable = (
     scrapedAt: string,
@@ -1934,6 +1951,20 @@ describe("dead-reckoned lane estimates (#759)", () => {
     fablePoint(at("11:30"), 40, at("13:00")),
     fablePoint(at("12:30"), 30, at("13:00")),
   ];
+
+  it("passes a stale one-reading lane still in the newest scrape through as read", async () => {
+    // The scraper stalled after 12:00 with the Fable lane in its last scrape,
+    // and that is the lane's only reading, so there is no pace to estimate
+    // from. The reading stays what it is, unmarked, as the durable fallback
+    // serves it; only a lane the newest scrape dropped reads unknown.
+    const snapshot = await snapshotAt(at("13:30"), withFable(at("12:00"), 70, RESET), [
+      fablePoint(at("12:00"), 70),
+    ]);
+
+    expect(snapshot.providers[0].modelWindows).toEqual([
+      expect.objectContaining({ usedPercent: 30, scrapedAt: at("12:00"), estimated: false }),
+    ]);
+  });
 
   it("shows an approximately full estimate right after the window rolls over", async () => {
     // Ten points an hour; the window reset at 13:00 with the last reading at

@@ -170,7 +170,8 @@ List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) => [
 ///   `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
 ///   Marked with an estimate note when dead-reckoned (#759).
 /// - Pacing row: `Pacing: every $interval` (omitted when [showThrottle] is false)
-/// - Warning row: `Warning: no real reading for ...` when stale (>2h) (#759)
+/// - Warning row: `Warning: no new reading for ...` when the reading behind
+///   the ring, estimated or served as-is, is older than 2h (#759)
 /// - Last read row: `Last Read: $age`, marked when stale or manually entered
 /// - Secondary pacing diagnostics ([quotaPacingDiagnostics]), when pacing is shown
 class QuotaTooltip extends StatelessWidget {
@@ -284,8 +285,7 @@ class QuotaTooltip extends StatelessWidget {
   String? _buildWarningText(DateTime currentTime) {
     final age = _staleAge(currentTime);
     if (age == null) return null;
-    return 'Warning: no real reading for ${formatStaleAge(age)}; '
-        'the ring is estimated from the last one';
+    return 'Warning: no new reading for ${formatStaleAge(age)}';
   }
 
   List<String> _buildDiagnostics() {

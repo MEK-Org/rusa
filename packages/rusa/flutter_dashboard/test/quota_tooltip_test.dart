@@ -569,13 +569,43 @@ void main() {
       await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
       expect(
-        find.text('Warning: no real reading for 3h; the ring is estimated from the last one'),
+        find.text('Warning: no new reading for 3h'),
         findsOneWidget,
       );
       expect(
         tooltip.toPlainText(),
-        contains('Warning: no real reading for 3h; the ring is estimated from the last one'),
+        contains('Warning: no new reading for 3h'),
       );
+    });
+
+    testWidgets('renders the same 2h warning for a stale reading served as-is (#759)', (
+      tester,
+    ) async {
+      final oldRead = now.subtract(const Duration(hours: 3));
+      final passThroughWeekly = QuotaWindowDto(
+        id: 'weekly',
+        label: 'Weekly',
+        usedPercent: 30,
+        status: 'available',
+        headline: true,
+        windowMs: 7 * 24 * 3600 * 1000,
+        resetAtIso: now.add(const Duration(days: 3)).toIso8601String(),
+        scrapedAt: oldRead.toIso8601String(),
+        estimated: false,
+      );
+
+      final tooltip = QuotaTooltip(
+        providerName: 'Claude',
+        windows: [passThroughWeekly],
+        throttle: null,
+        scrapedAt: oldRead.toIso8601String(),
+        showThrottle: false,
+        now: now,
+      );
+      await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
+
+      expect(find.text('Warning: no new reading for 3h'), findsOneWidget);
+      expect(tooltip.toPlainText(), isNot(contains('estimate')));
     });
   });
 }

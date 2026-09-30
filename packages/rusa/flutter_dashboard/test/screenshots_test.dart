@@ -487,7 +487,7 @@ void main() {
             .ensureTooltipVisible();
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
-        expect(find.textContaining('no real reading for 3h'), findsOneWidget);
+        expect(find.textContaining('no new reading for 3h'), findsOneWidget);
         await captureBoundary(
           key,
           '$_outDir/header_quota_missed_after_tooltip.png',

@@ -529,7 +529,7 @@ void main() {
           ),
         );
         expect(_staleWarning('Fable'), findsNothing);
-        expect(_tooltipOf(tester, 'Fable'), isNot(contains('no real reading')));
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('no new reading')));
         await store.dispose();
 
         store = await pumpFable(
@@ -549,7 +549,7 @@ void main() {
         expect(
           _tooltipOf(tester, 'Fable'),
           contains(
-            'Warning: no real reading for 3h; the ring is estimated from the last one',
+            'Warning: no new reading for 3h',
           ),
         );
         await store.dispose();
