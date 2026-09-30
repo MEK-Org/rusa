@@ -531,7 +531,14 @@ class _RoomAvatarButton extends StatelessWidget {
                       : _voiceLabel(actor),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: ring, fontSize: 12),
+                  // Only the live states borrow the ring colour; an idle tile's
+                  // ring is the dim border, which is illegible as text.
+                  style: TextStyle(
+                    color: speaking || recording
+                        ? ring
+                        : MeshColors.textSecondary,
+                    fontSize: 12,
+                  ),
                 ),
               ],
             ),

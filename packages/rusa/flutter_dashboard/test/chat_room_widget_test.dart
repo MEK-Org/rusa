@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/chat_room.dart';
 
 import 'fakes.dart';
@@ -62,6 +63,20 @@ void main() {
     expect(rootBounds.size, roomBounds.size);
   });
 
+  testWidgets('idle voice labels meet WCAG AA contrast on the tile', (
+    tester,
+  ) async {
+    store.addChatRoomParticipant('actor-b');
+    await pumpRoom(tester);
+
+    // Both the selected tile and the unselected idle tile.
+    for (final text in ['Voice: Puck', 'Voice: Kore']) {
+      final label = tester.widget<Text>(find.text(text));
+      final ratio = contrastRatio(label.style!.color!, MeshColors.bgSecondary);
+      expect(ratio, greaterThanOrEqualTo(4.5), reason: text);
+    }
+  });
+
   testWidgets(
     'adds a second actor and makes each avatar a tap-to-record control',
     (tester) async {
@@ -103,4 +118,13 @@ void main() {
       expect(api.memoSends, isEmpty);
     },
   );
+}
+
+/// WCAG 2.x contrast ratio between two opaque colours.
+double contrastRatio(Color a, Color b) {
+  final la = a.computeLuminance();
+  final lb = b.computeLuminance();
+  final hi = la > lb ? la : lb;
+  final lo = la > lb ? lb : la;
+  return (hi + 0.05) / (lo + 0.05);
 }

@@ -78,6 +78,9 @@ void main() {
       );
       await tester.pump();
       await tester.pump();
+      // Let the tile's 180ms ring animation finish so the capture shows the
+      // speaking ring rather than a mid-transition blend.
+      await tester.pump(const Duration(milliseconds: 250));
 
       expect(find.text('Speaking'), findsOneWidget);
       expect(find.text('1 queued'), findsOneWidget);
