@@ -93,6 +93,11 @@ function isValidLimit(raw: unknown, provider: string): boolean {
       return false;
     }
   }
+  if (limit.scrapedAt !== undefined && limit.scrapedAt !== null) {
+    if (typeof limit.scrapedAt !== "string" || !Number.isFinite(Date.parse(limit.scrapedAt))) {
+      return false;
+    }
+  }
   return isValidScope(limit.scope, provider);
 }
 

@@ -454,6 +454,7 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     recurrenceCron: status === "scheduled" ? "0 * * * *" : null,
     recurrenceIntervalSeconds: null,
     nextReadyAt: status === "scheduled" ? (nextReadyAt ?? "2026-08-02T00:00:00.000Z") : null,
+    snoozedUntil: null,
     checkpoint,
     checkpointAt: checkpoint == null ? null : "2026-09-07T12:00:00.000Z",
     checkpointBy: checkpoint == null ? null : "actor-a",
@@ -491,6 +492,22 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     expect(section).toContain("[WAITING] ob-waiting");
     expect(section).not.toContain("Blocked work");
     expect(section).toContain("[READY] ob-first");
+  });
+
+  it("marks snoozed obligations so a wake reads them as deliberately deferred (#722)", () => {
+    const until = "2026-10-05T09:00:00.000Z";
+    const section = project([
+      obligation("ob-now", "ready", "Actionable work", 1),
+      { ...obligation("ob-later", "ready", "Deferred work", 2), snoozedUntil: until },
+      { ...obligation("ob-gate", "waiting", "Blocked work", 3), snoozedUntil: until },
+      { ...obligation("ob-cycle", "scheduled", "Recurring work", 4), snoozedUntil: until },
+    ]);
+    expect(section).toContain("[READY] ob-now: Actionable work");
+    expect(section).toContain(`[READY] ob-later [snoozed until ${until}]: Deferred work`);
+    expect(section).toContain(`[WAITING] ob-gate [snoozed until ${until}]`);
+    expect(section).toContain(
+      `[SCHEDULED] ob-cycle returns at 2026-08-02T00:00:00.000Z [snoozed until ${until}]`
+    );
   });
 
   it("puts a ready obligation's current standing into its automatic wake context", () => {

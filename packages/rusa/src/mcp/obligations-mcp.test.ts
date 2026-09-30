@@ -17,6 +17,7 @@ import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoin
 import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { obligationResponsive } from "../db/migrations/0049_obligation_responsive.js";
 import { dropObligationReadyHeads } from "../db/migrations/0050_drop_obligation_ready_heads.js";
+import { obligationSnooze } from "../db/migrations/0052_obligation_snooze.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
@@ -54,11 +55,12 @@ describe("obligations MCP", () => {
     obligationCheckpoint.up(db);
     obligationHistory.up(db);
     obligationResponsive.up(db);
+    obligationSnooze.up(db);
     dropObligationReadyHeads.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 14 obligation tools", async () => {
+  it("exposes all 15 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -76,6 +78,7 @@ describe("obligations MCP", () => {
       "set_external_ref",
       "set_obligation_recurrence",
       "set_obligation_status",
+      "set_snooze",
     ]);
   });
 
@@ -1413,6 +1416,126 @@ describe("obligations MCP", () => {
       const historyEntries = repository.listHistory("p1");
       expect(historyEntries.length).toBe(3);
       expect(historyEntries[0].actingPrincipal).toBe("actor-b");
+    });
+  });
+
+  describe("set_snooze (#722)", () => {
+    const inHours = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString();
+    const call = (client: Client, id: string, until: string | null) =>
+      client.callTool({ name: "set_snooze", arguments: { id, until } }) as Promise<CallToolResult>;
+    // `rusa start` attaches the host scheduler; without one a snooze is refused.
+    beforeEach(() => {
+      repository.setOsScheduler({
+        instanceId: "test",
+        scheduleObligationActivation: () => {},
+        cancelObligationActivation: () => {},
+        listObligationActivations: () => [],
+        canScheduleAt: () => true,
+      });
+    });
+
+    it("lets the owner snooze and clear, and orders snoozed work after actionable work", async () => {
+      repository.create({ title: "first", id: "first", ownerId: "actor-a" });
+      repository.create({ title: "second", id: "second", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const until = inHours(2);
+
+      const set = await call(client, "first", until);
+      expect(set.isError).toBeFalsy();
+      expect(dataOf(set)).toEqual({
+        obligation: expect.objectContaining({ id: "first", status: "ready", snoozedUntil: until }),
+      });
+      const listed = (await client.callTool({
+        name: "list_owned",
+        arguments: {},
+      })) as CallToolResult;
+      expect(
+        (dataOf(listed) as { obligations: Array<{ id: string }> }).obligations.map((o) => o.id)
+      ).toEqual(["second", "first"]);
+
+      const cleared = await call(client, "first", null);
+      expect(cleared.isError).toBeFalsy();
+      expect(repository.require("first").snoozedUntil).toBeNull();
+    });
+
+    it("rejects a non-owner, including an ancestor or root with manage rights", async () => {
+      repository.create({ title: "theirs", id: "theirs", ownerId: "actor-b" });
+      for (const [actor, canManage] of [
+        ["actor-a", undefined],
+        ["root", () => true],
+        ["actor-parent", () => true],
+      ] as const) {
+        const client = await connect(
+          createObligationsMcpServer(repository, actor, canManage ? { canManage } : {})
+        );
+        const res = await call(client, "theirs", inHours(1));
+        expect(res.isError).toBe(true);
+        expect(JSON.stringify(res.content)).toContain("only the obligation's current owner");
+      }
+      expect(repository.require("theirs").snoozedUntil).toBeNull();
+      expect(repository.listHistory("theirs")).toEqual([]);
+    });
+
+    it("keeps the snooze across reassignment and hands control to the new owner", async () => {
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+      const until = inHours(3);
+      const ownerA = await connect(createObligationsMcpServer(repository, "actor-a"));
+      expect((await call(ownerA, "task", until)).isError).toBeFalsy();
+
+      const moved = (await ownerA.callTool({
+        name: "reassign_obligation",
+        arguments: { id: "task", owner_id: "actor-b" },
+      })) as CallToolResult;
+      expect(moved.isError).toBeFalsy();
+      expect(repository.require("task").snoozedUntil).toBe(until);
+
+      // The previous owner lost the snooze with the obligation.
+      const stale = await call(ownerA, "task", null);
+      expect(stale.isError).toBe(true);
+      expect(repository.require("task").snoozedUntil).toBe(until);
+
+      // Snoozing grants nothing: an unrelated actor still cannot reassign it.
+      const outsider = await connect(createObligationsMcpServer(repository, "actor-c"));
+      const grab = (await outsider.callTool({
+        name: "reassign_obligation",
+        arguments: { id: "task", owner_id: "actor-c" },
+      })) as CallToolResult;
+      expect(grab.isError).toBe(true);
+      expect(repository.require("task").ownerId).toBe("actor-b");
+
+      const ownerB = await connect(createObligationsMcpServer(repository, "actor-b"));
+      const cleared = await call(ownerB, "task", null);
+      expect(cleared.isError).toBeFalsy();
+      expect(repository.require("task").snoozedUntil).toBeNull();
+    });
+
+    it("reports a repository validation refusal as a tool error", async () => {
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const res = await call(client, "task", "2020-01-01T00:00:00Z");
+      expect(res.isError).toBe(true);
+      expect(JSON.stringify(res.content)).toContain("must be in the future");
+    });
+
+    it("returns the committed snooze with a warning when its timer fails to arm", async () => {
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+      repository.setOsScheduler({
+        instanceId: "test",
+        scheduleObligationActivation: () => {
+          throw new Error("at: queue write failed");
+        },
+        cancelObligationActivation: () => {},
+        listObligationActivations: () => [],
+        canScheduleAt: () => true,
+      });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const until = inHours(1);
+      const res = await call(client, "task", until);
+      expect(res.isError).toBeFalsy();
+      expect(dataOf(res)).toMatchObject({
+        obligation: { snoozedUntil: until },
+        warning: expect.stringContaining("at: queue write failed"),
+      });
     });
   });
 });

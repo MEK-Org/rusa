@@ -16,6 +16,7 @@ vi.mock("@google/genai", () => ({
   GoogleGenAI: class {
     models = { generateContent: (args: unknown) => mockGenerateContent(args) };
   },
+  FinishReason: { STOP: "STOP", MAX_TOKENS: "MAX_TOKENS" },
   Type: {
     OBJECT: "OBJECT",
     STRING: "STRING",
@@ -71,7 +72,7 @@ function availableParse(resetAtIso: string) {
           {
             label: "Weekly",
             kind: "weekly",
-            usedPercent: 50,
+            usedPercent: "50",
             resetAtIso,
           },
         ],

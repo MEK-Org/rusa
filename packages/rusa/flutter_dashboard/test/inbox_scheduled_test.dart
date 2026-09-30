@@ -59,7 +59,7 @@ void main() {
       // ready/waiting rows fill that page's limit).
       expect(
         api.fetchObligationsCalls.any(
-          (c) => c.ownerId == 'actor-a' && c.status == 'scheduled',
+          (c) => c.ownerId == 'actor-a' && c.queue == 'scheduled',
         ),
         isTrue,
       );

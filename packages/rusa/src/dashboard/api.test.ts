@@ -555,6 +555,7 @@ describe("handleMeshApiRequest", () => {
       ["POST", "/api/mesh/obligations", JSON.stringify({ ownerId: UUID_A, title: "t" })],
       ["POST", "/api/mesh/obligations/task/status", JSON.stringify({ status: "done" })],
       ["POST", "/api/mesh/obligations/task/reassign", JSON.stringify({ ownerId: UUID_A })],
+      ["POST", "/api/mesh/obligations/task/snooze", JSON.stringify({ until: null })],
       [
         "POST",
         "/api/mesh/admission-queue/reorder",
@@ -3554,6 +3555,23 @@ describe("handleMeshApiRequest", () => {
         expect(badStatus.statusCode).toBe(400);
       });
 
+      it("pages one presentation queue, and 400s on an invalid one", async () => {
+        obligations.create({ title: "ready", id: "ready", ownerId: "actor-1" });
+        obligations.create({ title: "waiting", id: "waiting", ownerId: "actor-1" });
+        obligations.create({ title: "kid", id: "kid", ownerId: "actor-2", parentId: "waiting" });
+        const ids = async (query: string) => {
+          const { res } = await call(deps, "GET", `/api/mesh/obligations?ownerId=actor-1&${query}`);
+          expect(res.statusCode).toBe(200);
+          return JSON.parse(res.body).obligations.map((o: { id: string }) => o.id);
+        };
+        expect(await ids("queue=ready")).toEqual(["ready"]);
+        expect(await ids("queue=waiting")).toEqual(["waiting"]);
+        expect(await ids("queue=scheduled")).toEqual([]);
+
+        const { res: badQueue } = await call(deps, "GET", "/api/mesh/obligations?queue=done");
+        expect(badQueue.statusCode).toBe(400);
+      });
+
       it("503s when obligations data is unavailable", async () => {
         const noObligationsDeps = { ...deps, obligations: undefined };
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");
@@ -4344,6 +4362,92 @@ describe("handleMeshApiRequest", () => {
         // "[object Object]" stored as a stated reason is worse than no reason.
         expect(res.statusCode).toBe(200);
         expect(JSON.parse(res.body).obligation.terminalNote).toBeNull();
+      });
+    });
+
+    describe("POST /api/mesh/obligations/:id/snooze (#722)", () => {
+      const future = () => new Date(Date.now() + 2 * 3_600_000).toISOString();
+      const snooze = async (id: string, body: unknown) => {
+        const { res } = await call(
+          deps,
+          "POST",
+          `/api/mesh/obligations/${id}/snooze`,
+          JSON.stringify(body)
+        );
+        await settled(res);
+        return { status: res.statusCode, data: JSON.parse(res.body) };
+      };
+      /** The wake timers `rusa start` would arm; the standalone dashboard attaches none. */
+      let armed: Map<string, unknown>;
+      beforeEach(() => {
+        armed = new Map();
+        obligations.setOsScheduler({
+          instanceId: "test",
+          scheduleObligationActivation: (id, time) => armed.set(id, time),
+          cancelObligationActivation: (id) => armed.delete(id),
+          listObligationActivations: () => [],
+          canScheduleAt: () => true,
+        });
+      });
+
+      it("lets the owning human set and clear a snooze, arming and cancelling its timer", async () => {
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const until = future();
+        const set = await snooze("mine", { until });
+        expect(set.status).toBe(200);
+        expect(set.data.obligation).toMatchObject({ status: "ready", snoozedUntil: until });
+        expect(set.data.warning).toBeUndefined();
+        expect(armed.get("mine")).toEqual({ kind: "at", date: new Date(until) });
+
+        const cleared = await snooze("mine", { until: null });
+        expect(cleared.status).toBe(200);
+        expect(cleared.data.obligation.snoozedUntil).toBeNull();
+        expect(armed.has("mine")).toBe(false);
+        expect(obligations.listHistory("mine")[0]).toMatchObject({
+          mutationKind: "snooze",
+          actingPrincipal: LOCAL_USER,
+        });
+      });
+
+      it("treats a row still owned by the legacy operator alias as the operator's", async () => {
+        obligations.create({ title: "legacy", id: "legacy", ownerId: HUMAN_OPERATOR });
+        expect((await snooze("legacy", { until: future() })).status).toBe(200);
+      });
+
+      it("refuses an obligation the human does not own", async () => {
+        obligations.create({ title: "theirs", id: "theirs", ownerId: "actor-1" });
+        const res = await snooze("theirs", { until: future() });
+        expect(res.status).toBe(403);
+        expect(res.data.error).toContain("only the obligation's current owner");
+        expect(obligations.get("theirs")?.snoozedUntil).toBeNull();
+      });
+
+      it("503s a snooze where no scheduler is attached, writing nothing", async () => {
+        // The standalone `rusa dashboard` serves this route over a repository
+        // with no host scheduler, so nothing there could end a snooze.
+        const bare = new ObligationRepository(db);
+        const standalone = { ...deps, obligations: bare };
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        const { res } = await call(
+          standalone,
+          "POST",
+          "/api/mesh/obligations/mine/snooze",
+          JSON.stringify({ until: future() })
+        );
+        await settled(res);
+        expect(res.statusCode).toBe(503);
+        expect(JSON.parse(res.body).error).toContain("no host activation scheduler");
+        expect(bare.get("mine")?.snoozedUntil).toBeNull();
+        expect(bare.listHistory("mine").some((h) => h.mutationKind === "snooze")).toBe(false);
+      });
+
+      it("404s a missing obligation and 400s an invalid deadline", async () => {
+        expect((await snooze("missing", { until: future() })).status).toBe(404);
+        obligations.create({ title: "mine", id: "mine", ownerId: LOCAL_USER });
+        expect((await snooze("mine", { until: "2020-01-01T00:00:00Z" })).status).toBe(400);
+        expect((await snooze("mine", { until: 1234 })).status).toBe(400);
+        expect((await snooze("mine", {})).status).toBe(400);
+        expect(obligations.get("mine")?.snoozedUntil).toBeNull();
       });
     });
 

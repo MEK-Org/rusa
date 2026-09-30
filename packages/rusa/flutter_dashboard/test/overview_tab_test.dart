@@ -563,10 +563,58 @@ void main() {
         // all, since it only ever derived ready/waiting from that page.
         expect(
           api.fetchObligationsCalls.any(
-            (c) => c.ownerId == 'human:operator' && c.status == 'scheduled',
+            (c) => c.ownerId == 'human:operator' && c.queue == 'scheduled',
           ),
           isTrue,
         );
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'OverviewTab pages each section on its own, so snoozed rows crowd out none',
+    (tester) async {
+      await tester.runAsync(() async {
+        final until = DateTime.now()
+            .toUtc()
+            .add(const Duration(days: 2))
+            .toIso8601String();
+        final api = FakeApi()
+          ..obligationPageLimit = 50
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [
+            for (var i = 0; i < 50; i++)
+              makeObligation(
+                'ob-ready-$i',
+                ownerId: 'human:operator',
+                status: 'ready',
+              ),
+            for (var i = 0; i < 50; i++)
+              makeObligation(
+                'ob-snoozed-$i',
+                ownerId: 'human:operator',
+                status: 'scheduled',
+                snoozedUntil: until,
+              ),
+            makeObligation(
+              'ob-scheduled',
+              ownerId: 'human:operator',
+              intent: 'Nightly digest',
+              status: 'scheduled',
+              nextReadyAt: '2026-10-01T06:00:00.000Z',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('50 ready'), findsOneWidget);
+        expect(find.text('50 waiting'), findsOneWidget);
+        expect(find.text('1 scheduled'), findsOneWidget);
         await store.dispose();
       });
     },

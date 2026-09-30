@@ -272,6 +272,43 @@ class ObligationRow extends StatelessWidget {
                 ],
               ),
             ],
+            // Styled like the blocked panel below, in yellow rather than red:
+            // a snooze is the owner's choice, not a stall.
+            if (obligation.isSnoozed) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1B0F),
+                  border: const Border(
+                    left: BorderSide(color: Color(0xFFEAB308), width: 3),
+                  ),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Snoozed:',
+                      style: TextStyle(
+                        color: Color(0xFFFDE047),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      snoozeLabel(obligation),
+                      style: const TextStyle(
+                        color: Color(0xFFFEF9C3),
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             if (hasTerminalNote) ...[
               const SizedBox(height: 12),
               Container(
@@ -337,7 +374,8 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${store.ownerLabel(blocker.ownerId)})',
+                          '• ${blocker.intent ?? blocker.id} (${store.ownerLabel(blocker.ownerId)})'
+                          '${blocker.isSnoozed ? ' — snoozed until ${formatTs(blocker.snoozedUntil!)}' : ''}',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,
@@ -354,6 +392,14 @@ class ObligationRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// The body of the card's yellow Snoozed panel, worded as the operator asked
+/// on #723.
+String snoozeLabel(ObligationDto obligation) {
+  final until = obligation.snoozedUntil!;
+  return 'This obligation is snoozed until ${formatTs(until)} '
+      '(${formatReturnsIn(until)})';
 }
 
 /// Who last said where this obligation stands, and when — `handle · timestamp`.

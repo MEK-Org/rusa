@@ -21,6 +21,48 @@ describe("versioned parsed quota state", () => {
     expect(parseParsedState(serializeParsedState(snapshot))).toEqual(snapshot);
   });
 
+  it("round-trips limit.scrapedAt timestamp through the versioned blob", () => {
+    const withLimitScrapedAt = {
+      ...snapshot,
+      limits: [
+        {
+          ...snapshot.limits[0],
+          scrapedAt: "2029-12-31T23:30:00.000Z",
+        },
+      ],
+    };
+    expect(parseParsedState(serializeParsedState(withLimitScrapedAt))).toEqual(withLimitScrapedAt);
+    expect(
+      parseParsedState(
+        JSON.stringify({
+          version: 1,
+          snapshot: {
+            ...snapshot,
+            limits: [{ ...snapshot.limits[0], scrapedAt: "not-a-date" }],
+          },
+        })
+      )
+    ).toBeNull();
+  });
+
+  it("round-trips failed extraction attempt diagnostics through the versioned blob (#774)", () => {
+    const withFailures = {
+      ...snapshot,
+      extractionFailures: [
+        {
+          attempt: 1,
+          model: "gemini-3.5-flash-lite",
+          elapsedMs: 4_210,
+          error: "Quota parse failed: response truncated by model output token limit",
+          finishReason: "MAX_TOKENS",
+          responseHead: '{"status":"available","windows":[{"usedPercent":"43.0000',
+          responseLength: 32_760,
+        },
+      ],
+    };
+    expect(parseParsedState(serializeParsedState(withFailures))).toEqual(withFailures);
+  });
+
   it("accepts a fully valid legacy bare snapshot, normalising provider scope and discarding old model strings", () => {
     expect(
       parseParsedState(

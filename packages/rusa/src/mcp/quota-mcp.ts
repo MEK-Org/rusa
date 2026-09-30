@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { Type } from "@google/genai";
+import { FinishReason, Type } from "@google/genai";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { RusaConfig } from "../config/types.js";
@@ -106,6 +106,35 @@ export interface QuotaLimit {
    * of configured models the window applies to. Absent reads as provider-wide.
    */
   scope?: QuotaWindowScope | LegacyQuotaWindowScope;
+  /**
+   * ISO-8601 instant when this specific reading was originally scraped.
+   * Preserved when an individual window is carried forward from a previous
+   * scrape (e.g. across a bad read or extraction failure), so downstream consumers
+   * can observe the true age of carried model or provider readings (#763).
+   */
+  scrapedAt?: string;
+}
+
+/**
+ * Why one LLM quota extraction attempt failed (#774). Enough to tell a
+ * runaway digit loop from a schema miss or a transport error, without keeping
+ * the full response body.
+ */
+export interface QuotaExtractionFailure {
+  /** 1 for the first model, 2 for the stronger-model retry. */
+  attempt: number;
+  /** The extraction model the attempt ran on. */
+  model: string;
+  /** Wall-clock time from request to failure. */
+  elapsedMs: number;
+  /** The failure message, capped at QUOTA_FAILURE_ERROR_CHARS. */
+  error: string;
+  /** The API's finish reason, when a response arrived and carried one. */
+  finishReason?: string;
+  /** The first QUOTA_FAILURE_RESPONSE_HEAD_CHARS of the response text. */
+  responseHead?: string;
+  /** Total length of the response text, in UTF-16 code units. */
+  responseLength?: number;
 }
 
 export interface ProviderQuotaSnapshot {
@@ -137,6 +166,11 @@ export interface ProviderQuotaSnapshot {
    * snapshot is identical to the raw parser output.
    */
   explanations?: QuotaInferenceExplanation[];
+  /**
+   * The LLM extraction attempts that failed in this cycle, one entry per
+   * attempt (at most two). Absent when the first attempt succeeded (#774).
+   */
+  extractionFailures?: QuotaExtractionFailure[];
   /**
    * Coordinator freshness block (§5.5, criterion 15) when served via the coordinator service.
    * Cold coordinator answers status: "unknown" with freshness.
@@ -208,7 +242,14 @@ interface LlmQuotaWindow {
    * boundary; `normalizeQuotaWindowKind` validates it.
    */
   kind?: QuotaWindowKind;
-  usedPercent?: number;
+  /**
+   * Exactly one of these carries the printed percentage as text, according to
+   * whether the source labels it used or left. Code parses it and does the
+   * `100 - N` conversion: asked to compute a number, the model could emit
+   * `43.000…` until the output-token cap (#775).
+   */
+  usedPercent?: string;
+  remainingPercent?: string;
   resetAtIso?: string;
   resetInIso?: string;
   placeholder?: boolean;
@@ -265,12 +306,20 @@ const LLM_WINDOW_ITEM_SCHEMA = {
         "'weekly' for a 7-day/weekly window; 'other' for anything that doesn't fit those.",
     },
     usedPercent: {
-      type: Type.NUMBER,
+      type: Type.STRING,
       description:
-        "Percentage of this window's quota used, 0-100. Copy the source number, or convert it " +
-        "when the source says left/remaining, exactly and preserve every printed decimal place. " +
-        "Use numeric text, never the apparent length of a progress bar. For example, 100% left " +
-        "is usedPercent 0 exactly, never an approximation such as 0.0001. " +
+        "Percentage of this window's quota USED, 0-100, copied as text from the printed number " +
+        "without the % sign (e.g. '43' or '57.5') when the source reports it as used. Leave this empty (or omit it) when the source reports left/remaining; " +
+        "that goes in remainingPercent. A window must carry exactly one of usedPercent or " +
+        "remainingPercent. Use numeric text, never the apparent length of a progress bar. " +
+        "Omit when placeholder is true.",
+    },
+    remainingPercent: {
+      type: Type.STRING,
+      description:
+        "Percentage of this window's quota LEFT or REMAINING, 0-100, copied as text from the " +
+        "printed number without the % sign when the source reports it as left/remaining. Do not convert it to used. Leave " +
+        "this empty (or omit it) when the source reports used; that goes in usedPercent. " +
         "Omit when placeholder is true.",
     },
     resetAtIso: {
@@ -432,6 +481,86 @@ function resolveResetAtIso(
   return undefined;
 }
 
+/**
+ * Output-token ceiling for one quota extraction attempt (#775).
+ * A typical valid extraction reply is ~300 tokens; 8192 is an uncalibrated,
+ * generous power-of-two ceiling leaving ample headroom for multi-group
+ * agy panels while bounding an LLM token runaway to a few seconds
+ * (roughly 8x below the 65,536 limit observed on staging).
+ */
+const QUOTA_PARSE_MAX_OUTPUT_TOKENS = 8192;
+
+/** Response text kept from a failed extraction attempt (#774). */
+const QUOTA_FAILURE_RESPONSE_HEAD_CHARS = 400;
+/** Failure message kept from a failed extraction attempt (#774). */
+const QUOTA_FAILURE_ERROR_CHARS = 300;
+
+/** What one extraction attempt saw before it succeeded or failed. */
+interface ExtractionAttemptObservation {
+  finishReason?: string;
+  text?: string;
+}
+
+function describeFailedAttempt(
+  attempt: number,
+  model: string,
+  elapsedMs: number,
+  error: unknown,
+  seen: ExtractionAttemptObservation
+): QuotaExtractionFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    attempt,
+    model,
+    elapsedMs,
+    error: message.slice(0, QUOTA_FAILURE_ERROR_CHARS),
+    ...(seen.finishReason ? { finishReason: seen.finishReason } : {}),
+    ...(seen.text !== undefined
+      ? {
+          responseHead: seen.text.slice(0, QUOTA_FAILURE_RESPONSE_HEAD_CHARS),
+          responseLength: seen.text.length,
+        }
+      : {}),
+  };
+}
+
+/**
+ * Read the model's copied percentage text ("43", "57.5", "43%") as a number
+ * in 0-100 with at most 4 decimal places. Anything else, including a JSON
+ * number, an unprinted decimal tail, or a runaway zero sequence, is undefined.
+ */
+function parsePrintedPercent(text: unknown): number | undefined {
+  if (typeof text !== "string") return undefined;
+  const match = /^(\d{1,3}(?:\.\d{1,4})?)\s*%?$/.exec(text.trim());
+  if (!match?.[1]) return undefined;
+  const value = Number(match[1]);
+  return value <= 100 ? value : undefined;
+}
+
+function isPercentFieldPresent(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string" && value.trim() === "") return false;
+  return true;
+}
+
+/**
+ * Resolve a window's percentLeft from whichever of usedPercent or
+ * remainingPercent the model copied. Returns an error message when the window
+ * carries both, neither, or text that is not a printed 0-100 percentage.
+ */
+function resolvePercentLeft(w: LlmQuotaWindow): number | string {
+  const hasUsed = isPercentFieldPresent(w.usedPercent);
+  const hasRemaining = isPercentFieldPresent(w.remainingPercent);
+  if (hasUsed === hasRemaining) {
+    return `must carry exactly one of usedPercent or remainingPercent, got ${hasUsed ? "both" : "neither"}`;
+  }
+  const field = hasUsed ? "usedPercent" : "remainingPercent";
+  const text = hasUsed ? w.usedPercent : w.remainingPercent;
+  const value = parsePrintedPercent(text);
+  if (value === undefined) return `has invalid ${field} ${JSON.stringify(text)}`;
+  return hasUsed ? 100 - value : value;
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -490,7 +619,7 @@ async function parseQuotaWithLlm(
           "`GPT-5.3-Codex-Spark limit` is a heading and all rows beneath it are scoped only to the gpt-5.3-codex-spark model class: emit each row beneath this heading (such as '5h limit:' or 'Weekly limit:') with `models: [\"gpt-5.3-codex-spark\"]`, even if that model is not in the configured model list below. Never use model rows to determine provider status. Account rows above the heading remain provider scope. " +
           "Other named-model, model-family, reserve, and special-allocation limits are model-specific: an inline label containing a model or reserve name before 'Weekly limit' (for example 'gpt-reserve Weekly limit'), or any rows beneath a standalone '<model name> limit:' heading. " +
           "Emit each model-specific row with `models` set to the matching IDs from the configured model list, and never use model rows to determine provider status. " +
-          "Codex percentages say LEFT. Convert the printed N% left to usedPercent = 100 - N exactly. " +
+          "Codex percentages say LEFT: copy the printed N% left as remainingPercent 'N' and leave usedPercent empty. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted' only when that message applies to the provider-wide quota; extract provider-wide percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
@@ -504,18 +633,18 @@ async function parseQuotaWithLlm(
             "Five Hour Limit window. " +
             "The shared GEMINI MODELS section is provider-wide: emit its rows with no `models`; they alone determine status. " +
             "Every other named model or model-group section is model-specific: emit its rows with `models` set to the matching IDs from the configured model list (sections matching nothing configured are omitted entirely), and never use them to determine status. " +
-            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage, preserve all its decimals, and ignore the apparent progress-bar length. " +
-            "'usedPercent' must still be the USED percentage, so emit usedPercent = 100 - N exactly " +
-            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → usedPercent 100; '3% remaining' → usedPercent 97; '48% remaining' → usedPercent 52). " +
+            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage and ignore the apparent progress-bar length. " +
+            "Copy the printed remaining number N into remainingPercent and leave usedPercent empty " +
+            "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → remainingPercent '0.00'; '3% remaining' → remainingPercent '3'; '48% remaining' → remainingPercent '48'). " +
             "A window showing 'Quota available' with a full (100%) bar is fully available: " +
-            "emit usedPercent 0. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
-            "emit this window with usedPercent 100 (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
+            "emit remainingPercent '100'. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
+            "emit this window with remainingPercent '0' (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
             "Emit the GEMINI MODELS Weekly Limit and Five Hour Limit at top level in `windows`, each with no `models`. " +
             "If weekly limit is at 100% used (0% remaining), status is 'exhausted'.\n"
           : "For Kimi: the interactive /usage panel shows Kimi Code platform quota, commonly including 5h/five-hour and weekly windows. " +
-            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N exactly for 'used'; for 'left/remaining', emit usedPercent = 100 - N exactly " +
-            "(e.g. '63% used' → usedPercent 63; '0% left' → usedPercent 100; '88% left' → usedPercent 12). " +
-            "Always use the numeric percentage text and preserve its decimals; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
+            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N into usedPercent for 'used' or into remainingPercent for 'left/remaining', never both " +
+            "(e.g. '63% used' → usedPercent '63'; '0% left' → remainingPercent '0'; '88% left' → remainingPercent '88'). " +
+            "Always use the numeric percentage text; never estimate from a progress bar. Provider-wide windows carry no `models` and alone determine status. " +
             "Every named-model or model-group limit is model-specific: emit it with `models` set to the matching IDs from the configured model list (rows matching nothing configured are omitted entirely), and never use it to determine status. " +
             "Extract every visible provider-wide quota window and set kind " +
             "to 'five_hour', 'weekly', 'session', or 'other'. If any provider window is 100% used (0% left), status is 'exhausted'. " +
@@ -551,7 +680,7 @@ async function parseQuotaWithLlm(
     "GROUNDING REQUIREMENT: You MUST ONLY report windows and statuses that are physically printed in the provided output. " +
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
     "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
-    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text, preserve all printed decimal precision, and never infer a value from progress-bar artwork. If the source reports USED, copy it exactly. If it reports LEFT or REMAINING, calculate usedPercent = 100 - N exactly.\n" +
+    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text and never infer a value from progress-bar artwork. Copy the printed number N as text and never compute a new number: put N in usedPercent if the source reports USED, or in remainingPercent if it reports LEFT or REMAINING. Fill exactly one of the two for each window. The precision of all numbers should be limited to at most 3 decimal places.\n" +
     providerClause +
     configuredModelClause +
     describeLocalNow(generatedAtMs) +
@@ -577,7 +706,10 @@ async function parseQuotaWithLlm(
     "a stronger model, so always fill the field rather than declining because the year or " +
     "timezone was not printed.";
 
-  const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
+  const executeOnce = async (
+    modelName: string,
+    seen: ExtractionAttemptObservation
+  ): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
       model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
@@ -585,6 +717,10 @@ async function parseQuotaWithLlm(
         // Quota parsing is extraction, not creative generation. A fixed
         // temperature keeps a repeated scrape from changing its window set.
         temperature: 0,
+        // A complete reply is a few hundred tokens. The cap makes a runaway
+        // reply fail in seconds, so the stronger-model retry fires at once
+        // instead of after minutes of output (#775).
+        maxOutputTokens: QUOTA_PARSE_MAX_OUTPUT_TOKENS,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -595,18 +731,44 @@ async function parseQuotaWithLlm(
       },
     });
 
+    // A response cut off at the model's output limit is incomplete; fail the
+    // attempt with that cause so the stronger-model retry logs why (#763).
+    const finishReason = response.candidates?.[0]?.finishReason;
+    if (finishReason) seen.finishReason = String(finishReason);
     const text = await extractGeminiText(response);
-    const parsed = JSON.parse(text);
+    seen.text = text;
+    if (finishReason === FinishReason.MAX_TOKENS) {
+      throw new Error(
+        `Quota parse failed: response truncated by model output token limit (finishReason: ${finishReason})`
+      );
+    }
 
-    if (!Array.isArray(parsed.windows)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (parseErr) {
+      throw new Error(
+        `Quota parse failed: invalid JSON output: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`
+      );
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Quota parse failed: response is not an object");
+    }
+    const parsedObj = parsed as { windows?: unknown; status?: unknown };
+    if (!Array.isArray(parsedObj.windows)) {
       throw new Error("Quota parse failed: response omitted the required windows array");
     }
-    if (!(["available", "exhausted", "unknown"] as const).includes(parsed.status)) {
-      throw new Error(`Quota parse failed: invalid status '${String(parsed.status)}'`);
+    if (
+      !(["available", "exhausted", "unknown"] as const).includes(
+        parsedObj.status as "available" | "exhausted" | "unknown"
+      )
+    ) {
+      throw new Error(`Quota parse failed: invalid status '${String(parsedObj.status)}'`);
     }
 
     const limits: QuotaLimit[] = [];
-    for (const rawWindow of parsed.windows) {
+    for (const rawWindow of parsedObj.windows) {
       if (!rawWindow || typeof rawWindow !== "object") {
         throw new Error("Quota parse failed: window is not an object");
       }
@@ -637,22 +799,14 @@ async function parseQuotaWithLlm(
       const hasExplicitModelScope = w.models !== undefined;
       const canonicalModels = resolveWindowModels(rawModels, configuredModelRefs(configuredModels));
       if (hasExplicitModelScope && canonicalModels.length === 0) continue;
-      const usedPercent = w.usedPercent;
-      if (
-        typeof usedPercent !== "number" ||
-        !Number.isFinite(usedPercent) ||
-        usedPercent < 0 ||
-        usedPercent > 100
-      ) {
-        throw new Error(
-          `Quota parse failed: window '${w.label}' has invalid usedPercent ${String(w.usedPercent)}`
-        );
+      const percentLeft = resolvePercentLeft(w);
+      if (typeof percentLeft === "string") {
+        throw new Error(`Quota parse failed: window '${w.label}' ${percentLeft}`);
       }
       const kind = normalizeQuotaWindowKind(w.kind);
       if (!kind) {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
       }
-      const percentLeft = 100 - usedPercent;
       // A duration the model did emit but that is not ISO-8601 is a bad read,
       // not a missing one: fail here so the stronger-model retry sees it,
       // rather than letting it degrade into "no reset" and, for a 100%-left
@@ -715,7 +869,7 @@ async function parseQuotaWithLlm(
           `'${duplicatedKind[0]}' windows — a model-specific block was read as provider-wide`
       );
     }
-    if (providerWindows.length === 0 && parsed.status === "available") {
+    if (providerWindows.length === 0 && parsedObj.status === "available") {
       throw new Error(
         `Quota parse failed: ${provider} status is available but no provider window was returned`
       );
@@ -726,7 +880,7 @@ async function parseQuotaWithLlm(
     // model's summary says available. The inverse could be a partial panel
     // whose exhausted row was omitted, so send that disagreement through the
     // existing stronger-model retry rather than downgrade exhaustion.
-    if (parsed.status === "exhausted" && providerWindows.length > 0 && !hasExhaustedWindow) {
+    if (parsedObj.status === "exhausted" && providerWindows.length > 0 && !hasExhaustedWindow) {
       throw new Error(
         "Quota parse failed: status 'exhausted' disagrees with available provider windows"
       );
@@ -734,8 +888,8 @@ async function parseQuotaWithLlm(
 
     const status = hasExhaustedWindow
       ? "exhausted"
-      : parsed.status === "unknown" || providerWindows.length === 0
-        ? parsed.status === "exhausted"
+      : parsedObj.status === "unknown" || providerWindows.length === 0
+        ? parsedObj.status === "exhausted"
           ? "exhausted"
           : "unknown"
         : "available";
@@ -746,18 +900,32 @@ async function parseQuotaWithLlm(
     };
   };
 
+  const extractionFailures: QuotaExtractionFailure[] = [];
+  const runAttempt = async (attempt: number, modelName: string) => {
+    const seen: ExtractionAttemptObservation = {};
+    const startedMs = Date.now();
+    try {
+      return await executeOnce(modelName, seen);
+    } catch (err) {
+      extractionFailures.push(
+        describeFailedAttempt(attempt, modelName, Date.now() - startedMs, err, seen)
+      );
+      throw err;
+    }
+  };
+
   try {
-    return await executeOnce("gemini-3.5-flash-lite");
+    return await runAttempt(1, "gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
       `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.8-flash`
     );
     try {
-      const result = await executeOnce("gemini-3.8-flash");
+      const result = await runAttempt(2, "gemini-3.8-flash");
       console.info(
         `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) succeeded`
       );
-      return result;
+      return { ...result, extractionFailures };
     } catch (secondErr) {
       console.error(
         `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.8-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
@@ -765,6 +933,7 @@ async function parseQuotaWithLlm(
       return {
         status: "unknown",
         message: `LLM quota parsing failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
+        extractionFailures,
       };
     }
   }
@@ -884,6 +1053,28 @@ export async function parseKimiQuota(
 }
 
 /**
+ * Whether a bad read may carry this previous window forward. Model-scoped
+ * windows carry only for Claude, whose Fable window #763 asked to keep.
+ */
+function carriesBadReadWindow(provider: string, limit: QuotaLimit): boolean {
+  return isProviderScopedWindow(limit) || provider === "claude";
+}
+
+/**
+ * A window carried across a bad read, stamped with its original read time for
+ * Claude only (#763). Other providers keep the staging behaviour: the carried
+ * window takes the bad read's time.
+ */
+function carriedBadReadWindow(
+  provider: string,
+  limit: QuotaLimit,
+  prevScrapedAt: string | undefined
+): QuotaLimit {
+  if (provider !== "claude") return { ...limit };
+  return { ...limit, scrapedAt: limit.scrapedAt ?? prevScrapedAt };
+}
+
+/**
  * Derive effective/inferred quota state from raw parser output .
  *
  * Rules:
@@ -919,19 +1110,32 @@ export function inferQuotaState(
 
   // Step 1: Bad read full-fallback (Rule: carried_forward_bad_read)
   // If the whole current parse returned status unknown or empty limits (bad read),
-  // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso.
+  // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso (#763).
+  // Claude also carries model-scoped windows (e.g. Fable), and its carried windows keep their
+  // original observed time and provenance; other providers carry provider-scoped windows only,
+  // at the bad read's time, as before.
+  // Provider availability is derived strictly from provider-scoped windows: model-only readings
+  // must never promote provider status to available/exhausted.
   if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
-    const activeUnexpiredLimits = prevState.limits.filter((limit) => {
-      if (!isProviderScopedWindow(limit)) return false;
-      if (!limit.resetAtIso) return false;
-      const resetMs = Date.parse(limit.resetAtIso);
-      if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
-      return !isAssumedReset(prevState, limit.label);
-    });
+    const activeUnexpiredLimits = prevState.limits
+      .filter((limit) => {
+        if (!carriesBadReadWindow(rawState.provider, limit)) return false;
+        if (!limit.resetAtIso) return false;
+        const resetMs = Date.parse(limit.resetAtIso);
+        if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
+        return !isAssumedReset(prevState, limit.label);
+      })
+      .map((limit) => carriedBadReadWindow(rawState.provider, limit, prevState.scrapedAt));
 
     if (activeUnexpiredLimits.length > 0) {
-      status = prevState.status;
-      limits = activeUnexpiredLimits.map((l) => ({ ...l }));
+      const activeProviderLimits = activeUnexpiredLimits.filter(isProviderScopedWindow);
+      if (activeProviderLimits.length > 0) {
+        status = prevState.status;
+      } else {
+        // Model-only limits must never promote provider status into available/exhausted (#763).
+        status = "unknown";
+      }
+      limits = activeUnexpiredLimits;
       message = rawState.message ?? prevState.message;
       for (const limit of limits) {
         explanations.push({
@@ -1125,7 +1329,7 @@ export class QuotaService {
       if (prevState?.limits && prevState.limits.length > 0) {
         const hasUnexpired = prevState.limits.some(
           (l) =>
-            isProviderScopedWindow(l) &&
+            carriesBadReadWindow(provider, l) &&
             l.resetAtIso &&
             Date.parse(l.resetAtIso) > Date.parse(scrapedAt) &&
             !prevState.explanations?.some(
@@ -1347,6 +1551,7 @@ export class QuotaService {
         status: parsed.status || "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw: output,
         scrapedAt,
       };
@@ -1405,6 +1610,7 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
       };
@@ -1448,6 +1654,7 @@ export class QuotaService {
           status: parsed.status ?? "unknown",
           message: parsed.message,
           limits: parsed.limits,
+          ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
           raw,
           scrapedAt,
         };
@@ -1514,6 +1721,7 @@ export class QuotaService {
         status: parsed.status ?? "unknown",
         message: parsed.message,
         limits: parsed.limits,
+        ...(parsed.extractionFailures ? { extractionFailures: parsed.extractionFailures } : {}),
         raw,
         scrapedAt,
       };

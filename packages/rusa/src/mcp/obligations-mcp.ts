@@ -19,6 +19,7 @@ type ObligationServerRepository = Pick<
   | "setTerminalStatus"
   | "setExternalRef"
   | "setCheckpoint"
+  | "setSnooze"
   | "attachArtifact"
   | "listArtifacts"
   | "movePriorityInternal"
@@ -291,7 +292,7 @@ export function createObligationsMcpServer(
     {
       title: "List this actor's obligations",
       description:
-        "List a bounded page of obligations owned by this actor in ready-before-waiting queue order. Actor identity is bound by the server.",
+        "List a bounded page of obligations owned by this actor in queue order: actionable ready work first (by priority), then snoozed ready work, then waiting, then the rest. A snoozed row keeps its status and carries snoozedUntil, so a `ready` filter returns snoozed ready rows after the actionable ones. Actor identity is bound by the server.",
       inputSchema: {
         status: z.enum(["ready", "waiting", "done", "cancelled", "scheduled"]).optional(),
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
@@ -524,6 +525,39 @@ export function createObligationsMcpServer(
         } catch {
           // ActorMesh already isolates its production event sink. This keeps
           // direct embedders on the same honest contract.
+        }
+        return toolOk({ obligation });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_snooze",
+    {
+      title: "Snooze or unsnooze an obligation you own",
+      description:
+        "Deliberately defer an obligation you own until a UTC time, or pass null to clear the snooze. Only the current owner may set or clear it — not its creator, an ancestor, or root. A snooze keeps the obligation's status (ready, waiting or scheduled) and still blocks its parent and dependents; it defers only automatic ready attention: it is not your ready head, sends no responsive-ready wake, and satisfies strict yield closure, until the deadline. Events still wake you. At the deadline it clears itself: ready work becomes actionable again as a fresh episode, waiting work keeps waiting, and a recurring occurrence that came due meanwhile activates once. Recurrence keeps its cadence underneath; completing a recurring obligation keeps the snooze, and final done/cancel clears it. Reassigning keeps the snooze and hands it to the new owner. `until` must be a future ISO-8601 timestamp with an offset (e.g. 2026-10-05T09:00:00Z); rewriting the same value is a no-op. A checkpoint is not a snooze reason — say why in set_checkpoint if it matters.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        until: z.string().trim().min(1).nullable(),
+      },
+    },
+    async ({ id, until }) => {
+      try {
+        const current = repository.require(id);
+        if (current.ownerId !== actorId) {
+          throw new Error("only the obligation's current owner may snooze or unsnooze it");
+        }
+        const { obligation, scheduleError } = repository.setSnooze(id, until, actorId);
+        if (scheduleError !== null) {
+          // The snooze committed; only its timer did not arm. Report both
+          // rather than a bare error, which would read as "nothing happened".
+          return toolOk({
+            obligation,
+            warning: `snooze saved, but its wake timer could not be armed (${scheduleError}); it is retried in-process and re-armed on restart`,
+          });
         }
         return toolOk({ obligation });
       } catch (err) {

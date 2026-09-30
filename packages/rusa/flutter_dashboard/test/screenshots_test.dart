@@ -19,6 +19,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
@@ -31,6 +32,7 @@ import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
+import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
 import 'screenshot_support.dart';
@@ -250,6 +252,104 @@ void main() {
   });
 
   testWidgets(
+    'renders the status dialogs before and after Ctrl+Enter submits (#768)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..obligationsResult = [
+            makeObligation(
+              'ob-shortcut-done',
+              ownerId: 'human:operator',
+              intent: 'Publish the release notes',
+            ),
+            makeObligation(
+              'ob-shortcut-cancel',
+              ownerId: 'human:operator',
+              intent: 'Draft the migration guide',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1200, 700));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: WorkTab(store: store, onSelectView: (_) {}),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        // Real delays too: the detail pane reloads through async fetches.
+        Future<void> settle() async {
+          for (var i = 0; i < 6; i++) {
+            await Future<void>.delayed(const Duration(milliseconds: 20));
+            await tester.pump(const Duration(milliseconds: 100));
+          }
+        }
+
+        for (final (heading, tooltip, name, note) in [
+          (
+            'Publish the release notes',
+            'Mark Done',
+            'done',
+            'Published to the docs site.\nLinked from the changelog.',
+          ),
+          (
+            'Draft the migration guide',
+            'Cancel Obligation',
+            'cancel',
+            'Superseded by the upgrade tool.\nNo manual steps remain.',
+          ),
+        ]) {
+          await tester.tap(find.text(heading).first);
+          await settle();
+          await tester.tap(find.byTooltip(tooltip));
+          await settle();
+          // Plain Enter stays a newline inside the note.
+          await tester.enterText(
+            find.descendant(
+              of: find.byType(AlertDialog),
+              matching: find.byType(TextField),
+            ),
+            note,
+          );
+          await settle();
+          await captureBoundary(key, '$_outDir/status_dialog_${name}_note.png');
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await settle();
+          expect(find.byType(AlertDialog), findsNothing);
+          await captureBoundary(
+            key,
+            '$_outDir/status_dialog_${name}_submitted.png',
+          );
+          ScaffoldMessenger.of(
+            tester.element(find.byType(WorkTab)),
+          ).removeCurrentSnackBar();
+          await settle();
+        }
+
+        expect(api.statusCalls.map((c) => c.status), ['done', 'cancelled']);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
+
+  testWidgets(
     'renders the header quota rings with Fable beside Claude (#752)',
     (tester) async {
       await tester.runAsync(() async {
@@ -302,8 +402,130 @@ void main() {
             .ensureTooltipVisible();
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
-        expect(find.textContaining('Current week (Fable)'), findsOneWidget);
+        expect(find.textContaining('Weekly: '), findsOneWidget);
+        expect(find.textContaining('Last Read: 30 minutes ago'), findsOneWidget);
         await captureBoundary(key, '$_outDir/header_quota_fable_tooltip.png');
+      });
+    },
+  );
+
+  testWidgets(
+    'renders the header quota Claude tooltip with operator layout (#760)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        const weeklyRemainingMs = 48 * 3600 * 1000;
+        final weeklyWindowMs = (weeklyRemainingMs / 0.79).round();
+        const sessionRemainingMs = 25 * 60 * 1000;
+        final sessionWindowMs = (sessionRemainingMs / 0.06).round();
+
+        final claude = ProviderQuotaDto(
+          provider: 'claude',
+          status: 'available',
+          usedPercent: 13,
+          tier: null,
+          message: null,
+          scrapedAt: now
+              .subtract(const Duration(minutes: 30))
+              .toIso8601String(),
+          throttle: QuotaThrottleDto(
+            intervalSeconds: 600,
+            expired: false,
+            capped: false,
+            buckets: const [
+              QuotaThrottleBucketDto(
+                key: 'claude:session',
+                error: 1,
+                percentLeft: 5,
+                timeRemainingPct: 6,
+              ),
+            ],
+            updatedAt: now.toIso8601String(),
+            freshness: const QuotaFreshnessDto(mode: 'scrape'),
+          ),
+          windows: [
+            QuotaWindowDto(
+              id: 'weekly',
+              label: 'Weekly',
+              usedPercent: 13,
+              status: 'available',
+              headline: true,
+              windowMs: weeklyWindowMs,
+              resetAtIso: now.add(const Duration(days: 2)).toIso8601String(),
+              scrapedAt: now
+                  .subtract(const Duration(minutes: 30))
+                  .toIso8601String(),
+            ),
+            QuotaWindowDto(
+              id: 'session',
+              label: 'Session',
+              usedPercent: 95,
+              status: 'available',
+              headline: false,
+              windowMs: sessionWindowMs,
+              resetAtIso: now
+                  .add(const Duration(minutes: 25))
+                  .toIso8601String(),
+              scrapedAt: now
+                  .subtract(const Duration(minutes: 30))
+                  .toIso8601String(),
+            ),
+          ],
+        );
+
+        final api = FakeApi()
+          ..threadsResult = _seedThreads()
+          ..quotaResult = QuotaSnapshotDto(
+            generatedAt: now.toIso8601String(),
+            providers: [claude],
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await store.refreshQuota();
+        addTearDown(store.dispose);
+
+        await tester.binding.setSurfaceSize(const Size(1200, 240));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.pumpWidget(
+          RepaintBoundary(
+            key: key,
+            child: MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: buildMeshTheme(),
+              home: Scaffold(
+                backgroundColor: MeshColors.bgPrimary,
+                body: Align(
+                  alignment: Alignment.topCenter,
+                  child: MeshHeader(
+                    store: store,
+                    selected: DashboardView.overview,
+                    onSelect: (_) {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        expect(find.text('Claude'), findsOneWidget);
+
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Claude'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('Weekly:'), findsOneWidget);
+        expect(find.textContaining('Freshness'), findsNothing);
+        expect(find.textContaining('Hottest bucket'), findsNothing);
+        await captureBoundary(key, '$_outDir/header_quota_claude_tooltip.png');
       });
     },
   );
@@ -477,9 +699,11 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
 );
 
 /// Claude with a Fable weekly allocation beside its provider-wide week (#752),
-/// plus Codex. Reset and scrape instants are null for a reproducible shot.
+/// plus Codex. The Fable window carries the provider's reset and scrape
+/// instants, as the server sends them, relative to the capture time.
 QuotaSnapshotDto _seedFableQuota() {
   final base = _seedQuota();
+  final now = DateTime.now().toUtc();
   final claude = base.providers.first;
   return QuotaSnapshotDto(
     generatedAt: base.generatedAt,
@@ -491,7 +715,8 @@ QuotaSnapshotDto _seedFableQuota() {
         tier: null,
         message: null,
         windows: claude.windows,
-        modelWindows: const [
+        scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
+        modelWindows: [
           QuotaWindowDto(
             id: 'weekly',
             label: 'Current week (Fable)',
@@ -499,7 +724,13 @@ QuotaSnapshotDto _seedFableQuota() {
             status: 'available',
             headline: true,
             windowMs: 604800000,
-            modelIds: ['claude-fable-5-1'],
+            resetAtIso: now
+                .add(const Duration(days: 3, hours: 4))
+                .toIso8601String(),
+            scrapedAt: now
+                .subtract(const Duration(minutes: 30))
+                .toIso8601String(),
+            modelIds: const ['claude-fable-5-1'],
           ),
         ],
       ),

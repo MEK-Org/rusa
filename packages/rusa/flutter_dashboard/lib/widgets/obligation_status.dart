@@ -84,14 +84,17 @@ class ObligationStatusColors {
       };
 }
 
-/// The chip text: the synthetic state's own name when active, otherwise the
-/// persisted status verbatim so an unknown status still says what it is.
+/// The chip text: the synthetic state's own name when active, WAITING when
+/// in the waiting presentation state (including snoozed obligations), otherwise
+/// the persisted status verbatim so an unknown status still says what it is.
 String obligationStatusLabel(
   ObligationDto obligation,
   ObligationPresentationState state,
-) => state == ObligationPresentationState.active
-    ? 'ACTIVE'
-    : obligation.status.toUpperCase();
+) => switch (state) {
+      ObligationPresentationState.active => 'ACTIVE',
+      ObligationPresentationState.waiting => 'WAITING',
+      _ => obligation.status.toUpperCase(),
+    };
 
 /// Rebuilds [builder] with the obligation's current presentation state,
 /// following the actor snapshot so a chip flips to and from green as the
