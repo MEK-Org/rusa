@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/chat_room_controller.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/walkie_controller.dart';
 
 import 'fakes.dart';
@@ -159,6 +162,150 @@ void main() {
         '/api/mesh/voice/audio/reply-a',
         '/api/mesh/voice/audio/reply-a',
       ]);
+    },
+  );
+
+  test(
+    'cancelling while recorder start is pending discards recording and does not revive',
+    () async {
+      final startCompleter = Completer<void>();
+      walkie.recorder.startCompleter = startCompleter;
+
+      final tapFuture = controller.tapParticipant('root');
+      await pumpEventQueue();
+
+      expect(controller.record.value.phase, RecordPhase.starting);
+      expect(controller.recordingRecipient.value, 'root');
+
+      await controller.cancelRecord();
+      await pumpEventQueue();
+
+      expect(controller.record.value.phase, RecordPhase.idle);
+      expect(controller.recordingRecipient.value, isNull);
+
+      startCompleter.complete();
+      await tapFuture;
+      await pumpEventQueue();
+
+      expect(controller.record.value.phase, RecordPhase.idle);
+      expect(controller.recordingRecipient.value, isNull);
+      expect(walkie.recorder.cancelCalls, greaterThanOrEqualTo(1));
+    },
+  );
+
+  test(
+    'live frames arriving during backlog fetch are queued and played in chronological order after backlog completes',
+    () async {
+      final backlogGate = Completer<List<VoiceAnnouncement>>();
+      api.backlogGates.add(backlogGate);
+      api.backlogPages.add(const []);
+
+      final enableFuture = controller.enable();
+      await pumpEventQueue();
+
+      // Live frame arrives with later timestamp while backlog is still pending.
+      walkie.stream.framesCtrl.add(
+        makeAnnouncement(
+          'live-late',
+          actor: 'root',
+          createdAt: '2026-07-17T00:00:10Z',
+        ),
+      );
+      await pumpEventQueue();
+
+      // Drain should not play yet because backlog fetch is in progress.
+      expect(walkie.player.playedUrls, isEmpty);
+
+      // Complete backlog with an earlier frame.
+      backlogGate.complete([
+        makeAnnouncement(
+          'backlog-early',
+          actor: 'root',
+          createdAt: '2026-07-17T00:00:01Z',
+        ),
+      ]);
+      await enableFuture;
+      await pumpEventQueue();
+
+      // The earlier backlog frame must play first!
+      expect(walkie.player.playedUrls, [
+        '/api/mesh/voice/audio/backlog-early',
+      ]);
+      expect(controller.queueDepth.value, 1);
+
+      walkie.player.finishCurrent();
+      await pumpEventQueue();
+
+      // Then the later live frame plays.
+      expect(walkie.player.playedUrls.last, '/api/mesh/voice/audio/live-late');
+      expect(api.ackedIds, ['backlog-early']);
+
+      walkie.player.finishCurrent();
+      await pumpEventQueue();
+      expect(api.ackedIds, ['backlog-early', 'live-late']);
+    },
+  );
+
+  test(
+    'complete user sequence: send to A, send to B, play both replies in arrival order',
+    () async {
+      await controller.enable();
+      await pumpEventQueue();
+
+      // 1. Record and send to actor A (root).
+      await controller.tapParticipant('root');
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.recordingRecipient.value, 'root');
+
+      await controller.tapParticipant('root');
+      await pumpEventQueue();
+      expect(api.memoSends, hasLength(1));
+      expect(api.memoSends.single.actorId, 'root');
+
+      // 2. Record and send to actor B (actor-b).
+      await controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(controller.record.value.phase, RecordPhase.recording);
+      expect(controller.recordingRecipient.value, 'actor-b');
+
+      await controller.tapParticipant('actor-b');
+      await pumpEventQueue();
+      expect(api.memoSends, hasLength(2));
+      expect(api.memoSends.last.actorId, 'actor-b');
+
+      // 3. Receive replies from both root and actor-b.
+      walkie.stream.framesCtrl.add(
+        makeAnnouncement(
+          'reply-from-a',
+          actor: 'root',
+          createdAt: '2026-07-17T00:01:00Z',
+        ),
+      );
+      walkie.stream.framesCtrl.add(
+        makeAnnouncement(
+          'reply-from-b',
+          actor: 'actor-b',
+          createdAt: '2026-07-17T00:01:05Z',
+        ),
+      );
+      await pumpEventQueue();
+
+      // 4. Replies play without overlap in arrival order.
+      expect(walkie.player.playedUrls, [
+        '/api/mesh/voice/audio/reply-from-a',
+      ]);
+      expect(controller.nowPlaying.value?.id, 'reply-from-a');
+
+      walkie.player.finishCurrent();
+      await pumpEventQueue();
+      expect(api.ackedIds, ['reply-from-a']);
+      expect(walkie.player.playedUrls.last, '/api/mesh/voice/audio/reply-from-b');
+      expect(controller.nowPlaying.value?.id, 'reply-from-b');
+
+      walkie.player.finishCurrent();
+      await pumpEventQueue();
+      expect(api.ackedIds, ['reply-from-a', 'reply-from-b']);
     },
   );
 }

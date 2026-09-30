@@ -1232,13 +1232,14 @@ VoiceAnnouncement makeAnnouncement(
   String id, {
   String actor = 'a',
   String? text,
+  String createdAt = '2026-07-17T00:00:00Z',
 }) => VoiceAnnouncement(
   id: id,
   actorId: actor,
   text: text ?? 'reply $id',
   audioUrl: '/api/mesh/voice/audio/$id',
   mime: 'audio/wav',
-  createdAt: '2026-07-17T00:00:00Z',
+  createdAt: createdAt,
 );
 
 class FakeVoiceRecorder implements VoiceRecorder {
@@ -1246,6 +1247,7 @@ class FakeVoiceRecorder implements VoiceRecorder {
   int stopCalls = 0;
   int cancelCalls = 0;
   Object? startError;
+  Completer<void>? startCompleter;
   RecordedAudio result = RecordedAudio(
     bytes: Uint8List.fromList([1, 2, 3]),
     mimeType: 'audio/webm;codecs=opus',
@@ -1256,6 +1258,8 @@ class FakeVoiceRecorder implements VoiceRecorder {
     startCalls++;
     final err = startError;
     if (err != null) throw err;
+    final c = startCompleter;
+    if (c != null) await c.future;
   }
 
   @override

@@ -66,6 +66,8 @@ class ChatRoomController {
   bool _droppedSinceConnect = false;
   bool _requeueCurrentForRecording = false;
   String? _interruptedAnnouncementId;
+  int _recordGeneration = 0;
+  int _backlogFetchesInProgress = 0;
   bool _disposed = false;
 
   ValueStream<bool> get enabled => _enabled.stream;
@@ -102,21 +104,6 @@ class ChatRoomController {
   void _setAvailable(bool value) {
     _deps.voiceAvailable = value;
     if (!_disposed) _available.add(value);
-  }
-
-  /// Add a live participant and, when the room is open, widen the existing
-  /// presence stream before fetching that actor's queued replies.
-  Future<bool> addParticipant(String actorId) async {
-    final trimmed = actorId.trim();
-    if (trimmed.isEmpty || _participants.value.contains(trimmed)) return false;
-    _participants.add([..._participants.value, trimmed]);
-    _recipient.add(_recipient.value ?? trimmed);
-    if (_enabled.value) {
-      _connection.add(WalkieConnection.connecting);
-      _stream?.connect(_participants.value, null);
-      await _fetchBacklogs([trimmed]);
-    }
-    return true;
   }
 
   /// Reconcile the UI-owned room roster against the live actor snapshot. This
@@ -172,6 +159,8 @@ class ChatRoomController {
 
   Future<void> disable() async {
     if (!_enabled.value) return;
+    _recordGeneration++;
+    _backlogFetchesInProgress = 0;
     _enabled.add(false);
     _connection.add(WalkieConnection.off);
     _teardownStream();
@@ -218,6 +207,7 @@ class ChatRoomController {
   Future<void> _fetchBacklogs(Iterable<String> actorIds) async {
     final ids = _normalizedParticipants(actorIds);
     if (ids.isEmpty) return;
+    _backlogFetchesInProgress++;
     try {
       final batches = await Future.wait(
         ids.map((actorId) => _deps.api.fetchVoiceBacklog(actorId)),
@@ -243,6 +233,11 @@ class ChatRoomController {
       _lastError.add('Backlog fetch failed: ${_apiErrorText(e)}');
     } catch (e) {
       _lastError.add('Backlog fetch failed: $e');
+    } finally {
+      _backlogFetchesInProgress--;
+      if (_enabled.value && !isRecording) {
+        unawaited(_drain());
+      }
     }
   }
 
@@ -255,13 +250,22 @@ class ChatRoomController {
         !_seenIds.add(frame.id)) {
       return;
     }
-    _queue.add(frame);
+    var insertIndex = _queue.length;
+    for (var i = 0; i < _queue.length; i++) {
+      if (frame.createdAt.compareTo(_queue[i].createdAt) < 0) {
+        insertIndex = i;
+        break;
+      }
+    }
+    _queue.insert(insertIndex, frame);
     _queueDepth.add(_queue.length);
-    unawaited(_drain());
+    if (_backlogFetchesInProgress == 0) {
+      unawaited(_drain());
+    }
   }
 
   Future<void> _drain() async {
-    if (_draining) return;
+    if (_draining || _backlogFetchesInProgress > 0) return;
     _draining = true;
     try {
       while (_enabled.value && _queue.isNotEmpty) {
@@ -343,6 +347,7 @@ class ChatRoomController {
   }
 
   Future<void> _startRecording(String actorId) async {
+    final generation = ++_recordGeneration;
     _lastError.add(null);
     _deliveredReset?.cancel();
     _recordingRecipient.add(actorId);
@@ -358,6 +363,7 @@ class ChatRoomController {
     try {
       await _deps.recorder.start();
     } catch (e) {
+      if (generation != _recordGeneration) return;
       _recordingRecipient.add(null);
       _record.add(
         RecordStatus(phase: RecordPhase.error, message: 'Mic unavailable: $e'),
@@ -365,7 +371,12 @@ class ChatRoomController {
       unawaited(_drain());
       return;
     }
-    if (!_enabled.value || _disposed) return;
+    if (generation != _recordGeneration || !_enabled.value || _disposed) {
+      try {
+        await _deps.recorder.cancel();
+      } catch (_) {}
+      return;
+    }
     _recordStartedAt = DateTime.now();
     _record.add(const RecordStatus(phase: RecordPhase.recording));
     _recordTicker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -385,6 +396,7 @@ class ChatRoomController {
         _record.value.phase != RecordPhase.starting) {
       return;
     }
+    _recordGeneration++;
     _stopRecordTimers();
     try {
       await _deps.recorder.cancel();
@@ -400,6 +412,7 @@ class ChatRoomController {
   Future<void> _stopAndSend() async {
     final target = _recordingRecipient.value;
     if (target == null) return;
+    _recordGeneration++;
     _lastError.add(null);
     _stopRecordTimers();
     _record.add(const RecordStatus(phase: RecordPhase.sending));
