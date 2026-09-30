@@ -278,10 +278,52 @@ class QuotaTooltip extends StatelessWidget {
     return staleReadingAge(windows, currentTime);
   }
 
-  String? _buildWarningText(DateTime currentTime) {
-    final age = _staleAge(currentTime);
-    if (age == null) return null;
-    return 'Warning: no new reading for ${formatStaleAge(age)}';
+  Widget _buildLastReadWidget(DateTime currentTime) {
+    final prefix = throttle?.freshness?.mode == 'manual'
+        ? 'Last Read (manual): '
+        : 'Last Read: ';
+
+    String ageText;
+    if (scrapedAt == null) {
+      ageText = 'n/a';
+    } else {
+      final scraped = DateTime.tryParse(scrapedAt!);
+      if (scraped == null) {
+        ageText = 'n/a';
+      } else {
+        ageText = formatLastReadAge(currentTime.difference(scraped));
+      }
+    }
+
+    String? overdueSuffix;
+    final freshness = throttle?.freshness;
+    if (freshness != null) {
+      if (freshness.hardStale) {
+        overdueSuffix = ' [overdue: hard-stale, fail-safe cap applied]';
+      } else if (freshness.stale) {
+        overdueSuffix = ' [overdue: stale]';
+      }
+    }
+
+    final isStale = _staleAge(currentTime) != null;
+    return Text.rich(
+      TextSpan(
+        style: const TextStyle(fontSize: 12),
+        children: [
+          TextSpan(text: prefix),
+          TextSpan(
+            text: ageText,
+            style: isStale
+                ? const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: MeshColors.quotaTooltipStaleWarning,
+                  )
+                : null,
+          ),
+          if (overdueSuffix != null) TextSpan(text: overdueSuffix),
+        ],
+      ),
+    );
   }
 
   List<String> _buildDiagnostics() {
@@ -320,10 +362,6 @@ class QuotaTooltip extends StatelessWidget {
     if (pacing != null) {
       lines.add(pacing);
     }
-    final warning = _buildWarningText(currentTime);
-    if (warning != null) {
-      lines.add(warning);
-    }
     lines.add(_buildLastReadText(currentTime));
     final diagnostics = _buildDiagnostics();
     if (diagnostics.isNotEmpty) {
@@ -339,8 +377,6 @@ class QuotaTooltip extends StatelessWidget {
     final currentTime = now ?? DateTime.now();
     final windowRows = _buildWindowRows(currentTime);
     final pacingText = _buildPacingText();
-    final warningText = _buildWarningText(currentTime);
-    final lastReadText = _buildLastReadText(currentTime);
     final diagnostics = _buildDiagnostics();
     final diagnosticStyle = TextStyle(
       fontSize: 11,
@@ -371,18 +407,7 @@ class QuotaTooltip extends StatelessWidget {
             Text(pacingText, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 2),
           ],
-          if (warningText != null) ...[
-            Text(
-              warningText,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: MeshColors.quotaTooltipStaleWarning,
-              ),
-            ),
-            const SizedBox(height: 2),
-          ],
-          Text(lastReadText, style: const TextStyle(fontSize: 12)),
+          _buildLastReadWidget(currentTime),
           if (diagnostics.isNotEmpty) ...[
             const SizedBox(height: 6),
             for (final text in diagnostics) Text(text, style: diagnosticStyle),

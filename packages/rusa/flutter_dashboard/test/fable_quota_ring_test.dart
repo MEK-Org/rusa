@@ -522,7 +522,7 @@ void main() {
           ),
         );
         expect(_staleWarning('Fable'), findsNothing);
-        expect(_tooltipOf(tester, 'Fable'), isNot(contains('no new reading')));
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Warning:')));
         await store.dispose();
 
         store = await pumpFable(
@@ -542,9 +542,10 @@ void main() {
         expect(
           _tooltipOf(tester, 'Fable'),
           contains(
-            'Warning: no new reading for 3h',
+            'Last Read: 3 hours ago',
           ),
         );
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Warning:')));
         await store.dispose();
       });
     });

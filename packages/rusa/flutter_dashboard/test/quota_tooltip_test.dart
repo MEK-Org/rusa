@@ -568,18 +568,27 @@ void main() {
       );
       await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
+      expect(find.textContaining('Warning:'), findsNothing);
       expect(
-        find.text('Warning: no new reading for 3h'),
+        find.textContaining('Last Read: 3 hours ago'),
         findsOneWidget,
       );
-      final warning = tester.widget<Text>(
-        find.text('Warning: no new reading for 3h'),
+      final lastReadWidget = tester.widget<Text>(
+        find.textContaining('Last Read: 3 hours ago'),
       );
-      expect(warning.style?.fontWeight, FontWeight.w700);
-      expect(warning.style?.color, const Color(0xFFC79A3C));
+      final span = lastReadWidget.textSpan as TextSpan;
+      expect(span.children?[0].toPlainText(), 'Last Read: ');
+      expect((span.children?[0] as TextSpan).style, null);
+      expect(span.children?[1].toPlainText(), '3 hours ago');
+      expect((span.children?[1] as TextSpan).style?.fontWeight, FontWeight.w700);
+      expect((span.children?[1] as TextSpan).style?.color, const Color(0xFFC79A3C));
       expect(
         tooltip.toPlainText(),
-        contains('Warning: no new reading for 3h'),
+        contains('Last Read: 3 hours ago'),
+      );
+      expect(
+        tooltip.toPlainText(),
+        isNot(contains('Warning:')),
       );
     });
 
@@ -609,8 +618,19 @@ void main() {
       );
       await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
-      expect(find.text('Warning: no new reading for 3h'), findsOneWidget);
+      expect(find.textContaining('Warning:'), findsNothing);
+      expect(
+        find.textContaining('Last Read: 3 hours ago'),
+        findsOneWidget,
+      );
+      final lastReadWidget = tester.widget<Text>(
+        find.textContaining('Last Read: 3 hours ago'),
+      );
+      final span = lastReadWidget.textSpan as TextSpan;
+      expect((span.children?[1] as TextSpan).style?.fontWeight, FontWeight.w700);
+      expect((span.children?[1] as TextSpan).style?.color, const Color(0xFFC79A3C));
       expect(tooltip.toPlainText(), isNot(contains('estimate')));
+      expect(tooltip.toPlainText(), isNot(contains('Warning:')));
     });
   });
 }
