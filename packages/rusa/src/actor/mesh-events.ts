@@ -205,6 +205,15 @@ export type MeshEventKind =
   // standing is read from the obligation; this says only that it moved, by
   // whom, and whether the current-standing field was cleared.
   | "obligation_checkpoint_set"
+  // One committed obligation mutation changed statuses (#773) — a close, the
+  // parent it re-readied, a prerequisite release, a scheduled activation. It
+  // tells open dashboard views which rows to refetch. `actorId` = the acting
+  // principal (an actor, a dashboard principal, or system:mesh); `detail` = the
+  // first changed id, normally the mutation's target; `payload` =
+  // { changes: [{ id, status }] } in write order. Like the checkpoint event it
+  // carries no body, note, resolution ref, title, or owner: the obligation is
+  // the record of why, and this only says what moved.
+  | "obligation_status_changed"
   // A granted email-send tool successfully sent via Gmail. `actorId` is the
   // sender; `detail` is the To recipient; payload contains To and Cc only.
   | "email_sent"
@@ -350,6 +359,23 @@ export interface MeshEventInput {
 }
 
 export type MeshEventSink = (event: MeshEventInput) => void;
+
+/** The statuses one committed obligation mutation changed; see `obligation_status_changed`. */
+export interface ObligationStatusChangedInput {
+  actingPrincipal: string;
+  changes: { id: string; status: string }[];
+}
+
+export function obligationStatusChangedEvent(change: ObligationStatusChangedInput): MeshEventInput {
+  return {
+    kind: "obligation_status_changed",
+    actorId: change.actingPrincipal,
+    detail: change.changes[0]?.id,
+    payload: JSON.stringify({
+      changes: change.changes.map(({ id, status }) => ({ id, status })),
+    }),
+  };
+}
 
 /** Default no-op sink — observability is opt-in; the mesh works without it. */
 export const NOOP_MESH_EVENT_SINK: MeshEventSink = () => {};

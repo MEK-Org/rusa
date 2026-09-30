@@ -33,6 +33,7 @@ import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationQueue,
   ObligationRepository,
+  type ObligationStatusChange,
   type ReadyHeadChange,
 } from "./obligation-repository.js";
 
@@ -4744,6 +4745,156 @@ describe("ObligationRepository", () => {
       expect(repository.listPrerequisiteEdges("parent-edge")).toEqual([
         { prerequisiteId: "prereq-edge", status: "done" },
       ]);
+    });
+  });
+
+  describe("status-change attention (#773)", () => {
+    let changes: ObligationStatusChange[];
+
+    beforeEach(() => {
+      changes = [];
+      repository.setStatusChangeListener((change) => changes.push(change));
+    });
+
+    it("reports a close and the parent it re-readies as one committed change", () => {
+      repository.create({ title: "parent", id: "parent", ownerId: "actor-a" });
+      repository.create({ title: "child", id: "child", ownerId: "actor-b", parentId: "parent" });
+      changes = [];
+
+      repository.setTerminalStatus(
+        "child",
+        "done",
+        "shipped as 1234abc",
+        "github:o/r/pulls/1",
+        "actor-b"
+      );
+
+      expect(changes).toEqual([
+        {
+          actingPrincipal: "actor-b",
+          changes: [
+            { id: "child", status: "done" },
+            { id: "parent", status: "ready" },
+          ],
+        },
+      ]);
+    });
+
+    it("reports a parent demoted by a new child, not the created row", () => {
+      repository.create({ title: "parent", id: "parent", ownerId: "actor-a" });
+      expect(changes).toEqual([]);
+
+      repository.create({
+        title: "child",
+        id: "child",
+        ownerId: "actor-b",
+        parentId: "parent",
+        creatorId: "actor-a",
+      });
+
+      expect(changes).toEqual([
+        { actingPrincipal: "actor-a", changes: [{ id: "parent", status: "waiting" }] },
+      ]);
+    });
+
+    it("reports prerequisite blocks and releases", () => {
+      repository.create({ title: "gate", id: "gate", ownerId: "actor-a" });
+      repository.create({ title: "work", id: "work", ownerId: "actor-b" });
+      repository.create({ title: "other", id: "other", ownerId: "actor-b" });
+      changes = [];
+
+      repository.addPrerequisite("work", "gate", "actor-b");
+      repository.addPrerequisite("other", "gate", "actor-b");
+      repository.removePrerequisite("other", "gate", "actor-b");
+      repository.setTerminalStatus("gate", "done", null, null, "actor-a");
+
+      expect(changes).toEqual([
+        { actingPrincipal: "actor-b", changes: [{ id: "work", status: "waiting" }] },
+        { actingPrincipal: "actor-b", changes: [{ id: "other", status: "waiting" }] },
+        { actingPrincipal: "actor-b", changes: [{ id: "other", status: "ready" }] },
+        {
+          actingPrincipal: "actor-a",
+          changes: [
+            { id: "gate", status: "done" },
+            { id: "work", status: "ready" },
+          ],
+        },
+      ]);
+    });
+
+    it("reports recurring completion and scheduled activation", () => {
+      repository.setOsScheduler(new FakeObligationScheduler());
+      repository.create({ title: "rec", id: "rec", ownerId: "actor-a" });
+      repository.setRecurrence(
+        "rec",
+        { policy: "completion_interval", intervalSeconds: 3600 },
+        "actor-a"
+      );
+      changes = [];
+
+      repository.setTerminalStatus("rec", "done", null, null, "actor-a");
+      repository.activateScheduled("rec", "system:mesh");
+
+      expect(changes).toEqual([
+        { actingPrincipal: "actor-a", changes: [{ id: "rec", status: "scheduled" }] },
+        { actingPrincipal: "system:mesh", changes: [{ id: "rec", status: "ready" }] },
+      ]);
+    });
+
+    it("reports both parents of a reparent", () => {
+      repository.create({ title: "old", id: "old", ownerId: "actor-a" });
+      repository.create({ title: "new", id: "new", ownerId: "actor-a" });
+      repository.create({ title: "moved", id: "moved", ownerId: "actor-b", parentId: "old" });
+      changes = [];
+
+      repository.reparent("moved", "new", "actor-a");
+
+      expect(changes).toEqual([
+        {
+          actingPrincipal: "actor-a",
+          changes: [
+            { id: "new", status: "waiting" },
+            { id: "old", status: "ready" },
+          ],
+        },
+      ]);
+    });
+
+    it("stays silent for mutations that change no status", () => {
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+      changes = [];
+
+      repository.setCheckpoint("task", "halfway", "actor-a");
+      repository.reassign("task", "actor-b", "actor-a");
+      repository.markResponsive("task", "actor-a");
+
+      expect(changes).toEqual([]);
+    });
+
+    it("reports nothing for a rolled-back mutation", () => {
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+      changes = [];
+      db.exec(`CREATE TRIGGER fail_history BEFORE INSERT ON obligation_history
+               BEGIN SELECT RAISE(ABORT, 'history unavailable'); END;`);
+
+      expect(() => repository.setTerminalStatus("task", "done", null, null, "actor-a")).toThrow(
+        "history unavailable"
+      );
+
+      expect(repository.require("task").status).toBe("ready");
+      expect(changes).toEqual([]);
+    });
+
+    it("keeps a committed transition when the listener throws", () => {
+      repository.setStatusChangeListener(() => {
+        throw new Error("sink unavailable");
+      });
+      repository.create({ title: "task", id: "task", ownerId: "actor-a" });
+
+      expect(() =>
+        repository.setTerminalStatus("task", "cancelled", null, null, "actor-a")
+      ).not.toThrow();
+      expect(repository.require("task").status).toBe("cancelled");
     });
   });
 

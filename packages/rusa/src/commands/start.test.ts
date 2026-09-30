@@ -8130,6 +8130,40 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(rootProjection).toEqual(workerProjection);
     });
 
+    it("streams a committed close and its parent's re-ready to dashboards, without the note (#773)", async () => {
+      const emitted = vi.spyOn(MeshEventEmitter.prototype, "emitMeshEvent");
+      await boot();
+      const obligations = getRepositories().obligations;
+      obligations.create({ title: "parent", id: "status-parent", ownerId: "root" });
+      obligations.create({
+        title: "child",
+        id: "status-child",
+        ownerId: "root",
+        parentId: "status-parent",
+      });
+      emitted.mockClear();
+
+      obligations.setTerminalStatus(
+        "status-child",
+        "done",
+        "landed from a private branch",
+        "github:o/r/pulls/9",
+        "root"
+      );
+
+      const streamed = emitted.mock.calls
+        .map(([event]) => event)
+        .filter((event) => event.kind === "obligation_status_changed");
+      expect(streamed).toMatchObject([{ actorId: "root", detail: "status-child" }]);
+      expect(JSON.parse(streamed[0]?.payload ?? "null")).toEqual({
+        changes: [
+          { id: "status-child", status: "done" },
+          { id: "status-parent", status: "ready" },
+        ],
+      });
+      expect(JSON.stringify(streamed)).not.toMatch(/private branch|pulls\/9/);
+    });
+
     it("releases resources newest first, ingress before the mesh, and clears every obligation sink before the database closes", async () => {
       writeConfig({ ...chatConfig, gitBridge: true, gitBridgePort: 9098 });
       const readyHeadListener = vi.spyOn(ObligationRepository.prototype, "setReadyHeadListener");
@@ -8141,6 +8175,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         ObligationRepository.prototype,
         "setResponsiveReadyListener"
       );
+      const statusListener = vi.spyOn(ObligationRepository.prototype, "setStatusChangeListener");
       const dashboardClose = vi.fn(async () => {});
       const dashboardSpy = vi
         .spyOn(webhookServer, "startDashboardServer")
@@ -8176,6 +8211,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
           vi.spyOn(mesh, "deliverPrerequisiteCancelledAttention").mockReturnValue(true),
           vi.spyOn(mesh, "deliverResponsiveReadyAttention").mockReturnValue(true),
         ];
+        const recordEvent = vi.spyOn(mesh, "recordEvent");
+        const statusEvents = () =>
+          recordEvent.mock.calls.filter(([event]) => event.kind === "obligation_status_changed")
+            .length;
         const fireObligationListeners = () => {
           readyHeadListener.mock.lastCall?.[0]?.({
             ownerId: "root",
@@ -8193,22 +8232,30 @@ describe("runStart webhook event routing (Phase 4)", () => {
             { id: "obligation", ownerId: "root", intent: "x", readyCount: 1 } as never,
             "root"
           );
+          statusListener.mock.lastCall?.[0]?.({
+            actingPrincipal: "root",
+            changes: [{ id: "obligation", status: "done" }],
+          });
         };
         // The captured listeners reach the live mesh before shutdown...
         fireObligationListeners();
         expect(deliveries.map((delivery) => delivery.mock.calls.length)).toEqual([1, 1, 1]);
+        expect(statusEvents()).toBe(1);
         // ...and none of them reaches it by the time the database closes.
         let deliveredAtClose: number[] = [];
+        let statusEventsAtClose = 0;
         dbMock.closeDb.mockClear();
         dbMock.closeDb.mockImplementationOnce(() => {
           fireObligationListeners();
           deliveredAtClose = deliveries.map((delivery) => delivery.mock.calls.length);
+          statusEventsAtClose = statusEvents();
           closeDb();
         });
 
         await shutdown();
 
         expect(deliveredAtClose).toEqual([1, 1, 1]);
+        expect(statusEventsAtClose).toBe(1);
         const order = (
           [
             ["probe settled", probeSettled],

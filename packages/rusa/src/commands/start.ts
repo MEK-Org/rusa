@@ -79,6 +79,7 @@ import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
 import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
   type MeshEventSink,
+  obligationStatusChangedEvent,
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
@@ -158,6 +159,7 @@ import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscript
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type {
+  ObligationStatusChange,
   PrerequisiteAttention,
   ReadyHeadChange,
 } from "../db/repositories/obligation-repository.js";
@@ -1191,6 +1193,10 @@ async function composeStart(
   getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
     responsiveReadySink?.(obligation, actingPrincipal)
   );
+
+  // #773 status changes for open dashboards: same deferred-sink shape again.
+  let statusChangeSink: ((change: ObligationStatusChange) => void) | undefined;
+  getRepositories().obligations.setStatusChangeListener((change) => statusChangeSink?.(change));
   // Released just before the database closes. The repository's listeners are
   // closures over these sinks; clearing the sinks rather than the listeners
   // stops a dead mesh being reachable through them without touching a
@@ -1199,6 +1205,7 @@ async function composeStart(
     readyHeadSink = undefined;
     prerequisiteCancellationSink = undefined;
     responsiveReadySink = undefined;
+    statusChangeSink = undefined;
   });
 
   try {
@@ -3312,6 +3319,7 @@ async function composeStart(
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
+  statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
       obligation.ownerId,
