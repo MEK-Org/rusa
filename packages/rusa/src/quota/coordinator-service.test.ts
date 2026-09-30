@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ProviderPacer } from "../actor/provider-pacer.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { QuotaCoordinatorClient } from "./coordinator-client.js";
+import { QuotaCoordinatorClient, reconcileProviderPacersFromClient } from "./coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
@@ -485,6 +486,149 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       generation: 3,
       updatedAt: new Date(nowMs).toISOString(),
     });
+  });
+
+  it("retains provider and model intervals through a hard-stale missing scrape until their governing windows reset", () => {
+    const nowMs = Date.parse("2040-01-01T00:00:00.000Z");
+    const observedAt = new Date(nowMs - 2 * 60 * 60_000).toISOString();
+    const resetAtIso = new Date(nowMs + 60 * 60_000).toISOString();
+    const provider: PersistedQuotaProviderStatus = {
+      provider: "claude",
+      intervalSeconds: 300,
+      uncappedIntervalSeconds: 300,
+      governingBucketKey: "claude:weekly",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: observedAt,
+      buckets: [
+        {
+          key: "claude:weekly",
+          percentLeft: 50,
+          timeRemainingPct: 50,
+          error: 0,
+          derivative: 0,
+          requiredIntervalSeconds: 300,
+          resetAtIso,
+          observedAt,
+        },
+      ],
+      modelLanes: [
+        {
+          provider: "claude",
+          models: ["claude-sonnet"],
+          intervalSeconds: 120,
+          uncappedIntervalSeconds: 120,
+          governingBucketKey: "claude:weekly",
+          capped: false,
+          expired: false,
+          exhaustedUntil: null,
+          updatedAt: observedAt,
+          buckets: [
+            {
+              key: "claude:weekly",
+              percentLeft: 50,
+              timeRemainingPct: 50,
+              error: 0,
+              derivative: 0,
+              requiredIntervalSeconds: 120,
+              resetAtIso,
+              observedAt,
+            },
+          ],
+        },
+      ],
+    };
+
+    const published = publishedThrottle(provider, {
+      nowMs,
+      maxIntervalSeconds: 3600,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+
+    expect(published.freshness.hardStale).toBe(true);
+    expect(published.intervalSeconds).toBe(300);
+    expect(published.modelLanes).toMatchObject([
+      { intervalSeconds: 120, freshness: { hardStale: true } },
+    ]);
+
+    const afterReset = publishedThrottle(provider, {
+      nowMs: Date.parse(resetAtIso),
+      maxIntervalSeconds: 3600,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    expect(afterReset.intervalSeconds).toBe(3600);
+    expect(afterReset.modelLanes).toMatchObject([{ intervalSeconds: 3600 }]);
+  });
+
+  it("rebuilds a missing-reading interval after coordinator restart and applies it to the client pacer", async () => {
+    const nowMs = Date.now();
+    const resetMs = nowMs + 3 * 24 * 60 * 60_000;
+    const resetAtIso = new Date(resetMs).toISOString();
+    const windowMs = 7 * 24 * 60 * 60_000;
+    const snapshot = (
+      scrapedAt: string,
+      providerPercentLeft: number,
+      modelPercentLeft: number
+    ): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: [
+        { kind: "weekly", label: "Weekly", percentLeft: providerPercentLeft, resetAtIso },
+        {
+          kind: "weekly",
+          label: "Sonnet weekly",
+          percentLeft: modelPercentLeft,
+          resetAtIso,
+          scope: { provider: "claude", models: ["claude-sonnet"] },
+        },
+      ],
+    });
+
+    store.configureController({ maxIntervalSeconds: 3600 });
+    for (let offset = 5; offset >= 0; offset -= 1) {
+      const observedMs = nowMs - 2 * 60 * 60_000 - offset * 5 * 60_000;
+      const scrapedAt = new Date(observedMs).toISOString();
+      const timeRemainingPct = ((resetMs - observedMs) / windowMs) * 100;
+      const state = snapshot(scrapedAt, timeRemainingPct - 2, timeRemainingPct - 12);
+      const id = store.recordRaw({ provider: "claude", scrapedAt, rawOutput: "fixture" });
+      store.recordParsed(id, state, state);
+    }
+    const beforeRestart = store.getProviderThrottle("claude");
+    expect(beforeRestart?.modelLanes).toHaveLength(1);
+    expect(beforeRestart?.intervalSeconds).toBeGreaterThan(0);
+    store.close();
+    store = new SharedQuotaStore(dbPath);
+    store.configureController({ maxIntervalSeconds: 3600 });
+    expect(store.getProviderThrottle("claude")).toEqual(beforeRestart);
+
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      now: () => nowMs,
+      maxIntervalSeconds: 3600,
+      hardStaleAfterMs: 60 * 60_000,
+    });
+    await service.start();
+    const client = new QuotaCoordinatorClient({
+      socketPath,
+      maxIntervalSeconds: 3600,
+      now: () => nowMs,
+    });
+    await client.getThrottle();
+
+    const pacer = new ProviderPacer(3600 * 1000, () => nowMs);
+    reconcileProviderPacersFromClient(() => pacer, ["claude"], client);
+    expect(client.getLastAppliedInterval("claude")).toBe(beforeRestart?.intervalSeconds);
+    expect(client.getLastPublishedStatus("claude")?.modelLanes).toMatchObject([
+      {
+        intervalSeconds: beforeRestart?.modelLanes?.[0]?.intervalSeconds,
+        freshness: { hardStale: true },
+      },
+    ]);
+    expect(pacer.interval).toBe((beforeRestart?.intervalSeconds ?? 0) * 1000);
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.

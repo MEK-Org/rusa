@@ -276,8 +276,15 @@ root to check the scrapes. A lane with neither a governing reset nor an
 exhaustion deadline stops being published once the provider has gone on
 reporting for longer than the hard-stale horizon without it. Manual readings
 carry no model windows, so a provider in manual mode dead-reckons its model
-lanes the same way. When the coordinator itself stops collecting, both lanes
-age together and widen to the ceiling as usual.
+lanes the same way.
+
+When the coordinator can still answer but a whole provider reading is missing,
+the provider lane and model lanes from that last reading keep their computed
+intervals while their governing window has not reset. The response remains
+truthfully `hardStale`; this is a pacing decision, not a freshness disguise. A
+newer provider scrape that omits only a governing window remains the existing
+partial-window case and widens conservatively. A client that cannot reach the
+coordinator keeps its separate local hard-stale ceiling fallback.
 
 ### Dashboard estimates for missing readings (#759)
 
