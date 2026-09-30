@@ -697,7 +697,7 @@ export class SharedQuotaStore {
 
   recordParsed(
     id: string,
-    _rawParsed: ProviderQuotaSnapshot,
+    rawParsed: ProviderQuotaSnapshot,
     inferredParsed: ProviderQuotaSnapshot
   ): void {
     const { raw: _raw, ...inferredState } = inferredParsed;
@@ -721,9 +721,11 @@ export class SharedQuotaStore {
         acceptModelScope: true,
       });
     })();
+    // Judge the parser's own read: a failed read that carried an earlier
+    // reading forward is not a clean parse (#775).
     this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
       provider: scrape?.provider ?? inferredParsed.provider,
-      outcome: "success",
+      outcome: rawParsed.status === "unknown" ? "failure" : "success",
     });
     if (this.controllerOptions) {
       this.advancePendingController(this.controllerOptions, inferredParsed.provider);

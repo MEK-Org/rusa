@@ -799,6 +799,11 @@ the rate each drill actually observed, at the much faster tick the drill runs.
 | `quota_client_service_connected` | gauge | `source` | instance |
 | `quota_client_applied_interval_seconds` | gauge | `source`, `provider` | instance |
 
+A scrape or parse counts as `outcome="failure"` when the probe's own read
+produced no reading, including when the served snapshot carries the previous
+reading forward. The carried reading keeps pacing conservative; the counter keeps
+the failure visible.
+
 The last two are emitted by the instance, never by the service: a service cannot
 count the clients it cannot see, so a service-side "degraded clients" gauge
 would read zero in exactly the partial failure that matters (§5.7).
