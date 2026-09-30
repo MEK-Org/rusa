@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { APIError, type Fetch, type JsonValue, noul, TypeSafeClient } from "@typesafe-ai/sdk";
 import {
   type JevDecisionClient,
@@ -21,6 +24,32 @@ export const JEV_DEFAULT_MODEL = "jev-latest";
  * The count left out is still sent, so the model knows the list was cut.
  */
 export const JEV_MAX_CANDIDATES = 20;
+
+/**
+ * One audited JEV query and its outcome, recorded at the send boundary.
+ * Captures the serialized query text and candidate context without credentials,
+ * linked to the evaluation ID and timestamp.
+ */
+export interface JevQueryAuditRecord {
+  evaluationId: string;
+  timestamp: string;
+  actorId: string;
+  incomingEntryId: string;
+  query: {
+    model: string;
+    state: JsonValue;
+    questions: Record<string, unknown>;
+  };
+  decision: {
+    interruptProbability: number;
+  } | null;
+  error: string | null;
+}
+
+export interface HttpJevDecisionClientOptions {
+  fetch?: Fetch;
+  auditPath?: string;
+}
 
 /** A type alias rather than an interface, so it is assignable to the SDK's JSON state. */
 export type JevResolvedInboxEntry = {
@@ -55,18 +84,21 @@ export type ResolveJevInboxEntry = (
  */
 export class HttpJevDecisionClient implements JevDecisionClient {
   private readonly client: TypeSafeClient;
+  private readonly auditPath?: string;
 
   constructor(
     apiKey: string,
     private readonly resolveEntry: ResolveJevInboxEntry,
-    fetch?: Fetch
+    options?: HttpJevDecisionClientOptions
   ) {
+    this.auditPath = options?.auditPath;
+
     this.client = new TypeSafeClient({
       apiKey,
       baseURL: JEV_BASE_URL,
       retry: { maxRetries: 0 },
       logLevel: "off",
-      ...(fetch ? { fetch } : {}),
+      ...(options?.fetch ? { fetch: options.fetch } : {}),
     });
   }
 
@@ -76,6 +108,7 @@ export class HttpJevDecisionClient implements JevDecisionClient {
   ): Promise<JevDecisionResponse> {
     const { actorId } = request;
     const { incomingEntryId, candidateEntryIds, candidateSource } = request.input;
+    const evaluationId = request.evaluationId ?? randomUUID();
     // Without the arriving item's text there is nothing to decide. That is an
     // input gap, not a transport failure, and the audit keeps them apart. It is
     // settled before any candidate is read.
@@ -98,18 +131,29 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       ...(omittedCandidates > 0 ? { omittedCandidates } : {}),
     };
 
+    const query = {
+      model: JEV_DEFAULT_MODEL,
+      state,
+      questions: { interruption: noul(request.question) },
+    };
+
+    const auditRecord: JevQueryAuditRecord = {
+      evaluationId,
+      timestamp: new Date().toISOString(),
+      actorId,
+      incomingEntryId,
+      query,
+      decision: null,
+      error: null,
+    };
+
     let answer: { type: unknown; noul: unknown } | undefined;
     try {
-      const result = await this.client.systemOne(
-        {
-          model: JEV_DEFAULT_MODEL,
-          state,
-          questions: { interruption: noul(request.question) },
-        },
-        { signal: options.signal }
-      );
+      const result = await this.client.systemOne(query, { signal: options.signal });
       answer = result.answers?.interruption;
     } catch (err) {
+      auditRecord.error = err instanceof Error ? err.message : String(err);
+      this.writeAudit(auditRecord);
       if (err instanceof APIError) {
         throw new Error(`JEV decision service returned HTTP ${err.status}`);
       }
@@ -124,8 +168,28 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       answer.noul < 0 ||
       answer.noul > 1
     ) {
+      auditRecord.error = "JEV decision service returned an invalid interruption answer";
+      this.writeAudit(auditRecord);
       throw new Error("JEV decision service returned an invalid interruption answer");
     }
+
+    auditRecord.decision = { interruptProbability: answer.noul };
+    this.writeAudit(auditRecord);
     return { interruptProbability: answer.noul };
+  }
+
+  private writeAudit(record: JevQueryAuditRecord): void {
+    try {
+      if (this.auditPath) {
+        const dir = dirname(this.auditPath);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        appendFileSync(this.auditPath, `${JSON.stringify(record)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      }
+    } catch {
+      // Failure of audit writing must not unexpectedly block delivery
+    }
   }
 }

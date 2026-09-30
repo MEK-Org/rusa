@@ -92,6 +92,7 @@ import {
   UnifiedAdmissionQueue,
 } from "./provider-pacer.js";
 import {
+  type JevDecisionClient,
   SHADOW_INTERRUPT_EMOJI,
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -3486,8 +3487,12 @@ describe("ActorMesh", () => {
     });
     const worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
-    // No run is admitted, so neither row is ever marked seen: a second poke
-    // re-reads the first row alongside the second.
+    // Start a background run on worker so it is actively running
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Repeated delivery pokes arrive while worker is running
     mesh.sendHumanMessage(worker, "first operator body", "session-1");
     await tick();
     mesh.sendHumanMessage(worker, "second operator body", "session-1");
@@ -3499,6 +3504,207 @@ describe("ActorMesh", () => {
       .map((event) => JSON.parse(event.payload ?? "{}").decision.incomingEntryId as string);
     expect(observed).toHaveLength(new Set(observed).size);
     expect(observed).toHaveLength(2);
+  });
+
+  it("evaluates JEV only when responsive item arrives while target actor is actively running vs idle vs queued (local actor)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveWorker1!: (result: Partial<RunResult>) => void;
+    let resolveWorker2!: (result: Partial<RunResult>) => void;
+    let jevEvaluations = 0;
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: async (request) => {
+          jevEvaluations++;
+          return {
+            interruptProbability: 0.9,
+            matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
+          };
+        },
+      },
+    });
+
+    let runCount = 0;
+    const provider = new FakeProvider(() => {
+      runCount++;
+      if (runCount === 1) {
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveWorker1 = resolve;
+        });
+      }
+      return new Promise<Partial<RunResult>>((resolve) => {
+        resolveWorker2 = resolve;
+      });
+    });
+
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      maxConcurrent: 1,
+    });
+
+    const w1 = mesh.spawn({ charter: "worker 1", parentId: "root" });
+    const w2 = mesh.spawn({ charter: "worker 2", parentId: "root" });
+    const w3 = mesh.spawn({ charter: "worker 3", parentId: "root" });
+
+    // 1. Idle state: w3 is idle when responsive message arrives
+    mesh.sendHumanMessage(w3, "hello idle w3", "session-3");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV should NOT evaluate for idle actor
+    expect(jevEvaluations).toBe(0);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
+
+    // 2. Queued state: w1 runs an ORDINARY run, filling the maxConcurrent: 1 slot
+    inboxStore.append([{ actorId: w1, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(w1);
+    await tick();
+
+    // Now w2 starts an ordinary run; because maxConcurrent is 1 and w1 holds it, w2 is queued
+    inboxStore.append([{ actorId: w2, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(w2);
+    await tick();
+
+    // Send responsive message to w2 while w2 is queued behind w1
+    mesh.sendHumanMessage(w2, "hello queued w2", "session-2");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV should NOT evaluate for queued actor
+    expect(jevEvaluations).toBe(0);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
+
+    // 3. Running state: send responsive message to w1 while w1 is actively running
+    mesh.sendHumanMessage(w1, "hello running w1", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV SHOULD evaluate for running actor
+    expect(jevEvaluations).toBe(1);
+    const shadowEvents = events.filter((e) => e.kind === "responsive_interruption_shadow");
+    expect(shadowEvents).toHaveLength(1);
+    expect(JSON.parse(shadowEvents[0].payload ?? "{}").decision.outcome).toBe("interrupt");
+
+    // Clean up held runs
+    resolveWorker1({ success: true, exitCode: 0, output: "done" });
+    await tick();
+    resolveWorker2({ success: true, exitCode: 0, output: "done" });
+    await tick();
+  });
+
+  it("pins arrival-time race semantics: arrival while running vs run ends before arrival", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveRun: (result: Partial<RunResult>) => void = () => {};
+    let jevEvaluations = 0;
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: async () => {
+          jevEvaluations++;
+          return { interruptProbability: 0.75 };
+        },
+      },
+    });
+
+    let holdRun = true;
+    const provider = new FakeProvider(() => {
+      if (!holdRun) {
+        return { success: true, exitCode: 0, output: "done" };
+      }
+      return new Promise<Partial<RunResult>>((resolve) => {
+        resolveRun = resolve;
+      });
+    });
+
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Start a run
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Race 1: Responsive message arrives while worker is running.
+    // Even if the run finishes shortly afterward, the arrival happened while running.
+    mesh.sendHumanMessage(worker, "arrival during run", "session-1");
+    // Release the run and allow any follow-up to finish immediately so worker becomes idle
+    holdRun = false;
+    resolveRun({ success: true, exitCode: 0, output: "done" });
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV was evaluated because at arrival time it was running
+    expect(jevEvaluations).toBe(1);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(1);
+
+    // Race 2: Run has completely ended; actor is now idle.
+    // Subsequent responsive arrival must NOT trigger JEV.
+    mesh.sendHumanMessage(worker, "arrival after run ended", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV evaluation count must remain 1
+    expect(jevEvaluations).toBe(1);
+  });
+
+  it("links evaluationId across shadow event payload and classifier decision", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let capturedEvaluationId: string | undefined;
+
+    const client: JevDecisionClient = {
+      decide: async (request) => {
+        capturedEvaluationId = request.evaluationId;
+        return { interruptProbability: 0.88 };
+      },
+    };
+
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client,
+    });
+
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Start background run
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Deliver responsive message while running
+    mesh.sendHumanMessage(worker, "operator request", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadowEvents = events.filter((e) => e.kind === "responsive_interruption_shadow");
+    expect(shadowEvents).toHaveLength(1);
+
+    const parsedEvent = JSON.parse(shadowEvents[0].payload ?? "{}");
+    const evaluationId = parsedEvent.evaluationId;
+    expect(evaluationId).toBeDefined();
+    expect(capturedEvaluationId).toBe(evaluationId);
+    expect(parsedEvent.decision.evaluationId).toBe(evaluationId);
+    expect(parsedEvent.decision.outcome).toBe("interrupt");
+    expect(parsedEvent.decision.interruptProbability).toBe(0.88);
   });
 
   it("does not let ordinary traffic abort the run already working the operator's message", async () => {

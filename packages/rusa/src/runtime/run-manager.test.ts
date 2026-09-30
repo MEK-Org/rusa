@@ -434,6 +434,57 @@ describe("RunManager", () => {
       expect(arrivals).toEqual([[entry.id], [entry.id], [entry.id]]);
     });
 
+    it("reports target actor's running state accurately on responsive arrival", async () => {
+      const observations: { actorId: string; entryIds: string[]; isRunning: boolean }[] = [];
+      const h = setup({
+        onResponsiveArrived: (actorId, entries, _baseline, isRunning) => {
+          observations.push({ actorId, entryIds: entries.map((e) => e.id), isRunning });
+        },
+      });
+
+      // 1. Idle actor: isRunning should be false at arrival time
+      const a1 = live(h, "a1", { hold: true });
+      const e1 = append("a1", { type: "human.message", priority: "responsive" });
+      expect(a1.isRunning).toBe(false);
+      h.manager.dispatch("a1");
+      expect(observations).toHaveLength(1);
+      expect(observations[0]).toEqual({
+        actorId: "a1",
+        entryIds: [e1.id],
+        isRunning: false,
+      });
+
+      // Now a1 starts and is holding (running = true)
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(a1.isRunning).toBe(true);
+
+      // 2. Running actor: isRunning should be true at arrival time
+      const e2 = append("a1", { type: "human.message", priority: "responsive" });
+      h.manager.dispatch("a1");
+      expect(observations).toHaveLength(2);
+      expect(observations[1]).toEqual({
+        actorId: "a1",
+        entryIds: [e2.id],
+        isRunning: true,
+      });
+
+      // 3. Queued actor: isRunning should be false at arrival time
+      const a2 = live(h, "a2");
+      a2.queued = true;
+      expect(a2.isRunning).toBe(false);
+      expect(a2.isQueued).toBe(true);
+      const e3 = append("a2", { type: "human.message", priority: "responsive" });
+      h.manager.dispatch("a2");
+      expect(observations).toHaveLength(3);
+      expect(observations[2]).toEqual({
+        actorId: "a2",
+        entryIds: [e3.id],
+        isRunning: false,
+      });
+
+      await a1.finishRun();
+    });
+
     it("returns no durable work and no-ops dispatch when backed by an empty inbox repository", () => {
       const emptyInbox = new EmptyInboxRepository();
       const h = setup({ inbox: emptyInbox });
