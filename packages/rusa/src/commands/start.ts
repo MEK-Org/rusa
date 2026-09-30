@@ -226,6 +226,10 @@ import {
 } from "../observability/log-secrets.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
+import {
+  codexAuthBrokerConfigured,
+  configureCodexAuthBroker,
+} from "../providers/codex-auth-broker.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   acceptableModelPins,
@@ -981,6 +985,7 @@ async function composeStart(
     return;
   }
   const rootActor = config.rootActor;
+  configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
   if (!rootActor) {
     throw new Error("config loader returned no rootActor after validating root configuration");

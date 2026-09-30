@@ -30,6 +30,7 @@ import {
   antigravityStateDir,
   ensureAntigravityPrivateState,
 } from "./antigravity-paths.js";
+import { CODEX_REFRESH_URL_ENV } from "./codex-auth-broker.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -195,10 +196,10 @@ const SANDBOX_CODEX_SESSIONS_PATH = "/tmp/sessions";
 /**
  * CODEX_HOME for every process the actor's Codex CLI starts from its shell tool
  * (and everything those start in turn: test runners, fake CLIs, a nested codex).
- * The CLI itself keeps CODEX_HOME=/tmp, where the live host auth file is bound
- * writable; its children get this empty per-invocation tmpfs directory instead,
- * so a child that writes `$CODEX_HOME/auth.json` writes a throwaway file. See the
- * auth bind in {@link buildMeshActorBwrapArgs}.
+ * The CLI itself keeps CODEX_HOME=/tmp, where the run's auth file is bound; its
+ * children get this empty per-invocation tmpfs directory instead, so a child that
+ * writes `$CODEX_HOME/auth.json` writes a throwaway file. See the auth bind in
+ * {@link buildMeshActorBwrapArgs}.
  */
 export const SANDBOX_CODEX_SHELL_HOME = "/tmp/codex-shell-home";
 
@@ -208,6 +209,18 @@ export const SANDBOX_CODEX_SHELL_HOME = "/tmp/codex-shell-home";
  * `shell_environment_policy.set` to the environment of each command it runs.
  */
 export const SANDBOX_CODEX_SHELL_ENV_OVERRIDE = `shell_environment_policy.set.CODEX_HOME=${JSON.stringify(SANDBOX_CODEX_SHELL_HOME)}`;
+
+/**
+ * A brokered Codex login for one sandboxed run (#782): a private `auth.json`
+ * carrying a per-run capability instead of the canonical refresh token, and the
+ * host broker URL the CLI refreshes through. See codex-auth-broker.ts.
+ */
+export interface SandboxCodexAuth {
+  /** Host path of the run's private auth file (owned by the run's temp dir). */
+  authFile: string;
+  /** Broker refresh URL, handed to the CLI as `CODEX_REFRESH_TOKEN_URL_OVERRIDE`. */
+  refreshUrl: string;
+}
 
 /**
  * Per-actor host directory that persists a codex actor's session rollouts ACROSS
@@ -800,7 +813,8 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
     case "codex":
       // Codex CLI stores auth in ~/.codex/auth.json and config in ~/.codex/config.toml.
       // Inside the sandbox we set CODEX_HOME=/tmp and bind the per-run config plus the
-      // shared host auth file to /tmp, so no writable host state directory is required.
+      // run's auth file (brokered copy, or the shared host file with the broker off) to
+      // /tmp, so no writable host state directory is required.
       return [];
     case "copilot":
       return [getCopilotHomeConfigPath(), ...getCopilotXdgConfigPaths()];
@@ -826,6 +840,7 @@ function buildMeshActorBwrapArgs(o: {
   mcpConfigPath?: string;
   isE2eRoot?: boolean;
   understandingMount?: string;
+  codexAuth?: SandboxCodexAuth;
 }): ActorBwrapResult {
   const pnpmStore = realpathIfExists(resolvePnpmStorePath());
   mkdirSync(pnpmStore, { recursive: true });
@@ -984,25 +999,40 @@ function buildMeshActorBwrapArgs(o: {
   }
 
   if (o.authMode === "codex") {
-    // Every codex process must read and update the same live auth file. Refresh tokens
-    // rotate globally, so a per-run copy leaves the host with the consumed token when
-    // the copy is swept. Bind only auth.json writable: CODEX_HOME remains the sandbox's
-    // private /tmp, and config/session state stays isolated. Codex's file auth backend
-    // truncates and rewrites auth.json in place, so a file bind supports refresh without
-    // granting the worker write access to the rest of the host ~/.codex directory.
-    //
-    // The bind is for the Codex CLI's own refreshes only. Every process in this sandbox
-    // shares its mounts, so the CLI's children cannot be kept from the path, but they
-    // are kept from the pointer: the CLI hands its shell children
-    // CODEX_HOME=SANDBOX_CODEX_SHELL_HOME (an empty tmpfs dir created here) through
-    // SANDBOX_CODEX_SHELL_ENV_OVERRIDE. A test or fake CLI the actor runs that writes
-    // `$CODEX_HOME/auth.json` then writes a throwaway file, not the host credential;
-    // tools that ignore CODEX_HOME fall back to ~/.codex, which is read-only here.
-    const hostHome = getHostHomeDir();
-    const hostAuthPath = join(hostHome, ".codex", "auth.json");
-    if (existsSync(hostAuthPath)) {
-      args.push("--bind", hostAuthPath, "/tmp/auth.json");
+    if (o.codexAuth) {
+      // Brokered login (#782): nothing in the sandbox can read or write the
+      // canonical login. The host ~/.codex (visible through the root ro-bind,
+      // auth.json included) is shadowed by an empty read-only tmpfs at both its
+      // path and its real path. The CLI reads a private copy whose refresh token
+      // is a per-run capability and refreshes through the host broker, which
+      // answers with fresh access tokens and alone writes the canonical file. A
+      // child that reads or rewrites /tmp/auth.json gets, or spoils, only this
+      // run's capability.
+      const hostCodexDir = join(getHostHomeDir(), ".codex");
+      for (const dir of new Set([hostCodexDir, realpathIfExists(hostCodexDir)])) {
+        if (existsSync(dir)) args.push("--tmpfs", dir, "--remount-ro", dir);
+      }
+      args.push("--bind", o.codexAuth.authFile, "/tmp/auth.json");
+      args.push("--setenv", CODEX_REFRESH_URL_ENV, o.codexAuth.refreshUrl);
+    } else {
+      // Broker off (legacy): every codex process must read and update the same live
+      // auth file. Refresh tokens rotate globally, so a per-run copy leaves the host
+      // with the consumed token when the copy is swept. Bind only auth.json writable:
+      // CODEX_HOME remains the sandbox's private /tmp, and config/session state stays
+      // isolated. Codex's file auth backend truncates and rewrites auth.json in place,
+      // so a file bind supports refresh without granting the worker write access to
+      // the rest of the host ~/.codex directory.
+      const hostAuthPath = join(getHostHomeDir(), ".codex", "auth.json");
+      if (existsSync(hostAuthPath)) {
+        args.push("--bind", hostAuthPath, "/tmp/auth.json");
+      }
     }
+    // Either way the CLI's shell children get a different pointer: the CLI hands
+    // them CODEX_HOME=SANDBOX_CODEX_SHELL_HOME (an empty tmpfs dir created here)
+    // through SANDBOX_CODEX_SHELL_ENV_OVERRIDE, so a test or fake CLI the actor runs
+    // that writes `$CODEX_HOME/auth.json` writes a throwaway file. Every process in
+    // the sandbox shares its mounts, so this is defence in depth; only the brokered
+    // login keeps the canonical credential off the mounts too.
     args.push("--dir", SANDBOX_CODEX_SHELL_HOME);
 
     // Cross-wake session continuity : persist codex's session rollouts in a
@@ -1171,7 +1201,8 @@ export function buildActorBwrapArgs(
   authMode?: SandboxAuthMode,
   mcpConfigPath?: string,
   isE2eRoot?: boolean,
-  understandingMount?: string
+  understandingMount?: string,
+  codexAuth?: SandboxCodexAuth
 ): ActorBwrapResult {
   return buildMeshActorBwrapArgs({
     actorDir,
@@ -1179,6 +1210,7 @@ export function buildActorBwrapArgs(
     mcpConfigPath,
     isE2eRoot,
     understandingMount,
+    codexAuth,
   });
 }
 

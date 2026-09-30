@@ -7,6 +7,10 @@ import type { RusaConfig } from "../config/types.js";
 import { ModelScrapeRepository } from "../db/repositories/model-scrape-repository.js";
 import { createQuotaService } from "../mcp/quota-mcp.js";
 import { createLogger, type Logger } from "../observability/logger.js";
+import {
+  codexAuthBrokerConfigured,
+  configureCodexAuthBroker,
+} from "../providers/codex-auth-broker.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { providerThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
@@ -244,6 +248,8 @@ export async function runQuotaCoordinator(opts: RunQuotaCoordinatorOptions = {})
   const log = opts.logger ?? createLogger({ context: { component: "quota-coordinator" } });
   const mcHome = opts.home ?? resolveHome();
   const config = loadConfig(mcHome);
+  // The coordinator's quota probes refresh the same login as the daemons do.
+  configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const probeOff = opts.probeOff === true || process.env.RUSA_QUOTA_COORDINATOR_PROBE_OFF === "1";
 
   const socketPath = resolveQuotaCoordinatorSocketPath(config, opts.socketPath);

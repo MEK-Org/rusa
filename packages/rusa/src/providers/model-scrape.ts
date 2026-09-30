@@ -1,8 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RusaConfig } from "../config/types.js";
+import {
+  activeCodexAuthBroker,
+  CODEX_REFRESH_URL_ENV,
+  type CodexAuthLease,
+  seedBrokeredCodexHome,
+} from "./codex-auth-broker.js";
 import {
   getProviderModelCatalog,
   ingestCodexHostModels,
@@ -297,7 +303,9 @@ export async function scrapeAgyModels(opts?: {
  * Host-side PTY scrape of Codex's interactive `/model` panel.
  * Uses inline config override (-c) for actor project trust so codex operates on the
  * real host ~/.codex in-place — any OAuth token rotation naturally persists and
- * host auth is never revoked or deleted.
+ * host auth is never revoked or deleted. With the host-owned broker on (#782) it
+ * runs in a brokered copy of that home instead, so its refreshes go through the
+ * broker, and the models cache it rewrites is copied back.
  */
 export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
@@ -306,6 +314,23 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
 
   const tempHome = mkdtempSync(join(tmpdir(), "rusa-codex-model-"));
   const sock = join(tempHome, "model-tmux.sock");
+  // A broker fault rejects the probe (an unknown reading), never falls back to
+  // the shared writable login.
+  const broker = opts.configDir ? undefined : activeCodexAuthBroker();
+  const hostCodexDir = join(homedir(), ".codex");
+  let lease: CodexAuthLease | undefined;
+  let brokeredHome: string | undefined;
+  if (broker) {
+    try {
+      lease = await broker.lease(timeoutMs + 60_000);
+      brokeredHome = seedBrokeredCodexHome(hostCodexDir, lease);
+    } catch (err) {
+      lease?.revoke();
+      rmSync(tempHome, { recursive: true, force: true });
+      throw err;
+    }
+  }
+  const codexHome = opts.configDir ?? brokeredHome;
   const q = JSON.stringify;
   const trustArg = `-c projects.${q(opts.actorDir)}.trust_level="trusted"`;
   // The caller's timeout is the probe's declared lifetime, so it is also the
@@ -332,6 +357,11 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   };
   const cleanup = () => {
     killTmux();
+    lease?.revoke();
+    if (brokeredHome) {
+      keepRewrittenModelsCache(brokeredHome, hostCodexDir);
+      rmSync(brokeredHome, { recursive: true, force: true });
+    }
     try {
       rmSync(tempHome, { recursive: true, force: true });
     } catch {
@@ -352,7 +382,8 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
         env: {
           ...process.env,
           TERM: "xterm-256color",
-          ...(opts.configDir ? { CODEX_HOME: opts.configDir } : {}),
+          ...(codexHome ? { CODEX_HOME: codexHome } : {}),
+          ...(lease ? { [CODEX_REFRESH_URL_ENV]: lease.refreshUrl } : {}),
         },
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
@@ -410,6 +441,24 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
     });
   } finally {
     cleanup();
+  }
+}
+
+/**
+ * A brokered probe's home symlinks the host models cache; if Codex replaced the
+ * link with a fresh file instead of writing through it, the fresh cache would
+ * vanish with the throwaway home. Put it back so the next refresh can take the
+ * cheap path. Best effort.
+ */
+function keepRewrittenModelsCache(brokeredHome: string, hostCodexDir: string): void {
+  const rewritten = join(brokeredHome, "models_cache.json");
+  try {
+    if (!lstatSync(rewritten).isFile()) return;
+    const staged = join(hostCodexDir, `.models_cache.json.rusa-${process.pid}.tmp`);
+    copyFileSync(rewritten, staged);
+    renameSync(staged, join(hostCodexDir, "models_cache.json"));
+  } catch {
+    /* absent, or written through the symlink already */
   }
 }
 

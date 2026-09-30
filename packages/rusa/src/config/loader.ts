@@ -291,6 +291,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
           "Remove the key."
       );
     }
+    if (providerConfig && "authBroker" in providerConfig) {
+      if (providerName !== "codex") {
+        throw new Error(
+          `config.yaml: providers.${providerName}.authBroker is only supported for codex`
+        );
+      }
+      if (typeof providerConfig.authBroker !== "boolean") {
+        throw new Error("config.yaml: providers.codex.authBroker must be true or false");
+      }
+    }
   }
   if (
     parsed.mesh &&
