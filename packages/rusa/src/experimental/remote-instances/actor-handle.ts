@@ -1005,6 +1005,14 @@ export class ActorHandle implements MeshActor {
         break;
       }
       case "runStart":
+        // Older followers do not emit `providerAttempt`, but their run-start
+        // tuple is still the leader-admitted initial attempt. Keep that useful
+        // attribution; current followers refine it for every actual fallback.
+        this.opts.actorOptions?.onProviderAttempt?.({
+          providerName: message.selected.provider,
+          model: message.selected.model,
+          effort: message.selected.effort,
+        });
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
@@ -1039,6 +1047,13 @@ export class ActorHandle implements MeshActor {
           injectRecord: message.injectRecord,
           selected: message.selected,
         });
+      case "providerAttempt":
+        this.opts.actorOptions?.onProviderAttempt?.({
+          providerName: message.attempt.provider,
+          model: message.attempt.model,
+          effort: message.attempt.effort,
+        });
+        break;
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;

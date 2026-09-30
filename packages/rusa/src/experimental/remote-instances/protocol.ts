@@ -156,6 +156,8 @@ export type ActorEvent =
       selected: RawProviderModelConfig;
       runId?: string;
     }
+  /** An actual follower-side provider invocation, including a pool fallback. */
+  | { type: "providerAttempt"; attempt: RawProviderModelConfig }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "coalesced"; count: number; ageMs: number }

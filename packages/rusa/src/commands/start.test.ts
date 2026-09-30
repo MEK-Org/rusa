@@ -18,7 +18,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type ActorOptions } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
-import { ActorMesh, RetirementBlockedError } from "../actor/actor-mesh.js";
+import {
+  type ActorFactoryContext,
+  ActorMesh,
+  RetirementBlockedError,
+} from "../actor/actor-mesh.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { PoolExhaustedError } from "../actor/concurrency-limiter.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
@@ -35,7 +39,9 @@ import { handleQuotaApiRequest, type QuotaHistoryDto } from "../dashboard/quota-
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
+import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
+import { RemoteInstance } from "../experimental/remote-instances/remote-instance.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { McpHttpServer } from "../mcp/http-server.js";
@@ -7546,6 +7552,110 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(chatClient.sent[1]?.text).toBe(
       `from worker\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
     );
+  });
+
+  it("uses remote provider attempts for Chat signatures and clears them at the terminal event", async () => {
+    const chatClient = new FakeChatClient();
+    let mesh: ActorMesh | undefined;
+    let remote: RemoteInstance | undefined;
+    let remoteOptions: ActorOptions | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          chatClient,
+          createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
+            remoteOptions = options;
+            remote ??= new RemoteInstance("signature-follower", process.platform, process.pid);
+            return new ActorHandle({
+              host: remote.createHost(context.record.id),
+              bootstrap: {
+                id: context.record.id,
+                cwd: options.cwd,
+                modelConfig: [...options.modelConfig],
+              },
+              context,
+              actorOptions: options,
+              snapshot: () => {
+                const record = context.getRecord();
+                if (!record) throw new Error("remote signature worker record missing");
+                return { record, prompt: "remote signature fixture" };
+              },
+              saveSession: () => {},
+              onFailure: () => {},
+            });
+          },
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("remote signature fixture mesh did not start");
+
+    const workerId = mesh.spawn({
+      charter: "remote signature fixture",
+      parentId: "root",
+      executionTarget: "signature-follower",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    mesh.grantCapability(workerId, "chat-write:spaces/A", "root");
+    if (!remote || !remoteOptions) throw new Error("remote signature worker did not start");
+    const chatUrl = remoteOptions.mcpServers.find((server) => server.name === "chat-write")?.url;
+    if (!chatUrl) throw new Error("remote chat-write server missing");
+    const callChat = async (text: string) => {
+      const client = new Client({ name: "remote-signature-test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+      try {
+        return await client.callTool({
+          name: "send_message",
+          arguments: { spaceName: "spaces/A", text },
+        });
+      } finally {
+        await client.close();
+      }
+    };
+
+    const runId = "remote-signature-run";
+    remote.receive({ actorId: workerId, message: { type: "ready", pid: 4242 } });
+    remote.receive({
+      actorId: workerId,
+      message: {
+        type: "runStart",
+        responsive: false,
+        runId,
+        selected: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      },
+    });
+    await vi.waitFor(() => expect(getRepositories().actorRuns.getById(runId)).not.toBeNull());
+    expect((await callChat("initial remote attempt")).isError).toBeFalsy();
+    expect(chatClient.sent[0]?.text).toBe(
+      `initial remote attempt\n\n_${generateHandle(workerId)} (Gemini 3.7 Flash, high)_`
+    );
+
+    remote.receive({
+      actorId: workerId,
+      message: {
+        type: "providerAttempt",
+        attempt: { provider: "antigravity", model: "Gemini 3.7 Pro", effort: "low" },
+      },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect((await callChat("fallback remote attempt")).isError).toBeFalsy();
+    expect(chatClient.sent[1]?.text).toBe(
+      `fallback remote attempt\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
+    );
+
+    remote.receive({
+      actorId: workerId,
+      message: { type: "result", result: { success: true, output: "done", exitCode: 0 } },
+    });
+    await vi.waitFor(() =>
+      expect(getRepositories().actorRuns.getById(runId)?.outcome).toBe("completed")
+    );
+    expect((await callChat("after remote terminal")).isError).toBeFalsy();
+    expect(chatClient.sent[2]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
   });
 
   it("records token usage linked to actor_runs.id through the real worker lifecycle wiring", async () => {

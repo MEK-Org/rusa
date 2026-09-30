@@ -55,6 +55,18 @@ export interface PromptBuild {
   injectRecord?: InjectRecord;
 }
 
+/**
+ * The normalized identity of one provider invocation.  This deliberately
+ * contains only the values consumers such as write attribution need, so a
+ * remote runtime can forward its actual attempt without pretending to own a
+ * full provider implementation.
+ */
+export interface ProviderAttempt {
+  providerName: string;
+  model?: string;
+  effort?: string;
+}
+
 export interface ActorOptions {
   /** Stable actor id (the thread handle). */
   id: string;
@@ -173,7 +185,7 @@ export interface ActorOptions {
    * lifecycle accounting. Its model and effort are the instantiated values, not
    * the pre-normalization request.
    */
-  onProviderAttempt?: (provider: CodingProvider) => void;
+  onProviderAttempt?: (provider: ProviderAttempt) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked.

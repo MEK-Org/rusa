@@ -38,6 +38,7 @@ describe("remote actor run accounting", () => {
   let gateCalls: number;
   let snapshotCalls: number;
   let context: ActorFactoryContext;
+  let providerAttempts: Array<{ providerName: string; model?: string; effort?: string }>;
 
   const openRuns = () =>
     db
@@ -72,6 +73,7 @@ describe("remote actor run accounting", () => {
     admits = [];
     gateCalls = 0;
     snapshotCalls = 0;
+    providerAttempts = [];
     const accounting = createRunAccounting(() => runs);
     remote = new RemoteInstance("test-follower", process.platform, process.pid);
 
@@ -113,6 +115,8 @@ describe("remote actor run accounting", () => {
 
     const actorOptions = {
       modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
+      onProviderAttempt: (attempt: { providerName: string; model?: string; effort?: string }) =>
+        providerAttempts.push(attempt),
       log: (chunk: string) => {
         if (chunk.includes("run accounting failed")) accountingErrors.push(chunk);
       },
@@ -147,6 +151,25 @@ describe("remote actor run accounting", () => {
     expect(failures).toHaveLength(1);
     expect(allRuns()).toEqual([]);
     expect(accountingErrors).toEqual([]);
+  });
+
+  it("forwards the admitted attempt and a follower fallback for leader-side attribution", async () => {
+    bootActor();
+    followerSends({
+      type: "runStart",
+      responsive: false,
+      selected: { provider: "codex", model: "gpt-5.5", effort: "high" },
+    });
+    followerSends({
+      type: "providerAttempt",
+      attempt: { provider: "claude", model: "claude-sonnet-5", effort: "low" },
+    } as unknown as Parameters<RemoteInstance["receive"]>[0]["message"]);
+    await Promise.resolve();
+
+    expect(providerAttempts).toEqual([
+      { providerName: "codex", model: "gpt-5.5", effort: "high" },
+      { providerName: "claude", model: "claude-sonnet-5", effort: "low" },
+    ]);
   });
 
   it("defers ordinary work at remote final admission without reserving a lane", async () => {
