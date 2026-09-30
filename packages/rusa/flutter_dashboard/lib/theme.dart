@@ -39,6 +39,10 @@ abstract final class MeshColors {
   /// The quota ring's no-recent-reading triangle (#759): a true yellow, kept
   /// apart from the amber [statusIdle] a ring on pace is drawn in.
   static const quotaStaleWarning = Color(0xFFFACC15);
+
+  /// The matching tooltip warning: a darker caramel so the text remains
+  /// legible against the tooltip surface.
+  static const quotaTooltipStaleWarning = Color(0xFFC79A3C);
 }
 
 /// Per-kind chip colors, lifted verbatim from the mockup's `.inline-kind-chip`

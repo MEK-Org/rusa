@@ -506,7 +506,7 @@ void main() {
       expect(tooltip.toPlainText(), isNot(contains('configured maximum')));
     });
 
-    testWidgets('renders an estimate note when a window is estimated (#759)', (
+    testWidgets('marks an estimated window on its reading line (#759)', (
       tester,
     ) async {
       final lastRead = now.subtract(const Duration(minutes: 45));
@@ -533,13 +533,13 @@ void main() {
       await tester.pumpWidget(MaterialApp(home: Scaffold(body: tooltip)));
 
       expect(
-        find.textContaining('estimate: extended from the last real reading'),
+        find.textContaining(
+          'Weekly: +17 (60% / 43%) - Resets in 3 days (est.)',
+        ),
         findsOneWidget,
       );
-      expect(
-        tooltip.toPlainText(),
-        contains('estimate: extended from the last real reading'),
-      );
+      expect(tooltip.toPlainText(), contains('(est.)'));
+      expect(tooltip.toPlainText(), isNot(contains('estimate:')));
     });
 
     testWidgets('renders a 2h stale warning when reading is older than 2 hours (#759)', (
@@ -572,6 +572,11 @@ void main() {
         find.text('Warning: no new reading for 3h'),
         findsOneWidget,
       );
+      final warning = tester.widget<Text>(
+        find.text('Warning: no new reading for 3h'),
+      );
+      expect(warning.style?.fontWeight, FontWeight.w700);
+      expect(warning.style?.color, const Color(0xFFC79A3C));
       expect(
         tooltip.toPlainText(),
         contains('Warning: no new reading for 3h'),
@@ -609,4 +614,3 @@ void main() {
     });
   });
 }
-

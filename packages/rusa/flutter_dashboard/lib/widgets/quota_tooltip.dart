@@ -257,14 +257,10 @@ class QuotaTooltip extends StatelessWidget {
         row = '$label: $quotaRemaining% remaining';
       }
 
-      rows.add(row);
       if (window.estimated) {
-        final scraped = DateTime.tryParse(window.scrapedAt ?? '');
-        final at = scraped == null
-            ? ''
-            : ' at ${DateFormat('HH:mm').format(scraped.toLocal())}';
-        rows.add('estimate: extended from the last real reading$at');
+        row = '$row (est.)';
       }
+      rows.add(row);
     }
     return rows;
   }
@@ -380,7 +376,8 @@ class QuotaTooltip extends StatelessWidget {
               warningText,
               style: const TextStyle(
                 fontSize: 12,
-                color: MeshColors.quotaStaleWarning,
+                fontWeight: FontWeight.w700,
+                color: MeshColors.quotaTooltipStaleWarning,
               ),
             ),
             const SizedBox(height: 2),

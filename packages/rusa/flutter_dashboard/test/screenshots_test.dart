@@ -527,10 +527,7 @@ void main() {
             .ensureTooltipVisible();
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 250));
-        expect(
-          find.textContaining('extended from the last real reading'),
-          findsOneWidget,
-        );
+        expect(find.textContaining('(est.)'), findsOneWidget);
         await captureBoundary(
           key,
           '$_outDir/header_quota_rollover_tooltip.png',

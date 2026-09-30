@@ -2,7 +2,6 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:intl/intl.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
@@ -461,7 +460,6 @@ void main() {
     testWidgets('renders the estimate and says it is one', (tester) async {
       await tester.runAsync(() async {
         final now = DateTime.now();
-        final lastReading = now.subtract(const Duration(minutes: 40));
         final store = await pumpFable(
           tester,
           _fableWeekly(
@@ -474,14 +472,9 @@ void main() {
 
         expect(_outerRingValue(tester, 'Fable'), closeTo(0.625, 1e-9));
         final tip = _tooltipOf(tester, 'Fable');
-        expect(
-          tip,
-          contains(
-            'estimate: extended from the last real reading at '
-            '${DateFormat('HH:mm').format(lastReading)}',
-          ),
-        );
-        expect(_tooltipOf(tester, 'Claude'), isNot(contains('estimate')));
+        expect(tip, contains('(est.)'));
+        expect(tip, isNot(contains('estimate:')));
+        expect(_tooltipOf(tester, 'Claude'), isNot(contains('(est.)')));
         expect(_staleWarning('Fable'), findsNothing);
         await store.dispose();
       });
@@ -510,7 +503,7 @@ void main() {
         expect(_outerRingValue(tester, 'Fable'), closeTo(0.95, 1e-9));
         final tip = _tooltipOf(tester, 'Fable');
         expect(tip, contains('Weekly: 95% remaining'));
-        expect(tip, contains('estimate: extended from the last real reading'));
+        expect(tip, contains('Weekly: 95% remaining (est.)'));
         await store.dispose();
       });
     });
