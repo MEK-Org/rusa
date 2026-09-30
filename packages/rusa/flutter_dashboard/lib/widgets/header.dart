@@ -877,6 +877,10 @@ class _ProviderQuotaRing extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
+    final staleFor = staleReadingAge([
+      weeklyWindow,
+      if (sessionWindow != null) sessionWindow,
+    ], now);
     final name = label ?? _providerLabel(provider.provider);
     final windows = <QuotaWindowDto>[
       weeklyWindow ??
@@ -909,6 +913,7 @@ class _ProviderQuotaRing extends StatelessWidget {
       throttle: showThrottle ? provider.throttle : null,
       scrapedAt: scrapedAt,
       showThrottle: showThrottle,
+      staleFor: staleFor,
       now: now,
     );
     final tooltip = tooltipWidget.toPlainText(now);
@@ -950,6 +955,17 @@ class _ProviderQuotaRing extends StatelessWidget {
                         backgroundColor: MeshColors.border,
                       ),
                     ),
+                  if (staleFor != null)
+                    const Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: Icon(
+                        Icons.warning_rounded,
+                        key: ValueKey('quota-ring-stale-warning'),
+                        size: 10,
+                        color: MeshColors.quotaStaleWarning,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -975,12 +991,13 @@ class _ProviderQuotaRing extends StatelessWidget {
 }
 
 /// The ring's fill fraction (quota remaining), or 0 (empty, grey) when the
-/// window is missing, past its reset, or its reading isn't known yet.
+/// window is missing, past its reset, or its reading isn't known yet. The
+/// server estimates the window after a reset (#759), and that estimate carries
+/// no reset time, so a window still past its reset here is one it could not
+/// estimate.
 double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
-  final used = window?.usedPercent;
-  if (window == null || used == null || !window.isKnown) return 0.0;
-  if (now != null && window.isPastReset(now)) return 0.0;
-  return (100 - used.clamp(0, 100)) / 100;
+  if (!ringShowsValue(window, now)) return 0.0;
+  return (100 - window!.usedPercent!.clamp(0, 100)) / 100;
 }
 
 String _providerLabel(String provider) => switch (provider) {

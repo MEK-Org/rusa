@@ -531,13 +531,19 @@ export class QuotaCoordinatorService {
       }
 
       const since = url.searchParams.get("since") ?? new Date(0).toISOString();
-      const records = this.options.store.listHistorySince(provider, since);
+      // One read transaction, so a parse that lands between the two queries
+      // cannot show a scrape whose window rows the same answer lacks (#759).
+      const { records, scrapes } = this.options.store.db.transaction(() => ({
+        records: this.options.store.listHistorySince(provider, since),
+        scrapes: this.options.store.listScrapeOutcomesSince(provider, since),
+      }))();
 
       this.sendJson(res, 200, {
         service: serviceInfo,
         provider,
         since,
         records,
+        scrapes,
       });
       return;
     }

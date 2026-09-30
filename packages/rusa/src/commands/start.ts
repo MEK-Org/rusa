@@ -271,6 +271,7 @@ import {
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
+import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
@@ -474,14 +475,17 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
 /**
  * Every producer that raises host alarms into `system:events`: the disk sensor,
  * the chat subscription keeper's lapse alert (#578) whenever chat is
- * configured, and the model lane retirement alert (#588) whenever the quota
- * throttle reads a coordinator. Root's `system:events` ownership is derived from this same call.
+ * configured, the model lane retirement alert (#588) whenever the quota
+ * throttle reads a coordinator, and the missed quota window alert (#759)
+ * whenever a coordinator is configured at all, since the history refresh that
+ * feeds it runs with or without throttling. Root's `system:events` ownership is
+ * derived from this same call.
  */
 export function hostAlarmProducerActive(config: RusaConfig): boolean {
   return (
     diskAlertActive(config) ||
     config.chat !== undefined ||
-    (config.quota?.throttle?.enabled === true && config.quota.coordinator?.socketPath !== undefined)
+    config.quota?.coordinator?.socketPath !== undefined
   );
 }
 
@@ -1880,15 +1884,30 @@ async function composeStart(
     }
   };
 
+  // A window one scrape carried and the next did not is raised to this
+  // instance's root once per gap (#759): the dashboard keeps drawing it from an
+  // estimate, so this is what says the reading is missing. Instances sharing a
+  // coordinator each tell their own root. The alarm is bound once the mesh exists.
+  const missedQuotaWindows = new MissedQuotaWindowDetector();
+  let raiseQuotaWindowMissedAlarm: ((missed: MissedQuotaWindow) => void) | null = null;
   let historyRefreshInFlight = false;
   const refreshQuotaHistory = async (): Promise<void> => {
     if (!quotaCoordinatorClient || historyRefreshInFlight) return;
     historyRefreshInFlight = true;
     try {
       const sinceIso = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
-      await Promise.allSettled(
+      const reads = await Promise.allSettled(
         quotaProviders.map((provider) => quotaCoordinatorClient.getHistory(provider, sinceIso))
       );
+      reads.forEach((read, index) => {
+        if (read.status !== "fulfilled" || read.value === null) return;
+        const provider = quotaProviders[index];
+        const scrapes = quotaCoordinatorClient.getCachedScrapeOutcomes(provider);
+        for (const missed of missedQuotaWindows.observe(provider, read.value, scrapes)) {
+          log.info("quota_window_missed", { ...missed });
+          raiseQuotaWindowMissedAlarm?.(missed);
+        }
+      });
     } catch (err) {
       log.warn("quota_history_refresh_failed", {
         err: err instanceof Error ? err.message : String(err),
@@ -4490,6 +4509,41 @@ async function composeStart(
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
   }
+
+  raiseQuotaWindowMissedAlarm = (missed) => {
+    const scrape = missed.scrapeFailed
+      ? "quota scrape failed to parse, so it no longer shows"
+      : "quota scrape no longer shows";
+    const message =
+      `Quota window missed: the latest ${missed.provider} ${scrape} ` +
+      `"${missed.label}", last read at ${missed.lastReadingAt}. The dashboard ring now shows ` +
+      "an estimate from that reading; check the scrapes to see why the window dropped out.";
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_window_missed", ...missed, message },
+          // Normal, not responsive: the ring keeps its estimate, a single
+          // missed panel often returns on the next scrape, and nothing here
+          // needs root to drop what it is doing.
+          priority: "normal",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_window_missed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_window_missed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: missed.provider,
+          lane: missed.lane,
+        });
+      }
+    });
+  };
 
   raiseModelLaneRetiredAlarm = (provider, model) => {
     const message =

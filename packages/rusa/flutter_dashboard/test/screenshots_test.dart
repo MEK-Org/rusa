@@ -410,6 +410,133 @@ void main() {
   );
 
   testWidgets(
+    'renders a missed Fable reading before and after dead reckoning (#759)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now().toUtc();
+        // Before: the scrape missed the Fable panel, so the API carried no
+        // Fable window and its ring read unknown.
+        // After: the API dead-reckons it from the last reading, three hours
+        // old here, so the ring also carries the warning triangle.
+        final estimated = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Current week (Fable)',
+          usedPercent: 81,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+          resetAtIso: now.add(const Duration(days: 2)).toIso8601String(),
+          scrapedAt: now
+              .subtract(const Duration(hours: 3, minutes: 10))
+              .toIso8601String(),
+          modelIds: const ['claude-fable-5-1'],
+          estimated: true,
+        );
+        await tester.binding.setSurfaceSize(const Size(1200, 260));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        Future<void> pumpHeader(QuotaSnapshotDto quota) async {
+          final api = FakeApi()
+            ..threadsResult = _seedThreads()
+            ..quotaResult = quota;
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          await store.refreshQuota();
+          addTearDown(store.dispose);
+          await tester.pumpWidget(
+            RepaintBoundary(
+              key: key,
+              child: MaterialApp(
+                debugShowCheckedModeBanner: false,
+                theme: buildMeshTheme(),
+                home: Scaffold(
+                  backgroundColor: MeshColors.bgPrimary,
+                  body: Align(
+                    alignment: Alignment.topCenter,
+                    child: MeshHeader(
+                      store: store,
+                      selected: DashboardView.overview,
+                      onSelect: (_) {},
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 250));
+        }
+
+        await pumpHeader(_seedFableQuota(fableWindows: const []));
+        await captureBoundary(key, '$_outDir/header_quota_missed_before.png');
+
+        await pumpHeader(_seedFableQuota(fableWindows: [estimated]));
+        expect(
+          find.byKey(const ValueKey('quota-ring-stale-warning')),
+          findsOneWidget,
+        );
+        await captureBoundary(key, '$_outDir/header_quota_missed_after.png');
+
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Fable'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('Last Read: 3 hours ago'), findsOneWidget);
+        await captureBoundary(
+          key,
+          '$_outDir/header_quota_missed_after_tooltip.png',
+        );
+
+        // Rollover: the window reset 40 minutes ago with no reading of the new
+        // one yet, so the API estimates it approximately full, with no reset
+        // time, from the last reading of the old window 70 minutes ago.
+        final rolledOver = QuotaWindowDto(
+          id: 'weekly',
+          label: 'Current week (Fable)',
+          usedPercent: 3,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+          scrapedAt: now
+              .subtract(const Duration(minutes: 70))
+              .toIso8601String(),
+          modelIds: const ['claude-fable-5-1'],
+          estimated: true,
+        );
+        Tooltip.dismissAllToolTips();
+        await pumpHeader(_seedFableQuota(fableWindows: [rolledOver]));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(
+          find.byKey(const ValueKey('quota-ring-stale-warning')),
+          findsNothing,
+        );
+        await captureBoundary(key, '$_outDir/header_quota_rollover.png');
+        tester
+            .state<TooltipState>(
+              find.ancestor(
+                of: find.text('Fable'),
+                matching: find.byType(Tooltip),
+              ),
+            )
+            .ensureTooltipVisible();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.textContaining('(est.)'), findsOneWidget);
+        await captureBoundary(
+          key,
+          '$_outDir/header_quota_rollover_tooltip.png',
+        );
+      });
+    },
+  );
+
+  testWidgets(
     'renders the header quota Claude tooltip with operator layout (#760)',
     (tester) async {
       await tester.runAsync(() async {
@@ -701,7 +828,7 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
 /// Claude with a Fable weekly allocation beside its provider-wide week (#752),
 /// plus Codex. The Fable window carries the provider's reset and scrape
 /// instants, as the server sends them, relative to the capture time.
-QuotaSnapshotDto _seedFableQuota() {
+QuotaSnapshotDto _seedFableQuota({List<QuotaWindowDto>? fableWindows}) {
   final base = _seedQuota();
   final now = DateTime.now().toUtc();
   final claude = base.providers.first;
@@ -716,7 +843,7 @@ QuotaSnapshotDto _seedFableQuota() {
         message: null,
         windows: claude.windows,
         scrapedAt: now.subtract(const Duration(minutes: 30)).toIso8601String(),
-        modelWindows: [
+        modelWindows: fableWindows ?? [
           QuotaWindowDto(
             id: 'weekly',
             label: 'Current week (Fable)',

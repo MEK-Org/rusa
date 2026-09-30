@@ -111,6 +111,14 @@ describe("quota model lane retirement alarm (#588)", () => {
     expect(configuredRootEventSources(config)).toContain("system:events");
   });
 
+  it("keeps system:events covered for the missed-window alarm with a coordinator and no throttle (#759)", () => {
+    const config = withQuota({
+      coordinator: { socketPath: "/tmp/coordinator.sock" },
+    } as RusaConfig["quota"]);
+    expect(hostAlarmProducerActive(config)).toBe(true);
+    expect(configuredRootEventSources(config)).toContain("system:events");
+  });
+
   it("adds no system:events coverage for a throttle with no coordinator to read", () => {
     const config = withQuota({ throttle: { enabled: true } } as RusaConfig["quota"]);
     expect(hostAlarmProducerActive(config)).toBe(false);

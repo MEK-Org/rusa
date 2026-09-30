@@ -9,8 +9,10 @@ import { isProviderScopedWindow } from "./window-scope.js";
 export const COORDINATOR_PROTOCOL_MAJOR = 1;
 // Minor 2 adds model identities to model-scoped history rows and model-scoped
 // throttle lanes (#588). Both are additive: an older reader ignores them and
-// keeps its provider-only behavior.
-export const COORDINATOR_PROTOCOL_MINOR = 2;
+// keeps its provider-only behavior. Minor 3 adds each scrape's outcome to
+// history (#759), so a reader can see a scrape that left no window row; an
+// older reader ignores it, and a newer reader of a minor-2 service sees rows only.
+export const COORDINATOR_PROTOCOL_MINOR = 3;
 /** Routine provider probe cache TTL: one scrape per provider per ~30 minutes (#690). */
 export const QUOTA_PROBE_TTL_MS = 30 * 60 * 1000;
 export const DEFAULT_HARD_STALE_AFTER_MS = 3_600_000; // 1 hour
@@ -157,11 +159,33 @@ export interface PublishedHistoryRecord {
   intervalSeconds: number | null;
 }
 
+/**
+ * One finished scrape (#759): its stamp, which every window row it wrote
+ * shares, and whether its output parsed. A scrape that parsed to no window, or
+ * failed to parse, has no row in `records`; this is how a reader sees it.
+ */
+export interface PublishedScrapeOutcome {
+  observedAt: string;
+  outcome: "parsed" | "failed";
+}
+
 export interface PublishedHistoryResponse {
   service: QuotaCoordinatorServiceInfo;
   provider: string;
   since: string;
   records: PublishedHistoryRecord[];
+  /** Minor 3 and later. */
+  scrapes?: PublishedScrapeOutcome[];
+}
+
+export function isValidScrapeOutcome(scrape: unknown): scrape is PublishedScrapeOutcome {
+  if (typeof scrape !== "object" || scrape === null) return false;
+  const s = scrape as Record<string, unknown>;
+  return (
+    typeof s.observedAt === "string" &&
+    Number.isFinite(Date.parse(s.observedAt)) &&
+    (s.outcome === "parsed" || s.outcome === "failed")
+  );
 }
 
 export function isValidHistoryRecord(record: unknown): record is PublishedHistoryRecord {

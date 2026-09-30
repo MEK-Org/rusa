@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
@@ -1125,6 +1126,50 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.records[0].percentLeft).toBe(85);
     // records is emitted once, not duplicated under history
     expect(res.json.history).toBeUndefined();
+  });
+
+  it("GET /v1/history lists each finished scrape's outcome, including scrapes that wrote no row (#759)", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+    await service.start();
+
+    const nowMs = Date.now();
+    const stamp = (secondsAgo: number) => new Date(nowMs - secondsAgo * 1000).toISOString();
+    const snapshot = (scrapedAt: string, percentLeft?: number): ProviderQuotaSnapshot => ({
+      provider: "claude",
+      status: "available",
+      scrapedAt,
+      limits: percentLeft === undefined ? [] : [{ kind: "session", label: "Session", percentLeft }],
+    });
+    const withWindow = store.recordRaw({
+      provider: "claude",
+      scrapedAt: stamp(40),
+      rawOutput: "a",
+    });
+    store.recordParsed(withWindow, snapshot(stamp(40), 85), snapshot(stamp(40), 85));
+    const noWindow = store.recordRaw({ provider: "claude", scrapedAt: stamp(30), rawOutput: "b" });
+    store.recordParsed(noWindow, snapshot(stamp(30)), snapshot(stamp(30)));
+    const unparsed = store.recordRaw({ provider: "claude", scrapedAt: stamp(20), rawOutput: "c" });
+    store.recordParseError(unparsed, new Error("truncated panel"));
+    // Still being parsed: not a finished scrape yet.
+    store.recordRaw({ provider: "claude", scrapedAt: stamp(10), rawOutput: "d" });
+
+    const res = await makeRequest(
+      socketPath,
+      `/v1/history?provider=claude&since=${encodeURIComponent(stamp(60))}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.json.service.protocolMinor).toBe(COORDINATOR_PROTOCOL_MINOR);
+    expect(res.json.records.map((r: { observedAt: string }) => r.observedAt)).toEqual([stamp(40)]);
+    // Stamps and outcomes only: no raw output or parse error leaves the store.
+    expect(res.json.scrapes).toEqual([
+      { observedAt: stamp(40), outcome: "parsed" },
+      { observedAt: stamp(30), outcome: "parsed" },
+      { observedAt: stamp(20), outcome: "failed" },
+    ]);
   });
 
   // §5.5: GET /v1/healthz and GET /v1/readyz
