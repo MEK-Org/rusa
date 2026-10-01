@@ -74,8 +74,10 @@ USER node
 # Copy manifests to cache dependency resolution step
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages/rusa/package.json ./packages/rusa/
-COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-core/package.json ./third_party/glass_goals_devkit/packages/goals-core/
-COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-types/package.json ./third_party/glass_goals_devkit/packages/goals-types/
+# The root prepare script runs during install and compiles the devkit packages,
+# so their sources and tsconfig must be present here, not just package.json.
+COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-core ./third_party/glass_goals_devkit/packages/goals-core
+COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-types ./third_party/glass_goals_devkit/packages/goals-types
 
 # Install deps fresh in the image to rebuild better-sqlite3 against Node 24 ABI
 RUN pnpm install --frozen-lockfile

@@ -139,9 +139,47 @@ describe("quickstart command", () => {
 
     expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
       ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [],
     });
-    expect(spawnSyncMock).not.toHaveBeenCalled();
+    // Only the read-only `docker port` lookups run before the doctor.
+    for (const [cmd, args] of spawnSyncMock.mock.calls as [string, string[]][]) {
+      expect(cmd).toBe("docker");
+      expect(args[0]).toBe("port");
+    }
     expect(process.exitCode).toBe(1);
+  });
+
+  it("lets a rerun replace its own running container instead of failing the port check", async () => {
+    spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "docker" && args[0] === "port" && args[1] === "rusa-quickstart") {
+        return {
+          status: 0,
+          stdout:
+            "8080/tcp -> 127.0.0.1:8080\n8085/tcp -> 127.0.0.1:8085\n9742/tcp -> 127.0.0.1:9742\n",
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "port") {
+        return { status: 1, stdout: "", stderr: "Error: No such container" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    await runQuickstart({ skipBuild: true });
+
+    expect(doctorMocks.runQuickstartDoctor).toHaveBeenCalledWith({
+      ports: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+      replaceablePorts: [QUICKSTART_DASHBOARD_PORT, QUICKSTART_GIT_BRIDGE_PORT],
+    });
+    const dockerArgs = spawnSyncMock.mock.calls
+      .filter((call: unknown[]) => call[0] === "docker")
+      .map((call: unknown[]) => (call[1] as string[]).join(" "));
+    const removeApp = dockerArgs.indexOf("rm -f rusa-quickstart");
+    const startApp = dockerArgs.findIndex(
+      (args) => args.startsWith("run ") && args.includes("--name rusa-quickstart ")
+    );
+    expect(removeApp).toBeGreaterThan(-1);
+    expect(startApp).toBeGreaterThan(removeApp);
   });
 
   it("writes quickstart config without the removed targets field", async () => {
@@ -832,7 +870,10 @@ describe("quickstart command", () => {
             localRepo: "/does/not/exist/at/all",
           })
         ).rejects.toThrow("Path does not exist");
-        expect(spawnSyncMock).not.toHaveBeenCalled();
+        const containerWork = spawnSyncMock.mock.calls.filter(
+          (call: unknown[]) => !(call[0] === "docker" && (call[1] as string[])[0] === "port")
+        );
+        expect(containerWork).toHaveLength(0);
       });
     });
 
