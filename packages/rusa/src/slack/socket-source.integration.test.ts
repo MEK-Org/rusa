@@ -62,6 +62,7 @@ describe("Slack receipt reaction (#609)", () => {
     entries: [{ id: "entry-1" }] as unknown as Delivery["entries"],
     ownerIds: ["owner-1"],
   };
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
 
   function platformError(code: string) {
     return Object.assign(new Error(`An API error occurred: ${code}`), { data: { error: code } });
@@ -84,7 +85,7 @@ describe("Slack receipt reaction (#609)", () => {
       ack,
     });
     // Let the fire-and-forget receipt settle.
-    await new Promise((resolve) => setImmediate(resolve));
+    await settle();
     return { ack, onError, onReactionError };
   }
 
@@ -106,19 +107,45 @@ describe("Slack receipt reaction (#609)", () => {
   };
 
   it("reacts with eyes to a DM and a channel mention after inbox delivery", async () => {
-    const order: string[] = [];
-    const deliver = vi.fn(async () => {
-      order.push("deliver");
-      return accepted;
-    });
-    const react = vi.fn(async (channel: string, ts: string) => {
-      order.push(`react ${channel} ${ts}`);
+    // Gate both sides: the receipt must wait for durable delivery, and the ack
+    // must not wait for the receipt.
+    let completeDelivery!: (delivery: Delivery) => void;
+    const deliver = vi.fn(
+      () =>
+        new Promise<Delivery>((resolve) => {
+          completeDelivery = resolve;
+        })
+    );
+    let completeReaction!: () => void;
+    const react = vi.fn(
+      (_channel: string, _ts: string) =>
+        new Promise<void>((resolve) => {
+          completeReaction = resolve;
+        })
+    );
+    const ack = vi.fn(async () => {});
+    await new SlackSocketSource("app-token").start(withReceiptReaction(deliver, react, vi.fn()));
+    const handled = mock.listeners.get("slack_event")?.({
+      type: "events_api",
+      body: { event_id: "Ev1", event: dm },
+      ack,
     });
 
-    const direct = await receive(deliver, react, dm);
-    expect(order).toEqual(["deliver", "react D1 1720000000.000001"]);
-    expect(direct.ack).toHaveBeenCalledOnce();
+    await settle();
+    expect(deliver).toHaveBeenCalledOnce();
+    expect(react).not.toHaveBeenCalled();
+    expect(ack).not.toHaveBeenCalled();
 
+    completeDelivery(accepted);
+    await settle();
+    expect(react).toHaveBeenCalledExactlyOnceWith("D1", "1720000000.000001");
+    expect(ack).toHaveBeenCalledOnce();
+
+    completeReaction();
+    await handled;
+
+    deliver.mockImplementation(async () => accepted);
+    react.mockImplementation(async () => {});
     await receive(deliver, react, { ...threadMention, thread_ts: undefined });
     expect(react).toHaveBeenLastCalledWith("C1", "1720000005.000002");
   });
