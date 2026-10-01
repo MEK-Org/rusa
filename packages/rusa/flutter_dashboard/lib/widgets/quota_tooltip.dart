@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../models.dart';
+import '../theme.dart';
 
 /// Formats a relative reset duration, e.g. "2 days", "25 minutes", "1 hour".
 String formatRelativeResetDuration(Duration diff) {
@@ -57,6 +58,45 @@ String formatLastReadAge(Duration age) {
   final d = age.inDays;
   return '$d ${d == 1 ? 'day' : 'days'} ago';
 }
+
+/// How long a lane may go without a real reading before its ring carries the
+/// yellow warning triangle (#759). The server's rollover estimate uses the
+/// same span.
+const Duration kQuotaReadingStaleAfter = Duration(hours: 2);
+
+/// How long ago [window]'s last real reading was taken, or null when it never
+/// had one or the stamp can't be parsed.
+Duration? readingAge(QuotaWindowDto? window, DateTime now) {
+  final scrapedText = window?.scrapedAt;
+  if (window == null || !window.isKnown || scrapedText == null) return null;
+  final scraped = DateTime.tryParse(scrapedText);
+  return scraped == null ? null : now.difference(scraped);
+}
+
+/// Whether the ring draws [window]'s value — possibly 0%, when a reading or
+/// estimate says the window is exhausted — rather than empty for unknown.
+bool ringShowsValue(QuotaWindowDto? window, DateTime? now) =>
+    window != null &&
+    window.usedPercent != null &&
+    window.isKnown &&
+    !(now != null && window.isPastReset(now));
+
+/// The age of the oldest reading behind a ring still showing a value, when it
+/// is more than [kQuotaReadingStaleAfter] old; null while every one is recent.
+Duration? staleReadingAge(Iterable<QuotaWindowDto?> windows, DateTime now) {
+  Duration? oldest;
+  for (final window in windows) {
+    if (!ringShowsValue(window, now)) continue;
+    final age = readingAge(window, now);
+    if (age == null || age <= kQuotaReadingStaleAfter) continue;
+    if (oldest == null || age > oldest) oldest = age;
+  }
+  return oldest;
+}
+
+/// Formats a stale duration for warnings, e.g. "3h", "2d".
+String formatStaleAge(Duration age) =>
+    age.inHours >= 24 ? '${age.inDays}d' : '${age.inHours}h';
 
 /// A window's burn-down position at [now]: quota remaining vs. time remaining
 /// in its window, shared by the ring color and the tooltip text so they never
@@ -128,7 +168,10 @@ List<String> quotaPacingDiagnostics(QuotaThrottleDto throttle) => [
 /// - One row per quota window, named for its kind (`Weekly`, `Session`) since
 ///   the heading already names the provider or model:
 ///   `$label: $margin ($quotaRemaining% / $timeRemaining%) - Resets in $relativeReset`
+///   Marked with an estimate note when dead-reckoned (#759).
 /// - Pacing row: `Pacing: every $interval` (omitted when [showThrottle] is false)
+/// - Warning row: `Warning: no new reading for ...` when the reading behind
+///   the ring, estimated or served as-is, is older than 2h (#759)
 /// - Last read row: `Last Read: $age`, marked when stale or manually entered
 /// - Secondary pacing diagnostics ([quotaPacingDiagnostics]), when pacing is shown
 class QuotaTooltip extends StatelessWidget {
@@ -139,6 +182,7 @@ class QuotaTooltip extends StatelessWidget {
     this.throttle,
     this.scrapedAt,
     this.showThrottle = true,
+    this.staleFor,
     this.now,
   });
 
@@ -147,6 +191,7 @@ class QuotaTooltip extends StatelessWidget {
   final QuotaThrottleDto? throttle;
   final String? scrapedAt;
   final bool showThrottle;
+  final Duration? staleFor;
   final DateTime? now;
 
   List<String> _buildWindowRows(DateTime currentTime) {
@@ -184,6 +229,7 @@ class QuotaTooltip extends StatelessWidget {
       final resetText = window.resetAtIso;
       final reset = resetText != null ? DateTime.tryParse(resetText) : null;
 
+      String row;
       if (pos != null &&
           pos.timeRemainingPct != null &&
           pos.remainingMs != null) {
@@ -193,29 +239,28 @@ class QuotaTooltip extends StatelessWidget {
         final resetDuration = formatRelativeResetDuration(
           Duration(milliseconds: pos.remainingMs!),
         );
-        rows.add(
-          '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration',
-        );
-        continue;
-      }
-
-      if (reset != null) {
+        row =
+            '$label: $marginStr ($quotaRemaining% / $timeRemaining%) - Resets in $resetDuration';
+      } else if (reset != null) {
         if (reset.isAfter(currentTime)) {
           final resetDuration = formatRelativeResetDuration(
             reset.difference(currentTime),
           );
-          rows.add(
-            '$label: $quotaRemaining% remaining - Resets in $resetDuration',
-          );
+          row = '$label: $quotaRemaining% remaining - Resets in $resetDuration';
         } else {
           final resetStr = DateFormat('EEE h:mm a').format(reset.toLocal());
-          rows.add('$label: $quotaRemaining% remaining - resets $resetStr');
+          row = '$label: $quotaRemaining% remaining - resets $resetStr';
         }
       } else if (resetText != null) {
-        rows.add('$label: $quotaRemaining% remaining - resets $resetText');
+        row = '$label: $quotaRemaining% remaining - resets $resetText';
       } else {
-        rows.add('$label: $quotaRemaining% remaining');
+        row = '$label: $quotaRemaining% remaining';
       }
+
+      if (window.estimated) {
+        row = '$row (est.)';
+      }
+      rows.add(row);
     }
     return rows;
   }
@@ -226,6 +271,59 @@ class QuotaTooltip extends StatelessWidget {
       return 'Pacing: every ${formatPacingInterval(throttle!.intervalSeconds)}';
     }
     return 'Pacing: n/a';
+  }
+
+  Duration? _staleAge(DateTime currentTime) {
+    if (staleFor != null) return staleFor;
+    return staleReadingAge(windows, currentTime);
+  }
+
+  Widget _buildLastReadWidget(DateTime currentTime) {
+    final prefix = throttle?.freshness?.mode == 'manual'
+        ? 'Last Read (manual): '
+        : 'Last Read: ';
+
+    String ageText;
+    if (scrapedAt == null) {
+      ageText = 'n/a';
+    } else {
+      final scraped = DateTime.tryParse(scrapedAt!);
+      if (scraped == null) {
+        ageText = 'n/a';
+      } else {
+        ageText = formatLastReadAge(currentTime.difference(scraped));
+      }
+    }
+
+    String? overdueSuffix;
+    final freshness = throttle?.freshness;
+    if (freshness != null) {
+      if (freshness.hardStale) {
+        overdueSuffix = ' [overdue: hard-stale, fail-safe cap applied]';
+      } else if (freshness.stale) {
+        overdueSuffix = ' [overdue: stale]';
+      }
+    }
+
+    final isStale = _staleAge(currentTime) != null;
+    return Text.rich(
+      TextSpan(
+        style: const TextStyle(fontSize: 12),
+        children: [
+          TextSpan(text: prefix),
+          TextSpan(
+            text: ageText,
+            style: isStale
+                ? const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: MeshColors.quotaTooltipStaleWarning,
+                  )
+                : null,
+          ),
+          if (overdueSuffix != null) TextSpan(text: overdueSuffix),
+        ],
+      ),
+    );
   }
 
   List<String> _buildDiagnostics() {
@@ -279,7 +377,6 @@ class QuotaTooltip extends StatelessWidget {
     final currentTime = now ?? DateTime.now();
     final windowRows = _buildWindowRows(currentTime);
     final pacingText = _buildPacingText();
-    final lastReadText = _buildLastReadText(currentTime);
     final diagnostics = _buildDiagnostics();
     final diagnosticStyle = TextStyle(
       fontSize: 11,
@@ -298,14 +395,19 @@ class QuotaTooltip extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           for (final text in windowRows) ...[
-            Text(text, style: const TextStyle(fontSize: 12)),
+            Text(
+              text,
+              style: text.startsWith('estimate:')
+                  ? diagnosticStyle
+                  : const TextStyle(fontSize: 12),
+            ),
             const SizedBox(height: 2),
           ],
           if (pacingText != null) ...[
             Text(pacingText, style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 2),
           ],
-          Text(lastReadText, style: const TextStyle(fontSize: 12)),
+          _buildLastReadWidget(currentTime),
           if (diagnostics.isNotEmpty) ...[
             const SizedBox(height: 6),
             for (final text in diagnostics) Text(text, style: diagnosticStyle),

@@ -48,6 +48,7 @@ QuotaWindowDto _fableWeekly({
   List<String> modelIds = const ['claude-fable-5-1'],
   Duration resetIn = const Duration(days: 4),
   Duration scrapedAgo = const Duration(minutes: 5),
+  bool estimated = false,
 }) => QuotaWindowDto(
   id: 'weekly',
   label: 'Current week (Fable)',
@@ -58,6 +59,7 @@ QuotaWindowDto _fableWeekly({
   resetAtIso: _iso(now.add(resetIn)),
   scrapedAt: _iso(now.subtract(scrapedAgo)),
   modelIds: modelIds,
+  estimated: estimated,
 );
 
 QuotaSnapshotDto _snapshot({
@@ -115,6 +117,11 @@ Future<DashboardStore> _pumpRings(
   await tester.pump(const Duration(milliseconds: 50));
   return store;
 }
+
+Finder _staleWarning(String name) => find.descendant(
+  of: _ringTooltip(name),
+  matching: find.byKey(const ValueKey('quota-ring-stale-warning')),
+);
 
 Finder _ringTooltip(String name) => find.ancestor(
   of: find.text(name),
@@ -408,6 +415,21 @@ void main() {
     expect(fableWeeklyWindow(claude)?.usedPercent, 75);
   });
 
+  test('the estimate marking survives the cached JSON round trip (#759)', () {
+    final now = DateTime.utc(2026, 9, 28, 14);
+    final snapshot = _snapshot(
+      claudeWindows: [_claudeWeekly(now: now)],
+      modelWindows: [_fableWeekly(now: now, estimated: true)],
+    );
+    final restored = QuotaSnapshotDto.fromJson(
+      jsonDecode(jsonEncode(snapshot.toJson())) as Map<String, dynamic>,
+    );
+    final claude = restored.provider('claude')!;
+
+    expect(fableWeeklyWindow(claude)?.estimated, isTrue);
+    expect(claude.windows.single.estimated, isFalse);
+  });
+
   test('a payload without modelWindows parses as none', () {
     final provider = ProviderQuotaDto.fromJson({
       'provider': 'claude',
@@ -417,5 +439,174 @@ void main() {
 
     expect(provider.modelWindows, isEmpty);
     expect(fableWeeklyWindow(provider), isNull);
+  });
+
+  group('dead-reckoned ring estimates (#759)', () {
+    Future<DashboardStore> pumpFable(
+      WidgetTester tester,
+      QuotaWindowDto fable,
+    ) {
+      final now = DateTime.now();
+      return _pumpRings(
+        tester,
+        _snapshot(
+          claudeWindows: [_claudeWeekly(now: now)],
+          modelWindows: [fable],
+          withCodex: false,
+        ),
+      );
+    }
+
+    testWidgets('renders the estimate and says it is one', (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        final store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            used: 37.5,
+            scrapedAgo: const Duration(minutes: 40),
+            estimated: true,
+          ),
+        );
+
+        expect(_outerRingValue(tester, 'Fable'), closeTo(0.625, 1e-9));
+        final tip = _tooltipOf(tester, 'Fable');
+        expect(tip, contains('(est.)'));
+        expect(tip, isNot(contains('estimate:')));
+        expect(_tooltipOf(tester, 'Claude'), isNot(contains('(est.)')));
+        expect(_staleWarning('Fable'), findsNothing);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('shows a rollover estimate as approximately full', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        final store = await pumpFable(
+          tester,
+          QuotaWindowDto(
+            id: 'weekly',
+            label: 'Current week (Fable)',
+            usedPercent: 5,
+            status: 'available',
+            headline: true,
+            windowMs: _weekMs,
+            scrapedAt: _iso(now.subtract(const Duration(minutes: 90))),
+            modelIds: const ['claude-fable-5-1'],
+            estimated: true,
+          ),
+        );
+
+        expect(_outerRingValue(tester, 'Fable'), closeTo(0.95, 1e-9));
+        final tip = _tooltipOf(tester, 'Fable');
+        expect(tip, contains('Weekly: 95% remaining'));
+        expect(tip, contains('Weekly: 95% remaining (est.)'));
+        await store.dispose();
+      });
+    });
+
+    testWidgets('draws the warning triangle only after two hours', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        var store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            scrapedAgo: const Duration(hours: 1, minutes: 55),
+            estimated: true,
+          ),
+        );
+        expect(_staleWarning('Fable'), findsNothing);
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Warning:')));
+        await store.dispose();
+
+        store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            scrapedAgo: const Duration(hours: 3, minutes: 5),
+            estimated: true,
+          ),
+        );
+        expect(_staleWarning('Fable'), findsOneWidget);
+        expect(_staleWarning('Claude'), findsNothing);
+        expect(
+          tester.widget<Icon>(_staleWarning('Fable')).color,
+          MeshColors.quotaStaleWarning,
+        );
+        expect(
+          _tooltipOf(tester, 'Fable'),
+          contains(
+            'Last Read: 3 hours ago',
+          ),
+        );
+        expect(_tooltipOf(tester, 'Fable'), isNot(contains('Warning:')));
+        await store.dispose();
+      });
+    });
+
+    testWidgets('keeps the warning on an estimate drawn down to 0%', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        // A paced estimate can run out before the reset: the ring is empty
+        // because the lane is exhausted, not because it is unknown.
+        final store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            used: 100,
+            scrapedAgo: const Duration(hours: 3),
+            estimated: true,
+          ),
+        );
+        expect(_outerRingValue(tester, 'Fable'), 0.0);
+        expect(_staleWarning('Fable'), findsOneWidget);
+        await store.dispose();
+      });
+    });
+
+    testWidgets('leaves a window it cannot estimate empty past its reset', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now();
+        // The server estimates a rolled-over window with no reset time; one
+        // still past its reset here is one it had nothing to estimate from, so
+        // it reads empty however recent its reading, and carries no warning.
+        var store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            resetIn: const Duration(minutes: -30),
+            scrapedAgo: const Duration(minutes: 90),
+          ),
+        );
+        expect(_outerRingValue(tester, 'Fable'), 0.0);
+        expect(_tooltipOf(tester, 'Fable'), contains('estimated ~100%'));
+        expect(_staleWarning('Fable'), findsNothing);
+        await store.dispose();
+
+        // Inside the window, however old the reading, the ring keeps its value.
+        store = await pumpFable(
+          tester,
+          _fableWeekly(
+            now: now,
+            used: 60,
+            scrapedAgo: const Duration(days: 2),
+            estimated: true,
+          ),
+        );
+        expect(_outerRingValue(tester, 'Fable'), closeTo(0.4, 1e-9));
+        expect(_staleWarning('Fable'), findsOneWidget);
+        await store.dispose();
+      });
+    });
   });
 }

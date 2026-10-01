@@ -276,8 +276,69 @@ root to check the scrapes. A lane with neither a governing reset nor an
 exhaustion deadline stops being published once the provider has gone on
 reporting for longer than the hard-stale horizon without it. Manual readings
 carry no model windows, so a provider in manual mode dead-reckons its model
-lanes the same way. When the coordinator itself stops collecting, both lanes
-age together and widen to the ceiling as usual.
+lanes the same way.
+
+When the coordinator can still answer but a whole provider reading is missing
+or failed, including when the coordinator stops collecting, the provider lane
+and model lanes from that last reading keep their computed intervals while
+their governing window has not reset. A failed probe carries no new
+information, so it does not send the lane back to the ceiling. This reverses
+the earlier #730 rule that such lanes age together and widen to the ceiling. The response remains
+truthfully `hardStale`; this is a pacing decision, not a freshness disguise.
+Once the window resets with still no reading, those lanes widen to the ceiling.
+They are not retired, and root is not alerted, as they are for a single missing
+model window. That retire-and-alert step is not implemented yet. A
+newer provider scrape that omits only a governing window remains the existing
+partial-window case and widens conservatively. A client that cannot reach the
+coordinator keeps its separate local hard-stale ceiling fallback.
+
+### Dashboard estimates for missing readings (#759)
+
+When a lane has no fresh reading, the dashboard quota API shows an estimate
+instead of an unknown value. This covers a lane that the newest scrape left
+out (from that first missed scrape, however recent its last reading), a reading
+older than the provider's stale threshold, and a window whose reset has passed. It applies to every provider-wide and model-scoped lane.
+
+The estimate starts from the lane's last real reading and continues at the
+consumption pace between the first and last readings of the current window.
+That window uses the same cycle boundary the controller applies. The window is
+marked `estimated: true`, and its `scrapedAt` is the time of the last real
+reading. The estimate is computed on each read and never stored, so no
+observation, controller history or pacing evidence ever contains it.
+
+After the window resets, the new window starts at 100% and is drawn down at the
+previous pace until a reading arrives or the new window would itself have ended.
+It shows no reset time, because no reading of the new window has come in. Some
+lanes get no estimate and stay unknown:
+
+- a lane with fewer than two readings in its window;
+- a lane whose window ended more than two hours after its last reading;
+- a lane the newest scrape dropped, once its last-seen window has reset. This
+  is the same point at which the controller retires a dropped model lane
+  (#588), so a retired lane is never drawn as a fresh window;
+- a lane with no reading within the three-day history window.
+
+Once a lane's last real reading is more than two hours old, its ring shows a
+yellow warning triangle.
+
+Each `rusa start` process that has a coordinator configured compares
+consecutive scrapes in the history it refreshes. A scrape is the set of
+observations that share one `observedAt` stamp, which the store writes on every
+row of one snapshot. The store keeps one row per window per five-minute slot, so
+when two scrapes land in one slot, a row still stamped with the earlier scrape
+is a window the later one dropped. A scrape that parsed to no window, or whose
+output failed to parse, leaves no row. `/v1/history` therefore also lists each
+finished scrape's time and whether it parsed (protocol minor 3), and such a
+scrape counts as one with no windows. A scrape still being parsed is not listed.
+Against a minor-2 coordinator the detection falls back to rows only. If a window appears
+in one scrape and is missing from the next, the process sends one normal-priority
+`system.quota_window_missed` alarm to its own root on `system:events`. Instances
+that share a coordinator each tell their own root once. The alarm is not
+repeated while the gap lasts. After the window reappears, the next gap raises
+a new alarm. The first history a process reads is a silent baseline, so a
+restart does not re-raise a gap that was already open. Switching a provider to
+manual readings, which carry no model windows, raises this alarm once for each
+of its model lanes.
 
 Deploy and rollback follow the v2 order above, with one difference. Opening the
 database with a v3 build rebuilds `quota_observations` once, adding
@@ -750,6 +811,11 @@ the rate each drill actually observed, at the much faster tick the drill runs.
 | `quota_service_reads_total` | counter | `path`, `status` | service |
 | `quota_client_service_connected` | gauge | `source` | instance |
 | `quota_client_applied_interval_seconds` | gauge | `source`, `provider` | instance |
+
+A scrape or parse counts as `outcome="failure"` when the probe's own read
+produced no reading, including when the served snapshot carries the previous
+reading forward. The carried reading keeps pacing conservative; the counter keeps
+the failure visible.
 
 The last two are emitted by the instance, never by the service: a service cannot
 count the clients it cannot see, so a service-side "degraded clients" gauge

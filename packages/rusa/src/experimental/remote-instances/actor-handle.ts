@@ -89,6 +89,7 @@ export class ActorHandle implements MeshActor {
    * admission request; that request is refused as cancelled when it arrives.
    */
   private pendingQueuedCancel = false;
+  private pendingQueuedCancelRetain?: boolean;
   /**
    * The pool changed between the follower's queued report and its admission
    * request, which was quoted under the old pool; refuse it as stale on arrival.
@@ -326,13 +327,18 @@ export class ActorHandle implements MeshActor {
    * Actor books the run `start-cancelled` and keeps the opportunity, as a local
    * queued-start cancellation does, until {@link resumeCancelledRun}.
    */
-  cancelQueuedRun(): boolean {
+  cancelQueuedRun(opts?: { retain?: boolean }): boolean {
     if (this.terminated) return false;
+    const retain = opts?.retain ?? true;
     if (this.resumeCancelledPending) {
-      // Halted again before the replay reached the follower: keep the
-      // opportunity parked for the next resume instead of launching it.
-      this.resumeCancelledPending = false;
-      this.cancelledQueuedRun = true;
+      if (retain) {
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedRun = true;
+      } else {
+        this.resumeCancelledPending = false;
+        this.cancelledQueuedRun = false;
+        this.cancelledQueuedNudge = undefined;
+      }
       return true;
     }
     const unstarted = [...this.gates.values()].filter((gate) => !gate.handle.started);
@@ -349,22 +355,28 @@ export class ActorHandle implements MeshActor {
       if (!cancelled) return false;
       // The gate's rejection replies on a later microtask, so this command lands
       // first and the follower settles its start as cancelled, not failed.
-      this.send({ type: "cancelQueued" });
+      this.send({ type: "cancelQueued", retain });
       responsive = unstarted.some((gate) => gate.admission.responsive);
     } else if (this.state === "queued" && !this.runOpen && !this.closed && this.gates.size === 0) {
       // The follower reported queued and its admission request has not taken
       // a gate yet. It follows the report on the same channel, so refuse it
       // on arrival (see rejectCancelledAdmission) as a local queued start would be.
       this.pendingQueuedCancel = true;
+      this.pendingQueuedCancelRetain = retain;
       responsive = this.pendingQueuedPromotion;
     } else {
       return false;
     }
-    this.cancelledQueuedNudge = mergeNudges(this.cancelledQueuedNudge ?? null, {
-      ...(responsive ? { priority: "responsive" } : {}),
-      mode: this.queuedMode ?? "ordinary",
-    });
-    this.cancelledQueuedRun = true;
+    if (retain) {
+      this.cancelledQueuedNudge = mergeNudges(this.cancelledQueuedNudge ?? null, {
+        ...(responsive ? { priority: "responsive" } : {}),
+        mode: this.queuedMode ?? "ordinary",
+      });
+      this.cancelledQueuedRun = true;
+    } else {
+      this.cancelledQueuedNudge = undefined;
+      this.cancelledQueuedRun = false;
+    }
     this.opts.context.onQueuedRunCancelled?.();
     return true;
   }
@@ -412,10 +424,12 @@ export class ActorHandle implements MeshActor {
   private rejectCancelledAdmission(requestId: number): boolean {
     if (!this.pendingQueuedCancel) return false;
     this.pendingQueuedCancel = false;
+    const retain = this.pendingQueuedCancelRetain ?? true;
+    this.pendingQueuedCancelRetain = undefined;
     // The resumed start asks again under the pool the follower holds by then.
     this.pendingQueuedRequote = false;
     this.pendingQueuedPromotion = false;
-    this.send({ type: "cancelQueued" });
+    this.send({ type: "cancelQueued", retain });
     this.send({ type: "reply", requestId, error: COORDINATOR_ADMISSION_CANCELLED_ERROR });
     return true;
   }
@@ -1005,6 +1019,14 @@ export class ActorHandle implements MeshActor {
         break;
       }
       case "runStart":
+        // Older followers do not send `providerAttempt`, but their run-start
+        // tuple is still the leader-admitted attempt. Keep that attribution;
+        // current followers refine it with the tuple they instantiated.
+        this.opts.actorOptions?.onProviderAttempt?.({
+          providerName: message.selected.provider,
+          model: message.selected.model,
+          effort: message.selected.effort,
+        });
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
@@ -1107,6 +1129,17 @@ export class ActorHandle implements MeshActor {
               this.send({ type: "reply", requestId });
               break;
             }
+            case "providerAttempt":
+              // An attempt that arrives after the run closed must not restore
+              // the selection terminal cleanup removed.
+              if (this.runOpen)
+                void this.opts.actorOptions?.onProviderAttempt?.({
+                  providerName: request.attempt.provider,
+                  model: request.attempt.model,
+                  effort: request.attempt.effort,
+                });
+              this.send({ type: "reply", requestId });
+              break;
             case "sendMessage":
               // Bind sender identity here; the remote actor cannot choose a different actor.
               this.send({

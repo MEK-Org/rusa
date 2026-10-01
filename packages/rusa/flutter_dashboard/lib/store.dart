@@ -32,6 +32,36 @@ const Duration _kRuntimeRetryMax = Duration(seconds: 5);
 const Duration _kQueuePacingPollInterval = Duration(seconds: 10);
 const Duration _kObligationLookupTtl = Duration(seconds: 30);
 
+/// One committed obligation write another client or an actor made, as the
+/// Work tab needs it (#773).
+class ObligationRefresh {
+  const ObligationRefresh({this.ids = const {}});
+
+  /// The obligations the write touched; empty when any may have changed.
+  final Set<String> ids;
+
+  bool touches(String id) => ids.isEmpty || ids.contains(id);
+}
+
+/// The `{id, status}` pairs of an `obligation_status_changed` payload, in
+/// write order; empty when the payload is missing or malformed.
+Map<String, String> _statusChanges(String? payload) {
+  if (payload == null) return const {};
+  try {
+    final changes = (jsonDecode(payload) as Map<String, dynamic>)['changes'];
+    if (changes is! List) return const {};
+    return {
+      for (final change in changes)
+        if (change is Map<String, dynamic> &&
+            change['id'] is String &&
+            change['status'] is String)
+          change['id'] as String: change['status'] as String,
+    };
+  } catch (_) {
+    return const {};
+  }
+}
+
 /// One line in the merged live-output console.
 class LiveLine {
   const LiveLine({
@@ -335,8 +365,9 @@ class DashboardStore {
   var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
-  final _recentActivity =
-      BehaviorSubject<List<RecentActivityItem>>.seeded(const []);
+  final _recentActivity = BehaviorSubject<List<RecentActivityItem>>.seeded(
+    const [],
+  );
 
   /// Model and effort of each active run, keyed by actor id. Seeded from the
   /// actor's newest `run_start` event and replaced by live ones; an actor's
@@ -368,6 +399,11 @@ class DashboardStore {
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
+  // The V1 Chat Room is dashboard-global rather than tied to the actor-detail
+  // selection. Its roster is mesh state that only root changes (#663), so
+  // every dashboard renders the server's list and none can edit it locally.
+  // Empty until the first fetch lands.
+  final _chatRoomParticipants = BehaviorSubject<List<String>>.seeded(const []);
 
   /// Ticks whenever any actor's avatar state changes so `ActorAvatar` /
   /// `AvatarLightbox` rebuild and read [avatarVersion] / [isAvatarGenerating].
@@ -380,7 +416,7 @@ class DashboardStore {
   final _generatingAvatars = <String>{};
   final _focusedObligationId = BehaviorSubject<String?>.seeded(null);
   final _detailPanelIndex = BehaviorSubject<int>.seeded(0);
-  final _obligationRefreshes = PublishSubject<String?>();
+  final _obligationRefreshes = PublishSubject<ObligationRefresh>();
 
   /// Anchor for shift-range selection (set by plain/ctrl clicks).
   String? _anchor;
@@ -432,6 +468,8 @@ class DashboardStore {
       _dashboardConfig.stream;
   ValueStream<String?> get error => _error.stream;
   ValueStream<bool> get walkieActive => _walkieActive.stream;
+  ValueStream<List<String>> get chatRoomParticipants =>
+      _chatRoomParticipants.stream;
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
 
   /// Cache-busting version for one actor's avatar URL (0 = never changed).
@@ -442,11 +480,13 @@ class DashboardStore {
   ValueStream<String?> get focusedObligationId => _focusedObligationId.stream;
   ValueStream<int> get detailPanelIndex => _detailPanelIndex.stream;
 
-  /// Fires after a committed checkpoint rewrite arrives over the mesh stream.
-  /// WorkTab owns the forest snapshot, so it consumes this narrow invalidation
-  /// signal and reloads the visible tree instead of keeping stale standing,
-  /// while mounted detail views filter on their specific obligation ID.
-  Stream<String?> get obligationRefreshes => _obligationRefreshes.stream;
+  /// Fires after a committed checkpoint rewrite or status change arrives over
+  /// the mesh stream, once per commit. WorkTab owns the forest snapshot, so it
+  /// consumes this narrow invalidation signal and reloads the visible tree
+  /// instead of keeping stale standing, while mounted detail views filter on
+  /// the obligations they show.
+  Stream<ObligationRefresh> get obligationRefreshes =>
+      _obligationRefreshes.stream;
 
   // ── Normalized actor selectors ──
   ActorViewState? actor(String id) => _actorStates.value.actor(id);
@@ -487,6 +527,26 @@ class DashboardStore {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
     }
+  }
+
+  /// Fetch the mesh-wide Chat Room roster. A changed roster also re-syncs the
+  /// threads: adding an actor can assign it a distinct voice, and its tile
+  /// should show that voice rather than the one it had before it joined.
+  Future<void> refreshChatRoom() async {
+    final List<String> ids;
+    try {
+      ids = await _api.fetchChatRoom();
+    } catch (_) {
+      return;
+    }
+    if (_chatRoomParticipants.isClosed) return;
+    final current = _chatRoomParticipants.value;
+    if (ids.length == current.length &&
+        Iterable<int>.generate(ids.length).every((i) => ids[i] == current[i])) {
+      return;
+    }
+    _chatRoomParticipants.add(List.unmodifiable(ids));
+    if (current.isNotEmpty) unawaited(refreshThreads());
   }
 
   void setFocusedObligationId(String? id) {
@@ -1373,14 +1433,26 @@ class DashboardStore {
         _runSelections.add({..._runSelections.value, e.actorId!: selection});
       }
     }
-    if (e.kind == 'run_end' || e.kind == 'obligation_status_changed') {
-      unawaited(refreshRecentActivity());
-    }
+    if (e.kind == 'run_end') unawaited(refreshRecentActivity());
 
     if (e.kind == 'obligation_checkpoint_set' &&
         !_obligationRefreshes.isClosed) {
       invalidateObligationsCache();
-      _obligationRefreshes.add(e.detail);
+      _obligationRefreshes.add(
+        ObligationRefresh(ids: {if (e.detail != null) e.detail!}),
+      );
+    }
+    if (e.kind == 'obligation_status_changed' &&
+        !_obligationRefreshes.isClosed) {
+      final statuses = _statusChanges(e.payload);
+      invalidateObligationsCache();
+      statuses.keys.forEach(_obligationLookups.remove);
+      _obligationRefreshes.add(ObligationRefresh(ids: statuses.keys.toSet()));
+      // Recent Activity lists closes only, so a re-ready or block adds no row.
+      if (statuses.isEmpty ||
+          statuses.values.any((s) => s == 'done' || s == 'cancelled')) {
+        unawaited(refreshRecentActivity());
+      }
     }
 
     // Prepend to the Events list only if it matches the *current* view filter.
@@ -1896,6 +1968,7 @@ class DashboardStore {
       _error.close(),
       _collapsed.close(),
       _walkieActive.close(),
+      _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
     ]);
   }

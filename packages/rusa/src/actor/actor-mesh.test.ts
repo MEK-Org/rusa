@@ -33,6 +33,7 @@ import type {
   InboxActorWork,
   InboxEntry,
   InboxItemsAppendedListener,
+  InboxItemsHandledListener,
   InboxListOptions,
   InboxPage,
   InboxPayload,
@@ -92,6 +93,7 @@ import {
   UnifiedAdmissionQueue,
 } from "./provider-pacer.js";
 import {
+  type JevDecisionClient,
   SHADOW_INTERRUPT_EMOJI,
   SHADOW_QUEUE_EMOJI,
   ShadowResponsiveInterruptionClassifier,
@@ -133,6 +135,7 @@ function captureLogger(records: Array<Record<string, unknown>>): Logger {
 function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
   const entries: InboxEntry[] = [];
   const listeners = new Set<InboxItemsAppendedListener>();
+  const handledListeners = new Set<InboxItemsHandledListener>();
   const pendingActors = (predicate: (entry: InboxEntry) => boolean): InboxActorWork[] => {
     const priorities = new Map<string, InboxActorWork["priority"]>();
     for (const entry of entries.filter(predicate)) {
@@ -185,6 +188,12 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
+      };
+    },
+    onItemsHandled: (listener) => {
+      handledListeners.add(listener);
+      return () => {
+        handledListeners.delete(listener);
       };
     },
     list: (actorId: string, options: InboxListOptions = {}): InboxPage => {
@@ -243,7 +252,7 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
       handledAt = new Date("2026-01-01T00:00:00Z"),
       handledNote?: string
     ) => {
-      return entryIds.map((id) => {
+      const results = entryIds.map((id) => {
         const entry = entries.find(
           (candidate) => candidate.actorId === actorId && candidate.id === id
         );
@@ -255,6 +264,16 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         }
         return { id, handledAt: entry.handledAt, alreadyHandled };
       });
+      if (results.length > 0) {
+        for (const listener of [...handledListeners]) {
+          try {
+            listener(actorId, results);
+          } catch {
+            // advisory
+          }
+        }
+      }
+      return results;
     },
     replaceEntries: (
       actorId,
@@ -294,6 +313,15 @@ function createMemoryInboxStore(): InboxRepository & { entries: InboxEntry[] } {
         return { id: entry.id, handledAt: entry.handledAt, alreadyHandled };
       });
       entries.push(...inserted);
+      if (handled.length > 0) {
+        for (const listener of [...handledListeners]) {
+          try {
+            listener(actorId, handled);
+          } catch {
+            // advisory
+          }
+        }
+      }
       if (inserted.length > 0) {
         for (const listener of [...listeners]) {
           try {
@@ -1067,6 +1095,7 @@ describe("ActorMesh", () => {
       // Partial fake: it never notifies, so the only wake here is whatever the
       // mesh path under test sends itself.
       onItemsAppended: () => () => {},
+      onItemsHandled: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -1586,12 +1615,13 @@ describe("ActorMesh", () => {
               selected.model,
               selected.effort
             ),
-          onProviderAttempt: (provider) =>
+          onProviderAttempt: (provider) => {
             attempts.push({
               provider: provider.providerName,
               model: provider.model,
               effort: provider.effort,
-            }),
+            });
+          },
           mcpServers: [],
           loadSessionId: () => ctx.getRecord()?.sessionId,
           saveSessionId: (sessionId) => ctx.mesh.actors.patch(ctx.record.id, { sessionId }),
@@ -3486,8 +3516,12 @@ describe("ActorMesh", () => {
     });
     const worker = mesh.spawn({ charter: "worker", parentId: "root" });
 
-    // No run is admitted, so neither row is ever marked seen: a second poke
-    // re-reads the first row alongside the second.
+    // Start a background run on worker so it is actively running
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Repeated delivery pokes arrive while worker is running
     mesh.sendHumanMessage(worker, "first operator body", "session-1");
     await tick();
     mesh.sendHumanMessage(worker, "second operator body", "session-1");
@@ -3499,6 +3533,207 @@ describe("ActorMesh", () => {
       .map((event) => JSON.parse(event.payload ?? "{}").decision.incomingEntryId as string);
     expect(observed).toHaveLength(new Set(observed).size);
     expect(observed).toHaveLength(2);
+  });
+
+  it("evaluates JEV only when responsive item arrives while target actor is actively running vs idle vs queued (local actor)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveWorker1!: (result: Partial<RunResult>) => void;
+    let resolveWorker2!: (result: Partial<RunResult>) => void;
+    let jevEvaluations = 0;
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: async (request) => {
+          jevEvaluations++;
+          return {
+            interruptProbability: 0.9,
+            matchedCandidateIds: request.input.candidateEntryIds.slice(0, 1),
+          };
+        },
+      },
+    });
+
+    let runCount = 0;
+    const provider = new FakeProvider(() => {
+      runCount++;
+      if (runCount === 1) {
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveWorker1 = resolve;
+        });
+      }
+      return new Promise<Partial<RunResult>>((resolve) => {
+        resolveWorker2 = resolve;
+      });
+    });
+
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+      maxConcurrent: 1,
+    });
+
+    const w1 = mesh.spawn({ charter: "worker 1", parentId: "root" });
+    const w2 = mesh.spawn({ charter: "worker 2", parentId: "root" });
+    const w3 = mesh.spawn({ charter: "worker 3", parentId: "root" });
+
+    // 1. Idle state: w3 is idle when responsive message arrives
+    mesh.sendHumanMessage(w3, "hello idle w3", "session-3");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV should NOT evaluate for idle actor
+    expect(jevEvaluations).toBe(0);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
+
+    // 2. Queued state: w1 runs an ORDINARY run, filling the maxConcurrent: 1 slot
+    inboxStore.append([{ actorId: w1, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(w1);
+    await tick();
+
+    // Now w2 starts an ordinary run; because maxConcurrent is 1 and w1 holds it, w2 is queued
+    inboxStore.append([{ actorId: w2, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(w2);
+    await tick();
+
+    // Send responsive message to w2 while w2 is queued behind w1
+    mesh.sendHumanMessage(w2, "hello queued w2", "session-2");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV should NOT evaluate for queued actor
+    expect(jevEvaluations).toBe(0);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(0);
+
+    // 3. Running state: send responsive message to w1 while w1 is actively running
+    mesh.sendHumanMessage(w1, "hello running w1", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV SHOULD evaluate for running actor
+    expect(jevEvaluations).toBe(1);
+    const shadowEvents = events.filter((e) => e.kind === "responsive_interruption_shadow");
+    expect(shadowEvents).toHaveLength(1);
+    expect(JSON.parse(shadowEvents[0].payload ?? "{}").decision.outcome).toBe("interrupt");
+
+    // Clean up held runs
+    resolveWorker1({ success: true, exitCode: 0, output: "done" });
+    await tick();
+    resolveWorker2({ success: true, exitCode: 0, output: "done" });
+    await tick();
+  });
+
+  it("pins arrival-time race semantics: arrival while running vs run ends before arrival", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveRun: (result: Partial<RunResult>) => void = () => {};
+    let jevEvaluations = 0;
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client: {
+        decide: async () => {
+          jevEvaluations++;
+          return { interruptProbability: 0.75 };
+        },
+      },
+    });
+
+    let holdRun = true;
+    const provider = new FakeProvider(() => {
+      if (!holdRun) {
+        return { success: true, exitCode: 0, output: "done" };
+      }
+      return new Promise<Partial<RunResult>>((resolve) => {
+        resolveRun = resolve;
+      });
+    });
+
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Start a run
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Race 1: Responsive message arrives while worker is running.
+    // Even if the run finishes shortly afterward, the arrival happened while running.
+    mesh.sendHumanMessage(worker, "arrival during run", "session-1");
+    // Release the run and allow any follow-up to finish immediately so worker becomes idle
+    holdRun = false;
+    resolveRun({ success: true, exitCode: 0, output: "done" });
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV was evaluated because at arrival time it was running
+    expect(jevEvaluations).toBe(1);
+    expect(events.filter((e) => e.kind === "responsive_interruption_shadow")).toHaveLength(1);
+
+    // Race 2: Run has completely ended; actor is now idle.
+    // Subsequent responsive arrival must NOT trigger JEV.
+    mesh.sendHumanMessage(worker, "arrival after run ended", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // JEV evaluation count must remain 1
+    expect(jevEvaluations).toBe(1);
+  });
+
+  it("links evaluationId across shadow event payload and classifier decision", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let capturedEvaluationId: string | undefined;
+
+    const client: JevDecisionClient = {
+      decide: async (request) => {
+        capturedEvaluationId = request.evaluationId;
+        return { interruptProbability: 0.88 };
+      },
+    };
+
+    const classifier = new ShadowResponsiveInterruptionClassifier({
+      threshold: 0.5,
+      client,
+    });
+
+    const provider = new FakeProvider(() => new Promise<Partial<RunResult>>(() => {}));
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+      responsiveInterruption: classifier,
+    });
+
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    // Start background run
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.dispatch(worker);
+    await tick();
+
+    // Deliver responsive message while running
+    mesh.sendHumanMessage(worker, "operator request", "session-1");
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const shadowEvents = events.filter((e) => e.kind === "responsive_interruption_shadow");
+    expect(shadowEvents).toHaveLength(1);
+
+    const parsedEvent = JSON.parse(shadowEvents[0].payload ?? "{}");
+    const evaluationId = parsedEvent.evaluationId;
+    expect(evaluationId).toBeDefined();
+    expect(capturedEvaluationId).toBe(evaluationId);
+    expect(parsedEvent.decision.evaluationId).toBe(evaluationId);
+    expect(parsedEvent.decision.outcome).toBe("interrupt");
+    expect(parsedEvent.decision.interruptProbability).toBe(0.88);
   });
 
   it("does not let ordinary traffic abort the run already working the operator's message", async () => {
@@ -8329,6 +8564,7 @@ describe("ActorMesh", () => {
           appendListeners.push(listener);
           return () => {};
         },
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -8423,6 +8659,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -8464,6 +8701,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
@@ -13307,6 +13545,274 @@ describe("accountRun token accounting (#443)", () => {
       const res = mesh.releaseChildInboxSelectionLock(parent, child, ["item-1"], "retry release");
       expect(res.released).toEqual(["item-1"]);
       expect(inboxStore.read(child, "item-1")?.handledAt).not.toBeNull();
+    });
+  });
+
+  describe("cancelling empty queued runs (#787)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("cancels a queued run when the last unhandled inbox item is marked handled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "second task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      // Now the last unhandled item for queuedWorker is marked handled:
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      expect(entry).toBeDefined();
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      // The queued run should be cancelled and no longer queued:
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(0);
+
+      // When the running worker completes and frees the concurrency slot,
+      // the queued worker must NOT run because its run was cancelled:
+      d.releaseAll();
+      await tick();
+      await tick();
+
+      expect(d.pending()).toBe(0);
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(false);
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+    });
+
+    it("drops work cleared during async onQueued before its provider reservation exists", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const provider = new FakeProvider();
+      let releaseQueued!: () => void;
+      let queued!: () => void;
+      const queuedEntered = new Promise<void>((resolve) => (queued = resolve));
+      const queuedHold = new Promise<void>((resolve) => (releaseQueued = resolve));
+      const { mesh, tick } = setup({
+        inboxStore,
+        createActor: (ctx) => {
+          ctx.lifecycle.add({
+            onQueued: async () => {
+              queued();
+              await queuedHold;
+            },
+          });
+          return new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: provider.providerName }],
+            resolveProvider: () => provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: () => {},
+            buildPrompt: () => ({ prompt: "Work from your inbox." }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            admitRun: ctx.admitRun,
+            lifecycle: ctx.lifecycle,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+        },
+      });
+      const worker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+      mesh.sendMessage(worker, "work to clear", "root");
+      await tick();
+      await queuedEntered;
+
+      const [entry] = inboxStore.list(worker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(worker, [entry.id]);
+      releaseQueued();
+      await tick();
+
+      expect(provider.calls).toHaveLength(0);
+      expect(mesh.runningThreadIds().has(worker)).toBe(false);
+    });
+
+    it("preserves an already-running turn when its inbox item is marked handled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        sharedProvider: d.provider,
+      });
+
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      mesh.sendMessage(worker, "active task", "root");
+      await tick();
+
+      expect(mesh.runningThreadIds().has(worker)).toBe(true);
+      expect(d.pending()).toBe(1);
+
+      const [entry] = inboxStore.list(worker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(worker, [entry.id]);
+      await tick();
+
+      // The active run is preserved:
+      expect(mesh.runningThreadIds().has(worker)).toBe(true);
+      expect(d.pending()).toBe(1);
+
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(worker)).toBe(false);
+    });
+
+    it("keeps the run queued when other unhandled inbox items remain", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "task 1", "root");
+      mesh.sendMessage(queuedWorker, "task 2", "root");
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(2);
+
+      const [firstEntry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [firstEntry.id]);
+      await tick();
+
+      // Since 1 unhandled item remains, the run stays queued:
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      // Release running worker: queued worker claims the slot:
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("re-dispatches newly arriving work after an empty queued run was cancelled", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+
+      mesh.sendMessage(queuedWorker, "cancelled task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+
+      // New work arrives for queuedWorker:
+      mesh.sendMessage(queuedWorker, "fresh task", "root");
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("replays work delivered while an empty queued cancellation unwinds", async () => {
+      const d = deferredProvider();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, tick } = setup({
+        inboxStore,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      mesh.sendMessage(queuedWorker, "cancelled task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = inboxStore.list(queuedWorker, { status: "unhandled" }).entries;
+      inboxStore.markHandled(queuedWorker, [entry.id]);
+      // Deliver before the cancelled gate's rejection reaches runOnce's finally.
+      mesh.sendMessage(queuedWorker, "fresh task during unwind", "root");
+      await tick();
+
+      expect(inboxStore.countUnhandled(queuedWorker)).toBe(1);
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+      expect(mesh.runningThreadIds().has(queuedWorker)).toBe(true);
+      d.releaseAll();
+      await tick();
+    });
+
+    it("cancels empty queued run through SqliteInboxRepository", async () => {
+      const db = new Database(":memory:");
+      runMigrations(db);
+      const sqliteInbox = new SqliteInboxRepository(db);
+
+      const d = deferredProvider();
+      const { mesh, tick } = setup({
+        inboxStore: sqliteInbox,
+        maxConcurrent: 1,
+        sharedProvider: d.provider,
+      });
+
+      const runningWorker = mesh.spawn({ charter: "occupy slot", parentId: "root" });
+      const queuedWorker = mesh.spawn({ charter: "queued worker", parentId: "root" });
+
+      mesh.sendMessage(runningWorker, "first task", "root");
+      await tick();
+      expect(mesh.runningThreadIds().has(runningWorker)).toBe(true);
+
+      mesh.sendMessage(queuedWorker, "second task", "root");
+      await tick();
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(true);
+
+      const [entry] = sqliteInbox.list(queuedWorker, { status: "unhandled" }).entries;
+      expect(entry).toBeDefined();
+      sqliteInbox.markHandled(queuedWorker, [entry.id]);
+      await tick();
+
+      expect(mesh.queuedThreadIds().has(queuedWorker)).toBe(false);
+      expect(sqliteInbox.countUnhandled(queuedWorker)).toBe(0);
+
+      db.close();
     });
   });
 });

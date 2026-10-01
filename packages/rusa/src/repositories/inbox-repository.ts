@@ -78,6 +78,12 @@ export interface InboxActorWork {
 /** Listener for rows durably committed by {@link InboxRepository.append}. */
 export type InboxItemsAppendedListener = (items: readonly InboxEntry[]) => void;
 
+/** Listener for entries durably marked handled by {@link InboxRepository.markHandled}. */
+export type InboxItemsHandledListener = (
+  actorId: string,
+  results: readonly MarkHandledResult[]
+) => void;
+
 /**
  * Persistence boundary for actor inbox items, alongside `ActorRepository`.
  * Only markSeen is allowed to write seenAt.
@@ -110,6 +116,12 @@ export interface InboxRepository {
    * contract; it re-enters this notification path and is not guarded.
    */
   onItemsAppended(listener: InboxItemsAppendedListener): () => void;
+  /**
+   * Subscribe to notifications when entries are marked handled. The listener
+   * receives the actor id and the batch results after commit. Returns an
+   * unsubscribe function.
+   */
+  onItemsHandled(listener: InboxItemsHandledListener): () => void;
   list(actorId: string, options?: InboxListOptions): InboxPage;
   /**
    * Exact queue-card candidate across every unhandled entry, ordered responsive
@@ -182,6 +194,9 @@ export class EmptyInboxRepository implements InboxRepository {
     return [];
   }
   onItemsAppended(_listener: InboxItemsAppendedListener): () => void {
+    return () => {};
+  }
+  onItemsHandled(_listener: InboxItemsHandledListener): () => void {
     return () => {};
   }
   list(_actorId: string, _options?: InboxListOptions): InboxPage {

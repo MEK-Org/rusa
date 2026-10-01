@@ -17,6 +17,9 @@ const writeFileSyncMock = vi.fn();
 const rmSyncMock = vi.fn();
 const mkdirSyncMock = vi.fn();
 const symlinkSyncMock = vi.fn();
+const readFileSyncMock = vi.fn();
+const readdirSyncMock = vi.fn();
+const readlinkSyncMock = vi.fn();
 
 vi.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => spawnMock(...args),
@@ -35,7 +38,9 @@ vi.mock("node:fs", () => ({
   rmSync: (...args: unknown[]) => rmSyncMock(...args),
   mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
   symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
-  readFileSync: vi.fn().mockReturnValue(""),
+  readFileSync: (...args: unknown[]) => readFileSyncMock(...args),
+  readdirSync: (...args: unknown[]) => readdirSyncMock(...args),
+  readlinkSync: (...args: unknown[]) => readlinkSyncMock(...args),
   default: {
     mkdtempSync: (...args: unknown[]) => mkdtempSyncMock(...args),
     existsSync: (...args: unknown[]) => existsSyncMock(...args),
@@ -44,13 +49,33 @@ vi.mock("node:fs", () => ({
     rmSync: (...args: unknown[]) => rmSyncMock(...args),
     mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
     symlinkSync: (...args: unknown[]) => symlinkSyncMock(...args),
-    readFileSync: vi.fn().mockReturnValue(""),
+    readFileSync: (...args: unknown[]) => readFileSyncMock(...args),
+    readdirSync: (...args: unknown[]) => readdirSyncMock(...args),
+    readlinkSync: (...args: unknown[]) => readlinkSyncMock(...args),
   },
 }));
 
+const leaseMock = vi.fn();
+const revokeMock = vi.fn();
+let brokerOn = false;
+
+vi.mock("./codex-auth-broker.js", () => ({
+  CODEX_REFRESH_URL_ENV: "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+  activeCodexAuthBroker: () => (brokerOn ? { lease: leaseMock } : undefined),
+  writeCodexLeaseAuth: (dir: string, lease: { authJson: string }) => {
+    writeFileSyncMock(`${dir}/auth.json`, lease.authJson, { mode: 0o600 });
+    return `${dir}/auth.json`;
+  },
+}));
+
+import type { Logger } from "../observability/logger.js";
 import {
   buildTmuxScript,
+  detectProcessesReferencingHome,
+  isProcessReferencingHome,
   scrapeCodexStatus,
+  setCodexScrapeLogger,
+  supportsNoDaemon,
   type TmuxScriptTiming,
 } from "./codex-status-scrape.js";
 
@@ -60,6 +85,9 @@ describe("codex-status-scrape", () => {
     mkdtempSyncMock.mockReturnValue("/tmp/test-codex-home");
     existsSyncMock.mockReturnValue(false);
     lstatSyncMock.mockReturnValue({ isSymbolicLink: () => true });
+    readFileSyncMock.mockReturnValue("");
+    readdirSyncMock.mockReturnValue([]);
+    readlinkSyncMock.mockReturnValue("");
   });
 
   describe("buildTmuxScript", () => {
@@ -99,6 +127,20 @@ describe("codex-status-scrape", () => {
       expect(errorBranch).not.toContain("capture-pane");
     });
 
+    it("runs without background daemon (issue #779)", () => {
+      const script = buildTmuxScript("codex", "/tmp/test.sock");
+      expect(script).toContain("--no-daemon");
+      expect(script).not.toContain("--disable daemon_auto_start");
+    });
+
+    it("omits --no-daemon for a CLI whose help does not advertise it", () => {
+      const script = buildTmuxScript("codex", "/tmp/test.sock", {}, false);
+      expect(script).toContain('tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 "codex"');
+      expect(script).not.toContain(
+        'tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 "codex" --no-daemon'
+      );
+    });
+
     it("retries /status within a bounded budget when only the refresh placeholder renders", () => {
       const script = buildTmuxScript("codex", "/tmp/test.sock");
 
@@ -117,6 +159,47 @@ describe("codex-status-scrape", () => {
 
       // AUTH-SAFETY: every retry is still /status, never /usage.
       expect(script).not.toContain("/usage");
+    });
+  });
+
+  describe("--no-daemon capability detection (issue #779)", () => {
+    const probeEnv = { CODEX_HOME: "/tmp/isolated-codex-home" };
+
+    it("picks up an in-place CLI upgrade between probes", () => {
+      spawnSyncMock
+        .mockReturnValueOnce({ status: 0, stdout: "Usage: codex\n", stderr: "" })
+        .mockReturnValueOnce({
+          status: 0,
+          stdout: "Usage: codex\n  --no-daemon\n",
+          stderr: "",
+        });
+
+      expect(supportsNoDaemon("codex-upgrade-test", probeEnv)).toBe(false);
+      expect(supportsNoDaemon("codex-upgrade-test", probeEnv)).toBe(true);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(2);
+      expect(spawnSyncMock).toHaveBeenNthCalledWith(1, "codex-upgrade-test", ["--help"], {
+        encoding: "utf8",
+        env: probeEnv,
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(spawnSyncMock).toHaveBeenNthCalledWith(2, "codex-upgrade-test", ["--help"], {
+        encoding: "utf8",
+        env: probeEnv,
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    });
+
+    it("does not use the flag when a CLI help result lacks it", () => {
+      spawnSyncMock.mockReturnValue({ status: 0, stdout: "Usage: codex\n", stderr: "" });
+      expect(supportsNoDaemon("codex-without-daemon-test", probeEnv)).toBe(false);
+    });
+
+    it("falls back when the bounded capability probe fails", () => {
+      spawnSyncMock.mockReturnValue({ status: 2, stdout: "", stderr: "unknown option" });
+      expect(supportsNoDaemon("codex-failed-help-test", probeEnv)).toBe(false);
+      expect(spawnSyncMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -331,6 +414,71 @@ describe("codex-status-scrape", () => {
       expect(output).toBe("rendered 5h limit: 99% left\n");
     });
 
+    it("launches an older CLI without --no-daemon when its help lacks that flag", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnSyncMock.mockImplementation((command: unknown) => {
+        if (command === "codex-0.144.4-test") {
+          return { status: 0, stdout: "Usage: codex\n", stderr: "" };
+        }
+      });
+      spawnMock.mockImplementation((_command, _args) => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      await scrapeCodexStatus({
+        actorDir: "/tmp/actor",
+        cliCommand: "codex-0.144.4-test",
+        codexConfigDir: "/tmp/codex-config",
+      });
+
+      const script = String(spawnMock.mock.calls[0]?.[1]?.[1]);
+      expect(script).toContain('new-session -d -s "$S" -x 120 -y 50 "codex-0.144.4-test"');
+      expect(script).not.toContain('"codex-0.144.4-test" --no-daemon');
+    });
+
+    it("runs the capability probe in the isolated home, never an inherited CODEX_HOME (issue #781)", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnSyncMock.mockReturnValue({ status: 0, stdout: "Usage: codex\n", stderr: "" });
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      const origCodexHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = "/tmp/ambient-live-codex-home";
+      try {
+        await scrapeCodexStatus({
+          actorDir: "/tmp/actor",
+          cliCommand: "codex-env-pin-test",
+          codexConfigDir: "/tmp/codex-config",
+        });
+      } finally {
+        if (origCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = origCodexHome;
+      }
+
+      const probe = spawnSyncMock.mock.calls.find(
+        ([command, args]) => command === "codex-env-pin-test" && String(args) === "--help"
+      );
+      expect(probe?.[2]?.env?.CODEX_HOME).toBe("/tmp/test-codex-home");
+      expect(spawnMock.mock.calls[0]?.[2]?.env?.CODEX_HOME).toBe("/tmp/test-codex-home");
+    });
+
     it("symlinks the host auth.json into the isolated codex home when it exists", async () => {
       existsSyncMock.mockImplementation((p) => String(p).endsWith("auth.json"));
 
@@ -357,6 +505,186 @@ describe("codex-status-scrape", () => {
         expect.stringContaining("/tmp/codex-config/auth.json"),
         "/tmp/test-codex-home/auth.json"
       );
+    });
+
+    it("with the broker on, seeds a leased copy instead of the shared symlink and revokes it", async () => {
+      existsSyncMock.mockImplementation((p) => String(p).endsWith("auth.json"));
+      lstatSyncMock.mockReturnValue({ isSymbolicLink: () => false });
+      leaseMock.mockResolvedValue({
+        authJson: '{"tokens":{"refresh_token":"rusa-cap-fixture"}}',
+        refreshUrl: "http://127.0.0.1:4555/oauth/token",
+        revoke: revokeMock,
+      });
+      brokerOn = true;
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      try {
+        await scrapeCodexStatus({ actorDir: "/tmp/actor", codexConfigDir: "/tmp/codex-config" });
+      } finally {
+        brokerOn = false;
+      }
+
+      expect(symlinkSyncMock).not.toHaveBeenCalled();
+      expect(writeFileSyncMock).toHaveBeenCalledWith(
+        "/tmp/test-codex-home/auth.json",
+        '{"tokens":{"refresh_token":"rusa-cap-fixture"}}',
+        { mode: 0o600 }
+      );
+      const env = spawnMock.mock.calls[0]?.[2]?.env;
+      expect(env?.CODEX_HOME).toBe("/tmp/test-codex-home");
+      expect(env?.CODEX_REFRESH_TOKEN_URL_OVERRIDE).toBe("http://127.0.0.1:4555/oauth/token");
+      expect(revokeMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("with the broker on, rejects rather than falling back when the lease fails", async () => {
+      leaseMock.mockRejectedValue(
+        new Error("codex auth broker cannot read the canonical auth.json")
+      );
+      brokerOn = true;
+      try {
+        await expect(
+          scrapeCodexStatus({ actorDir: "/tmp/actor", codexConfigDir: "/tmp/codex-config" })
+        ).rejects.toThrow(/canonical auth\.json/);
+      } finally {
+        brokerOn = false;
+      }
+      expect(symlinkSyncMock).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
+    });
+
+    it("logs diagnostic warning if lingering processes reference codexHome during cleanup", async () => {
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      readdirSyncMock.mockReturnValue(["99999"]);
+      readFileSyncMock.mockReturnValue("/tmp/test-codex-home/app-server --managed-daemon");
+      const logs: { event: string; fields?: Record<string, unknown> }[] = [];
+      const testLogger = {
+        warn: (event: string, fields?: Record<string, unknown>) => {
+          logs.push({ event, fields });
+        },
+      } as unknown as Logger;
+      setCodexScrapeLogger(testLogger);
+
+      try {
+        await scrapeCodexStatus({
+          actorDir: "/tmp/actor",
+          codexConfigDir: "/tmp/codex-config",
+        });
+
+        expect(
+          logs.some((l) => l.event === "lingering_codex_home_processes" && l.fields?.count === 1)
+        ).toBe(true);
+        expect(rmSyncMock).toHaveBeenCalledWith("/tmp/test-codex-home", {
+          recursive: true,
+          force: true,
+        });
+      } finally {
+        setCodexScrapeLogger(undefined);
+      }
+    });
+  });
+
+  describe("process detection and cleanup diagnostics (issue #779)", () => {
+    it.each([
+      { pid: 0, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "system pid 0" },
+      { pid: 1, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "init pid 1" },
+      { pid: process.pid, home: "/tmp/home", cmd: "", cwd: "", expected: false, name: "self pid" },
+      {
+        pid: process.ppid,
+        home: "/tmp/home",
+        cmd: "",
+        cwd: "",
+        expected: false,
+        name: "parent pid",
+      },
+      { pid: 54321, home: "", cmd: "/tmp/home", cwd: "", expected: false, name: "empty home" },
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "codex --listen unix:///tmp/home/app.sock",
+        cwd: "",
+        expected: true,
+        name: "cmdline match",
+      },
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "codex",
+        cwd: "/tmp/home/subpath",
+        expected: true,
+        name: "cwd match",
+      },
+      {
+        pid: 54321,
+        home: "/tmp/home",
+        cmd: "unrelated",
+        cwd: "/var/log",
+        expected: false,
+        name: "unrelated process",
+      },
+    ])("isProcessReferencingHome correctly classifies $name", ({
+      pid,
+      home,
+      cmd,
+      cwd,
+      expected,
+    }) => {
+      readFileSyncMock.mockReturnValue(cmd);
+      readlinkSyncMock.mockReturnValue(cwd);
+      expect(isProcessReferencingHome(pid, home)).toBe(expected);
+    });
+
+    it("isProcessReferencingHome handles unreadable /proc entries gracefully", () => {
+      readFileSyncMock.mockImplementation(() => {
+        throw new Error("ENOENT");
+      });
+      readlinkSyncMock.mockImplementation(() => {
+        throw new Error("ENOENT");
+      });
+      expect(isProcessReferencingHome(54321, "/tmp/home")).toBe(false);
+    });
+
+    it("detectProcessesReferencingHome returns matching pids without killing", () => {
+      readdirSyncMock.mockReturnValue(["100", "200", "not-a-pid"]);
+      readFileSyncMock.mockImplementation((p: unknown) => {
+        if (String(p).includes("/100/cmdline")) return "app-server /tmp/target-home";
+        return "unrelated-process";
+      });
+      readlinkSyncMock.mockReturnValue("/other/dir");
+
+      const matches = detectProcessesReferencingHome("/tmp/target-home");
+      expect(matches).toEqual([100]);
+    });
+
+    it("detectProcessesReferencingHome returns empty array on empty home or unreadable /proc", () => {
+      expect(detectProcessesReferencingHome("")).toEqual([]);
+      readdirSyncMock.mockImplementation(() => {
+        throw new Error("EACCES");
+      });
+      expect(detectProcessesReferencingHome("/tmp/home")).toEqual([]);
     });
   });
 });

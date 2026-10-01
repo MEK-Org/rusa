@@ -4,13 +4,31 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createLogger, type Logger } from "../observability/logger.js";
+import {
+  activeCodexAuthBroker,
+  CODEX_REFRESH_URL_ENV,
+  type CodexAuthLease,
+  writeCodexLeaseAuth,
+} from "./codex-auth-broker.js";
+
+let _scrapeLogger: Logger | undefined;
+export function setCodexScrapeLogger(logger: Logger | undefined): void {
+  _scrapeLogger = logger;
+}
+function scrapeLog(): Logger {
+  _scrapeLogger ??= createLogger({ context: { component: "codex-status-scrape" } });
+  return _scrapeLogger;
+}
 
 /**
  * Host-side PTY scrape of codex's interactive `/status` panel .
@@ -70,11 +88,50 @@ export interface TmuxScriptTiming {
   bannerTries?: number;
 }
 
+/**
+ * Environment for every Codex process the scrape starts. `CODEX_HOME` is always
+ * pinned to the isolated throwaway home: an inherited `CODEX_HOME` can name a
+ * live credential store (inside a Codex sandbox it is the writable host
+ * `auth.json` bind), so no spawn here may fall through to it.
+ */
+function codexProbeEnv(codexHome: string, lease?: CodexAuthLease): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" };
+  if (lease) env[CODEX_REFRESH_URL_ENV] = lease.refreshUrl;
+  return env;
+}
+
+/**
+ * Determine whether the interactive TUI currently accepts `--no-daemon`.
+ * Codex 0.158+ needs the flag to avoid starting a managed app-server, while
+ * the quickstart image's 0.144.4 CLI rejects it outright. Probe for every
+ * scrape rather than caching the result: an in-place CLI upgrade must take
+ * effect without restarting the coordinator. A failed capability probe is
+ * deliberately treated as unsupported: the regular scrape will then report
+ * its own launch failure rather than making a second, unbounded best-effort
+ * probe part of the quota-read path.
+ */
+export function supportsNoDaemon(cliCommand: string, env: NodeJS.ProcessEnv): boolean {
+  try {
+    const help = spawnSync(cliCommand, ["--help"], {
+      encoding: "utf8",
+      env,
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (help.error || help.status !== 0) return false;
+
+    return `${help.stdout ?? ""}\n${help.stderr ?? ""}`.includes("--no-daemon");
+  } catch {
+    return false;
+  }
+}
+
 /** tmux orchestration: launch codex, send /status, capture the rendered panel. */
 export function buildTmuxScript(
   cliCommand: string,
   sockPath: string,
-  timing: TmuxScriptTiming = {}
+  timing: TmuxScriptTiming = {},
+  useNoDaemon = true
 ): string {
   const budgetS = timing.budgetS ?? 80;
   const attemptSecs = timing.attemptSecs ?? 10;
@@ -106,7 +163,11 @@ export function buildTmuxScript(
     // capturing + reaping tmux before Node's timer fires.
     `BUDGET_S=${budgetS}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}`,
+    // Codex 0.158+ needs --no-daemon to avoid leaking a managed app-server;
+    // older supported CLIs (including quickstart's 0.144.4) reject that flag.
+    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${
+      useNoDaemon ? " --no-daemon" : ""
+    }`,
     // Wait for the codex banner (TUI ready), polling ~0.5s per try.
     `for i in $(seq 1 ${bannerTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -189,12 +250,20 @@ export function buildTmuxScript(
  * (so credential refreshes persist across cleanup, matching #128's shared-auth discipline)
  * plus a probe-specific `config.toml` (host config, best effort) with the probe dir
  * pre-trusted so the interactive TUI never blocks on its "Do you trust this directory?" prompt.
+ * With the host-owned broker on (#782) the probe gets a brokered `lease` copy instead of
+ * the symlink, so it refreshes through the broker and never writes the canonical login.
  * Returns the new home dir (caller deletes it).
  */
-function seedIsolatedCodexHome(actorDir: string, hostCodexDir: string): string {
+function seedIsolatedCodexHome(
+  actorDir: string,
+  hostCodexDir: string,
+  lease?: CodexAuthLease
+): string {
   const codexHome = mkdtempSync(join(tmpdir(), "rusa-codex-status-"));
   const hostAuth = join(hostCodexDir, "auth.json");
-  if (existsSync(hostAuth)) {
+  if (lease) {
+    writeCodexLeaseAuth(codexHome, lease);
+  } else if (existsSync(hostAuth)) {
     try {
       symlinkSync(resolve(hostAuth), join(codexHome, "auth.json"));
     } catch {
@@ -245,15 +314,67 @@ function stderrTail(chunks: readonly string[]): string {
   return `: ${text.length > 300 ? `\u2026${text.slice(-300)}` : text}`;
 }
 
+/**
+ * Test whether a process appears to reference a specific isolated CODEX_HOME
+ * either through its command line arguments or its current working directory.
+ */
+export function isProcessReferencingHome(pid: number, codexHome: string): boolean {
+  if (pid <= 1 || pid === process.pid || pid === process.ppid || !codexHome) return false;
+  try {
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    if (cmd.includes(codexHome)) return true;
+  } catch {
+    // Process exited or unreadable
+  }
+  try {
+    const cwd = readlinkSync(`/proc/${pid}/cwd`);
+    if (cwd === codexHome || cwd.startsWith(`${codexHome}/`)) return true;
+  } catch {
+    // Process exited or unreadable
+  }
+  return false;
+}
+
+/**
+ * Detect any surviving processes referencing the throwaway CODEX_HOME before directory
+ * removal (e.g. reparented daemons or child processes). Returns matching PIDs.
+ */
+export function detectProcessesReferencingHome(codexHome: string): number[] {
+  if (!codexHome) return [];
+  const matches: number[] = [];
+  try {
+    const entries = readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (isProcessReferencingHome(pid, codexHome)) {
+        matches.push(pid);
+      }
+    }
+  } catch {
+    // /proc unreadable (non-Linux or sandboxed)
+  }
+  return matches;
+}
+
 export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
 
   const hostCodexDir = opts.codexConfigDir ?? join(homedir(), ".codex");
-  const codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir);
+  // A broker fault rejects the scrape (an unknown reading), never falls back to
+  // the shared writable login.
+  const lease = await activeCodexAuthBroker()?.lease(timeoutMs + 60_000);
+  let codexHome: string;
+  try {
+    codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir, lease);
+  } catch (err) {
+    lease?.revoke();
+    throw err;
+  }
+  const env = codexProbeEnv(codexHome, lease);
   const sock = join(codexHome, "status-tmux.sock");
-  const script = buildTmuxScript(cliCommand, sock);
 
   // The bash script launches a DETACHED tmux server (`new-session -d`) that
   // double-forks away from bash's process group — so killing the bash shell (on
@@ -271,8 +392,17 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
   const cleanup = () => {
     killTmux();
+    const lingering = detectProcessesReferencingHome(codexHome);
+    if (lingering.length > 0) {
+      scrapeLog().warn("lingering_codex_home_processes", {
+        count: lingering.length,
+        pids: lingering.slice(0, 10),
+        codexHome,
+      });
+    }
+    lease?.revoke();
     try {
-      assertSharedAuthSymlink(codexHome, hostCodexDir);
+      if (!lease) assertSharedAuthSymlink(codexHome, hostCodexDir);
     } catch {
       try {
         rmSync(codexHome, { recursive: true, force: true });
@@ -289,6 +419,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   };
 
   try {
+    const script = buildTmuxScript(cliCommand, sock, {}, supportsNoDaemon(cliCommand, env));
     return await new Promise<string>((resolve, reject) => {
       const chunks: string[] = [];
       const errChunks: string[] = [];
@@ -296,7 +427,7 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
       // signal the whole group with `process.kill(-pid, ...)`.
       const child = spawn("bash", ["-c", script], {
         cwd: opts.actorDir,
-        env: { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" },
+        env,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });

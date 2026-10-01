@@ -463,6 +463,71 @@ describe("SqliteInboxRepository", () => {
     });
   });
 
+  describe("onItemsHandled", () => {
+    const entry = (id: string, actorId = "actor-a") => ({
+      id,
+      actorId,
+      source: "chat",
+      payload: { type: "message.created" },
+    });
+
+    it("notifies subscribers with actorId and results when markHandled is called", () => {
+      store.append([entry("h-1"), entry("h-2")]);
+      const listener = vi.fn();
+      store.onItemsHandled(listener);
+
+      const handled = store.markHandled("actor-a", ["h-1"], undefined, "resolved");
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith("actor-a", handled);
+      expect(handled).toEqual([{ id: "h-1", handledAt: expect.any(Date), alreadyHandled: false }]);
+    });
+
+    it("notifies subscribers when replaceEntries marks entries handled", () => {
+      store.append([entry("orig")]);
+      const listener = vi.fn();
+      store.onItemsHandled(listener);
+
+      const { handled } = store.replaceEntries("actor-a", ["orig"], "delegated", [entry("repl")]);
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith("actor-a", handled);
+      expect(handled[0]?.id).toBe("orig");
+    });
+
+    it("stops notifying after unsubscribing", () => {
+      store.append([entry("unsub-1"), entry("unsub-2")]);
+      const listener = vi.fn();
+      const unsubscribe = store.onItemsHandled(listener);
+
+      store.markHandled("actor-a", ["unsub-1"]);
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      unsubscribe();
+      store.markHandled("actor-a", ["unsub-2"]);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("isolates throwing listeners and reports through the listener error handler", () => {
+      store.append([entry("err-1")]);
+      const errors: unknown[] = [];
+      const throwing = vi.fn(() => {
+        throw new Error("listener boom");
+      });
+      const surviving = vi.fn();
+
+      store.setListenerErrorHandler((err) => errors.push(err));
+      store.onItemsHandled(throwing);
+      store.onItemsHandled(surviving);
+
+      const handled = store.markHandled("actor-a", ["err-1"]);
+      expect(throwing).toHaveBeenCalledTimes(1);
+      expect(surviving).toHaveBeenCalledWith("actor-a", handled);
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as Error).message).toBe("listener boom");
+    });
+  });
+
   it("handled_at changes only through actor mark_handled", async () => {
     vi.useFakeTimers();
     store.append([

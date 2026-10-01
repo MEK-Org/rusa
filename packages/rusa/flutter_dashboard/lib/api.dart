@@ -38,6 +38,17 @@ class DashboardApi {
     return ThreadsSnapshot.fromJson(await _getJson(_u('/api/mesh/threads')));
   }
 
+  /// `GET /api/mesh/chat-room` → the mesh-wide Chat Room roster (#663): root
+  /// first, then each actor root added, in the order it was added.
+  Future<List<String>> fetchChatRoom() async {
+    final json = await _getJson(_u('/api/mesh/chat-room'));
+    return (json['participants'] as List<dynamic>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map((participant) => participant['actorId'])
+        .whereType<String>()
+        .toList();
+  }
+
   /// `GET /api/mesh/recent-activity` → newest-first activity items (#664).
   Future<List<RecentActivityItem>> fetchRecentActivity({int limit = 50}) async {
     final json = await _getJson(

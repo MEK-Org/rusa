@@ -55,6 +55,18 @@ export interface PromptBuild {
   injectRecord?: InjectRecord;
 }
 
+/**
+ * The normalized identity of one provider invocation.  This deliberately
+ * contains only the values consumers such as write attribution need, so a
+ * remote runtime can forward its actual attempt without pretending to own a
+ * full provider implementation.
+ */
+export interface ProviderAttempt {
+  providerName: string;
+  model?: string;
+  effort?: string;
+}
+
 export interface ActorOptions {
   /** Stable actor id (the thread handle). */
   id: string;
@@ -171,9 +183,11 @@ export interface ActorOptions {
    * Called immediately before each provider attempt with the instance that will
    * run. Unlike onRunStart, this includes fallbacks without changing run
    * lifecycle accounting. Its model and effort are the instantiated values, not
-   * the pre-normalization request.
+   * the pre-normalization request. The provider is not invoked until a returned
+   * promise settles, so a hook that publishes the attempt elsewhere can confirm
+   * it is installed before the provider can act under it.
    */
-  onProviderAttempt?: (provider: CodingProvider) => void;
+  onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked.
@@ -428,30 +442,48 @@ export class Actor {
     this.killable = false;
   }
 
-  /** Cancel a provider start that is still queued, retaining its scheduling opportunity. */
-  cancelQueuedRun(): boolean {
+  /**
+   * Cancel a provider start that is still queued. By default (`retain: true`),
+   * retains its scheduling opportunity for resume (used by halt/concurrency).
+   * When `retain: false`, drops the opportunity so empty-inbox cancellations
+   * leave the actor idle without waiting for a resume replay.
+   */
+  cancelQueuedRun(opts?: { retain?: boolean }): boolean {
+    const retain = opts?.retain ?? true;
     // A re-quote has already cancelled the provider reservation but has not
     // unwound into its fresh admission yet. A halt in that window must claim
     // the queued work and clear the dirty replay, otherwise the fresh
     // beforeRun would skip it without leaving anything for /resume to replay.
     if (this.reschedulingQueuedRun) {
-      this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+      if (retain) {
+        this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+        this.cancelledQueuedRun = true;
+      } else {
+        this.cancelledQueuedNudge = undefined;
+        this.cancelledQueuedRun = false;
+      }
       this.reschedulingQueuedRun = false;
       // A re-admission can be paused in beforeRun after the old reservation
       // has unwound. Invalidate that admission too, so its eventual preflight
       // result cannot proceed after this halt has parked the opportunity.
       this.admissionEpoch++;
       this.runner.cancelPending();
-      this.cancelledQueuedRun = true;
       return true;
     }
     if (!this.pendingStart?.cancel?.()) return false;
-    this.cancelledQueuedNudge = mergeNudges(
-      this.runner.currentNudgeSnapshot(),
-      this.nudgeWhileQueued ?? null
-    );
-    this.nudgeWhileQueued = undefined;
-    this.cancelledQueuedRun = true;
+    if (retain) {
+      this.cancelledQueuedNudge = mergeNudges(
+        this.runner.currentNudgeSnapshot(),
+        this.nudgeWhileQueued ?? null
+      );
+      this.cancelledQueuedRun = true;
+      this.nudgeWhileQueued = undefined;
+    } else {
+      this.cancelledQueuedNudge = undefined;
+      this.cancelledQueuedRun = false;
+      // Leave this.nudgeWhileQueued intact: if new work arrived while queued,
+      // runOnce's finally block will request a fresh run for it.
+    }
     this.opts.onQueuedRunCancelled?.();
     return true;
   }
@@ -774,8 +806,8 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (provider: CodingProvider): Promise<RunResult> => {
-      this.opts.onProviderAttempt?.(provider);
+    const runProvider = async (provider: CodingProvider): Promise<RunResult> => {
+      await this.opts.onProviderAttempt?.(provider);
       return provider.run({
         prompt: built.prompt,
         cwd: this.opts.cwd,
@@ -823,6 +855,8 @@ export class Actor {
         // A normal run can wait in provider pacing after its initial preflight.
         // Do not let that stale opportunity cross a newer host-owned authority
         // boundary; the authority release supplies its own durable-work nudge.
+        // The same refusal drops a run whose inbox was handled to empty while
+        // it waited; newly delivered work requests a fresh run.
         this.lastRunSkipped = true;
         throw new RunStartCancelledError();
       }

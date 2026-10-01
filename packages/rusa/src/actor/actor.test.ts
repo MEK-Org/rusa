@@ -131,12 +131,13 @@ describe("Actor", () => {
           { provider: provider.providerName, model: "gpt-5.6-terra" },
         ],
         gate: (fn, candidates) => fn(candidates[1]),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       provider
     );
@@ -170,12 +171,13 @@ describe("Actor", () => {
             selected.model,
             selected.effort
           ),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       new FakeProvider()
     );
@@ -533,6 +535,43 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
     await flush();
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+  });
+
+  it("cancels a queued run without retaining its scheduling opportunity when retain is false (#787)", async () => {
+    let releaseBlocker!: () => void;
+    const blocker = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const limiter = new ConcurrencyLimiter(1);
+    limiter.enqueue(() => blocker);
+
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(actor.isQueued).toBe(true);
+    expect(actor.cancelQueuedRun({ retain: false })).toBe(true);
+    await flush();
+    expect(provider.calls).toHaveLength(0);
+    expect(actor.isQueued).toBe(false);
+
+    releaseBlocker();
+    await flush();
+    // Because retain: false was requested, the opportunity is NOT retained:
+    expect(actor.resumeCancelledRun()).toBe(false);
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(provider.calls).toHaveLength(0);
   });
 
   it("requotes a queued run without changing its responsive corrective nudge", async () => {
@@ -1073,12 +1112,13 @@ describe("Actor", () => {
         ],
         resolveProvider: resolvePoolEntry,
         classifyExhaustion: async () => ({ exhausted: true }),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       primary
     );
@@ -1127,12 +1167,13 @@ describe("Actor", () => {
         ],
         resolveProvider: resolvePoolEntry,
         classifyExhaustion: async () => ({ exhausted: true }),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       primary
     );

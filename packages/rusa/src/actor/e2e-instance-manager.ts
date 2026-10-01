@@ -18,6 +18,10 @@ import { loadConfig } from "../config/index.js";
 import { assertSecretContainment, SECRETS_DIRNAME } from "../config/secrets.js";
 import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
+  activeCodexAuthBroker,
+  codexAuthBrokerConfigured,
+} from "../providers/codex-auth-broker.js";
+import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
   buildToolchainPath,
@@ -79,6 +83,7 @@ export interface E2EInstanceManagerOptions {
   isPortReady?: (port: number) => Promise<boolean>;
   delay?: (ms: number) => Promise<void>;
   exec?: (file: string, args: string[]) => string;
+  codexAuthBroker?: boolean;
 }
 
 const isSelfOrDescendant = (root: string, target: string): boolean =>
@@ -552,13 +557,27 @@ export class E2EInstanceManager {
     // nested actor sandboxes. Claude/Antigravity/Copilot need writable token
     // refresh state; Codex reads its host auth.json read-only here (the nested
     // sandbox binds it writable directly, matching the direct/non-e2e path).
+    // When providers.codex.authBroker is enabled, bind no Codex login at all:
+    // nested instances fail closed rather than exposing canonical host credentials.
     // Kimi is handled separately below: it needs a narrower, per-subdirectory
     // split rather than one blanket read-only (or writable) directory bind.
+    const codexBrokerActive =
+      this.opts.codexAuthBroker ??
+      (activeCodexAuthBroker() !== undefined ||
+        (hasBaseConfig &&
+          (() => {
+            try {
+              return codexAuthBrokerConfigured(loadConfig(dirname(configSource)));
+            } catch {
+              return true;
+            }
+          })()));
+
     for (const [relativePath, writable] of [
       [".claude", true],
       [".claude.json", true],
       [".gemini", true],
-      [".codex", false],
+      ...(!codexBrokerActive ? [[".codex", false] as const] : []),
       [".copilot", true],
       [join(".config", "github-copilot"), true],
       [join(".config", "copilot"), true],

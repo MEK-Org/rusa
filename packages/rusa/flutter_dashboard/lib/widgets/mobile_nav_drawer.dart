@@ -17,6 +17,7 @@ class MobileNavDrawer extends StatelessWidget {
     required this.selected,
     required this.onSelect,
     this.quotaProviders = kDefaultQuotaProviders,
+    this.destinations,
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
@@ -31,6 +32,7 @@ class MobileNavDrawer extends StatelessWidget {
   final ValueChanged<DashboardView> onSelect;
 
   final Map<String, QuotaProviderConfig> quotaProviders;
+  final List<DashboardDestination>? destinations;
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
@@ -72,7 +74,8 @@ class MobileNavDrawer extends StatelessWidget {
                   ),
                   const Divider(height: 1, color: MeshColors.border),
                   const SizedBox(height: 8),
-                  for (final destination in kDashboardDestinations)
+                  for (final destination
+                      in (destinations ?? kDashboardDestinations))
                     _DrawerNavItem(
                       destination: destination,
                       selected: selected,

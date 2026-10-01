@@ -274,6 +274,11 @@ export interface QuotaProbeOutcome {
   state?: ProviderQuotaSnapshot;
   didProbe: boolean;
   error?: unknown;
+  /**
+   * The probe's own read produced no reading, even when `state` carries an
+   * earlier reading forward (#775).
+   */
+  readFailed?: boolean;
 }
 
 /** The valid `QuotaWindowKind` values, for validating the LLM's `kind` output. */
@@ -365,6 +370,21 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     },
   },
   required: ["label", "kind", "placeholder", "scope"],
+  // Gemini writes optional keys alphabetically unless told otherwise, which
+  // puts usedPercent after both reset fields. A model that skipped the resets
+  // then wrote them into the percentage ("36-10-05T02:59:00+00:00", "10idk")
+  // and dropped the reset. Percentages first, then resets (#775).
+  propertyOrdering: [
+    "label",
+    "kind",
+    "placeholder",
+    "scope",
+    "models",
+    "usedPercent",
+    "remainingPercent",
+    "resetAtIso",
+    "resetInIso",
+  ],
 };
 
 /**
@@ -1262,6 +1282,8 @@ export class QuotaService {
     string,
     { promise: Promise<ProviderQuotaSnapshot>; startedAt: number }
   >();
+  /** States a probe returned after its own read failed, carried or not. */
+  private readonly failedReads = new WeakSet<ProviderQuotaSnapshot>();
 
   constructor(deps: QuotaMcpDeps) {
     this.deps = deps;
@@ -1323,6 +1345,7 @@ export class QuotaService {
       const rawState = await parse();
       const inferredState = inferQuotaState(rawState, prevState, scrapedAt);
       if (id) this.deps.scrapeStore?.recordParsed(id, rawState, inferredState);
+      if (rawState.status === "unknown") this.failedReads.add(inferredState);
       return inferredState;
     } catch (error) {
       if (id) this.deps.scrapeStore?.recordParseError(id, error);
@@ -1340,7 +1363,7 @@ export class QuotaService {
             )
         );
         if (hasUnexpired) {
-          return inferQuotaState(
+          const carried = inferQuotaState(
             {
               provider,
               status: "unknown",
@@ -1351,6 +1374,8 @@ export class QuotaService {
             prevState,
             scrapedAt
           );
+          this.failedReads.add(carried);
+          return carried;
         }
       }
       throw error;
@@ -1420,7 +1445,11 @@ export class QuotaService {
       // a slow CLI must not silently add a collection tick to the 30m cadence.
       this.cache.set(provider, { state, timestamp: inFlight.startedAt });
     }
-    return { state, didProbe };
+    return {
+      state,
+      didProbe,
+      ...(state.status === "unknown" || this.failedReads.has(state) ? { readFailed: true } : {}),
+    };
   }
 
   async getQuota(provider: "claude" | "codex" | "agy" | "kimi"): Promise<ProviderQuotaSnapshot> {

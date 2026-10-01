@@ -126,7 +126,7 @@ export interface MeshActor {
   readonly isRunning: boolean;
   readonly isQueued?: boolean;
   readonly isYielded?: boolean;
-  cancelQueuedRun?(): boolean;
+  cancelQueuedRun?(opts?: { retain?: boolean }): boolean;
   /** Cancel a queued reservation and re-admit its same work against current next-run config. */
   rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
@@ -926,6 +926,7 @@ export class ActorMesh {
   private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxRepository;
   private unsubscribeInboxAppends?: () => void;
+  private unsubscribeInboxHandled?: () => void;
   private dispatchJoiningActiveRunPort?: (actorId: string) => boolean;
   /**
    * Recipients of durably committed inbox rows that nothing has woken yet, with
@@ -1079,9 +1080,10 @@ export class ActorMesh {
             onResponsiveArrived: (
               actorId: string,
               entries: readonly InboxEntry[],
-              baseline: "interrupt" | "queue"
+              baseline: "interrupt" | "queue",
+              isRunning: boolean
             ) => {
-              this.shadowResponsiveInterruptions(actorId, entries, baseline);
+              this.shadowResponsiveInterruptions(actorId, entries, baseline, isRunning);
             },
           }
         : {}),
@@ -1118,6 +1120,9 @@ export class ActorMesh {
     if (opts.inboxStore) {
       this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
+      });
+      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId) => {
+        this.cancelEmptyQueuedRun(actorId);
       });
     }
   }
@@ -1484,10 +1489,11 @@ export class ActorMesh {
   private shadowResponsiveInterruptions(
     actorId: string,
     incoming: readonly InboxEntry[],
-    baseline: "interrupt" | "queue"
+    baseline: "interrupt" | "queue",
+    wasRunning: boolean
   ): void {
     const classifier = this.responsiveInterruption;
-    if (!classifier || incoming.length === 0) return;
+    if (!classifier || incoming.length === 0 || !wasRunning) return;
     const selectedEntryIds = [...this.selectedInboxEntries(actorId)];
     // Unselected rows are only ever the fallback for an actor holding no
     // selection, so a selection spares the full unhandled scan entirely.
@@ -1498,14 +1504,15 @@ export class ActorMesh {
       // Direct interrupt() does not dispatch at all, preserving its hard path.
       if (entry.payload.type === "operator.run_now") continue;
       const incomingEntryId = entry.id;
+      const evaluationId = this.idgen();
       void classifier
-        .evaluate({ actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
+        .evaluate({ evaluationId, actorId, incomingEntryId, selectedEntryIds, pendingEntryIds })
         .then((decision) => {
           this.recordEvent({
             kind: "responsive_interruption_shadow",
             actorId,
             detail: "shadow",
-            payload: JSON.stringify({ baseline, decision }),
+            payload: JSON.stringify({ evaluationId, baseline, decision }),
           });
           // The audit row is recorded first and independently: a chat space
           // the bot cannot react in must not cost the measurement this whole
@@ -5182,6 +5189,8 @@ export class ActorMesh {
   shutdownAll(): void {
     this.unsubscribeInboxAppends?.();
     this.unsubscribeInboxAppends = undefined;
+    this.unsubscribeInboxHandled?.();
+    this.unsubscribeInboxHandled = undefined;
     this.appendWakesOwed.clear();
     this.runResponsiveReadyAttention.clear();
     this.runs.closeAll();
@@ -5337,6 +5346,35 @@ export class ActorMesh {
   }
 
   /**
+   * If an actor's unhandled inbox items have dropped to zero while its run is
+   * still queued (in provider pacing or the concurrency limiter), cancel the
+   * queued run without retaining a scheduling opportunity. Active runs and
+   * runs with remaining durable work are preserved.
+   */
+  cancelEmptyQueuedRun(actorId: string): boolean {
+    const resolved = this.resolveThreadId(actorId);
+    const actor = this.runs.liveActor(resolved);
+    if (!actor || actor.isRunning || !actor.isQueued) return false;
+    if (this.hasRunnableInbox(resolved)) return false;
+    return actor.cancelQueuedRun?.({ retain: false }) === true;
+  }
+
+  /**
+   * The durable-work half of the run admission predicate, shared by every
+   * admission boundary: worker factory contexts and the host-wired root.
+   */
+  hasRunnableInbox(actorId: string): boolean {
+    if (!this.inboxStore) return true;
+    const actor = this.runs.liveActor(actorId);
+    const watermark = actor?.getInterruptedWatermark?.();
+    if (watermark) {
+      const entries = this.inboxStore.list(actorId, { status: "unhandled" }).entries;
+      return entries.some((entry) => entry.deliveredAt > watermark);
+    }
+    return this.inboxStore.countUnhandled(actorId) > 0;
+  }
+
+  /**
    * Requeue a reservation after its actor's model pool was explicitly
    * replaced. This is model-change recovery, not quota rebalancing: #672
    * leaves unclaimed work in the shared admission list until a compatible lane
@@ -5362,16 +5400,10 @@ export class ActorMesh {
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: () => {
         if (!this.prepareRun(record.id)) return false;
-        if (!this.inboxStore) return true;
-        const actor = this.runs.liveActor(record.id);
-        const watermark = actor?.getInterruptedWatermark?.();
-        if (watermark) {
-          const entries = this.inboxStore.list(record.id, { status: "unhandled" }).entries;
-          return entries.some((e) => e.deliveredAt > watermark);
-        }
-        return this.inboxStore.countUnhandled(record.id) > 0;
+        return this.hasRunnableInbox(record.id);
       },
-      admitRun: ({ responsive }) => responsive || !this.isVoiceSessionActive(record.id),
+      admitRun: ({ responsive }) =>
+        this.hasRunnableInbox(record.id) && (responsive || !this.isVoiceSessionActive(record.id)),
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
     };

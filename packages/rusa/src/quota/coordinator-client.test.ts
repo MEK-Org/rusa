@@ -1031,6 +1031,51 @@ describe("Issue #355: Quota coordinator client read mode in instance", () => {
       expect(client.getCachedHistory("claude")).toEqual([]);
     });
 
+    it("caches scrape outcomes with the history they came with, and reads a minor-2 service as rows only (#759)", async () => {
+      root = mkdtempSync(join(tmpdir(), "quota-client-history-scrapes-"));
+      const socketPath = join(root, "coordinator.sock");
+      let scrapes: unknown;
+      await listen(socketPath, (_req, res) => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            service: serviceInfo(),
+            provider: "claude",
+            since: "2026-09-15T00:00:00.000Z",
+            records: [],
+            ...(scrapes === undefined ? {} : { scrapes }),
+          })
+        );
+      });
+      const client = new QuotaCoordinatorClient({ socketPath });
+      const outcomes = [
+        { observedAt: "2026-09-15T20:00:00.000Z", outcome: "parsed" },
+        { observedAt: "2026-09-15T20:30:00.000Z", outcome: "failed" },
+      ];
+
+      expect(client.getCachedScrapeOutcomes("claude")).toEqual([]);
+      scrapes = outcomes;
+      expect(await client.getHistory("claude")).toEqual([]);
+      expect(client.getCachedScrapeOutcomes("claude")).toEqual(outcomes);
+
+      // A malformed outcome fails the read and keeps the last good cache.
+      for (const bad of [
+        "not an array",
+        [{ observedAt: "2026-09-15T21:00:00.000Z", outcome: "partial" }],
+        [{ observedAt: "not a time", outcome: "parsed" }],
+        [{ outcome: "parsed" }],
+      ]) {
+        scrapes = bad;
+        expect(await client.getHistory("claude")).toBeNull();
+        expect(client.getCachedScrapeOutcomes("claude")).toEqual(outcomes);
+      }
+
+      // A service that predates the field answers rows only.
+      scrapes = undefined;
+      expect(await client.getHistory("claude")).toEqual([]);
+      expect(client.getCachedScrapeOutcomes("claude")).toEqual([]);
+    });
+
     it("times out coordinator history request when socket hangs", async () => {
       root = mkdtempSync(join(tmpdir(), "quota-client-history-hung-"));
       const socketPath = join(root, "coordinator.sock");

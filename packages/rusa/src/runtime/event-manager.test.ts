@@ -9,6 +9,7 @@ import type {
   InboxAppendInput,
   InboxEntry,
   InboxItemsAppendedListener,
+  InboxItemsHandledListener,
   InboxListOptions,
   InboxPage,
   InboxRepository,
@@ -33,6 +34,11 @@ class FakeInboxStore implements InboxRepository {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  // markHandled below never handles anything, so there is nothing to announce.
+  onItemsHandled(_listener: InboxItemsHandledListener): () => void {
+    return () => {};
   }
 
   append(inputs: InboxAppendInput[]): InboxEntry[] {

@@ -36,6 +36,8 @@ export interface SubprocessRunConfig {
   command: string;
   args: string[];
   cwd: string;
+  /** Child environment; inherits this process's when omitted. */
+  env?: NodeJS.ProcessEnv;
   timeoutMs: number;
   signal?: AbortSignal;
   onChunk?: (chunk: string) => void;
@@ -74,6 +76,7 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
     try {
       child = spawn(config.command, config.args, {
         cwd: config.cwd,
+        env: config.env,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
         // Do NOT pass `timeout:` here — Node's spawn timeout signals only the

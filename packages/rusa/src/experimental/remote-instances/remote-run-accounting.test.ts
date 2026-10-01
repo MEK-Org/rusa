@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorOptions } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
@@ -38,6 +38,7 @@ describe("remote actor run accounting", () => {
   let gateCalls: number;
   let snapshotCalls: number;
   let context: ActorFactoryContext;
+  let providerAttempts: Array<{ providerName: string; model?: string; effort?: string }>;
 
   const openRuns = () =>
     db
@@ -72,6 +73,7 @@ describe("remote actor run accounting", () => {
     admits = [];
     gateCalls = 0;
     snapshotCalls = 0;
+    providerAttempts = [];
     const accounting = createRunAccounting(() => runs);
     remote = new RemoteInstance("test-follower", process.platform, process.pid);
 
@@ -113,6 +115,8 @@ describe("remote actor run accounting", () => {
 
     const actorOptions = {
       modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
+      onProviderAttempt: (attempt: { providerName: string; model?: string; effort?: string }) =>
+        providerAttempts.push(attempt),
       log: (chunk: string) => {
         if (chunk.includes("run accounting failed")) accountingErrors.push(chunk);
       },
@@ -147,6 +151,45 @@ describe("remote actor run accounting", () => {
     expect(failures).toHaveLength(1);
     expect(allRuns()).toEqual([]);
     expect(accountingErrors).toEqual([]);
+  });
+
+  it("installs the admitted and instantiated attempts only while the run is open", async () => {
+    bootActor();
+    followerSends({
+      type: "runStart",
+      responsive: false,
+      selected: { provider: "codex", model: "gpt-5.5" },
+    });
+    const attempt = (requestId: number) =>
+      followerSends({
+        type: "request",
+        requestId,
+        request: {
+          op: "providerAttempt",
+          attempt: { provider: "codex", model: "gpt-5.5", effort: "high" },
+        },
+      });
+    attempt(7);
+    await Promise.resolve();
+    expect(providerAttempts).toEqual([
+      { providerName: "codex", model: "gpt-5.5", effort: undefined },
+      { providerName: "codex", model: "gpt-5.5", effort: "high" },
+    ]);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 7 },
+    });
+
+    await reportComplete();
+    await vi.waitFor(() => expect(openRuns()).toEqual([]));
+    attempt(8);
+    await Promise.resolve();
+    // Answered so the follower is not left waiting, but not installed.
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 8 },
+    });
+    expect(providerAttempts).toHaveLength(2);
   });
 
   it("defers ordinary work at remote final admission without reserving a lane", async () => {
@@ -405,5 +448,43 @@ describe("remote actor run accounting", () => {
     } finally {
       orderedHandle.close();
     }
+  });
+
+  it("cancels a queued remote run without retaining the opportunity when retain is false (#787)", async () => {
+    bootActor();
+    let gateCancelled = false;
+    const gateHandle = {
+      get started() {
+        return false;
+      },
+      promote: () => {},
+      cancel: () => {
+        gateCancelled = true;
+        return true;
+      },
+    };
+    (context as unknown as { admitRun: () => boolean }).admitRun = () => true;
+    (context as unknown as { gate: () => typeof gateHandle }).gate = () => gateHandle;
+
+    followerSends({
+      type: "request",
+      requestId: 20,
+      request: {
+        op: "admit",
+        candidates: [{ provider: "codex", model: "gpt-5.5" }],
+        responsive: false,
+        mode: "ordinary",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(handle.cancelQueuedRun({ retain: false })).toBe(true);
+    expect(gateCancelled).toBe(true);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "cancelQueued", retain: false },
+    });
+    expect(handle.resumeCancelledRun()).toBe(false);
   });
 });

@@ -79,6 +79,7 @@ import { HttpJevDecisionClient } from "../actor/jev-decision-client.js";
 import { createJevInboxTextResolver } from "../actor/jev-inbox-text-resolver.js";
 import {
   type MeshEventSink,
+  obligationStatusChangedEvent,
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
@@ -158,6 +159,7 @@ import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscript
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import { importLegacyPortableContextState } from "../db/legacy-portable-context-import.js";
 import type {
+  ObligationStatusChange,
   PrerequisiteAttention,
   ReadyHeadChange,
 } from "../db/repositories/obligation-repository.js";
@@ -226,6 +228,10 @@ import {
 } from "../observability/log-secrets.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
+import {
+  codexAuthBrokerConfigured,
+  configureCodexAuthBroker,
+} from "../providers/codex-auth-broker.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   acceptableModelPins,
@@ -269,6 +275,7 @@ import {
   type PublishedThrottleProviderStatus,
   weeklyAdmissionObservation,
 } from "../quota/coordinator-protocol.js";
+import { type MissedQuotaWindow, MissedQuotaWindowDetector } from "../quota/missed-windows.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { InboxEntry, InboxRepository } from "../repositories/inbox-repository.js";
@@ -304,7 +311,11 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
+import { ChatRoomService } from "../voice/chat-room.js";
+import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
+import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, filterConfiguredVoices } from "../voice/voice-catalog.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
@@ -472,14 +483,17 @@ export function configuredRootEventSources(config: RusaConfig): EventResource[] 
 /**
  * Every producer that raises host alarms into `system:events`: the disk sensor,
  * the chat subscription keeper's lapse alert (#578) whenever chat is
- * configured, and the model lane retirement alert (#588) whenever the quota
- * throttle reads a coordinator. Root's `system:events` ownership is derived from this same call.
+ * configured, the model lane retirement alert (#588) whenever the quota
+ * throttle reads a coordinator, and the missed quota window alert (#759)
+ * whenever a coordinator is configured at all, since the history refresh that
+ * feeds it runs with or without throttling. Root's `system:events` ownership is
+ * derived from this same call.
  */
 export function hostAlarmProducerActive(config: RusaConfig): boolean {
   return (
     diskAlertActive(config) ||
     config.chat !== undefined ||
-    (config.quota?.throttle?.enabled === true && config.quota.coordinator?.socketPath !== undefined)
+    config.quota?.coordinator?.socketPath !== undefined
   );
 }
 
@@ -981,6 +995,7 @@ async function composeStart(
     return;
   }
   const rootActor = config.rootActor;
+  configureCodexAuthBroker(codexAuthBrokerConfigured(config));
   const errorSink = resolveErrorSink(config);
   if (!rootActor) {
     throw new Error("config loader returned no rootActor after validating root configuration");
@@ -1191,6 +1206,10 @@ async function composeStart(
   getRepositories().obligations.setResponsiveReadyListener((obligation, actingPrincipal) =>
     responsiveReadySink?.(obligation, actingPrincipal)
   );
+
+  // #773 status changes for open dashboards: same deferred-sink shape again.
+  let statusChangeSink: ((change: ObligationStatusChange) => void) | undefined;
+  getRepositories().obligations.setStatusChangeListener((change) => statusChangeSink?.(change));
   // Released just before the database closes. The repository's listeners are
   // closures over these sinks; clearing the sinks rather than the listeners
   // stops a dead mesh being reachable through them without touching a
@@ -1199,6 +1218,7 @@ async function composeStart(
     readyHeadSink = undefined;
     prerequisiteCancellationSink = undefined;
     responsiveReadySink = undefined;
+    statusChangeSink = undefined;
   });
 
   try {
@@ -1519,7 +1539,10 @@ async function composeStart(
                     ...(slackClient ? { slackClient } : {}),
                     meshChat: getRepositories().meshChat,
                     issueClient,
-                  })
+                  }),
+                  {
+                    auditPath: join(mcHome, "audit", "jev-queries.jsonl"),
+                  }
                 ),
               }
             : {}),
@@ -1873,15 +1896,30 @@ async function composeStart(
     }
   };
 
+  // A window one scrape carried and the next did not is raised to this
+  // instance's root once per gap (#759): the dashboard keeps drawing it from an
+  // estimate, so this is what says the reading is missing. Instances sharing a
+  // coordinator each tell their own root. The alarm is bound once the mesh exists.
+  const missedQuotaWindows = new MissedQuotaWindowDetector();
+  let raiseQuotaWindowMissedAlarm: ((missed: MissedQuotaWindow) => void) | null = null;
   let historyRefreshInFlight = false;
   const refreshQuotaHistory = async (): Promise<void> => {
     if (!quotaCoordinatorClient || historyRefreshInFlight) return;
     historyRefreshInFlight = true;
     try {
       const sinceIso = new Date(Date.now() - HISTORY_WINDOW_MS).toISOString();
-      await Promise.allSettled(
+      const reads = await Promise.allSettled(
         quotaProviders.map((provider) => quotaCoordinatorClient.getHistory(provider, sinceIso))
       );
+      reads.forEach((read, index) => {
+        if (read.status !== "fulfilled" || read.value === null) return;
+        const provider = quotaProviders[index];
+        const scrapes = quotaCoordinatorClient.getCachedScrapeOutcomes(provider);
+        for (const missed of missedQuotaWindows.observe(provider, read.value, scrapes)) {
+          log.info("quota_window_missed", { ...missed });
+          raiseQuotaWindowMissedAlarm?.(missed);
+        }
+      });
     } catch (err) {
       log.warn("quota_history_refresh_failed", {
         err: err instanceof Error ? err.message : String(err),
@@ -2425,6 +2463,20 @@ async function composeStart(
   const supportedVoiceCatalog = buildSupportedVoiceCatalog(credentialValidSupportedVoices, {
     availableProviders: availableVoiceProviders,
   });
+  // The mesh-wide Chat Room roster (#663): read by every dashboard, changed
+  // only through the root-seeded `room-admin` tools. An actor without a stored
+  // voice speaks with the instance default, so that is what collisions compare.
+  const chatRoom = new ChatRoomService({
+    store: getRepositories().chatRoom,
+    actors,
+    rootId,
+    voices: () => supportedVoiceCatalog,
+    defaultVoice: googleVoiceConfig(
+      canonicalSupportedVoiceName(config.voice?.voiceName ?? DEFAULT_VOICE_NAME) ??
+        DEFAULT_VOICE_NAME
+    ),
+    isHumanPrincipal: (id) => getRepositories().principals.getUser(id) !== undefined,
+  });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
   // for the root, which has no parent — to the statically configured error chat.
@@ -2752,7 +2804,8 @@ async function composeStart(
     // #549: the administrative capabilities gate the management tools on the
     // agent-exec endpoint itself, so they have no server factory either; the
     // mesh and the endpoint both consult the grant rows directly. The
-    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`)
+    // host-global names listed here (`update`, `pnpm-hardlinks`, `model-admin`,
+    // `room-admin`)
     // are stripped by the mesh: it never grants one, and only the seed below
     // creates their rows.
     grantableCapabilities: new Set([
@@ -2981,6 +3034,7 @@ async function composeStart(
             validateModelClass: (input) =>
               validateModelConfigPool(config, input, { portable: true }),
             getFollowers: () => (followerHub ? followerHub.list() : []),
+            chatRoom,
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -3312,6 +3366,7 @@ async function composeStart(
   prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
     mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
+  statusChangeSink = (change) => mesh.recordEvent(obligationStatusChangedEvent(change));
   responsiveReadySink = (obligation, actingPrincipal) => {
     mesh.deliverResponsiveReadyAttention(
       obligation.ownerId,
@@ -3418,6 +3473,7 @@ async function composeStart(
         mesh.markUnkillable(rootId);
       },
       getFollowers: () => (followerHub ? followerHub.list() : []),
+      chatRoom,
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
@@ -3603,17 +3659,13 @@ async function composeStart(
     },
     // Responsive human wakes bypass normal pacing/concurrency; background root
     // wakes use the same normal scheduling path as workers.
-    beforeRun: (): boolean => {
-      if (!mesh.prepareRun(rootId)) return false;
-      const watermark = root.getInterruptedWatermark?.();
-      if (watermark) {
-        const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
-        return entries.some((e) => e.deliveredAt > watermark);
-      }
-      return inboxStore.countUnhandled(rootId) > 0;
-    },
+    // Root shares the workers' durable-work predicate at both boundaries, so
+    // work handled while its queued run awaits async onQueued is refused at
+    // final admission instead of launching a provider with an empty inbox.
+    beforeRun: (): boolean => mesh.prepareRun(rootId) && mesh.hasRunnableInbox(rootId),
     admitRun: ({ responsive }): boolean =>
-      responsive || !(voiceService?.hasActiveSession(rootId) ?? false),
+      mesh.hasRunnableInbox(rootId) &&
+      (responsive || !(voiceService?.hasActiveSession(rootId) ?? false)),
     gate: (fn, candidates, responsive) =>
       computerUseLock.gateAfterProvider(
         rootId,
@@ -4056,6 +4108,7 @@ async function composeStart(
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
           supportedVoices: supportedVoiceCatalog,
+          chatRoom,
           getFollowers: () => (followerHub ? followerHub.list() : []),
           updateFollower: (id, opts) => {
             if (!followerHub) throw new Error("Follower gateway not enabled");
@@ -4482,6 +4535,41 @@ async function composeStart(
       (quotaThrottleConfig?.tickSeconds ?? 300) * 1000
     );
   }
+
+  raiseQuotaWindowMissedAlarm = (missed) => {
+    const scrape = missed.scrapeFailed
+      ? "quota scrape failed to parse, so it no longer shows"
+      : "quota scrape no longer shows";
+    const message =
+      `Quota window missed: the latest ${missed.provider} ${scrape} ` +
+      `"${missed.label}", last read at ${missed.lastReadingAt}. The dashboard ring now shows ` +
+      "an estimate from that reading; check the scrapes to see why the window dropped out.";
+    void deliverHostAlarm({
+      deliver: () =>
+        mesh.deliverExternalEvent({
+          sourceType: "timer",
+          rawResource: "system:events",
+          rawPayload: { type: "system.quota_window_missed", ...missed, message },
+          // Normal, not responsive: the ring keeps its estimate, a single
+          // missed panel often returns on the next scrape, and nothing here
+          // needs root to drop what it is doing.
+          priority: "normal",
+          eventSummary: message,
+        }),
+      message,
+      sendToErrorChat,
+      log,
+      alarmName: "quota_window_missed",
+    }).then((outcome) => {
+      if (outcome !== "delivered") {
+        log.warn("quota_window_missed_not_delivered_to_mesh", {
+          fallback: outcome,
+          provider: missed.provider,
+          lane: missed.lane,
+        });
+      }
+    });
+  };
 
   raiseModelLaneRetiredAlarm = (provider, model) => {
     const message =

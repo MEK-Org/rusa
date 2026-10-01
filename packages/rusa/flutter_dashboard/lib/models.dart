@@ -1201,6 +1201,7 @@ class QuotaWindowDto {
     this.windowMs = 0,
     this.scrapedAt,
     this.modelIds = const [],
+    this.estimated = false,
   });
 
   final String id;
@@ -1228,6 +1229,11 @@ class QuotaWindowDto {
   /// reached a probe.
   final String? scrapedAt;
 
+  /// True when [usedPercent] is the server's read-time estimate, dead-reckoned
+  /// from the last real reading at the window's observed pace (#759), rather
+  /// than a reading. [scrapedAt] is then that last real reading.
+  final bool estimated;
+
   bool get isKnown => usedPercent != null && status != 'unknown';
 
   /// Returns true if this window has an absolute reset instant that has already
@@ -1253,6 +1259,7 @@ class QuotaWindowDto {
     modelIds: (j['modelIds'] as List<dynamic>? ?? const [])
         .whereType<String>()
         .toList(),
+    estimated: j['estimated'] as bool? ?? false,
   );
 
   /// Inverse of [fromJson] — used to persist the last-known snapshot to
@@ -1269,6 +1276,7 @@ class QuotaWindowDto {
     'windowMs': windowMs,
     'scrapedAt': scrapedAt,
     if (modelIds.isNotEmpty) 'modelIds': modelIds,
+    if (estimated) 'estimated': true,
   };
 }
 

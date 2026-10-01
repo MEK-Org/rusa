@@ -12,6 +12,12 @@ export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
   dailyCap?: string;
+  /**
+   * Codex only: route every Codex refresh through the daemon's host-owned
+   * broker so launched processes never hold or write the canonical login
+   * (#782). Default off while it canaries.
+   */
+  authBroker?: boolean;
 }
 
 export interface GitHubOrgConfig {

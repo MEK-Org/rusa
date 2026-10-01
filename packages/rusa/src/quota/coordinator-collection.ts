@@ -238,7 +238,9 @@ export class QuotaCollectionLoop {
           (Date.now() - startedMs) / 1000,
           { provider }
         );
-        if (outcome.error || outcome.state?.status === "unknown") {
+        // readFailed covers a failed read whose state carries an earlier
+        // reading forward, so the counter tracks clean reads (#775).
+        if (outcome.error || outcome.readFailed || outcome.state?.status === "unknown") {
           stat.failures += 1;
           stat.lastOutcome = "failure";
           stat.lastError = describeProbeFailure(outcome);

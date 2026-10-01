@@ -262,6 +262,16 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  /// The server Chat Room roster (#663), root first.
+  List<String> chatRoomParticipants = const ['root'];
+  int chatRoomCallCount = 0;
+
+  @override
+  Future<List<String>> fetchChatRoom() async {
+    chatRoomCallCount++;
+    return chatRoomParticipants;
+  }
+
   List<RecentActivityItem> recentActivityResult = [];
   int recentActivityCallCount = 0;
 
@@ -1232,13 +1242,14 @@ VoiceAnnouncement makeAnnouncement(
   String id, {
   String actor = 'a',
   String? text,
+  String createdAt = '2026-07-17T00:00:00Z',
 }) => VoiceAnnouncement(
   id: id,
   actorId: actor,
   text: text ?? 'reply $id',
   audioUrl: '/api/mesh/voice/audio/$id',
   mime: 'audio/wav',
-  createdAt: '2026-07-17T00:00:00Z',
+  createdAt: createdAt,
 );
 
 class FakeVoiceRecorder implements VoiceRecorder {
@@ -1246,27 +1257,50 @@ class FakeVoiceRecorder implements VoiceRecorder {
   int stopCalls = 0;
   int cancelCalls = 0;
   Object? startError;
+  Completer<void>? startCompleter;
+
+  /// Per-call acquisition gates for multi-start races: the Nth [start] call
+  /// awaits index N-1 when present, letting tests resolve overlapping
+  /// acquisitions in either completion order.
+  final List<Completer<void>> startGates = [];
   RecordedAudio result = RecordedAudio(
     bytes: Uint8List.fromList([1, 2, 3]),
     mimeType: 'audio/webm;codecs=opus',
   );
 
+  /// Mirrors `WebVoiceRecorder`'s ownership token: [cancel] and [stop] bump
+  /// it, so a [start] still awaiting a gate when either runs is superseded
+  /// and throws instead of returning normally.
+  int _generation = 0;
+
   @override
   Future<void> start() async {
     startCalls++;
+    final generation = _generation;
     final err = startError;
     if (err != null) throw err;
+    final gate = startCalls <= startGates.length
+        ? startGates[startCalls - 1]
+        : null;
+    if (gate != null) await gate.future;
+    final c = startCompleter;
+    if (c != null) await c.future;
+    if (generation != _generation) {
+      throw StateError('mic acquisition superseded by a newer recording session');
+    }
   }
 
   @override
   Future<RecordedAudio> stop() async {
     stopCalls++;
+    _generation++;
     return result;
   }
 
   @override
   Future<void> cancel() async {
     cancelCalls++;
+    _generation++;
   }
 }
 
@@ -1332,7 +1366,7 @@ class FakeVoiceStream implements VoiceStreamSource {
   final framesCtrl = StreamController<VoiceAnnouncement>.broadcast();
   final statusCtrl = StreamController<VoiceStreamStatus>.broadcast();
   final controlsCtrl = StreamController<VoiceSessionControl>.broadcast();
-  final connectCalls = <({List<String> actors, String sessionId})>[];
+  final connectCalls = <({List<String> actors, String? sessionId})>[];
   bool disposed = false;
 
   @override
@@ -1343,7 +1377,7 @@ class FakeVoiceStream implements VoiceStreamSource {
   Stream<VoiceSessionControl> get controls => controlsCtrl.stream;
 
   @override
-  void connect(List<String> actors, String sessionId) =>
+  void connect(List<String> actors, String? sessionId) =>
       connectCalls.add((actors: actors, sessionId: sessionId));
 
   @override

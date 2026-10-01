@@ -1,7 +1,12 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { ProviderQuotaSnapshot, QuotaLimit } from "../mcp/quota-mcp.js";
-import { HISTORY_WINDOW_MS, type PublishedHistoryRecord } from "../quota/coordinator-protocol.js";
+import {
+  DEFAULT_STALE_AFTER_MS,
+  HISTORY_WINDOW_MS,
+  type PublishedHistoryRecord,
+} from "../quota/coordinator-protocol.js";
+import { estimateLane, type LaneReading, quotaLaneKey } from "../quota/lane-estimate.js";
 import { isProviderScopedWindow } from "../quota/window-scope.js";
 
 /**
@@ -71,9 +76,17 @@ export interface QuotaWindowDto {
    * 5) — stamped once at probe time in `ProviderQuotaSnapshot.scrapedAt` and
    * passed through unchanged here, including on cache hits. Null when the
    * state behind this window never reached a probe (kimi, or an
-   * error/unsupported state) rather than a fetch/render time.
+   * error/unsupported state) rather than a fetch/render time. For an
+   * `estimated` window this is the last real reading the estimate extends.
    */
   scrapedAt: string | null;
+  /**
+   * True when `usedPercent` is a read-time estimate rather than a reading
+   * (#759): the lane had no fresh reading, so its last real reading is carried
+   * forward at the window's observed consumption pace. Computed per request and
+   * never persisted or fed back into observations or pacing.
+   */
+  estimated: boolean;
 }
 
 /**
@@ -208,6 +221,7 @@ function claudeWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt: limit.scrapedAt ?? scrapedAt,
+        estimated: false,
       };
     });
   }
@@ -232,6 +246,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
+        estimated: false,
       };
     });
   }
@@ -253,6 +268,7 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
     headline: limit.kind === "weekly",
     windowMs: windowMsFor(limit.kind ?? "other"),
     scrapedAt,
+    estimated: false,
   }));
 }
 
@@ -271,6 +287,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
         scrapedAt: state.scrapedAt ?? null,
+        estimated: false,
       };
     });
   }
@@ -306,6 +323,7 @@ function modelWindowsFor(
         windowMs: windowMsFor(id),
         // Only Claude's bad-read carry dates a window on its own (#763).
         scrapedAt: provider === "claude" ? (limit.scrapedAt ?? scrapedAt) : scrapedAt,
+        estimated: false,
         modelIds: [...modelIds],
       },
     ];
@@ -516,6 +534,112 @@ function latestStateFromHistory(
   };
 }
 
+/**
+ * Replace every window without a fresh reading by its read-time estimate
+ * (#759), and add a window for each lane the newest reading dropped but whose
+ * history can still be dead-reckoned. A window is fresh when it is in the
+ * newest reading, that reading is no older than the lane's stale threshold,
+ * and its window has not reset. A window with nothing to estimate from keeps
+ * what it showed before. A dropped lane is estimated only until its last-seen
+ * window resets, never into a next window no scrape has shown: that is also
+ * when the controller retires a dropped model lane (#588). Nothing here is
+ * written anywhere.
+ *
+ * Window ids and history kinds key the same lanes: both are the closed
+ * `QuotaWindowKind` set, validated where a scrape is parsed and where the
+ * coordinator publishes it, so the store's `normalizeKind` never changes one.
+ */
+function withEstimates(
+  dto: ProviderQuotaDto,
+  history: readonly QuotaHistorySource[],
+  staleAfterMs: number,
+  nowMs: number
+): ProviderQuotaDto {
+  const lanes = new Map<string, QuotaHistorySource[]>();
+  for (const record of history) {
+    const key = quotaLaneKey(record.scope, record.models ?? [], record.kind);
+    const lane = lanes.get(key);
+    if (lane) lane.push(record);
+    else lanes.set(key, [record]);
+  }
+  const estimate = <W extends QuotaWindowDto>(window: W, key: string, missed = false): W => {
+    const scrapedMs = window.scrapedAt === null ? Number.NaN : Date.parse(window.scrapedAt);
+    const resetMs = window.resetAtIso === null ? Number.NaN : Date.parse(window.resetAtIso);
+    const fresh =
+      !Number.isFinite(scrapedMs) ||
+      (!missed &&
+        nowMs - scrapedMs <= staleAfterMs &&
+        !(Number.isFinite(resetMs) && resetMs <= nowMs));
+    if (fresh) return window;
+    const readings: LaneReading[] = [...(lanes.get(key) ?? [])];
+    if (window.usedPercent !== null && !readings.some((r) => r.observedAt === window.scrapedAt)) {
+      readings.push({
+        observedAt: window.scrapedAt as string,
+        percentLeft: 100 - window.usedPercent,
+        resetAtIso: window.resetAtIso,
+      });
+    }
+    const reckoned = estimateLane(readings, window.windowMs, nowMs, { rollover: !missed });
+    if (!reckoned) return window;
+    return {
+      ...window,
+      usedPercent: 100 - reckoned.percentLeft,
+      status: reckoned.percentLeft <= 0 ? "exhausted" : "available",
+      resetAtIso: reckoned.resetAtIso,
+      scrapedAt: reckoned.lastReadingAt,
+      estimated: true,
+    };
+  };
+  const dropped = (key: string): QuotaWindowDto | null => {
+    const readings = lanes.get(key) ?? [];
+    const last = readings.reduce<QuotaHistorySource | undefined>(
+      (newest, r) =>
+        !newest || Date.parse(r.observedAt) > Date.parse(newest.observedAt) ? r : newest,
+      undefined
+    );
+    if (!last) return null;
+    const window: QuotaWindowDto = {
+      id: last.kind,
+      label: last.label,
+      usedPercent: 100 - last.percentLeft,
+      status: last.percentLeft <= 0 ? "exhausted" : "available",
+      resetAtIso: last.resetAtIso,
+      headline: last.kind === "weekly",
+      windowMs: windowMsFor(last.kind),
+      scrapedAt: last.observedAt,
+      estimated: false,
+    };
+    // Missing from the newest scrape is itself the missed reading (#759): it is
+    // estimated however recent its last reading, and not past its reset.
+    const reckoned = estimate(window, key, true);
+    return reckoned.estimated ? reckoned : null;
+  };
+
+  const windows = dto.windows.map((w) => estimate(w, quotaLaneKey("provider", [], w.id)));
+  const modelWindows = dto.modelWindows.map((w) =>
+    estimate(w, quotaLaneKey("model", w.modelIds, w.id))
+  );
+  const shown = new Set([
+    ...windows.map((w) => quotaLaneKey("provider", [], w.id)),
+    ...modelWindows.map((w) => quotaLaneKey("model", w.modelIds, w.id)),
+  ]);
+  for (const [key, readings] of lanes) {
+    if (shown.has(key)) continue;
+    const window = dropped(key);
+    if (!window) continue;
+    const models = readings.at(-1)?.models ?? [];
+    if (readings[0].scope === "provider") windows.push(window);
+    else modelWindows.push({ ...window, modelIds: [...models] });
+  }
+  const headlineWindow = windows.find((w) => w.headline);
+  return {
+    ...dto,
+    usedPercent: headlineWindow ? headlineWindow.usedPercent : null,
+    windows,
+    modelWindows,
+  };
+}
+
 function historyPointLimit(provider: SupportedProvider, point: QuotaHistorySource): QuotaLimit {
   return {
     label: point.label,
@@ -540,11 +664,13 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
   const states = await Promise.all(providers.map((provider) => deps.getQuota(provider)));
   const providerDtos = providers.map((provider, i) => {
     let state = states[i];
+    const history = deps.listHistory?.(provider, toIso(nowMs - HISTORY_WINDOW_MS)) ?? [];
     if (state.status === "unknown" || !state.limits || state.limits.length === 0) {
-      const fallbackRows = deps.listHistory?.(provider, toIso(nowMs - MAX_FALLBACK_HOLD_MS)) ?? [];
-      state = latestStateFromHistory(provider, fallbackRows, nowMs) ?? state;
+      state = latestStateFromHistory(provider, history, nowMs) ?? state;
     }
-    return toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
+    const dto = toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
+    const staleAfterMs = state.freshness?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    return withEstimates(dto, history, staleAfterMs, nowMs);
   });
   return {
     generatedAt,

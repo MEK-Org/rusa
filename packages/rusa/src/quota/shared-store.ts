@@ -13,7 +13,9 @@ import {
   type QuotaMetrics,
   type QuotaObservationResult,
 } from "./coordinator-metrics.js";
+import type { PublishedScrapeOutcome } from "./coordinator-protocol.js";
 import { parseParsedState, serializeParsedState } from "./parsed-state.js";
+import { QUOTA_OBSERVATION_SLOT_MS, quotaCycleChanged } from "./quota-cycle.js";
 import {
   assertQuotaSchemaVersion,
   QUOTA_SCHEMA_VERSION,
@@ -26,7 +28,7 @@ export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalErr
 // the one persistence decoder/writer rather than duplicating JSON handling.
 export { parseParsedState, serializeParsedState } from "./parsed-state.js";
 
-const SLOT_MS = 5 * 60 * 1000;
+const SLOT_MS = QUOTA_OBSERVATION_SLOT_MS;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
@@ -84,19 +86,8 @@ function elapsedActuatorResponse(
     slew: QUOTA_MAX_SLEW_SECONDS * (elapsedSeconds / QUOTA_ACTUATOR_REFERENCE_STEP_SECONDS),
   };
 }
-/**
- * A rise in remaining quota above this many points is read as a refill rather
- * than a measurement. Inside one window `percentLeft` only falls — consumption
- * is the only thing that moves it — so a genuine rise means the budget was
- * replenished under us.
- *
- * This is a noise floor, not a sensitivity knob. The reading is parsed from a
- * rendered percentage, so display rounding can move it by a point without any
- * underlying change; two points clears that with margin. Sensitivity is not the
- * binding constraint in the other direction, because a real refill moves tens
- * of points at once — a weekly window returns to ~100 from single digits.
- */
-export const QUOTA_REFILL_EPSILON_POINTS = 2;
+
+export { QUOTA_REFILL_EPSILON_POINTS } from "./quota-cycle.js";
 
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {
   const expanded =
@@ -706,7 +697,7 @@ export class SharedQuotaStore {
 
   recordParsed(
     id: string,
-    _rawParsed: ProviderQuotaSnapshot,
+    rawParsed: ProviderQuotaSnapshot,
     inferredParsed: ProviderQuotaSnapshot
   ): void {
     const { raw: _raw, ...inferredState } = inferredParsed;
@@ -730,9 +721,11 @@ export class SharedQuotaStore {
         acceptModelScope: true,
       });
     })();
+    // Judge the parser's own read: a failed read that carried an earlier
+    // reading forward is not a clean parse (#775).
     this.metrics.counter(QUOTA_SERVICE_METRICS.parsesTotal, {
       provider: scrape?.provider ?? inferredParsed.provider,
-      outcome: "success",
+      outcome: rawParsed.status === "unknown" ? "failure" : "success",
     });
     if (this.controllerOptions) {
       this.advancePendingController(this.controllerOptions, inferredParsed.provider);
@@ -968,6 +961,27 @@ export class SharedQuotaStore {
     });
   }
 
+  /**
+   * Every finished scrape since `sinceIso`, parsed or failed, by stamp (#759).
+   * A scrape that parsed to no window, or failed to parse, writes no
+   * observation, so this is the only record that it happened. A row still
+   * being parsed (neither column set) is left out until it finishes; no raw
+   * output leaves the store.
+   */
+  listScrapeOutcomesSince(provider: string, sinceIso: string): PublishedScrapeOutcome[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT scraped_at AS observedAt, parse_error IS NOT NULL AS failed
+           FROM quota_scrapes
+           WHERE provider = ? AND scraped_at >= ?
+             AND (parsed_state IS NOT NULL OR parse_error IS NOT NULL)
+           ORDER BY scraped_at ASC, rowid ASC`
+        )
+        .all(provider, sinceIso) as Array<{ observedAt: string; failed: 0 | 1 }>
+    ).map(({ observedAt, failed }) => ({ observedAt, outcome: failed ? "failed" : "parsed" }));
+  }
+
   getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {
     const row = this.db
       .prepare(
@@ -1047,28 +1061,15 @@ export class SharedQuotaStore {
     );
     const error = timeRemainingPct - observation.percentLeft;
     // A cycle boundary is anything that makes the previous error incomparable
-    // to this one, and there are two independent signals for it. Either is
-    // sufficient:
-    //
-    //  1. the reset instant moved — we are budgeting against a different window;
-    //  2. remaining quota rose — the budget refilled underneath us.
-    //
-    // (2) is not implied by (1). A refill whose `reset_at` did not move with it,
-    // or one where the previous row carried no `reset_at` at all, leaves (1)
-    // false. Error is `timeRemainingPct - percentLeft`, so the refill makes the
-    // error fall sharply, and with (1) false that fall is read as genuine
-    // progress rather than the discontinuity it is. It does not merely spike:
+    // to this one: the reset instant moved, or remaining quota rose (see
+    // `quotaCycleChanged`). A refill with an unmoved reset matters on its own:
+    // error is `timeRemainingPct - percentLeft`, so the refill makes the error
+    // fall sharply, and read as genuine progress rather than the discontinuity
+    // it is, that fall does not merely spike:
     // `QUOTA_KD_SECONDS_SQUARED_PER_POINT` and `QUOTA_DERIVATIVE_TAU_SECONDS`
     // share an 1800 s constant, so the misread relaxes the interval across
     // roughly half an hour of subsequent observations.
-    const resetMoved =
-      previous?.resetAtIso != null &&
-      Math.abs(Date.parse(previous.resetAtIso) - resetMs) >
-        Math.min(60 * 60 * 1000, observation.windowMs * 0.05);
-    const quotaRefilled =
-      previous != null &&
-      observation.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
-    const cycleChanged = resetMoved || quotaRefilled;
+    const cycleChanged = quotaCycleChanged(previous, observation, observation.windowMs);
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
       ? Math.max(1, (observedMs - previousObservedMs) / 1000)

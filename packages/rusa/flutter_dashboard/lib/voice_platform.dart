@@ -21,6 +21,11 @@ class RecordedAudio {
 }
 
 /// Microphone capture (MediaRecorder on web). One recording at a time.
+///
+/// Implementations must treat [cancel] as taking effect immediately: if it
+/// runs while [start] is still awaiting mic acquisition, the pending start
+/// fails (never returns normally) and releases whatever it acquired without
+/// disturbing a newer session's state.
 abstract interface class VoiceRecorder {
   /// Start capturing (may prompt for mic permission). Throws when the mic is
   /// unavailable or permission is denied.
@@ -73,8 +78,10 @@ abstract interface class VoiceStreamSource {
   Stream<VoiceStreamStatus> get status;
   Stream<VoiceSessionControl> get controls;
 
-  /// Open the stream for [actors] (≥1 required by the server).
-  void connect(List<String> actors, String sessionId);
+  /// Open the stream for [actors] (≥1 required by the server). A non-null
+  /// [sessionId] opts into the existing single-actor leased-walkie authority;
+  /// a room has presence for several actors but deliberately owns no lease.
+  void connect(List<String> actors, String? sessionId);
 
   /// Close the connection (drops walkie presence) and the streams.
   void dispose();

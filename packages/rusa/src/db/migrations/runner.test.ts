@@ -108,6 +108,7 @@ describe("Database Migration System", () => {
       "0050_drop_obligation_ready_heads",
       "0051_event_source_config",
       "0052_obligation_snooze",
+      "0053_chat_room_participants",
     ]);
 
     const tableNames = (
@@ -116,6 +117,7 @@ describe("Database Migration System", () => {
       }>
     ).map((t) => t.name);
     expect(tableNames).not.toContain("obligation_ready_heads");
+    expect(tableNames).toContain("chat_room_participants");
 
     const meshEventsColumns = (
       db.prepare("PRAGMA table_info(mesh_events)").all() as Array<{ name: string }>

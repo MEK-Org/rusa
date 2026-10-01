@@ -327,6 +327,20 @@ export function createActorRuntime(
         },
       ]),
       onFirstChunk: () => send({ type: "firstChunk" }),
+      // The leader owns public write attribution, while this follower owns the
+      // actual provider invocation, whose model and effort its own config may
+      // fill in. Events reach the leader on a batched, retried path and the
+      // provider's MCP writes on another, so wait for the leader to confirm the
+      // attempt before the Actor invokes the provider.
+      onProviderAttempt: (provider) =>
+        request<void>({
+          op: "providerAttempt",
+          attempt: {
+            provider: provider.providerName,
+            model: provider.model,
+            effort: provider.effort,
+          },
+        }).result,
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;
@@ -387,7 +401,7 @@ export function createActorRuntime(
       case "cancelQueued":
         leaderCancelling = true;
         try {
-          actor?.cancelQueuedRun();
+          actor?.cancelQueuedRun({ retain: message.retain });
         } finally {
           leaderCancelling = false;
         }
