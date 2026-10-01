@@ -230,6 +230,7 @@ slack:
                            Configure app_mentions:read,
                            im:history, channels:history, channels:read, chat:write, and reactions:write bot scopes,
                            plus files:read and files:write for the attachment tools.
+                           Attachment tools run on the leader and refuse follower-hosted actors (#812).
   Root owns inbound slack:channels; workers may receive delegated channels.
   Message references use slack:channels/<id>/messages/<timestamp>.
 
