@@ -2297,6 +2297,7 @@ async function composeStart(
           ...(observation.mimeType ? { mimeType: observation.mimeType } : {}),
         }),
       }),
+    quotaManual: { client: quotaCoordinatorClient },
   });
   // Actor keeps this array by reference and hands its current contents to the
   // provider at run start. A live grant updates it synchronously, which is the
