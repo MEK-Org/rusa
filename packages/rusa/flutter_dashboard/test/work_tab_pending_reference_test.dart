@@ -45,6 +45,7 @@ void main() {
   late FakeApi api;
   late DashboardStore store;
   late List<String> detailCalls;
+  late FakeStream stream;
 
   final obA = makeObligation('ob-a', ownerId: 'root', intent: 'Cites a chat');
   final obB = makeObligation('ob-b', ownerId: 'root', intent: 'Other work');
@@ -78,7 +79,8 @@ void main() {
     api = FakeApi()
       ..threadsResult = [makeThread('root')]
       ..obligationsResult = [obA, obB];
-    store = DashboardStore(api: api, stream: FakeStream());
+    stream = FakeStream();
+    store = DashboardStore(api: api, stream: stream);
   });
 
   Future<void> mount(WidgetTester tester) async {
@@ -156,6 +158,89 @@ void main() {
     );
     expect(find.text('loading context'), findsNothing);
     expect(find.text('could not load context'), findsOneWidget);
+    await tester.runAsync(store.dispose);
+  });
+
+  testWidgets('a citation that turns pending after another gave up gets its '
+      'own retries', (tester) async {
+    const refB = 'github:MEK-Org/rusa/issues/2';
+    var withB = false;
+    var callsWithB = 0;
+    api.obligationDetailByOffset = (id, _) {
+      detailCalls.add(id);
+      final bFirst = withB && callsWithB++ == 0;
+      return ObligationDetailSnapshot(
+        obligation: obA,
+        children: const [],
+        blockingChildren: const [],
+        artifacts: [
+          ObligationArtifactDto(ref: _ref, reference: _pending()),
+          if (withB)
+            ObligationArtifactDto(
+              ref: refB,
+              reference: ReferenceDto(
+                ref: refB,
+                scheme: 'github',
+                title: bFirst ? refB : 'The second issue',
+                unavailable: bFirst ? 'loading context' : null,
+                cacheState: bFirst ? 'pending' : 'fresh',
+                entity: bFirst
+                    ? null
+                    : const {
+                        'type': 'github_issue',
+                        'title': 'The second issue',
+                        'description': 'Second body',
+                      },
+              ),
+            ),
+        ],
+      );
+    };
+    await mount(tester);
+    await open(tester, 'Cites a chat');
+    for (final delay in pendingReferenceRetryDelays) {
+      await tester.pump(delay);
+      await tester.pump();
+    }
+    await tester.pump(_pastCeiling);
+    await tester.pump();
+    expect(find.text('could not load context'), findsOneWidget);
+    final spent = detailCalls.length;
+
+    // A second citation is attached; the write's event refreshes the pane.
+    withB = true;
+    stream.meshCtrl.add(
+      MeshEvent(
+        id: 'attach-b',
+        ts: '2026-10-01T21:00:00.000Z',
+        kind: 'obligation_checkpoint_set',
+        actorId: 'root',
+        detail: obA.id,
+        body: null,
+        payload: '{"cleared":false}',
+        success: null,
+      ),
+    );
+    // The store relays the event, then the pane refetches and rebuilds.
+    for (var i = 0; i < 4; i += 1) {
+      await tester.pump();
+    }
+
+    // The new citation starts its own ladder; the one that gave up stays put.
+    expect(find.text('loading context'), findsOneWidget);
+    expect(find.text('could not load context'), findsOneWidget);
+
+    await tester.pump(pendingReferenceRetryDelays.first);
+    await tester.pump();
+    expect(find.text('loading context'), findsNothing);
+    expect(find.textContaining('The second issue'), findsWidgets);
+    expect(find.text('could not load context'), findsOneWidget);
+
+    // Only the new citation is pending now, and it resolved: nothing more.
+    final settled = detailCalls.length;
+    await tester.pump(_pastCeiling);
+    expect(detailCalls.length, settled);
+    expect(settled - spent, 2);
     await tester.runAsync(store.dispose);
   });
 

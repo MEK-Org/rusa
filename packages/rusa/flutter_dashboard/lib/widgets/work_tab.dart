@@ -795,11 +795,16 @@ class _DetailViewState extends State<_DetailView> {
   int _fetchGeneration = 0;
 
   /// The scheduled refetch while a reference in the loaded snapshot is still
-  /// pending on the server's background read (#595), how many have been
-  /// spent on this obligation, and whether they ran out.
+  /// pending on the server's background read (#595), and how many the
+  /// current ladder has spent. A ladder covers the pending refs it started
+  /// with; a ref seen pending for the first time starts a fresh one, so each
+  /// distinct ref buys at most one ladder while this obligation is open.
   Timer? _pendingRetry;
   int _pendingAttempts = 0;
-  bool _pendingGaveUp = false;
+  Set<String> _pendingSeen = const {};
+
+  /// Refs still pending when their ladder ran out; shown as unavailable.
+  Set<String> _pendingGaveUp = const {};
 
   /// Every obligation the loaded snapshot draws besides this one: its parent,
   /// children and dependency edges (#773).
@@ -838,7 +843,8 @@ class _DetailViewState extends State<_DetailView> {
       _completionsHasMore = false;
       _showDoneChildren = false;
       _pendingAttempts = 0;
-      _pendingGaveUp = false;
+      _pendingSeen = const {};
+      _pendingGaveUp = const {};
       _fetch();
     }
   }
@@ -858,18 +864,27 @@ class _DetailViewState extends State<_DetailView> {
     return ++_fetchGeneration;
   }
 
-  static bool _hasPendingReference(ObligationDetailSnapshot data) =>
-      data.externalReference?.cacheState == 'pending' ||
-      data.artifacts.any((a) => a.reference?.cacheState == 'pending');
+  static Set<String> _pendingRefs(ObligationDetailSnapshot data) => {
+    for (final reference in [
+      data.externalReference,
+      for (final artifact in data.artifacts) artifact.reference,
+    ])
+      if (reference?.cacheState == 'pending') reference!.ref,
+  };
 
   /// Schedules the next bounded refetch when [data] still carries a pending
   /// reference. The server shares one provider read across these, so they
   /// cost no extra provider traffic; the timer belongs to this load's
   /// generation, so navigating away or a newer load leaves it inert.
   void _schedulePendingRetry(ObligationDetailSnapshot data) {
-    if (!_hasPendingReference(data)) return;
+    final pending = _pendingRefs(data).difference(_pendingGaveUp);
+    if (pending.isEmpty) return;
+    if (!_pendingSeen.containsAll(pending)) {
+      _pendingSeen = {..._pendingSeen, ...pending};
+      _pendingAttempts = 0;
+    }
     if (_pendingAttempts >= pendingReferenceRetryDelays.length) {
-      _pendingGaveUp = true;
+      _pendingGaveUp = {..._pendingGaveUp, ...pending};
       return;
     }
     final gen = _fetchGeneration;
@@ -899,12 +914,13 @@ class _DetailViewState extends State<_DetailView> {
         });
   }
 
-  /// A reference still pending once the retries ran out is shown as the
+  /// A reference still pending once its retries ran out is shown as the
   /// server shows any read it could not complete.
   ReferenceDto? _settled(ReferenceDto? reference) =>
-      _pendingGaveUp && reference?.cacheState == 'pending'
+      reference?.cacheState == 'pending' &&
+          _pendingGaveUp.contains(reference!.ref)
       ? ReferenceDto(
-          ref: reference!.ref,
+          ref: reference.ref,
           scheme: reference.scheme,
           title: reference.title,
           body: reference.body,

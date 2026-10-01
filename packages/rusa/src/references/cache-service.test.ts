@@ -620,27 +620,6 @@ describe("ReferenceCacheService", () => {
 
     const ref = "gchat:spaces/AAAA/messages/abc.def";
 
-    it("serves the background write to the next get after a pending answer", async () => {
-      const { repo } = memoryRepo();
-      const read = deferred<{ name: string; text: string }>();
-      const getMessage = vi.fn().mockReturnValue(read.promise);
-      const deps = { chatClient: { getMessage, getSpace: vi.fn() } };
-      const svc = new ReferenceCacheService({ repo, deadlineMs: 20 });
-
-      const first = await svc.get(ref, deps);
-      expect(first.cacheState).toBe("pending");
-      expect(first.unavailable).toBe("loading context");
-
-      read.resolve({ name: "spaces/AAAA/messages/abc.def", text: "Late but real" });
-      await flush();
-
-      const second = await svc.get(ref, deps);
-      expect(second.cacheState).toBe("fresh");
-      expect(second.unavailable).toBeNull();
-      expect(second.entity).toEqual({ type: "gchat_message", contents: "Late but real" });
-      expect(getMessage).toHaveBeenCalledTimes(1);
-    });
-
     it("shares one provider read across overlapping gets of the same canonical ref", async () => {
       const { repo } = memoryRepo();
       const read = deferred<{ name: string; text: string }>();
@@ -660,7 +639,9 @@ describe("ReferenceCacheService", () => {
 
       read.resolve({ name: "spaces/AAAA/messages/abc.def", text: "Once" });
       await flush();
-      expect((await svc.get(ref, deps)).cacheState).toBe("fresh");
+      const after = await svc.get(ref, deps);
+      expect(after.cacheState).toBe("fresh");
+      expect(after.entity).toEqual({ type: "gchat_message", contents: "Once" });
       expect(getMessage).toHaveBeenCalledTimes(1);
       expect(repo.set).toHaveBeenCalledTimes(1);
     });
@@ -681,8 +662,10 @@ describe("ReferenceCacheService", () => {
       expect((await svc.get("github:a/b/issues/1", { issueClient: { getIssue } })).cacheState).toBe(
         "stale"
       );
+      // The row goes away while the refresh is out, so the next get is cold.
+      rows.delete("github:a/b/issues/1");
       expect((await svc.get("github:a/b/issues/1", { issueClient: { getIssue } })).cacheState).toBe(
-        "stale"
+        "pending"
       );
       expect(getIssue).toHaveBeenCalledTimes(1);
 
@@ -717,20 +700,23 @@ describe("ReferenceCacheService", () => {
     });
 
     it("reads the provider again once a failed read's memo expires", async () => {
+      const { repo } = memoryRepo();
+      const read = deferred<never>();
+      const getMessage = vi
+        .fn()
+        .mockReturnValueOnce(read.promise)
+        .mockResolvedValueOnce({ name: "spaces/AAAA/messages/abc.def", text: "Back" });
+      const deps = { chatClient: { getMessage, getSpace: vi.fn() } };
+      const svc = new ReferenceCacheService({ repo, deadlineMs: 20, unavailableTtlMs: 1000 });
+
+      expect((await svc.get(ref, deps)).cacheState).toBe("pending");
+      read.reject(new Error("transient"));
+      await flush();
+      expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
+      expect(getMessage).toHaveBeenCalledTimes(1);
+
       vi.useFakeTimers({ toFake: ["Date"] });
       try {
-        const { repo } = memoryRepo();
-        const getMessage = vi
-          .fn()
-          .mockRejectedValueOnce(new Error("transient"))
-          .mockResolvedValueOnce({ name: "spaces/AAAA/messages/abc.def", text: "Back" });
-        const deps = { chatClient: { getMessage, getSpace: vi.fn() } };
-        const svc = new ReferenceCacheService({ repo, unavailableTtlMs: 1000 });
-
-        expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
-        expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
-        expect(getMessage).toHaveBeenCalledTimes(1);
-
         vi.setSystemTime(Date.now() + 1001);
         const res = await svc.get(ref, deps);
         expect(res.cacheState).toBe("fresh");
@@ -738,6 +724,23 @@ describe("ReferenceCacheService", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it("remembers no failure that was answered inside the deadline", async () => {
+      const { repo } = memoryRepo();
+      const getMessage = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("transient"))
+        .mockResolvedValueOnce({ name: "spaces/AAAA/messages/abc.def", text: "Back" });
+      const deps = { chatClient: { getMessage, getSpace: vi.fn() } };
+      const svc = new ReferenceCacheService({ repo });
+
+      // The caller already holds a terminal answer, so nothing retries it;
+      // the next view asks the provider again, as before #595.
+      expect((await svc.get(ref, deps)).cacheState).toBe("unavailable");
+      const res = await svc.get(ref, deps);
+      expect(res.cacheState).toBe("fresh");
+      expect(getMessage).toHaveBeenCalledTimes(2);
     });
   });
 });
