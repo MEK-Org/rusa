@@ -49,6 +49,13 @@ export interface ReferenceCacheServiceOptions {
   repo: ReferenceCacheRepository;
   ttlMs?: number;
   deadlineMs?: number;
+  /**
+   * How long a failed provider read answers a cold get as unavailable before
+   * the provider is asked again. Long enough that the dashboard's bounded
+   * retries of a pending card settle on a terminal state (#595); short enough
+   * that a transient failure or a newly granted permission recovers on its own.
+   */
+  unavailableTtlMs?: number;
   logger?: {
     info: (event: string, data?: Record<string, unknown>) => void;
     error: (event: string, data?: Record<string, unknown>) => void;
@@ -59,12 +66,22 @@ export class ReferenceCacheService {
   private readonly repo: ReferenceCacheRepository;
   private readonly ttlMs: number;
   private readonly deadlineMs: number;
+  private readonly unavailableTtlMs: number;
   private readonly logger?: ReferenceCacheServiceOptions["logger"];
+  /**
+   * The provider read currently out for each canonical ref. A cold get, a
+   * stale refresh and a client retry that overlap all await this one read, so
+   * a pending card's retries can never multiply provider traffic (#595).
+   */
+  private readonly inFlight = new Map<string, Promise<ReferenceEntity | null>>();
+  /** Canonical ref → epoch ms until which its last failed read stands. In memory only. */
+  private readonly unavailableUntil = new Map<string, number>();
 
   constructor(options: ReferenceCacheServiceOptions) {
     this.repo = options.repo;
     this.ttlMs = options.ttlMs ?? 1000 * 60 * 60; // 1 hour
     this.deadlineMs = options.deadlineMs ?? 250; // 250ms for UI deadline
+    this.unavailableTtlMs = options.unavailableTtlMs ?? 30_000;
     this.logger = options.logger;
   }
 
@@ -125,12 +142,29 @@ export class ReferenceCacheService {
       }
     }
 
+    // A read that just failed — typically one that outlived the deadline and
+    // so was answered "pending" — is reported unavailable without asking the
+    // provider again, so the caller's next retry reaches a terminal state.
+    const failedUntil = this.unavailableUntil.get(key);
+    if (failedUntil !== undefined) {
+      if (now.getTime() < failedUntil) {
+        this.logger?.info("reference_cache_unavailable", {
+          scheme: reference.scheme,
+          type: getResourceShape(reference),
+          recent: true,
+        });
+        const base = resolveReferenceSync(key, deps);
+        return { ...base, unavailable: "could not load context", cacheState: "unavailable" };
+      }
+      this.unavailableUntil.delete(key);
+    }
+
     // Cold miss
     this.logger?.info("reference_cache_miss", {
       scheme: reference.scheme,
       type: getResourceShape(reference),
     });
-    const readPromise = this.performProviderRead(key, deps);
+    const readPromise = this.sharedProviderRead(key, deps);
     const deadlinePromise = new Promise<"deadline">((resolve) =>
       setTimeout(() => resolve("deadline"), this.deadlineMs)
     );
@@ -171,7 +205,7 @@ export class ReferenceCacheService {
   private async triggerRefresh(ref: string, deps: ReferenceResolverDeps): Promise<void> {
     const reference = parseReference(ref);
     try {
-      const result = await this.performProviderRead(ref, deps);
+      const result = await this.sharedProviderRead(ref, deps);
       if (result) {
         this.logger?.info("reference_cache_refresh", {
           scheme: reference.scheme,
@@ -187,6 +221,44 @@ export class ReferenceCacheService {
     } catch (_e) {
       this.logger?.error("reference_cache_refresh", { scheme: reference.scheme, outcome: "error" });
     }
+  }
+
+  /**
+   * Joins the read already out for `key`, or starts one. Either way its
+   * outcome is recorded once: a failure (null or thrown) is remembered for
+   * `unavailableTtlMs`, a success clears that memory.
+   */
+  private sharedProviderRead(
+    key: string,
+    deps: ReferenceResolverDeps
+  ): Promise<ReferenceEntity | null> {
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+    const read = this.performProviderRead(key, deps)
+      .then(
+        (entity) => {
+          if (entity) this.unavailableUntil.delete(key);
+          else this.rememberUnavailable(key);
+          return entity;
+        },
+        (err: unknown) => {
+          this.rememberUnavailable(key);
+          throw err;
+        }
+      )
+      .finally(() => this.inFlight.delete(key));
+    this.inFlight.set(key, read);
+    return read;
+  }
+
+  private rememberUnavailable(key: string): void {
+    const now = Date.now();
+    // Bound the memo: refs that failed once and were never asked about again
+    // are dropped as soon as they have expired.
+    for (const [ref, until] of this.unavailableUntil) {
+      if (until <= now) this.unavailableUntil.delete(ref);
+    }
+    this.unavailableUntil.set(key, now + this.unavailableTtlMs);
   }
 
   /**
