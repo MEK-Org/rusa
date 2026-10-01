@@ -1,19 +1,41 @@
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { SlackClient } from "../slack/slack-client.js";
+import { MAX_SLACK_FILE_BYTES, type SlackClient } from "../slack/slack-client.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
+import { resolveAttachmentPath, resolveDownloadPath } from "./workdir-path.js";
 
 export const SLACK_READ_MCP_NAME = "slack-read";
 export const SLACK_WRITE_MCP_NAME = "slack-write";
 
-export function createSlackReadMcpServer(client: SlackClient, isFenced?: () => boolean): McpServer {
-  const server = createMcpServer({ name: SLACK_READ_MCP_NAME, version: "0.1.0" }, { isFenced });
+export interface SlackMcpOptions {
+  isFenced?: () => boolean;
+  /** The calling actor's workdir; file uploads read from and downloads write into it. */
+  workDir?: string;
+  maxFileBytes?: number;
+}
+
+function requireWorkDir(options: SlackMcpOptions): string {
+  if (!options.workDir) throw new Error("Slack file tools need an actor workdir");
+  return options.workDir;
+}
+
+export function createSlackReadMcpServer(
+  client: SlackClient,
+  options: SlackMcpOptions = {}
+): McpServer {
+  const server = createMcpServer(
+    { name: SLACK_READ_MCP_NAME, version: "0.1.0" },
+    { isFenced: options.isFenced }
+  );
   server.registerTool(
     "get_message",
     {
       title: "Read a Slack message",
-      description: "Read a Slack message by channel ID and timestamp.",
+      description:
+        "Read a Slack message by channel ID and timestamp, including metadata for any attached files.",
       inputSchema: { channel: z.string(), ts: z.string() },
     },
     async ({ channel, ts }) => {
@@ -39,15 +61,54 @@ export function createSlackReadMcpServer(client: SlackClient, isFenced?: () => b
       }
     }
   );
+  server.registerTool(
+    "download_file",
+    {
+      title: "Download a file attached to a Slack message",
+      description:
+        "Save a file attached to the message at channel/ts into your working directory. The destination must not already exist; its directory must.",
+      inputSchema: {
+        channel: z.string(),
+        ts: z.string().describe("Timestamp of the message the file is attached to"),
+        fileId: z.string().describe("File ID from get_message's files"),
+        destinationPath: z
+          .string()
+          .describe("New file path inside your working directory, absolute or relative to it"),
+      },
+    },
+    async ({ channel, ts, fileId, destinationPath }) => {
+      try {
+        const target = await resolveDownloadPath(requireWorkDir(options), destinationPath);
+        const { file, data } = await client.downloadMessageFile(
+          channel,
+          ts,
+          fileId,
+          options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
+        );
+        await writeFile(target, data, { flag: "wx" });
+        return toolOk({
+          path: target,
+          bytes: data.length,
+          file,
+          source: `slack:channels/${channel}/messages/${ts}`,
+        });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
   return server;
 }
 
 export function createSlackWriteMcpServer(
   client: SlackClient,
   allowedChannels: "all" | string[],
-  isFenced?: () => boolean
+  options: SlackMcpOptions = {}
 ): McpServer {
-  const server = createMcpServer({ name: SLACK_WRITE_MCP_NAME, version: "0.1.0" }, { isFenced });
+  const server = createMcpServer(
+    { name: SLACK_WRITE_MCP_NAME, version: "0.1.0" },
+    { isFenced: options.isFenced }
+  );
   const allowed = (channel: string) =>
     allowedChannels === "all" || allowedChannels.includes(channel);
   server.registerTool(
@@ -79,6 +140,46 @@ export function createSlackWriteMcpServer(
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         await client.react(channel, ts, emoji);
         return toolOk({ ok: true });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+  server.registerTool(
+    "upload_file",
+    {
+      title: "Upload a file to Slack",
+      description:
+        "Share a file from your working directory into a channel, or a thread using its parent timestamp.",
+      inputSchema: {
+        channel: z.string(),
+        filePath: z
+          .string()
+          .describe(
+            "Path to a file inside your working directory, absolute or relative to it; paths outside it are rejected"
+          ),
+        threadTs: z.string().optional(),
+        filename: z.string().optional().describe("Defaults to the file's basename"),
+        title: z.string().optional(),
+        initialComment: z.string().optional().describe("Message text posted with the file"),
+      },
+    },
+    async ({ channel, filePath, threadTs, filename, title, initialComment }) => {
+      try {
+        if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
+        const source = await resolveAttachmentPath(requireWorkDir(options), filePath);
+        const maxBytes = options.maxFileBytes ?? MAX_SLACK_FILE_BYTES;
+        if ((await stat(source)).size > maxBytes) {
+          throw new Error(`file size limit exceeded: file is larger than ${maxBytes} bytes`);
+        }
+        const fileIds = await client.uploadFile(channel, {
+          filename: filename || basename(source),
+          data: await readFile(source),
+          ...(threadTs ? { threadTs } : {}),
+          ...(title ? { title } : {}),
+          ...(initialComment ? { initialComment } : {}),
+        });
+        return toolOk({ fileIds, channel, ...(threadTs ? { threadTs } : {}) });
       } catch (err) {
         return toolError(err);
       }

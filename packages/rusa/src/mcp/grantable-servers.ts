@@ -218,13 +218,13 @@ export function buildGrantableServers(
     });
   }
   if (deps.slackClient) {
-    map.set(SLACK_WRITE_MCP_NAME, (_selfId, params, options) => {
+    map.set(SLACK_WRITE_MCP_NAME, (selfId, params, options) => {
       if (!deps.slackClient) throw new Error("slackClient is required for slack-write capability");
-      return createSlackWriteMcpServer(
-        deps.slackClient,
-        params.includes("*") ? "all" : params,
-        options?.isFenced
-      );
+      const workDir = deps.actorRootFor?.(selfId);
+      return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
+        isFenced: options?.isFenced,
+        ...(workDir ? { workDir } : {}),
+      });
     });
   }
   const updateToolDepsFor = deps.hostMaintenance?.updateToolDepsFor;

@@ -1513,7 +1513,11 @@ async function composeStart(
   if (chatClient) {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
-  if (slackClient) servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient);
+  if (slackClient) {
+    // Only root mounts the shared server, so its downloads land in root's workdir.
+    const workDir = join(mcHome, "root-agent");
+    servers[SLACK_READ_MCP_NAME] = () => createSlackReadMcpServer(slackClient, { workDir });
+  }
   // Read when an inbox server is built, so every actor's selection sees the
   // same chat backends the read tools do.
   const inboxChatContextSources = (): InboxChatContextSources => ({
@@ -3122,7 +3126,7 @@ async function composeStart(
         }
         if (slackClient) {
           const slackReadUrl = mcpHttp.addServer(`${id}:${SLACK_READ_MCP_NAME}`, () =>
-            createSlackReadMcpServer(slackClient, isFenced)
+            createSlackReadMcpServer(slackClient, { isFenced, workDir: join(workersDir, id) })
           );
           perActorShared.push({ name: SLACK_READ_MCP_NAME, url: slackReadUrl });
         }
@@ -3560,7 +3564,7 @@ async function composeStart(
   const rootSlackUrl =
     slackClient && config.slack
       ? mcpHttp.addServer(`${rootId}:${SLACK_WRITE_MCP_NAME}`, () =>
-          createSlackWriteMcpServer(slackClient, "all")
+          createSlackWriteMcpServer(slackClient, "all", { workDir: rootAgentDir })
         )
       : undefined;
 
