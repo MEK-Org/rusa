@@ -4013,6 +4013,30 @@ describe("ActorMesh", () => {
     expect(events.some((e) => e.kind === "message_sent" && e.actorId === id)).toBe(false);
   });
 
+  it("isolates throwing onRunReturned hook so mandatory cleanup and recovery still complete (#828)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const env = setup({
+      inboxStore,
+      onRunReturned: () => {
+        throw new Error("hook exploded");
+      },
+    });
+    const id = env.mesh.spawn({ charter: "child worker", parentId: "root" });
+    env.mesh.sendMessage(id, "work to do", "root");
+    await env.tick();
+    const entries = inboxStore.list(id).entries;
+    expect(entries).toHaveLength(1);
+    env.mesh.selectInboxEntries(id, [entries[0].id]);
+    expect(env.mesh.selectedInboxEntries(id)).toEqual([entries[0].id]);
+
+    expect(() =>
+      env.mesh.finishInboxRun(id, { successful: true, runId: "test-run" })
+    ).not.toThrow();
+
+    expect(env.mesh.selectedInboxEntries(id)).toEqual([]);
+    expect(env.logs.some((l) => l.includes("hook exploded"))).toBe(true);
+  });
+
   it("drops a message to a non-live thread without throwing", async () => {
     const { mesh, logs } = setup();
     expect(mesh.sendMessage("ghost", "hi", "root")).toEqual({ delivered: false });
@@ -12797,6 +12821,9 @@ describe("strict obligation handling experiment (#382)", () => {
         .entries.find((entry) => entry.source === `mesh:mechanical:${subject}`);
       expect(escalation?.payload.status).toBe("exhausted_inbox");
       expect(escalation?.payload.note).toContain(entryId);
+      expect(escalation?.payload.note).toContain(
+        'Strict head closure shortfalls recorded at return:\n- Head obligation left-head ("Left head"): obligation is still ready'
+      );
     });
 
     it("refuses mark handled for every entry of a direct focus selection until the focus closes", () => {

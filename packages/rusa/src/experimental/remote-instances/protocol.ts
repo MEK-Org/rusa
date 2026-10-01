@@ -140,11 +140,12 @@ export type ActorEvent =
       type: "preempted";
       requestId: number;
       preempted: boolean;
-      phase?: "running" | "queued";
+      phase?: "running" | "queued" | "winding_down";
     }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }
-  | { type: "state"; state: ActorRuntimeState }
+  /** Wire state; "winding_down" is retained for v7/v8 follower compatibility until OLDEST_FOLLOWER_PROTOCOL_VERSION > 8. */
+  | { type: "state"; state: ActorRuntimeState | "winding_down"; yielded?: boolean }
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode; runId?: string }
   | { type: "error"; error: string }

@@ -2325,4 +2325,20 @@ describe("monolithic follower instance", () => {
     );
     expect(Boolean(h.inboxStore.read(id, entry.id)?.handledAt)).toBe(closes);
   });
+
+  it("normalizes an admitted v7/v8 follower's winding_down state to running (#828)", async () => {
+    const h = setup({ delayMs: 300 });
+    const id = h.mesh.spawn({
+      charter: "legacy follower",
+      parentId: "root",
+      modelConfig: { provider: "instance-fixture", model: "scripted" },
+    });
+    // Synthesize an older follower reporting winding_down while its provider is alive
+    h.remote.receive({
+      actorId: id,
+      message: { type: "state", state: "winding_down" as const },
+    });
+    expect(h.mesh.activeRunState(id)).toEqual({ actorId: id, phase: "running" });
+    expect(() => h.mesh.retire(id)).toThrow(/cannot retire/);
+  });
 });

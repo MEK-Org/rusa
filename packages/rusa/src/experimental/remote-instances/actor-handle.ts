@@ -937,10 +937,16 @@ export class ActorHandle implements MeshActor {
         if (message.state === "queued" && (this.state !== "queued" || reattachReport)) {
           this.quotedGeneration = this.modelConfigGeneration;
         }
-        this.state = message.state;
+        // Legacy wire reader: older v7/v8 followers can still report "winding_down"
+        // while their provider is alive; normalize it to "running" so activeRunState
+        // and isRunning treat the live run as running until those versions leave
+        // the supported window.
+        const wireState: ActorRuntimeState =
+          message.state === "winding_down" ? "running" : message.state;
+        this.state = wireState;
         this.stateStale = false;
         this.stateUnconfirmed = false;
-        if (message.state !== "queued") {
+        if (wireState !== "queued") {
           this.pendingQueuedPromotion = false;
           this.pendingQueuedCancel = false;
         }
@@ -950,7 +956,7 @@ export class ActorHandle implements MeshActor {
         }
         // Any wake held since reattach is now ordered behind the preempt decision.
         this.settleState?.();
-        ctx.onRuntimeStateChanged(message.state);
+        ctx.onRuntimeStateChanged(wireState);
         // The first report after a reattach is the deadline for claiming a
         // retained ticket: whatever the follower holds now, it is not the run
         // that ticket was reserved for.

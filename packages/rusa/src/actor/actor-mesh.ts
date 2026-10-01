@@ -2055,9 +2055,11 @@ export class ActorMesh {
    * that throws is recorded as a rejection of every armed head rather than
    * allowed to abort the rest of run finishing.
    */
-  private recordReturnRejections(actorId: string): void {
+  private recordReturnRejections(
+    actorId: string
+  ): Array<{ obligationId: string; title: string | null; reason: string }> {
     const runState = this.headClosureRuns.get(actorId);
-    if (!runState) return;
+    if (!runState) return [];
     let shortfalls: Array<Pick<HeadClosureShortfall, "obligationId" | "title" | "reason">>;
     try {
       shortfalls = this.closureShortfalls(actorId, runState, runState.headObligationIds);
@@ -2080,6 +2082,7 @@ export class ActorMesh {
         `return from ${actorId} rejected: head obligation ${obligationId} not finished or decomposed (${reason})`
       );
     }
+    return shortfalls;
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {
@@ -2092,8 +2095,14 @@ export class ActorMesh {
     const selectedIds = [...this.selectedInboxEntries(actorId)];
     // A failed run is not a return the actor chose, so it keeps the ordinary
     // failure route below rather than a closure rejection.
-    if (outcome.successful !== false) this.recordReturnRejections(actorId);
-    this.deliverReturnedRunResult(actorId, selectedIds, outcome);
+    const rejections = outcome.successful !== false ? this.recordReturnRejections(actorId) : [];
+    try {
+      this.deliverReturnedRunResult(actorId, selectedIds, outcome);
+    } catch (err) {
+      this.log(
+        `run result delivery failed for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
@@ -2138,7 +2147,7 @@ export class ActorMesh {
 
         const exhaustedIds = unhandledIds.filter((id) => (priorCounts.get(id) ?? 0) + 1 >= 2);
         if (exhaustedIds.length > 0) {
-          this.escalateExhaustedInboxWorkToParent(actorId, exhaustedIds, outcome.runId);
+          this.escalateExhaustedInboxWorkToParent(actorId, exhaustedIds, outcome.runId, rejections);
         }
       }
     }
@@ -2178,7 +2187,8 @@ export class ActorMesh {
   private escalateExhaustedInboxWorkToParent(
     actorId: string,
     exhaustedIds: readonly string[],
-    runId?: string
+    runId?: string,
+    closureShortfalls?: readonly { obligationId: string; title?: string | null; reason: string }[]
   ): void {
     if (actorId === this.rootId) {
       return;
@@ -2189,10 +2199,20 @@ export class ActorMesh {
       return;
     }
 
-    const note =
+    let note =
       `[inbox recovery exhausted] Child ${actorId} exhausted bounded recovery for selected inbox entries: ${exhaustedIds.join(", ")}.\n\n` +
       "Please investigate why recovery exhausted. In cases observed so far, the child completed the work but skipped mark_handled; other possible causes include a tool failure, a run killed before it finished, or work that genuinely could not be handled.\n\n" +
       `If the investigation reveals a convention slip, remind the child in mesh chat and update its charter (and its children's charters). Then use release_selection_lock or mark_exhausted_inbox_handled with thread_id '${actorId}' to resolve the entries.`;
+
+    if (closureShortfalls && closureShortfalls.length > 0) {
+      const shortfallLines = closureShortfalls
+        .map(
+          (s) =>
+            `- Head obligation ${s.obligationId}${s.title ? ` ("${s.title}")` : ""}: ${s.reason}`
+        )
+        .join("\n");
+      note += `\n\nStrict head closure shortfalls recorded at return:\n${shortfallLines}`;
+    }
 
     this.deliverMechanicalInboxNotice(
       parentId,
