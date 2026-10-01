@@ -1276,13 +1276,19 @@ sequenceDiagram
     Note over A: A applies it unchanged, exactly as today
     Note over S: ... failures continue past hardStaleAfterMs ...
     A->>S: GET /v1/throttle
+    S-->>A: last interval, freshness.hardStale true, while governing reset is future
+    Note over S: ... governing reset passes without a newer reading ...
+    A->>S: GET /v1/throttle
     S-->>A: intervalSeconds = maxIntervalSeconds, freshness.hardStale true
-    S->>S: metric quota_service_snapshot_age_seconds rises, alert fires
+    Note over S: provider-wide retirement and alert are not implemented; #794 tracks them
 ```
 
-Degradation is monotone toward slower. A stale publication never speeds anything
-up. Note where the alert lives: on the **service**, because under A5 the service
-is the only thing that can tell a failed scrape from a stable quota window. A
+A whole provider lane whose governing reset is still future keeps its last
+reasoned interval through a hard-stale failed scrape; after that reset, the
+fallback widens to `maxIntervalSeconds`. The fallback degradation is monotone
+toward slower. Provider-wide retirement and an alert after the reset are not
+implemented yet; #794 tracks that work. The service, not a client, is the only
+place that can distinguish a failed scrape from a stable quota window, because a
 client sees an unchanging interval either way.
 
 ### 6.3 Service restart
