@@ -508,7 +508,7 @@ describe("SqliteInboxRepository", () => {
       expect(listener).toHaveBeenCalledTimes(1);
     });
 
-    it("isolates throwing listeners and invokes onListenerError", () => {
+    it("isolates throwing listeners and reports through the listener error handler", () => {
       store.append([entry("err-1")]);
       const errors: unknown[] = [];
       const throwing = vi.fn(() => {
@@ -516,7 +516,7 @@ describe("SqliteInboxRepository", () => {
       });
       const surviving = vi.fn();
 
-      store.onListenerError = (err) => errors.push(err);
+      store.setListenerErrorHandler((err) => errors.push(err));
       store.onItemsHandled(throwing);
       store.onItemsHandled(surviving);
 

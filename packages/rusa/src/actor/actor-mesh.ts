@@ -1120,7 +1120,7 @@ export class ActorMesh {
       this.unsubscribeInboxAppends = opts.inboxStore.onItemsAppended((items) => {
         this.scheduleAppendedWork(items);
       });
-      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled?.((actorId) => {
+      this.unsubscribeInboxHandled = opts.inboxStore.onItemsHandled((actorId) => {
         this.cancelEmptyQueuedRun(actorId);
       });
     }

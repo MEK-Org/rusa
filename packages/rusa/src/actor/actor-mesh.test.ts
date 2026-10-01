@@ -1094,6 +1094,7 @@ describe("ActorMesh", () => {
       // Partial fake: it never notifies, so the only wake here is whatever the
       // mesh path under test sends itself.
       onItemsAppended: () => () => {},
+      onItemsHandled: () => () => {},
     } as unknown as InboxRepository;
     const { mesh, registry, fake, logs } = setup({ inboxStore });
     registry.upsert({
@@ -8356,6 +8357,7 @@ describe("ActorMesh", () => {
           appendListeners.push(listener);
           return () => {};
         },
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({
         inboxStore,
@@ -8450,6 +8452,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
@@ -8491,6 +8494,7 @@ describe("ActorMesh", () => {
         // Partial fake: it never notifies, so the only wake here is whatever the
         // mesh path under test sends itself.
         onItemsAppended: () => () => {},
+        onItemsHandled: () => () => {},
       } as unknown as InboxRepository;
 
       const { mesh, tick } = setup({ inboxStore });
