@@ -267,6 +267,27 @@ describe("routeRunFailure", () => {
       expect(toParent.map((n) => n.responsive)).toEqual([true]);
     });
 
+    it.each([
+      ["run", (deps: FailureSinkDeps) => routeRunFailure(deps, "w1", FAIL)],
+      ["spawn", (deps: FailureSinkDeps) => routeSpawnFailure(deps, "w1", "root", "bad pool")],
+    ] as const)("keeps a child's escalation when its %s-failure notice fails to deliver", async (_, route) => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      const deliver = deps.sendToParent;
+      let failNext = true;
+      deps.sendToParent = (...args) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("inbox append failed");
+        }
+        deliver(...args);
+      };
+      await expect(async () => route(deps)).rejects.toThrow("inbox append failed");
+      now.t = 30_000;
+      await route(deps);
+      expect(toParent.map((n) => n.responsive)).toEqual([true]);
+    });
+
     it("leaves the root's error-chat path unchanged", async () => {
       const { deps, toParent, toChat } = escalating({ t: 0 });
       await routeRunFailure(deps, "root", FAIL);

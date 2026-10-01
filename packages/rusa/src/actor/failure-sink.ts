@@ -45,7 +45,7 @@ export interface FailureSinkDeps {
    * Optional per-child backoff for waking the parent responsively (#189).
    * Absent, every failure notice keeps ordinary priority.
    */
-  escalation?: Pick<FailureEscalationBackoff, "admit">;
+  escalation?: Pick<FailureEscalationBackoff, "mayEscalate" | "recordEscalation">;
 }
 
 /**
@@ -55,7 +55,9 @@ export interface FailureSinkDeps {
  * still delivered, just at ordinary priority, so a crash loop cannot turn the
  * bypass into a tight loop on the parent. Each escalation that lands soon after
  * the previous window doubles the next window up to `maxMs`; a full window of
- * quiet past the last one resets the child to `baseMs`. Process-local by
+ * quiet past the last one resets the child to `baseMs`. A child's budget is
+ * spent only once its responsive notice is delivered, so a delivery that
+ * throws leaves the next failure free to escalate. Process-local by
  * design: a restart forgets the backoff and at worst grants one extra
  * responsive wake per failing child.
  */
@@ -71,17 +73,21 @@ export class FailureEscalationBackoff {
     this.now = opts.now ?? Date.now;
   }
 
-  /** Whether this failure from `childId` may wake its parent responsively. */
-  admit(childId: string): boolean {
+  /** Whether a failure from `childId` may wake its parent responsively now. Spends nothing. */
+  mayEscalate(childId: string): boolean {
+    const previous = this.windows.get(childId);
+    return !previous || this.now() >= previous.until;
+  }
+
+  /** Spend `childId`'s escalation once its responsive notice has been delivered. */
+  recordEscalation(childId: string): void {
     const t = this.now();
     for (const [id, w] of this.windows) {
       if (t >= w.until + w.windowMs) this.windows.delete(id);
     }
     const previous = this.windows.get(childId);
-    if (previous && t < previous.until) return false;
     const windowMs = previous ? Math.min(previous.windowMs * 2, this.maxMs) : this.baseMs;
     this.windows.set(childId, { until: t + windowMs, windowMs });
-    return true;
   }
 }
 
@@ -256,12 +262,29 @@ export function routeSpawnFailure(
   errorMsg: string
 ): void {
   if (parentId) {
-    deps.sendToParent(parentId, `[spawn failed] ${errorMsg}`, actorId, undefined, {
-      responsive: deps.escalation?.admit(actorId) ?? false,
-    });
+    sendFailureToParent(deps, parentId, `[spawn failed] ${errorMsg}`, actorId);
   } else {
     deps.postToErrorChat?.(`⚠️ ${errorMsg}`);
   }
+}
+
+/**
+ * Deliver a child's failure notice, responsive when the child's escalation
+ * budget allows (#189). The budget is spent only after `sendToParent` returns:
+ * a throwing delivery reached no one, so it must not cost the next failure its
+ * responsive wake. Check, delivery and spend run in one synchronous turn, so no
+ * other failure from the same child can interleave.
+ */
+function sendFailureToParent(
+  deps: FailureSinkDeps,
+  parentId: string,
+  body: string,
+  actorId: string,
+  forensics?: MechanicalInboxForensics
+): void {
+  const responsive = deps.escalation?.mayEscalate(actorId) ?? false;
+  deps.sendToParent(parentId, body, actorId, forensics, { responsive });
+  if (responsive) deps.escalation?.recordEscalation(actorId);
 }
 
 /** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
@@ -359,19 +382,13 @@ function routeMechanicalFailureNotice(
   }
 
   if (record?.parentId) {
-    deps.sendToParent(
-      record.parentId,
-      `[${label}] ${summary}${extraMessage}`,
+    sendFailureToParent(deps, record.parentId, `[${label}] ${summary}${extraMessage}`, actorId, {
+      // Older direct callers have no durable run record. Lifecycle callers
+      // pass the UUID so the parent can inspect the exact failed attempt.
+      runId: runId ?? actorId,
       actorId,
-      {
-        // Older direct callers have no durable run record. Lifecycle callers
-        // pass the UUID so the parent can inspect the exact failed attempt.
-        runId: runId ?? actorId,
-        actorId,
-        exitCode,
-      },
-      { responsive: deps.escalation?.admit(actorId) ?? false }
-    );
+      exitCode,
+    });
     return;
   }
 
