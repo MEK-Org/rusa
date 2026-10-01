@@ -32,6 +32,7 @@ import {
   buildQuickstartImage,
   buildSetupDockerRunArgs,
   enabledProviders,
+  printFallbackCommands,
   QUICKSTART_DASHBOARD_PORT,
   QUICKSTART_GIT_BRIDGE_PORT,
   runProviderLogins,
@@ -604,6 +605,18 @@ describe("quickstart command", () => {
         );
         log.mockRestore();
         warn.mockRestore();
+      });
+    });
+
+    describe("printFallbackCommands", () => {
+      it("recovers an existing rusa remote and quotes the path and URL", () => {
+        const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+        printFallbackCommands("/work/it's repo", "http://localhost:8085/local/my-repo.git");
+        const printed = log.mock.calls.map((call) => String(call[0])).join("\n");
+        expect(printed).toContain(
+          "git -C '/work/it'\\''s repo' remote set-url rusa 'http://localhost:8085/local/my-repo.git' || git -C '/work/it'\\''s repo' remote add rusa 'http://localhost:8085/local/my-repo.git'"
+        );
+        log.mockRestore();
       });
     });
 

@@ -77,15 +77,16 @@ export interface LocalRepoValidation {
   error?: string;
 }
 
-export type GitCommandExecutor = (
-  args: string[],
-  cwd?: string
-) => { status: number | null; stdout?: string; stderr?: string };
+export type GitCommandExecutor = (args: string[]) => {
+  status: number | null;
+  stdout?: string;
+  stderr?: string;
+};
 
 export function validateLocalGitRepo(
   repoPath: string,
-  executeGit: GitCommandExecutor = (args, cwd) =>
-    spawnSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" })
+  executeGit: GitCommandExecutor = (args) =>
+    spawnSync("git", args, { encoding: "utf8", stdio: "pipe" })
 ): LocalRepoValidation {
   const trimmed = repoPath.trim();
   if (!trimmed) {
@@ -184,9 +185,11 @@ export interface SetupBridgeRemoteOptions {
 }
 
 export function printFallbackCommands(repoPath: string, remoteUrl: string): void {
+  const git = `git -C ${shellQuote(repoPath)}`;
+  const url = shellQuote(remoteUrl);
   console.log(`[quickstart] You can manually configure and push your repository:`);
-  console.log(`  git -C ${shellQuote(repoPath)} remote add rusa ${remoteUrl}`);
-  console.log(`  git -C ${shellQuote(repoPath)} push rusa HEAD`);
+  console.log(`  ${git} remote set-url rusa ${url} || ${git} remote add rusa ${url}`);
+  console.log(`  ${git} push rusa HEAD`);
 }
 
 export function setupBridgeRemoteAndPush(opts: SetupBridgeRemoteOptions): {
@@ -197,8 +200,7 @@ export function setupBridgeRemoteAndPush(opts: SetupBridgeRemoteOptions): {
   const port = opts.port ?? QUICKSTART_GIT_BRIDGE_PORT;
   const remoteUrl = `http://localhost:${port}/${opts.repoKey}.git`;
   const execute =
-    opts.executeGit ??
-    ((args, cwd) => spawnSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }));
+    opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
 
   const getUrlRes = execute(["-C", opts.repoPath, "remote", "get-url", "rusa"]);
   if (getUrlRes.status === 0) {
@@ -358,8 +360,7 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
   const setupContainer = `${container}-setup`;
   const volume = opts.volume ?? "rusa-quickstart-home";
   const executeGit =
-    opts.executeGit ??
-    ((args, cwd) => spawnSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }));
+    opts.executeGit ?? ((args) => spawnSync("git", args, { encoding: "utf8", stdio: "pipe" }));
   const waitForBridge = opts.waitForBridgeReady ?? waitForPortReady;
 
   console.log("\nRusa quickstart\n");

@@ -20,10 +20,11 @@ The root `quickstart` command accepts the following options:
 ### Walkthrough: End-to-End Flow
 
 1. **Host-Side Local Repository Validation**
-   Before launching any container, `rusa quickstart` prompts for or accepts `--repo <path>` and validates it on the host:
+   `rusa quickstart` validates the repository on the host. A `--repo <path>` is checked before any container is started or replaced; without `--repo`, the prompt appears once the setup container is up and the wizard is about to run (first run or `--reconfigure`), and rejects an invalid path before the wizard starts:
    * Confirms the path exists and is a directory.
    * Confirms the path is inside a Git worktree (`git rev-parse --is-inside-work-tree`).
    * Confirms the repository has at least one commit (`git rev-parse --verify HEAD`).
+   * Confirms the directory name uses only letters, digits, `.`, `_` and `-`, since it becomes the `local/<dirname>` repo key and part of the bridge URL.
 
 2. **Image Build & Volume Provisioning**
    Unless `--no-build` is specified, the CLI builds the local Docker image `rusa:quickstart`. It then creates a persistent Docker volume (`rusa-quickstart-home` by default) to hold your credentials, repository checkouts, and configuration files.
