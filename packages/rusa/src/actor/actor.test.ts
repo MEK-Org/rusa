@@ -131,12 +131,13 @@ describe("Actor", () => {
           { provider: provider.providerName, model: "gpt-5.6-terra" },
         ],
         gate: (fn, candidates) => fn(candidates[1]),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       provider
     );
@@ -170,12 +171,13 @@ describe("Actor", () => {
             selected.model,
             selected.effort
           ),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       new FakeProvider()
     );
@@ -1073,12 +1075,13 @@ describe("Actor", () => {
         ],
         resolveProvider: resolvePoolEntry,
         classifyExhaustion: async () => ({ exhausted: true }),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       primary
     );
@@ -1127,12 +1130,13 @@ describe("Actor", () => {
         ],
         resolveProvider: resolvePoolEntry,
         classifyExhaustion: async () => ({ exhausted: true }),
-        onProviderAttempt: (attempt) =>
+        onProviderAttempt: (attempt) => {
           attempts.push({
             provider: attempt.providerName,
             model: attempt.model,
             effort: attempt.effort,
-          }),
+          });
+        },
       },
       primary
     );

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorOptions } from "../../actor/actor.js";
 import { createActorLifecycle } from "../../actor/actor-lifecycle.js";
 import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
@@ -153,23 +153,43 @@ describe("remote actor run accounting", () => {
     expect(accountingErrors).toEqual([]);
   });
 
-  it("forwards the admitted attempt and a follower fallback for leader-side attribution", async () => {
+  it("installs the admitted and instantiated attempts only while the run is open", async () => {
     bootActor();
     followerSends({
       type: "runStart",
       responsive: false,
-      selected: { provider: "codex", model: "gpt-5.5", effort: "high" },
+      selected: { provider: "codex", model: "gpt-5.5" },
     });
-    followerSends({
-      type: "providerAttempt",
-      attempt: { provider: "claude", model: "claude-sonnet-5", effort: "low" },
-    } as unknown as Parameters<RemoteInstance["receive"]>[0]["message"]);
+    const attempt = (requestId: number) =>
+      followerSends({
+        type: "request",
+        requestId,
+        request: {
+          op: "providerAttempt",
+          attempt: { provider: "codex", model: "gpt-5.5", effort: "high" },
+        },
+      });
+    attempt(7);
     await Promise.resolve();
-
     expect(providerAttempts).toEqual([
+      { providerName: "codex", model: "gpt-5.5", effort: undefined },
       { providerName: "codex", model: "gpt-5.5", effort: "high" },
-      { providerName: "claude", model: "claude-sonnet-5", effort: "low" },
     ]);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 7 },
+    });
+
+    await reportComplete();
+    await vi.waitFor(() => expect(openRuns()).toEqual([]));
+    attempt(8);
+    await Promise.resolve();
+    // Answered so the follower is not left waiting, but not installed.
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 8 },
+    });
+    expect(providerAttempts).toHaveLength(2);
   });
 
   it("defers ordinary work at remote final admission without reserving a lane", async () => {

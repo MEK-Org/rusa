@@ -1005,9 +1005,9 @@ export class ActorHandle implements MeshActor {
         break;
       }
       case "runStart":
-        // Older followers do not emit `providerAttempt`, but their run-start
-        // tuple is still the leader-admitted initial attempt. Keep that useful
-        // attribution; current followers refine it for every actual fallback.
+        // Older followers do not send `providerAttempt`, but their run-start
+        // tuple is still the leader-admitted attempt. Keep that attribution;
+        // current followers refine it with the tuple they instantiated.
         this.opts.actorOptions?.onProviderAttempt?.({
           providerName: message.selected.provider,
           model: message.selected.model,
@@ -1047,13 +1047,6 @@ export class ActorHandle implements MeshActor {
           injectRecord: message.injectRecord,
           selected: message.selected,
         });
-      case "providerAttempt":
-        this.opts.actorOptions?.onProviderAttempt?.({
-          providerName: message.attempt.provider,
-          model: message.attempt.model,
-          effort: message.attempt.effort,
-        });
-        break;
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;
@@ -1122,6 +1115,17 @@ export class ActorHandle implements MeshActor {
               this.send({ type: "reply", requestId });
               break;
             }
+            case "providerAttempt":
+              // An attempt that arrives after the run closed must not restore
+              // the selection terminal cleanup removed.
+              if (this.runOpen)
+                void this.opts.actorOptions?.onProviderAttempt?.({
+                  providerName: request.attempt.provider,
+                  model: request.attempt.model,
+                  effort: request.attempt.effort,
+                });
+              this.send({ type: "reply", requestId });
+              break;
             case "sendMessage":
               // Bind sender identity here; the remote actor cannot choose a different actor.
               this.send({

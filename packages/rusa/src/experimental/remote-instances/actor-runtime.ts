@@ -328,18 +328,19 @@ export function createActorRuntime(
       ]),
       onFirstChunk: () => send({ type: "firstChunk" }),
       // The leader owns public write attribution, while this follower owns the
-      // actual provider invocation. Forward every attempt (not merely the
-      // leader-selected initial candidate) so a supported pool fallback cannot
-      // leave a subsequent write labelled with the failed model.
+      // actual provider invocation, whose model and effort its own config may
+      // fill in. Events reach the leader on a batched, retried path and the
+      // provider's MCP writes on another, so wait for the leader to confirm the
+      // attempt before the Actor invokes the provider.
       onProviderAttempt: (provider) =>
-        send({
-          type: "providerAttempt",
+        request<void>({
+          op: "providerAttempt",
           attempt: {
             provider: provider.providerName,
             model: provider.model,
             effort: provider.effort,
           },
-        }),
+        }).result,
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
       onRuntimeStateChanged: (state) => {
         lastRuntimeState = state;

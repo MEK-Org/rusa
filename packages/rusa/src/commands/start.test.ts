@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type ActorOptions } from "../actor/actor.js";
 import type { ActorLifecycleAbandonmentReason } from "../actor/actor-lifecycle.js";
@@ -40,6 +40,7 @@ import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { buildE2EConfig } from "../e2e/provision.js";
 import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
+import { FollowerInstance } from "../experimental/remote-instances/follower-instance.js";
 import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import { RemoteInstance } from "../experimental/remote-instances/remote-instance.js";
 import type { IssueClient } from "../gitops/issue-client.js";
@@ -7636,27 +7637,179 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     remote.receive({
       actorId: workerId,
-      message: {
-        type: "providerAttempt",
-        attempt: { provider: "antigravity", model: "Gemini 3.7 Pro", effort: "low" },
-      },
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect((await callChat("fallback remote attempt")).isError).toBeFalsy();
-    expect(chatClient.sent[1]?.text).toBe(
-      `fallback remote attempt\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
-    );
-
-    remote.receive({
-      actorId: workerId,
       message: { type: "result", result: { success: true, output: "done", exitCode: 0 } },
     });
     await vi.waitFor(() =>
       expect(getRepositories().actorRuns.getById(runId)?.outcome).toBe("completed")
     );
     expect((await callChat("after remote terminal")).isError).toBeFalsy();
-    expect(chatClient.sent[2]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
+    expect(chatClient.sent[1]?.text).toBe(`after remote terminal\n\n_${generateHandle(workerId)}_`);
+
+    // A late attempt is still answered, but cannot restore the cleared selection.
+    remote.receive({
+      actorId: workerId,
+      message: {
+        type: "request",
+        requestId: 1,
+        request: {
+          op: "providerAttempt",
+          attempt: { provider: "antigravity", model: "Gemini 3.7 Pro", effort: "low" },
+        },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(remote?.commands).toContainEqual({
+        actorId: workerId,
+        message: { type: "reply", requestId: 1 },
+      })
+    );
+    expect((await callChat("after late attempt")).isError).toBeFalsy();
+    expect(chatClient.sent[2]?.text).toBe(`after late attempt\n\n_${generateHandle(workerId)}_`);
   });
+
+  it("installs a real follower's normalized attempt before its provider can write", async () => {
+    const chatClient = new FakeChatClient();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" }, codex: { cliCommand: "codex" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    let mesh: ActorMesh | undefined;
+    let remote: RemoteInstance | undefined;
+    let leaderOptions: ActorOptions | undefined;
+    const followerHome = mkdtempSync(join(tmpdir(), "rusa-signature-follower-"));
+    onTestFinished(() => rmSync(followerHome, { recursive: true, force: true }));
+    // Follower events reach the leader in order but late, as through
+    // follower.ts's batched, retried flush. From the attempt report on, the
+    // test holds them, so the provider's public write has no transport timing
+    // to win the race with.
+    let held: Array<() => void> | undefined;
+    let providerStarted = false;
+    // The follower's own config fills what the admitted tuple omits, as
+    // configured-provider.ts does. Each run makes its public write at once.
+    const follower = new FollowerInstance(
+      followerHome,
+      false,
+      (event) => {
+        const deliver = () => remote?.receive(structuredClone(event));
+        const { message } = event;
+        if (message.type === "request" && message.request.op === "providerAttempt") held ??= [];
+        if (held) held.push(deliver);
+        else queueMicrotask(deliver);
+      },
+      (_bridge, _options, selected) => ({
+        name: "follower-normalized",
+        providerName: selected?.provider ?? "codex",
+        model: selected?.model ?? "gpt-5.5",
+        effort: selected?.effort ?? "low",
+        async run(run) {
+          providerStarted = true;
+          const chatUrl = leaderOptions?.mcpServers.find(
+            (server) => server.name === "chat-write"
+          )?.url;
+          if (!chatUrl) throw new Error("remote chat-write server missing");
+          const client = new Client({ name: "remote-signature-follower", version: "0.0.0" });
+          await client.connect(new StreamableHTTPClientTransport(new URL(chatUrl)));
+          try {
+            await client.callTool({
+              name: "send_message",
+              arguments: { spaceName: "spaces/A", text: "written at provider start" },
+            });
+          } finally {
+            await client.close();
+          }
+          return { success: true, output: "done", exitCode: 0, sessionId: run.session?.id };
+        },
+      })
+    );
+    onTestFinished(() => follower.close());
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          chatClient,
+          createWorkerActor: (context: ActorFactoryContext, options: ActorOptions) => {
+            leaderOptions = options;
+            if (!remote) {
+              const instance = new RemoteInstance(
+                "signature-follower",
+                process.platform,
+                process.pid
+              );
+              instance.flush = () => {
+                for (const command of instance.commands.splice(0))
+                  if ("actorId" in command)
+                    queueMicrotask(() => follower.dispatch(structuredClone(command)));
+              };
+              remote = instance;
+            }
+            return new ActorHandle({
+              host: remote.createHost(context.record.id),
+              bootstrap: {
+                id: context.record.id,
+                cwd: options.cwd,
+                modelConfig: [...options.modelConfig],
+              },
+              context,
+              actorOptions: options,
+              snapshot: () => {
+                const record = context.getRecord();
+                if (!record) throw new Error("remote signature worker record missing");
+                return { record, prompt: "remote signature fixture" };
+              },
+              saveSession: () => {},
+              onFailure: () => {},
+            });
+          },
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("remote signature fixture mesh did not start");
+
+    // The admitted tuple omits effort; the follower's config supplies it.
+    const workerId = mesh.spawn({
+      charter: "remote signature fixture",
+      parentId: "root",
+      executionTarget: "signature-follower",
+      modelConfig: { provider: "codex", model: "gpt-5.5" },
+    });
+    mesh.grantCapability(workerId, "chat-write:spaces/A", "root");
+    // This suite records Actor wakes instead of running them. Only the
+    // follower's Actor, which runs the fixture provider, needs a real run.
+    const recordWake = vi.mocked(Actor.prototype.requestRun).getMockImplementation();
+    vi.mocked(Actor.prototype.requestRun).mockRestore();
+    const requestRun = Actor.prototype.requestRun;
+    vi.spyOn(Actor.prototype, "requestRun").mockImplementation(function (this: Actor, nudge) {
+      if (this.id === workerId) return requestRun.call(this, nudge);
+      recordWake?.call(this, nudge);
+    });
+    mesh.sendMessage(workerId, "write the signature fixture", "root");
+
+    await vi.waitFor(() => expect(held).toBeDefined(), { timeout: 15_000 });
+    for (let turn = 0; turn < 5; turn++) await new Promise((resolve) => setImmediate(resolve));
+    expect(providerStarted).toBe(false);
+    for (const deliver of held?.splice(0) ?? []) deliver();
+    held = undefined;
+    await vi.waitFor(() => expect(chatClient.sent).toHaveLength(1), { timeout: 15_000 });
+    expect(chatClient.sent[0]?.text).toBe(
+      `written at provider start\n\n_${generateHandle(workerId)} (gpt-5.5, low)_`
+    );
+  }, 20_000);
 
   it("records token usage linked to actor_runs.id through the real worker lifecycle wiring", async () => {
     let mesh: ActorMesh | undefined;

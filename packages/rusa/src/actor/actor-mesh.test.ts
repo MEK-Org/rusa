@@ -1586,12 +1586,13 @@ describe("ActorMesh", () => {
               selected.model,
               selected.effort
             ),
-          onProviderAttempt: (provider) =>
+          onProviderAttempt: (provider) => {
             attempts.push({
               provider: provider.providerName,
               model: provider.model,
               effort: provider.effort,
-            }),
+            });
+          },
           mcpServers: [],
           loadSessionId: () => ctx.getRecord()?.sessionId,
           saveSessionId: (sessionId) => ctx.mesh.actors.patch(ctx.record.id, { sessionId }),
