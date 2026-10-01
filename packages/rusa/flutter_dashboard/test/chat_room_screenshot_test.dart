@@ -3,8 +3,8 @@
 //   flutter test test/chat_room_screenshot_test.dart
 //
 // It writes `flutter_dashboard/screenshots/chat_room_three_actors.png` for the
-// PR's visual review: a 2×2 three-actor grid with one active speaking ring and
-// one queued voice reply.
+// PR's visual review: a 2×2 three-actor grid with one actor speaking while a
+// second voice reply waits in the shared queue.
 
 import 'dart:io';
 
@@ -83,8 +83,13 @@ void main() {
       await tester.pump(const Duration(milliseconds: 250));
 
       expect(find.text('Speaking'), findsOneWidget);
-      expect(find.text('1 queued'), findsOneWidget);
-      expect(find.byKey(const ValueKey('chat-room-avatar-root')), findsOneWidget);
+      // Reply B waits in the shared queue; the room no longer has a header to
+      // count it in (#803).
+      expect(find.text('CHAT ROOM'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('chat-room-avatar-root')),
+        findsOneWidget,
+      );
       expect(
         find.byKey(const ValueKey('chat-room-avatar-actor-b')),
         findsOneWidget,
