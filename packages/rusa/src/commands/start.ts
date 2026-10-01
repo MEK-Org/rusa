@@ -3192,7 +3192,11 @@ async function composeStart(
           buildPrompt: () => {
             const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
-            const handles = resolveHandleLabels(r.handles, (hid) => actors.get(hid)?.charter);
+            const handles = resolveHandleLabels(
+              r.handles,
+              (hid) => actors.get(hid)?.charter,
+              (hid) => actors.get(hid)?.title
+            );
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.

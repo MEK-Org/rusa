@@ -5,6 +5,8 @@ import { generateHandle } from "./handle-generator.js";
 export interface ResolvedHandle {
   id: string;
   label: string;
+  /** Parent-authored thread title, when one is available. */
+  title?: string;
 }
 
 /**
@@ -21,7 +23,11 @@ your notifications. Blocking to wait for a reply wastes a run and can deadlock t
 mesh. When you've delegated and have no other independent work to do until they
 answer, yield the run and call no more tools — provider return settles it until
 a real wake arrives. Retire a child (your judgment) once it has reported its
-work done.`;
+work done.
+
+If an actor-to-actor message reaches you but belongs with a different live
+recipient, reply to its sender with \`Not for me — I think this was intended for
+<recipient>.\` Do not forward it yourself.`;
 
 /**
  * Stay grounded in real tool results — the universal anti-confabulation rule for
@@ -265,19 +271,21 @@ export function summarizeCharter(charter: string | undefined, max = 100): string
  */
 export function resolveHandleLabels(
   handles: ActorHandle[] | undefined,
-  charterOf: (id: string) => string | undefined
+  charterOf: (id: string) => string | undefined,
+  titleOf?: (id: string) => string | undefined
 ): ResolvedHandle[] {
-  return (handles ?? []).map((h) => ({
-    id: h.id,
-    label: h.role ?? summarizeCharter(charterOf(h.id)),
-  }));
+  return (handles ?? []).map((h) => {
+    const label = h.role ?? summarizeCharter(charterOf(h.id));
+    const title = titleOf?.(h.id);
+    return { id: h.id, label, ...(title ? { title } : {}) };
+  });
 }
 
 /** Render the reachable actors as a bullet list: parent first, then granted handles. */
 function renderAddressBook(ctx: WorkerPromptContext): string {
   const lines = [`- \`${ctx.parentId}\` — your **parent** (report results here)`];
   for (const h of ctx.handles ?? []) {
-    lines.push(`- \`${h.id}\` — ${h.label}`);
+    lines.push(`- \`${h.id}\` — ${h.label}${h.title ? ` (title: ${h.title})` : ""}`);
   }
   return lines.join("\n");
 }

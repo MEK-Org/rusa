@@ -2818,6 +2818,37 @@ export class ActorMesh {
   }
 
   /**
+   * A delivered actor message is an introduction to its sender (#187). Keep
+   * this at the delivery boundary rather than the send boundary: a dropped or
+   * merely scheduled message must not mint an address-book capability.
+   *
+   * Human principals deliberately stay outside actor handles. A known retired
+   * actor remains an attributable sender, so the recipient can inspect its
+   * context and attempt the requested reply; the normal send path then reports
+   * that it is no longer live.
+   */
+  private introduceMessageSender(toId: string, fromId: string): void {
+    if (
+      isHumanOperator(fromId) ||
+      (this.principals !== undefined && this.principals.getUser(fromId) !== undefined)
+    ) {
+      return;
+    }
+    const recipient = this.actors.get(toId);
+    const sender = this.actors.get(fromId);
+    if (!recipient || !sender || recipient.id === sender.id) return;
+    // A parent is already a stable, separately rendered address-book alias.
+    // Do not turn that topology edge into a duplicate explicit handle.
+    if (recipient.parentId !== null && this.resolveThreadId(recipient.parentId) === sender.id) {
+      return;
+    }
+    // Callback retries re-enter the delivery seam. Do not record a second
+    // handle_granted event once the durable address-book entry exists.
+    if ((recipient.handles ?? []).some((handle) => handle.id === sender.id)) return;
+    this.grantHandle(recipient.id, { id: sender.id });
+  }
+
+  /**
    * Remove `targetId` from `toId`'s address book. Idempotent; no-op if `toId` is
    * unknown or does not hold a handle to `targetId`. Takes effect on the actor's
    * next wake.
@@ -3637,6 +3668,26 @@ export class ActorMesh {
   }
 
   /**
+   * Whether an actor may direct a message to a live peer. The parent edge and
+   * a delayed self-wake are stable aliases; every other peer needs a durable
+   * handle. The actor-facing MCP server enforces this capability boundary.
+   */
+  canSendMessage(fromId: string, toId: string): boolean {
+    fromId = this.resolveThreadId(fromId);
+    toId = this.resolveThreadId(toId);
+    const sender = this.actors.get(fromId);
+    const recipient = this.actors.get(toId);
+    if (!sender || !recipient) return false;
+    if (sender.id === recipient.id) return true;
+    if (sender.parentId !== null && this.resolveThreadId(sender.parentId) === recipient.id) {
+      return true;
+    }
+    return (sender.handles ?? []).some(
+      (handle) => this.resolveThreadId(handle.id) === recipient.id
+    );
+  }
+
+  /**
    * Deliver a message to a thread's inbox. Actor→actor only; the human↔root edge
    * is handled by the wiring (chat/webhook), not here. Async by design.
    */
@@ -3745,6 +3796,7 @@ export class ActorMesh {
           payload: { type: "mesh.message", messageId, fromId, sessionId },
         },
       ]);
+      this.introduceMessageSender(toId, fromId);
     }
     this.dispatch(toId);
     return { delivered: true };
@@ -5491,6 +5543,7 @@ export class ActorMesh {
           },
         },
       ]);
+      this.introduceMessageSender(toId, scheduled.fromId);
       this.dispatch(toId);
       return;
     }

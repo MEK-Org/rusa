@@ -512,7 +512,11 @@ function setup(
             prompt: buildWorkerPrompt(r.charter, {
               threadId: r.id,
               parentId: r.parentId ?? "human",
-              handles: resolveHandleLabels(r.handles, (hid) => registry.get(hid)?.charter),
+              handles: resolveHandleLabels(
+                r.handles,
+                (hid) => registry.get(hid)?.charter,
+                (hid) => registry.get(hid)?.title
+              ),
             }),
           };
         },
@@ -4163,6 +4167,74 @@ describe("ActorMesh", () => {
     expect(last).toContain("Work from your inbox");
     // The coder's prompt advertises the reviewer handle it was granted.
     expect(last).toContain("code reviewer (high-tier)");
+  });
+
+  it("introduces a delivered peer sender with its handle and title", async () => {
+    const { mesh, registry, fake, tick } = setup();
+    const sender = mesh.spawn({
+      charter: "review this patch",
+      parentId: "root",
+      title: "Release reviewer",
+    });
+    const recipient = mesh.spawn({ charter: "implement the patch", parentId: "root" });
+
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+    expect(mesh.sendMessage(recipient, "Could you check this?", sender)).toEqual({
+      delivered: true,
+    });
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender }]);
+
+    await tick();
+    const prompt = fake(recipient).calls.at(-1)?.prompt ?? "";
+    expect(prompt).toContain(`\`${sender}\``);
+    expect(prompt).toContain("title: Release reviewer");
+    expect(prompt).toContain("Not for me — I think this was intended for");
+  });
+
+  it("keeps the parent alias separate and never grants a human sender handle", () => {
+    const { mesh, registry } = setup();
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    expect(mesh.sendMessage(child, "from your parent", "root")).toEqual({ delivered: true });
+    expect(registry.get(child)?.handles ?? []).toEqual([]);
+
+    expect(mesh.sendHumanMessage(child, "from the operator", "session-1")).toEqual({
+      delivered: true,
+    });
+    expect(registry.get(child)?.handles ?? []).toEqual([]);
+  });
+
+  it("introduces a scheduled sender only when delivery occurs and only once", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, registry, scheduledMessages } = setup({ events: (event) => events.push(event) });
+    const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+
+    expect(
+      mesh.sendMessage(
+        recipient,
+        "arrive later",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      )
+    ).toEqual({ delivered: true });
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+
+    const scheduled = scheduledMessages.listForRecipient(recipient)[0];
+    expect(scheduled).toBeDefined();
+    mesh.deliverScheduledMessage(scheduled);
+    mesh.deliverScheduledMessage(scheduled);
+
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender }]);
+    expect(
+      events.filter(
+        (event) =>
+          event.kind === "handle_granted" &&
+          event.actorId === recipient &&
+          JSON.parse(event.payload ?? "{}").handleId === sender
+      )
+    ).toHaveLength(1);
   });
 
   it("calls onRetire for every node in a retired subtree", async () => {
@@ -10136,7 +10208,11 @@ describe("ActorMesh", () => {
       mesh.deliverScheduledMessage(message);
 
       expect(chatRows.get(message.id)).toBe(message.body);
-      expect(events.map((event) => event.kind)).toEqual(["message_sent", "message_received"]);
+      expect(events.map((event) => event.kind)).toEqual([
+        "message_sent",
+        "message_received",
+        "handle_granted",
+      ]);
     });
 
     it("makes callback retries idempotent without a local pending-message row", () => {
