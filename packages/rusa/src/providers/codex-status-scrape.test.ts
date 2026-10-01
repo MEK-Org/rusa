@@ -55,6 +55,19 @@ vi.mock("node:fs", () => ({
   },
 }));
 
+const leaseMock = vi.fn();
+const revokeMock = vi.fn();
+let brokerOn = false;
+
+vi.mock("./codex-auth-broker.js", () => ({
+  CODEX_REFRESH_URL_ENV: "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+  activeCodexAuthBroker: () => (brokerOn ? { lease: leaseMock } : undefined),
+  writeCodexLeaseAuth: (dir: string, lease: { authJson: string }) => {
+    writeFileSyncMock(`${dir}/auth.json`, lease.authJson, { mode: 0o600 });
+    return `${dir}/auth.json`;
+  },
+}));
+
 import type { Logger } from "../observability/logger.js";
 import {
   buildTmuxScript,
@@ -492,6 +505,62 @@ describe("codex-status-scrape", () => {
         expect.stringContaining("/tmp/codex-config/auth.json"),
         "/tmp/test-codex-home/auth.json"
       );
+    });
+
+    it("with the broker on, seeds a leased copy instead of the shared symlink and revokes it", async () => {
+      existsSyncMock.mockImplementation((p) => String(p).endsWith("auth.json"));
+      lstatSyncMock.mockReturnValue({ isSymbolicLink: () => false });
+      leaseMock.mockResolvedValue({
+        authJson: '{"tokens":{"refresh_token":"rusa-cap-fixture"}}',
+        refreshUrl: "http://127.0.0.1:4555/oauth/token",
+        revoke: revokeMock,
+      });
+      brokerOn = true;
+      const mockChild = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        pid: 12345,
+      });
+      spawnMock.mockImplementation(() => {
+        setTimeout(() => {
+          mockChild.stdout.emit("data", Buffer.from("rendered 5h limit: 99% left\n"));
+          mockChild.emit("close", 0);
+        }, 10);
+        return mockChild as unknown as childProcess.ChildProcess;
+      });
+
+      try {
+        await scrapeCodexStatus({ actorDir: "/tmp/actor", codexConfigDir: "/tmp/codex-config" });
+      } finally {
+        brokerOn = false;
+      }
+
+      expect(symlinkSyncMock).not.toHaveBeenCalled();
+      expect(writeFileSyncMock).toHaveBeenCalledWith(
+        "/tmp/test-codex-home/auth.json",
+        '{"tokens":{"refresh_token":"rusa-cap-fixture"}}',
+        { mode: 0o600 }
+      );
+      const env = spawnMock.mock.calls[0]?.[2]?.env;
+      expect(env?.CODEX_HOME).toBe("/tmp/test-codex-home");
+      expect(env?.CODEX_REFRESH_TOKEN_URL_OVERRIDE).toBe("http://127.0.0.1:4555/oauth/token");
+      expect(revokeMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("with the broker on, rejects rather than falling back when the lease fails", async () => {
+      leaseMock.mockRejectedValue(
+        new Error("codex auth broker cannot read the canonical auth.json")
+      );
+      brokerOn = true;
+      try {
+        await expect(
+          scrapeCodexStatus({ actorDir: "/tmp/actor", codexConfigDir: "/tmp/codex-config" })
+        ).rejects.toThrow(/canonical auth\.json/);
+      } finally {
+        brokerOn = false;
+      }
+      expect(symlinkSyncMock).not.toHaveBeenCalled();
+      expect(spawnMock).not.toHaveBeenCalled();
     });
 
     it("logs diagnostic warning if lingering processes reference codexHome during cleanup", async () => {

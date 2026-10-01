@@ -17,6 +17,7 @@ import {
   parseCodexModel,
   stripMcpServersFromToml,
 } from "./codex.js";
+import { SANDBOX_CODEX_SHELL_ENV_OVERRIDE } from "./sandbox.js";
 
 const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
   const spawnFn = vi.fn();
@@ -685,6 +686,18 @@ trust_level = "trusted"
       expect(result.success).toBe(true);
     });
 
+    it("hands shell children the throwaway CODEX_HOME on resume and on the fresh retry", async () => {
+      seedRollout(ID);
+      const { argvs } = await runWithSpawns({ id: ID }, [1, 0]);
+      expect(argvs).toHaveLength(2);
+      for (const argv of argvs) {
+        const codexArgs = codexArgsOf(argv);
+        const at = codexArgs.indexOf(SANDBOX_CODEX_SHELL_ENV_OVERRIDE);
+        expect(at).toBeGreaterThan(-1);
+        expect(codexArgs[at - 1]).toBe("--config");
+      }
+    });
+
     it("backstop: does NOT retry fresh when a resume succeeds", async () => {
       seedRollout(ID);
       const { argvs, result } = await runWithSpawns({ id: ID }, [0]);
@@ -743,6 +756,8 @@ trust_level = "trusted"
         'mcp_servers.inbox.url="http://127.0.0.1:5555/mcp/inbox-token"',
       ])
     );
+    // No sandbox, no auth bind: the shell-home redirect is sandbox-only.
+    expect(spawnArgs).not.toContain(SANDBOX_CODEX_SHELL_ENV_OVERRIDE);
   });
 
   it("sandboxed: mcp-config source on host /tmp, bound to /tmp/config.toml", async () => {

@@ -960,6 +960,31 @@ describe("loadConfig understanding root", () => {
   });
 });
 
+describe("loadConfig providers.codex.authBroker", () => {
+  it("accepts a boolean on codex", () => {
+    const config = loadConfig(
+      writeConfig({ providers: { codex: { cliCommand: "codex", authBroker: true } } })
+    );
+    expect(config.providers.codex?.authBroker).toBe(true);
+  });
+
+  it("rejects it on any other provider and as a non-boolean", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: {
+            codex: { cliCommand: "codex" },
+            claude: { cliCommand: "claude", authBroker: true },
+          },
+        })
+      )
+    ).toThrow(/providers\.claude\.authBroker is only supported for codex/);
+    expect(() =>
+      loadConfig(writeConfig({ providers: { codex: { cliCommand: "codex", authBroker: "yes" } } }))
+    ).toThrow(/providers\.codex\.authBroker must be true or false/);
+  });
+});
+
 describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   it("throws naming the ruling and issue when a provider carries fallbackModel", () => {
     expect(() =>

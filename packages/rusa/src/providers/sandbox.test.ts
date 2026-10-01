@@ -1588,6 +1588,64 @@ describe("sandbox bwrap args", () => {
 
     expect(args.join(" ")).toContain("--setenv CODEX_HOME /tmp");
     expect(args.join(" ")).not.toContain(`--bind ${join(home, ".codex")} ${join(home, ".codex")}`);
+
+    // The CLI's shell children get their own empty CODEX_HOME on the private tmpfs,
+    // outside the auth bind's directory.
+    const { SANDBOX_CODEX_SHELL_ENV_OVERRIDE, SANDBOX_CODEX_SHELL_HOME } = await import(
+      "./sandbox.js"
+    );
+    const shellHomeIndex = args.indexOf(SANDBOX_CODEX_SHELL_HOME);
+    expect(args[shellHomeIndex - 1]).toBe("--dir");
+    expect(shellHomeIndex).toBeGreaterThan(args.indexOf("--tmpfs"));
+    expect(SANDBOX_CODEX_SHELL_HOME).not.toBe("/tmp");
+    expect(SANDBOX_CODEX_SHELL_ENV_OVERRIDE).toBe(
+      `shell_environment_policy.set.CODEX_HOME="${SANDBOX_CODEX_SHELL_HOME}"`
+    );
+  });
+
+  it("with a brokered login, binds only the run's private auth and hides the host codex home", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+    tempDirs.push(home);
+    process.env.HOME = home;
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "mock-auth-data");
+
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs, SANDBOX_CODEX_SHELL_HOME } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "codex", undefined, false, undefined, {
+      authFile: "/tmp/rusa-codex-auth-run/auth.json",
+      refreshUrl: "http://127.0.0.1:4555/oauth/token",
+    });
+    const joined = args.join(" ");
+    const hostCodexDir = join(home, ".codex");
+
+    // The canonical login is neither bound nor readable through the root ro-bind.
+    expect(args).not.toContain(join(hostCodexDir, "auth.json"));
+    const hide = args.findIndex((a, i) => a === "--tmpfs" && args[i + 1] === hostCodexDir);
+    expect(hide).toBeGreaterThan(
+      args.findIndex((a, i) => a === "--ro-bind" && args[i + 1] === "/")
+    );
+    expect(args.slice(hide, hide + 4)).toEqual([
+      "--tmpfs",
+      hostCodexDir,
+      "--remount-ro",
+      hostCodexDir,
+    ]);
+
+    // The CLI reads the private copy and refreshes through the broker.
+    expect(joined).toContain("--bind /tmp/rusa-codex-auth-run/auth.json /tmp/auth.json");
+    expect(joined).toContain(
+      "--setenv CODEX_REFRESH_TOKEN_URL_OVERRIDE http://127.0.0.1:4555/oauth/token"
+    );
+    expect(joined).toContain("--setenv CODEX_HOME /tmp");
+    expect(args[args.indexOf(SANDBOX_CODEX_SHELL_HOME) - 1]).toBe("--dir");
+    tempDirs.push("/tmp/rusa-codex-sessions-worktree");
   });
 
   it("persists codex session rollouts: binds a per-actor host-/tmp store over /tmp/sessions, after the tmpfs", async () => {

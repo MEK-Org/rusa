@@ -1,8 +1,24 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type { ProviderConfig } from "../config/types.js";
+import {
+  activeCodexAuthBroker,
+  CODEX_REFRESH_URL_ENV,
+  type CodexAuthLease,
+  seedBrokeredCodexHome,
+  writeCodexLeaseAuth,
+} from "./codex-auth-broker.js";
 import {
   formatLiveError,
   formatMcpInvocationNotice,
@@ -16,6 +32,7 @@ import {
   buildActorBwrapArgs,
   buildActorBwrapCommand,
   codexRolloutStoreDir,
+  SANDBOX_CODEX_SHELL_ENV_OVERRIDE,
   teardownFlutterOverlay,
 } from "./sandbox.js";
 import { sanitizeArgvText } from "./spawn-arguments.js";
@@ -30,6 +47,8 @@ import type { CodingProvider, McpServerSpec, RunOptions, RunResult } from "./typ
 export { CODEX_REASONING_EFFORTS, parseCodexModel } from "./reasoning-effort.js";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/** Capability lifetime past a run's worst case (a resume attempt, then a fresh one). */
+const AUTH_LEASE_GRACE_MS = 5 * 60 * 1000;
 
 /** A session/conversation UUID as it appears in codex rollout filenames + `session_meta.payload.id`. */
 const SESSION_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -367,6 +386,7 @@ export class CodexProvider implements CodingProvider {
     const tempPaths: string[] = [];
 
     let mcpConfigSource: string | undefined;
+    let authLease: CodexAuthLease | undefined;
 
     const cleanupMcpConfig = () => {
       if (mcpConfigSource) {
@@ -386,6 +406,7 @@ export class CodexProvider implements CodingProvider {
       if (opts.sandbox) {
         teardownFlutterOverlay(opts.sandbox.worktreePath);
       }
+      authLease?.revoke();
     };
 
     // Resolve where this run's session rollouts live, so we can decide
@@ -409,8 +430,10 @@ export class CodexProvider implements CodingProvider {
         : undefined;
 
     const codexCwd = opts.sandbox ? opts.sandbox.worktreePath : opts.cwd;
+    // Sandboxed: keep the CLI's shell children off the live auth bind (see
+    // SANDBOX_CODEX_SHELL_HOME). Model and MCP servers travel in the bound config.
     const configOverrides = opts.sandbox
-      ? undefined
+      ? [SANDBOX_CODEX_SHELL_ENV_OVERRIDE]
       : buildCodexConfigOverrides(opts.mcpServers ?? [], this.model, this.effort);
 
     // Build the bwrap wrapper ONCE (sandbox setup + per-actor sessions-store bind +
@@ -418,6 +441,7 @@ export class CodexProvider implements CodingProvider {
     // still sees the bound auth/config; only the codex args after `--` differ per attempt.
     let spawnCommand = command;
     const spawnCwd = opts.sandbox ? "/" : opts.cwd;
+    let spawnEnv: NodeJS.ProcessEnv | undefined;
     let bwrapResult: ActorBwrapResult | undefined;
 
     // Capture the session id for the next wake to resume . codex writes
@@ -652,6 +676,7 @@ export class CodexProvider implements CodingProvider {
         command: spawnCommand,
         args: spawnArgs,
         cwd: spawnCwd,
+        env: spawnEnv,
         timeoutMs,
         signal: opts.signal,
         onStdout: opts.onStdout,
@@ -773,6 +798,42 @@ export class CodexProvider implements CodingProvider {
         writeFileSync(mcpConfigSource, merged);
       }
 
+      // With the host-owned broker on (#782) the run gets a per-run capability,
+      // never the canonical login. A broker fault fails the launch closed: there is
+      // no fallback to the shared writable login.
+      const broker = activeCodexAuthBroker();
+      let codexAuth: { authFile: string; refreshUrl: string } | undefined;
+      if (broker) {
+        try {
+          authLease = await broker.lease(2 * timeoutMs + AUTH_LEASE_GRACE_MS);
+        } catch (err) {
+          return {
+            success: false,
+            output:
+              "codex auth broker: login required; Codex launches are paused " +
+              `(${err instanceof Error ? err.message : "lease failed"})`,
+            exitCode: 1,
+          };
+        }
+        const hostCodexDir = join(process.env.HOME ?? "/root", ".codex");
+        if (opts.sandbox) {
+          const authDir = mkdtempSync(join(tmpdir(), "rusa-codex-auth-"));
+          tempPaths.push(authDir);
+          codexAuth = {
+            authFile: writeCodexLeaseAuth(authDir, authLease),
+            refreshUrl: authLease.refreshUrl,
+          };
+        } else {
+          const codexHome = seedBrokeredCodexHome(hostCodexDir, authLease);
+          tempPaths.push(codexHome);
+          spawnEnv = {
+            ...process.env,
+            CODEX_HOME: codexHome,
+            [CODEX_REFRESH_URL_ENV]: authLease.refreshUrl,
+          };
+        }
+      }
+
       if (opts.sandbox) {
         // codex is a Node.js script installed globally via npm. The sandbox already
         // mounts the node runtime root (which includes global node_modules) read-only,
@@ -782,7 +843,8 @@ export class CodexProvider implements CodingProvider {
           "codex",
           mcpConfigSource,
           opts.sandbox.isE2eRoot,
-          opts.sandbox.understandingMount
+          opts.sandbox.understandingMount,
+          codexAuth
         );
         bwrapResult = bResult;
         spawnCommand = "bwrap";

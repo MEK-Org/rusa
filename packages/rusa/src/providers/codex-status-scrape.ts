@@ -14,6 +14,12 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createLogger, type Logger } from "../observability/logger.js";
+import {
+  activeCodexAuthBroker,
+  CODEX_REFRESH_URL_ENV,
+  type CodexAuthLease,
+  writeCodexLeaseAuth,
+} from "./codex-auth-broker.js";
 
 let _scrapeLogger: Logger | undefined;
 export function setCodexScrapeLogger(logger: Logger | undefined): void {
@@ -88,8 +94,10 @@ export interface TmuxScriptTiming {
  * live credential store (inside a Codex sandbox it is the writable host
  * `auth.json` bind), so no spawn here may fall through to it.
  */
-function codexProbeEnv(codexHome: string): NodeJS.ProcessEnv {
-  return { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" };
+function codexProbeEnv(codexHome: string, lease?: CodexAuthLease): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome, TERM: "xterm-256color" };
+  if (lease) env[CODEX_REFRESH_URL_ENV] = lease.refreshUrl;
+  return env;
 }
 
 /**
@@ -242,12 +250,20 @@ export function buildTmuxScript(
  * (so credential refreshes persist across cleanup, matching #128's shared-auth discipline)
  * plus a probe-specific `config.toml` (host config, best effort) with the probe dir
  * pre-trusted so the interactive TUI never blocks on its "Do you trust this directory?" prompt.
+ * With the host-owned broker on (#782) the probe gets a brokered `lease` copy instead of
+ * the symlink, so it refreshes through the broker and never writes the canonical login.
  * Returns the new home dir (caller deletes it).
  */
-function seedIsolatedCodexHome(actorDir: string, hostCodexDir: string): string {
+function seedIsolatedCodexHome(
+  actorDir: string,
+  hostCodexDir: string,
+  lease?: CodexAuthLease
+): string {
   const codexHome = mkdtempSync(join(tmpdir(), "rusa-codex-status-"));
   const hostAuth = join(hostCodexDir, "auth.json");
-  if (existsSync(hostAuth)) {
+  if (lease) {
+    writeCodexLeaseAuth(codexHome, lease);
+  } else if (existsSync(hostAuth)) {
     try {
       symlinkSync(resolve(hostAuth), join(codexHome, "auth.json"));
     } catch {
@@ -347,8 +363,17 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
   mkdirSync(opts.actorDir, { recursive: true });
 
   const hostCodexDir = opts.codexConfigDir ?? join(homedir(), ".codex");
-  const codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir);
-  const env = codexProbeEnv(codexHome);
+  // A broker fault rejects the scrape (an unknown reading), never falls back to
+  // the shared writable login.
+  const lease = await activeCodexAuthBroker()?.lease(timeoutMs + 60_000);
+  let codexHome: string;
+  try {
+    codexHome = seedIsolatedCodexHome(opts.actorDir, hostCodexDir, lease);
+  } catch (err) {
+    lease?.revoke();
+    throw err;
+  }
+  const env = codexProbeEnv(codexHome, lease);
   const sock = join(codexHome, "status-tmux.sock");
 
   // The bash script launches a DETACHED tmux server (`new-session -d`) that
@@ -375,8 +400,9 @@ export async function scrapeCodexStatus(opts: ScrapeCodexStatusOptions): Promise
         codexHome,
       });
     }
+    lease?.revoke();
     try {
-      assertSharedAuthSymlink(codexHome, hostCodexDir);
+      if (!lease) assertSharedAuthSymlink(codexHome, hostCodexDir);
     } catch {
       try {
         rmSync(codexHome, { recursive: true, force: true });

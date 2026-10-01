@@ -20,7 +20,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import { QuotaCoordinatorService } from "../quota/coordinator-service.js";
 import { SharedQuotaStore } from "../quota/shared-store.js";
-import { E2E_INSTANCE_UNIT_NAME, E2EInstanceManager } from "./e2e-instance-manager.js";
+import {
+  E2E_INSTANCE_UNIT_NAME,
+  E2EInstanceManager,
+  type E2EInstanceManagerOptions,
+} from "./e2e-instance-manager.js";
 
 function probeBwrapCapable(): boolean {
   try {
@@ -94,7 +98,7 @@ describe("E2EInstanceManager", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  const manager = () =>
+  const manager = (overrides?: Partial<E2EInstanceManagerOptions>) =>
     new E2EInstanceManager({
       mcHome,
       workersDir,
@@ -125,6 +129,7 @@ describe("E2EInstanceManager", () => {
           "Result=success",
         ].join("\n");
       },
+      ...overrides,
     });
 
   it("rejects a second up with the holder identity and three teardown paths", async () => {
@@ -1401,6 +1406,79 @@ describe("E2EInstanceManager", () => {
         join(runtimeKimiCodeDir, "oauth"),
       ])
     );
+  });
+
+  it("binds no Codex login when providers.codex.authBroker is enabled in config.yaml", async () => {
+    writeFileSync(
+      join(mcHome, "config.yaml"),
+      [
+        "github:",
+        "  account: mock-bot",
+        "providers:",
+        "  codex:",
+        "    cliCommand: codex",
+        "    authBroker: true",
+        "rootActor:",
+        "  provider: codex",
+        "  model: default",
+        "webhook:",
+        "  port: 0",
+        '  secret: ""',
+        "",
+      ].join("\n")
+    );
+
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+    expect(
+      launch?.args.some(
+        (arg, index) => arg === "--ro-bind" && launch.args[index + 1] === join(root, ".codex")
+      )
+    ).toBe(false);
+    expect(launch?.args.join(" ")).not.toContain(".codex");
+    expect(existsSync(join(runtimeHome, ".codex"))).toBe(false);
+
+    expect(launch?.args).toEqual(
+      expect.arrayContaining(["--bind", join(root, ".claude"), join(runtimeHome, ".claude")])
+    );
+  });
+
+  it("binds no Codex login when codexAuthBroker option is explicitly enabled", async () => {
+    const subject = manager({ codexAuthBroker: true });
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    const runtimeHome = join(mcHome, "e2e-instance", "runtime", "home");
+    expect(
+      launch?.args.some(
+        (arg, index) => arg === "--ro-bind" && launch.args[index + 1] === join(root, ".codex")
+      )
+    ).toBe(false);
+    expect(existsSync(join(runtimeHome, ".codex"))).toBe(false);
+  });
+
+  it("fails closed and binds no Codex login when base config loading throws a configuration error", () => {
+    writeFileSync(join(mcHome, "config.yaml"), ": invalid: yaml: [");
+
+    const subject = manager();
+    const args = (
+      subject as unknown as {
+        buildBwrapArgs(
+          worktree: string,
+          root: string,
+          resume: boolean,
+          socketDir?: string
+        ): string[];
+      }
+    ).buildBwrapArgs(actorWorktree, join(root, "run-1"), false, join(root, "socket"));
+
+    expect(
+      args.some((arg, index) => arg === "--ro-bind" && args[index + 1] === join(root, ".codex"))
+    ).toBe(false);
+    expect(args.join(" ")).not.toContain(".codex");
   });
 });
 
