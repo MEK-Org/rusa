@@ -331,7 +331,10 @@ export function createActorRuntime(
       // actual provider invocation, whose model and effort its own config may
       // fill in. Events reach the leader on a batched, retried path and the
       // provider's MCP writes on another, so wait for the leader to confirm the
-      // attempt before the Actor invokes the provider.
+      // attempt before the Actor invokes the provider. A leader reconnect while
+      // this is pending rejects it and fails the admitted run before launch, by
+      // design: the provider's writes go through that leader, so launching
+      // anyway would lose their attribution.
       onProviderAttempt: (provider) =>
         request<void>({
           op: "providerAttempt",
