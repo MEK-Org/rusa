@@ -20,6 +20,12 @@ export type ContextConfig = NativeContextConfig | PortableContextConfig;
 export interface ActorHandle {
   id: string;
   role?: string;
+  /**
+   * Provenance of the handle capability. A delivery-introduced handle (#187) is
+   * marked 'message' so the recipient has reply addressability without gaining
+   * voice-transfer authority. Omitted for explicit parent/peer grants.
+   */
+  origin?: "message";
 }
 
 /** Actor identity and configuration; non-durable projection fields are marked explicitly below. */

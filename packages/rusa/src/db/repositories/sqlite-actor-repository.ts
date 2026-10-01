@@ -525,7 +525,13 @@ export class SqliteActorRepository implements ActorRepository {
         "INSERT INTO actor_handles (actor_id, target_id, role) VALUES (?, ?, ?)"
       );
       for (const handle of record.handles ?? []) {
-        addHandle.run(record.id, handle.id, handle.role ?? null);
+        const storedRole =
+          handle.origin === "message"
+            ? handle.role
+              ? `__origin:message:${handle.role}`
+              : "__origin:message"
+            : (handle.role ?? null);
+        addHandle.run(record.id, handle.id, storedRole);
       }
     })();
 
@@ -625,10 +631,22 @@ export class SqliteActorRepository implements ActorRepository {
       ...(row.parent_id === null ? { isRoot: true } : {}),
       ...(handles.length
         ? {
-            handles: handles.map((handle) => ({
-              id: handle.target_id,
-              ...(handle.role ? { role: handle.role } : {}),
-            })),
+            handles: handles.map((handle) => {
+              const roleText = handle.role ?? undefined;
+              const isMessage =
+                roleText === "__origin:message" ||
+                Boolean(roleText?.startsWith("__origin:message:"));
+              const role = isMessage
+                ? roleText === "__origin:message"
+                  ? undefined
+                  : roleText?.slice("__origin:message:".length)
+                : roleText;
+              return {
+                id: handle.target_id,
+                ...(role ? { role } : {}),
+                ...(isMessage ? { origin: "message" as const } : {}),
+              };
+            }),
           }
         : {}),
       ...(lastHumanMessage ? { humanUnlocked: true } : {}),

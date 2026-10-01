@@ -377,6 +377,38 @@ describe("SqliteActorRepository", () => {
     expect(repository.get("worker")).not.toHaveProperty("handles");
   });
 
+  it("round-trips delivery-introduced and explicit handles with and without roles", () => {
+    repository.upsert(root);
+    for (const peerId of ["peer-1", "peer-2", "peer-3"]) {
+      repository.upsert({
+        id: peerId,
+        charter: `Charter for ${peerId}`,
+        parentId: "root",
+        status: "active",
+        createdAt: "2026-09-03T13:00:00.000Z",
+      });
+    }
+    const worker: ActorRecord = {
+      id: "worker-handles",
+      charter: "Test handle origins",
+      parentId: "root",
+      status: "active",
+      handles: [
+        { id: "peer-1", origin: "message" },
+        { id: "peer-2", role: "reviewer" },
+        { id: "peer-3" },
+      ],
+      createdAt: "2026-09-03T13:01:00.000Z",
+    };
+    repository.upsert(worker);
+
+    expect(repository.get("worker-handles")?.handles).toEqual([
+      { id: "peer-1", origin: "message" },
+      { id: "peer-2", role: "reviewer" },
+      { id: "peer-3" },
+    ]);
+  });
+
   it("preserves the original retired_at across repeated upserts of an already-retired record", () => {
     repository.upsert(root);
     repository.upsert({

@@ -2662,7 +2662,7 @@ export class ActorMesh {
     if (requested === requesterId || this.handleForId(requesterId).toLowerCase() === normalized) {
       throw new Error("cannot transfer a voice session to itself");
     }
-    const held = requester.handles ?? [];
+    const held = (requester.handles ?? []).filter((handle) => handle.origin !== "message");
     const matches = held
       .map((handle) => this.actors.get(handle.id))
       .filter((record): record is ActorRecord =>
@@ -2802,9 +2802,11 @@ export class ActorMesh {
     const rec = this.actors.get(toId);
     if (!rec) return;
     if (handle.id === toId) return; // don't hand an actor its own handle
-    const entry: ActorHandle = handle.role
-      ? { id: handle.id, role: handle.role }
-      : { id: handle.id };
+    const entry: ActorHandle = {
+      id: handle.id,
+      ...(handle.role ? { role: handle.role } : {}),
+      ...(handle.origin ? { origin: handle.origin } : {}),
+    };
     const handles = (rec.handles ?? []).filter((h) => h.id !== handle.id);
     handles.push(entry);
     this.actors.patch(toId, { handles });
@@ -2845,7 +2847,7 @@ export class ActorMesh {
     // Callback retries re-enter the delivery seam. Do not record a second
     // handle_granted event once the durable address-book entry exists.
     if ((recipient.handles ?? []).some((handle) => handle.id === sender.id)) return;
-    this.grantHandle(recipient.id, { id: sender.id });
+    this.grantHandle(recipient.id, { id: sender.id, origin: "message" });
   }
 
   /**

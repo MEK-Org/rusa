@@ -4182,7 +4182,7 @@ describe("ActorMesh", () => {
     expect(mesh.sendMessage(recipient, "Could you check this?", sender)).toEqual({
       delivered: true,
     });
-    expect(registry.get(recipient)?.handles).toEqual([{ id: sender }]);
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender, origin: "message" }]);
 
     await tick();
     const prompt = fake(recipient).calls.at(-1)?.prompt ?? "";
@@ -4226,7 +4226,7 @@ describe("ActorMesh", () => {
     mesh.deliverScheduledMessage(scheduled);
     mesh.deliverScheduledMessage(scheduled);
 
-    expect(registry.get(recipient)?.handles).toEqual([{ id: sender }]);
+    expect(registry.get(recipient)?.handles).toEqual([{ id: sender, origin: "message" }]);
     expect(
       events.filter(
         (event) =>
@@ -4235,6 +4235,51 @@ describe("ActorMesh", () => {
           JSON.parse(event.payload ?? "{}").handleId === sender
       )
     ).toHaveLength(1);
+  });
+
+  it("allows replying to a delivery-introduced sender but refuses voice transfer unless separately authorized", () => {
+    let holder = "";
+    const { mesh, registry } = setup({
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "walkie-session",
+        transferActiveSession: (_fromActorId, targetActorId) => {
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+    });
+    const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+    const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+    holder = recipient;
+
+    expect(registry.get(recipient)?.handles ?? []).toEqual([]);
+
+    expect(mesh.sendMessage(recipient, "hello", sender)).toEqual({ delivered: true });
+    expect(mesh.sendMessage(sender, "replying to sender", recipient)).toEqual({ delivered: true });
+
+    expect(() => mesh.transferVoiceSession(recipient, sender)).toThrow("not a handle held");
+
+    mesh.grantHandle(recipient, { id: sender });
+    expect(mesh.transferVoiceSession(recipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
+    expect(holder).toBe(sender);
+
+    // An actor with a previously authorized handle does not get downgraded by message delivery.
+    const authorizedRecipient = mesh.spawn({ charter: "recipient 2", parentId: "root" });
+    mesh.grantHandle(authorizedRecipient, { id: sender });
+    holder = authorizedRecipient;
+    expect(mesh.sendMessage(authorizedRecipient, "hello authorized", sender)).toEqual({
+      delivered: true,
+    });
+    expect(mesh.transferVoiceSession(authorizedRecipient, sender)).toEqual({
+      sessionId: "walkie-session",
+      targetActorId: sender,
+    });
   });
 
   it("calls onRetire for every node in a retired subtree", async () => {
