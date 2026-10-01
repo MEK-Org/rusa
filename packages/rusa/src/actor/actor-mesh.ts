@@ -811,7 +811,7 @@ export interface ActorMeshOptions {
  * anyway. One wording means the instruction cannot drift from the rule.
  */
 const STRICT_HEAD_CLOSURE_EXITS =
-  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+  "complete it, cancel it, schedule it, snooze it until a future time with `set_snooze`, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
