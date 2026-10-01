@@ -205,6 +205,58 @@ $ rusa start
 start | jq` for JSON in a terminal, `RUSA_LOG_FORMAT=pretty` for readable lines
 out of a pipe.
 
+## Service log file rotation
+
+An instance that `install-service` set up without the journal sends its
+output to `$RUSA_HOME/logs/rusa.log` through `append:`. That file is
+bounded by a per-instance systemd timer, which `install-service` writes and
+enables alongside the service:
+
+- `rusa-logrotate.timer` and `rusa-logrotate.service`, or
+  `rusa-staging-logrotate.*` for staging.
+- The timer fires hourly, and `Persistent=true` catches up a run missed while
+  the host was down.
+- The oneshot runs the standalone `scripts/rotate-log.mjs` against that
+  instance's own log, pinned by absolute path. It only ever touches `rusa.log`
+  and `rusa.log.<n>`, so rotation never reaches another instance's files.
+
+Each run checks the file against a size bound:
+
+- Under the bound, nothing happens.
+- At or over the bound, the active file is copied to `rusa.log.1`. Older
+  generations shift up, and anything past the retention count is deleted.
+- The active file is then truncated in place. The service keeps its
+  `append:` descriptor and goes on writing at the new end of the file, with no
+  restart.
+- The cost is the usual copy-then-truncate one: a line written in the instant
+  between the copy and the truncate is lost.
+- Rotated files keep the active log's permissions.
+
+Defaults and overrides. Set these in the instance's `$RUSA_HOME/.env`; the
+next timer run picks them up:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUSA_LOG_ROTATE_MAX_BYTES` | `52428800` (50 MiB) | Rotate once the active file reaches this size |
+| `RUSA_LOG_ROTATE_KEEP` | `5` | Rotated generations to keep; `0` truncates without keeping a copy |
+| `RUSA_LOG_ROTATE` | on | `off` makes each run a no-op |
+
+With the defaults, the log and its generations stay within about 300 MiB, plus
+whatever is written in the hour between runs. A malformed value logs a warning
+and falls back to its default; it does not disable rotation.
+
+Opting out with `RUSA_LOG_ROTATE=off` lasts across reinstalls, because
+`install-service` rewrites and re-enables the timer every time. Two other paths:
+
+- `systemctl --user disable --now rusa-logrotate.timer` stops rotation only
+  until the next install.
+- `rusa uninstall-service` removes both rotation units. It leaves any rotated
+  files in place.
+
+The production self-deploy logs to the journal, which rotates itself. Its timer
+is installed anyway and only bounds a `rusa.log` left behind by an earlier
+file-logging install.
+
 ## Reading actor output
 
 The service log and the actor stream are separate on purpose, and they are read

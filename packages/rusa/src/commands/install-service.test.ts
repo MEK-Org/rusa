@@ -1,12 +1,19 @@
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { POOL_COORDINATOR_UNIT } from "./coordinator-provisioning.js";
 import {
   buildAlertUnit,
+  buildLogRotateTimer,
+  buildLogRotateUnit,
   buildQuotaCoordinatorUnit,
   buildServiceUnit,
   unitOrdersAfter,
   withCoordinatorOrdering,
+  writeLogRotationUnits,
 } from "./install-service.js";
+import { logRotationUnitNames } from "./service-instance.js";
 
 const base = {
   description: "Rusa",
@@ -233,5 +240,99 @@ describe("withCoordinatorOrdering — the instance that was installed first", ()
 
   it("refuses a file that is not a unit rather than guessing where the section is", () => {
     expect(() => withCoordinatorOrdering("not a unit\n", coordinator)).toThrow(/\[Unit\]/);
+  });
+});
+
+describe("service log rotation units (#580)", () => {
+  const rotate = {
+    description: "Rusa log rotation (rusa-staging)",
+    nodePath: "/usr/bin/node",
+    rotateScript: "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs",
+    mcHome: "/home/x/.rusa-staging",
+    logPath: "/home/x/.rusa-staging/logs/rusa.log",
+  };
+
+  it("names the rotation units after the instance they belong to", () => {
+    expect(logRotationUnitNames("rusa")).toEqual({
+      service: "rusa-logrotate.service",
+      timer: "rusa-logrotate.timer",
+    });
+    expect(logRotationUnitNames("rusa-staging")).toEqual({
+      service: "rusa-staging-logrotate.service",
+      timer: "rusa-staging-logrotate.timer",
+    });
+  });
+
+  it("is a oneshot that runs the standalone rotator against this instance's log only", () => {
+    const unit = buildLogRotateUnit(rotate);
+    expect(unit).toContain("Type=oneshot");
+    expect(unit).toContain(
+      'ExecStart="/usr/bin/node" "/deploy/rusa/packages/rusa/scripts/rotate-log.mjs"'
+    );
+    expect(unit).toContain("Environment=RUSA_HOME=/home/x/.rusa-staging");
+    expect(unit).toContain("Environment=RUSA_LOG_PATH=/home/x/.rusa-staging/logs/rusa.log");
+    // Operator overrides (bound, retention, opt-out) come from the instance's own .env.
+    expect(unit).toContain("EnvironmentFile=-/home/x/.rusa-staging/.env");
+    // Started by the timer, never enabled on its own.
+    expect(unit).not.toContain("[Install]");
+  });
+
+  it("fires the rotation hourly, catching up a run missed while the host was down", () => {
+    const timer = buildLogRotateTimer({
+      description: "Rusa log rotation timer (rusa-staging)",
+      rotateUnit: "rusa-staging-logrotate.service",
+    });
+    expect(timer).toContain("[Timer]");
+    expect(timer).toContain("OnCalendar=hourly");
+    expect(timer).toContain("Persistent=true");
+    expect(timer).toContain("Unit=rusa-staging-logrotate.service");
+    expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  it("writes both units, and rewriting them is a no-op", () => {
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    const write = () =>
+      writeLogRotationUnits({ systemdUserDir, serviceBasename: "rusa-staging", ...rotate });
+    const names = write();
+    expect(names).toEqual(logRotationUnitNames("rusa-staging"));
+    const first = readdirSync(systemdUserDir).map((f) => [
+      f,
+      readFileSync(join(systemdUserDir, f), "utf8"),
+    ]);
+    write();
+    const second = readdirSync(systemdUserDir).map((f) => [
+      f,
+      readFileSync(join(systemdUserDir, f), "utf8"),
+    ]);
+    expect(second).toEqual(first);
+    expect(first.map(([f]) => f).sort()).toEqual([
+      "rusa-staging-logrotate.service",
+      "rusa-staging-logrotate.timer",
+    ]);
+  });
+
+  it("keeps two instances' rotation apart: distinct units, each pinned to its own log", () => {
+    const systemdUserDir = mkdtempSync(join(tmpdir(), "rusa-units-"));
+    writeLogRotationUnits({
+      systemdUserDir,
+      serviceBasename: "rusa",
+      ...rotate,
+      mcHome: "/home/x/.rusa",
+      logPath: "/home/x/.rusa/logs/rusa.log",
+    });
+    writeLogRotationUnits({ systemdUserDir, serviceBasename: "rusa-staging", ...rotate });
+    const prod = readFileSync(join(systemdUserDir, "rusa-logrotate.service"), "utf8");
+    const staging = readFileSync(join(systemdUserDir, "rusa-staging-logrotate.service"), "utf8");
+    expect(prod).toContain("RUSA_LOG_PATH=/home/x/.rusa/logs/rusa.log");
+    expect(prod).not.toContain(".rusa-staging");
+    expect(staging).toContain("RUSA_LOG_PATH=/home/x/.rusa-staging/logs/rusa.log");
+    expect(readFileSync(join(systemdUserDir, "rusa-logrotate.timer"), "utf8")).toContain(
+      "Unit=rusa-logrotate.service"
+    );
+  });
+
+  it("ships the rotator in the package, beside the notifier", () => {
+    const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
+    expect(packageJson.files).toContain("scripts/rotate-log.mjs");
   });
 });
