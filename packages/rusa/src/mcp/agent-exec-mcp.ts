@@ -386,14 +386,6 @@ export function createAgentExecMcpServer(
             new Error("actor-facing send path structurally cannot claim human origin")
           );
         }
-        // Preserve the address-book capability boundary. A destination that is
-        // not live continues through the mesh so callers retain its precise
-        // unknown/retired delivery result.
-        if (mesh.resolveLiveActorId(thread_id) && !mesh.canSendMessage(selfId, thread_id)) {
-          return toolError(
-            new Error(`cannot message ${thread_id}: it is not in your address book`)
-          );
-        }
         if (selfId === rootId && options?.rootControl) {
           options.rootControl.sendMessage(thread_id, body, "root-llm", deliver_at);
           options?.onWrite?.();

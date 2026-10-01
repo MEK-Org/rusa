@@ -1813,34 +1813,6 @@ describe("agent-execution MCP server", () => {
     expect(dataOf(res)).toBe("sent");
   });
 
-  it("permits a reply only after delivery introduces the sender", async () => {
-    const { mesh, registry } = setup();
-    const modelConfig = { provider: "claude", model: "claude-sonnet-4-6" };
-    const sender = mesh.spawn({ charter: "sender", parentId: "root", modelConfig });
-    const recipient = mesh.spawn({ charter: "recipient", parentId: "root", modelConfig });
-    const senderClient = await connect(createAgentExecMcpServer(mesh, sender, "root"));
-
-    const beforeIntroduction = (await senderClient.callTool({
-      name: "send_message",
-      arguments: { thread_id: recipient, body: "Can you help?" },
-    })) as CallToolResult;
-    expect(beforeIntroduction.isError).toBe(true);
-    expect(dataOf(beforeIntroduction)).toBe(
-      `cannot message ${recipient}: it is not in your address book`
-    );
-
-    mesh.grantHandle(recipient, { id: sender });
-    expect(mesh.sendMessage(sender, "Please review this.", recipient)).toEqual({ delivered: true });
-    expect(registry.get(sender)?.handles).toEqual([{ id: recipient }]);
-
-    const reply = (await senderClient.callTool({
-      name: "send_message",
-      arguments: { thread_id: recipient, body: "I can review it." },
-    })) as CallToolResult;
-    expect(reply.isError).toBeFalsy();
-    expect(dataOf(reply)).toBe("sent");
-  });
-
   it("send_message reports a retired recipient instead of claiming delivery", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));

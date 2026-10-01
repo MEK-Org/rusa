@@ -3668,26 +3668,6 @@ export class ActorMesh {
   }
 
   /**
-   * Whether an actor may direct a message to a live peer. The parent edge and
-   * a delayed self-wake are stable aliases; every other peer needs a durable
-   * handle. The actor-facing MCP server enforces this capability boundary.
-   */
-  canSendMessage(fromId: string, toId: string): boolean {
-    fromId = this.resolveThreadId(fromId);
-    toId = this.resolveThreadId(toId);
-    const sender = this.actors.get(fromId);
-    const recipient = this.actors.get(toId);
-    if (!sender || !recipient) return false;
-    if (sender.id === recipient.id) return true;
-    if (sender.parentId !== null && this.resolveThreadId(sender.parentId) === recipient.id) {
-      return true;
-    }
-    return (sender.handles ?? []).some(
-      (handle) => this.resolveThreadId(handle.id) === recipient.id
-    );
-  }
-
-  /**
    * Deliver a message to a thread's inbox. Actor→actor only; the human↔root edge
    * is handled by the wiring (chat/webhook), not here. Async by design.
    */
