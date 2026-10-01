@@ -107,6 +107,8 @@ const quickstart = program
     "--reconfigure",
     "Re-run interactive configuration wizard even if volume is already configured"
   )
+  .option("--repo <path>", "Target local git repository path")
+  .option("--local-repo <path>", "Target local git repository path (alias)")
   .action(
     async (opts: {
       image: string;
@@ -114,6 +116,8 @@ const quickstart = program
       volume: string;
       build: boolean;
       reconfigure?: boolean;
+      repo?: string;
+      localRepo?: string;
     }) => {
       await runQuickstart({
         image: opts.image,
@@ -121,6 +125,7 @@ const quickstart = program
         volume: opts.volume,
         skipBuild: opts.build === false,
         reconfigure: opts.reconfigure,
+        localRepo: opts.repo || opts.localRepo,
       });
     }
   );
