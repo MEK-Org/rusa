@@ -81,6 +81,8 @@ export interface GrantableServerDeps {
   logger?: Logger;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
+  /** Whether a grantee's file tools can access the host where it executes. */
+  fileToolsAvailableForActor?: (actorId: string) => boolean;
   driveClients: DriveClient;
   onDriveRead?: (actorId: string, observation: DriveReadObservation) => void;
   /**
@@ -224,6 +226,9 @@ export function buildGrantableServers(
       return createSlackWriteMcpServer(deps.slackClient, params.includes("*") ? "all" : params, {
         isFenced: options?.isFenced,
         ...(workDir ? { workDir } : {}),
+        ...(deps.fileToolsAvailableForActor
+          ? { fileToolsAvailable: () => deps.fileToolsAvailableForActor?.(selfId) ?? false }
+          : {}),
       });
     });
   }

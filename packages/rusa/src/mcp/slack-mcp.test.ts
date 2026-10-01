@@ -293,4 +293,75 @@ describe("Slack write MCP upload_file", () => {
     expect((await upload("C1", "big.bin")).text).toContain("file size limit exceeded");
     expect(uploadV2).not.toHaveBeenCalled();
   });
+
+  it("refuses file reads and writes while the actor is follower-hosted", async () => {
+    const dir = workdir();
+    writeFileSync(join(dir, "stale-on-leader.txt"), "stale");
+    let followerHosted = true;
+    const fileToolsAvailable = () => !followerHosted;
+    const replies = messageWithFile(reportFile);
+    const postMessage = vi.fn(async () => ({ ok: true, ts: "2.0" }));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const read = await connect(
+      createSlackReadMcpServer(slackWith({ conversations: { replies } }), {
+        workDir: dir,
+        fileToolsAvailable,
+      })
+    );
+    const uploadV2 = uploader();
+    const write = await connect(
+      createSlackWriteMcpServer(slackWith({ chat: { postMessage }, files: { uploadV2 } }), ["C1"], {
+        workDir: dir,
+        fileToolsAvailable,
+      })
+    );
+
+    // Text tools remain functional while follower-hosted
+    const send = await call(write, "send_message", { channel: "C1", text: "hello" });
+    expect(send.isError).toBe(false);
+    expect(postMessage).toHaveBeenCalled();
+    const msg = await call(read, "get_message", { channel: "C1", ts: "1.0" });
+    expect(msg.isError).toBe(false);
+    expect(replies).toHaveBeenCalled();
+
+    // File tools refuse visibly and do not touch leader files or Slack APIs
+    replies.mockClear();
+    const download = await call(read, "download_file", {
+      channel: "C1",
+      ts: "1.0",
+      fileId: "F1",
+      destinationPath: "downloaded.txt",
+    });
+    const upload = await call(write, "upload_file", {
+      channel: "C1",
+      filePath: "stale-on-leader.txt",
+    });
+    expect(download.text).toContain("unavailable for follower-hosted actors (see #812)");
+    expect(upload.text).toContain("unavailable for follower-hosted actors (see #812)");
+    expect(replies).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(uploadV2).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, "downloaded.txt"))).toBe(false);
+
+    // The placement is checked at call time, not only when the server is mounted.
+    followerHosted = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("fresh"))
+    );
+    expect(
+      (
+        await call(read, "download_file", {
+          channel: "C1",
+          ts: "1.0",
+          fileId: "F1",
+          destinationPath: "downloaded.txt",
+        })
+      ).isError
+    ).toBe(false);
+    expect(
+      (await call(write, "upload_file", { channel: "C1", filePath: "stale-on-leader.txt" })).isError
+    ).toBe(false);
+  });
 });

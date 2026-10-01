@@ -18,12 +18,20 @@ export interface SlackMcpOptions {
   isFenced?: () => boolean;
   /** The calling actor's workdir; file uploads read from and downloads write into it. */
   workDir?: string;
+  /** Rechecked when a file tool is called, because follower placement can change live. */
+  fileToolsAvailable?: () => boolean;
   maxFileBytes?: number;
 }
 
 function requireWorkDir(options: SlackMcpOptions): string {
   if (!options.workDir) throw new Error("Slack file tools need an actor workdir");
   return options.workDir;
+}
+
+function requireFileToolsAvailable(options: SlackMcpOptions): void {
+  if (options.fileToolsAvailable?.() === false) {
+    throw new Error("Slack file tools are unavailable for follower-hosted actors (see #812)");
+  }
 }
 
 export function createSlackReadMcpServer(
@@ -70,7 +78,7 @@ export function createSlackReadMcpServer(
     {
       title: "Download a file attached to a Slack message",
       description:
-        "Save a file attached to the message at channel/ts into your working directory. The destination must not already exist; its directory must.",
+        "Save a file attached to the message at channel/ts into your working directory. The destination must not already exist; its directory must. Unavailable for follower-hosted actors (see #812).",
       inputSchema: {
         channel: z.string(),
         ts: z.string().describe("Timestamp of the message the file is attached to"),
@@ -82,6 +90,7 @@ export function createSlackReadMcpServer(
     },
     async ({ channel, ts, fileId, destinationPath }) => {
       try {
+        requireFileToolsAvailable(options);
         const target = await resolveDownloadPath(requireWorkDir(options), destinationPath);
         const { file, data } = await client.downloadMessageFile(
           channel,
@@ -154,7 +163,7 @@ export function createSlackWriteMcpServer(
     {
       title: "Upload a file to Slack",
       description:
-        "Share a file from your working directory into a channel, or a thread using its parent timestamp.",
+        "Share a file from your working directory into a channel, or a thread using its parent timestamp. Unavailable for follower-hosted actors (see #812).",
       inputSchema: {
         channel: z.string(),
         filePath: z
@@ -171,6 +180,7 @@ export function createSlackWriteMcpServer(
     async ({ channel, filePath, threadTs, filename, title, initialComment }) => {
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
+        requireFileToolsAvailable(options);
         const source = await resolveAttachmentPath(requireWorkDir(options), filePath);
         const data = await readBoundedRegularFile(
           source,
