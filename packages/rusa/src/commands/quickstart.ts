@@ -1,6 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -14,6 +22,7 @@ import { formatDoctorResults, runQuickstartDoctor } from "./quickstart-doctor.js
 export const QUICKSTART_DASHBOARD_PORT = 8080;
 export const QUICKSTART_GIT_BRIDGE_PORT = 8085;
 const QUICKSTART_WEBHOOK_PORT = 9742;
+const LOCAL_REPO_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 export interface ProviderLoginCommand {
   cliCommand: string;
@@ -111,11 +120,14 @@ export function validateLocalGitRepo(
     };
   }
 
+  // The name becomes the `local/<name>` key in github.repos and a path segment of
+  // the bridge URL, so it must pass the config loader's repo pattern and route
+  // through the bridge without percent-encoding.
   const repoName = basename(resolvedPath);
-  if (!repoName) {
+  if (!LOCAL_REPO_NAME_PATTERN.test(repoName)) {
     return {
       valid: false,
-      error: `Could not determine repository name from path: ${resolvedPath}`,
+      error: `Repository directory name "${repoName}" can only contain letters, digits, ".", "_" and "-": ${resolvedPath}`,
     };
   }
 
@@ -129,32 +141,12 @@ export function validateLocalGitRepo(
 
 export function updateQuickstartRepoConfig(config: RusaConfig, repoKey: string): RusaConfig {
   const currentRepos = config.github?.repos ?? [];
-  let replaced = false;
-  const newRepos: string[] = [];
-  for (const repo of currentRepos) {
-    if (repo === repoKey) {
-      if (!newRepos.includes(repoKey)) {
-        newRepos.push(repoKey);
-      }
-      replaced = true;
-    } else if (repo.startsWith("local/")) {
-      // Reconfigure updates the existing local/<dirname> entry rather than duplicating
-      if (!replaced) {
-        newRepos.push(repoKey);
-        replaced = true;
-      }
-    } else {
-      newRepos.push(repo);
-    }
-  }
-  if (!replaced) {
-    newRepos.push(repoKey);
-  }
+  if (currentRepos.includes(repoKey)) return config;
   return {
     ...config,
     github: {
       ...config.github,
-      repos: newRepos,
+      repos: [...currentRepos, repoKey],
     },
   };
 }
@@ -326,6 +318,40 @@ export function buildQuickstartImage(image: string): void {
   });
 }
 
+const VOLUME_CONFIG_PATH = "/home/node/.rusa/config.yaml";
+
+// Adds the repo key to the volume's config.yaml through the setup container.
+// Any failure throws: the bridge serves only listed repos, so continuing would
+// leave the host pointed at a repo the app never admits.
+function registerLocalRepo(setupContainer: string, repoKey: string): void {
+  function fail(reason: string): never {
+    const message = `Could not register ${repoKey} in ${VOLUME_CONFIG_PATH}: ${reason}`;
+    console.error(`[quickstart] ${message}`);
+    throw new Error(message);
+  }
+  const catRes = spawnSync("docker", ["exec", setupContainer, "cat", VOLUME_CONFIG_PATH], {
+    encoding: "utf8",
+  });
+  if (catRes.status !== 0 || !catRes.stdout?.trim()) {
+    fail(catRes.stderr?.trim() || "config.yaml is missing or empty");
+  }
+  let config: RusaConfig;
+  try {
+    config = parseYaml(catRes.stdout) as RusaConfig;
+  } catch (err) {
+    fail(`config.yaml did not parse: ${err instanceof Error ? err.message : err}`);
+  }
+  const writeRes = spawnSync(
+    "docker",
+    ["exec", "-i", setupContainer, "sh", "-c", `cat > ${VOLUME_CONFIG_PATH}`],
+    { input: toYaml(updateQuickstartRepoConfig(config, repoKey)), encoding: "utf8" }
+  );
+  if (writeRes.status !== 0) {
+    fail(writeRes.stderr?.trim() || "write failed");
+  }
+  console.log(`[quickstart] Registered ${repoKey} in volume config.yaml`);
+}
+
 export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void> {
   const image = opts.image ?? "rusa:quickstart";
   const container = opts.container ?? "rusa-quickstart";
@@ -378,7 +404,7 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     setupContainer,
     "test",
     "-f",
-    "/home/node/.rusa/config.yaml",
+    VOLUME_CONFIG_PATH,
   ]);
   const hasExistingConfig = checkConfigRes.status === 0;
 
@@ -436,34 +462,7 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
   }
 
   if (localRepoValidation?.repoKey) {
-    const catRes = spawnSync(
-      "docker",
-      ["exec", setupContainer, "cat", "/home/node/.rusa/config.yaml"],
-      { encoding: "utf8" }
-    );
-    if (catRes.status === 0 && catRes.stdout?.trim()) {
-      try {
-        const config = parseYaml(catRes.stdout) as RusaConfig;
-        const updatedConfig = updateQuickstartRepoConfig(config, localRepoValidation.repoKey);
-        const yamlContent = toYaml(updatedConfig);
-        const writeRes = spawnSync(
-          "docker",
-          ["exec", "-i", setupContainer, "sh", "-c", "cat > /home/node/.rusa/config.yaml"],
-          { input: yamlContent, encoding: "utf8" }
-        );
-        if (writeRes.status !== 0) {
-          console.warn(
-            `[quickstart] Warning: failed to update config.yaml in volume: ${writeRes.stderr?.trim()}`
-          );
-        } else {
-          console.log(
-            `[quickstart] Registered ${localRepoValidation.repoKey} in volume config.yaml`
-          );
-        }
-      } catch (err) {
-        console.warn(`[quickstart] Warning: could not parse/update config.yaml: ${err}`);
-      }
-    }
+    registerLocalRepo(setupContainer, localRepoValidation.repoKey);
   }
 
   console.log("\n[quickstart] Replacing setup container with the app container...");
@@ -576,6 +575,19 @@ export function runProviderLogins(
   }
 }
 
+function readExistingRepos(configPath: string): string[] {
+  if (!existsSync(configPath)) return [];
+  try {
+    const repos = (parseYaml(readFileSync(configPath, "utf8")) as RusaConfig | null)?.github?.repos;
+    return Array.isArray(repos) ? repos.filter((repo) => typeof repo === "string") : [];
+  } catch (err) {
+    console.warn(
+      `[quickstart] Warning: could not read github.repos from the existing ${configPath}; it will not be carried forward: ${err}`
+    );
+    return [];
+  }
+}
+
 export interface QuickstartConfigureOptions {
   home?: string;
   executeProviderCommand?: ProviderCommandExecutor;
@@ -642,9 +654,12 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
   // bridge; nothing here subscribes to GitHub. The webhook stanza below is the
   // only GitHub ingestion edge, and it stays idle until an operator adds
   // `github.repos` and points a reachable webhook at it (docs/quickstart.md).
+  // A reconfigure keeps the repositories an earlier run or the operator added.
+  const configPath = join(mcHome, "config.yaml");
+  const existingRepos = readExistingRepos(configPath);
   const config: RusaConfig = {
     profile: "quickstart",
-    github: {},
+    github: existingRepos.length > 0 ? { repos: existingRepos } : {},
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),
@@ -663,7 +678,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     },
   };
 
-  const configPath = join(mcHome, "config.yaml");
   writeFileSync(configPath, toYaml(config), { encoding: "utf8", mode: 0o600 });
   chmodSync(configPath, 0o600);
 

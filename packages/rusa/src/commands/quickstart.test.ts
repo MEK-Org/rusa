@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -189,6 +189,31 @@ describe("quickstart command", () => {
     expect(config.github).toEqual({});
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
+  });
+
+  it("carries github.repos forward when configure rewrites an existing config", async () => {
+    writeFileSync(
+      join(home, "config.yaml"),
+      toYaml({
+        profile: "quickstart",
+        github: { repos: ["local/first", "local/hand-added", "upstream/project"] },
+        providers: { codex: { cliCommand: "codex" } },
+        webhook: { port: 9742, secret: "old" },
+      })
+    );
+    promptMocks.state.inputs = ["codex", "my-root-entity", "gpt-5.6-sol"];
+    promptMocks.state.passwords = ["test-gemini-key"];
+
+    await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
+
+    const config = loadConfig(home);
+    expect(config.github?.repos).toEqual(["local/first", "local/hand-added", "upstream/project"]);
+    expect(updateQuickstartRepoConfig(config, "local/second").github?.repos).toEqual([
+      "local/first",
+      "local/hand-added",
+      "upstream/project",
+      "local/second",
+    ]);
   });
 
   it("persists the entire node home for provider CLI state", () => {
@@ -390,6 +415,53 @@ describe("quickstart command", () => {
       });
     });
 
+    describe("validateLocalGitRepo repository name", () => {
+      const acceptingGit = vi.fn((args: string[]) => ({
+        status: 0,
+        stdout: args.includes("--is-inside-work-tree") ? "true\n" : "c0ffee\n",
+        stderr: "",
+      }));
+
+      for (const dirName of ["My Project", "repo#1", "what?", "pct%20"]) {
+        it(`rejects a directory name the loader or bridge cannot route: ${JSON.stringify(dirName)}`, () => {
+          const parent = mkdtempSync(join(tmpdir(), "repo-name-"));
+          const repoDir = join(parent, dirName);
+          try {
+            mkdirSync(repoDir);
+            const res = validateLocalGitRepo(repoDir, acceptingGit);
+            expect(res.valid).toBe(false);
+            expect(res.error).toContain(dirName);
+          } finally {
+            rmSync(parent, { recursive: true, force: true });
+          }
+        });
+      }
+
+      it("accepts letters, digits, dot, underscore and hyphen, and the key loads", () => {
+        const parent = mkdtempSync(join(tmpdir(), "repo-name-"));
+        const repoDir = join(parent, "My.repo_2-x");
+        try {
+          mkdirSync(repoDir);
+          const res = validateLocalGitRepo(repoDir, acceptingGit);
+          expect(res.valid).toBe(true);
+          expect(res.repoKey).toBe("local/My.repo_2-x");
+          writeFileSync(
+            join(home, "config.yaml"),
+            toYaml(
+              createTestConfig({
+                github: { repos: [res.repoKey as string] },
+                providers: { codex: { cliCommand: "codex" } },
+                rootActor: { provider: "codex", model: "gpt-5.6-sol", handle: "root" },
+              })
+            )
+          );
+          expect(loadConfig(home).github?.repos).toEqual(["local/My.repo_2-x"]);
+        } finally {
+          rmSync(parent, { recursive: true, force: true });
+        }
+      });
+    });
+
     const createTestConfig = (overrides?: Partial<RusaConfig>): RusaConfig => ({
       profile: "quickstart",
       github: {},
@@ -405,12 +477,16 @@ describe("quickstart command", () => {
         expect(updated.github?.repos).toEqual(["local/my-repo"]);
       });
 
-      it("updates existing local/ repo entry without duplicating on reconfigure", () => {
+      it("adds a new local entry without removing any existing entry", () => {
         const config = createTestConfig({
-          github: { repos: ["local/old-repo"] },
+          github: { repos: ["local/old-repo", "local/hand-added"] },
         });
         const updated = updateQuickstartRepoConfig(config, "local/new-repo");
-        expect(updated.github?.repos).toEqual(["local/new-repo"]);
+        expect(updated.github?.repos).toEqual([
+          "local/old-repo",
+          "local/hand-added",
+          "local/new-repo",
+        ]);
       });
 
       it("does not duplicate entry when existing config already holds the same entry", () => {
@@ -421,12 +497,16 @@ describe("quickstart command", () => {
         expect(updated.github?.repos).toEqual(["local/my-repo"]);
       });
 
-      it("preserves non-local repositories while updating the local entry", () => {
+      it("preserves non-local repositories when adding the local entry", () => {
         const config = createTestConfig({
           github: { repos: ["upstream/project", "local/old-repo"] },
         });
         const updated = updateQuickstartRepoConfig(config, "local/new-repo");
-        expect(updated.github?.repos).toEqual(["upstream/project", "local/new-repo"]);
+        expect(updated.github?.repos).toEqual([
+          "upstream/project",
+          "local/old-repo",
+          "local/new-repo",
+        ]);
       });
     });
 
@@ -528,7 +608,7 @@ describe("quickstart command", () => {
     });
 
     describe("runQuickstart four root scenarios", () => {
-      it("scenario 1 (reconfigure path): updates github.repos from local/old to local/new and pushes", async () => {
+      it("scenario 1 (reconfigure path): adds local/new beside local/old and pushes", async () => {
         doctorMocks.runQuickstartDoctor.mockResolvedValue([
           { name: "node", status: "pass", message: "node ok" },
         ]);
@@ -580,12 +660,69 @@ describe("quickstart command", () => {
 
           const parsed = parseYaml(writtenConfig) as RusaConfig;
           const repoName = testRepoDir.split("/").pop();
-          expect(parsed.github?.repos).toEqual([`local/${repoName}`]);
+          expect(parsed.github?.repos).toEqual(["local/old-repo", `local/${repoName}`]);
           expect(gitOps.some((args) => args.includes("push") && args.includes("rusa"))).toBe(true);
         } finally {
           rmSync(testRepoDir, { recursive: true, force: true });
         }
       });
+
+      const registrationFailures: Array<{
+        name: string;
+        cat: { status: number; stdout: string; stderr: string };
+        writeStatus?: number;
+      }> = [
+        { name: "cat exits non-zero", cat: { status: 1, stdout: "", stderr: "no such file" } },
+        { name: "cat returns empty output", cat: { status: 0, stdout: "", stderr: "" } },
+        { name: "config does not parse", cat: { status: 0, stdout: "github: [", stderr: "" } },
+        {
+          name: "write fails",
+          cat: { status: 0, stdout: toYaml(createTestConfig()), stderr: "" },
+          writeStatus: 1,
+        },
+      ];
+      for (const failure of registrationFailures) {
+        it(`stops before the app container and any host remote change when ${failure.name}`, async () => {
+          const gitOps: string[][] = [];
+          const executeGit = vi.fn((args: string[]) => {
+            gitOps.push(args);
+            if (args.includes("--is-inside-work-tree"))
+              return { status: 0, stdout: "true\n", stderr: "" };
+            return { status: 0, stdout: "commit1\n", stderr: "" };
+          });
+          const dockerOps: string[][] = [];
+          spawnSyncMock.mockImplementation(
+            (cmd: string, args: string[], opts?: { input?: string }) => {
+              if (cmd === "docker") dockerOps.push(args);
+              if (cmd === "docker" && args.includes("cat")) return failure.cat;
+              if (cmd === "docker" && args.includes("sh") && opts?.input !== undefined)
+                return { status: failure.writeStatus ?? 0, stdout: "", stderr: "denied" };
+              return { status: 0, stdout: "", stderr: "" };
+            }
+          );
+          const testRepoDir = mkdtempSync(join(tmpdir(), "reg-fail-"));
+          const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+          try {
+            await expect(
+              runQuickstart({
+                skipBuild: true,
+                reconfigure: true,
+                localRepo: testRepoDir,
+                executeGit,
+                waitForBridgeReady: async () => true,
+              })
+            ).rejects.toThrow(/Could not register local\/reg-fail-/);
+            expect(
+              gitOps.filter((args) => args.includes("remote") || args.includes("push"))
+            ).toEqual([]);
+            // Only the setup container ever starts; the app container never does.
+            expect(dockerOps.filter((args) => args[0] === "run")).toHaveLength(1);
+          } finally {
+            errorSpy.mockRestore();
+            rmSync(testRepoDir, { recursive: true, force: true });
+          }
+        });
+      }
 
       it("scenario 2 (missing/non-git path): rejects invalid path before container launch", async () => {
         doctorMocks.runQuickstartDoctor.mockResolvedValue([

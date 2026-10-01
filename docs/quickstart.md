@@ -15,7 +15,7 @@ The root `quickstart` command accepts the following options:
 * `--container <name>`: The name of the launched application container (default: `rusa-quickstart`).
 * `--volume <name>`: The Docker volume used to persist the service user's home and Rusa data (default: `rusa-quickstart-home`).
 * `--no-build`: Skip the local Docker image build step and run an existing local image.
-* `--repo <path>`, `--local-repo <path>`: Local Git repository directory to evaluate with Rusa. If omitted in an interactive terminal, quickstart prompts for it.
+* `--repo <path>`: Local Git repository directory to evaluate with Rusa. If omitted in an interactive terminal, quickstart prompts for it.
 
 ### Walkthrough: End-to-End Flow
 
@@ -48,7 +48,7 @@ The root `quickstart` command accepts the following options:
    * If the bridge wait times out or the push fails, fallback commands are printed so you can manually push.
 
 ### Local Repository, Not GitHub
-Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) but subscribes to no external repositories: the orchestrator binds the webhook listener inside the container, but the port is not published and no external repository is admitted.
+Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) and subscribes only to the selected `local/<dirname>` repository: the orchestrator still binds the webhook listener inside the container, but the port is not published and no GitHub repository is admitted, so any GitHub delivery that did reach it is dropped as not covered by any subscription. Rusa has no GitHub polling fallback: connecting a quickstart instance to GitHub means adding `github.repos`, publishing the webhook port (`9742`, not published by the quickstart container by default), and registering a GitHub webhook that can reach it. See `rusa config-docs` for the `webhook` keys. A `github-poller-state.json` left in the volume by an earlier build is ignored.
 
 ### Local Git Bridge
 The Git bridge publishes a local web dashboard on port `8080` and the smart HTTP Git server on port `8085`.
