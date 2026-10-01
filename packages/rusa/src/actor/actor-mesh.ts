@@ -5359,8 +5359,11 @@ export class ActorMesh {
     return actor.cancelQueuedRun?.({ retain: false }) === true;
   }
 
-  /** The durable-work half of the run admission predicate, shared by every admission boundary. */
-  private hasRunnableInbox(actorId: string): boolean {
+  /**
+   * The durable-work half of the run admission predicate, shared by every
+   * admission boundary: worker factory contexts and the host-wired root.
+   */
+  hasRunnableInbox(actorId: string): boolean {
     if (!this.inboxStore) return true;
     const actor = this.runs.liveActor(actorId);
     const watermark = actor?.getInterruptedWatermark?.();

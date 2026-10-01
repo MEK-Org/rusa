@@ -5800,6 +5800,44 @@ describe("runStart webhook event routing (Phase 4)", () => {
     halt.resume();
   });
 
+  it("root's final admission refuses a queued run whose inbox was handled to empty (#787)", async () => {
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!root) throw new Error("root not ready");
+    type RootAdmission = {
+      beforeRun: () => boolean;
+      admitRun: (context: { responsive: boolean; mode: "ordinary" }) => boolean;
+    };
+    const { beforeRun, admitRun } = (root as unknown as { opts: RootAdmission }).opts;
+    const inbox = getRepositories().inbox;
+    const admits = (responsive: boolean) => admitRun({ responsive, mode: "ordinary" });
+
+    // No await separates delivery from handling, so root's own debounced run
+    // never reaches admission here; the test drives both boundaries directly,
+    // as they would run after a handle lands during the async onQueued emit.
+    const [entry] = inbox.append([
+      { actorId: "root", source: "mesh:operator", payload: { type: "mesh.message" } },
+    ]);
+    expect(beforeRun()).toBe(true);
+    expect(admits(false)).toBe(true);
+    expect(admits(true)).toBe(true);
+
+    inbox.markHandled("root", [entry.id]);
+    expect(beforeRun()).toBe(false);
+    expect(admits(false)).toBe(false);
+    expect(admits(true)).toBe(false);
+  });
+
   it("root's launch gate allows dispatch when an unhalted pool fallback exists (#625)", async () => {
     clearProviderModelCatalog("antigravity");
     clearProviderModelCatalog("claude");
