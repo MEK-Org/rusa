@@ -12,6 +12,7 @@ import {
   formatProviderLabel,
   isHumanOperatorCancelled,
   routeRunFailure,
+  routeSpawnFailure,
 } from "./failure-sink.js";
 
 const FAIL: RunResult = {
@@ -277,6 +278,52 @@ describe("routeRunFailure", () => {
       const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
       await routeRunFailure(deps, "w1", FAIL);
       expect(toParent.map((n) => n.responsive)).toEqual([false]);
+    });
+
+    it("routes a capped failure to the parent as a responsive [capped] notice", async () => {
+      const { deps, toParent } = escalating({ t: 0 });
+      await routeRunFailure(deps, "w1", { ...FAIL, capped: true });
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.body.startsWith("[capped] ")).toBe(true);
+      expect(toParent[0]?.responsive).toBe(true);
+    });
+
+    it("wakes the parent responsively for a child's spawn failure", () => {
+      const { deps, toParent, toChat } = escalating({ t: 0 });
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      expect(toParent).toEqual([
+        {
+          toId: "root",
+          body: "[spawn failed] worker w1 spawn failed: bad pool",
+          fromId: "w1",
+          forensics: undefined,
+          responsive: true,
+        },
+      ]);
+      expect(toChat).toHaveLength(0);
+    });
+
+    it("delivers a repeat spawn failure inside the backoff window at normal priority", () => {
+      const now = { t: 0 };
+      const { deps, toParent } = escalating(now);
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      now.t = 30_000;
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      expect(toParent.map((n) => n.responsive)).toEqual([true, false]);
+    });
+
+    it("shares one per-child budget between spawn and run failures", async () => {
+      const { deps, toParent } = escalating({ t: 0 });
+      routeSpawnFailure(deps, "w1", "root", "worker w1 spawn failed: bad pool");
+      await routeRunFailure(deps, "w1", FAIL);
+      expect(toParent.map((n) => n.responsive)).toEqual([true, false]);
+    });
+
+    it("posts a parentless spawn failure to the error chat", () => {
+      const { deps, toParent, toChat } = escalating({ t: 0 });
+      routeSpawnFailure(deps, "w1", null, "worker w1 spawn failed: bad pool");
+      expect(toParent).toHaveLength(0);
+      expect(toChat).toEqual(["⚠️ worker w1 spawn failed: bad pool"]);
     });
   });
 

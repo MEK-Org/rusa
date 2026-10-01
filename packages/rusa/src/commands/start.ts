@@ -58,6 +58,7 @@ import {
   type FailureSinkDeps,
   formatProviderLabel,
   routeRunFailure,
+  routeSpawnFailure,
 } from "../actor/failure-sink.js";
 import { GracefulShutdown } from "../actor/graceful-shutdown.js";
 import {
@@ -2606,7 +2607,7 @@ async function composeStart(
             body: JSON.stringify(compacted),
           });
         }
-        if (!result.success && !result.capped) {
+        if (!result.success) {
           await routeRunFailure(
             failureSink,
             id,
@@ -3011,11 +3012,7 @@ async function composeStart(
           body: errorMsg,
         });
 
-        if (rec.parentId) {
-          failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
-        } else {
-          failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
-        }
+        routeSpawnFailure(failureSink, id, rec.parentId, errorMsg);
         throw new Error(errorMsg);
       }
 

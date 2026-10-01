@@ -238,7 +238,30 @@ export async function routeRunFailure(
     leadLine = `provider run ${providerLabel} failed.`;
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
-  routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result, runId);
+  // A capped run is a failure too (#189); it keeps its own label so the parent
+  // can tell a hit limit from a crash.
+  const label = result.capped ? "capped" : "run failed";
+  routeMechanicalFailureNotice(deps, actorId, label, body, result.exitCode, result, runId);
+}
+
+/**
+ * Report a child that could not be instantiated (#189). With a parent, the
+ * `[spawn failed]` notice spends the same per-child escalation budget as a run
+ * failure; without one it goes to the error chat.
+ */
+export function routeSpawnFailure(
+  deps: FailureSinkDeps,
+  actorId: string,
+  parentId: string | null | undefined,
+  errorMsg: string
+): void {
+  if (parentId) {
+    deps.sendToParent(parentId, `[spawn failed] ${errorMsg}`, actorId, undefined, {
+      responsive: deps.escalation?.admit(actorId) ?? false,
+    });
+  } else {
+    deps.postToErrorChat?.(`⚠️ ${errorMsg}`);
+  }
 }
 
 /** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
