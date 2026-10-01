@@ -138,6 +138,10 @@ export type MeshEventKind =
   // closing the selected head obligation; payload identifies the obligation and
   // actionable reason.
   | "run_yield_rejected"
+  // A strict-obligation participant returned successfully without closing a
+  // selected head obligation (#828); payload identifies the obligation and the
+  // shortfall. Its attention stays unhandled for the ordinary bounded retry.
+  | "run_return_rejected"
   | "continuation_capped"
   // Capability lifecycle (design ISSUE_NUM, phase 1a): the root granted/revoked an
   // extra MCP capability to an actor. `actorId` = the grantee actor, `payload` = { grantedBy },

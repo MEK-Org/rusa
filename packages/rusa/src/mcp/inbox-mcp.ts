@@ -27,6 +27,8 @@ export interface InboxMcpRunScope {
   select: (entryIds: string[], obligationId?: string) => InboxEntry[] | SelectedInboxRun;
   selected: () => readonly string[];
   onHandled?: () => void;
+  /** Refuse entries whose selected head obligation is not yet closed (#828). */
+  assertHandleable?: (entryIds: readonly string[]) => void;
   /** Explicit walkie authority hides and fences ordinary work for this actor. */
   isVoiceSessionActive?: () => boolean;
   /** Where selected chat entries read their recent conversation from (#651). Omitted: no chat context. */
@@ -183,6 +185,7 @@ export function createInboxMcpServer(
         if (unselected.length > 0) {
           throw new Error(`entries must be selected in this run: ${unselected.join(", ")}`);
         }
+        scope.assertHandleable?.(ids);
         const entries = store.markHandled(actorId, ids, undefined, note);
         scope.onHandled?.();
         return toolOk({ entries });

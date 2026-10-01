@@ -1820,7 +1820,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // start one through the production run hook.
     const selectHeadOverMcp = async (
       actorId: string
-    ): Promise<{ obligationId: string; selection: Record<string, unknown>; runId: string }> => {
+    ): Promise<{
+      entryId: string;
+      obligationId: string;
+      selection: Record<string, unknown>;
+      runId: string;
+    }> => {
       const runId = await startLifecycleRun(
         actorOf(actorId),
         {
@@ -1843,7 +1848,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         entry_ids: [entry.id],
       });
       expect(selected.isError).toBeFalsy();
-      return { obligationId: entry.payload.obligationId, selection: payloadOf(selected), runId };
+      return {
+        entryId: entry.id,
+        obligationId: entry.payload.obligationId,
+        selection: payloadOf(selected),
+        runId,
+      };
     };
     const strict = await selectHeadOverMcp(optedIn);
     const strictHeadId = strict.obligationId;
@@ -1862,6 +1872,20 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // The unenrolled control's selection carries no trace of the experiment.
     expect(controlSelection.selection).not.toHaveProperty("discipline");
     expect(JSON.stringify(controlSelection.selection)).not.toContain("strict_obligation_handling");
+
+    // The rule is held, not only stated: the strict head's attention cannot be
+    // marked handled while the head is as it was found, and the control's can.
+    const markHandled = (actorId: string, entryId: string) =>
+      call(urlOf(actorOf(actorId), "inbox"), "mark_handled", {
+        entry_id: entryId,
+        note: "handled in this run",
+      });
+    const refused = await markHandled(optedIn, strict.entryId);
+    expect(refused.isError).toBe(true);
+    expect(JSON.stringify(refused)).toContain(
+      `Cannot mark handled: selected head obligation ${strictHeadId}`
+    );
+    expect((await markHandled(control, controlSelection.entryId)).isError).toBeFalsy();
 
     // Direct focus takes the separate production path: an ordinary mesh
     // message plus an explicit owned obligation, selected through the same
@@ -1910,6 +1934,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       title: "Review the strict head",
     });
     expect(child.isError).toBeFalsy();
+    expect((await markHandled(optedIn, strict.entryId)).isError).toBeFalsy();
 
     // Handing the head to a sibling is a legal exit too (#420), through the
     // worker's own obligations MCP under the production owner-or-ancestor
@@ -1970,6 +1995,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       status: "ready",
       checkpointBy: handoffSource,
     });
+    expect((await markHandled(handoffSource, handoffRun.entryId)).isError).toBeFalsy();
 
     // A root enrollment change lands at the next selection across the same
     // live boundary.
@@ -2003,6 +2029,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
       output: "",
       exitCode: 0,
     });
+    // That run returned with its armed head as found, so the return is
+    // recorded as rejected and the attention stays unhandled. The direct-focus
+    // run above closed its head first and returned clean.
+    const returnRejections = (actorId: string) =>
+      getRepositories().meshEvents.listEventsByActors([actorId], {
+        limit: 20,
+        kinds: ["run_return_rejected"],
+      }).events;
+    expect(returnRejections(switched).map((event) => JSON.parse(event.payload ?? "{}"))).toEqual([
+      expect.objectContaining({ obligationId: enrolledRun.obligationId }),
+    ]);
+    expect(returnRejections(direct)).toEqual([]);
     getRepositories().obligations.create({
       title: "live released head",
       ownerId: switched,

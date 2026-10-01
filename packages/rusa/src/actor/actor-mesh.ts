@@ -9,7 +9,9 @@ import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import {
+  isBlockingObligationStatus,
   isReadyForAttention,
+  isTerminalObligationStatus,
   type Obligation,
   type ObligationStatus,
   prerequisiteEdgeKey,
@@ -841,6 +843,22 @@ interface HeadClosureRunState {
   selectedHeads: Map<string, SelectedHeadSnapshot | null>;
   preExistingChildIds: Map<string, Set<string>>;
   preExistingPrerequisiteIds: Map<string, Set<string>>;
+  /**
+   * The armed heads each selected inbox entry is attention for: a ready-head
+   * entry for its own obligation, and every entry of a direct-focus selection
+   * for that focus. Marking an entry handled is refused while any of these
+   * heads still falls short of closure.
+   */
+  headsByEntryId: Map<string, Set<string>>;
+}
+
+/** Why one armed head does not count as closed, as returned to the run and recorded. */
+export interface HeadClosureShortfall {
+  obligationId: string;
+  title: string | null;
+  reason: string;
+  /** The actionable sentence the actor is shown. */
+  message: string;
 }
 
 /** The fields of a selected strict head that a handoff is judged against. */
@@ -1767,15 +1785,32 @@ export class ActorMesh {
         selectedHeads: new Map<string, SelectedHeadSnapshot | null>(),
         preExistingChildIds: new Map<string, Set<string>>(),
         preExistingPrerequisiteIds: new Map<string, Set<string>>(),
+        headsByEntryId: new Map<string, Set<string>>(),
       };
       this.headClosureRuns.set(actorId, run);
+      for (const entry of entries) {
+        const heads = new Set<string>();
+        if (
+          entry.payload.type === "obligation.ready_head" &&
+          typeof entry.payload.obligationId === "string" &&
+          headObligationIds.includes(entry.payload.obligationId)
+        ) {
+          heads.add(entry.payload.obligationId);
+        }
+        if (focusedObligationId !== undefined && headObligationIds.includes(focusedObligationId)) {
+          heads.add(focusedObligationId);
+        }
+        if (heads.size === 0) continue;
+        const existing = run.headsByEntryId.get(entry.id);
+        run.headsByEntryId.set(entry.id, existing ? new Set([...existing, ...heads]) : heads);
+      }
       for (const obligationId of headObligationIds) {
         run.headObligationIds.add(obligationId);
         if (!run.selectedHeads.has(obligationId)) {
           // An unreadable head is recorded as such rather than left absent, so
           // a later re-selection cannot quietly supply a baseline the run did
-          // not start with. Enforcement then fails closed on a handoff of it;
-          // every other exit is judged from the live row as before.
+          // not start with. The closure check then fails closed on a handoff of
+          // it; every other exit is judged from the live row as before.
           const selected = closure.get(obligationId);
           run.selectedHeads.set(
             obligationId,
@@ -1835,7 +1870,216 @@ export class ActorMesh {
     const heads = [...runState.headObligationIds];
     const selected =
       heads.length === 1 ? `head obligation ${heads[0]}` : `head obligations ${heads.join(", ")}`;
-    return `This run selected ${selected}. Before you return, every selected head must ${STRICT_HEAD_CLOSURE_EXITS}. Provider return settles the run, and selected work left unhandled stays visible for bounded recovery.`;
+    return `This run selected ${selected}. Before you return, every selected head must ${STRICT_HEAD_CLOSURE_EXITS}. Its attention cannot be marked handled until it does, and a return that leaves any selected head as it was found is rejected: the attention stays unhandled for one bounded retry, then escalates to your parent.`;
+  }
+
+  /**
+   * Every armed head of this actor's current run that is not yet closed, or
+   * none when the run armed nothing (#382, #828). A head is closed when it is
+   * terminal, snoozed, handed off with this run's checkpoint, or waiting on a
+   * new live direct child or a new unmet prerequisite.
+   */
+  headClosureShortfalls(actorId: string): HeadClosureShortfall[] {
+    actorId = this.resolveThreadId(actorId);
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState) return [];
+    return this.closureShortfalls(actorId, runState, runState.headObligationIds);
+  }
+
+  /**
+   * Refuse to mark selected entries handled while a head they are attention
+   * for falls short of closure. handled_at only moves forward, so this is
+   * where "the attention stays unhandled" is decided; a return that still
+   * falls short is then recorded and rides the ordinary bounded retry.
+   */
+  assertInboxEntriesHandleable(actorId: string, entryIds: readonly string[]): void {
+    actorId = this.resolveThreadId(actorId);
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState) return;
+    const heads = new Set(entryIds.flatMap((id) => [...(runState.headsByEntryId.get(id) ?? [])]));
+    if (heads.size === 0) return;
+    const shortfalls = this.closureShortfalls(actorId, runState, heads);
+    if (shortfalls.length > 0) {
+      throw new Error(`Cannot mark handled: ${shortfalls.map((s) => s.message).join(" ")}`);
+    }
+  }
+
+  private closureShortfalls(
+    actorId: string,
+    runState: HeadClosureRunState,
+    heads: ReadonlySet<string>
+  ): HeadClosureShortfall[] {
+    const shortfalls: HeadClosureShortfall[] = [];
+    const fallShort = (obligationId: string, title: string | null, reason: string) =>
+      shortfalls.push({
+        obligationId,
+        title,
+        reason,
+        message: `selected head obligation ${obligationId} ("${title ?? obligationId}") was not finished or decomposed. Reason: ${reason}. Every selected head must ${STRICT_HEAD_CLOSURE_EXITS}.`,
+      });
+    const closure = this.obligations;
+    // Selection already refused to arm a run without these reads, so this is
+    // the second half of the same fail-closed rule rather than a soft skip: an
+    // armed head never counts as closed on evidence the mesh cannot read.
+    if (!supportsObligationClosureReads(closure)) {
+      for (const obligationId of heads) {
+        fallShort(
+          obligationId,
+          null,
+          "the mesh obligation closure port is unavailable, so closure cannot be verified"
+        );
+      }
+      return shortfalls;
+    }
+
+    // A snooze is the owner's explicit, time-bounded decision to defer this
+    // work, so it closes the head whether it was set during the run or before
+    // (#722). One whose deadline already passed is cleared first, through the
+    // normal mutation path, and the obligation then answers to the ordinary
+    // ready/waiting rules below.
+    closure.expireDueSnoozes([...heads]);
+
+    for (const obligationId of heads) {
+      const obligation = closure.get(obligationId);
+      if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
+      if (obligation.snoozedUntil !== null) continue;
+
+      if (obligation.status === "ready") {
+        const shortfall = this.strictHandoffShortfall(
+          actorId,
+          obligation,
+          runState.selectedHeads.get(obligationId) ?? null
+        );
+        if (shortfall !== null) fallShort(obligationId, obligation.title, shortfall);
+        continue;
+      }
+
+      const preExistingChildren =
+        runState.preExistingChildIds.get(obligationId) ?? new Set<string>();
+      const hasNewlyCreatedLiveChild = closure
+        .listDirectChildEdges(obligationId)
+        .some(
+          (child) =>
+            child.creatorId === actorId &&
+            !isTerminalObligationStatus(child.status) &&
+            !preExistingChildren.has(child.id)
+        );
+      const preExistingPrerequisites =
+        runState.preExistingPrerequisiteIds.get(obligationId) ?? new Set<string>();
+      const hasNewlyAddedUnmetPrerequisite = closure
+        .listPrerequisiteEdges(obligationId)
+        .some(
+          (prerequisite) =>
+            !preExistingPrerequisites.has(prerequisite.prerequisiteId) &&
+            !isTerminalObligationStatus(prerequisite.status)
+        );
+      if (!hasNewlyCreatedLiveChild && !hasNewlyAddedUnmetPrerequisite) {
+        fallShort(
+          obligationId,
+          obligation.title,
+          "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
+        );
+      }
+    }
+    return shortfalls;
+  }
+
+  /**
+   * Why a still-ready strict head does not count as handed off by this run, or
+   * null when it does (#420).
+   *
+   * A handoff is the outgoing owner's own act: the run started with this actor
+   * owning the head, the head now belongs to a distinct actor that can be
+   * woken, and the checkpoint it carries was written by this actor during the
+   * run. The selection-time owner is load-bearing rather than a restatement of
+   * `actorId`: head attention is delivered to the owner, but ownership can move
+   * between delivery and selection (an ancestor reassigns it elsewhere), and
+   * without the snapshot such a run could return closed on a transfer it never
+   * performed. The checkpoint is compared against the same snapshot so a
+   * standing left from an earlier run cannot stand in for this one.
+   *
+   * The obligation row and the ready-head transition are already committed by
+   * the repository before this runs, which is what makes the disposition
+   * durable: the live listener delivers the recipient's attention in-process,
+   * and boot reconciliation restores it if the process is interrupted between
+   * that commit and the wake.
+   */
+  private strictHandoffShortfall(
+    outgoingActorId: string,
+    obligation: Obligation,
+    selected: SelectedHeadSnapshot | null
+  ): string | null {
+    const recipientId = this.resolveThreadId(obligation.ownerId);
+    if (recipientId === outgoingActorId) return "obligation is still ready";
+    const moved = `obligation is still ready and moved to ${obligation.ownerId}`;
+    if (!selected) {
+      return `${moved}, but it could not be read when selected, so the transfer cannot be attributed to this run`;
+    }
+    if (this.resolveThreadId(selected.ownerId) !== outgoingActorId) {
+      return `${moved}, but this actor did not own it when selected, so the transfer is not this run's handoff`;
+    }
+    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
+      return `${moved} without a checkpoint written by this actor`;
+    }
+    if (
+      obligation.checkpoint === selected.checkpoint &&
+      obligation.checkpointAt === selected.checkpointAt &&
+      obligation.checkpointBy === selected.checkpointBy
+    ) {
+      return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
+    }
+    if (!this.isWakeableRecipient(obligation.ownerId)) {
+      return `${moved}, which is not an active actor that can be woken`;
+    }
+    return null;
+  }
+
+  /**
+   * Whether a handoff recipient will ever be woken for the work: an actor in
+   * the tree — not a human or system principal, which no inbox serves — whose
+   * durable record is active and which is not mid-retirement. The durable
+   * record is used rather than `live` on purpose: an active recipient may be
+   * between process restart and rehydration, when the committed ready-head
+   * transition is exactly what restores its queue. Retirement is the one
+   * non-restart state that record cannot show (see {@link isActiveActor}).
+   */
+  private isWakeableRecipient(ownerId: string): boolean {
+    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    return this.isActiveActor(this.resolveThreadId(ownerId));
+  }
+
+  /**
+   * Record each armed head a successful return left unclosed. Its attention
+   * was refused handling, so the ordinary bounded retry and parent escalation
+   * that follow in {@link finishInboxRun} carry it from here. A closure read
+   * that throws is recorded as a rejection of every armed head rather than
+   * allowed to abort the rest of run finishing.
+   */
+  private recordReturnRejections(actorId: string): void {
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState) return;
+    let shortfalls: Array<Pick<HeadClosureShortfall, "obligationId" | "title" | "reason">>;
+    try {
+      shortfalls = this.closureShortfalls(actorId, runState, runState.headObligationIds);
+    } catch (err) {
+      const reason = `closure could not be read at return: ${err instanceof Error ? err.message : String(err)}`;
+      shortfalls = [...runState.headObligationIds].map((obligationId) => ({
+        obligationId,
+        title: null,
+        reason,
+      }));
+    }
+    for (const { obligationId, title, reason } of shortfalls) {
+      this.recordEvent({
+        kind: "run_return_rejected",
+        actorId,
+        detail: `Return rejected for head obligation ${obligationId}: ${reason}`,
+        payload: JSON.stringify({ obligationId, title, reason }),
+      });
+      this.log(
+        `return from ${actorId} rejected: head obligation ${obligationId} not finished or decomposed (${reason})`
+      );
+    }
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {
@@ -1846,6 +2090,9 @@ export class ActorMesh {
   finishInboxRun(actorId: string, outcome: { successful?: boolean; runId?: string } = {}): void {
     actorId = this.resolveThreadId(actorId);
     const selectedIds = [...this.selectedInboxEntries(actorId)];
+    // A failed run is not a return the actor chose, so it keeps the ordinary
+    // failure route below rather than a closure rejection.
+    if (outcome.successful !== false) this.recordReturnRejections(actorId);
     this.deliverReturnedRunResult(actorId, selectedIds, outcome);
     this.selectedInboxEntryIds.delete(actorId);
     this.headClosureRuns.delete(actorId);
