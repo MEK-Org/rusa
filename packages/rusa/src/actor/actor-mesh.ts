@@ -5352,18 +5352,20 @@ export class ActorMesh {
     const resolved = this.resolveThreadId(actorId);
     const actor = this.runs.liveActor(resolved);
     if (!actor || actor.isRunning || !actor.isQueued) return false;
-    if (this.inboxStore) {
-      const watermark = actor.getInterruptedWatermark?.();
-      if (watermark) {
-        const entries = this.inboxStore.list(resolved, { status: "unhandled" }).entries;
-        if (entries.some((e) => e.deliveredAt > watermark)) return false;
-      } else if (this.inboxStore.countUnhandled(resolved) > 0) {
-        return false;
-      }
-    } else if (this.runs.durableWork(resolved) !== null) {
-      return false;
-    }
+    if (this.hasRunnableInbox(resolved)) return false;
     return actor.cancelQueuedRun?.({ retain: false }) === true;
+  }
+
+  /** The durable-work half of the run admission predicate, shared by every admission boundary. */
+  private hasRunnableInbox(actorId: string): boolean {
+    if (!this.inboxStore) return true;
+    const actor = this.runs.liveActor(actorId);
+    const watermark = actor?.getInterruptedWatermark?.();
+    if (watermark) {
+      const entries = this.inboxStore.list(actorId, { status: "unhandled" }).entries;
+      return entries.some((entry) => entry.deliveredAt > watermark);
+    }
+    return this.inboxStore.countUnhandled(actorId) > 0;
   }
 
   /**
@@ -5392,16 +5394,10 @@ export class ActorMesh {
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: () => {
         if (!this.prepareRun(record.id)) return false;
-        if (!this.inboxStore) return true;
-        const actor = this.runs.liveActor(record.id);
-        const watermark = actor?.getInterruptedWatermark?.();
-        if (watermark) {
-          const entries = this.inboxStore.list(record.id, { status: "unhandled" }).entries;
-          return entries.some((e) => e.deliveredAt > watermark);
-        }
-        return this.inboxStore.countUnhandled(record.id) > 0;
+        return this.hasRunnableInbox(record.id);
       },
-      admitRun: ({ responsive }) => responsive || !this.isVoiceSessionActive(record.id),
+      admitRun: ({ responsive }) =>
+        this.hasRunnableInbox(record.id) && (responsive || !this.isVoiceSessionActive(record.id)),
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
     };
