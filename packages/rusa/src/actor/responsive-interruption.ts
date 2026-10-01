@@ -27,9 +27,12 @@
 /** A live client sees ids; resolving them to text is its own concern. */
 export interface JevDecisionClient {
   /**
-   * `signal` is the policy deadline's cancellation path. A client must pass it
-   * to its transport so an abandoned shadow observation does not continue
-   * sending content after the scheduler has stopped waiting for it.
+   * `signal` fires when the policy deadline expires. A client must send
+   * nothing once it has fired, so an abandoned shadow observation does not
+   * start sending content after the scheduler has stopped waiting for it. It
+   * must not cancel a request already in flight with it: the deadline stops
+   * waiting, it does not cancel, so the transport's own timeout bounds a sent
+   * request (#813).
    */
   decide(
     request: JevDecisionRequest,
@@ -189,9 +192,9 @@ export type ResponsiveInterruptionDecision =
 /**
  * How long a decision may take before the policy stops waiting on it. The
  * budget covers the live client's source reads as well as its HTTP request.
- * Expiry aborts the request through the `AbortSignal` passed to `decide`; the
- * source clients take no signal, so the client stops waiting on a read in
- * progress rather than cancelling it, and sends nothing after expiry.
+ * Expiry fires the `AbortSignal` passed to `decide` and stops waiting; it
+ * cancels nothing in progress. The client sends nothing after expiry, and a
+ * request already sent runs out under the transport's own timeout.
  * Uncalibrated placeholder: shadow mode delays nothing, and `timeout` is
  * recorded as its own reason, so the shadow data is what calibrates it.
  */

@@ -49,6 +49,30 @@ export interface JevQueryAuditRecord {
 export interface HttpJevDecisionClientOptions {
   fetch?: Fetch;
   auditPath?: string;
+  /** The SDK's request timeout, headers through end of body. Defaults to the SDK's. */
+  requestTimeoutMs?: number;
+}
+
+/**
+ * Hands the SDK a response whose body has already fully arrived.
+ *
+ * `@typesafe-ai/sdk` 0.6.0 buffers by draining `response.clone()`. On Node 24,
+ * aborting a fetch while a cloned body is still arriving leaves a rejection
+ * inside the tee that nothing can handle, and the process exits (#813). The
+ * SDK's own request timeout aborts exactly that way. Reading the body here,
+ * on the uncloned response, turns a mid-body abort into an ordinary rejection
+ * of this call, which the SDK reports as its timeout or connection error.
+ */
+function bufferBodyBeforeSdk(fetch: Fetch): Fetch {
+  return async (url, init) => {
+    const response = await fetch(url, init);
+    const body = await response.arrayBuffer();
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
 }
 
 /** A type alias rather than an interface, so it is assignable to the SDK's JSON state. */
@@ -98,7 +122,8 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       baseURL: JEV_BASE_URL,
       retry: { maxRetries: 0 },
       logLevel: "off",
-      ...(options?.fetch ? { fetch: options.fetch } : {}),
+      fetch: bufferBodyBeforeSdk(options?.fetch ?? ((url, init) => globalThis.fetch(url, init))),
+      ...(options?.requestTimeoutMs !== undefined ? { timeout: options.requestTimeoutMs } : {}),
     });
   }
 
@@ -147,9 +172,13 @@ export class HttpJevDecisionClient implements JevDecisionClient {
       error: null,
     };
 
+    // The deadline stops waiting; it does not cancel. Nothing is sent after it
+    // expires, but a request already sent is bounded by the SDK's own timeout,
+    // never by this signal (#813).
+    options.signal?.throwIfAborted();
     let answer: { type: unknown; noul: unknown } | undefined;
     try {
-      const result = await this.client.systemOne(query, { signal: options.signal });
+      const result = await this.client.systemOne(query);
       answer = result.answers?.interruption;
     } catch (err) {
       auditRecord.error = err instanceof Error ? err.message : String(err);
