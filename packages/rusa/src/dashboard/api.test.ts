@@ -820,6 +820,23 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
+  it("serves the one server-side Chat Room roster, and 503s when it is not wired (#663)", async () => {
+    const participants = [
+      { actorId: "root", addedBy: null, addedAt: null },
+      { actorId: UUID_A, addedBy: "root", addedAt: "2026-09-30T12:00:00.000Z" },
+    ];
+    const { res } = await call(
+      { ...deps, chatRoom: { participants: () => participants } },
+      "GET",
+      "/api/mesh/chat-room"
+    );
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ participants });
+
+    const { res: unwired } = await call(deps, "GET", "/api/mesh/chat-room");
+    expect(unwired.statusCode).toBe(503);
+  });
+
   it("ignores non-/api/mesh paths (returns false)", async () => {
     const { handled } = await call(deps, "GET", "/dashboard");
     expect(handled).toBe(false);

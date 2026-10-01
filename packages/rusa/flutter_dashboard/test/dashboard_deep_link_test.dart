@@ -108,6 +108,10 @@ void main() {
         parseDashboardView(Uri.parse('/understanding')),
         DashboardView.understanding,
       );
+      expect(
+        parseDashboardView(Uri.parse('/chat-room')),
+        DashboardView.chatRoom,
+      );
       expect(parseDashboardView(Uri.parse('/reports')), DashboardView.reports);
       expect(parseDashboardView(Uri.parse('/work')), DashboardView.work);
       expect(
@@ -149,6 +153,13 @@ void main() {
       );
       expect(updated.path, '/actors/actor-2');
       expect(updated.queryParameters, {'other': 'keep'});
+
+      final room = buildDashboardUri(
+        Uri.parse('/actors/actor-2?other=keep'),
+        DashboardView.chatRoom,
+      );
+      expect(room.path, '/chat-room');
+      expect(room.queryParameters, {'other': 'keep'});
     });
   });
 

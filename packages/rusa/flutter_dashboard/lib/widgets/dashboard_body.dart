@@ -7,6 +7,7 @@ import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'actor_tree.dart';
+import 'chat_room.dart';
 import 'detail_panel.dart';
 import 'header.dart';
 import 'mobile_nav_drawer.dart';
@@ -246,6 +247,8 @@ class _DashboardBodyState extends State<DashboardBody> {
                   )
                 : _view == DashboardView.work
                 ? WorkTab(store: widget.store, onSelectView: _selectView)
+                : _view == DashboardView.chatRoom
+                ? ChatRoomTab(store: widget.store)
                 : _ActorsBody(store: widget.store, onSelectView: _selectView),
           ),
         ],

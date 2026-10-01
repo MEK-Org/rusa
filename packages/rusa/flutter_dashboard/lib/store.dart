@@ -399,6 +399,11 @@ class DashboardStore {
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
+  // The V1 Chat Room is dashboard-global rather than tied to the actor-detail
+  // selection. Its roster is mesh state that only root changes (#663), so
+  // every dashboard renders the server's list and none can edit it locally.
+  // Empty until the first fetch lands.
+  final _chatRoomParticipants = BehaviorSubject<List<String>>.seeded(const []);
 
   /// Ticks whenever any actor's avatar state changes so `ActorAvatar` /
   /// `AvatarLightbox` rebuild and read [avatarVersion] / [isAvatarGenerating].
@@ -463,6 +468,8 @@ class DashboardStore {
       _dashboardConfig.stream;
   ValueStream<String?> get error => _error.stream;
   ValueStream<bool> get walkieActive => _walkieActive.stream;
+  ValueStream<List<String>> get chatRoomParticipants =>
+      _chatRoomParticipants.stream;
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
 
   /// Cache-busting version for one actor's avatar URL (0 = never changed).
@@ -520,6 +527,26 @@ class DashboardStore {
     if (!_walkieActive.isClosed) {
       _walkieActive.add(active);
     }
+  }
+
+  /// Fetch the mesh-wide Chat Room roster. A changed roster also re-syncs the
+  /// threads: adding an actor can assign it a distinct voice, and its tile
+  /// should show that voice rather than the one it had before it joined.
+  Future<void> refreshChatRoom() async {
+    final List<String> ids;
+    try {
+      ids = await _api.fetchChatRoom();
+    } catch (_) {
+      return;
+    }
+    if (_chatRoomParticipants.isClosed) return;
+    final current = _chatRoomParticipants.value;
+    if (ids.length == current.length &&
+        Iterable<int>.generate(ids.length).every((i) => ids[i] == current[i])) {
+      return;
+    }
+    _chatRoomParticipants.add(List.unmodifiable(ids));
+    if (current.isNotEmpty) unawaited(refreshThreads());
   }
 
   void setFocusedObligationId(String? id) {
@@ -1941,6 +1968,7 @@ class DashboardStore {
       _error.close(),
       _collapsed.close(),
       _walkieActive.close(),
+      _chatRoomParticipants.close(),
       _obligationRefreshes.close(),
     ]);
   }

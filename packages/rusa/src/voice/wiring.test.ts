@@ -1,5 +1,11 @@
+import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { VoiceConfigDocument } from "./voice-config.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ChatRoomRepository } from "../db/repositories/chat-room-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import { ChatRoomService } from "./chat-room.js";
+import { buildSupportedVoiceCatalog } from "./voice-catalog.js";
+import { googleVoiceConfig, type VoiceConfigDocument } from "./voice-config.js";
 import { createVoiceService } from "./wiring.js";
 
 const clients = vi.hoisted(() => ({
@@ -123,5 +129,58 @@ describe("voice provider routing", () => {
     await expect(googleOnlyService.handleMeshEvent(event)).rejects.toThrow(
       "ElevenLabs TTS: elevenlabsApiKey is not configured; select an available actor voice"
     );
+  });
+
+  it("speaks a Chat Room A then B reply in two different voices after B joins (#663)", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    for (const id of ["root", "actor-b"]) {
+      // Neither has a stored voice, so both would speak the instance default.
+      actors.upsert({
+        id,
+        charter: id,
+        parentId: id === "root" ? null : "root",
+        ...(id === "root" ? { isRoot: true } : {}),
+        status: "active",
+        context: { type: "native" },
+        createdAt: "2026-09-30T00:00:00.000Z",
+      });
+    }
+    new ChatRoomService({
+      store: new ChatRoomRepository(db),
+      actors,
+      rootId: "root",
+      voices: () => buildSupportedVoiceCatalog(),
+      defaultVoice: googleVoiceConfig("Laomedeia"),
+      isHumanPrincipal: () => false,
+    }).add("actor-b", "root");
+
+    const service = createVoiceService({
+      home: "/unused",
+      apiKey: "key",
+      voice: { voiceName: "Laomedeia" },
+      voiceConfigFor: (actorId) => actors.get(actorId)?.voiceConfig,
+    });
+    service.presenceConnect(["root", "actor-b"]);
+    // Stop at the synthesis boundary, before filesystem/encoder work.
+    clients.google.streamSynthesize.mockRejectedValue(new Error("render"));
+    const reply = (id: string, actorId: string, body: string) => ({
+      id,
+      ts: "now",
+      kind: "message_sent",
+      actorId,
+      detail: null,
+      body,
+      payload: JSON.stringify({ to: "human:operator" }),
+      success: null,
+    });
+    await expect(service.handleMeshEvent(reply("a", "root", "Reply A"))).rejects.toThrow();
+    await expect(service.handleMeshEvent(reply("b", "actor-b", "Reply B"))).rejects.toThrow();
+
+    expect(clients.google.streamSynthesize.mock.calls).toEqual([
+      ["Reply A", "Laomedeia"],
+      ["Reply B", "Achernar"],
+    ]);
   });
 });

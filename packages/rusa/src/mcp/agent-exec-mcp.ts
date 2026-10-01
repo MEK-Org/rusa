@@ -6,6 +6,7 @@ import {
   CAPABILITY_ADMIN_CAPABILITY,
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
+  ROOM_ADMIN_CAPABILITY,
 } from "../actor/administrative-capabilities.js";
 import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
 import {
@@ -21,6 +22,8 @@ import type { ModelClassRepository } from "../db/repositories/model-class-reposi
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
+import type { ChatRoomService } from "../voice/chat-room.js";
+import type { VoiceConfigDocument } from "../voice/voice-config.js";
 import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
@@ -131,6 +134,11 @@ export function createAgentExecMcpServer(
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
     /** List of connected followers available for remote placement. */
     getFollowers?: () => FollowerInfo[];
+    /**
+     * The mesh-wide Chat Room roster (#663). Its tools mount only when this is
+     * wired AND the endpoint's actor holds `room-admin`.
+     */
+    chatRoom?: Pick<ChatRoomService, "participants" | "add" | "remove">;
   }
 ): McpServer {
   const server = createMcpServer(
@@ -1056,9 +1064,10 @@ export function createAgentExecMcpServer(
   // refused outside it, and an inspection read returns only the rows whose
   // actor lies inside it — the same scoping the mesh applies to grants,
   // experiments and model changes, so delegating a capability down a tree
-  // never widens what its holder can see. The model-class registry has no
-  // subtree to scope to; that is why `model-admin` is host-global and never
-  // granted through the mesh (see HOST_GLOBAL_CAPABILITIES).
+  // never widens what its holder can see. The model-class registry and the
+  // Chat Room roster have no subtree to scope to; that is why `model-admin` and
+  // `room-admin` are host-global and never granted through the mesh (see
+  // HOST_GLOBAL_CAPABILITIES).
   const holds = (capability: string) => mesh.hasActiveCapability(selfId, capability);
   const assertCapability = (capability: string) =>
     holds(capability)
@@ -1585,6 +1594,91 @@ export function createAgentExecMcpServer(
         }
       );
     }
+  }
+
+  // ── Chat Room membership (#663) ── One mesh-wide room. Every dashboard
+  // renders this roster, so it changes only here, for the `room-admin` holder.
+  if (options?.chatRoom && holds(ROOM_ADMIN_CAPABILITY)) {
+    const chatRoom = options.chatRoom;
+    const assertRoomAdmin = () => assertCapability(ROOM_ADMIN_CAPABILITY);
+    const voiceName = (voice: VoiceConfigDocument) =>
+      voice.provider === "google" ? voice.config.voiceName : voice.config.voiceId;
+
+    server.registerTool(
+      "list_room_participants",
+      {
+        title: "List Chat Room participants (room-admin)",
+        description:
+          "List the dashboard Chat Room's participants: root first, then each added actor in the order it was added. Requires the room-admin capability.",
+        inputSchema: {},
+      },
+      async () => {
+        const denied = assertRoomAdmin();
+        if (denied) return denied;
+        try {
+          return toolOk(
+            chatRoom.participants().map((p) => ({
+              actor_id: p.actorId,
+              added_by: p.addedBy,
+              added_at: p.addedAt,
+            }))
+          );
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "add_room_participant",
+      {
+        title: "Add an actor to the Chat Room (room-admin)",
+        description:
+          "Add a live actor to the one mesh-wide Chat Room that every dashboard shows. Root is always a participant. Human principals and aliases such as 'root' or 'parent' cannot be added. If the actor's voice is already used by another participant, it is assigned the next unused voice through its ordinary voice setting so listeners can tell participants apart. Adding a current participant changes nothing. Requires the room-admin capability.",
+        inputSchema: {
+          actor_id: z.string().min(1).describe("The actor's thread id."),
+        },
+      },
+      async ({ actor_id }) => {
+        const denied = assertRoomAdmin();
+        if (denied) return denied;
+        try {
+          const result = chatRoom.add(actor_id, selfId);
+          if (result.added) options?.onWrite?.();
+          return toolOk({
+            actor_id: result.actorId,
+            added: result.added,
+            voice: voiceName(result.voice),
+            replaced_voice: result.replacedVoice ? voiceName(result.replacedVoice) : null,
+          });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "remove_room_participant",
+      {
+        title: "Remove an actor from the Chat Room (room-admin)",
+        description:
+          "Remove an actor from the mesh-wide Chat Room. Root cannot be removed. The actor keeps its voice setting. Requires the room-admin capability.",
+        inputSchema: {
+          actor_id: z.string().min(1).describe("The participant's thread id."),
+        },
+      },
+      async ({ actor_id }) => {
+        const denied = assertRoomAdmin();
+        if (denied) return denied;
+        try {
+          const removed = chatRoom.remove(actor_id);
+          if (removed) options?.onWrite?.();
+          return toolOk({ actor_id, removed });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
   }
 
   // ── Grant inspection ── The audit view of who holds what, for a

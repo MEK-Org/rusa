@@ -50,6 +50,7 @@ import type {
   InboxPayload,
   InboxRepository,
 } from "../repositories/inbox-repository.js";
+import type { ChatRoomService } from "../voice/chat-room.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import { buildSupportedVoiceCatalog, type SupportedVoice } from "../voice/voice-catalog.js";
 import {
@@ -89,6 +90,11 @@ export interface DashboardDataDeps {
   sseHub: SseHub;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
+  /**
+   * The mesh-wide Chat Room roster (#663), read by every dashboard. Membership
+   * is changed only by the `room-admin` tools, never through this API.
+   */
+  chatRoom?: Pick<ChatRoomService, "participants">;
   /** Root-authorized commands exposed to trusted dashboard operators. */
   rootControl?: RootControlService;
   /**
@@ -1882,6 +1888,17 @@ export async function handleMeshApiRequest(
       return true;
     }
     sendJson(res, 200, { followerId, updateStatus: follower.updateStatus ?? null });
+    return true;
+  }
+
+  // GET /api/mesh/chat-room — the Chat Room roster: root first, then added
+  // actors in the order they joined. Read-only: root manages membership.
+  if (pathname === "/api/mesh/chat-room") {
+    if (!deps.chatRoom) {
+      sendJson(res, 503, { error: "chat room unavailable (no live mesh bound)" });
+      return true;
+    }
+    sendJson(res, 200, { participants: deps.chatRoom.participants() });
     return true;
   }
 

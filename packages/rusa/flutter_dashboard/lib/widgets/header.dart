@@ -11,7 +11,7 @@ import 'brand_mark.dart';
 import 'quota_tooltip.dart';
 
 /// The top-level dashboard views the header nav switches between.
-enum DashboardView { overview, actors, understanding, reports, work }
+enum DashboardView { overview, actors, chatRoom, understanding, reports, work }
 
 /// One top-level destination the navigation offers. The desktop header renders
 /// these inline and the phone drawer renders them as rows, from this one list —
@@ -58,6 +58,14 @@ const List<DashboardDestination> kDashboardDestinations = [
     label: 'Actors',
     view: DashboardView.actors,
     icon: Icons.account_tree_outlined,
+  ),
+  // #663's dashboard-global Chat Room. The nav label is the short "Room" so
+  // all five destinations still fit the inline nav at [kNarrowBreakpoint];
+  // the room's own controls carry the full "Chat Room" name.
+  DashboardDestination(
+    label: 'Room',
+    view: DashboardView.chatRoom,
+    icon: Icons.forum_outlined,
   ),
   DashboardDestination(
     label: 'Work',
@@ -149,12 +157,14 @@ class MeshHeader extends StatelessWidget {
     this.onBack,
     this.pageTitle,
     this.detailActor,
+    this.destinations,
     this.onLogout,
     this.profilePhotoUrl,
     this.profileDisplayName,
   });
 
   final DashboardStore store;
+  final List<DashboardDestination>? destinations;
   final VoidCallback? onLogout;
   final String? profilePhotoUrl;
   final String? profileDisplayName;
@@ -331,7 +341,8 @@ class MeshHeader extends StatelessWidget {
                                       children: [
                                         SizedBox(width: compact ? 8 : 16),
                                         for (final destination
-                                            in kDashboardDestinations)
+                                            in (destinations ??
+                                                kDashboardDestinations))
                                           _NavItem(
                                             destination: destination,
                                             selected: selected,

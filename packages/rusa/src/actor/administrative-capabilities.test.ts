@@ -8,6 +8,7 @@ import {
   CONFIGURED_ACTOR_BOOTSTRAP_GRANTOR,
   EXPERIMENT_ADMIN_CAPABILITY,
   MODEL_ADMIN_CAPABILITY,
+  ROOM_ADMIN_CAPABILITY,
   seedConfiguredActorGrants,
 } from "./administrative-capabilities.js";
 import { InMemoryCapabilityGrantStore } from "./capability-grants.js";
@@ -21,6 +22,7 @@ describe("administrative capabilities", () => {
       EXPERIMENT_ADMIN_CAPABILITY,
       MODEL_ADMIN_CAPABILITY,
       ACTOR_ADMIN_CAPABILITY,
+      ROOM_ADMIN_CAPABILITY,
       "update",
       "pnpm-hardlinks",
     ]);
@@ -60,6 +62,7 @@ describe("administrative capabilities", () => {
       EXPERIMENT_ADMIN_CAPABILITY,
       MODEL_ADMIN_CAPABILITY,
       ACTOR_ADMIN_CAPABILITY,
+      ROOM_ADMIN_CAPABILITY,
       "pnpm-hardlinks",
     ]);
     const store = new InMemoryCapabilityGrantStore();
