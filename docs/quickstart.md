@@ -15,54 +15,56 @@ The root `quickstart` command accepts the following options:
 * `--container <name>`: The name of the launched application container (default: `rusa-quickstart`).
 * `--volume <name>`: The Docker volume used to persist the service user's home and Rusa data (default: `rusa-quickstart-home`).
 * `--no-build`: Skip the local Docker image build step and run an existing local image.
+* `--repo <path>`: Local Git repository directory to evaluate with Rusa. If omitted in an interactive terminal, quickstart prompts for it.
 
 ### Walkthrough: End-to-End Flow
 
-1. **Image Build & Volume Provisioning**
-   Run the quickstart command from your local workspace:
-   ```bash
-   rusa quickstart
-   ```
+1. **Host-Side Local Repository Validation**
+   `rusa quickstart` validates the repository on the host. A `--repo <path>` is checked before any container is started or replaced; without `--repo`, the prompt appears once the setup container is up and the wizard is about to run (first run or `--reconfigure`), and rejects an invalid path before the wizard starts:
+   * Confirms the path exists and is a directory.
+   * Confirms the path is inside a Git worktree (`git rev-parse --is-inside-work-tree`).
+   * Confirms the repository has at least one commit (`git rev-parse --verify HEAD`).
+   * Confirms a branch is checked out (not a detached `HEAD`); that branch becomes the base agents work from.
+   * Confirms the directory name uses only letters, digits, `.`, `_` and `-`, since it becomes the `local/<dirname>` repo key and part of the bridge URL.
+
+2. **Image Build & Volume Provisioning**
    Unless `--no-build` is specified, the CLI builds the local Docker image `rusa:quickstart`. It then creates a persistent Docker volume (`rusa-quickstart-home` by default) to hold your credentials, repository checkouts, and configuration files.
 
-2. **Temporary Setup Container**
-   A temporary container named `<container>-setup` is started in the background. This container mounts the persistent volume at `/home/node`, so vendor CLIs' credential stores and `$RUSA_HOME` are retained for the service container.
-
-3. **In-Container Configuration Wizard**
-   The CLI automatically prompts you to execute the configuration wizard inside the temporary setup container:
-   ```bash
-   docker exec -it rusa-quickstart-setup rusa quickstart configure
-   ```
-   The interactive wizard collects configuration details and writes them directly inside the volume:
-   * **Local repository**: An optional local Git repository path. The wizard records the selection in its output but does not yet copy it into the container or configure a GitHub subscription; completing that host-to-container bridge is tracked in [#69](https://github.com/MEK-Org/rusa/issues/69).
+3. **Temporary Setup Container & Configuration Wizard**
+   A temporary container named `<container>-setup` is started in the background, mounting the persistent volume at `/home/node`. The CLI guides you through the configuration wizard:
    * **Coding LLM providers**: Choose one or more of `codex`, `claude`, `antigravity`, or `kimi` (defaults to `codex`).
    * **Provider sign-in**: For `codex`, `claude`, and `antigravity`, quickstart hands the real terminal to that vendor's CLI login, then verifies the login before continuing (for `antigravity`, exit the CLI session via `Ctrl+D Ctrl+D` or `/exit` after logging in to proceed). No API key is pasted into Rusa. Quickstart login for `kimi` is not supported yet; complete authentication with the vendor's own CLI.
    * **Verification record**: Quickstart writes each supported provider's pass/fail verification result and exit code to `$RUSA_HOME/logs/quickstart-provider-login.jsonl`; it never captures vendor login output.
    * **Gemini API key**: Used for background classification and avatar tasks and written to the Rusa secrets directory.
    * **Root handle**: The display identity for the local root actor.
 
-4. **Launching the Orchestrator**
-   Once configuration is complete, the quickstart CLI automatically tears down the temporary setup container and boots the main app container (`rusa-quickstart`). This container mounts the volume and starts the orchestrator service.
+4. **Automatic Repository Subscription**
+   Quickstart adds `local/<dirname>` to `github.repos` in the volume's `config.yaml` if it is not already there. Existing entries, local or not, are never removed, and `--reconfigure` carries them forward. If the config cannot be read or written, quickstart stops before starting the app or touching your repository.
+
+5. **Seeding the Bridge Repository**
+   Still in the setup container, before the app starts, quickstart seeds the bridge's copy of your repository with the branch you have checked out:
+   * On the host it writes that branch to a temporary `git bundle`, copies the bundle into the setup container, and runs `rusa quickstart seed` there. Your repository is never mounted into a container.
+   * The first seed creates the bridge repository. A later run with `--repo` fast-forwards the base branch to your current commit and leaves agent `mc/*` branches untouched. If your branch has been rewritten so it no longer fast-forwards, seeding fails and quickstart stops.
+   * The bridge keeps refusing pushes outside `refs/heads/mc/*`, so seeding is the only way the base branch changes.
+
+6. **Launching the Orchestrator & Local Git Remote**
+   Quickstart replaces the setup container with the main app container (`rusa-quickstart`), then points a `rusa` remote in your repository at the bridge (`remote add`, or `set-url` if `rusa` already exists). Nothing is pushed. If the remote cannot be set, quickstart prints the command to run yourself.
 
 ### Local Repository, Not GitHub
-Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) but subscribes to no repositories: the orchestrator still binds the webhook listener inside the container, but the port is not published and no repository is admitted, so any GitHub delivery that did reach it is dropped as not covered by any subscription. Rusa has no GitHub polling fallback: connecting a quickstart instance to GitHub means adding `github.repos`, publishing the webhook port (`9742`, not published by the quickstart container by default), and registering a GitHub webhook that can reach it. See `rusa config-docs` for the `webhook` keys. A `github-poller-state.json` left in the volume by an earlier build is ignored.
+Quickstart is built to run against a **local repository** through the Git bridge below; it does not talk to GitHub. The wizard writes a webhook stanza (the only GitHub ingestion edge) and subscribes only to the selected `local/<dirname>` repository: the orchestrator still binds the webhook listener inside the container, but the port is not published and no GitHub repository is admitted, so any GitHub delivery that did reach it is dropped as not covered by any subscription. Rusa has no GitHub polling fallback: connecting a quickstart instance to GitHub means adding `github.repos`, publishing the webhook port (`9742`, not published by the quickstart container by default), and registering a GitHub webhook that can reach it. See `rusa config-docs` for the `webhook` keys. A `github-poller-state.json` left in the volume by an earlier build is ignored.
 
 ### Local Git Bridge
-Once the orchestrator is running, each repository explicitly listed in `github.repos` has a Git HTTP bridge endpoint. The quickstart wizard does not add this configuration automatically; add the repository's `owner/name` to `github.repos` in the volume's `config.yaml` first. You can then connect a matching local workspace repository to it using:
-
-Add the bridge remote to your local repository:
-```bash
-git remote add rusa http://localhost:8085/<owner>/<repo>.git
-```
-Seed your initial repository code to the orchestrator:
-```bash
-git push rusa main
-```
-Fetch branches produced by agents:
+The Git bridge publishes a local web dashboard on port `8080` and the smart HTTP Git server on port `8085`.
+From your repository directory, fetch the branches agents produce:
 ```bash
 git fetch rusa
 ```
-The Git bridge publishes a local web dashboard on port `8080` and the smart HTTP Git server on port `8085`.
+The bridge accepts pushes only to `mc/*` branches, so `git push rusa HEAD` from your own branch is rejected. To give agents newer work on your base branch, rerun quickstart with `--repo <path>`, which reseeds it.
+
+To set the remote yourself:
+```bash
+git remote set-url rusa http://localhost:8085/local/<dirname>.git || git remote add rusa http://localhost:8085/local/<dirname>.git
+```
 
 ---
 
