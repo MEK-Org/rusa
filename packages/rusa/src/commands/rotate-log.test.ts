@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  truncateSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -24,11 +25,12 @@ function logDir(): string {
   return dir;
 }
 
-function rotate(logPath: string, env: Record<string, string> = {}) {
+function rotate(logPath: string, env: Record<string, string> = {}, timeout?: number) {
   return spawnSync(process.execPath, [resolve("scripts/rotate-log.mjs")], {
     cwd: resolve("."),
     env: { ...process.env, RUSA_LOG_PATH: logPath, ...env },
     encoding: "utf8",
+    timeout,
   });
 }
 
@@ -161,14 +163,79 @@ describe("rotate-log (#580)", () => {
     expect(existsSync(log)).toBe(false);
   });
 
-  it("falls back to the defaults on a malformed override rather than disabling rotation", () => {
+  // A malformed or out-of-range override falls back to its default rather than
+  // disabling rotation. Digit-only is not enough: 400 nines pass a digit check but
+  // Number() makes them Infinity, which would never reach the bound (MAX_BYTES) or
+  // never finish shifting generations (KEEP).
+  const infinite = "9".repeat(400);
+  const unsafe = "9007199254740993"; // past Number.MAX_SAFE_INTEGER
+
+  const outOfRange = [
+    { label: "past MAX_SAFE_INTEGER", value: unsafe },
+    { label: "400 nines (Infinity)", value: infinite },
+  ];
+
+  it.each([
+    { label: "50MB", value: "50MB" },
+    { label: "-1", value: "-1" },
+    { label: "0", value: "0" },
+    ...outOfRange,
+  ])("falls back to the default bound on RUSA_LOG_ROTATE_MAX_BYTES=$label", ({ value }) => {
     const log = join(logDir(), "rusa.log");
     writeFileSync(log, "short\n");
-    const result = rotate(log, { RUSA_LOG_ROTATE_MAX_BYTES: "50MB", RUSA_LOG_ROTATE_KEEP: "-1" });
+    const result = rotate(log, { RUSA_LOG_ROTATE_MAX_BYTES: value });
     expect(result.status).toBe(0);
-    expect(result.stderr).toContain("RUSA_LOG_ROTATE_MAX_BYTES");
-    expect(result.stderr).toContain("RUSA_LOG_ROTATE_KEEP");
+    expect(result.stderr).toContain("ignoring RUSA_LOG_ROTATE_MAX_BYTES");
+    expect(result.stderr).toContain("using 52428800");
     expect(readFileSync(log, "utf8")).toBe("short\n");
+  });
+
+  it("still rotates at the default bound when the bound override is too large to represent", () => {
+    const log = join(logDir(), "rusa.log");
+    writeFileSync(log, "");
+    truncateSync(log, 52428800); // sparse: the default bound, exactly
+    const result = rotate(log, { RUSA_LOG_ROTATE_MAX_BYTES: infinite, RUSA_LOG_ROTATE_KEEP: "1" });
+    expect(result.status).toBe(0);
+    expect(statSync(`${log}.1`).size).toBe(52428800);
+    expect(statSync(log).size).toBe(0);
+  });
+
+  it.each([
+    { label: "-1", value: "-1" },
+    { label: "five", value: "five" },
+    { label: "101", value: "101" },
+    ...outOfRange,
+  ])("falls back to keeping 5 generations on RUSA_LOG_ROTATE_KEEP=$label", ({ value }) => {
+    const dir = logDir();
+    const log = join(dir, "rusa.log");
+    for (const n of [1, 2, 3, 4, 5, 6]) writeFileSync(`${log}.${n}`, `old ${n}\n`);
+    writeFileSync(log, "over the bound now\n");
+    // The timeout turns a runaway shift loop into a failure instead of a hang.
+    const result = rotate(
+      log,
+      { RUSA_LOG_ROTATE_MAX_BYTES: "10", RUSA_LOG_ROTATE_KEEP: value },
+      10_000
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("ignoring RUSA_LOG_ROTATE_KEEP");
+    expect(readdirSync(dir).sort()).toEqual([
+      "rusa.log",
+      "rusa.log.1",
+      "rusa.log.2",
+      "rusa.log.3",
+      "rusa.log.4",
+      "rusa.log.5",
+    ]);
+  });
+
+  it("accepts the largest supported retention count", () => {
+    const dir = logDir();
+    const log = join(dir, "rusa.log");
+    writeFileSync(log, "over the bound now\n");
+    const result = rotate(log, { RUSA_LOG_ROTATE_MAX_BYTES: "10", RUSA_LOG_ROTATE_KEEP: "100" });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("keeping 100");
   });
 
   it("defaults the log path to $RUSA_HOME/logs/rusa.log", () => {

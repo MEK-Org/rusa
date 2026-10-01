@@ -239,13 +239,13 @@ next timer run picks them up:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RUSA_LOG_ROTATE_MAX_BYTES` | `52428800` (50 MiB) | Rotate once the active file reaches this size |
-| `RUSA_LOG_ROTATE_KEEP` | `5` | Rotated generations to keep; `0` truncates without keeping a copy |
+| `RUSA_LOG_ROTATE_MAX_BYTES` | `52428800` (50 MiB) | Rotate once the active file reaches this many bytes; at least `1` |
+| `RUSA_LOG_ROTATE_KEEP` | `5` | Rotated generations to keep, `0` to `100`; `0` truncates without keeping a copy |
 | `RUSA_LOG_ROTATE` | on | `off` makes each run a no-op |
 
 With the defaults, the log and its generations stay within about 300 MiB, plus
-whatever is written in the hour between runs. A malformed value logs a warning
-and falls back to its default; it does not disable rotation.
+whatever is written in the hour between runs. A malformed or out-of-range value
+logs a warning and falls back to its default; it does not disable rotation.
 
 Opting out with `RUSA_LOG_ROTATE=off` lasts across reinstalls, because
 `install-service` rewrites and re-enables the timer every time. Two other paths:

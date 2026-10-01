@@ -21,8 +21,9 @@
 //   log:      the argument, else $RUSA_LOG_PATH, else $RUSA_HOME/logs/rusa.log
 //             (RUSA_HOME default ~/.rusa). The installed unit always passes the
 //             argument, so nothing in the instance .env can retarget it.
-//   bound:    $RUSA_LOG_ROTATE_MAX_BYTES (default 52428800 = 50 MiB)
-//   keep:     $RUSA_LOG_ROTATE_KEEP rotated generations (default 5; 0 = truncate only)
+//   bound:    $RUSA_LOG_ROTATE_MAX_BYTES (default 52428800 = 50 MiB; at least 1)
+//   keep:     $RUSA_LOG_ROTATE_KEEP rotated generations (default 5; 0 = truncate
+//             only; at most 100)
 //   opt-out:  $RUSA_LOG_ROTATE=off
 
 import {
@@ -40,12 +41,20 @@ import { basename, dirname, join } from "node:path";
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_KEEP = 5;
 
-// A malformed override falls back to the default rather than disabling
-// rotation: a typo in .env must not quietly reopen the unbounded-growth hole.
-function nonNegativeInt(name, fallback) {
+// More generations than anyone retains on purpose; the cap keeps the shift loop
+// below short however large a value the .env holds.
+const MAX_KEEP = 100;
+
+// A malformed or out-of-range override falls back to the default rather than
+// disabling rotation: a typo in .env must not quietly reopen the unbounded-growth
+// hole. Digit-only is not enough on its own, since a long enough run of digits
+// parses to Infinity (or an imprecise unsafe integer), which would never reach
+// the bound or never finish shifting generations.
+function intInRange(name, fallback, min, max) {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
-  if (/^\d+$/.test(raw.trim())) return Number(raw.trim());
+  const value = /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : Number.NaN;
+  if (Number.isSafeInteger(value) && value >= min && value <= max) return value;
   console.error(`rotate-log: ignoring ${name}=${JSON.stringify(raw)}; using ${fallback}`);
   return fallback;
 }
@@ -56,8 +65,13 @@ if ((process.env.RUSA_LOG_ROTATE ?? "").trim().toLowerCase() === "off") {
 
 const home = process.env.RUSA_HOME || join(homedir(), ".rusa");
 const logPath = process.argv[2] || process.env.RUSA_LOG_PATH || join(home, "logs", "rusa.log");
-const maxBytes = nonNegativeInt("RUSA_LOG_ROTATE_MAX_BYTES", DEFAULT_MAX_BYTES);
-const keep = nonNegativeInt("RUSA_LOG_ROTATE_KEEP", DEFAULT_KEEP);
+const maxBytes = intInRange(
+  "RUSA_LOG_ROTATE_MAX_BYTES",
+  DEFAULT_MAX_BYTES,
+  1,
+  Number.MAX_SAFE_INTEGER
+);
+const keep = intInRange("RUSA_LOG_ROTATE_KEEP", DEFAULT_KEEP, 0, MAX_KEEP);
 
 if (!existsSync(logPath)) process.exit(0);
 const size = statSync(logPath).size;
