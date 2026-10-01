@@ -292,9 +292,7 @@ describe("quickstart command", () => {
 
     expect(execute).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "Quickstart login for kimi isn't supported yet (tracked in ISSUE_NUM)"
-      )
+      "[quickstart] Quickstart login for kimi isn't supported yet; complete auth via the vendor's own CLI."
     );
     log.mockRestore();
   });
