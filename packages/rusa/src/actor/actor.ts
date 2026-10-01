@@ -55,6 +55,18 @@ export interface PromptBuild {
   injectRecord?: InjectRecord;
 }
 
+/**
+ * The normalized identity of one provider invocation.  This deliberately
+ * contains only the values consumers such as write attribution need, so a
+ * remote runtime can forward its actual attempt without pretending to own a
+ * full provider implementation.
+ */
+export interface ProviderAttempt {
+  providerName: string;
+  model?: string;
+  effort?: string;
+}
+
 export interface ActorOptions {
   /** Stable actor id (the thread handle). */
   id: string;
@@ -171,9 +183,11 @@ export interface ActorOptions {
    * Called immediately before each provider attempt with the instance that will
    * run. Unlike onRunStart, this includes fallbacks without changing run
    * lifecycle accounting. Its model and effort are the instantiated values, not
-   * the pre-normalization request.
+   * the pre-normalization request. The provider is not invoked until a returned
+   * promise settles, so a hook that publishes the attempt elsewhere can confirm
+   * it is installed before the provider can act under it.
    */
-  onProviderAttempt?: (provider: CodingProvider) => void;
+  onProviderAttempt?: (provider: ProviderAttempt) => void | Promise<void>;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked.
@@ -774,8 +788,8 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (provider: CodingProvider): Promise<RunResult> => {
-      this.opts.onProviderAttempt?.(provider);
+    const runProvider = async (provider: CodingProvider): Promise<RunResult> => {
+      await this.opts.onProviderAttempt?.(provider);
       return provider.run({
         prompt: built.prompt,
         cwd: this.opts.cwd,

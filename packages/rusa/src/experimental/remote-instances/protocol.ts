@@ -103,7 +103,13 @@ export type Request =
        */
       modelConfigGeneration?: number;
     }
-  | { op: "sendMessage"; to: string; body: string };
+  | { op: "sendMessage"; to: string; body: string }
+  /**
+   * The provider tuple the follower actually instantiated, after its own config
+   * filled anything the admitted tuple omitted. A request rather than an event:
+   * the follower waits for the reply before invoking the provider.
+   */
+  | { op: "providerAttempt"; attempt: RawProviderModelConfig };
 
 export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }

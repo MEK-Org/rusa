@@ -1005,6 +1005,14 @@ export class ActorHandle implements MeshActor {
         break;
       }
       case "runStart":
+        // Older followers do not send `providerAttempt`, but their run-start
+        // tuple is still the leader-admitted attempt. Keep that attribution;
+        // current followers refine it with the tuple they instantiated.
+        this.opts.actorOptions?.onProviderAttempt?.({
+          providerName: message.selected.provider,
+          model: message.selected.model,
+          effort: message.selected.effort,
+        });
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
         this.runStartTime = performance.now();
@@ -1107,6 +1115,17 @@ export class ActorHandle implements MeshActor {
               this.send({ type: "reply", requestId });
               break;
             }
+            case "providerAttempt":
+              // An attempt that arrives after the run closed must not restore
+              // the selection terminal cleanup removed.
+              if (this.runOpen)
+                void this.opts.actorOptions?.onProviderAttempt?.({
+                  providerName: request.attempt.provider,
+                  model: request.attempt.model,
+                  effort: request.attempt.effort,
+                });
+              this.send({ type: "reply", requestId });
+              break;
             case "sendMessage":
               // Bind sender identity here; the remote actor cannot choose a different actor.
               this.send({
