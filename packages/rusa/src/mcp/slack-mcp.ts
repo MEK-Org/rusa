@@ -1,4 +1,3 @@
-import { writeFile } from "node:fs/promises";
 import { basename } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -9,6 +8,7 @@ import {
   readBoundedRegularFile,
   resolveAttachmentPath,
   resolveDownloadPath,
+  writeNewFileInWorkdir,
 } from "./workdir-path.js";
 
 export const SLACK_READ_MCP_NAME = "slack-read";
@@ -91,14 +91,17 @@ export function createSlackReadMcpServer(
     async ({ channel, ts, fileId, destinationPath }) => {
       try {
         requireFileToolsAvailable(options);
-        const target = await resolveDownloadPath(requireWorkDir(options), destinationPath);
+        const workDir = requireWorkDir(options);
+        const target = await resolveDownloadPath(workDir, destinationPath);
         const { file, data } = await client.downloadMessageFile(
           channel,
           ts,
           fileId,
           options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
         );
-        await writeFile(target, data, { flag: "wx" });
+        // Opened only now, after the fetch, and walked from the root so a
+        // directory swapped during the fetch cannot redirect the write.
+        await writeNewFileInWorkdir(workDir, target, data);
         return toolOk({
           path: target,
           bytes: data.length,
@@ -181,8 +184,10 @@ export function createSlackWriteMcpServer(
       try {
         if (!allowed(channel)) throw new Error(`access denied: Slack channel ${channel}`);
         requireFileToolsAvailable(options);
-        const source = await resolveAttachmentPath(requireWorkDir(options), filePath);
+        const workDir = requireWorkDir(options);
+        const source = await resolveAttachmentPath(workDir, filePath);
         const data = await readBoundedRegularFile(
+          workDir,
           source,
           options.maxFileBytes ?? MAX_SLACK_FILE_BYTES
         );

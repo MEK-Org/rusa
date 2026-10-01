@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -234,6 +235,49 @@ describe("Slack read MCP files", () => {
 
     expect((await download("sub/ok.txt")).isError).toBe(false);
     expect(readFileSync(join(dir, "sub", "ok.txt"), "utf8")).toBe("hello");
+  });
+
+  it("refuses a download whose directory is swapped for an outside symlink during the fetch", async () => {
+    const dir = workdir();
+    const outside = workdir();
+    mkdirSync(join(dir, "sub"));
+    let fetchStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      fetchStarted = resolve;
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        fetchStarted();
+        await held;
+        return new Response("hello");
+      })
+    );
+    const client = await connect(
+      createSlackReadMcpServer(
+        slackWith({ conversations: { replies: messageWithFile(reportFile) } }),
+        { workDir: dir }
+      )
+    );
+    const pending = call(client, "download_file", {
+      channel: "C1",
+      ts: "1.0",
+      fileId: "F1",
+      destinationPath: "sub/new.txt",
+    });
+    await started;
+    renameSync(join(dir, "sub"), join(dir, "sub-moved"));
+    symlinkSync(outside, join(dir, "sub"));
+    release();
+
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("access denied");
+    expect(existsSync(join(outside, "new.txt"))).toBe(false);
   });
 });
 

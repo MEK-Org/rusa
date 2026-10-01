@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { type FileHandle, open, realpath, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 function isContained(parent: string, child: string): boolean {
   const rel = relative(parent, child);
@@ -32,9 +32,9 @@ export async function resolveAttachmentPath(workDir: string, filePath: string): 
 /**
  * Resolve a download destination inside the calling actor's workdir. The
  * parent directory must already exist and realpath inside the workdir, so a
- * symlinked directory cannot redirect the write elsewhere; callers create the
- * file exclusively (`wx`), which also refuses an existing file or symlink at
- * the final component.
+ * symlinked directory cannot redirect the write elsewhere. This only
+ * validates the name; write it with {@link writeNewFileInWorkdir}, which holds
+ * the boundary at the open itself.
  */
 export async function resolveDownloadPath(
   workDir: string,
@@ -52,17 +52,101 @@ export async function resolveDownloadPath(
   return join(realParent, basename(target));
 }
 
+/**
+ * Open a resolved path by walking it from the workdir root one component at a
+ * time, each relative to the previous directory's descriptor and without
+ * following symlinks. The workdir is mutable by its actor, so a pathname
+ * validated earlier can have an ancestor swapped for a symlink before the I/O;
+ * descriptor-anchored lookups refuse that instead of following it out of the
+ * root. Node has no openat, so lookups go through Linux's `/proc/self/fd`;
+ * without it this fails closed rather than falling back to a pathname open.
+ */
+async function openInWorkdir(
+  workDir: string,
+  confinedPath: string,
+  flags: number,
+  mode?: number
+): Promise<FileHandle> {
+  const realRoot = await realpath(workDir);
+  if (!isContained(realRoot, confinedPath)) {
+    throw new Error("access denied: path resolves outside the actor workdir");
+  }
+  const names = relative(realRoot, confinedPath).split(sep).filter(Boolean);
+  const dirFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+  let dir = await open(realRoot, names.length > 0 ? dirFlags : flags, mode);
+  try {
+    const anchor = await stat(`/proc/self/fd/${dir.fd}`).catch(() => undefined);
+    const rootStat = await dir.stat();
+    if (anchor?.dev !== rootStat.dev || anchor?.ino !== rootStat.ino) {
+      throw new Error("workdir file I/O needs Linux /proc/self/fd; refusing to open by pathname");
+    }
+    for (const [index, name] of names.entries()) {
+      const last = index === names.length - 1;
+      let next: FileHandle;
+      try {
+        next = await open(`/proc/self/fd/${dir.fd}/${name}`, last ? flags : dirFlags, mode);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ELOOP" || (!last && code === "ENOTDIR")) {
+          throw Object.assign(
+            new Error("access denied: path changed to a symlink inside the actor workdir"),
+            { code }
+          );
+        }
+        throw err;
+      }
+      await dir.close();
+      dir = next;
+    }
+    return dir;
+  } catch (err) {
+    await dir.close();
+    throw err;
+  }
+}
+
+/**
+ * Create a new file at a {@link resolveDownloadPath} result and write `data`
+ * through the descriptor. The final component is created exclusively, so an
+ * existing file or symlink there is refused too.
+ */
+export async function writeNewFileInWorkdir(
+  workDir: string,
+  path: string,
+  data: Uint8Array
+): Promise<void> {
+  const handle = await openInWorkdir(
+    workDir,
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o666
+  );
+  try {
+    await handle.writeFile(data);
+  } finally {
+    await handle.close();
+  }
+}
+
 const READ_CHUNK_BYTES = 64 * 1024;
 
 /**
  * Read a confined file with a hard byte bound at the read itself, so the cap
  * holds even if the file grows or is replaced after it was resolved. The
- * handle is opened without following a final symlink and nonblocking (a FIFO
- * cannot stall the open), then must be a regular file; at most `maxBytes + 1`
- * bytes are ever read.
+ * handle is opened within the workdir without following any symlink and
+ * nonblocking (a FIFO cannot stall the open), then must be a regular file; at
+ * most `maxBytes + 1` bytes are ever read.
  */
-export async function readBoundedRegularFile(path: string, maxBytes: number): Promise<Buffer> {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+export async function readBoundedRegularFile(
+  workDir: string,
+  path: string,
+  maxBytes: number
+): Promise<Buffer> {
+  const handle = await openInWorkdir(
+    workDir,
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
   try {
     if (!(await handle.stat()).isFile()) {
       throw new Error("access denied: filePath is not a regular file");
