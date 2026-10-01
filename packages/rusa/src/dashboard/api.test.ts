@@ -2720,6 +2720,14 @@ describe("handleMeshApiRequest", () => {
         },
       },
     ]);
+    // A prior run's selection associated the unlinked event with ob-pr.
+    deps = {
+      ...deps,
+      inboxFocus: {
+        listEntryObligationIds: (_actorId: string, entryId: string) =>
+          entryId === "unlinked-event" ? ["ob-pr"] : [],
+      } as unknown as DashboardDataDeps["inboxFocus"],
+    };
 
     const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     const byId = new Map(
@@ -2734,6 +2742,7 @@ describe("handleMeshApiRequest", () => {
     expect(byId.get("ready-head")?.obligationId).toBe("ob-pr");
     // A closed obligation no longer governs its issue's events.
     expect(byId.get("terminal-link")?.obligationId).toBeUndefined();
+    // Selection-only association does not make an entry an obligation card.
     expect(byId.get("unlinked-event")?.obligationId).toBeUndefined();
     // A cancelled-prerequisite notice keeps its own rendering.
     expect(byId.get("prereq-cancelled")?.obligationId).toBeUndefined();
