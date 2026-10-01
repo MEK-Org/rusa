@@ -2751,6 +2751,33 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const notes = mechanicalNotes("root");
       expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
     });
+
+    // #189: a capped run used to be filtered out before the failure route, so
+    // the parent never heard about it.
+    it("forwards a capped run to the parent as a responsive [capped] notice", async () => {
+      const workerId = "capped-worker";
+      const mesh = await bootWithWorker(workerId);
+      const actor = actorFor(mesh, workerId);
+
+      const runId = await startRun(actor);
+      await endLifecycleRun(actor, runId, {
+        success: false,
+        capped: true,
+        exitCode: 1,
+        output: "turn limit reached",
+      });
+
+      const notices = getRepositories()
+        .inbox.list("root", { status: "all" })
+        .entries.filter((entry) => entry.payload?.fromId === workerId);
+      expect(notices.map((entry) => entry.payload)).toEqual([
+        expect.objectContaining({
+          type: "mesh.mechanical_note",
+          note: expect.stringMatching(/^\[capped\] /),
+          priority: "responsive",
+        }),
+      ]);
+    });
   });
 
   it("mounts a live calendar-read grant for root on the next run", async () => {
